@@ -682,7 +682,7 @@ pub(super) fn validate_plan_values(
                 return Ok((data_type.clone(), false));
             }
             if let Some(type_name) = bindings.get(variable) {
-                let node = catalog.node_types.get(*type_name).ok_or_else(|| {
+                let node = catalog.query_node_type(type_name).ok_or_else(|| {
                     OmniError::manifest_internal(format!("unknown node type {type_name}"))
                 })?;
                 let field = node

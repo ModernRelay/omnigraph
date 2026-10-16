@@ -901,7 +901,9 @@ fn affected_graphs(
                     old_bindings.union(&new_bindings).copied().collect()
                 };
                 for binding in bindings {
-                    if let Some(graph) = binding.strip_prefix("graph.") {
+                    if let Some(graph) = binding.strip_prefix("graph.")
+                        && graph != omnigraph_compiler::CATALOGUE_SCOPE
+                    {
                         graphs.insert(graph.to_owned());
                     }
                 }
@@ -1420,12 +1422,11 @@ pub async fn plan_captured_deployment(
                 });
             }
             ResourceKind::Policy(_) => {
-                for target in resource
-                    .applies_to
-                    .iter()
-                    .flatten()
-                    .filter(|target| target.starts_with("graph."))
-                {
+                for target in resource.applies_to.iter().flatten().filter(|target| {
+                    target
+                        .strip_prefix("graph.")
+                        .is_some_and(|graph| graph != omnigraph_compiler::CATALOGUE_SCOPE)
+                }) {
                     dependencies.insert(Dependency {
                         from: address.clone(),
                         to: target.clone(),
@@ -2043,6 +2044,16 @@ async fn prepare_graphs(
             recovery_executor: None,
         };
         if !existing {
+            if graph.starts_with(omnigraph_compiler::SYSTEM_GRAPH_ID_PREFIX) {
+                return Err(refusal(
+                    "reserved_graph_id",
+                    format!(
+                        "graph id `{graph}` uses the reserved system prefix `{}`; `{}` is the engine catalogue every server serves",
+                        omnigraph_compiler::SYSTEM_GRAPH_ID_PREFIX,
+                        omnigraph_compiler::CATALOGUE_SCOPE
+                    ),
+                ));
+            }
             let uri = store.graph_root(&graph);
             let canonical = admission::canonical_graph_uri(&uri)?;
             let expected_uri = format!(
@@ -2442,9 +2453,10 @@ async fn finish(
                 if let Some(bindings) = resource.applies_to.as_mut() {
                     bindings.retain(|binding| {
                         binding == "cluster"
-                            || binding
-                                .strip_prefix("graph.")
-                                .is_some_and(|graph| achieved_graphs.iter().any(|id| id == graph))
+                            || binding.strip_prefix("graph.").is_some_and(|graph| {
+                                graph == omnigraph_compiler::CATALOGUE_SCOPE
+                                    || achieved_graphs.iter().any(|id| id == graph)
+                            })
                     });
                     if bindings.is_empty() {
                         continue;

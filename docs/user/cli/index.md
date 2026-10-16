@@ -28,6 +28,11 @@ from that folder with an explicit `--graph`. Applied Cedar policy determines you
 permissions. See [managed data access](managed-data.md) for expiry, offline
 operation and credential clearing.
 
+Organization administrators can [invite, enroll and remove
+teammates](managed-team.md) with `organization --managed`, using the same cached
+login. Cluster admission and control grants remain separate from Cedar graph
+permissions.
+
 ## Create, load, and query a graph
 
 ```bash
@@ -268,3 +273,21 @@ omnigraph queries validate --cluster ./company-brain --graph knowledge
 
 `lint` checks one `.gq` source. `queries validate` checks the applied stored
 query registry for a cluster graph.
+
+## Give an agent the matching skill
+
+The binary carries the `omnigraph` agent skill written for its own commands and
+HTTP contract. Export it where your agent loads skills:
+
+```bash
+omnigraph skill export ~/.claude/skills/omnigraph --force --json
+omnigraph skill show references/queries.md
+```
+
+`skill export` creates the directory and refuses to replace existing files
+unless `--force`. It records the files it wrote in `.omnigraph-skill.json`; a
+later `--force` export removes a recorded file this skill no longer has only
+while its bytes are unchanged, and touches no other file. `--json` reports the
+`files` written, `skill_version`, `cli_version` and `http_contract`.
+`skill show` prints `SKILL.md`, or the named skill file, to stdout. Neither
+command reads configuration or contacts a server.

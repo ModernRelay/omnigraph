@@ -676,6 +676,9 @@ pub(crate) async fn remote_no_content(
 /// (positional URI / `--store` / `--profile` / `defaults.store`). No
 /// omnigraph.yaml `cli.graph` fallback — an absent address is a loud error.
 pub(crate) fn resolve_uri(cli_uri: Option<String>) -> Result<String> {
+    if crate::client::is_catalogue_scope(cli_uri.as_deref()) {
+        return Err(crate::client::catalogue_scope_refusal("this command"));
+    }
     cli_uri.ok_or_else(|| {
         color_eyre::eyre::eyre!(
             "no graph addressed — pass a positional URI, --store <uri>, --server <name>, \

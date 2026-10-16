@@ -2,21 +2,81 @@ use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::ir::QueryIR;
 use serde::{Deserialize, Serialize};
 
-/// The physical owner of one table image: the dataset, its native Lance
-/// branch and the pinned version (RFC 0067 and detached-only tables), so a
-/// routed plan reads exactly the owner the executor reads.
+/// Where a table's rows come from: a pinned dataset in the graph's store,
+/// or the engine catalogue the running binary answers from memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum TableSource {
+    /// The dataset and its native Lance branch (RFC 0067 and detached-only
+    /// tables), so a routed plan reads exactly the owner the executor reads.
+    Dataset {
+        dataset_path: String,
+        native_branch: Option<String>,
+    },
+    /// A built-in `@` type (`omnigraph_compiler::catalogue`): rows derived
+    /// from the binary's registries, never a dataset, never a snapshot.
+    Catalogue,
+}
+
+impl TableSource {
+    /// The explain spelling.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Dataset { .. } => "dataset",
+            Self::Catalogue => "catalogue",
+        }
+    }
+}
+
+/// One table image: its type key and the source its rows come from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableRef {
     pub type_key: String,
-    pub dataset_path: String,
-    pub native_branch: Option<String>,
+    #[serde(flatten)]
+    pub source: TableSource,
 }
 
 impl TableRef {
+    pub fn dataset(
+        type_key: impl Into<String>,
+        dataset_path: impl Into<String>,
+        native_branch: Option<String>,
+    ) -> Self {
+        Self {
+            type_key: type_key.into(),
+            source: TableSource::Dataset {
+                dataset_path: dataset_path.into(),
+                native_branch,
+            },
+        }
+    }
+
+    pub fn catalogue(type_key: impl Into<String>) -> Self {
+        Self {
+            type_key: type_key.into(),
+            source: TableSource::Catalogue,
+        }
+    }
+
     /// The bare node type name of a `node:<Type>` table; `None` for any
     /// other table.
     pub fn node_type_name(&self) -> Option<&str> {
         self.type_key.strip_prefix("node:")
+    }
+
+    pub fn is_catalogue(&self) -> bool {
+        matches!(self.source, TableSource::Catalogue)
+    }
+
+    /// The dataset path and native branch of a dataset-backed table.
+    pub fn dataset_owner(&self) -> Option<(&str, Option<&str>)> {
+        match &self.source {
+            TableSource::Dataset {
+                dataset_path,
+                native_branch,
+            } => Some((dataset_path.as_str(), native_branch.as_deref())),
+            TableSource::Catalogue => None,
+        }
     }
 }
 

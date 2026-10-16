@@ -271,11 +271,7 @@ fn a_hash_join_lowers_its_probe_then_its_build_scan_then_itself() {
         spec: Box::new(ScanSpec {
             access: None,
             side: SideId::Base,
-            table: omnigraph_planner::TableRef {
-                type_key: "node:Doc".to_string(),
-                dataset_path: "node_Doc".to_string(),
-                native_branch: None,
-            },
+            table: omnigraph_planner::TableRef::dataset("node:Doc", "node_Doc", None),
             version: None,
             columns: omnigraph_compiler::SystemColumns {
                 id: "__id",

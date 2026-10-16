@@ -34,9 +34,9 @@ use omnigraph_planner::{
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
 use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerUdaf};
 use super::operators::{
-    AntiJoinMaskExec, ArmOrder, ContainsJoinExec, CrossJoinExec, ExpandExec, ExpandExecution,
-    ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec, LimitExec, LookupSpec,
-    MetadataCountExec, OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec,
+    AntiJoinMaskExec, ArmOrder, CatalogueExec, ContainsJoinExec, CrossJoinExec, ExpandExec,
+    ExpandExecution, ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec, LimitExec,
+    LookupSpec, MetadataCountExec, OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec,
     RuntimeFilterSlot, ScanExec, ScanSource, SortExec, SortKey, fresh_tag_column, tagged_schema,
 };
 use super::*;
@@ -51,7 +51,9 @@ pub(super) const HIDDEN: &str = "~";
 pub(super) struct Lowering<'a> {
     pub(super) plan: &'a PhysicalPlan,
     pub(super) values: &'a ValueTable,
-    pub(super) snapshot: &'a Snapshot,
+    /// The graph storage the stored-type scans, counts, hydrations and
+    /// traversals read; `None` under the catalogue-only scope.
+    pub(super) snapshot: Option<&'a Snapshot>,
     pub(super) graph_index: &'a Arc<GraphIndexHandle>,
     pub(super) catalog: &'a Arc<Catalog>,
 }
@@ -76,11 +78,21 @@ impl Lowered {
     }
 }
 
-/// What every operator of one lowering shares.
+/// What every operator of one lowering shares; the graph environment only
+/// when the lowering has storage.
 struct Scope {
     id: LoweringId,
-    env: Arc<GraphEnv>,
+    env: Option<Arc<GraphEnv>>,
     ctx: Arc<ProjectionContext>,
+}
+
+impl Scope {
+    fn env(&self, what: &str) -> Lowers<Arc<GraphEnv>> {
+        self.env
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| super::no_graph_storage(what).into())
+    }
 }
 
 impl<'a> Lowering<'a> {
@@ -99,6 +111,12 @@ impl<'a> Lowering<'a> {
         self.plan.node(id).ok_or_else(|| {
             OmniError::manifest_internal(format!("physical node {id} is a tombstone"))
         })
+    }
+
+    /// The snapshot a storage-reading node needs, or the catalogue-only
+    /// refusal naming `what`.
+    fn snapshot(&self, what: &str) -> Result<&'a Snapshot> {
+        self.snapshot.ok_or_else(|| super::no_graph_storage(what))
     }
 
     fn params(&self) -> &'a Arc<ParamMap> {
@@ -177,9 +195,9 @@ impl<'a> Lowering<'a> {
         Ok(mode)
     }
 
-    /// What a scan of `spec` reads: the destination type, the binding, the
-    /// pushed filters and the projection, on either side of a hash join too.
-    fn lookup(&self, spec: &ScanSpec) -> Result<LookupSpec> {
+    /// The type, binding and projection a scan of `spec` reads, the part of
+    /// a lookup that needs no storage.
+    fn lookup_columns(&self, spec: &ScanSpec) -> Result<ScanColumnsSpec> {
         let binding = spec.binding.as_deref().ok_or_else(|| {
             OmniError::manifest_internal(
                 "a read plan's scan is bound to a match variable".to_string(),
@@ -190,20 +208,37 @@ impl<'a> Lowering<'a> {
             .type_key
             .strip_prefix("node:")
             .unwrap_or(&spec.table.type_key);
-        Ok(LookupSpec {
+        Ok(ScanColumnsSpec {
             type_name: type_name.to_string(),
             binding: binding.to_string(),
+            projection: spec
+                .projection
+                .as_ref()
+                .map(|columns| NeededColumns(columns.iter().cloned().collect())),
+        })
+    }
+
+    /// What a scan of `spec` reads: the destination type, the binding, the
+    /// pushed filters and the projection, on either side of a hash join too.
+    fn lookup(&self, spec: &ScanSpec) -> Result<LookupSpec> {
+        let ScanColumnsSpec {
+            type_name,
+            binding,
+            projection,
+        } = self.lookup_columns(spec)?;
+        Ok(LookupSpec {
+            type_name,
+            binding,
             filters: spec
                 .filter
                 .as_ref()
                 .map(Predicate::gq_filters)
                 .unwrap_or_default(),
-            projection: spec
-                .projection
-                .as_ref()
-                .map(|columns| NeededColumns(columns.iter().cloned().collect())),
+            projection,
             params: Arc::clone(self.params()),
-            snapshot: self.snapshot.clone(),
+            snapshot: self
+                .snapshot(&format!("the scan of `{}`", spec.table.type_key))?
+                .clone(),
             catalog: Arc::clone(self.catalog),
         })
     }
@@ -361,6 +396,13 @@ struct OuterScope {
     tag_column: String,
 }
 
+/// The storage-free part of a scan's lookup.
+struct ScanColumnsSpec {
+    type_name: String,
+    binding: String,
+    projection: Option<NeededColumns>,
+}
+
 /// The state of one `PhysicalPlan::lower` call over a read plan.
 struct Walk<'l, 'a> {
     lowering: &'l Lowering<'a>,
@@ -385,10 +427,12 @@ impl<'l, 'a> Walk<'l, 'a> {
             pass,
             scope: Scope {
                 id: LoweringId::next(),
-                env: Arc::new(GraphEnv {
-                    graph_index: Arc::clone(lowering.graph_index),
-                    snapshot: lowering.snapshot.clone(),
-                    catalog: Arc::clone(lowering.catalog),
+                env: lowering.snapshot.map(|snapshot| {
+                    Arc::new(GraphEnv {
+                        graph_index: Arc::clone(lowering.graph_index),
+                        snapshot: snapshot.clone(),
+                        catalog: Arc::clone(lowering.catalog),
+                    })
                 }),
                 ctx: Arc::new(ProjectionContext::for_plan(lowering.catalog, lowering.plan)),
             },
@@ -485,7 +529,9 @@ impl Lower for Walk<'_, '_> {
         })?;
         let count = MetadataCountExec::new(
             spec.table.type_key.clone(),
-            self.lowering.snapshot.clone(),
+            self.lowering
+                .snapshot(&format!("the metadata count of `{}`", spec.table.type_key))?
+                .clone(),
             Arc::clone(&properties.schema),
         );
         self.built(id, count)
@@ -506,6 +552,27 @@ impl Lower for Walk<'_, '_> {
                 "scan {id} declares an ordered or keys-only read the engine does not honour"
             ))
             .into());
+        }
+        if spec.table.is_catalogue() {
+            if ranked.is_some()
+                || spec.runtime_filter.is_some()
+                || !matches!(source, ScanInput::Table)
+                || input.is_some()
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "scan {id} of `{}` asks the catalogue for a ranked, runtime-filtered or dependent read",
+                    spec.table.type_key
+                ))
+                .into());
+            }
+            let lookup = self.lowering.lookup_columns(spec)?;
+            let scan = CatalogueExec::try_new(
+                &lookup.type_name,
+                &lookup.binding,
+                lookup.projection.as_ref(),
+                self.lowering.catalog,
+            )?;
+            return self.built(id, scan);
         }
         let runtime = match (source, ranked, &spec.runtime_filter) {
             (ScanInput::Table, None, Some(filter)) => {
@@ -593,7 +660,9 @@ impl Lower for Walk<'_, '_> {
         let hydrate = HydrateExec::try_new(
             input,
             bindings.to_vec(),
-            self.lowering.snapshot.clone(),
+            self.lowering
+                .snapshot("the hydration of return columns")?
+                .clone(),
             self.lowering.catalog,
             declared.schema.as_ref(),
         )?;
@@ -702,7 +771,8 @@ impl Lower for Walk<'_, '_> {
             edge_binding: fields.edge_binding.map(str::to_string),
             frontier_estimate: fields.frontier_estimate,
         };
-        let expand = ExpandExec::try_new(input, step, Arc::clone(&self.scope.env))?;
+        let env = self.scope.env("a traversal")?;
+        let expand = ExpandExec::try_new(input, step, env)?;
         self.built(id, expand)
     }
 
@@ -757,7 +827,8 @@ impl Lower for Walk<'_, '_> {
             scope.slot,
             *strategy,
             bulk,
-            Arc::clone(&self.scope.env),
+            Arc::clone(self.lowering.catalog),
+            Arc::clone(self.lowering.graph_index),
         );
         self.built(id, mask)
     }

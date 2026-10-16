@@ -18,7 +18,7 @@ pub(crate) async fn explain_document(
     query: &CompiledQuery,
     params: &ParamMap,
     catalog: &Arc<Catalog>,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     settings: &SessionSettings,
 ) -> Result<serde_json::Value> {
     let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
@@ -215,7 +215,7 @@ fn explain_detail(value: &serde_json::Value) -> String {
 pub(crate) async fn explain_rows(
     query: &CompiledQuery,
     params: &ParamMap,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     catalog: &Arc<Catalog>,
     settings: &SessionSettings,
 ) -> Result<QueryResult> {
@@ -230,6 +230,7 @@ pub(crate) async fn explain_rows(
         reason,
         entry,
         operation,
+        logical_plan_initial,
         logical_plan,
         logical_hash,
         physical_plan,
@@ -239,6 +240,9 @@ pub(crate) async fn explain_rows(
         validation,
     } = &planned.explain;
     let mut rows = ExplainRows::default();
+    if let Some(root) = logical_plan_initial {
+        rows.push_tree("logical_initial", root, 0);
+    }
     if let Some(root) = logical_plan {
         rows.push_tree("logical", root, 0);
     }

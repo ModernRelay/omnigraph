@@ -11834,6 +11834,13 @@
           "schema_source"
         ],
         "properties": {
+          "catalogue_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The engine catalogue's built-in `@` types as `.pg`-style\ndeclarations, listed beside the graph's own schema: read-only rows\nthe binary derives from its registries, never part of the schema\nsource above. Optional for compatibility with servers predating it."
+          },
           "schema_source": {
             "type": "string"
           },

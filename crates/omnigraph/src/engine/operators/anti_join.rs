@@ -22,6 +22,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::StreamExt;
+use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{ParamMap, SubqueryPredicate};
 use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{AggregateSpec, AntiJoinStrategy};
@@ -30,8 +31,8 @@ use super::memory::WorkMemory;
 use super::subquery_aggregate::{
     RowCountPredicate, SubqueryAggregate, ValueAccumulator, absorb_inner_batches,
 };
-use super::{GraphEnv, breaker_properties, breaker_stream, drain, drain_one, external, polled};
-use crate::engine::graph::bulk_anti_join_mask;
+use super::{breaker_properties, breaker_stream, drain, drain_one, external, polled};
+use crate::engine::graph::{GraphIndexHandle, bulk_anti_join_mask};
 use crate::error::{OmniError, Result};
 
 /// The outer batch handed from `AntiJoinMaskExec` to the `OuterReferenceExec`
@@ -151,7 +152,8 @@ pub(crate) struct AntiJoinMaskExec {
     strategy: AntiJoinStrategy,
     /// The edge the bulk CSR check answers (`Lowering::bulk_row_count`).
     bulk: Option<(String, Direction)>,
-    env: Arc<GraphEnv>,
+    catalog: Arc<Catalog>,
+    graph_index: Arc<GraphIndexHandle>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -169,7 +171,8 @@ impl AntiJoinMaskExec {
         slot: Arc<OuterSlot>,
         strategy: AntiJoinStrategy,
         bulk: Option<(String, Direction)>,
-        env: Arc<GraphEnv>,
+        catalog: Arc<Catalog>,
+        graph_index: Arc<GraphIndexHandle>,
     ) -> Self {
         let schema = outer.schema();
         Self {
@@ -183,7 +186,8 @@ impl AntiJoinMaskExec {
             slot,
             strategy,
             bulk,
-            env,
+            catalog,
+            graph_index,
             properties: breaker_properties(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -285,7 +289,8 @@ impl ExecutionPlan for AntiJoinMaskExec {
             Arc::clone(&self.slot),
             self.strategy,
             self.bulk.clone(),
-            Arc::clone(&self.env),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.graph_index),
         )))
     }
 
@@ -308,7 +313,8 @@ impl ExecutionPlan for AntiJoinMaskExec {
         let slot = Arc::clone(&self.slot);
         let strategy = self.strategy;
         let bulk = self.bulk.clone();
-        let env = Arc::clone(&self.env);
+        let catalog = Arc::clone(&self.catalog);
+        let graph_index = Arc::clone(&self.graph_index);
         let declared = Arc::clone(&schema);
         let stream = breaker_stream(
             "AntiJoinMaskExec",
@@ -325,8 +331,7 @@ impl ExecutionPlan for AntiJoinMaskExec {
                             return Ok(wide);
                         }
                         if strategy == AntiJoinStrategy::KeySet {
-                            let key_column =
-                                format!("{outer_var}.{}", env.catalog.system_columns.id);
+                            let key_column = format!("{outer_var}.{}", catalog.system_columns.id);
                             let keep = key_set_mask(
                                 &wide,
                                 inner.execute(0, inner_ctx)?,
@@ -343,13 +348,13 @@ impl ExecutionPlan for AntiJoinMaskExec {
                             && let Some(row_count) =
                                 RowCountPredicate::resolve(&predicate, &params).map_err(external)?
                         {
-                            let gi = env.graph_index.get().await.map_err(external)?;
+                            let gi = graph_index.get().await.map_err(external)?;
                             if let Some(mask) = bulk_anti_join_mask(
                                 &wide,
                                 edge_type,
                                 *direction,
                                 gi,
-                                &env.catalog,
+                                &catalog,
                                 &outer_var,
                                 &row_count,
                                 &reservation,

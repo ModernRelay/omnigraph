@@ -21,7 +21,7 @@ direct — direct storage access; reject --server (init, upgrade, optimize, rebu
 repair, cleanup, schema plan/apply, lint).\n  \
 control — manage or inspect a cluster (--config for bundles; explicit --cluster roots for \
 self-hosted deployment/recovery; --managed for the managed service; policy & queries via --cluster).\n  \
-local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
+local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, skill, version.\n\
 MANAGED FOLDERS: cluster --managed uses .omnigraph/context; data commands acquire identity credentials automatically.\n\
 Implicit query, mutate, load and commit list/show use folder context and require --graph.\n\
 Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
@@ -100,6 +100,17 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Manage people and invitations in the selected organization.
+    #[command(visible_alias = "org")]
+    Organization {
+        /// Use the managed service and your cached organization identity.
+        #[arg(long, global = true)]
+        managed: bool,
+        #[command(flatten)]
+        target: OrganizationArgs,
+        #[command(subcommand)]
+        command: OrganizationCommand,
+    },
     // ── Data plane ── run against a graph (embedded or via --server).
     /// Execute a read query, a branch read (`branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`), or an `explain` statement against a branch or snapshot.
     ///
@@ -468,12 +479,46 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    /// Export or print the agent skill built into this binary, which matches
+    /// this CLI's commands and HTTP contract.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Print the CLI version, the HTTP contract it speaks, and the storage
     /// formats it writes and serves.
     Version {
         /// Emit the same facts as one JSON object.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SkillCommand {
+    /// Write the agent skill into a directory, creating it when missing.
+    ///
+    /// Refuses when any file the export writes already exists, unless
+    /// --force. A record of the written files (`.omnigraph-skill.json`) lets a
+    /// later --force export remove files this skill no longer has, but only
+    /// while their bytes are unchanged. Other files are never touched.
+    Export {
+        /// Skill directory, e.g. ~/.claude/skills/omnigraph.
+        dir: PathBuf,
+        /// Replace the skill's files and remove unchanged files that an
+        /// earlier export recorded and this skill no longer has.
+        #[arg(long)]
+        force: bool,
+        /// Emit JSON: the files written, the skill version, the CLI version
+        /// and the HTTP contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one file of the agent skill to stdout.
+    Show {
+        /// Path below the skill root.
+        #[arg(default_value = "SKILL.md", value_name = "PATH")]
+        path: String,
     },
 }
 
@@ -890,6 +935,89 @@ pub(crate) enum ClusterMembersCommand {
         /// Emit the API envelope instead of a readable member table.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct OrganizationArgs {
+    /// API origin; may be omitted in a bound configuration directory.
+    #[arg(long, global = true)]
+    pub(crate) api: Option<String>,
+    /// Organization ID; omission uses the folder binding or sole cached organization.
+    #[arg(long, global = true)]
+    pub(crate) organization: Option<String>,
+    /// Configuration folder supplying an optional managed context.
+    #[arg(long, global = true, default_value = ".")]
+    pub(crate) config: PathBuf,
+    /// Emit the validated API envelope instead of readable text.
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum OrganizationCommand {
+    /// Inspect or change local enrollment, admission and control permissions.
+    Members {
+        #[command(subcommand)]
+        command: OrganizationMembersCommand,
+    },
+    /// Manage provider invitations; acceptance does not grant cluster access.
+    Invitations {
+        #[command(subcommand)]
+        command: OrganizationInvitationsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum OrganizationMembersCommand {
+    /// List provider members and retained local enrollment, including current versions.
+    List,
+    /// Apply a versioned YAML add/update/remove patch; graph policy is unchanged.
+    Apply {
+        file: PathBuf,
+        /// Stable request key; retain it if the result is uncertain.
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Remove local access, organization membership and its sessions.
+    /// Deploy Cedar revocation and verify old graph credentials first.
+    Offboard {
+        user_id: String,
+        /// Current local grant version; zero for an unenrolled person.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        expected_version: i64,
+        /// Stable request key; retain it if the result is uncertain.
+        #[arg(long)]
+        idempotency_key: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum OrganizationInvitationsCommand {
+    /// List one provider page of up to 100 invitations.
+    List {
+        /// Continue from the previous page's exact cursor.
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// Email an invitation to join this organization.
+    Send {
+        email: String,
+        /// Stable request key; retain it if the result is uncertain.
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Resend one exact pending invitation.
+    Resend {
+        invitation_id: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Revoke one exact pending invitation.
+    Revoke {
+        invitation_id: String,
+        #[arg(long)]
+        idempotency_key: String,
     },
 }
 

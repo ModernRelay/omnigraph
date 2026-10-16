@@ -1,0 +1,79 @@
+# issue: none
+# notes: Catalogue rows join user rows in one query (a filtered cross join and an anti-join
+# notes: over `@Operator`), a write targeting a catalogue type is refused before any write
+# notes: work, and text search over a catalogue binding is refused at the check.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Job {
+    name: String @key
+    uses: String
+}
+
+--- seed
+{"type":"Job","data":{"name":"nightly","uses":"Scan"}}
+{"type":"Job","data":{"name":"weekly","uses":"Expand"}}
+{"type":"Job","data":{"name":"adhoc","uses":"Teleport"}}
+
+--- query
+set engine = v2;
+query jobs_with_a_real_operator() {
+    match { $j: Job $o: @Operator $j.uses = $o.name }
+    return { $j.name, $o.inputs }
+    order { $j.name }
+}
+
+--- expect ordered
+{"j.name":"nightly","o.inputs":[0,1]}
+{"j.name":"weekly","o.inputs":[1]}
+
+--- expect shape
+j.name: String
+o.inputs: [I64]
+
+--- query
+set engine = v2;
+query jobs_naming_no_operator() {
+    match {
+        $j: Job
+        not { $o: @Operator $o.name = $j.uses }
+    }
+    return { $j.name }
+}
+
+--- expect unordered
+{"j.name":"adhoc"}
+
+--- expect shape
+j.name: String
+
+--- mutate
+query rename_scan() {
+    update @Operator set { name: "Read" } where name = "Scan"
+}
+
+--- expect error: catalogue type `@Operator` is read-only
+
+--- mutate
+query add_operator() {
+    insert @Operator { name: "Teleport" }
+}
+
+--- expect error: catalogue type `@Operator` is read-only
+
+--- query
+set engine = v2;
+query search_operators($q: String) {
+    match { $o: @Operator match_text($o.name, $q) }
+    return { $o.name }
+}
+
+--- params
+{"q":"scan"}
+
+--- expect error: match_text cannot target catalogue binding `$o: @Operator`

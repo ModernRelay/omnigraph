@@ -1,3 +1,4 @@
+pub mod catalogue;
 pub mod schema_ir;
 pub mod schema_plan;
 pub mod schema_shape;
@@ -26,6 +27,21 @@ pub struct Catalog {
     /// direct projection of one validated accepted SchemaIR and retain that
     /// authority so no consumer can reconstruct IDs from mutable names.
     pub identity: CatalogIdentity,
+    /// The engine catalogue's built-in `@` types as a query reads them,
+    /// spelled with this graph's identity column; never part of
+    /// `node_types`, so schema apply, validation and stored identity never
+    /// see them.
+    pub catalogue: HashMap<String, NodeType>,
+}
+
+impl Catalog {
+    /// The node type a `match` binding may read: a declared type by name,
+    /// or a catalogue type by its `@` name.
+    pub fn query_node_type(&self, name: &str) -> Option<&NodeType> {
+        self.node_types
+            .get(name)
+            .or_else(|| self.catalogue.get(name))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -551,6 +567,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
         interfaces,
         system_columns,
         identity: CatalogIdentity::SourceUnbound,
+        catalogue: catalogue::catalogue_node_types(system_columns),
     })
 }
 
@@ -830,6 +847,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
         interfaces,
         system_columns,
         identity: CatalogIdentity::Bound(Arc::new(ir.clone())),
+        catalogue: catalogue::catalogue_node_types(system_columns),
     })
 }
 

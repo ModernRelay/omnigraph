@@ -746,7 +746,7 @@ async fn a_hash_join_without_a_declared_fallback_lowers_to_the_same_one_operator
         },
     };
     let context = crate::engine::EngineContext {
-        snapshot: &view.snapshot,
+        snapshot: Some(&view.snapshot),
         catalog: &catalog,
         graph_index: Arc::new(crate::engine::GraphIndexHandle::none()),
     };

@@ -19,7 +19,11 @@ use crate::validate::ValidationSummary;
 /// Version 4: `Expand` carries typed `edges`, `src_type` and per-member
 /// `versions` instead of one `edge_type`, `direction` and `version`; Sort
 /// and RankFuse declare exact metadata tie-break keys, including edge type.
-pub const EXPLAIN_VERSION: u32 = 4;
+/// Version 5: `pipelines` entries carry identity, pipeline `id` and
+/// `depends_on`, with `source`, `operators` and `sink` as objects whose `id`
+/// joins the `physical_plan` nodes; the additive `logical_plan_initial`
+/// arrived with the same bump.
+pub const EXPLAIN_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySummary {
@@ -108,6 +112,10 @@ pub struct Explain {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<EntrySummary>,
     pub operation: OperationSummary,
+    /// The logical plan as resolved, before rewrite passes ran;
+    /// `logical_plan` is the rewritten one the physical plan lowers from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_plan_initial: Option<Value>,
     pub logical_plan: Option<Value>,
     pub logical_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +142,7 @@ impl Explain {
             reason: None,
             entry: None,
             operation,
+            logical_plan_initial: None,
             logical_plan: None,
             logical_hash: None,
             physical_plan: None,

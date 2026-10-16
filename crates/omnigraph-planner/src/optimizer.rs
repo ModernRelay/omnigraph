@@ -30,6 +30,7 @@ use crate::logical::{
 use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
 use crate::output::{node_object_types, return_schema};
+use crate::passes::{PassId, PassStage};
 use crate::physical::{
     Assumptions, Eligibility, EmptyEligible, Estimate, Hop, HydratedBinding, HydratedColumn,
     NearestPolicy, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
@@ -63,17 +64,17 @@ pub struct Bounds {
     pub late_materialization_only: bool,
 }
 
-pub const PASS_RESOLVE: &str = "resolve";
-pub const PASS_PREDICATE_PUSHDOWN: &str = "predicate_pushdown";
-pub const PASS_AGGREGATE_PUSHDOWN: &str = "aggregate_pushdown";
-pub const PASS_PROJECTION_PUSHDOWN: &str = "projection_pushdown";
-pub const PASS_FRAGMENT_SCOPE: &str = "fragment_scope";
-pub const PASS_ADDRESS_SHORT_CIRCUIT: &str = "address_short_circuit";
-pub const PASS_LATE_MATERIALIZATION: &str = "late_materialization";
-pub const PASS_JOIN_ALGORITHM: &str = "join_algorithm";
-pub const PASS_EXPAND_MODE: &str = "expand_mode";
-pub const PASS_ACCESS_PATH: &str = "access_path";
-pub const PASS_ANTI_JOIN_STRATEGY: &str = "anti_join_strategy";
+pub const PASS_RESOLVE: &str = PassId::Resolve.name();
+pub const PASS_PREDICATE_PUSHDOWN: &str = PassId::PredicatePushdown.name();
+pub const PASS_AGGREGATE_PUSHDOWN: &str = PassId::AggregatePushdown.name();
+pub const PASS_PROJECTION_PUSHDOWN: &str = PassId::ProjectionPushdown.name();
+pub const PASS_FRAGMENT_SCOPE: &str = PassId::FragmentScope.name();
+pub const PASS_ADDRESS_SHORT_CIRCUIT: &str = PassId::AddressShortCircuit.name();
+pub const PASS_LATE_MATERIALIZATION: &str = PassId::LateMaterialization.name();
+pub const PASS_JOIN_ALGORITHM: &str = PassId::JoinAlgorithm.name();
+pub const PASS_EXPAND_MODE: &str = PassId::ExpandMode.name();
+pub const PASS_ACCESS_PATH: &str = PassId::AccessPath.name();
+pub const PASS_ANTI_JOIN_STRATEGY: &str = PassId::AntiJoinStrategy.name();
 
 /// The optimizer's output: the physical plan with every property declared,
 /// the passes that fired, and every statistic a pass read.
@@ -1223,21 +1224,33 @@ pub(crate) fn rewrite_with(
     source: &dyn PlanSource,
     tracer: &mut Tracer,
 ) -> Result<Vec<&'static str>, PlanError> {
-    let mut fired = vec![PASS_RESOLVE];
+    let mut fired = Vec::new();
     let query = is_query_plan(plan);
-    let pushed = if query {
-        place_query_filters(plan, source, tracer)
-    } else {
-        resume_pushdown(plan)
-    };
-    if pushed {
-        fired.push(PASS_PREDICATE_PUSHDOWN);
-    }
-    if query && aggregate_pushdown(plan)? {
-        fired.push(PASS_AGGREGATE_PUSHDOWN);
-    }
-    if query && projection_pushdown(plan, source, tracer)? {
-        fired.push(PASS_PROJECTION_PUSHDOWN);
+    for pass in PassId::of_stage(PassStage::Rewrite) {
+        let applied = match pass {
+            PassId::Resolve => true,
+            PassId::PredicatePushdown => {
+                if query {
+                    place_query_filters(plan, source, tracer)
+                } else {
+                    resume_pushdown(plan)
+                }
+            }
+            PassId::AggregatePushdown => query && aggregate_pushdown(plan)?,
+            PassId::ProjectionPushdown => query && projection_pushdown(plan, source, tracer)?,
+            PassId::FragmentScope
+            | PassId::AddressShortCircuit
+            | PassId::LateMaterialization
+            | PassId::JoinAlgorithm
+            | PassId::ExpandMode
+            | PassId::AccessPath
+            | PassId::AntiJoinStrategy
+            | PassId::KeyToId
+            | PassId::ScanAccess => continue,
+        };
+        if applied {
+            fired.push(pass.name());
+        }
     }
     Ok(fired)
 }
@@ -1277,11 +1290,25 @@ pub(crate) fn physical_plan_with(
         .schema(plan.root())
         .cloned()
         .ok_or_else(|| PlanError::Internal("resolved plan root has no schema".to_string()))?;
-    if fragment_scope(plan, source) {
-        fired.push(PASS_FRAGMENT_SCOPE);
-    }
-    if address_short_circuit(plan, source) {
-        fired.push(PASS_ADDRESS_SHORT_CIRCUIT);
+    for pass in PassId::of_stage(PassStage::Physical) {
+        let applied = match pass {
+            PassId::FragmentScope => fragment_scope(plan, source),
+            PassId::AddressShortCircuit => address_short_circuit(plan, source),
+            PassId::LateMaterialization
+            | PassId::JoinAlgorithm
+            | PassId::ExpandMode
+            | PassId::AccessPath
+            | PassId::AntiJoinStrategy => break,
+            PassId::Resolve
+            | PassId::PredicatePushdown
+            | PassId::AggregatePushdown
+            | PassId::ProjectionPushdown
+            | PassId::KeyToId
+            | PassId::ScanAccess => continue,
+        };
+        if applied {
+            fired.push(pass.name());
+        }
     }
     let key_sets = key_set_trees(plan, source)?;
     let mut lowering = Lowering {
@@ -1317,23 +1344,28 @@ pub(crate) fn physical_plan_with(
     physical.set_root(root);
     let late_query =
         query && materialize_returns_late(&mut physical, plan, source, &mut decisions, tracer)?;
-    if late_materialization || late_query {
-        fired.push(PASS_LATE_MATERIALIZATION);
-    }
     let contains_join = physical
         .live()
         .any(|(_, node)| matches!(node, PhysicalNode::ContainsJoin { .. }));
-    if join_algorithm || contains_join {
-        fired.push(PASS_JOIN_ALGORITHM);
-    }
-    if expand_mode {
-        fired.push(PASS_EXPAND_MODE);
-    }
-    if access_path {
-        fired.push(PASS_ACCESS_PATH);
-    }
-    if anti_join_strategy {
-        fired.push(PASS_ANTI_JOIN_STRATEGY);
+    for pass in PassId::of_stage(PassStage::Physical) {
+        let applied = match pass {
+            PassId::LateMaterialization => late_materialization || late_query,
+            PassId::JoinAlgorithm => join_algorithm || contains_join,
+            PassId::ExpandMode => expand_mode,
+            PassId::AccessPath => access_path,
+            PassId::AntiJoinStrategy => anti_join_strategy,
+            PassId::FragmentScope
+            | PassId::AddressShortCircuit
+            | PassId::Resolve
+            | PassId::PredicatePushdown
+            | PassId::AggregatePushdown
+            | PassId::ProjectionPushdown
+            | PassId::KeyToId
+            | PassId::ScanAccess => continue,
+        };
+        if applied {
+            fired.push(pass.name());
+        }
     }
     let mut statistics = decisions;
     statistics.extend(derive_properties(&mut physical, source, bounds)?);
@@ -1573,7 +1605,9 @@ fn place_query_filters(
                     stack.push(*input);
                 }
                 Some(LogicalNode::TableScan { input, spec }) => {
-                    if let Some(binding) = &spec.binding {
+                    if let Some(binding) = &spec.binding
+                        && !spec.table.is_catalogue()
+                    {
                         if input.is_some() {
                             dependent_scans.insert(binding.clone(), id);
                         } else {
@@ -1864,6 +1898,7 @@ fn aggregate_pushdown(plan: &mut LogicalPlan) -> Result<bool, PlanError> {
             };
             if spec.filter.is_some()
                 || spec.fragments.is_some()
+                || spec.table.is_catalogue()
                 || return_exprs.is_empty()
                 || plan.parent_of(*input) != Some(id)
             {
@@ -2305,6 +2340,9 @@ fn materialize_returns_late(
         let Some(projection) = spec.projection.as_ref() else {
             continue;
         };
+        if spec.table.is_catalogue() {
+            continue;
+        }
         let node_type = node_type_of(spec, source)?;
         let deferrable = |property: &str| {
             !kept.contains(&(binding.clone(), property.to_string()))
@@ -2800,7 +2838,7 @@ impl Lowering<'_> {
         else {
             return Ok(false);
         };
-        if haystack.binding.as_deref() != Some(shape.haystack.0) {
+        if haystack.binding.as_deref() != Some(shape.haystack.0) || haystack.table.is_catalogue() {
             return Ok(false);
         }
         let Some(needle) = self.scan_of_binding(left, shape.needle.0) else {
@@ -4309,11 +4347,7 @@ mod tests {
 
     fn side(version: u64) -> Side {
         Side {
-            table: TableRef {
-                type_key: "node:Doc".to_string(),
-                dataset_path: "tables/node_Doc".to_string(),
-                native_branch: None,
-            },
+            table: TableRef::dataset("node:Doc", "tables/node_Doc", None),
             version,
             columns: COLUMNS,
         }
@@ -4469,18 +4503,37 @@ mod tests {
         );
         let pipelines = optimized.physical.pipelines_json();
         assert_eq!(pipelines.as_array().map(Vec::len), Some(2));
-        assert_eq!(pipelines[0]["sink"], "SortMergeJoin(build)");
-        assert_eq!(pipelines[1]["sink"], "consumer");
+        assert_eq!(pipelines[0]["id"], 0);
+        assert_eq!(pipelines[0]["sink"]["name"], "SortMergeJoin(build)");
+        assert_eq!(pipelines[1]["id"], 1);
+        assert_eq!(pipelines[1]["sink"]["name"], "consumer");
+        assert_eq!(pipelines[1]["depends_on"], serde_json::json!([0]));
+        let operators: Vec<&str> = pipelines[1]["operators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|operator| operator["name"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            pipelines[1]["operators"],
-            serde_json::json!([
+            operators,
+            [
                 "SortMergeJoin(probe)",
                 "HydrateByAddress(child)",
                 "HydrateByAddress(parent)",
                 "RowCompare",
                 "Page"
-            ])
+            ]
         );
+        assert_eq!(
+            pipelines[0]["sink"]["id"], pipelines[1]["operators"][0]["id"],
+            "the build sink and the probe operator are the same join node"
+        );
+        assert_eq!(pipelines[1]["source"]["node"], "Scan");
+        let scan_id = pipelines[1]["source"]["id"].as_u64().unwrap() as usize;
+        assert!(matches!(
+            optimized.physical.node(scan_id),
+            Some(PhysicalNode::Scan { .. })
+        ));
     }
 
     #[test]

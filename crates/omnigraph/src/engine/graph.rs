@@ -40,7 +40,7 @@ impl<'a> EmbeddingResolver<'a> {
         Self::Client { cell, config }
     }
 
-    pub(super) fn explain() -> Self {
+    pub(crate) fn explain() -> Self {
         Self::Explain {
             requested: std::sync::atomic::AtomicBool::new(false),
         }

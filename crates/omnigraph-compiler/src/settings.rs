@@ -21,6 +21,8 @@ pub enum SettingKind {
     Enum(&'static [&'static str]),
     /// An integer from `min` up to `max` inclusive; `None` is unbounded.
     Integer { min: i64, max: Option<i64> },
+    /// Any text, in identifier, string or integer spelling.
+    Text,
 }
 
 /// Who may set a setting: any caller (`request`), or only the process that
@@ -145,6 +147,14 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         env: "OMNIGRAPH_HISTORY_RELEASE_BYTES",
         doc: "the byte budget of a branch's buffer of unreleased commits; a mutate, load or branch merge of this session whose buffer and head reach it closes a history block and the publish after it writes the block under `__history`; query results never change, only where settled commits are stored and how many requests a publish makes",
     },
+    SettingSpec {
+        name: "explain_dump_dir",
+        kind: SettingKind::Text,
+        default: "",
+        scope: SettingScope::Process,
+        env: "OMNIGRAPH_EXPLAIN_DUMP_DIR",
+        doc: "the directory each finished explain document is written into, one `<operation>_<logical_hash>.explain.json` per planned operation; empty disables the write",
+    },
 ];
 
 /// One variant per [`DEFINITIONS`] row, in the table's order.
@@ -160,6 +170,7 @@ pub enum SettingId {
     LoadSourceMaxBytes,
     QueryMemoryBytes,
     HistoryReleaseBytes,
+    ExplainDumpDir,
 }
 
 impl SettingId {
@@ -175,6 +186,7 @@ impl SettingId {
         SettingId::LoadSourceMaxBytes,
         SettingId::QueryMemoryBytes,
         SettingId::HistoryReleaseBytes,
+        SettingId::ExplainDumpDir,
     ];
 
     /// The setting a name denotes.
@@ -389,6 +401,7 @@ pub struct SessionSettings {
     load_source_max_bytes: u64,
     query_memory_bytes: u64,
     history_release_bytes: usize,
+    explain_dump_dir: String,
 }
 
 impl Default for SessionSettings {
@@ -407,6 +420,7 @@ impl Default for SessionSettings {
             load_source_max_bytes: 1,
             query_memory_bytes: 1,
             history_release_bytes: 1024,
+            explain_dump_dir: String::new(),
         };
         for id in SettingId::ALL {
             settings
@@ -488,6 +502,7 @@ impl SessionSettings {
                 self.history_release_bytes = usize::try_from(parse_integer(id, value)?)
                     .expect("invariant: the row's range is 1024..=262144");
             }
+            SettingId::ExplainDumpDir => self.explain_dump_dir = value.to_string(),
         }
         Ok(())
     }
@@ -514,6 +529,9 @@ impl SessionSettings {
             SettingId::HistoryReleaseBytes => {
                 self.history_release_bytes = from.history_release_bytes;
             }
+            SettingId::ExplainDumpDir => {
+                self.explain_dump_dir = from.explain_dump_dir.clone();
+            }
         }
     }
 
@@ -530,6 +548,7 @@ impl SessionSettings {
             SettingId::LoadSourceMaxBytes => self.load_source_max_bytes.to_string(),
             SettingId::QueryMemoryBytes => self.query_memory_bytes.to_string(),
             SettingId::HistoryReleaseBytes => self.history_release_bytes.to_string(),
+            SettingId::ExplainDumpDir => self.explain_dump_dir.clone(),
         }
     }
 
@@ -604,6 +623,12 @@ impl SessionSettings {
     /// ceiling, so a session may only lower it.
     pub fn history_release_bytes(&self) -> usize {
         self.history_release_bytes
+    }
+
+    /// The directory each finished explain document is written into; `None`
+    /// when unset.
+    pub fn explain_dump_dir(&self) -> Option<&str> {
+        (!self.explain_dump_dir.is_empty()).then_some(self.explain_dump_dir.as_str())
     }
 }
 
@@ -760,7 +785,7 @@ fn setting_names() -> String {
 fn enum_values(id: SettingId) -> String {
     match id.spec().kind {
         SettingKind::Enum(values) => values.join(", "),
-        SettingKind::Integer { .. } => integer_range(id),
+        SettingKind::Integer { .. } | SettingKind::Text => integer_range(id),
     }
 }
 
@@ -772,6 +797,7 @@ fn integer_range(id: SettingId) -> String {
         } => format!("an integer in {min}..={max}"),
         SettingKind::Integer { min, max: None } => format!("an integer of at least {min}"),
         SettingKind::Enum(values) => format!("one of {}", values.join(", ")),
+        SettingKind::Text => "a text value".to_string(),
     }
 }
 
@@ -929,6 +955,39 @@ mod tests {
     }
 
     #[test]
+    fn explain_dump_dir_row_is_process_scoped_text() {
+        let id = SettingId::parse("explain_dump_dir").unwrap();
+        let defaults = SessionSettings::default();
+        assert_eq!(defaults.get(id), "");
+        assert_eq!(defaults.explain_dump_dir(), None);
+        for value in ["/tmp/explains", "\"/tmp/with space\"", "7"] {
+            let changed = defaults.clone().with("explain_dump_dir", value).unwrap();
+            let text = value.trim_matches('"');
+            assert_eq!(changed.get(id), text);
+            assert_eq!(changed.explain_dump_dir(), Some(text));
+            let mut copied = defaults.clone();
+            copied.copy_field(&changed, id);
+            assert_eq!(copied, changed);
+        }
+        let err = id.refuse_from_request().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "setting `explain_dump_dir` is a process setting; it is read from the server's environment, not from a request"
+        );
+        let (environment, sources) = from_env_with(|name| {
+            (name == "OMNIGRAPH_EXPLAIN_DUMP_DIR").then(|| "/tmp/explains".to_string())
+        })
+        .unwrap();
+        assert_eq!(environment.explain_dump_dir(), Some("/tmp/explains"));
+        assert_eq!(sources[id as usize], Source::Env);
+        let (unset, sources) =
+            from_env_with(|name| (name == "OMNIGRAPH_EXPLAIN_DUMP_DIR").then(|| "  ".to_string()))
+                .unwrap();
+        assert_eq!(unset.explain_dump_dir(), None);
+        assert_eq!(sources[id as usize], Source::Default);
+    }
+
+    #[test]
     fn history_release_bytes_row_bounds() {
         let defaults = SessionSettings::default();
         assert_eq!(defaults.history_release_bytes(), 262_144);
@@ -1000,7 +1059,7 @@ mod tests {
         let err = SettingId::parse("merge_linage").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes"
+            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir"
         );
         let err = SessionSettings::default().with("engine", "v1").unwrap_err();
         assert_eq!(

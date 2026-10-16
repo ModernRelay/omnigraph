@@ -61,6 +61,7 @@ mod output;
 mod planes;
 mod schema_upgrade;
 mod scope;
+mod skill;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/unix_gateway.rs"]
 mod unix_gateway_fixture;
@@ -263,6 +264,12 @@ fn validate_cluster_arguments(
     cli: &Cli,
     command_matches: &clap::ArgMatches,
 ) -> std::result::Result<(), clap::Error> {
+    if matches!(&cli.command, Command::Organization { managed: false, .. }) {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "organization commands require --managed",
+        ));
+    }
     let Command::Cluster { managed, command } = &cli.command else {
         return Ok(());
     };
@@ -610,6 +617,17 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Skill { command } => match command {
+            SkillCommand::Export { dir, force, json } => {
+                let output = skill::export(&dir, force)?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    skill::print_export_human(&output);
+                }
+            }
+            SkillCommand::Show { path } => skill::show(&path)?,
+        },
         Command::Version { json } => print_version(&VersionOutput::current(), json)?,
         Command::Embed(args) => {
             let output = execute_embed(&args).await?;
@@ -1389,6 +1407,11 @@ async fn run(cli: Cli) -> Result<()> {
                 let output = client.schema_source().await?;
                 if json {
                     print_json(&output)?;
+                } else if client.is_catalogue() {
+                    if let Some(catalogue) = &output.catalogue_source {
+                        println!("// engine catalogue (read-only, derived from this binary)");
+                        println!("{catalogue}");
+                    }
                 } else {
                     println!("{}", output.schema_source);
                 }
@@ -1636,6 +1659,12 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let params_json = load_params_json(&params)?;
             let has_target = branch.is_some() || snapshot.is_some();
+            if has_target && matches!(client, client::GraphClient::Catalogue) {
+                bail!(
+                    "`{}` has no branches or snapshots; drop --branch and --snapshot",
+                    omnigraph::catalogue::CATALOGUE_SCOPE
+                );
+            }
             let target = resolve_read_target(branch, snapshot, None)?;
             let output: ReadOutput = if query.is_some() || query_string.is_some() {
                 // Ad-hoc lane: run the source; the positional `name` selects
@@ -1689,7 +1718,7 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                         client
                             .query(
-                                target,
+                                has_target.then_some(target),
                                 &query_source,
                                 name.as_deref(),
                                 params_json.as_ref(),
@@ -2234,7 +2263,9 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Use { .. } => unreachable!("managed dispatch handles use"),
+        Command::Use { .. } | Command::Organization { .. } => {
+            unreachable!("managed dispatch handles organization commands and use")
+        }
         Command::Cluster { command, .. } => match command {
             ClusterCommand::Validate { config, json } => {
                 let output = validate_config_dir(config);

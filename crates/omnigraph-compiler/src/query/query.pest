@@ -255,7 +255,9 @@ ident_chars = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 // falls through `traversal` to `filter` instead of naming an edge `and`.
 edge_ident = @{ !reserved ~ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
-type_name = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
+// A leading `@` names an engine catalogue type (`@Operator`), read-only and
+// engine-owned like the `@` meta-fields; a user schema cannot declare one.
+type_name = @{ "@"? ~ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
 ident = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 literal = { list_lit | datetime_lit | date_lit | string_lit | float_lit | integer | bool_lit }

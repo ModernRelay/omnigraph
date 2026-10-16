@@ -25,10 +25,8 @@ pub(super) async fn index_split(source: &QuerySource<'_>, spec: &ScanSpec) -> Re
         spec.table.type_key.strip_prefix("node:").ok_or_else(|| {
             OmniError::manifest_internal("query scan access requires a node table")
         })?;
-    let dataset = source
-        .snapshot
-        .open_lance_dataset(&spec.table.type_key)
-        .await?;
+    let snapshot = source.snapshot(&format!("the scan access of `{}`", spec.table.type_key))?;
+    let dataset = snapshot.open_lance_dataset(&spec.table.type_key).await?;
     let filters = spec
         .filter
         .as_ref()
@@ -41,7 +39,7 @@ pub(super) async fn index_split(source: &QuerySource<'_>, spec: &ScanSpec) -> Re
     let read = NodeRead::for_index_split(
         dataset.clone(),
         type_name,
-        source.snapshot.contract_covers(&spec.table.type_key),
+        snapshot.contract_covers(&spec.table.type_key),
         &filters,
         source.params.shared(),
         source.catalog,

@@ -4,6 +4,7 @@
 
 use serde::Serialize;
 
+pub use crate::logical::Coverage;
 use crate::logical::{Census, JoinKind, LogicalKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -12,13 +13,6 @@ pub enum Route {
     Executor,
     Planner,
     PlannerBehindFlag,
-}
-
-/// Whether a logical node kind may appear in a routed plan at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Coverage {
-    Routable,
-    RefusedByName,
 }
 
 /// An exact shape: the sorted multiset of node kinds plus the sorted kinds
@@ -62,32 +56,10 @@ pub struct Entry {
 /// until an integration and its differential evidence are added together.
 pub static REGISTRY: &[Entry] = &[];
 
-/// Every logical node kind, marked routable or refused by name. Not a
+/// The coverage a kind declares beside its name (`logical_kinds!`); not a
 /// registry key space: a kind is not a shape.
-pub static COVERAGE: &[(LogicalKind, Coverage)] = &[
-    (LogicalKind::Aggregate, Coverage::RefusedByName),
-    (LogicalKind::AntiJoin, Coverage::RefusedByName),
-    (LogicalKind::Expand, Coverage::RefusedByName),
-    (LogicalKind::Filter, Coverage::Routable),
-    (LogicalKind::Join, Coverage::Routable),
-    (LogicalKind::Limit, Coverage::Routable),
-    (LogicalKind::MergeClassify, Coverage::Routable),
-    (LogicalKind::MetadataCount, Coverage::RefusedByName),
-    (LogicalKind::Nearest, Coverage::RefusedByName),
-    (LogicalKind::OuterReference, Coverage::RefusedByName),
-    (LogicalKind::Projection, Coverage::Routable),
-    (LogicalKind::RankFuse, Coverage::RefusedByName),
-    (LogicalKind::RowDiff, Coverage::Routable),
-    (LogicalKind::Sort, Coverage::Routable),
-    (LogicalKind::TableScan, Coverage::Routable),
-    (LogicalKind::TextSearch, Coverage::RefusedByName),
-];
-
 pub fn coverage(kind: LogicalKind) -> Coverage {
-    COVERAGE
-        .iter()
-        .find(|(candidate, _)| *candidate == kind)
-        .map_or(Coverage::RefusedByName, |(_, coverage)| *coverage)
+    kind.coverage()
 }
 
 /// The entry whose shape equals `census`, if any. Entries are pairwise

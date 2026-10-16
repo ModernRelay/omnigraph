@@ -230,7 +230,26 @@ pub(crate) enum GraphClient {
         base_url: String,
         token: Option<String>,
         response_limit: Option<usize>,
+        catalogue: bool,
     },
+    /// The engine catalogue scope `og_catalog`: the binary's own registries
+    /// read as `@` types, with no store opened. Serves read queries and
+    /// `schema show`; every other verb is refused.
+    Catalogue,
+}
+
+/// The refusal every verb outside the catalogue scope's reads answers.
+pub(crate) fn catalogue_scope_refusal(verb: &str) -> color_eyre::Report {
+    eyre!(
+        "`{verb}` is not available under `{}`: the engine catalogue scope serves read queries, `explain` and `schema show` only",
+        omnigraph::catalogue::CATALOGUE_SCOPE
+    )
+}
+
+/// Whether an addressed store is the exact catalogue scope token; `./og_catalog`,
+/// an absolute path and a `file://` URI stay ordinary store addresses.
+pub(crate) fn is_catalogue_scope(uri: Option<&str>) -> bool {
+    uri == Some(omnigraph::catalogue::CATALOGUE_SCOPE)
 }
 
 /// RFC-011 Decision 7: a server scope that selects no graph (no `--graph`, no
@@ -283,19 +302,26 @@ impl GraphClient {
             endpoint,
             remote_url(endpoint, &["graphs", graph], &[])?,
             token,
+            is_catalogue_scope(Some(graph)),
         )
     }
 
     pub(crate) fn managed_registry(endpoint: &str, token: String) -> Result<Self> {
-        Self::managed_url(endpoint, endpoint.to_owned(), token)
+        Self::managed_url(endpoint, endpoint.to_owned(), token, false)
     }
 
-    fn managed_url(endpoint: &str, base_url: String, token: String) -> Result<Self> {
+    fn managed_url(
+        endpoint: &str,
+        base_url: String,
+        token: String,
+        catalogue: bool,
+    ) -> Result<Self> {
         Ok(Self::Remote {
             http: GraphHttpClient::managed(endpoint)?,
             base_url,
             token: Some(token),
             response_limit: Some(8 * 1024 * 1024),
+            catalogue,
         })
     }
 
@@ -312,6 +338,7 @@ impl GraphClient {
             base_url: base,
             token,
             response_limit: None,
+            catalogue: false,
         })
     }
 
@@ -383,6 +410,9 @@ impl GraphClient {
         )?;
         require_graph_for_multi_graph_server(&scope).await?;
         let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
+        if server.is_none() && is_catalogue_scope(uri.as_deref()) {
+            return Ok(GraphClient::Catalogue);
+        }
         let via_server = server.is_some();
         let server_root = resolve_server_flag(server, None)?;
         let uri = apply_server_flag(server_root.as_deref(), graph, uri)?;
@@ -395,6 +425,7 @@ impl GraphClient {
                 base_url: uri,
                 token,
                 response_limit: None,
+                catalogue: is_catalogue_scope(graph),
             })
         } else {
             Ok(GraphClient::Embedded { uri, actor: None })
@@ -439,6 +470,9 @@ impl GraphClient {
         cli_as: Option<&str>,
     ) -> Result<Self> {
         let (server, graph) = (scope.server.as_deref(), scope.graph.as_deref());
+        if server.is_none() && is_catalogue_scope(scope.uri.as_deref()) {
+            return Err(catalogue_scope_refusal("a write"));
+        }
         let via_server = server.is_some();
         let server_root = resolve_server_flag(server, None)?;
         let uri = apply_server_flag(server_root.as_deref(), graph, scope.uri.clone())?;
@@ -462,6 +496,7 @@ impl GraphClient {
                 base_url: resolved.uri,
                 token,
                 response_limit: None,
+                catalogue: is_catalogue_scope(graph),
             })
         } else {
             let actor = resolve_cli_actor(cli_as)?;
@@ -477,7 +512,32 @@ impl GraphClient {
         match self {
             GraphClient::Embedded { uri, .. } => uri,
             GraphClient::Remote { base_url, .. } => base_url,
+            GraphClient::Catalogue => omnigraph::catalogue::CATALOGUE_SCOPE,
         }
+    }
+
+    pub(crate) fn is_catalogue(&self) -> bool {
+        matches!(
+            self,
+            Self::Catalogue
+                | Self::Remote {
+                    catalogue: true,
+                    ..
+                }
+        )
+    }
+
+    /// The catalogue scope under the environment's defaults and the `--set`
+    /// values, the one session the embedded CLI is.
+    fn catalogue_scope(
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<omnigraph::catalogue::CatalogueScope> {
+        let (defaults, _) = omnigraph::settings::from_env()?;
+        let mut scope = omnigraph::catalogue::CatalogueScope::new(defaults)?;
+        for (id, value) in settings {
+            scope.set(*id, value)?;
+        }
+        Ok(scope)
     }
 
     pub(crate) fn is_remote(&self) -> bool {
@@ -575,7 +635,9 @@ impl GraphClient {
                     request.history_release_bytes =
                         Some(given.get(SettingId::HistoryReleaseBytes).parse()?)
                 }
-                SettingId::RrfPlan | SettingId::StageWriteConcurrency => {
+                SettingId::RrfPlan
+                | SettingId::StageWriteConcurrency
+                | SettingId::ExplainDumpDir => {
                     bail!(
                         "setting `{}` has request scope but no request field; add it to \
                          `SettingsRequest`",
@@ -633,6 +695,7 @@ impl GraphClient {
                     details: None,
                 })
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("branch list")),
         }
     }
 
@@ -660,6 +723,7 @@ impl GraphClient {
                 let listing = session.branch_list_detailed(&mut |_| true).await?;
                 Ok(branch_list_output(&listing))
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("branch list")),
         }
     }
 
@@ -687,6 +751,7 @@ impl GraphClient {
                 snapshot_payload(branch, &snapshot, internal_schema_version)
                     .map_err(|error| eyre!(error))
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("snapshot")),
         }
     }
 
@@ -712,6 +777,15 @@ impl GraphClient {
                 Ok(SchemaOutput {
                     schema_source: db.schema_source().to_string(),
                     system_columns: Some(db.catalog().system_columns.into()),
+                    catalogue_source: Some(omnigraph_compiler::catalogue_declarations()),
+                })
+            }
+            GraphClient::Catalogue => {
+                let scope = Self::catalogue_scope(&[])?;
+                Ok(SchemaOutput {
+                    schema_source: String::new(),
+                    system_columns: Some(scope.catalog().system_columns.into()),
+                    catalogue_source: Some(scope.schema_source()),
                 })
             }
         }
@@ -724,6 +798,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let url = match branch {
                     Some(branch) => remote_url(base_url, &["commits"], &[("branch", branch)])?,
@@ -750,6 +825,7 @@ impl GraphClient {
                     .collect::<Vec<_>>();
                 Ok(CommitListOutput { commits })
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("list commits")),
         }
     }
 
@@ -766,6 +842,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let url = match branch {
                     Some(branch) => remote_url(
@@ -796,6 +873,7 @@ impl GraphClient {
                     .collect::<Vec<_>>();
                 Ok(CommitListOutput { commits })
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("list unpublished commits")),
         }
     }
 
@@ -812,6 +890,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let url = match branch {
                     Some(branch) => remote_url(
@@ -842,6 +921,7 @@ impl GraphClient {
                     .collect::<Vec<_>>();
                 Ok(CommitListOutput { commits })
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("list unattached commits")),
         }
     }
 
@@ -852,6 +932,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 remote_json_bounded(
                     http,
@@ -868,6 +949,7 @@ impl GraphClient {
                 let session = Self::open_read_session(uri, &[]).await?;
                 Ok(commit_output(&session.get_commit(commit_id).await?))
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("get commit")),
         }
     }
 
@@ -922,6 +1004,7 @@ impl GraphClient {
                     .await?;
                 Ok(commit_changes_output(&page))
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("commit changes page")),
         }
     }
 
@@ -1008,6 +1091,7 @@ impl GraphClient {
                     .await?;
                 Ok(change_feed_output(&page))
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("poll changes page")),
         }
     }
 
@@ -1084,6 +1168,7 @@ impl GraphClient {
                 writer.flush()?;
                 Ok(change_baseline_output(&baseline))
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("change baseline")),
         }
     }
 
@@ -1105,6 +1190,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 if !settings.is_empty() {
                     bail!("{}", SETTINGS_AT_SERVED_LOAD);
@@ -1161,6 +1247,7 @@ impl GraphClient {
                     &session.catalog(),
                 ))
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("load")),
         }
     }
 
@@ -1188,6 +1275,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let route: &[&str] = if expected_head.is_some() {
                     &["mutate", "if-graph-commit"]
@@ -1250,6 +1338,7 @@ impl GraphClient {
                     outcome: None,
                 })
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("mutate")),
         }
     }
 
@@ -1272,6 +1361,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_change_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
@@ -1380,6 +1470,7 @@ impl GraphClient {
                     outcome: Some(outcome),
                 })
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("branch write statement")),
         }
     }
 
@@ -1399,6 +1490,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_change_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
@@ -1471,6 +1563,7 @@ impl GraphClient {
                     outcome: Some(outcome),
                 })
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("commit write statement")),
         }
     }
 
@@ -1493,6 +1586,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_change_request(query_source);
                 request.branch = branch.map(str::to_string);
@@ -1531,6 +1625,7 @@ impl GraphClient {
                     outcome: None,
                 })
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("load statement")),
         }
     }
 
@@ -1561,6 +1656,7 @@ impl GraphClient {
                         .await?,
                 )
             }
+            GraphClient::Catalogue => return Err(catalogue_scope_refusal("commit publish")),
         };
         if !published.published || published.graph_commit_id != commit_id {
             bail!(
@@ -1594,6 +1690,7 @@ impl GraphClient {
                     .await
                     .map_err(Into::into)
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("commit drop")),
         }
     }
 
@@ -1614,6 +1711,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_query_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
@@ -1631,6 +1729,7 @@ impl GraphClient {
             GraphClient::Embedded { .. } => Ok(branch_list_read_output(
                 &self.branch_list().await?.branches,
             )?),
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("branch list statement")),
         }
     }
 
@@ -1650,6 +1749,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_query_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
@@ -1668,6 +1768,7 @@ impl GraphClient {
                 let session = Self::open_read_session(uri, settings).await?;
                 Ok(branch_read_output(&session.branch_read(&read).await?)?)
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("branch read statement")),
         }
     }
 
@@ -1687,6 +1788,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_query_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
@@ -1706,15 +1808,16 @@ impl GraphClient {
                 Self::apply_prefix(&mut session, query_source)?;
                 Ok(show_read_output(&session.show(id))?)
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("show statement")),
         }
     }
 
-    /// `query` — run a read query against `target`. Folds `execute_read` /
-    /// `execute_read_remote`; the embedded arm opens WITHOUT policy (reads
-    /// never attach one), so this verb resolves via `resolve()`.
+    /// Run a read query with an optional explicit target. An omitted target
+    /// lets the selected scope choose its default; only a stored graph has
+    /// a default branch. Reads resolve through `resolve()` without policy.
     pub(crate) async fn query(
         &self,
-        target: ReadTarget,
+        target: Option<ReadTarget>,
         query_source: &str,
         query_name: Option<&str>,
         params_json: Option<&Value>,
@@ -1726,10 +1829,14 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let (branch, snapshot) = match &target {
-                    ReadTarget::Branch(branch) => (Some(branch.clone()), None),
-                    ReadTarget::Snapshot(snapshot) => (None, Some(snapshot.as_str().to_string())),
+                    Some(ReadTarget::Branch(branch)) => (Some(branch.clone()), None),
+                    Some(ReadTarget::Snapshot(snapshot)) => {
+                        (None, Some(snapshot.as_str().to_string()))
+                    }
+                    None => (None, None),
                 };
                 remote_json_bounded(
                     http,
@@ -1754,6 +1861,7 @@ impl GraphClient {
                     select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
                 let session = Self::open_read_session(uri, settings).await?;
+                let target = target.unwrap_or_else(|| ReadTarget::branch("main"));
                 let (result, graph_commit_id) = session
                     .query_with_head(target.clone(), query_source, &selected_name, &params)
                     .await?;
@@ -1763,6 +1871,26 @@ impl GraphClient {
                     result,
                     graph_commit_id,
                 )?)
+            }
+            GraphClient::Catalogue => {
+                if target.is_some() {
+                    bail!(
+                        "`{}` has no branches or snapshots; drop --branch and --snapshot",
+                        omnigraph::catalogue::CATALOGUE_SCOPE
+                    );
+                }
+                let (selected_name, query_params) =
+                    select_named_query(parse_query(query_source)?, query_name)?;
+                let params = query_params_from_json(&query_params, params_json)?;
+                let scope = Self::catalogue_scope(settings)?;
+                let result = scope.query(query_source, &selected_name, &params).await?;
+                let mut output =
+                    read_output(selected_name, &ReadTarget::branch("main"), result, None)?;
+                output.target = omnigraph_api_types::ReadTargetOutput {
+                    branch: None,
+                    snapshot: None,
+                };
+                Ok(output)
             }
         }
     }
@@ -1789,6 +1917,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let body = InvokeStoredQueryRequest {
                     params: params_json.cloned(),
@@ -1816,6 +1945,7 @@ impl GraphClient {
                  server-owned); use -e '<gq>' or --query <file> for an ad-hoc query \
                  against --store, or address a server with --server / --profile"
             ),
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("invoke named")),
         }
     }
 
@@ -1855,6 +1985,7 @@ impl GraphClient {
                     actor_id: actor.map(String::from),
                 })
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("branch create from")),
         }
     }
 
@@ -1885,6 +2016,7 @@ impl GraphClient {
                     actor_id: actor.map(String::from),
                 })
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("branch delete")),
         }
     }
 
@@ -1974,6 +2106,7 @@ impl GraphClient {
                     dry_run: false,
                 }
             }
+            GraphClient::Catalogue => return Err(catalogue_scope_refusal("branch merge")),
         };
         validate_merge_output(&output, source, into, delete_branch, as_commit, dry_run)?;
         Ok(output)
@@ -2052,6 +2185,7 @@ impl GraphClient {
                     .await?;
                 Ok(diff_output(&page))
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("diff page")),
         }
     }
 
@@ -2083,6 +2217,7 @@ impl GraphClient {
                 let base = session.merge_base(source, target).await?;
                 Ok(merge_base_output(source, target, &base))
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("merge base")),
         }
     }
 
@@ -2108,6 +2243,7 @@ impl GraphClient {
                     .await?;
                 Ok(schema_apply_output(uri, result))
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("apply schema")),
         }
     }
 
@@ -2157,6 +2293,7 @@ impl GraphClient {
                 writer.flush()?;
                 Ok(())
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("export")),
         }
     }
 
@@ -2265,6 +2402,7 @@ impl GraphClient {
                 writer.flush()?;
                 Ok(())
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("blob get")),
         }
     }
 
@@ -2322,6 +2460,7 @@ impl GraphClient {
                     status => Err(remote_blob_error(status)),
                 }
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("blob stat")),
         }
     }
 
@@ -2377,6 +2516,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let url = blob_write_url(base_url, query)?;
                 let request = match bytes {
@@ -2396,6 +2536,7 @@ impl GraphClient {
                     .await
                     .map_err(verified_blob_precondition)
             }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("blob write")),
         }
     }
 
@@ -2425,6 +2566,7 @@ impl GraphClient {
                 "internal error: `graphs list` reached an embedded client — registry \
                  addressing always resolves a server"
             ),
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("list graphs")),
         }
     }
 
@@ -2436,6 +2578,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 remote_json_bounded(
                     http,
@@ -2449,6 +2592,7 @@ impl GraphClient {
                 .await
             }
             Self::Embedded { .. } => bail!("graph discovery requires a server"),
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("discover graphs")),
         }
     }
 }
@@ -2980,19 +3124,32 @@ mod tests {
 
     #[tokio::test]
     async fn command_outcome_keeps_earlier_effects_and_scopes_independent_invocations() {
+        #[derive(Clone, Copy)]
+        enum Refusal {
+            Busy,
+            Condition,
+            Denied,
+        }
         async fn attempt(
             earlier_request: bool,
             read_refusal: bool,
-            conditional: bool,
+            kind: Refusal,
         ) -> crate::command_outcome::Failure {
-            let mut refusal = contract_reply(
-                if conditional { 412 } else { 429 },
-                if conditional {
-                    json!({"error":"head changed", "precondition_failure":{"expected":"head-a","actual":"head-b"}})
-                } else {
-                    json!({"error":"actor is busy", "code":"too_many_requests"})
-                },
-            );
+            let conditional = matches!(kind, Refusal::Condition);
+            let mut refusal = match kind {
+                Refusal::Busy => contract_reply(
+                    429,
+                    json!({"error":"actor is busy", "code":"too_many_requests"}),
+                ),
+                Refusal::Condition => contract_reply(
+                    412,
+                    json!({"error":"head changed", "precondition_failure":{"expected":"head-a","actual":"head-b"}}),
+                ),
+                Refusal::Denied => contract_reply(
+                    403,
+                    json!({"error":"change denied by current policy", "code":"forbidden"}),
+                ),
+            };
             refusal
                 .headers
                 .push(("Retry-After".into(), "Wed, 21 Oct 2026 07:28:00 GMT".into()));
@@ -3039,8 +3196,10 @@ mod tests {
             crate::command_outcome::Failure::classify(error, evidence)
         }
         // Poll concurrently: invocation evidence must never leak to a peer.
-        let (compound, single) =
-            tokio::join!(attempt(true, false, false), attempt(false, false, false));
+        let (compound, single) = tokio::join!(
+            attempt(true, false, Refusal::Busy),
+            attempt(false, false, Refusal::Busy)
+        );
         assert_eq!(compound.exit, 1);
         assert_eq!(single.exit, 75);
         assert_eq!(
@@ -3058,19 +3217,31 @@ mod tests {
             })
         );
         // A later read's typed refusal cannot erase an earlier successful
-        // write; likewise a later conditional refusal closes only its request.
-        for (read_refusal, conditional) in [(true, false), (false, true), (true, true)] {
-            let compound = attempt(true, read_refusal, conditional).await;
+        // write; likewise a later conditional refusal or policy denial closes
+        // only its request.
+        for (read_refusal, kind) in [
+            (true, Refusal::Busy),
+            (false, Refusal::Condition),
+            (true, Refusal::Condition),
+            (false, Refusal::Denied),
+        ] {
+            let compound = attempt(true, read_refusal, kind).await;
             assert_eq!(compound.exit, 1);
             assert_eq!(
                 serde_json::to_value(compound).unwrap()["command_outcome"]["effects"],
                 "unknown"
             );
         }
-        let conditional = attempt(false, false, true).await;
+        let conditional = attempt(false, false, Refusal::Condition).await;
         assert_eq!(conditional.exit, 4);
         assert_eq!(
             serde_json::to_value(conditional).unwrap()["command_outcome"],
+            json!({"execution":"not_started","effects":"none","action":"refresh"})
+        );
+        let denied = attempt(false, false, Refusal::Denied).await;
+        assert_eq!(denied.exit, 1);
+        assert_eq!(
+            serde_json::to_value(denied).unwrap()["command_outcome"],
             json!({"execution":"not_started","effects":"none","action":"refresh"})
         );
     }
@@ -3286,7 +3457,7 @@ mod tests {
                             _ => (
                                 client
                                     .query(
-                                        ReadTarget::branch("main"),
+                                        Some(ReadTarget::branch("main")),
                                         "query q() {}",
                                         Some("q"),
                                         None,
@@ -3340,7 +3511,7 @@ mod tests {
                 "query",
                 client
                     .query(
-                        ReadTarget::branch("main"),
+                        Some(ReadTarget::branch("main")),
                         "query q() {}",
                         Some("q"),
                         None,
@@ -3449,7 +3620,7 @@ mod tests {
         .unwrap();
         client
             .query(
-                ReadTarget::branch("main"),
+                Some(ReadTarget::branch("main")),
                 "query q() {}",
                 Some("q"),
                 None,

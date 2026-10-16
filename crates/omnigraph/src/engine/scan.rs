@@ -818,8 +818,7 @@ pub(super) fn scan_output_schema(
     binding_columns: Option<&NeededColumns>,
 ) -> Result<SchemaRef> {
     let node_type = catalog
-        .node_types
-        .get(type_name)
+        .query_node_type(type_name)
         .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
     let nearest = search_mode.nearest.is_some();
     let mut scores_fts = search_mode.bm25.is_some();
