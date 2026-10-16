@@ -835,6 +835,14 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "cleanup.table_gc" | "cleanup.pre_gates" => {
             return vec![MutateMain, DeleteFixtureOnMain, CleanupMain];
         }
+        // A dead staging for cleanup to reclaim: the census's setup crash
+        // stops the index build at its pre-manifest window, stranding a
+        // detached commit whose witness records main's head; the second
+        // insert moves that head on, so the next cleanup judges the staging
+        // dead and deletes its files before its manifest.
+        "cleanup.sweep_pre_dead_manifest_delete" => {
+            return vec![MutateMain, EnsureIndicesMain, MutateMain, CleanupMain];
+        }
         // Recovery internals: build the PRIMARY crash's precondition (the
         // census adds the crash itself).
         "recovery.before_roll_forward_publish" => {
@@ -1107,7 +1115,8 @@ pub struct UniverseReport {
     /// (0 without `client_retry`).
     pub client_retries: usize,
     /// Failed maintenance attempts whose obligation pass ran (rerun
-    /// converged + per-op obligation held), including returned Cleanup errors.
+    /// converged + per-op obligation held), including returned Cleanup errors
+    /// and cleanups a scheduled window left owing a table.
     pub maintenance_reruns: usize,
     /// content reads returned with read-time bit rot (0 without
     /// `corrupt_read_pct`). Bite evidence for the corruption axis; the
@@ -1150,7 +1159,9 @@ pub struct UniverseReport {
     /// (context, verdict, channel) where context names what died or was
     /// deferred (`crash:<window>@op<i>`, `crash-state:write#k@op<i>`,
     /// `fault@op<i>`, `watch-interrupt@op<i>` for a watch-ending op judged
-    /// inside the resolution, `keep-serving-deferred@op<i>`),
+    /// inside the resolution, `keep-serving-deferred@op<i>`,
+    /// `deferred:<window>@op<i>` for a cleanup the window left owing a
+    /// table, verdict `Deferred` on channel `cleanup`),
     /// verdict is `Applied` / `AppliedTwice` / `ForkOnly` / `NotApplied`; the
     /// keep-serving-deferred rows append ` matched=<composition>`
     /// provenance (e.g. `Applied matched=A+E`), a human-triage surface,
@@ -4775,6 +4786,10 @@ enum CrashOutcome {
     /// The op failed for its OWN legal reason (model-predicted merge
     /// conflict), not the scheduled window — no crash to reconcile.
     LegalRejection,
+    /// The window was hit inside cleanup's per-table pass: cleanup reported
+    /// the table's error and returned, so nothing died, but the table is
+    /// owed the retry a crashed cleanup gets.
+    CleanupDeferred,
     /// The window was hit; reconcile ran; `outcome` = how the op settled,
     /// `channel` = the observation channel(s) the arbitration rested on
     /// (values documented on `UniverseReport::reconcile_verdicts`).
@@ -4782,6 +4797,28 @@ enum CrashOutcome {
         outcome: ReconcileOutcome,
         channel: &'static str,
     },
+}
+
+/// Was the scheduled window hit inside this cleanup? Cleanup catches a
+/// table's error into that table's row, so the window's error text is in
+/// the deferrals the op recorded rather than in its result.
+#[cfg(feature = "failpoints")]
+fn cleanup_deferred_by(db: &Session, wop: &WorldOp, failpoint: &str) -> bool {
+    if !matches!(
+        wop,
+        WorldOp::Data {
+            op: Op::Cleanup,
+            ..
+        }
+    ) {
+        return false;
+    }
+    let injected = format!("injected failpoint triggered: {failpoint}");
+    LAST_CLEANUP_DEFERRED
+        .lock()
+        .expect("cleanup deferral map")
+        .get(db.uri())
+        .is_some_and(|deferred| deferred.values().any(|error| error.contains(&injected)))
 }
 
 #[cfg(feature = "failpoints")]
@@ -4818,6 +4855,9 @@ async fn crash_op(
                     format!("engine ACCEPTED a merge the model predicts conflicts (op={wop:?})"),
                     "the engine's accept/conflict decision matches the three-way prediction",
                 );
+            }
+            if cleanup_deferred_by(&db, wop, failpoint) {
+                return (db, CrashOutcome::CleanupDeferred);
             }
             return (db, CrashOutcome::OpSucceeded);
         }
@@ -5654,59 +5694,79 @@ impl UniverseScenario<RustResources> for Scenario {
                 ))
                 .await;
                 db = new_db;
-                match outcome {
-                    CrashOutcome::OpSucceeded => apply_world(&mut world, &wop),
-                    CrashOutcome::LegalRejection => legal_rejections += 1,
+                let owed = match outcome {
+                    CrashOutcome::OpSucceeded => {
+                        apply_world(&mut world, &wop);
+                        None
+                    }
+                    CrashOutcome::LegalRejection => {
+                        legal_rejections += 1;
+                        None
+                    }
+                    CrashOutcome::CleanupDeferred => {
+                        let context = format!("deferred:{failpoint}@op{i}");
+                        reconcile_verdicts.push((
+                            context.clone(),
+                            "Deferred".to_string(),
+                            "cleanup".to_string(),
+                        ));
+                        apply_world(&mut world, &wop);
+                        Some(context)
+                    }
                     CrashOutcome::Crashed { outcome, channel } => {
                         reopens += 1;
                         crashes += 1;
+                        let context = format!("crash:{failpoint}@op{i}");
                         reconcile_verdicts.push((
-                            format!("crash:{failpoint}@op{i}"),
+                            context.clone(),
                             format!("{outcome:?}"),
                             channel.to_string(),
                         ));
                         outcome.apply(&mut world, &wop);
-                        // a maintenance death gets its
-                        // obligations judged, fault-suspended. Gated on the
-                        // target still existing: a same-iteration ruling can
-                        // remove it, and the convergence rerun would fail
-                        // "not found" — a false red, not a divergence.
-                        if let Some(f) = &failing {
-                            f.suspend();
-                        }
-                        let ran = if op_targets_live(&world, &wop) {
-                            Box::pin(maintenance_obligations(
-                                &db,
-                                &world,
-                                &wop,
-                                &format!("crash:{failpoint}@op{i}"),
-                                i,
-                                sc.fail_maintenance_rerun,
-                                CleanupEvidence {
-                                    images: &cleanup_images,
-                                    paths: cleanup_paths.as_ref(),
-                                },
-                            ))
-                            .await
-                        } else {
-                            false
-                        };
-                        if let Some(f) = &failing {
-                            f.resume();
-                        }
-                        if ran {
-                            maintenance_reruns += 1;
-                            if matches!(
-                                &wop,
-                                WorldOp::Data {
-                                    op: Op::Cleanup,
-                                    ..
-                                }
-                            ) {
-                                // The rerun is a cleanup ATTEMPT — same
-                                // retention-horizon truncation as mainline.
-                                history_verified_from = history.len().saturating_sub(1);
+                        Some(context)
+                    }
+                };
+                // a maintenance death, or a cleanup the window left owing a
+                // table, gets its obligations judged, fault-suspended. Gated
+                // on the target still existing: a same-iteration ruling can
+                // remove it, and the convergence rerun would fail "not
+                // found" — a false red, not a divergence.
+                if let Some(context) = owed {
+                    if let Some(f) = &failing {
+                        f.suspend();
+                    }
+                    let ran = if op_targets_live(&world, &wop) {
+                        Box::pin(maintenance_obligations(
+                            &db,
+                            &world,
+                            &wop,
+                            &context,
+                            i,
+                            sc.fail_maintenance_rerun,
+                            CleanupEvidence {
+                                images: &cleanup_images,
+                                paths: cleanup_paths.as_ref(),
+                            },
+                        ))
+                        .await
+                    } else {
+                        false
+                    };
+                    if let Some(f) = &failing {
+                        f.resume();
+                    }
+                    if ran {
+                        maintenance_reruns += 1;
+                        if matches!(
+                            &wop,
+                            WorldOp::Data {
+                                op: Op::Cleanup,
+                                ..
                             }
+                        ) {
+                            // The rerun is a cleanup ATTEMPT — same
+                            // retention-horizon truncation as mainline.
+                            history_verified_from = history.len().saturating_sub(1);
                         }
                     }
                 }
