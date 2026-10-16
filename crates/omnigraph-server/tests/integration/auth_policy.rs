@@ -1648,6 +1648,9 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         .commit
         .graph_commit_id;
     db.branch_delete("gone").await.unwrap();
+    let main_commits = db.list_commits(None).await.unwrap();
+    let main_head = main_commits[0].graph_commit_id.clone();
+    let main_root = main_commits.last().unwrap().graph_commit_id.clone();
     drop(db);
 
     let policy_path = temp.path().join("policy.yaml");
@@ -1772,6 +1775,61 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
             assert_eq!(body["error"], expected, "{statement}");
         }
     }
+    // A page token is checksummed, not signed: a caller can rewrite its
+    // commits and checksum. A continuation reads only the commits its sides
+    // reach, so a token naming a commit of an unreadable branch is refused
+    // and reads nothing. The first and third rows name a `from` other than
+    // the commit that side spells, which never moves; the second names a
+    // `to` the moved-side rules must reject: unreadable on its own branch and
+    // never a head of `main`.
+    let first_page = format!("/diff?from={main_root}&to=main&type=Person&limit=1");
+    let (status, first) = json_response(&app, get(first_page.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("the loaded people page at one")
+        .to_string();
+    let (status, next) = json_response(&app, get(format!("{first_page}&page_token={token}"))).await;
+    assert_eq!(status, StatusCode::OK, "the minted token continues: {next}");
+    for (from, to) in [
+        (main_head.as_str(), feature_commit.as_str()),
+        (main_root.as_str(), feature_commit.as_str()),
+        (main_head.as_str(), main_head.as_str()),
+    ] {
+        let forged = resign_change_token(&token, |payload| {
+            payload["from_commit_id"] = json!(from);
+            payload["to_commit_id"] = json!(to);
+        });
+        let (status, body) =
+            json_response(&app, get(format!("{first_page}&page_token={forged}"))).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a token naming {from} to {to} for these sides: {body}"
+        );
+        assert!(
+            body["changes"].is_null(),
+            "a refused continuation reads no change: {body}"
+        );
+        assert_eq!(body["error"], DIFF_TOKEN_UNREACHED, "{body}");
+    }
+    // A branch side that moved still reaches the head the first page resolved,
+    // which the caller may read on the branch that authored it.
+    let writer = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    writer
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"later","age":42}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    drop(writer);
+    let (status, moved) =
+        json_response(&app, get(format!("{first_page}&page_token={token}"))).await;
+    assert_eq!(status, StatusCode::OK, "after main moved: {moved}");
+    assert_eq!(moved["to_commit_id"], first["to_commit_id"], "{moved}");
+    assert_eq!(moved["changes"], next["changes"], "{moved}");
     // The branch routes name their branches outright: a read denial is a 403,
     // and a dry run is a read of both branches.
     for uri in [
@@ -1891,6 +1949,16 @@ async fn policy_branch_review_needs_read_on_the_target() {
     )
     .await
     .unwrap();
+    let private_commit = db
+        .load_with_receipt(
+            "private",
+            r#"{"type":"Person","data":{"name":"private-only","age":42}}"#,
+            omnigraph::loader::LoadMode::Merge,
+        )
+        .await
+        .unwrap()
+        .commit
+        .graph_commit_id;
     drop(db);
     // act-bruno reads main and feature but not private; act-ada reads all.
     let policy_path = temp.path().join("policy.yaml");
@@ -1971,6 +2039,154 @@ async fn policy_branch_review_needs_read_on_the_target() {
             json_response(&app, statement_request("/query", "team-token", &source)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{source}: {body}");
     }
+    // A continuation of a review the actor may read reopens only the base
+    // and the source head the branches reach: a re-signed token naming a
+    // commit of the unreadable branch reads nothing, by route and statement.
+    // The first two rows reach the moved-side rules; the third names a base
+    // that is not its `from`.
+    let review = "/branches/diff?source=feature&target=main&limit=1";
+    let (status, first) = json_response(&app, get(review, "team-token")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("two changes page at one")
+        .to_string();
+    let base = first["from_commit_id"].as_str().unwrap().to_string();
+    let (status, next) = json_response(
+        &app,
+        get(&format!("{review}&page_token={token}"), "team-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the minted token continues: {next}");
+    for (from, to, base) in [
+        (base.as_str(), private_commit.as_str(), Some(base.as_str())),
+        (
+            private_commit.as_str(),
+            private_commit.as_str(),
+            Some(private_commit.as_str()),
+        ),
+        (base.as_str(), first["to_commit_id"].as_str().unwrap(), None),
+    ] {
+        let forged = resign_change_token(&token, |payload| {
+            payload["from_commit_id"] = json!(from);
+            payload["to_commit_id"] = json!(to);
+            payload["base_commit_id"] = json!(base);
+        });
+        let (status, body) = json_response(
+            &app,
+            get(&format!("{review}&page_token={forged}"), "team-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{from} to {to}: {body}");
+        assert!(body["changes"].is_null(), "{body}");
+        assert_eq!(body["error"], DIFF_TOKEN_UNREACHED, "{body}");
+        let statement = format!(r#"branch diff feature into main after page "{forged}" limit 1"#);
+        let (status, body) =
+            json_response(&app, statement_request("/query", "team-token", &statement)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{statement}: {body}");
+        assert_eq!(body["error"], DIFF_TOKEN_UNREACHED, "{body}");
+    }
+}
+
+/// The refusal of a diff page token naming a commit its sides do not reach.
+const DIFF_TOKEN_UNREACHED: &str =
+    "change cursor rejected: diff page token names a commit its sides do not reach";
+
+/// A diff continuation follows a branch side that moved since its first
+/// page. The head that page resolved still answers when another branch
+/// published it, as `main` published a fork's first head, although the
+/// caller reads unprotected branches only. A token naming a commit below that
+/// head, which was never the branch's head, is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_diff_continuation_follows_a_moved_inherited_head() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    for branch in ["fresh", "other"] {
+        db.branch_create_from(ReadTarget::branch("main"), branch)
+            .await
+            .unwrap();
+    }
+    db.load_with_receipt(
+        "other",
+        concat!(
+            r#"{"type":"Person","data":{"name":"other-one","age":40}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"other-two","age":41}}"#,
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let main_root = db
+        .list_commits(None)
+        .await
+        .unwrap()
+        .last()
+        .unwrap()
+        .graph_commit_id
+        .clone();
+    drop(db);
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        "version: 1\ngroups:\n  agents: [act-agent]\nprotected_branches: [main]\nrules:\n  - id: agent-read\n    allow: {actors: {group: agents}, actions: [read], branch_scope: unprotected}\n",
+    )
+    .unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![("act-agent".to_string(), "agent-token".to_string())],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+    let get = |uri: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(uri))
+            .method(Method::GET)
+            .header("authorization", "Bearer agent-token")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let review = "/diff?from=other&to=fresh&type=Person&limit=1";
+    let (status, first) = json_response(&app, get(review)).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("two people page at one")
+        .to_string();
+    let writer = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    writer
+        .load_with_receipt(
+            "fresh",
+            r#"{"type":"Person","data":{"name":"fresh-one","age":42}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    drop(writer);
+    let (status, next) = json_response(&app, get(&format!("{review}&page_token={token}"))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fresh's first head, published by main: {next}"
+    );
+    assert_eq!(next["to_commit_id"], first["to_commit_id"], "{next}");
+
+    let forged = resign_change_token(&token, |payload| {
+        payload["to_commit_id"] = json!(main_root);
+    });
+    let (status, body) = json_response(&app, get(&format!("{review}&page_token={forged}"))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "below fresh's first head: {body}"
+    );
+    assert_eq!(body["error"], DIFF_TOKEN_UNREACHED, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3132,4 +3348,20 @@ rules:
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(main_head().await, before);
+}
+
+/// `token` with its payload edited and its checksum recomputed, as any caller
+/// can: a continuation's envelope is `base64url(json ‖ sha256(json))`.
+fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let bytes = engine.decode(token).unwrap();
+    let (payload, _) = bytes.split_at(bytes.len() - 32);
+    let mut payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    edit(&mut payload);
+    let mut encoded = serde_json::to_vec(&payload).unwrap();
+    let checksum = sha2::Sha256::digest(&encoded);
+    encoded.extend_from_slice(&checksum);
+    engine.encode(encoded)
 }

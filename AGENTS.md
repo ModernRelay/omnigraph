@@ -211,6 +211,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   rows with v1's. A defect seen on v1 is fixed on v2
   (`crates/omnigraph/src/engine/`); a v1 edit needs the pin updated in the
   same PR and a reviewer's eyes.
+- A change to what an operation reads or writes in storage adds or updates
+  its row in the DST storage-cost golden,
+  `crates/omnigraph-dst/cost_table.txt`, and the pull request explains every
+  changed line ([testing](docs/dev/testing.md#dst-storage-cost-golden)).
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries
