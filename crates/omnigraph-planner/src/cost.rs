@@ -4,7 +4,7 @@
 //! decision on `PhysicalNode::Expand`. Execution adjusts for the observed
 //! frontier and warm CSR; only legacy plans probe index coverage again.
 
-use omnigraph_compiler::ir::IRExpr;
+use omnigraph_compiler::ir::{IRExpr, ValidateCheck};
 use omnigraph_compiler::query::ast::{CompOp, Literal};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
@@ -497,6 +497,59 @@ fn estimate_rows_over(
         ),
         LogicalNode::OuterReference { .. } => outer_rows,
         LogicalNode::MergeClassify { .. } => None,
+        LogicalNode::CsvSource { spec } => Some(spec.estimated_rows),
+        LogicalNode::Validate { input, .. } => estimate_rows(plan, *input, source),
+        LogicalNode::FragmentWrite { .. } => Some(1),
+    }
+}
+
+/// Keys per committed-image probe chunk: one chunk is one filtered scan of
+/// the consulted table; past one chunk a projected scan matched in memory
+/// costs less, so a validation with more estimated rows scans.
+pub const PROBE_CHUNK_KEYS: u64 = 8_192;
+
+/// Source bytes per parser partition: a smaller file stays one partition,
+/// so the parallel source never splits what one reader finishes first.
+pub const SOURCE_PARTITION_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How a load validation reads the committed image it judges the delta
+/// against: nothing (the delta alone decides), a filtered probe per key
+/// chunk, or one projected scan matched in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidateAccess {
+    Delta,
+    Probe,
+    Scan,
+}
+
+impl ValidateAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delta => "delta",
+            Self::Probe => "probe",
+            Self::Scan => "scan",
+        }
+    }
+}
+
+/// The access of a validation that reads a committed image: retained-edge
+/// and cardinality checks probe, and a uniqueness
+/// or endpoint check scans past one probe chunk of estimated rows.
+pub fn choose_validate_access(check: &ValidateCheck, estimated_rows: u64) -> ValidateAccess {
+    match check {
+        ValidateCheck::RetainedEdges { .. } | ValidateCheck::Cardinality { .. } => {
+            ValidateAccess::Probe
+        }
+        ValidateCheck::Unique { .. }
+        | ValidateCheck::EdgeRi { .. }
+        | ValidateCheck::Value { .. } => {
+            if estimated_rows > PROBE_CHUNK_KEYS {
+                ValidateAccess::Scan
+            } else {
+                ValidateAccess::Probe
+            }
+        }
     }
 }
 

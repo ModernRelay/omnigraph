@@ -3,11 +3,11 @@ rfc: "2026-10-15-bulk-load-as-a-query-plan"
 title: "Bulk load as a query plan"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: partial
 authors:
   - azimafroozeh
 created: 2026-10-15
-updated: 2026-10-15
+updated: 2026-10-16
 discussion: null
 supersedes: []
 superseded_by: []
@@ -520,10 +520,7 @@ Each step ships independently.
 3. Does load `explain` reuse query `explain_version` formats or a
    load-specific shape? Decided in the step-2 change; either encoding must
    carry the accepted estimates, access paths, worker maximum, fallback and
-   addressable constraint identities defined above.
+   addressable constraint identities defined above. Decided 2026-10-16 in
+   step 3: the query document, `explain_version` 6.
 
 ## Decision log
-
-- 2026-10-15: Created, from the LDBC SNB benchmark's load measurements and
-  the GQT one-call load measurements that located the cost in per-call
-  re-reads of validated-against tables.

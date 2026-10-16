@@ -284,6 +284,9 @@ pub struct Snapshot {
 pub struct SnapshotReadCaches {
     pub session: Arc<lance::session::Session>,
     pub handles: Arc<TableHandleCache>,
+    /// A statement-scoped store wrapper (the load read memo); `None` on the
+    /// graph-lifetime caches live Branch reads attach.
+    pub table_wrapper: Option<Arc<dyn lance::io::WrappingObjectStore>>,
 }
 
 impl std::fmt::Debug for SnapshotReadCaches {
@@ -732,6 +735,7 @@ impl Snapshot {
                         entry.version_metadata.last_linear_version(),
                         &location,
                         Some(&caches.session),
+                        caches.table_wrapper.clone(),
                     )
                     .await
             }

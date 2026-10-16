@@ -318,6 +318,95 @@ pub(super) fn classify_failure(
     OmniError::datafusion(error)
 }
 
+/// One load statement's admitted read-reuse allowance: a named reservation on
+/// the statement's pool, held until the statement's reuse caches drop (RFC
+/// 2026-10-15 bulk load as a query plan).
+pub(crate) struct LoadReuseReservation {
+    _reservation: MemoryReservation,
+}
+
+/// One load statement's tracked memory: the engine's pool sized by
+/// `query_memory_bytes`, shared by the read-reuse caches, the retained
+/// source, every decoded batch, validation state and the staging working
+/// set, so several individually small parts still exhaust one allowance.
+pub(crate) struct LoadMemory {
+    context: QueryContext,
+}
+
+impl LoadMemory {
+    pub(crate) fn new(query_memory_bytes: u64) -> Result<Self> {
+        Ok(Self {
+            context: QueryContext::with_traversal_limit(query_memory_bytes, None)?,
+        })
+    }
+
+    pub(crate) fn limit(&self) -> u64 {
+        self.context.memory_limit
+    }
+
+    /// The context a load plan runs under: this statement's pool.
+    pub(super) fn context(&self) -> &QueryContext {
+        &self.context
+    }
+
+    /// Admit `want` bytes of read-reuse buffers, reserving before anything is
+    /// retained; `None` means the allowance cannot admit them and the caller
+    /// runs uncached.
+    pub(crate) fn admit_read_reuse(&self, want: u64) -> Option<LoadReuseReservation> {
+        let pool = Arc::clone(&self.context.pool) as Arc<dyn MemoryPool>;
+        let reservation = MemoryConsumer::new("load read reuse").register(&pool);
+        reservation
+            .try_grow(usize::try_from(want).unwrap_or(usize::MAX))
+            .ok()?;
+        Some(LoadReuseReservation {
+            _reservation: reservation,
+        })
+    }
+
+    /// A named charge on the statement's pool, freed when dropped.
+    pub(crate) fn charge(&self, name: &str) -> Result<LoadCharge> {
+        super::operators::memory::WorkMemory::new(self.context.task_ctx(), name)
+            .map(LoadCharge)
+            .map_err(|error| self.context.classify(error))
+    }
+}
+
+/// One named charge of a load statement: grows by bytes or by held batches,
+/// each refusal the typed `query_memory_bytes` resource error.
+pub(crate) struct LoadCharge(super::operators::memory::WorkMemory);
+
+impl fmt::Debug for LoadCharge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadCharge").finish_non_exhaustive()
+    }
+}
+
+impl LoadCharge {
+    /// Release temporary capture headroom after only the final bytes remain.
+    pub(crate) fn shrink_to(&self, bytes: u64) {
+        self.0
+            .shrink_to(usize::try_from(bytes).unwrap_or(usize::MAX));
+    }
+    pub(crate) fn grow(&self, bytes: u64) -> Result<()> {
+        self.0
+            .grow(usize::try_from(bytes).unwrap_or(usize::MAX))
+            .map_err(|error| self.0.error(error))
+    }
+
+    /// Charge `count` entries of a collection of `T`, hash overhead included.
+    pub(crate) fn entries<T>(&self, count: usize) -> Result<()> {
+        self.0
+            .entries::<T>(count)
+            .map_err(|error| self.0.error(error))
+    }
+
+    /// Hold `batch`'s buffers for this charge's lifetime, each shared buffer
+    /// charged once across every holder.
+    pub(crate) fn hold(&self, batch: &arrow_array::RecordBatch) -> Result<()> {
+        self.0.hold(batch).map_err(|error| self.0.error(error))
+    }
+}
+
 /// The sizes of one refused reservation: what the pool held and what was asked.
 #[derive(Clone, Copy, Debug)]
 struct Refusal {

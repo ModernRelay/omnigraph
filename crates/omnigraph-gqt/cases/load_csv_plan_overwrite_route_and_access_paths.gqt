@@ -1,0 +1,130 @@
+# issue: none
+# notes: A `load csv` statement executes an accepted load plan that `--- expect plan` pins: an
+# notes: overwrite runs the plan route with every validate stage named by check, table and
+# notes: access path and the write stage as fragments; append and merge
+# notes: report the pipeline route with their keyed adapters; the executed report records
+# notes: the partitions and rows that ran.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    id: String @key
+    email: String @unique
+}
+edge Knows: Person -> Person {
+    w: I64
+}
+
+--- seed
+{"type":"Person","data":{"id":"p1","email":"p1@x"}}
+{"type":"Person","data":{"id":"p2","email":"p2@x"}}
+{"type":"Person","data":{"id":"p3","email":"p3@x"}}
+{"edge":"Knows","from":"p1","to":"p2","data":{"w":1}}
+
+--- csv people.csv
+id,email
+p1,a@x
+p2,b@x
+p3,c@x
+
+--- mutate
+load csv "people.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load scan: partitions 1 fallback single_scan
+load validate unique node:Person key [id]: access delta
+load validate unique node:Person unique [email]: access delta
+load validate retained_edges node:Person edge:Knows from: access probe
+load validate retained_edges node:Person edge:Knows to: access probe
+load write: overwrite fragments
+load executed: partitions 1 rows 3
+
+--- csv knows.csv
+from,to,w
+p1,p3,7
+p2,p3,8
+
+--- mutate
+load csv "knows.csv" into edge:Knows mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load scan: partitions 1 fallback single_scan
+load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows to Person: access probe
+load write: overwrite fragments
+load executed: partitions 1 rows 2
+
+--- csv knows_more.csv
+from,to,w
+p3,p1,9
+
+--- mutate
+load csv "knows_more.csv" into edge:Knows mode append header
+
+--- expect ok
+
+--- expect plan
+load route: pipeline
+load validate edge_ri edge:Knows from Person: access probe
+load write: append strict_insert
+load executed: partitions 1 rows 1
+
+--- csv people_more.csv
+id,email
+p4,d@x
+
+--- mutate
+load csv "people_more.csv" into node:Person mode merge header
+
+--- expect ok
+
+--- expect plan
+load route: pipeline
+load validate unique node:Person unique [email]: access probe
+load write: merge upsert
+load executed: partitions 1 rows 1
+
+--- query
+query loaded() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.id, $b.id }
+}
+
+--- expect unordered
+{"a.id": "p1", "b.id": "p3"}
+{"a.id": "p2", "b.id": "p3"}
+{"a.id": "p3", "b.id": "p1"}
+
+--- expect shape
+a.id: String
+b.id: String
+
+--- query
+query people() {
+    match { $p: Person }
+    return { count($p) as n }
+}
+
+--- expect unordered
+{"n": 4}
+
+--- expect shape
+n: I64

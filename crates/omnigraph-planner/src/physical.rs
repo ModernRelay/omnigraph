@@ -13,8 +13,9 @@ use crate::aggregate::AggregateSpec;
 use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy};
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
-    ColumnRef, KeyJoinKind, ScanSpec, filters_json, metadata_count_json, ordering_text, scan_json,
-    tiebreak_text,
+    ColumnRef, CsvSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec, ValidateSpec,
+    csv_source_json, filters_json, fragment_write_json, metadata_count_json, ordering_text,
+    scan_json, tiebreak_text, validate_json,
 };
 use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
@@ -879,6 +880,32 @@ physical_nodes! {
         /// so the order is total; empty where they cannot change visible order.
         tiebreak: Vec<ColumnRef>,
     } => "Sort" [input: NodeId];
+    /// A load's parallel parser: at most `max_partitions` byte ranges cut on
+    /// quote-aware row boundaries, at most `max_workers` readers, batches in
+    /// source order; an unprovable boundary falls back to one reader.
+    CsvSource {
+        spec: Box<CsvSourceSpec>,
+        max_partitions: u32,
+        max_workers: u32,
+    } => "CsvSource" [];
+    /// The one validation over the whole delta, a pipeline breaker: every
+    /// check extracted in one pass per batch, each check's `access` saying
+    /// how its committed image is read after the last batch.
+    Validate {
+        input: NodeId,
+        table: String,
+        checks: Vec<ValidateSpec>,
+        max_workers: u32,
+    } => "Validate" [input: NodeId];
+    /// The fragment sink: the validated delta, every input checked against
+    /// `max_input_bytes`, written by at most `max_workers` writers into one
+    /// staged transaction the driver commits.
+    FragmentWrite {
+        input: NodeId,
+        spec: Box<FragmentWriteSpec>,
+        max_input_bytes: u64,
+        max_workers: u32,
+    } => "FragmentWrite" [input: NodeId];
 }
 
 /// One `@Operator` row: a distinct explain name and the sorted, distinct
@@ -940,7 +967,10 @@ impl PhysicalNode {
             | Self::AntiJoin { .. }
             | Self::OuterReference { .. }
             | Self::Projection { .. }
-            | Self::Aggregate { .. } => None,
+            | Self::Aggregate { .. }
+            | Self::CsvSource { .. }
+            | Self::Validate { .. }
+            | Self::FragmentWrite { .. } => None,
         }
     }
 
@@ -1388,6 +1418,38 @@ impl PhysicalPlan {
                 "typed_residual": crate::typed::exprs(residual),
                 "typed_conjunct": crate::typed::expr(conjunct),
             }),
+            PhysicalNode::CsvSource {
+                spec,
+                max_partitions,
+                max_workers,
+            } => {
+                let mut value = csv_source_json(spec);
+                value["max_partitions"] = json!(max_partitions);
+                value["max_workers"] = json!(max_workers);
+                value["fallback"] = json!("single_scan");
+                value
+            }
+            PhysicalNode::Validate {
+                table,
+                checks,
+                max_workers,
+                ..
+            } => {
+                let mut value = validate_json(table, checks);
+                value["max_workers"] = json!(max_workers);
+                value
+            }
+            PhysicalNode::FragmentWrite {
+                spec,
+                max_input_bytes,
+                max_workers,
+                ..
+            } => {
+                let mut value = fragment_write_json(spec);
+                value["max_input_bytes"] = json!(max_input_bytes);
+                value["max_workers"] = json!(max_workers);
+                value
+            }
             other => json!({ "node": other.name() }),
         };
         value["id"] = json!(id);
@@ -1481,6 +1543,10 @@ impl PhysicalPlan {
                         "node": "Scan",
                         "side": spec.side,
                         "ordered": ordered,
+                    }),
+                    Some(PhysicalNode::CsvSource { spec, .. }) => json!({
+                        "node": "CsvSource",
+                        "source": spec.source,
                     }),
                     Some(PhysicalNode::OuterReference { outer_var }) => json!({
                         "node": "OuterReference",
@@ -1618,10 +1684,13 @@ impl PhysicalPlan {
             | PhysicalNode::Expand { input, .. }
             | PhysicalNode::Projection { input, .. }
             | PhysicalNode::Aggregate { input, .. }
-            | PhysicalNode::Sort { input, .. } => {
+            | PhysicalNode::Sort { input, .. }
+            | PhysicalNode::Validate { input, .. }
+            | PhysicalNode::FragmentWrite { input, .. } => {
                 operators.push(id);
                 self.pipeline_of(*input, operators, pipelines, depends_on)
             }
+            PhysicalNode::CsvSource { .. } => PipelineSource::Node(id),
         }
     }
 
