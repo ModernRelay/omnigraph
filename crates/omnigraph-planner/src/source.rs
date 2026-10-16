@@ -266,6 +266,13 @@ pub trait PlanSource {
         GatePolicy::default()
     }
 
+    /// The directory each finished explain document is written into, one
+    /// `<operation>_<logical_hash>.explain.json` per planned operation;
+    /// `None` disables the write.
+    fn explain_dump_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// How far the full-text index of `property` covers the pinned table
     /// `type_key` names. The default claims no coverage, the answer under
     /// which every plan stays correct.
@@ -337,6 +344,7 @@ pub struct MemorySource {
     /// When set, a key's canonical id renders as `id:<value>`, a parameter
     /// resolved from these values.
     canonical_keys: Option<omnigraph_compiler::ir::ParamMap>,
+    explain_dump_dir: Option<std::path::PathBuf>,
 }
 
 impl MemorySource {
@@ -353,6 +361,11 @@ impl MemorySource {
 
     pub fn with_canonical_key_ids(mut self, params: omnigraph_compiler::ir::ParamMap) -> Self {
         self.canonical_keys = Some(params);
+        self
+    }
+
+    pub fn with_explain_dump_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.explain_dump_dir = Some(dir);
         self
     }
 
@@ -531,5 +544,9 @@ impl PlanSource for MemorySource {
             .get(&(type_key.to_string(), property.to_string()))
             .copied()
             .unwrap_or(FullTextCoverage::Absent)
+    }
+
+    fn explain_dump_dir(&self) -> Option<std::path::PathBuf> {
+        self.explain_dump_dir.clone()
     }
 }

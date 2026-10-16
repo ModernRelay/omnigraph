@@ -575,7 +575,9 @@ impl GraphClient {
                     request.history_release_bytes =
                         Some(given.get(SettingId::HistoryReleaseBytes).parse()?)
                 }
-                SettingId::RrfPlan | SettingId::StageWriteConcurrency => {
+                SettingId::RrfPlan
+                | SettingId::StageWriteConcurrency
+                | SettingId::ExplainDumpDir => {
                     bail!(
                         "setting `{}` has request scope but no request field; add it to \
                          `SettingsRequest`",
