@@ -458,10 +458,13 @@ fn a_cross_join_side_keeps_its_operators_and_a_query_explain_has_no_pipelines() 
     let pipelines = plan.pipelines_json();
     let join = &pipelines[0]["source"];
     assert_eq!(join["node"], "CrossJoin");
-    assert_eq!(
-        join["left"]["operators"],
-        serde_json::json!(["Expand", "Scan(input ids)"])
-    );
+    let left_operators: Vec<&str> = join["left"]["operators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operator| operator["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(left_operators, ["Expand", "Scan(input ids)"]);
     assert_eq!(join["left"]["source"]["node"], "Scan");
     assert_eq!(join["right"]["operators"], serde_json::json!([]));
     let decision = omnigraph_planner::route(

@@ -575,7 +575,9 @@ impl GraphClient {
                     request.history_release_bytes =
                         Some(given.get(SettingId::HistoryReleaseBytes).parse()?)
                 }
-                SettingId::RrfPlan | SettingId::StageWriteConcurrency => {
+                SettingId::RrfPlan
+                | SettingId::StageWriteConcurrency
+                | SettingId::ExplainDumpDir => {
                     bail!(
                         "setting `{}` has request scope but no request field; add it to \
                          `SettingsRequest`",
@@ -2950,19 +2952,32 @@ mod tests {
 
     #[tokio::test]
     async fn command_outcome_keeps_earlier_effects_and_scopes_independent_invocations() {
+        #[derive(Clone, Copy)]
+        enum Refusal {
+            Busy,
+            Condition,
+            Denied,
+        }
         async fn attempt(
             earlier_request: bool,
             read_refusal: bool,
-            conditional: bool,
+            kind: Refusal,
         ) -> crate::command_outcome::Failure {
-            let mut refusal = contract_reply(
-                if conditional { 412 } else { 429 },
-                if conditional {
-                    json!({"error":"head changed", "precondition_failure":{"expected":"head-a","actual":"head-b"}})
-                } else {
-                    json!({"error":"actor is busy", "code":"too_many_requests"})
-                },
-            );
+            let conditional = matches!(kind, Refusal::Condition);
+            let mut refusal = match kind {
+                Refusal::Busy => contract_reply(
+                    429,
+                    json!({"error":"actor is busy", "code":"too_many_requests"}),
+                ),
+                Refusal::Condition => contract_reply(
+                    412,
+                    json!({"error":"head changed", "precondition_failure":{"expected":"head-a","actual":"head-b"}}),
+                ),
+                Refusal::Denied => contract_reply(
+                    403,
+                    json!({"error":"change denied by current policy", "code":"forbidden"}),
+                ),
+            };
             refusal
                 .headers
                 .push(("Retry-After".into(), "Wed, 21 Oct 2026 07:28:00 GMT".into()));
@@ -3009,8 +3024,10 @@ mod tests {
             crate::command_outcome::Failure::classify(error, evidence)
         }
         // Poll concurrently: invocation evidence must never leak to a peer.
-        let (compound, single) =
-            tokio::join!(attempt(true, false, false), attempt(false, false, false));
+        let (compound, single) = tokio::join!(
+            attempt(true, false, Refusal::Busy),
+            attempt(false, false, Refusal::Busy)
+        );
         assert_eq!(compound.exit, 1);
         assert_eq!(single.exit, 75);
         assert_eq!(
@@ -3028,19 +3045,31 @@ mod tests {
             })
         );
         // A later read's typed refusal cannot erase an earlier successful
-        // write; likewise a later conditional refusal closes only its request.
-        for (read_refusal, conditional) in [(true, false), (false, true), (true, true)] {
-            let compound = attempt(true, read_refusal, conditional).await;
+        // write; likewise a later conditional refusal or policy denial closes
+        // only its request.
+        for (read_refusal, kind) in [
+            (true, Refusal::Busy),
+            (false, Refusal::Condition),
+            (true, Refusal::Condition),
+            (false, Refusal::Denied),
+        ] {
+            let compound = attempt(true, read_refusal, kind).await;
             assert_eq!(compound.exit, 1);
             assert_eq!(
                 serde_json::to_value(compound).unwrap()["command_outcome"]["effects"],
                 "unknown"
             );
         }
-        let conditional = attempt(false, false, true).await;
+        let conditional = attempt(false, false, Refusal::Condition).await;
         assert_eq!(conditional.exit, 4);
         assert_eq!(
             serde_json::to_value(conditional).unwrap()["command_outcome"],
+            json!({"execution":"not_started","effects":"none","action":"refresh"})
+        );
+        let denied = attempt(false, false, Refusal::Denied).await;
+        assert_eq!(denied.exit, 1);
+        assert_eq!(
+            serde_json::to_value(denied).unwrap()["command_outcome"],
             json!({"execution":"not_started","effects":"none","action":"refresh"})
         );
     }

@@ -16,6 +16,7 @@ pub(crate) mod data;
 mod deployment;
 mod lifecycle;
 mod members;
+mod organization;
 
 /// Managed transports must not render an endpoint's reflected credential.
 pub(crate) fn scrub_response_error(text: String, secret: &str) -> String {
@@ -621,6 +622,25 @@ async fn cluster_command(
 /// Only explicit managed commands and managed authentication enter this dispatcher.
 pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
     match &cli.command {
+        Command::Organization {
+            managed: true,
+            target,
+            command,
+        } => {
+            if let Err(error) = reject_scope(cli).and_then(|()| {
+                if cli.direct {
+                    Err(Failure::refused(
+                        "managed_scope_conflict",
+                        "--managed and --direct cannot be used together",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }) {
+                return Some(Output::from_result(Err(error), target.json, 2));
+            }
+            Some(organization::dispatch(target, command).await)
+        }
         Command::Login {
             api: Some(api),
             organization,

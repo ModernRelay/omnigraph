@@ -14,6 +14,7 @@ arrow-schema = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }

@@ -402,11 +402,11 @@ fn physical_ids(node: &serde_json::Value, out: &mut Vec<u64>) {
 }
 
 /// Pins a wire constant and a wire key that no query result shows: the
-/// document stamps `explain_version` 4, and every physical node carries the
+/// document stamps `explain_version` 5, and every physical node carries the
 /// `id` of its node in the plan.
 #[test]
-fn explain_version_is_four_and_every_physical_node_carries_its_id() {
-    assert_eq!(omnigraph_planner::explain::EXPLAIN_VERSION, 4);
+fn explain_version_is_five_and_every_physical_node_carries_its_id() {
+    assert_eq!(omnigraph_planner::explain::EXPLAIN_VERSION, 5);
     let Decision::Engine { plan, explain, .. } = futures::executor::block_on(
         route(
             &documents_query(),
@@ -419,13 +419,137 @@ fn explain_version_is_four_and_every_physical_node_carries_its_id() {
         panic!("read query did not build an engine plan");
     };
     let document = explain.to_value();
-    assert_eq!(document["explain_version"], 4);
+    assert_eq!(document["explain_version"], 5);
+    assert!(
+        document.get("logical_plan_initial").is_some(),
+        "the document carries the pre-rewrite logical plan"
+    );
     let mut ids = Vec::new();
     physical_ids(&document["physical_plan"], &mut ids);
     ids.sort_unstable();
     let mut planned: Vec<u64> = plan.post_order().into_iter().map(|id| id as u64).collect();
     planned.sort_unstable();
     assert_eq!(ids, planned);
+}
+
+/// A configured dump directory receives each finished document, named
+/// `<operation>_<logical_hash>.explain.json` and byte-equal to the decision's
+/// explain.
+#[test]
+fn a_dump_directory_receives_the_finalized_document() {
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let source = doc_source().with_explain_dump_dir(dir.path().to_path_buf());
+    let Decision::Engine { explain, .. } = futures::executor::block_on(
+        route(
+            &documents_query(),
+            &source,
+            RouteOverride::Registry,
+            &BOUNDS,
+        )
+        .finalize(&source),
+    ) else {
+        panic!("read query did not build an engine plan");
+    };
+    let hash = explain.logical_hash.as_deref().expect("a logical hash");
+    let path = dir.path().join(format!("query_{hash}.explain.json"));
+    let written = std::fs::read_to_string(&path).expect("the document was dumped");
+    let document: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+    assert_eq!(document, explain.to_value());
+}
+
+/// GQT cannot observe concurrent filesystem publication.
+#[test]
+fn concurrent_dumps_publish_complete_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = doc_source().with_explain_dump_dir(dir.path().to_path_buf());
+    let render = |override_| {
+        let decision = futures::executor::block_on(
+            route(&documents_query(), &source, override_, &BOUNDS).finalize(&source),
+        );
+        serde_json::to_string_pretty(&decision.explain().unwrap().to_value()).unwrap()
+    };
+    let documents = [
+        render(RouteOverride::Registry),
+        render(RouteOverride::ForceExecutor),
+    ];
+    assert_ne!(documents[0], documents[1]);
+    let path = std::fs::read_dir(dir.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let start = std::sync::Barrier::new(9);
+    std::thread::scope(|scope| {
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let start = &start;
+                let render = &render;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..64 {
+                        render(if i % 2 == 0 {
+                            RouteOverride::Registry
+                        } else {
+                            RouteOverride::ForceExecutor
+                        });
+                    }
+                })
+            })
+            .collect();
+        start.wait();
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                documents.contains(&written),
+                "a reader saw an incomplete or mixed document"
+            );
+        }
+    });
+    assert!(documents.contains(&std::fs::read_to_string(path).unwrap()));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+/// GQT cannot place a symlink at a diagnostic destination.
+#[cfg(unix)]
+#[test]
+fn a_dump_replaces_a_symlink_without_writing_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let captures = dir.path().join("captures");
+    let source = doc_source().with_explain_dump_dir(captures.clone());
+    let render = || {
+        futures::executor::block_on(
+            route(
+                &documents_query(),
+                &source,
+                RouteOverride::Registry,
+                &BOUNDS,
+            )
+            .finalize(&source),
+        )
+    };
+    render();
+    let path = std::fs::read_dir(&captures)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let sentinel = dir.path().join("sentinel");
+    std::fs::write(&sentinel, "untouched").unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&sentinel, &path).unwrap();
+    let decision = render();
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "untouched");
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_file()
+    );
+    let written: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(written, decision.explain().unwrap().to_value());
+    assert_eq!(std::fs::read_dir(captures).unwrap().count(), 1);
 }
 
 /// Census rendering is a planner diagnostic, not a GQ result surface.

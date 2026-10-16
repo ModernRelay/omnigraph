@@ -103,7 +103,7 @@ impl Fixture {
     }
 
     fn traced(&self) -> crate::gate::Traced {
-        crate::gate::plan_traced(&self.ir, &self.source, &BOUNDS).expect("the query plans")
+        crate::gate::plan_traced(&self.ir, &self.source, &BOUNDS, false).expect("the query plans")
     }
 
     fn plan(&self) -> PhysicalPlan {

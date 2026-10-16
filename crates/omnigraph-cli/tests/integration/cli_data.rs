@@ -2408,14 +2408,21 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
             });
             if arguments[0] == "mutate" {
+                // A verified precondition and a typed policy denial both refuse
+                // before effects; every other row leaves the outcome unknown.
+                let (execution, effects) = if exit == 4 || body["code"] == "forbidden" {
+                    ("not_started", "none")
+                } else {
+                    ("unknown", "unknown")
+                };
                 assert_eq!(actual["http_status"], status);
                 assert_eq!(
-                    actual["command_outcome"]["execution"],
-                    if exit == 4 { "not_started" } else { "unknown" }
+                    actual["command_outcome"]["execution"], execution,
+                    "{arguments:?}: {actual}"
                 );
                 assert_eq!(
-                    actual["command_outcome"]["effects"],
-                    if exit == 4 { "none" } else { "unknown" }
+                    actual["command_outcome"]["effects"], effects,
+                    "{arguments:?}: {actual}"
                 );
                 let fields = actual.as_object_mut().unwrap();
                 fields.remove("http_status");
@@ -2434,10 +2441,10 @@ fn remote_json_errors_preserve_server_codes_and_details() {
     );
 }
 
-/// Whole-command retry classification needs real CLI processes and a wire
+/// Whole-command outcome classification needs real CLI processes and a wire
 /// census; row/error GQT expectations cannot observe exits or resubmission.
 #[test]
-fn data_write_outcomes_and_retry_permission_issue_466() {
+fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
 
     let temp = tempdir().unwrap();
@@ -2455,43 +2462,49 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
         vec![
             "load", "--data", data, "--mode", "merge", "--branch", "review", "--from", "main",
         ],
+        vec![
+            "blob", "put", "node", "Document", "readme", "content", "--file", data,
+        ],
+        vec!["blob", "clear", "node", "Document", "readme", "content"],
     ];
+    let not_started = |action: &str| serde_json::json!({"execution":"not_started","effects":"none","action":action});
+    let unknown = |action: &str| serde_json::json!({"execution":"unknown","effects":"unknown","action":action});
     let cases = [
         (
             429,
             serde_json::json!({"error":"actor is busy","code":"too_many_requests"}),
             75,
-            "retry",
+            not_started("retry"),
         ),
         (
             429,
             serde_json::json!({"error":"unqualified proxy throttle"}),
             1,
-            "reconcile",
+            unknown("reconcile"),
         ),
         (
             409,
             serde_json::json!({"error":"conflict","code":"conflict"}),
             1,
-            "reconcile",
+            unknown("reconcile"),
         ),
         (
             503,
             serde_json::json!({"error":"unavailable"}),
             1,
-            "reconcile",
+            unknown("reconcile"),
         ),
         (
             409,
             serde_json::json!({"error":"authority changed","read_set_conflict":{"member":"graph_head","expected":"before","actual":"after"}}),
             1,
-            "refresh",
+            unknown("refresh"),
         ),
         (
             409,
             serde_json::json!({"error":"input too large","resource_limit":{"resource":"entities","limit":10,"actual":11}}),
             1,
-            "refresh",
+            unknown("refresh"),
         ),
         // Admission probes an external Blob source before any effect; the
         // typed detail, not the status, makes the refusal a refresh.
@@ -2499,25 +2512,65 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
             424,
             serde_json::json!({"error":"source unavailable","external_blob_source":{"uri":"s3://bucket/object","reason":"not found"}}),
             1,
-            "refresh",
+            unknown("refresh"),
         ),
         (
             424,
             serde_json::json!({"error":"source unavailable"}),
             1,
-            "reconcile",
+            unknown("reconcile"),
         ),
         (
             503,
             serde_json::json!({"error":"schema completion required","recovery_required":{"operation_id":"published-commit"}}),
             1,
-            "recover",
+            unknown("recover"),
         ),
         (
             429,
             serde_json::json!({"error":"contradictory refusal","code":"too_many_requests","recovery_required":{"operation_id":"published-commit"}}),
             1,
-            "recover",
+            unknown("recover"),
+        ),
+        // The server answers these before admission: bearer authentication,
+        // then the contract header, then policy, all ahead of any staging.
+        (
+            401,
+            serde_json::json!({"error":"invalid bearer token","code":"unauthorized"}),
+            1,
+            not_started("refresh"),
+        ),
+        (
+            403,
+            serde_json::json!({"error":"change denied by current policy","code":"forbidden"}),
+            1,
+            not_started("refresh"),
+        ),
+        (
+            400,
+            serde_json::json!({"error":"exactly one contract header is required","code":"api_contract_mismatch"}),
+            1,
+            not_started("refresh"),
+        ),
+        // Only the code under its own status proves the refusal; contradictory
+        // effect evidence outranks it.
+        (
+            403,
+            serde_json::json!({"error":"denied by an intermediary"}),
+            1,
+            unknown("reconcile"),
+        ),
+        (
+            400,
+            serde_json::json!({"error":"misplaced denial","code":"forbidden"}),
+            1,
+            unknown("reconcile"),
+        ),
+        (
+            403,
+            serde_json::json!({"error":"contradictory denial","code":"forbidden","recovery_required":{"operation_id":"published-commit"}}),
+            1,
+            unknown("recover"),
         ),
     ];
     let matrix: Vec<_> = commands
@@ -2527,7 +2580,7 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
     for_each_concurrently(
         matrix,
         CASE_WORKERS,
-        |(arguments, (status, body, exit, action))| {
+        |(arguments, (status, body, exit, outcome))| {
             let mut reply = IntentReply::json(*status, body.clone());
             reply.headers.push(("Retry-After".into(), "17".into()));
             let server = IntentApiFixture::graph(vec![reply]);
@@ -2553,13 +2606,8 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
             assert_eq!(actual["http_status"], *status);
             assert_eq!(actual["retry_after"], "17");
             assert_eq!(
-                actual["command_outcome"],
-                serde_json::json!({
-                    "execution": if *exit == 75 {"not_started"} else {"unknown"},
-                    "effects": if *exit == 75 {"none"} else {"unknown"},
-                    "action": action,
-                }),
-                "{arguments:?} HTTP {status}"
+                &actual["command_outcome"], outcome,
+                "{arguments:?} HTTP {status} {body}"
             );
             let fields = actual.as_object_mut().unwrap();
             fields.remove("command_outcome");

@@ -1584,7 +1584,9 @@ impl ApiError {
             // Engine-layer policy enforcement (MR-722). Authentication
             // middleware has already distinguished a missing/invalid bearer
             // (401); policy denials and evaluation failures surface as 403.
-            // Most handlers also perform an HTTP-layer policy check.
+            // Most handlers also perform an HTTP-layer policy check. Clients
+            // read this 403 as proof the write never started, so `enforce`
+            // must precede every durable effect (docs/dev/writes.md).
             OmniError::Policy(message) => Self::forbidden(message),
             // `Omnigraph::init` against an existing graph URI in strict
             // mode. Not currently HTTP-reachable (POST /graphs was

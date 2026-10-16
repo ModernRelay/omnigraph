@@ -4469,18 +4469,37 @@ mod tests {
         );
         let pipelines = optimized.physical.pipelines_json();
         assert_eq!(pipelines.as_array().map(Vec::len), Some(2));
-        assert_eq!(pipelines[0]["sink"], "SortMergeJoin(build)");
-        assert_eq!(pipelines[1]["sink"], "consumer");
+        assert_eq!(pipelines[0]["id"], 0);
+        assert_eq!(pipelines[0]["sink"]["name"], "SortMergeJoin(build)");
+        assert_eq!(pipelines[1]["id"], 1);
+        assert_eq!(pipelines[1]["sink"]["name"], "consumer");
+        assert_eq!(pipelines[1]["depends_on"], serde_json::json!([0]));
+        let operators: Vec<&str> = pipelines[1]["operators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|operator| operator["name"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            pipelines[1]["operators"],
-            serde_json::json!([
+            operators,
+            [
                 "SortMergeJoin(probe)",
                 "HydrateByAddress(child)",
                 "HydrateByAddress(parent)",
                 "RowCompare",
                 "Page"
-            ])
+            ]
         );
+        assert_eq!(
+            pipelines[0]["sink"]["id"], pipelines[1]["operators"][0]["id"],
+            "the build sink and the probe operator are the same join node"
+        );
+        assert_eq!(pipelines[1]["source"]["node"], "Scan");
+        let scan_id = pipelines[1]["source"]["id"].as_u64().unwrap() as usize;
+        assert!(matches!(
+            optimized.physical.node(scan_id),
+            Some(PhysicalNode::Scan { .. })
+        ));
     }
 
     #[test]

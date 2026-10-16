@@ -79,6 +79,7 @@ refuses startup; no default is substituted.
 | `load_source_max_bytes` | integer, at least `1` | `33554432` (32 MiB) | request | `OMNIGRAPH_LOAD_SOURCE_MAX_BYTES` | the largest object a `load csv` statement reads, checked before any payload byte is fetched; a served load is additionally bounded by the server's workload admission |
 | `query_memory_bytes` | integer, at least `1` | `157286400` (150 MiB) | request | `OMNIGRAPH_QUERY_MEMORY_BYTES` | the memory pool one read query runs under; operators that cannot spill refuse work beyond it, while spillable operators may use bounded scratch storage; raising it permits more tracked memory per query |
 | `history_release_bytes` | integer `1024..=262144` | `262144` | request | `OMNIGRAPH_HISTORY_RELEASE_BYTES` | the byte budget of a branch's buffer of unreleased commits; a mutate, load or branch merge of the session whose buffer and head reach it closes a history block, and the publish after it writes the block under `__history` (schema apply, branch create and delete, repair and upgrade publish under the production budget); a load reaches it only through the CLI or an embedded `Session`, since the HTTP load routes take no settings; query results never change, only the number of requests and files; production keeps the default, a caller may only lower it |
+| `explain_dump_dir` | text | empty (disabled) | process | `OMNIGRAPH_EXPLAIN_DUMP_DIR` | the directory each finished explain document is written into, one `<operation>_<logical_hash>.explain.json` per operation and logical hash; each complete document atomically replaces the previous one at that path; empty disables the write; a failed write reports on stderr and never fails the operation |
 
 For these statements the cap covers all traversals, including named and nested
 ones, and remains shared across retries. It charges consumed source rows,
@@ -148,7 +149,7 @@ settings line's refusal as `ERROR line <n>, column <c>: <message>`.
 set merge_lineage = fast;
 error: unknown value `fast` for setting `merge_lineage`; expected one of off, on, verify
 set traversal = csr;                      (likewise reset traversal; and show traversal;)
-error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes
+error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir
 set ann_nprobes = "many";
 error: setting `ann_nprobes` takes an integer of at least 0, got a string
 set stage_write_concurrency = 0;

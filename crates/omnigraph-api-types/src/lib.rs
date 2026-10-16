@@ -189,6 +189,7 @@ fn setting_schema(id: SettingId) -> utoipa::openapi::schema::Object {
             .minimum(Some(min))
             .maximum(max)
             .build(),
+        SettingKind::Text => builder.schema_type(Type::String).build(),
     }
 }
 

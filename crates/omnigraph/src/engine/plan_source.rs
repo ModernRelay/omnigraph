@@ -442,6 +442,12 @@ impl PlanSource for QuerySource<'_> {
     fn gate_policy(&self) -> GatePolicy {
         self.gate_policy
     }
+
+    fn explain_dump_dir(&self) -> Option<std::path::PathBuf> {
+        self.settings
+            .explain_dump_dir()
+            .map(std::path::PathBuf::from)
+    }
 }
 
 /// A query shape the planner refuses by design: the caller's error, a bad

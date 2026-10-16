@@ -70,6 +70,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `use` | Select a managed cluster for a config directory | managed API |
 | `profile list/show` | Inspect operator profiles | local |
 | `alias` | Invoke a personal stored-query alias | served |
+| `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
 | `version` | Print the package version, HTTP contract and storage formats; `--json` prints `version`, `http_contract` and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 `rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
@@ -185,8 +186,7 @@ reads `--file <PATH>` or stdin; `put` and `clear` accept `--branch`,
 
 ## Operator configuration
 
-The default path is `~/.omnigraph/config.yaml`. Set `OMNIGRAPH_HOME` to use a
-different directory.
+The default path is `~/.omnigraph/config.yaml`. Set `OMNIGRAPH_HOME` to use a different directory.
 
 ```yaml
 operator:
@@ -272,7 +272,7 @@ for origin validation, separate organization sessions, identity pins and renewal
 | `cluster history --managed [--limit N] [--since RFC3339]` | Read newest deliveries first, default and maximum 100; filter creation time inclusively before the limit |
 | `cluster cancel --managed DEPLOYMENT_ID` | Cancel your queued delivery before its first dispatch attempt |
 
-See [managed lifecycle](managed-lifecycle.md) for discovery, source checkout and lifecycle operations.
+See [managed lifecycle](managed-lifecycle.md) for cluster operations and [team administration](managed-team.md) for `organization --managed` (`org`), invitation commands and versioned member changes.
 All accept `--config DIR` and `--json`. Plan and apply also accept
 `--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. An omitted key is
 generated and printed before submission. Retain it and the exact request after

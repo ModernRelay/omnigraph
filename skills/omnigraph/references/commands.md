@@ -1,6 +1,8 @@
 # Reference Commands
 
 ## Contents
+- Command index
+- Version-matched skill (skill export, skill show)
 - Inspect state (snapshot, export)
 - Branches · commits · changes · graphs
 - Blob reads
@@ -12,9 +14,68 @@
 - Operator config & credentials
 - Addressing a graph
 - Output formats and positions · health check
+- Organization administration (members and invitations)
 - Cluster control plane (direct and managed)
 
 Commands you'll reach for but don't need best-practice rules around. Quick syntax reference.
+
+## Command Index
+
+Every public command of this CLI. `omnigraph <command> [<subcommand>] --help`
+prints the exact flags of the installed binary.
+
+| Command | Subcommands | Use |
+|---|---|---|
+| `query` | — | Run a read query: a served stored query by name, or ad-hoc `--query`/`-e` source; also the `branch list` and `explain` statements |
+| `mutate` | — | Run a mutation, or a `branch create`/`delete`/`merge` or `commit publish`/`drop` statement |
+| `alias` | — | Invoke an operator alias's stored read query |
+| `load` | — | Bulk-load JSONL; `--mode` is required |
+| `branch` | `create` `list` `delete` `merge` `diff` `merge-base` | Manage graph branches; `diff` reviews what a branch changed since its merge base, `merge-base` prints that base |
+| `snapshot` | — | Show one branch's types, entity counts and dataset versions |
+| `export` | — | Stream a branch as JSONL |
+| `diff` | — | Net entity changes between two read targets (branch heads or graph commit ids) |
+| `blob` | `get` `stat` `put` `clear` | Read, inspect, replace or clear one Blob cell |
+| `commit` | `list` `show` `changes` `publish` `drop` | Read history; publish or drop an unpublished commit |
+| `changes` | `poll` `baseline` | Follow a branch's change feed |
+| `schema` | `show` `plan` `apply` `upgrade-system-columns` | Read, plan or apply a schema; respell legacy system columns |
+| `graphs` | `list` | List the graphs a multi-graph server serves |
+| `init` | — | Create a graph from a `.pg` schema |
+| `upgrade` | — | Convert a standalone graph's storage offline |
+| `optimize` | — | Compact data and reconcile declared indexes |
+| `rebuild-full-text-indexes` | — | Replace one branch's full-text indexes |
+| `repair` | — | Report foreign Lance history without adopting it |
+| `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
+| `lint` | — | Validate `.gq` source against a schema or a graph |
+| `queries` | `validate` `list` | Check or list a cluster's stored queries |
+| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; `--managed` selects the managed service |
+| `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires `--managed`; `org` is an alias |
+| `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
+| `embed` | — | Generate, clean or refresh seed embeddings |
+| `login` | — | Store a server's bearer token, or open a managed session |
+| `logout` | — | Remove a stored token or a managed session |
+| `use` | — | Select a managed cluster for a config folder |
+| `profile` | `list` `show` | Inspect operator profiles |
+| `skill` | `export` `show` | Export or print this skill as built into the CLI |
+| `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
+
+## Version-Matched Skill
+
+The `omnigraph` binary carries this skill, written for its own commands and
+HTTP contract. Export it where your agent loads skills:
+
+```bash
+omnigraph skill export ~/.claude/skills/omnigraph --force --json
+omnigraph skill show                          # SKILL.md on stdout
+omnigraph skill show references/queries.md    # any other skill file
+```
+
+The export refuses to replace existing files unless `--force`. It also writes
+`.omnigraph-skill.json`, a record of each file it wrote; a later `--force`
+export uses it to remove files this skill no longer has, but only while their
+bytes are unchanged, and reports them under `removed` and `kept`. No other file
+in the directory is touched. `--json` reports the `files` written,
+`skill_version`, `cli_version` and `http_contract`. The command reads no
+configuration and needs no graph, server or network.
 
 ## Inspect State
 
@@ -130,9 +191,12 @@ omnigraph schema upgrade-system-columns "$REPO" --check --json
 ```
 
 `omnigraph upgrade` converts a standalone v8 or v9 graph (written by 0.11) or
-a v13 graph to storage format 14 in place, keeping branches, commit ids and
-commit history; `--to-format` accepts 14 only. `schema upgrade-system-columns`
-is a separate step on a graph already at 14: it respells the legacy
+a v13 graph in place to the storage format this binary writes, the first
+number `omnigraph version` reports, keeping branches, commit ids and commit
+history. A graph at an older format this binary serves is only stamped to it,
+with one metadata-only commit per live branch. `--to-format` accepts only the
+written format. `schema upgrade-system-columns` is a separate step on a graph
+this binary serves: it respells the legacy
 `id`/`src`/`dst` system columns and requires only `main` and no user property
 starting with `_`. Both are standalone, offline operations: stop every process
 using the graph and keep a verified whole-root backup; cluster-managed roots
@@ -282,7 +346,7 @@ omnigraph login --api <origin>             # managed Intent API session (OS keyc
 omnigraph logout --api <origin>            # revoke that session and remove its keychain entry
 ```
 
-The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. `--config` selects source/context folders for `cluster` and `use`.
+The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. `--config` selects source/context folders for `cluster`, `organization` and `use`.
 
 ## Addressing a Graph
 
@@ -356,6 +420,56 @@ while a graph is still loading, when a nonempty inventory has no ready graph,
 and once draining starts. Readiness is not proof that every configured graph
 is healthy; authorized `graphs list --server <name|url> --json` returns one
 `graphs` list with each graph's `state` and `action`, blocked graphs included.
+
+## Organization Administration
+
+`organization` (alias `org`) requires explicit `--managed` and the selected
+organization's control grant `{cluster: null, verb: members_manage}`. Sign in
+with `login --api <origin> --organization <id>`. Supply those same selectors to
+organization commands, or use a bound folder (`--config <dir>` selects another
+folder). Explicit selectors must agree with that binding; outside a bound
+folder, omitting `--organization` requires exactly one cached organization for
+the API. These commands do not change the binding. They reject `--server`,
+`--profile`, `--store`, `--cluster`, `--graph`, `--as` and `--direct`.
+`--json` prints the validated API envelope.
+
+In a bound folder:
+
+```bash
+omnigraph organization members list --managed --json
+omnigraph organization members apply member.yaml --managed --idempotency-key <key> --json
+omnigraph organization members offboard <USER_ID> --managed --expected-version <N> --idempotency-key <key> --json
+omnigraph organization invitations list --managed [--after <cursor>] --json
+omnigraph organization invitations send <email> --managed --idempotency-key <key>
+omnigraph organization invitations resend <INVITATION_ID> --managed --idempotency-key <key>
+omnigraph organization invitations revoke <INVITATION_ID> --managed --idempotency-key <key>
+```
+
+`members list` returns the complete directory, including provider membership
+status and current local grant versions; more than 1,000 members refuses.
+`members apply` takes a versioned YAML add/update/remove patch. Use exact IDs and
+the current grant version. Add/update patches preserve unrelated grants and
+admissions; a remove patch clears local access while retaining provider membership.
+Invitation lists are pages of up to 100; pass the returned `data.after` as
+`--after` until it is null. Wait for acceptance before enrollment. Invitation
+acceptance and cluster admission do not grant graph or configuration permissions:
+applied Cedar policy owns those permissions.
+
+Before `members offboard`, remove the person's principal from applicable Cedar
+policies, deploy them and verify denial with a previously issued graph credential.
+Offboarding clears local access, removes that organization's membership and
+revokes its explicitly scoped sessions; it preserves the shared user and other
+organizations' sessions. Existing graph credentials may last 86,400 seconds, so
+membership removal alone does not immediately revoke graph access. Use grant
+version zero only for someone not enrolled locally. A partial cleanup exits 3;
+inspect its separate local, provider and session outcomes.
+
+Every write requires `--idempotency-key`. Keep the exact arguments, YAML and key
+after a timeout; it does not cancel provider work. Replay the identical request
+with the same key to retrieve its retained outcome. A new key starts a new action,
+and a partial offboard result remains partial on replay. See the
+[team administration guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/managed-team.md)
+for the patch schema and the full onboarding workflow.
 
 ## Cluster Control Plane
 

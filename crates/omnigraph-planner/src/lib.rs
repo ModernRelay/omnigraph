@@ -74,8 +74,9 @@ pub use output::{NodeObjectType, validate_output_schemas};
 pub use physical::{
     Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, GatePolicy, Hop,
     HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OrderKey, OverfetchRung, PhysicalNode,
-    PhysicalPlan, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind,
-    RankScope, RankedAccess, ScanInput, StatisticSource,
+    PhysicalPlan, PipelineSink, PipelineSource, PipelineSpec, Prefilter, PrefilterMode, Properties,
+    ROW_ADDRESS_PREFIX, RankArm, RankKind, RankScope, RankedAccess, ScanInput, SideChain,
+    StatisticSource,
 };
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;

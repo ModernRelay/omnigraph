@@ -58,6 +58,8 @@ control grant, up to 1,000 members; exceeding the limit refuses instead of
 truncating. It does not list invitations or calculate effective graph permissions:
 applied Cedar policy authorizes graph operations separately. This command is
 read-only and does not invite people or change their permissions.
+Organization administrators use [team administration](managed-team.md) to invite,
+enroll and remove people through the same cached CLI login.
 
 ## Create an empty cluster
 
