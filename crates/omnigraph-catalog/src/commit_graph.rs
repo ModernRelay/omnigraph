@@ -63,9 +63,10 @@ fn kind_is_published(kind: &GraphCommitKind) -> bool {
 }
 
 impl GraphCommit {
-    /// The one total order for deterministic lineage listing, head selection,
-    /// and any future commit-list keyset cursor. Ancestry and CDC traversal use
-    /// persisted first-parent links instead; this key never defines feed order.
+    /// The one total order for deterministic lineage listing and head
+    /// selection. A commit-list page, ancestry and CDC traversal follow
+    /// persisted first-parent links instead, along which this key and the
+    /// generation both rise; this key never defines feed order.
     pub fn lineage_key(&self) -> (u64, i64, &str) {
         (
             self.graph_manifest_version,
@@ -729,6 +730,87 @@ impl CommitGraph {
         commits.sort_by(|a, b| a.lineage_key().cmp(&b.lineage_key()));
         Ok(commits)
     }
+
+    /// Up to `limit` commits of the first-parent chain that starts at
+    /// `start`, newest first; `None` when no commit `start` names is held or
+    /// in `__history`. Generation falls strictly along the chain, so a page
+    /// is the keyset `generation < g` of the chain below the commit before it.
+    ///
+    /// The head, the buffer and the commits the cache holds cost nothing; a
+    /// commit outside them is read by its id with the rest of its `__history`
+    /// extent, which usually holds the commits after it on the chain. A page
+    /// costs one read per extent its commits occupy, never a read of the
+    /// history below it, and never fills the cache's parent-closed set.
+    pub async fn first_parent_page(
+        &self,
+        start: &str,
+        limit: usize,
+    ) -> Result<Option<FirstParentPage>> {
+        let settled = self.history.held();
+        let mut read: HashMap<String, GraphCommit> = HashMap::new();
+        let mut commits: Vec<GraphCommit> = Vec::with_capacity(limit.min(PAGE_PREALLOCATED));
+        let mut next = Some(start.to_string());
+        while commits.len() < limit {
+            let Some(id) = next.take() else { break };
+            let held = self
+                .held
+                .get(&id)
+                .or_else(|| settled.as_ref().and_then(|commits| commits.get(&id)))
+                .or_else(|| read.get(&id))
+                .cloned();
+            let commit = match held {
+                Some(commit) => commit,
+                None => {
+                    let found = history::read_lineage_of_bounded_in(
+                        &self.root_uri,
+                        &self.session,
+                        self.history.objects(),
+                        &[id.as_str()],
+                        PAGE_READ_BYTES,
+                    )
+                    .await?;
+                    read.extend(
+                        found
+                            .into_iter()
+                            .map(|(id, row)| (id, graph_commit_from_manifest_row(row))),
+                    );
+                    match read.get(&id) {
+                        Some(commit) => commit.clone(),
+                        None if commits.is_empty() => return Ok(None),
+                        None => return Err(missing_parent(&id)),
+                    }
+                }
+            };
+            if let Some(child) = commits.last()
+                && commit.generation >= child.generation
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "graph commit '{}' has generation {} and its first parent '{}' generation {}",
+                    child.graph_commit_id,
+                    child.generation,
+                    commit.graph_commit_id,
+                    commit.generation
+                )));
+            }
+            next = commit.parent_commit_id.clone();
+            commits.push(commit);
+        }
+        Ok(Some(FirstParentPage { commits, next }))
+    }
+}
+
+/// Commits a page reserves room for before it learns how long its chain is.
+const PAGE_PREALLOCATED: usize = 1024;
+
+/// Bytes one `__history` read of a commit page may fetch and decode.
+const PAGE_READ_BYTES: usize = 32 * 1024 * 1024;
+
+/// One page of a first-parent chain: its commits, newest first, and the id of
+/// the commit the next page starts at, `None` once the page ends at the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstParentPage {
+    pub commits: Vec<GraphCommit>,
+    pub next: Option<String>,
 }
 
 pub fn graph_commit_from_manifest_row(row: crate::GraphLineageRow) -> GraphCommit {

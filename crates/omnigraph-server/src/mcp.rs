@@ -447,6 +447,17 @@ struct BranchArguments {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CommitsListArguments {
+    graph: String,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    page_token: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommitArguments {
     graph: String,
     commit_id: String,
@@ -989,7 +1000,7 @@ impl GraphTools {
                 bounded_result(&output.0)
             }
             "commits_list" => {
-                let args: BranchArguments = arguments_as(arguments)?;
+                let args: CommitsListArguments = arguments_as(arguments)?;
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
                 let output = handlers::server_commit_list(
                     Extension(handle),
@@ -998,6 +1009,8 @@ impl GraphTools {
                         branch: args.branch,
                         unpublished: false,
                         unattached: false,
+                        limit: args.limit,
+                        page_token: args.page_token,
                     }),
                 )
                 .await?;
@@ -1420,8 +1433,8 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "commits_list",
         title: "List commits",
-        description: "List a branch's commits (default `main`), newest first, each with its `graph_commit_id`, parents, actor and time.",
-        input: branch_schema,
+        description: "List a branch's commits (default `main`), newest first, each with its `graph_commit_id`, parents, actor and time. Pass `limit` to page a long history: the page names `head_commit_id` and continues with its `next_page_token` as `page_token`, keeping the same `branch`.",
+        input: commits_list_schema,
         output: None,
         effect: Effect::Read,
         gate: Gate::Always,
@@ -1603,6 +1616,17 @@ fn graph_schema() -> Value {
 fn branch_schema() -> Value {
     arguments(
         json!({"branch": text_schema("Branch. Defaults to `main`.")}),
+        &[],
+    )
+}
+
+fn commits_list_schema() -> Value {
+    arguments(
+        json!({
+            "branch": text_schema("Branch. Defaults to `main`."),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Commits in this page; without it and `page_token`, the whole history."},
+            "page_token": text_schema("The previous page's `next_page_token`."),
+        }),
         &[],
     )
 }

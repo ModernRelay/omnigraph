@@ -269,4 +269,108 @@ async fn graph_lineage_lives_only_in_manifest() {
         authored >= 4,
         "expected the authored commits to surface their actor in the projection, saw {authored}"
     );
+
+    // ── paged listing: the same order, one page at a time ────────────────────
+    // Pages walk first parents by falling generation; across the fork and the
+    // merge they must concatenate to the listing, whatever the page size.
+    for (branch, listed) in [(None, &listed_main), (Some("feature"), &listed_feature)] {
+        for limit in [1, 2, listed.len(), listed.len() + 1] {
+            let (head, paged) = all_pages(&main, branch, limit).await;
+            assert_eq!(head, listed[0].graph_commit_id, "{branch:?} by {limit}");
+            assert_eq!(&paged, listed, "{branch:?} by {limit}");
+        }
+    }
+    assert!(
+        listed_main
+            .windows(2)
+            .all(|pair| pair[0].generation > pair[1].generation),
+        "the listing falls in generation, the page walk's keyset"
+    );
+
+    // A continuation answers for the head its first page resolved, after the
+    // branch moves; another branch's request refuses it.
+    let first = main.list_commits_page(None, None, Some(2)).await.unwrap();
+    assert_eq!(first.head_commit_id, merge_commit.graph_commit_id);
+    assert_eq!(first.commits, listed_main[..2]);
+    let token = first.next_page_token.clone().expect("more pages");
+    main.mutate_as(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 52)]),
+        Some("act-frank"),
+    )
+    .await
+    .unwrap();
+    let mut rest = first.commits.clone();
+    let mut next = Some(token.clone());
+    while let Some(token) = next {
+        let page = main
+            .list_commits_page(None, Some(&token), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(page.head_commit_id, merge_commit.graph_commit_id);
+        rest.extend(page.commits);
+        next = page.next_page_token;
+    }
+    assert_eq!(rest, listed_main, "the continuation keeps the old head");
+    let moved = main.list_commits_page(None, None, Some(1)).await.unwrap();
+    assert_ne!(moved.head_commit_id, merge_commit.graph_commit_id);
+    assert_eq!(moved.commits[0].actor_id.as_deref(), Some("act-frank"));
+    for (branch, token) in [(Some("feature"), token.as_str()), (None, "not-a-token")] {
+        let error = main
+            .list_commits_page(branch, Some(token), Some(2))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                omnigraph::error::OmniError::ChangeCursorRejected { .. }
+            ),
+            "{error:?}"
+        );
+    }
+    let error = main
+        .list_commits_page(
+            None,
+            None,
+            Some(omnigraph::db::COMMIT_LIST_MAX_PAGE_COMMITS + 1),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            omnigraph::error::OmniError::ResourceLimitExceeded { .. }
+        ),
+        "{error:?}"
+    );
+    assert!(main.list_commits_page(None, None, Some(0)).await.is_err());
+}
+
+/// Every page of `branch`'s commit list at `limit` per page, concatenated,
+/// and the head the first page named, which every page repeats.
+async fn all_pages(
+    db: &omnigraph::session::Session,
+    branch: Option<&str>,
+    limit: usize,
+) -> (String, Vec<GraphCommit>) {
+    let first = db
+        .list_commits_page(branch, None, Some(limit))
+        .await
+        .unwrap();
+    let head = first.head_commit_id.clone();
+    let mut commits = first.commits;
+    let mut next = first.next_page_token;
+    while let Some(token) = next {
+        let page = db
+            .list_commits_page(branch, Some(&token), Some(limit))
+            .await
+            .unwrap();
+        assert_eq!(page.head_commit_id, head, "every page names the first head");
+        assert!(page.commits.len() <= limit && !page.commits.is_empty());
+        commits.extend(page.commits);
+        next = page.next_page_token;
+    }
+    (head, commits)
 }

@@ -1012,6 +1012,11 @@ async fn mcp_read_parity_tools_equal_their_routes() {
             "/graphs/default/commits".to_string(),
         ),
         (
+            "commits_list",
+            json!({"graph":"default","branch":"main","limit":1}),
+            "/graphs/default/commits?branch=main&limit=1".to_string(),
+        ),
+        (
             "commits_get",
             json!({"graph":"default","commit_id":commit}),
             format!("/graphs/default/commits/{commit}"),

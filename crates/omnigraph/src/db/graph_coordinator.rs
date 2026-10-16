@@ -9,7 +9,8 @@ use crate::error::{OmniError, Result};
 use crate::storage::{StorageAdapter, normalize_root_uri};
 
 use super::commit_graph::{
-    CommitGraph, GraphCommit, HistoryCache, Lineage, graph_commit_from_manifest_row,
+    CommitGraph, FirstParentPage, GraphCommit, HistoryCache, Lineage,
+    graph_commit_from_manifest_row,
 };
 use super::manifest::{
     BranchRecords, CapturedManifestProbe, CommitBuffer, DatasetUpdate, ExpectedTableVersions,
@@ -422,6 +423,21 @@ impl GraphCoordinator {
     /// The commits of the branch, oldest first.
     pub(crate) async fn load_commits(&self) -> Result<Vec<GraphCommit>> {
         self.manifest.commit_graph().load_commits().await
+    }
+
+    /// The head this coordinator holds and up to `limit` commits of the
+    /// first-parent chain from `start` (that head when `None`), newest first;
+    /// `None` when no commit `start` names is found.
+    pub(crate) async fn first_parent_page(
+        &self,
+        start: Option<&str>,
+        limit: usize,
+    ) -> Result<(GraphCommit, Option<FirstParentPage>)> {
+        let graph = self.manifest.commit_graph();
+        let head = graph.head().clone();
+        let start = start.unwrap_or(&head.graph_commit_id);
+        let page = graph.first_parent_page(start, limit).await?;
+        Ok((head, page))
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {

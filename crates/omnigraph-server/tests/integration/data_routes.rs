@@ -7350,6 +7350,91 @@ async fn commit_changes_pages_are_ordered_with_cause_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn commit_list_pages_answer_for_the_head_their_first_page_named() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let person = |name: &str| format!(r#"{{"type":"Person","data":{{"name":"{name}","age":1}}}}"#);
+    for name in ["Page A", "Page B", "Page C"] {
+        load_commit(&app, &person(name)).await;
+    }
+    let (status, whole) = get_json(&app, g("/commits")).await;
+    assert_eq!(status, StatusCode::OK, "{whole}");
+    assert!(
+        whole.get("head_commit_id").is_none() && whole.get("next_page_token").is_none(),
+        "an unpaged listing keeps its shape: {whole}"
+    );
+    let whole = whole["commits"].as_array().unwrap().clone();
+    assert!(whole.len() > 4, "test setup: several pages of two");
+
+    let (status, first) = get_json(&app, g("/commits?branch=main&limit=2")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["head_commit_id"], whole[0]["graph_commit_id"]);
+    assert_eq!(first["commits"], json!(whole[..2]));
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("a first page of two continues")
+        .to_string();
+
+    load_commit(&app, &person("Page D")).await;
+    let mut paged = first["commits"].as_array().unwrap().clone();
+    let mut next = Some(token.clone());
+    while let Some(token) = next {
+        let (status, page) =
+            get_json(&app, g(&format!("/commits?limit=2&page_token={token}"))).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["head_commit_id"], first["head_commit_id"], "{page}");
+        paged.extend(page["commits"].as_array().unwrap().iter().cloned());
+        next = page["next_page_token"].as_str().map(str::to_string);
+    }
+    assert_eq!(
+        paged, whole,
+        "later pages answer for the head the first page named"
+    );
+    let (status, rest) = get_json(&app, g(&format!("/commits?page_token={token}"))).await;
+    assert_eq!(status, StatusCode::OK, "{rest}");
+    assert_eq!(
+        rest["commits"],
+        json!(whole[2..]),
+        "100 commits per page by default"
+    );
+    assert!(rest.get("next_page_token").is_none(), "{rest}");
+
+    for (uri, expected) in [
+        (
+            format!("/commits?branch=feature&page_token={token}"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/commits?page_token=not-a-token".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/commits?limit=0".to_string(), StatusCode::BAD_REQUEST),
+        (
+            "/commits?limit=2&unpublished=true".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/commits?page_token={token}&unattached=true"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/commits?limit=1001".to_string(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ] {
+        let (status, body) = get_json(&app, g(&uri)).await;
+        assert_eq!(status, expected, "{uri}: {body}");
+    }
+    let (_, body) = get_json(&app, g("/commits?page_token=not-a-token")).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("change cursor rejected: "),
+        "a rejected page token keeps the continuation prefix: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn commit_changes_images_follow_op_shape() {
     let (_temp, app) = app_for_loaded_graph().await;
     load_commit(&app, r#"{"type":"Person","data":{"name":"Shape","age":1}}"#).await;

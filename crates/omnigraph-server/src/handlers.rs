@@ -3157,8 +3157,11 @@ async fn delete_merged_source_branch(
     params(CommitListQuery),
     responses(
         (status = 200, description = "List of commits", body = CommitListOutput),
+        (status = 400, description = "Two listings selected, a page parameter with `unpublished` or `unattached`, a zero `limit`, or a rejected page token", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Branch not found", body = ErrorOutput),
+        (status = 413, description = "Requested limit exceeds 1000 commits per page", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -3168,16 +3171,23 @@ async fn delete_merged_source_branch(
 /// reachable from that branch's head (the main commits inherited up to the
 /// fork plus the branch-authored commits); omitting it returns `main`'s
 /// history. There is no cross-branch listing. Ordering is part of the
-/// contract — newest first by (graph-manifest version, created-at, commit id) — and
-/// a future `cursor`/`limit` pagination will be keyset-based on that same
-/// order. Read-only.
+/// contract: newest first along the branch's first-parent chain, which is
+/// falling generation and falling (graph-manifest version, created-at, commit
+/// id). Read-only.
+///
+/// `limit` pages the history: each page names the head its listing resolved
+/// (`head_commit_id`) and continues with `next_page_token`, sent back as
+/// `page_token` with the same `branch`; later pages answer for that head's
+/// chain even after the branch moves. A page reads only the history it
+/// returns. Without `limit` and `page_token` the whole history is one answer.
 ///
 /// `unpublished=true` lists instead the unpublished commits whose recorded
 /// target is `branch` (writes `as commit` awaiting `commit publish`), newest
 /// first; each carries `published: false`. `unattached=true` lists instead
 /// the live unattached snapshots whose recorded target is `branch` (writes
 /// `as unattached branch`), newest first, each with `kind: "unattached"`;
-/// the two filters together are refused (400).
+/// the two filters together are refused (400), as is either with `limit` or
+/// `page_token`.
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -3186,6 +3196,17 @@ pub(crate) async fn server_commit_list(
     if query.unattached && query.unpublished {
         return Err(ApiError::bad_request(
             "`unattached=true` and `unpublished=true` select different listings; pass one",
+        ));
+    }
+    let paged = query.limit.is_some() || query.page_token.is_some();
+    if paged && (query.unattached || query.unpublished) {
+        return Err(ApiError::bad_request(
+            "`limit` and `page_token` page a branch's history, not `unpublished` or `unattached`",
+        ));
+    }
+    if query.limit == Some(0) {
+        return Err(ApiError::bad_request(
+            "commit list page limit must be greater than zero",
         ));
     }
     // An omitted `branch` means main's history, so the policy gate must
@@ -3202,6 +3223,21 @@ pub(crate) async fn server_commit_list(
         },
     )?;
     let db = &handle.engine;
+    if paged {
+        let page = db
+            .list_commits_page(
+                Some(branch.as_str()),
+                query.page_token.as_deref(),
+                query.limit,
+            )
+            .await
+            .map_err(ApiError::from_omni)?;
+        return Ok(Json(CommitListOutput {
+            commits: page.commits.iter().map(api::commit_output).collect(),
+            head_commit_id: Some(page.head_commit_id),
+            next_page_token: page.next_page_token,
+        }));
+    }
     let commits = if query.unattached {
         db.list_unattached_commits(Some(branch.as_str())).await
     } else if query.unpublished {
@@ -3212,6 +3248,8 @@ pub(crate) async fn server_commit_list(
     .map_err(ApiError::from_omni)?;
     Ok(Json(CommitListOutput {
         commits: commits.iter().map(api::commit_output).collect(),
+        head_commit_id: None,
+        next_page_token: None,
     }))
 }
 

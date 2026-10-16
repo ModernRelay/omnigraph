@@ -6,8 +6,8 @@ use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
-    CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput,
-    SchemaApplyOutput, SnapshotDatasetOutput, query_file_refusals,
+    CommitListOutput, CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput,
+    ReadOutput, SchemaApplyOutput, SnapshotDatasetOutput, query_file_refusals,
 };
 use omnigraph_cluster::{
     DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
@@ -925,6 +925,8 @@ async fn run(cli: Cli) -> Result<()> {
                 branch,
                 unpublished,
                 unattached,
+                limit,
+                page_token,
                 json,
             } => {
                 let client = match managed_data {
@@ -945,13 +947,17 @@ async fn run(cli: Cli) -> Result<()> {
                     client.list_unattached_commits(branch.as_deref()).await?
                 } else if unpublished {
                     client.list_unpublished_commits(branch.as_deref()).await?
+                } else if limit.is_some() || page_token.is_some() {
+                    client
+                        .list_commits_page(branch.as_deref(), page_token.as_deref(), limit)
+                        .await?
                 } else {
                     client.list_commits(branch.as_deref()).await?
                 };
                 if json {
                     print_json(&payload)?;
                 } else {
-                    print_commit_list_human(&payload.commits);
+                    print_commit_list_human(&payload);
                 }
             }
             CommitCommand::Publish {
