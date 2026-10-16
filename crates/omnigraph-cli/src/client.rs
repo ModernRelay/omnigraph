@@ -230,6 +230,7 @@ pub(crate) enum GraphClient {
         base_url: String,
         token: Option<String>,
         response_limit: Option<usize>,
+        catalogue: bool,
     },
     /// The engine catalogue scope `og_catalog`: the binary's own registries
     /// read as `@` types, with no store opened. Serves read queries and
@@ -301,19 +302,26 @@ impl GraphClient {
             endpoint,
             remote_url(endpoint, &["graphs", graph], &[])?,
             token,
+            is_catalogue_scope(Some(graph)),
         )
     }
 
     pub(crate) fn managed_registry(endpoint: &str, token: String) -> Result<Self> {
-        Self::managed_url(endpoint, endpoint.to_owned(), token)
+        Self::managed_url(endpoint, endpoint.to_owned(), token, false)
     }
 
-    fn managed_url(endpoint: &str, base_url: String, token: String) -> Result<Self> {
+    fn managed_url(
+        endpoint: &str,
+        base_url: String,
+        token: String,
+        catalogue: bool,
+    ) -> Result<Self> {
         Ok(Self::Remote {
             http: GraphHttpClient::managed(endpoint)?,
             base_url,
             token: Some(token),
             response_limit: Some(8 * 1024 * 1024),
+            catalogue,
         })
     }
 
@@ -330,6 +338,7 @@ impl GraphClient {
             base_url: base,
             token,
             response_limit: None,
+            catalogue: false,
         })
     }
 
@@ -416,6 +425,7 @@ impl GraphClient {
                 base_url: uri,
                 token,
                 response_limit: None,
+                catalogue: is_catalogue_scope(graph),
             })
         } else {
             Ok(GraphClient::Embedded { uri, actor: None })
@@ -486,6 +496,7 @@ impl GraphClient {
                 base_url: resolved.uri,
                 token,
                 response_limit: None,
+                catalogue: is_catalogue_scope(graph),
             })
         } else {
             let actor = resolve_cli_actor(cli_as)?;
@@ -503,6 +514,17 @@ impl GraphClient {
             GraphClient::Remote { base_url, .. } => base_url,
             GraphClient::Catalogue => omnigraph::catalogue::CATALOGUE_SCOPE,
         }
+    }
+
+    pub(crate) fn is_catalogue(&self) -> bool {
+        matches!(
+            self,
+            Self::Catalogue
+                | Self::Remote {
+                    catalogue: true,
+                    ..
+                }
+        )
     }
 
     /// The catalogue scope under the environment's defaults and the `--set`
@@ -745,6 +767,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let url = match branch {
                     Some(branch) => remote_url(base_url, &["commits"], &[("branch", branch)])?,
@@ -788,6 +811,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let url = match branch {
                     Some(branch) => remote_url(
@@ -835,6 +859,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let url = match branch {
                     Some(branch) => remote_url(
@@ -876,6 +901,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 remote_json_bounded(
                     http,
@@ -1133,6 +1159,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 if !settings.is_empty() {
                     bail!("{}", SETTINGS_AT_SERVED_LOAD);
@@ -1217,6 +1244,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let route: &[&str] = if expected_head.is_some() {
                     &["mutate", "if-graph-commit"]
@@ -1302,6 +1330,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_change_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
@@ -1430,6 +1459,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_change_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
@@ -1525,6 +1555,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_change_request(query_source);
                 request.branch = branch.map(str::to_string);
@@ -1649,6 +1680,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_query_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
@@ -1686,6 +1718,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_query_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
@@ -1724,6 +1757,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let mut request = branch_statement_query_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
@@ -1764,6 +1798,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let (branch, snapshot) = match &target {
                     Some(ReadTarget::Branch(branch)) => (Some(branch.clone()), None),
@@ -1851,6 +1886,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let body = InvokeStoredQueryRequest {
                     params: params_json.cloned(),
@@ -2449,6 +2485,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 let url = blob_write_url(base_url, query)?;
                 let request = match bytes {
@@ -2510,6 +2547,7 @@ impl GraphClient {
                 base_url,
                 token,
                 response_limit,
+                ..
             } => {
                 remote_json_bounded(
                     http,

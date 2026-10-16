@@ -356,7 +356,8 @@ fn schema_show_preserves_plain_source_and_json_contract() {
         payload,
         serde_json::json!({
             "schema_source": source,
-            "system_columns": { "id": "__id", "src": "__src", "dst": "__dst" }
+            "system_columns": { "id": "__id", "src": "__src", "dst": "__dst" },
+            "catalogue_source": omnigraph_compiler::catalogue_declarations()
         })
     );
 }

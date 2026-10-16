@@ -251,6 +251,45 @@ fn parity_schema_show() {
     let p = parity();
     let (l, r) = p.run(&["schema", "show", "--json"]);
     assert_parity("schema show", &l, &r);
+
+    let expected = std::fs::read_to_string(fixture("test.pg")).unwrap();
+    let (local, served) = p.run(&["schema", "show"]);
+    for (arm, output) in [("direct", local), ("served", served)] {
+        assert!(output.status.success(), "{arm}: {output:?}");
+        let source = stdout_string(&output);
+        assert_eq!(source.trim_end(), expected.trim_end(), "{arm}");
+        omnigraph_compiler::schema::parser::parse_schema(&source)
+            .unwrap_or_else(|err| panic!("{arm} schema output must re-parse: {err}"));
+    }
+
+    let home = p._temp.path().join("operator");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "servers:\n  local:\n    url: '{}'\nprofiles:\n  catalogue:\n    server: local\n    default_graph: og_catalog\n",
+            p.server.base_url
+        ),
+    )
+    .unwrap();
+    for addressing in [
+        vec!["--store", "og_catalog"],
+        vec!["--server", &p.server.base_url, "--graph", "og_catalog"],
+        vec!["--profile", "catalogue"],
+    ] {
+        let output = output_success(
+            cli()
+                .env("OMNIGRAPH_HOME", &home)
+                .env("OMNIGRAPH_BEARER_TOKEN", "parity-tok")
+                .args(&addressing)
+                .args(["schema", "show"]),
+        );
+        let source = stdout_string(&output);
+        assert!(
+            source.contains(&omnigraph_compiler::catalogue_declarations()),
+            "{addressing:?}: {source}"
+        );
+    }
 }
 
 #[test]

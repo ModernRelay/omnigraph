@@ -16,8 +16,9 @@ query operators() {
 ```
 
 The declarations, one per type, are in [`catalogue.gq`](catalogue.gq);
-`omnigraph schema show` prints them after a graph's own schema, and
-`omnigraph schema show og_catalog` prints them alone.
+`omnigraph schema show og_catalog` prints them. Ordinary `schema show`
+prints only the graph's reusable schema source; `--json` includes the
+built-in declarations in the separate `catalogue_source` field.
 
 ## Where to run it
 

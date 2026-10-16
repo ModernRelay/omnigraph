@@ -1405,14 +1405,13 @@ async fn run(cli: Cli) -> Result<()> {
                 let output = client.schema_source().await?;
                 if json {
                     print_json(&output)?;
-                } else {
-                    if !output.schema_source.trim().is_empty() {
-                        println!("{}", output.schema_source);
-                    }
+                } else if client.is_catalogue() {
                     if let Some(catalogue) = &output.catalogue_source {
                         println!("// engine catalogue (read-only, derived from this binary)");
                         println!("{catalogue}");
                     }
+                } else {
+                    println!("{}", output.schema_source);
                 }
             }
         },
