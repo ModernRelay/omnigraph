@@ -79,6 +79,15 @@ retain `http_status` and, when present, the original `retry_after` string.
 | 75 | The server's typed admission refusal proves this whole command did not start. Honor `Retry-After` and bound any caller retry. |
 | 1 | Inspect the action and details. A conflict, resource limit, unavailable server, incomplete response or lost connection does not by itself permit repeating the write. |
 
+A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
+`api_contract_mismatch` exits 1 with `execution: not_started`, `effects: none`
+and `action: refresh`. The server answers these before it admits the write:
+bearer authentication, then the API contract header, then policy. Fix the
+credential, the policy grant or the client before running the command again.
+The status counts only with its matching `code` in a response that carries the
+server's API contract header: a bare `403` from a proxy stays `unknown` with
+`reconcile`, and a refusal that also reports recovery work stays `recover`.
+
 `refresh` means inspect current inputs and correct the command; it does not grant
 automatic replay. `recover` means finish the reported recovery obligation.
 `reconcile` means establish the original operation's outcome before another

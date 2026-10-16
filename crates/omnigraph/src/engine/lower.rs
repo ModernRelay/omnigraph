@@ -24,9 +24,9 @@ use omnigraph_compiler::ir::SubqueryPredicate;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 use omnigraph_planner::logical::{EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use omnigraph_planner::{
-    Accumulator, AggregateFields, BoundPlan, ColumnRef, ContainsJoinFields, ExpandFields,
-    HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError,
-    Predicate, ROW_ADDRESS_PREFIX, RankArm, RankFuseFields, RankKind, RankedAccess,
+    Accumulator, AggregateFields, AntiJoinStrategy, BoundPlan, ColumnRef, ContainsJoinFields,
+    ExpandFields, HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan,
+    PlanError, Predicate, ROW_ADDRESS_PREFIX, RankArm, RankFuseFields, RankKind, RankedAccess,
     RuntimeFilterKind, RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
     ValueTable,
 };
@@ -725,6 +725,7 @@ impl Lower for Walk<'_, '_> {
             inner: inner_id,
             predicate,
             aggregate,
+            strategy,
             ..
         } = self.lowering.node(id)?
         else {
@@ -739,9 +740,12 @@ impl Lower for Walk<'_, '_> {
             )
             .into());
         }
-        let bulk = self
-            .lowering
-            .bulk_row_count(*inner_id, outer_var, predicate)?;
+        let bulk = match strategy {
+            AntiJoinStrategy::Correlated => self
+                .lowering
+                .bulk_row_count(*inner_id, outer_var, predicate)?,
+            AntiJoinStrategy::KeySet => None,
+        };
         let mask = AntiJoinMaskExec::new(
             outer,
             inner,
@@ -751,6 +755,7 @@ impl Lower for Walk<'_, '_> {
             Arc::clone(self.lowering.params()),
             scope.tag_column,
             scope.slot,
+            *strategy,
             bulk,
             Arc::clone(&self.scope.env),
         );

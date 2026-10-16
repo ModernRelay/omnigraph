@@ -2,7 +2,7 @@
 name: omnigraph
 description: Operate OmniGraph graphs and deployments. Use for `.pg` schemas, `.gq` queries, OmniGraph CLI commands, `file://`/`s3://`/`az://` graph URIs, `cluster.yaml`, operator config, bearer-authenticated servers, graph-backed knowledge or memory, Blob values, embeddings, branches, commits, and change feeds. Apply especially before schema changes, bulk loads, and retries after uncertain remote outcomes.
 license: MIT (see LICENSE at repo root)
-compatibility: Covers the current OmniGraph CLI and server, using HTTP contract 0.13. Upgrade the CLI, server and HTTP integrations together; storage formats 14 through 16 are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
+compatibility: Covers the current OmniGraph CLI and server, using HTTP contract 0.13. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
   author: ModernRelay
   version: "0.14.0"
@@ -16,8 +16,8 @@ This skill captures the operational rules for working with a locally or remotely
 Check `omnigraph version` and the command's `--help` before using these
 instructions. This skill tracks the current CLI/server contract, including
 `Omnigraph-Http-Api: 0.13`; the released 0.12 contract is unsupported. The engine
-reports `internal-schema 16 (serves v14 to v16)` and serves storage
-formats 14 through 16. New graphs use `__id`/`__src`/`__dst` system columns; a graph
+reports `internal-schema 16 (serves v14 to v16)`: the storage format it
+writes, then the range it serves. New graphs use `__id`/`__src`/`__dst` system columns; a graph
 that already spells them `id`/`src`/`dst` keeps its physical columns. A
 standalone v8 or v9 graph (written by 0.11.x) or a v13 graph is converted in
 place by the offline `omnigraph upgrade`; a v0.10 graph uses v6 and is first
@@ -25,6 +25,13 @@ taken to v9 with the 0.11 binary, or rebuilt. See
 [upgrading past v0.11](references/migrations.md#upgrade-v011-to-storage-format-14).
 Read [migration guidance](references/migrations.md) before replacing a
 deployed binary.
+
+An `omnigraph` binary that has the `skill` command carries the copy of this
+skill written for it: `omnigraph skill export <dir> --force` writes it where
+your agent loads skills, and `omnigraph skill show [<path>]` prints one file.
+Prefer that copy when the installed CLI differs from the one this copy was
+written for (see
+[version-matched skill](references/commands.md#version-matched-skill)).
 
 ## GQ 2.1 traversal support
 
@@ -170,6 +177,7 @@ Notation: `<x>` required · `[x]` optional · `<a|b>` choice · `…` repeatable
 - `export [--branch <b>] [--type <T>…]` (streams JSONL)
 - `branch <create <name> [--from <base>] | list | delete <name> | merge <source> [--into <target>] [--delete-branch]> [--json]` (`--from`/`--into` default to `main`; also available as GQ statements via `mutate -e`/`query -e`)
 - `commit <list [--branch <b>] | show <commit_id> | changes <commit_id> [filters…]> [--json]`
+- `diff --from <branch|commit_id> --to <branch|commit_id> [filters…] [--json]` — net entity changes between two read targets; `branch diff <source> [--into <target>]` reviews a branch against its merge base, and `branch merge-base <source> [--into <target>]` prints that base
 - `changes <poll [--start now|beginning|after:<id> | --cursor <c>] | baseline --out <snapshot.jsonl>> [filters…] [--json]`
 - `schema show` (alias `get`)
 
@@ -185,11 +193,13 @@ executing the query. It uses the ordinary query target and parameter flags.
 accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
 - `init --schema <f.pg> <uri> [--force]`
 - `schema <plan|apply> --schema <f.pg> [--json]` — `apply` refuses a cluster-managed graph; evolve those via `cluster apply`
-- `upgrade <uri> [--check] [--to-format 14] [--json]` — offline standalone
-  conversion of a v8, v9 or v13 graph to format 14, the only target.
-  `schema upgrade-system-columns <uri> [--check] [--json]` respells a
-  format-14 graph's legacy `id`/`src`/`dst` columns without changing the
-  format. Read [migration preconditions](references/migrations.md) first;
+- `upgrade <uri> [--check] [--to-format <N>] [--json]` — offline standalone
+  conversion of a v8, v9 or v13 graph to the format `omnigraph version`
+  reports as written, the only `--to-format` target; a graph at an older
+  served format is only stamped to it.
+  `schema upgrade-system-columns <uri> [--check] [--json]` respells a served
+  graph's legacy `id`/`src`/`dst` columns without changing its format.
+  Read [migration preconditions](references/migrations.md) first;
   cluster-managed roots refuse. The 0.11 binary's `upgrade` took
   `--to-format <7|8|9>` and defaulted to v9.
 - `lint --query <f.gq> [--schema <f.pg>] [<uri>] [--json]` — offline with `--schema`, graph-backed with a URI
@@ -206,7 +216,7 @@ accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
 **Local** (no graph):
 - `alias <name> [args…]` — invoke an operator alias's bound stored read query; `[--params … | --params-file <p>] [--format <fmt> | --json]` (server/graph/query come from the binding)
 - `embed (--seed <embed.yaml> | --input <raw.jsonl> --output <out.jsonl> --spec <spec.json>) [--reembed-all | --clean] [--type <T>…] [--select "<Type>:<field>=<value>"]`
-- `login <server> [--token <t>]` (prefer piping the token on stdin) · `logout <server>` · `login --api <origin>` / `logout --api <origin>` (managed session) · `profile <list | show [<name>]>` · `version`
+- `login <server> [--token <t>]` (prefer piping the token on stdin) · `logout <server>` · `login --api <origin>` / `logout --api <origin>` (managed session) · `profile <list | show [<name>]>` · `skill <export <dir> [--force] [--json] | show [<path>]>` · `version [--json]`
 
 Managed folders can select an Intent API with `login --api` and `use`; implicit
 `query`, `mutate`, `load`, `commit list`/`show` and `graphs list` then acquire
@@ -217,36 +227,39 @@ before using ambient targets or credentials.
 
 Pre-0.7.0 spellings (`read`/`change`/`ingest`, `--target`, positional `http://`) → [`references/migrations.md`](references/migrations.md).
 
-## Five Ontology Design Criteria (Gruber 1993)
+## Schema Design
 
-Omnigraph schemas are ontologies. The canonical design criteria from Gruber's *Toward Principles for the Design of Ontologies Used for Knowledge Sharing* (Int. J. Human-Computer Studies 43:907–928) apply directly when authoring `.pg` files.
+Omnigraph schemas are ontologies, and when many agents share one graph the
+schema is their coordinate system: it decides where a fact goes, what a stored
+value means, and which paths agents reason along. Design for **convergence**:
+two agents given the same input should write the same graph and read the same
+meaning back. Decide conservatively what to model; once modeled, constrain
+precisely, because tightening later is a rebuild (adding
+`@key`/`@unique`/`@range`/`@check`, changing cardinality, and `T?` → `T` are
+refused; only `@index` additions, nullable additions, enum widening, renames and
+drops apply in place).
 
-1. **Clarity** — definitions should communicate intended meaning unambiguously and be independent of social or computational context. In Omnigraph: precise type names, narrow enums over `String`, `@check`/`@range` for stated invariants. A reviewer should understand the domain from the schema alone.
-2. **Coherence** — inferences sanctioned by the schema must be consistent with the domain modeled. Gruber's trap: defining quantity as a `(magnitude, unit)` pair makes `6 feet ≠ 2 yards` even though they describe the same length. In Omnigraph: watch for `@card`, `@unique`, and edge directionality that let the schema distinguish things the domain treats as equal.
-3. **Extendibility** — the schema should support specialization without revising existing definitions. In Omnigraph: prefer interfaces for shared shape, leave enums open where the domain genuinely admits more, model identifiers via mapping functions rather than baking units/formats into the entity.
-4. **Minimal encoding bias** — representation choices made for notation or implementation convenience leak into the model. In Omnigraph: don't type dates as `String` because the source API returns strings; separate conceptual entities (a publication date, a person) from their surface encoding (a year integer, a name string) when both matter.
-5. **Minimal ontological commitment** — make as few claims about the world as the use case requires. In Omnigraph: don't add required properties, closed enums, or `@card(1..1)` "in case". Weaker schemas leave consumers room to specialize — but tightening later is a rebuild, not an in-place `schema apply` (adding `@key`/`@unique`/`@range`/`@check`, changing cardinality, and `T?` → `T` are refused; only `@index` additions, nullable additions, enum widening, renames, and drops apply in place), so decide deliberately.
-
-The criteria trade off against each other — Clarity wants tight definitions while Minimal Commitment wants weak ones. Gruber's resolution: *having decided a distinction is worth making, give it the tightest possible definition*. Decide what to model conservatively; once modeled, constrain precisely.
-
-## Schema Authoring Principles
-
-Twelve practical rules for `.pg` authoring — full text and examples in the bundled [`references/schema.md`](references/schema.md). In short: schema-is-the-contract · explicit identity via `@key` · model meaning not tables · strong intentional types · deliberate optionality · shared shape in interfaces · schema-level constraints (`@unique`/`@index`/`@range`/`@check`/`@card`) · search as a schema decision · edge semantics matter · reviewable schemas · intentional migrations (`@rename_from`) · domain clarity over ORM habits.
-
-Design flow: entities → stable keys → relationships worth their own edge → enum candidates → uniqueness/bounds/cardinality → search needs → shared shape into interfaces → evolution plan.
-
-## Provenance Is Structural (Multi-Agent Source of Truth)
-
-When Omnigraph serves as canonical truth across multiple agents, every assertion must answer *who said it, when, based on what evidence*. This is the runtime guarantee Gruber's criteria don't cover — his agents shared vocabulary; ours additionally must share attribution. Provenance belongs in the schema, not in logs.
-
-Without structural provenance, agents cannot reconcile contradictory assertions, retract facts when a source is discredited, replay graph state at a past timestamp, or distinguish high-evidence facts from speculation.
-
-**In Omnigraph:** model provenance as a `Claim` node linked by typed edges to
-the asserted fact, an `Actor`, and a `Source`. Keep scalar facts such as
-`asserted_at: DateTime` and optional `confidence: F64` on `Claim`; properties
-cannot be node-typed. Don't stash provenance into a free-text `source: String`
-or a metadata dump—structural provenance is queryable and migratable;
-free-form provenance is neither.
+In short: Gruber's five criteria (clarity · coherence · extendibility · minimal
+encoding bias · minimal commitment) · neither too loose (one meaning, many
+encodings) nor too tight (a meaning with no encoding): tight where agents must
+converge, open at declared extension points · write the questions as `.gq`
+first ·
+design identity first (`@key`, keyed edges, find before create) · kinds are
+types, roles are edges · put a fact on what determines it · keep attribution,
+justification, confidence and time on separate axes · provenance is structural
+(`Claim` → fact, `Actor`, `Source`), never a free-text `source` field · layer
+extracted and synthesized knowledge over raw spans, with lineage back to them,
+keyed per fact (span + extractor + statement digest) · store decisions, compute
+derived facts · narrow types and closed vocabularies · constraints in the
+schema; rules it cannot express as `GraphPolicy` nodes agents lint the graph
+against, including an orphan check per required link (`@card` never counts a
+node written with no edge) · compose around shared identities (modules add
+facets, never modify the core) from general primitives that combine · optimize
+retrieval: links for recall, specific edges, filters and answer-sized units for
+precision · write names, `@description` and `@instruction` for a reader without
+context · never repurpose a field · measure convergence with two independent
+encoders. Full text with Omnigraph
+mappings: [`references/schema-design.md`](references/schema-design.md).
 
 ## Storage & Credentials
 
@@ -386,6 +399,7 @@ For anything beyond the basics, load the relevant reference file. Each is self-c
 | Reference | When to load |
 |-----------|--------------|
 | [`references/schema.md`](references/schema.md) | Editing `.pg` files, running `schema plan`/`apply`, renaming types, backfilling required fields |
+| [`references/schema-design.md`](references/schema-design.md) | Designing or reviewing a schema: Gruber's criteria, design flow, identity, provenance, `GraphPolicy` rules, composition, and measuring convergence across agents |
 | [`references/queries.md`](references/queries.md) | Writing or linting `.gq` files, search functions, aggregations, multi-hop patterns |
 | [`references/data.md`](references/data.md) | Choosing between `mutate` and `load` (required `--mode`, `--from` to fork a review branch); branch review workflow; exact overwrite scope |
 | [`references/blobs.md`](references/blobs.md) | Writing and reading managed/external Blob values, selectors/ranges, security and lifecycle boundaries |

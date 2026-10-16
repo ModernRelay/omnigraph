@@ -1,6 +1,8 @@
 # Reference Commands
 
 ## Contents
+- Command index
+- Version-matched skill (skill export, skill show)
 - Inspect state (snapshot, export)
 - Branches · commits · changes · graphs
 - Blob reads
@@ -15,6 +17,63 @@
 - Cluster control plane (direct and managed)
 
 Commands you'll reach for but don't need best-practice rules around. Quick syntax reference.
+
+## Command Index
+
+Every public command of this CLI. `omnigraph <command> [<subcommand>] --help`
+prints the exact flags of the installed binary.
+
+| Command | Subcommands | Use |
+|---|---|---|
+| `query` | — | Run a read query: a served stored query by name, or ad-hoc `--query`/`-e` source; also the `branch list` and `explain` statements |
+| `mutate` | — | Run a mutation, or a `branch create`/`delete`/`merge` or `commit publish`/`drop` statement |
+| `alias` | — | Invoke an operator alias's stored read query |
+| `load` | — | Bulk-load JSONL; `--mode` is required |
+| `branch` | `create` `list` `delete` `merge` `diff` `merge-base` | Manage graph branches; `diff` reviews what a branch changed since its merge base, `merge-base` prints that base |
+| `snapshot` | — | Show one branch's types, entity counts and dataset versions |
+| `export` | — | Stream a branch as JSONL |
+| `diff` | — | Net entity changes between two read targets (branch heads or graph commit ids) |
+| `blob` | `get` `stat` `put` `clear` | Read, inspect, replace or clear one Blob cell |
+| `commit` | `list` `show` `changes` `publish` `drop` | Read history; publish or drop an unpublished commit |
+| `changes` | `poll` `baseline` | Follow a branch's change feed |
+| `schema` | `show` `plan` `apply` `upgrade-system-columns` | Read, plan or apply a schema; respell legacy system columns |
+| `graphs` | `list` | List the graphs a multi-graph server serves |
+| `init` | — | Create a graph from a `.pg` schema |
+| `upgrade` | — | Convert a standalone graph's storage offline |
+| `optimize` | — | Compact data and reconcile declared indexes |
+| `rebuild-full-text-indexes` | — | Replace one branch's full-text indexes |
+| `repair` | — | Report foreign Lance history without adopting it |
+| `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
+| `lint` | — | Validate `.gq` source against a schema or a graph |
+| `queries` | `validate` `list` | Check or list a cluster's stored queries |
+| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; `--managed` selects the managed service |
+| `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
+| `embed` | — | Generate, clean or refresh seed embeddings |
+| `login` | — | Store a server's bearer token, or open a managed session |
+| `logout` | — | Remove a stored token or a managed session |
+| `use` | — | Select a managed cluster for a config folder |
+| `profile` | `list` `show` | Inspect operator profiles |
+| `skill` | `export` `show` | Export or print this skill as built into the CLI |
+| `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
+
+## Version-Matched Skill
+
+The `omnigraph` binary carries this skill, written for its own commands and
+HTTP contract. Export it where your agent loads skills:
+
+```bash
+omnigraph skill export ~/.claude/skills/omnigraph --force --json
+omnigraph skill show                          # SKILL.md on stdout
+omnigraph skill show references/queries.md    # any other skill file
+```
+
+The export refuses to replace existing files unless `--force`. It also writes
+`.omnigraph-skill.json`, a record of each file it wrote; a later `--force`
+export uses it to remove files this skill no longer has, but only while their
+bytes are unchanged, and reports them under `removed` and `kept`. No other file
+in the directory is touched. `--json` reports the `files` written,
+`skill_version`, `cli_version` and `http_contract`. The command reads no
+configuration and needs no graph, server or network.
 
 ## Inspect State
 
@@ -130,9 +189,12 @@ omnigraph schema upgrade-system-columns "$REPO" --check --json
 ```
 
 `omnigraph upgrade` converts a standalone v8 or v9 graph (written by 0.11) or
-a v13 graph to storage format 14 in place, keeping branches, commit ids and
-commit history; `--to-format` accepts 14 only. `schema upgrade-system-columns`
-is a separate step on a graph already at 14: it respells the legacy
+a v13 graph in place to the storage format this binary writes, the first
+number `omnigraph version` reports, keeping branches, commit ids and commit
+history. A graph at an older format this binary serves is only stamped to it,
+with one metadata-only commit per live branch. `--to-format` accepts only the
+written format. `schema upgrade-system-columns` is a separate step on a graph
+this binary serves: it respells the legacy
 `id`/`src`/`dst` system columns and requires only `main` and no user property
 starting with `_`. Both are standalone, offline operations: stop every process
 using the graph and keep a verified whole-root backup; cluster-managed roots

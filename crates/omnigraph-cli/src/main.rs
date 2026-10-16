@@ -61,6 +61,7 @@ mod output;
 mod planes;
 mod schema_upgrade;
 mod scope;
+mod skill;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/unix_gateway.rs"]
 mod unix_gateway_fixture;
@@ -616,6 +617,17 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Skill { command } => match command {
+            SkillCommand::Export { dir, force, json } => {
+                let output = skill::export(&dir, force)?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    skill::print_export_human(&output);
+                }
+            }
+            SkillCommand::Show { path } => skill::show(&path)?,
+        },
         Command::Version { json } => print_version(&VersionOutput::current(), json)?,
         Command::Embed(args) => {
             let output = execute_embed(&args).await?;

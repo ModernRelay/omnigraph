@@ -184,6 +184,16 @@ query nobody_older() {
     }
     return { $p.name }
 }
+query skips_d1() {
+    match {
+        $p: Person
+        not {
+            $p likes $d
+            $d: Doc { title: "d1" }
+        }
+    }
+    return { $p.name }
+}
 query none_ordered() {
     match { $p: Person }
     return { $p.name }
@@ -793,6 +803,52 @@ async fn anti_join_inner_tree_is_skipped_under_the_bulk_check_and_executed_witho
         assert_eq!(operator(&run, leaf), "OuterReferenceExec");
         assert_eq!(row(&run, leaf).status, inner_status, "{name}");
     }
+}
+
+/// A key-set block's inner tree reads no outer rows: no `OuterReference`
+/// node, its table scan of the bounded binding and its reversed expand both
+/// executed, and the `AntiJoinMaskExec` keeps the persons d1 never met.
+#[tokio::test]
+async fn key_set_anti_join_executes_its_inner_tree_without_an_outer_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = graph(&dir, PEOPLE_SCHEMA, PEOPLE_SEED).await;
+    let (rows, run) = run(&db, PEOPLE_QUERIES, "skips_d1", &ParamMap::new()).await;
+    assert_eq!(rows, 2);
+    assert_covers(&run);
+    let anti = node_id(&run.plan, |node| {
+        matches!(
+            node,
+            PhysicalNode::AntiJoin {
+                strategy: omnigraph_planner::AntiJoinStrategy::KeySet,
+                ..
+            }
+        )
+    });
+    assert_eq!(operator(&run, anti), "AntiJoinMaskExec");
+    assert_eq!(row(&run, anti).status, RowStatus::Executed);
+    assert!(
+        !run.plan
+            .live()
+            .any(|(_, node)| matches!(node, PhysicalNode::OuterReference { .. }))
+    );
+    let root = node_id(&run.plan, |node| {
+        matches!(
+            node,
+            PhysicalNode::Scan {
+                source: omnigraph_planner::ScanInput::Table,
+                spec,
+                ..
+            } if spec.binding.as_deref() == Some("d")
+        )
+    });
+    assert_eq!(operator(&run, root), "ScanExec");
+    assert_eq!(row(&run, root).status, RowStatus::Executed);
+    let reversed = node_id(
+        &run.plan,
+        |node| matches!(node, PhysicalNode::Expand { src, dst, .. } if src == "d" && dst == "p"),
+    );
+    assert_eq!(operator(&run, reversed), "ExpandExec");
+    assert_eq!(row(&run, reversed).status, RowStatus::Executed);
 }
 
 #[tokio::test]
