@@ -573,7 +573,7 @@ Appendix A lists the changes kept out of this scope.
 | Connections | Remove the operator-config and credentials parsers (`graph_store/src/cli_config.rs`) and the name-based token lookup. The target picker waits for the listing in [A7](#a7-rfc-0059-additions); the launcher path does not need it. |
 | Access | Show a session's access from its line and hide write affordances in a read-only session. |
 | Agents | Give agents `omnigraph mcp --target`, or point the agent gateway at the session. |
-| Releases | Developer ID signing and notarization with a fixed team identifier in the release workflow, which today has a `(TEAMID)` placeholder and signs ad hoc without an identity; a stable latest download URL for each architecture; an updater inside the app; a stable package identity when Windows ships. Phase 5 waits for these. |
+| Releases | Configure the Apple secrets so every release is Developer ID signed and notarized; the workflow already does both when they are set, but releases so far are pre-releases signed ad hoc. A fixed, documented team identifier the CLI can pin; full releases with version-free asset names, so a latest URL resolves for each architecture; an updater inside the app; a package identity when Windows ships as an installer rather than a zip. Phase 5 waits for these ([omnigraph-studio#3](https://github.com/ModernRelay/omnigraph-studio/issues/3)). |
 | Specs | Rewrite spec 012's E1–E5 as this RFC and update specs 002 (links), 003 (connections), 011 and 013 (agents). |
 
 ### The managed control plane
@@ -592,7 +592,9 @@ tracked in that repository.
    writers.
 4. **`credential` and `omnigraph mcp`.**
 5. **Installing Studio**, once Studio's signed and notarized releases, team
-   identifier, latest URL and updater exist. `implementation: complete`.
+   identifier, latest URL and updater exist
+   ([omnigraph-studio#3](https://github.com/ModernRelay/omnigraph-studio/issues/3)).
+   `implementation: complete`.
 
 Phases 1–4 are usable without phase 5. Studio's steps follow each phase in its
 repository.
