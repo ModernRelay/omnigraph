@@ -54,7 +54,10 @@ kw_mode      = @{ "mode" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_delimiter = @{ "delimiter" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_header    = @{ "header" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_columns   = @{ "columns" ~ !(ASCII_ALPHANUMERIC | "_") }
-branch_create = { kw_create ~ branch_name ~ (kw_from ~ branch_name)? }
+branch_create = { kw_create ~ branch_name ~ (kw_from ~ (create_from_commit | branch_name))? }
+// `from commit "<id>"`: the new branch starts at that graph commit. A bare
+// `commit` with no quoted id after it names a branch called `commit`.
+create_from_commit = { kw_commit ~ string_lit }
 branch_delete = { kw_delete ~ branch_name }
 branch_merge  = { kw_merge ~ branch_name ~ (kw_into ~ branch_name)? ~ (as_commit_clause | dry_run_clause)? }
 branch_list   = { kw_list }

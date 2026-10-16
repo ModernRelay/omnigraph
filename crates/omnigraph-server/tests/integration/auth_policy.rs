@@ -2223,6 +2223,7 @@ async fn branch_statements_take_their_routes_policy_decision() {
     assert_forbidden(status, body, "branch create by a reader");
     let create = BranchCreateRequest {
         from: None,
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (status, body) = json_response(
@@ -2246,6 +2247,43 @@ async fn branch_statements_take_their_routes_policy_decision() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["actor_id"], "act-ragnor");
     assert_eq!(body["outcome"]["kind"], "created");
+    let head = body["outcome"]["from_commit_id"]
+        .as_str()
+        .expect("the receipt names the commit the branch starts at")
+        .to_string();
+
+    // A commit start the actor may not branch from answers the 404 of a
+    // `from` that names nothing, on both doors: the id discloses nothing.
+    let at_head = format!("branch create at_head from commit \"{head}\"");
+    let (status, body) =
+        json_response(&app, statement_request("/mutate", "reader-token", &at_head)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let create_at_head = BranchCreateRequest {
+        from: None,
+        from_commit: Some(head.clone()),
+        name: "at_head".to_string(),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("authorization", "Bearer reader-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create_at_head).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) =
+        json_response(&app, statement_request("/mutate", "admin-token", &at_head)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["outcome"]["from"], "main",
+        "the branch that wrote the commit"
+    );
+    assert_eq!(body["outcome"]["from_commit_id"], head);
 
     let (status, body) = json_response(
         &app,
@@ -2267,7 +2305,10 @@ async fn branch_statements_take_their_routes_policy_decision() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["rows"], json!([{"name": "feature"}, {"name": "main"}]));
+    assert_eq!(
+        body["rows"],
+        json!([{"name": "at_head"}, {"name": "feature"}, {"name": "main"}])
+    );
     let (status, body) = json_response(
         &app,
         statement_request("/query", "admin-token", "branch list"),
@@ -2466,6 +2507,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, _) = json_response(

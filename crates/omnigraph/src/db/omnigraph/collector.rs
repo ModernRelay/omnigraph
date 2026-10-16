@@ -513,7 +513,7 @@ async fn capture_index_paths(
     Ok(())
 }
 
-async fn capture_dataset_paths(
+pub(crate) async fn capture_dataset_paths(
     snapshot: &mut CollectorPathSnapshot,
     dataset: &lance::Dataset,
     location: &str,
