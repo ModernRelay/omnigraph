@@ -194,7 +194,8 @@ which Studio owns.
 
 - On macOS it opens Studio by bundle identifier (`open -b`); elsewhere through
   the platform opener. When Studio is not installed it prints how to install it
-  and exits nonzero. It never downloads anything or opens a browser.
+  and exits nonzero, until [installing Studio](#installing-studio) ships. It
+  never opens a browser.
 - With `--json` it prints the link and the target.
 - Studio resolves the target. For a direct target it runs
   `omnigraph serve --target NAME --reuse --json` with the login-shell
@@ -208,6 +209,39 @@ which Studio owns.
   as Studio's own link rules require.
 - A person who needs a terminal-only environment, such as a one-off
   `AWS_PROFILE`, runs `omnigraph serve` in that terminal; Studio attaches to it.
+
+### Installing Studio
+
+A later phase, gated on Studio shipping releases a launcher can verify: builds
+signed with Studio's Developer ID and notarized, a fixed Apple team identifier,
+a stable "latest" download URL for each architecture, and an updater inside
+the app. Until then `omnigraph studio` only prints how to install Studio. Once
+the gate opens it follows the Codex desktop launcher
+(`codex-rs/cli/src/desktop_app/`):
+
+- **macOS.**
+  - Find Studio in `/Applications` and `~/Applications` by its bundle
+    identifier, `com.modernrelay.omnigraph-studio`, not by its name.
+  - Before every open, run `codesign --verify --deep --strict` against the
+    requirement `identifier "com.modernrelay.omnigraph-studio" and anchor apple
+    generic and certificate leaf[subject.OU] = "<team>"`, so an app that only
+    carries Studio's name or bundle identifier is refused.
+  - When Studio is missing, download the latest disk image for the machine's
+    architecture into a temporary directory, mount it, and verify the mounted
+    app against the same requirement, refusing to install it if verification
+    fails. Copy it to `/Applications`, falling back to `~/Applications`, detach
+    the image and open Studio. The Apple signature is the integrity proof, so
+    no separate checksum is needed. A `--download-url` override, for testing,
+    is verified the same way.
+- **Windows.** Detect Studio by its package identity and open its link through
+  the protocol handler. When it is missing, open its installer or store page
+  and ask the person to rerun the command.
+- **Linux.** Print how to install Studio. Linux has no common installer
+  convention, and Codex implements none.
+
+The CLI pins no Studio version: it installs whatever the latest URL serves,
+and Studio updates itself. The two versions stay independent, and their only
+contract remains the link format.
 
 ### MCP for agents
 
@@ -444,6 +478,7 @@ Reverting removes the commands and the embedding API; no graph data migrates.
 | A cooperative writer lock on every direct write | The previous revision. It changes every direct write for a gap that exists without Studio, and protects only cooperating processes of one account on one machine. See [A1](#a1-cross-process-writer-safety). |
 | A browser UI embedded in the CLI ([PR #850](https://github.com/ModernRelay/omnigraph/pull/850)) | Studio is a native client in its own repository, and embedding a JavaScript build makes a frontend toolchain a prerequisite of every CLI build. Its boot mode takes cluster writer admission and runs unauthenticated. Its point that an embedder must reuse the server lifecycle is adopted as `serve_local`. |
 | Serve local graphs unauthenticated on loopback | Any local process or account can write, writes record no actor, and `Host` checks do not stop another local user. |
+| Never install Studio from the CLI | Leaves the first launch to a manual step. Installing is safe only with a signature to verify, which is why it waits for Studio's signed releases rather than being dropped. |
 | Studio bundles its own engine | A newer engine stamps a branch's storage format forward on first publication, and an older binary refuses a newer stamp. Sessions run the person's own CLI. |
 | Route every direct command through a live session automatically | RFC 0059 forbids discovery from selecting a destination, and [unified access paths](0009-unified-access-paths.md) rejects a localhost funnel for the embedded path. `--session` is explicit. |
 | Studio parses the CLI's files | Two resolvers have already drifted, and RFC 0059 changes the format. |
@@ -462,7 +497,7 @@ Surveyed 2026-10-15 and 2026-10-16 from source, documentation and advisories:
 | Prisma Studio | Serves its own UI locally and opens a browser | None | Fixed in 7.10 (August 2026, PR 29890) after "a malicious website visited while Studio was open could read or modify the connected database": binds `127.0.0.1`, no CORS, foreign `Origin` refused | Another port |
 | Supabase local | Studio and pg-meta in Docker | "Studio, pgMeta (/pg/*), and analytics have no authentication"; binds `0.0.0.0` | None | Finds the running stack by container label |
 | Jupyter Server | Serves its UI on `localhost` | Per-launch token; opens the browser on a `0600` file that redirects with the token, which replaced a single-use token in argv (notebook 5.7.3) | `Host` check on loopback; no CORS; foreign `Origin` refused | Runtime files (`0600`, `0700` directory) list running servers |
-| Codex | The desktop app runs its own app-server as a child; `codex app` only opens it with `codex://threads/new?path=…`; the daemon uses a `0600` Unix socket in a per-user `0700` directory | Socket permissions; non-loopback `ws://` requires a token given by file or digest | Any `Origin` refused | Lock plus connect probe; per-thread writer locks are empty files held with `try_lock` |
+| Codex | The desktop app runs its own app-server as a child; `codex app` opens it with `codex://threads/new?path=…` after verifying its code signature, and installs it from a signed disk image when missing; the daemon uses a `0600` Unix socket in a per-user `0700` directory | Socket permissions; non-loopback `ws://` requires a token given by file or digest | Any `Origin` refused | Lock plus connect probe; per-thread writer locks are empty files held with `try_lock` |
 | kubectl | `kubectl proxy` holds kubeconfig credentials; exec credential plugins return short-lived tokens to the client | kubeconfig bindings | `--accept-hosts` defaults to loopback | Not applicable |
 | Ollama, Vite, webpack-dev-server | Local HTTP servers | None by default | `Host` allowlists after DNS-rebinding advisories (CVE-2024-28224, CVE-2025-24010); webpack stopped relying on `Sec-Fetch-*` (CVE-2026-6402) and hardened header parsing (CVE-2026-14631) | Not applicable |
 
@@ -500,6 +535,11 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   check; directory ownership and mode refusals; `mcp` relaying, hosting and
   filtering write tools without `--write`; `studio` opening its link through a
   substituted opener and refusing when Studio is absent.
+- **CLI, the installer (phase 5),** with a substituted verifier and download
+  source: an app failing the signature requirement is refused before it opens
+  and before it installs; a missing app is downloaded, verified and installed
+  to the first writable Applications directory; an override URL is verified
+  the same way; Linux prints instructions.
 - **CLI, `integration/cli_schema_config.rs`:** `credential` over a pipe from the
   target-keyed variable and the credentials file, never `OMNIGRAPH_BEARER_TOKEN`;
   `credential_terminal` under a pseudo-terminal; `credential_kind` and
@@ -520,7 +560,7 @@ Appendix A lists the changes kept out of this scope.
 | Area | Change |
 |---|---|
 | `omnigraph-server` | `AppState::local`, `LocalOptions`, `SessionCredential`; `serve_local` with the lifecycle extracted from `serve_config`; local states mount no `/cluster/*` routes and cap MCP write tools by access; read-only refusal in `ingress::admit`. |
-| `omnigraph-cli` | `serve` (with `--write`, `--reuse`, `--port`, `--json`), `studio`, `mcp`, `credential` and `--session`, classified in `planes.rs`; the loopback guard; session records, reusing the `coordination.rs` checks; the notice to direct writers; the MCP bridge with its `readOnlyHint` filter; the platform opener. |
+| `omnigraph-cli` | `serve` (with `--write`, `--reuse`, `--port`, `--json`), `studio`, `mcp`, `credential` and `--session`, classified in `planes.rs`; the loopback guard; session records, reusing the `coordination.rs` checks; the notice to direct writers; the MCP bridge with its `readOnlyHint` filter; the platform opener; later, the Studio installer with code-signature verification. |
 | Docs | Amend the support boundary in [invariants](../dev/invariants.md); a user page for local sessions; the CLI reference; the server authentication page's self-hosting settings; the MCP guide's `omnigraph mcp`; the public embedding APIs in [control plane](../dev/control-plane.md); new owners in [testing](../dev/testing.md); a disposition note on RFC 0003 for the stdio bridge it deferred; `changelog.d` notes; new rows in the bundled skill's command index, which a drift test requires. |
 
 ### ModernRelay/omnigraph-studio
@@ -533,6 +573,7 @@ Appendix A lists the changes kept out of this scope.
 | Connections | Remove the operator-config and credentials parsers (`graph_store/src/cli_config.rs`) and the name-based token lookup. The target picker waits for the listing in [A7](#a7-rfc-0059-additions); the launcher path does not need it. |
 | Access | Show a session's access from its line and hide write affordances in a read-only session. |
 | Agents | Give agents `omnigraph mcp --target`, or point the agent gateway at the session. |
+| Releases | Developer ID signing and notarization with a fixed team identifier in the release workflow, which today has a `(TEAMID)` placeholder and signs ad hoc without an identity; a stable latest download URL for each architecture; an updater inside the app; a stable package identity when Windows ships. Phase 5 waits for these. |
 | Specs | Rewrite spec 012's E1–E5 as this RFC and update specs 002 (links), 003 (connections), 011 and 013 (agents). |
 
 ### The managed control plane
@@ -549,9 +590,12 @@ tracked in that repository.
    `studio` launcher, user docs and a changelog note.
 3. **Read-write sessions:** `--write`, `--session` and the notice to direct
    writers.
-4. **`credential` and `omnigraph mcp`.** `implementation: complete`.
+4. **`credential` and `omnigraph mcp`.**
+5. **Installing Studio**, once Studio's signed and notarized releases, team
+   identifier, latest URL and updater exist. `implementation: complete`.
 
-Studio's steps follow each phase in its repository.
+Phases 1–4 are usable without phase 5. Studio's steps follow each phase in its
+repository.
 
 ## Unresolved questions
 
@@ -733,3 +777,5 @@ against the graph URI while the route id is `default`.
 - 2026-10-16: Linked the Appendix A issues and the comment on PR #675, and
   described the managed control plane by what it must change rather than by
   its internal specs.
+- 2026-10-16: Added installing Studio as phase 5, following the Codex desktop
+  launcher and gated on Studio's signed, notarized releases.
