@@ -134,6 +134,11 @@ def main() -> int:
                 "release-edge.yml: only an audited commit on main may be published",
                 failures,
             )
+            require(
+                "\nconcurrency:\n  group: release-edge\n  cancel-in-progress: false\n" in text,
+                "release-edge.yml: runs must not overlap between publication and the rolling-channel checks",
+                failures,
+            )
             gate_call = job_block(text, "vocabulary_gate")
             require(
                 "source_ref: ${{ github.sha }}" in gate_call and "wait_minutes:" in gate_call,

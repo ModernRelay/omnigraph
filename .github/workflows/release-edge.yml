@@ -18,6 +18,13 @@ on:
   # Manual dispatch on `main` builds its tip now.
   workflow_dispatch:
 
+# One run at a time, from publication through the installer checks of the
+# rolling channel, so a newer build cannot move `edge` under an older run's
+# smoke tests.
+concurrency:
+  group: release-edge
+  cancel-in-progress: false
+
 jobs:
   # Decided before the audit gate, which may wait for the commit's CI run.
   prepare_edge_release:
@@ -96,11 +103,6 @@ jobs:
     name: Publish edge release
     needs: [vocabulary_gate, prepare_edge_release, build_release]
     runs-on: ubuntu-latest
-    # One writer of the edge releases at a time, across CI calls and manual
-    # dispatches.
-    concurrency:
-      group: release-edge-publication
-      cancel-in-progress: false
     permissions:
       contents: write
       id-token: write
