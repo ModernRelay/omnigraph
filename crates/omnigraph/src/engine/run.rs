@@ -44,10 +44,40 @@ pub(super) async fn run_plan(
     let batch = reservation
         .concat(&root.schema(), &batches)
         .map_err(|error| ctx.classify(error))?;
-    match return_order(plan)? {
-        Some(names) => in_order(batch, &names),
-        None => Ok(batch),
+    let batch = match return_order(plan) {
+        Some(names) => in_order(batch, &names)?,
+        None => batch,
+    };
+    let declared = plan
+        .properties(plan.root())
+        .ok_or_else(|| OmniError::manifest_internal("root has no declared schema"))?;
+    let schema = batch.schema();
+    if schema.fields().len() != declared.schema.fields().len()
+        || schema
+            .fields()
+            .iter()
+            .zip(declared.schema.fields())
+            .any(|(actual, expected)| {
+                actual.name() != expected.name() || actual.data_type() != expected.data_type()
+            })
+    {
+        return Err(OmniError::manifest_internal(
+            "root names, order, count or types differ from declared schema",
+        ));
     }
+    for field in declared.schema.fields() {
+        if !field.is_nullable()
+            && batch
+                .column_by_name(field.name())
+                .is_some_and(|column| column.null_count() != 0)
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "root column {} contains undeclared nulls",
+                field.name()
+            )));
+        }
+    }
+    Ok(batch)
 }
 
 /// The rows of pass `rung`: one per live node of `plan` in post-order, from

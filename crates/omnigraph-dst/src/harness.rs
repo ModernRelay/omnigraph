@@ -12,7 +12,10 @@ use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 
 use omnigraph::Session;
-use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
+use omnigraph::changes::{
+    ChangeEntityKind, ChangeFeedScope, ChangeOpKind, GraphDiffRequest, GraphDiffSides,
+    GraphEntityChange,
+};
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::error::{OmniError, Result as OmniResult};
 use omnigraph::loader::LoadMode;
@@ -3467,9 +3470,9 @@ async fn capture_history(db: &Omnigraph, main: &Model, history: &mut Vec<(String
 ///    must equal the recorded model state — for EVERY commit in the
 ///    universe's history. A recovery or maintenance op that corrupts the
 ///    PAST while preserving the head passed every oracle before this one.
-/// 2. **Conservative Person diff** over adjacent commits via
-///    `diff_commits`: every model-changed name must appear in the engine's
-///    ChangeSet, every engine-reported Delete must be a model delete, and
+/// 2. **Conservative Person diff** over adjacent commits via the graph diff
+///    (`diff_page`, every page): every model-changed name must appear in the
+///    engine's changes, every engine-reported Delete must be a model delete, and
 ///    engine deletes may not exceed model deletes. Deliberately one-sided
 ///    where semantics are ambiguous (a value-equal upsert may legitimately
 ///    surface as an engine Update the model-diff can't see) — no guessing,
@@ -3501,12 +3504,12 @@ async fn assert_history_matches(db: &Session, history: &[(String, Model)], where
     for pair in history.windows(2) {
         let (a_id, a_m) = &pair[0];
         let (b_id, b_m) = &pair[1];
-        let filter = ChangeFilter {
-            kinds: Some(vec![EntityKind::Node]),
+        let scope = ChangeFeedScope {
+            kinds: Some(vec![ChangeEntityKind::Node]),
             type_names: Some(vec!["Person".to_string()]),
             ops: None,
         };
-        let cs = match Box::pin(db.diff_commits(a_id, b_id, &filter)).await {
+        let changes = match Box::pin(graph_diff_changes(db, a_id, b_id, &scope)).await {
             Ok(changes) => changes,
             Err(OmniError::ChangeSchemaBoundary {
                 graph_commit_id,
@@ -3518,7 +3521,7 @@ async fn assert_history_matches(db: &Session, history: &[(String, Model)], where
                 continue;
             }
             Err(error) => panic!(
-                "{where_}: diff_commits over recorded history failed without a matching \
+                "{where_}: the graph diff over recorded history failed without a matching \
                  accepted schema transition: {error:?}"
             ),
         };
@@ -3540,30 +3543,57 @@ async fn assert_history_matches(db: &Session, history: &[(String, Model)], where
                 model_changed.insert(name.clone());
             }
         }
-        let engine_ids: BTreeSet<&str> = cs.changes.iter().map(|c| c.id.as_str()).collect();
-        let engine_deletes: BTreeSet<&str> = cs
-            .changes
+        let engine_ids: BTreeSet<&str> = changes.iter().map(|c| c.id.as_str()).collect();
+        let engine_deletes: BTreeSet<&str> = changes
             .iter()
-            .filter(|c| matches!(c.op, ChangeOp::Delete))
+            .filter(|c| matches!(c.op, ChangeOpKind::Delete))
             .map(|c| c.id.as_str())
             .collect();
         for name in model_changed.iter().chain(model_deleted.iter()) {
             assert!(
                 engine_ids.contains(name.as_str()),
-                "{where_}: diff_commits {a_id}→{b_id} is MISSING model-changed Person '{name}'"
+                "{where_}: the graph diff {a_id}→{b_id} is MISSING model-changed Person '{name}'"
             );
         }
         for name in &model_deleted {
             assert!(
                 engine_deletes.contains(name.as_str()),
-                "{where_}: diff_commits {a_id}→{b_id} did not report model-deleted Person '{name}' as Delete"
+                "{where_}: the graph diff {a_id}→{b_id} did not report model-deleted Person '{name}' as Delete"
             );
         }
         for id in &engine_deletes {
             assert!(
                 model_deleted.contains(*id),
-                "{where_}: diff_commits {a_id}→{b_id} reports a Delete of '{id}' the model never deleted"
+                "{where_}: the graph diff {a_id}→{b_id} reports a Delete of '{id}' the model never deleted"
             );
+        }
+    }
+}
+
+/// Every change of the graph diff `from` → `to` within `scope`, page by page.
+async fn graph_diff_changes(
+    db: &Session,
+    from: &str,
+    to: &str,
+    scope: &ChangeFeedScope,
+) -> omnigraph::error::Result<Vec<GraphEntityChange>> {
+    let mut request = GraphDiffRequest {
+        sides: GraphDiffSides::Between {
+            from: from.to_string(),
+            to: to.to_string(),
+        },
+        scope: scope.clone(),
+        page_token: None,
+        max_changes: None,
+        max_bytes: None,
+    };
+    let mut changes = Vec::new();
+    loop {
+        let page = db.diff_page(&request).await?;
+        changes.extend(page.changes);
+        match page.next_page_token {
+            Some(token) => request.page_token = Some(token),
+            None => return Ok(changes),
         }
     }
 }
@@ -7008,12 +7038,20 @@ mod collector_oracle_tests {
                     .unwrap()
                     .dataset_path
                     .clone();
+                let pinned = snapshot
+                    .open_dataset("node:Person")
+                    .await
+                    .unwrap()
+                    .published_dataset_version();
+                // The base is the manifest main pins; a table's first write
+                // also leaves the effect beneath its full-text declaration,
+                // a link no commit pins.
                 let initial = objects(store.as_ref()).await;
                 let base_manifests: Vec<_> = initial
                     .keys()
                     .filter(|path| {
-                        path.as_ref().contains(&format!("{table}/_versions/d"))
-                            && path.as_ref().ends_with(".manifest")
+                        path.as_ref()
+                            .ends_with(&format!("{table}/_versions/d{pinned}.manifest"))
                     })
                     .cloned()
                     .collect();

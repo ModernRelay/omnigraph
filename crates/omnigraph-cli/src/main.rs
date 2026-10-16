@@ -5,9 +5,9 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
-    BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitOutput,
-    ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotDatasetOutput, query_file_refusals,
+    BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
+    CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput,
+    SchemaApplyOutput, SnapshotDatasetOutput, query_file_refusals,
 };
 use omnigraph_cluster::{
     DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
@@ -15,7 +15,7 @@ use omnigraph_cluster::{
     validate_config_dir,
 };
 use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, EmptyFile, FileBody, QueryFile, SettingStmt,
+    BranchStmt, BranchWrite, CommitWrite, EmptyFile, FileBody, QueryFile, SettingStmt,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -61,6 +61,10 @@ mod output;
 mod planes;
 mod schema_upgrade;
 mod scope;
+mod skill;
+#[cfg(all(test, unix))]
+#[path = "../tests/support/unix_gateway.rs"]
+mod unix_gateway_fixture;
 mod upgrade;
 use cli::*;
 use helpers::*;
@@ -287,18 +291,13 @@ fn validate_cluster_arguments(
                 if plan.is_none() {
                     return Err(Cli::command().error(
                         clap::error::ErrorKind::MissingRequiredArgument,
-                        "cluster apply --managed requires --plan <PLAN_ID>",
+                        "cluster apply --managed requires --plan <PREVIEW_ID>",
                     ));
                 }
             }
-            ClusterCommand::Status {
-                deployment_id,
-                wait,
-                timeout,
-                ..
-            } if deployment_id.is_some() || *wait || timeout.is_some() => {
+            ClusterCommand::Status { deployment_id, .. } if deployment_id.is_some() => {
                 return Err(conflict(
-                    "--managed status accepts a positional RUN_ID; --deployment-id, --wait and --timeout apply only to server deployments",
+                    "--managed status accepts a positional DEPLOYMENT_ID; --deployment-id selects a server or storage deployment",
                 ));
             }
             _ => {}
@@ -309,6 +308,9 @@ fn validate_cluster_arguments(
     }
     match command {
         ClusterCommand::Create { .. }
+        | ClusterCommand::List { .. }
+        | ClusterCommand::Members { .. }
+        | ClusterCommand::Pull { .. }
         | ClusterCommand::Push { .. }
         | ClusterCommand::Delete { .. }
         | ClusterCommand::UndoDelete { .. }
@@ -337,7 +339,7 @@ fn validate_cluster_arguments(
             run_id: Some(_), ..
         } => {
             return Err(conflict(
-                "a positional RUN_ID requires --managed; use --deployment-id for a server or storage deployment",
+                "a positional delivery ID requires --managed; use --deployment-id for a server or storage deployment",
             ));
         }
         _ => {}
@@ -609,15 +611,18 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Version => {
-            println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
-            println!(
-                "internal-schema {} (serves v{} to v{})",
-                omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
-                omnigraph::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
-                omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
-            );
-        }
+        Command::Skill { command } => match command {
+            SkillCommand::Export { dir, force, json } => {
+                let output = skill::export(&dir, force)?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    skill::print_export_human(&output);
+                }
+            }
+            SkillCommand::Show { path } => skill::show(&path)?,
+        },
+        Command::Version { json } => print_version(&VersionOutput::current(), json)?,
         Command::Embed(args) => {
             let output = execute_embed(&args).await?;
             if args.json {
@@ -770,6 +775,8 @@ async fn run(cli: Cli) -> Result<()> {
                 source,
                 into,
                 delete_branch,
+                as_commit,
+                dry_run,
                 settings,
                 json,
             } => {
@@ -785,9 +792,11 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
                 let into = resolve_branch(into, None, "main");
-                echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
+                if !dry_run {
+                    echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
+                }
                 let payload = client
-                    .branch_merge(&source, &into, delete_branch, &settings)
+                    .branch_merge(&source, &into, delete_branch, as_commit, dry_run, &settings)
                     .await?;
                 // Keep the successful merge receipt on stdout; optional
                 // deletion has its own structured result and human warning.
@@ -799,21 +808,119 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 if json {
                     print_json(&payload)?;
-                } else {
+                } else if payload.dry_run {
                     println!(
-                        "merged {} into {}: {}",
+                        "dry run: merging {} into {} would be: {} (nothing was written)",
                         payload.source,
                         payload.target,
                         payload.outcome.as_str()
                     );
+                } else {
+                    match payload.commit.as_ref().filter(|commit| !commit.published) {
+                        Some(commit) => println!(
+                            "merged {} into {} as commit {}: {}",
+                            payload.source,
+                            payload.target,
+                            commit.graph_commit_id,
+                            payload.outcome.as_str()
+                        ),
+                        None => println!(
+                            "merged {} into {}: {}",
+                            payload.source,
+                            payload.target,
+                            payload.outcome.as_str()
+                        ),
+                    }
                     if payload.branch_deleted == Some(true) {
                         println!("deleted branch {}", payload.source);
                     }
                 }
             }
+            BranchCommand::Diff {
+                uri,
+                source,
+                into,
+                limit,
+                page_token,
+                kinds,
+                types,
+                ops,
+                json,
+            } => {
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let into = resolve_branch(into, None, "main");
+                let sides = client::DiffSidesArg::Branch {
+                    source: &source,
+                    target: &into,
+                };
+                run_diff(&client, sides, page_token, limit, kinds, types, ops, json).await?;
+            }
+            BranchCommand::MergeBase {
+                uri,
+                source,
+                into,
+                json,
+            } => {
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let into = resolve_branch(into, None, "main");
+                let output = client.merge_base(&source, &into).await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_merge_base_human(&output);
+                }
+            }
         },
+        Command::Diff {
+            uri,
+            from,
+            to,
+            limit,
+            page_token,
+            kinds,
+            types,
+            ops,
+            json,
+        } => {
+            let client = client::GraphClient::resolve(
+                capability,
+                cli.server.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+            )
+            .await?;
+            let sides = client::DiffSidesArg::Between {
+                from: &from,
+                to: &to,
+            };
+            run_diff(&client, sides, page_token, limit, kinds, types, ops, json).await?;
+        }
         Command::Commit { command } => match command {
-            CommitCommand::List { uri, branch, json } => {
+            CommitCommand::List {
+                uri,
+                branch,
+                unpublished,
+                unattached,
+                json,
+            } => {
                 let client = match managed_data {
                     Some(client) => client,
                     None => {
@@ -828,11 +935,76 @@ async fn run(cli: Cli) -> Result<()> {
                         .await?
                     }
                 };
-                let payload = client.list_commits(branch.as_deref()).await?;
+                let payload = if unattached {
+                    client.list_unattached_commits(branch.as_deref()).await?
+                } else if unpublished {
+                    client.list_unpublished_commits(branch.as_deref()).await?
+                } else {
+                    client.list_commits(branch.as_deref()).await?
+                };
                 if json {
                     print_json(&payload)?;
                 } else {
                     print_commit_list_human(&payload.commits);
+                }
+            }
+            CommitCommand::Publish {
+                uri,
+                commit_id,
+                json,
+            } => {
+                let client = client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                echo_write_target(
+                    cli.quiet,
+                    "commit publish",
+                    client.uri(),
+                    client.is_remote(),
+                );
+                let commit = client.commit_publish(&commit_id).await?;
+                if json {
+                    print_json(&commit)?;
+                } else {
+                    println!(
+                        "published commit {} on {}",
+                        commit.graph_commit_id,
+                        commit.graph_branch.as_deref().unwrap_or("main")
+                    );
+                }
+            }
+            CommitCommand::Drop {
+                uri,
+                commit_id,
+                json,
+            } => {
+                let client = client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                confirm_destructive("commit drop", client.uri(), cli.yes, json)?;
+                echo_write_target(cli.quiet, "commit drop", client.uri(), client.is_remote());
+                client.commit_drop(&commit_id).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "uri": client.uri(),
+                        "graph_commit_id": commit_id,
+                    }))?;
+                } else {
+                    println!("dropped commit {commit_id}");
                 }
             }
             CommitCommand::Show {
@@ -915,7 +1087,7 @@ async fn run(cli: Cli) -> Result<()> {
                             .commit_changes_page(
                                 &commit_id,
                                 next_page_token.as_deref(),
-                                limit,
+                                auto_page_limit(limit),
                                 &filter,
                                 &settings,
                             )
@@ -935,7 +1107,7 @@ async fn run(cli: Cli) -> Result<()> {
                             .commit_changes_page(
                                 &commit_id,
                                 next_page_token.as_deref(),
-                                limit,
+                                auto_page_limit(limit),
                                 &filter,
                                 &settings,
                             )
@@ -991,7 +1163,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 cursor.as_deref(),
                                 start.as_deref(),
                                 next_page_token.as_deref(),
-                                limit,
+                                auto_page_limit(limit),
                                 &filter,
                                 &settings,
                             )
@@ -1013,7 +1185,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 cursor.as_deref(),
                                 start.as_deref(),
                                 next_page_token.as_deref(),
-                                limit,
+                                auto_page_limit(limit),
                                 &filter,
                                 &settings,
                             )
@@ -1380,6 +1552,72 @@ async fn run(cli: Cli) -> Result<()> {
                     print_blob_stat_human(&output);
                 }
             }
+            BlobCommand::Put {
+                entity,
+                type_name,
+                id,
+                property,
+                branch,
+                file,
+                if_match,
+                json,
+            } => {
+                // A malformed precondition and input over the limit are
+                // refused before scope resolution, so neither arm starts.
+                let precondition = blob_cli::parse_if_match(if_match.as_deref())?;
+                let bytes = blob_cli::read_put_input(file.as_deref())?;
+                let query =
+                    blob_cli::blob_write_query(entity.into(), type_name, id, property, branch);
+                let client = client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let output = client
+                    .blob_write(&query, Some(bytes), if_match.as_deref(), precondition)
+                    .await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_blob_write_human(&output);
+                }
+            }
+            BlobCommand::Clear {
+                entity,
+                type_name,
+                id,
+                property,
+                branch,
+                if_match,
+                json,
+            } => {
+                let precondition = blob_cli::parse_if_match(if_match.as_deref())?;
+                let query =
+                    blob_cli::blob_write_query(entity.into(), type_name, id, property, branch);
+                let client = client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let output = client
+                    .blob_write(&query, None, if_match.as_deref(), precondition)
+                    .await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_blob_write_human(&output);
+                }
+            }
         },
         Command::Query {
             name,
@@ -1421,7 +1659,7 @@ async fn run(cli: Cli) -> Result<()> {
                         ..
                     }) => {
                         refuse_process_prefix_when_remote(&client, &prefix)?;
-                        run_branch_list_statement_cli(
+                        run_branch_read_statement_cli(
                             &client,
                             &query_source,
                             stmt,
@@ -1431,6 +1669,14 @@ async fn run(cli: Cli) -> Result<()> {
                         )
                         .await?
                     }
+                    Ok(QueryFile {
+                        body: FileBody::Commit(write),
+                        ..
+                    }) => bail!("{}", commit_write_at_read_door(&write)),
+                    Ok(QueryFile {
+                        body: FileBody::Load(stmt),
+                        ..
+                    }) => bail!("{}", helpers::load_at_read_door(&stmt)),
                     Ok(QueryFile {
                         body: FileBody::Show(id),
                         settings: prefix,
@@ -1513,7 +1759,6 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let params_json = load_params_json(&params)?;
             let has_target = branch.is_some();
-            let branch = resolve_branch(branch, None, "main");
             let result: Result<ChangeOutput> = if query.is_some() || query_string.is_some() {
                 // Ad-hoc lane: run the source; positional `name` selects within it.
                 let query_source =
@@ -1539,6 +1784,44 @@ async fn run(cli: Cli) -> Result<()> {
                         .await
                     }
                     Ok(QueryFile {
+                        body: FileBody::Commit(write),
+                        settings: prefix,
+                        ..
+                    }) => {
+                        refuse_process_prefix_when_remote(&client, &prefix)?;
+                        run_commit_statement_cli(
+                            &client,
+                            &query_source,
+                            write,
+                            has_target,
+                            name.is_some() || params_json.is_some(),
+                            if_commit.is_some(),
+                            cli.yes,
+                            json,
+                            &settings,
+                        )
+                        .await
+                    }
+                    Ok(QueryFile {
+                        body: FileBody::Load(stmt),
+                        settings: prefix,
+                        ..
+                    }) => {
+                        refuse_process_prefix_when_remote(&client, &prefix)?;
+                        run_load_statement_cli(
+                            &client,
+                            &query_source,
+                            stmt,
+                            branch.as_deref(),
+                            name.is_some() || params_json.is_some(),
+                            if_commit.is_some(),
+                            cli.yes,
+                            json,
+                            &settings,
+                        )
+                        .await
+                    }
+                    Ok(QueryFile {
                         body: FileBody::Show(id),
                         ..
                     }) => Err(color_eyre::eyre::eyre!("{}", show_at_write_door(id))),
@@ -1552,7 +1835,7 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                         client
                             .mutate(
-                                &branch,
+                                branch.as_deref(),
                                 &query_source,
                                 name.as_deref(),
                                 params_json.as_ref(),
@@ -1580,7 +1863,7 @@ async fn run(cli: Cli) -> Result<()> {
                         &name,
                         true,
                         params_json.as_ref(),
-                        Some(branch),
+                        branch,
                         None,
                         if_commit.as_deref(),
                     )
@@ -2071,6 +2354,9 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             ClusterCommand::Create { .. }
+            | ClusterCommand::List { .. }
+            | ClusterCommand::Members { .. }
+            | ClusterCommand::Pull { .. }
             | ClusterCommand::Push { .. }
             | ClusterCommand::Delete { .. }
             | ClusterCommand::UndoDelete { .. }
@@ -2157,7 +2443,7 @@ fn refuse_process_prefix_when_remote(
 /// The `query` door's branch-statement path: the door check, then the
 /// envelope refusals, then the round trip. The door rule itself is documented
 /// on `refuse_wrong_door` in `crates/omnigraph-server/src/handlers/dispatch.rs`.
-async fn run_branch_list_statement_cli(
+async fn run_branch_read_statement_cli(
     client: &client::GraphClient,
     query_source: &str,
     stmt: BranchStmt,
@@ -2169,7 +2455,14 @@ async fn run_branch_list_statement_cli(
         bail!("{}", control_write_at_read_door(write));
     }
     refuse_statement_envelope(has_target, has_name_or_params, false)?;
-    client.branch_list_statement(query_source, settings).await
+    match stmt {
+        BranchStmt::Read(read) => {
+            client
+                .branch_read_statement(query_source, read, settings)
+                .await
+        }
+        _ => client.branch_list_statement(query_source, settings).await,
+    }
 }
 
 /// The `query` door's `show` path: the envelope refusals `branch list`
@@ -2202,8 +2495,9 @@ async fn run_branch_statement_cli(
     json: bool,
     settings: &[(SettingId, SettingValue)],
 ) -> Result<ChangeOutput> {
+    let statement_name = stmt.statement_name();
     let BranchStmt::Write(write) = stmt else {
-        bail!("{}", read_at_write_door());
+        bail!("{}", read_at_write_door(statement_name));
     };
     refuse_statement_envelope(has_target, has_name_or_params, has_expected_head)?;
     if let BranchWrite::Delete { .. } = &write {
@@ -2212,6 +2506,77 @@ async fn run_branch_statement_cli(
     client
         .branch_write_statement(query_source, write, settings)
         .await
+}
+
+/// The `mutate` door's commit-statement path: the envelope refusals a branch
+/// statement meets, drop consent, then the round trip; the proposal names its
+/// own target, so `--branch` is refused like any request target.
+#[allow(clippy::too_many_arguments)]
+async fn run_commit_statement_cli(
+    client: &client::GraphClient,
+    query_source: &str,
+    write: CommitWrite,
+    has_target: bool,
+    has_name_or_params: bool,
+    has_expected_head: bool,
+    yes: bool,
+    json: bool,
+    settings: &[(SettingId, SettingValue)],
+) -> Result<ChangeOutput> {
+    refuse_statement_envelope(has_target, has_name_or_params, has_expected_head)?;
+    if let CommitWrite::Drop { .. } = &write {
+        confirm_destructive("commit drop", client.uri(), yes, json)?;
+    }
+    client
+        .commit_write_statement(query_source, write, settings)
+        .await
+}
+
+/// The `mutate` door's load-statement path: envelope refusals as for a
+/// branch statement, `--branch` as the target, overwrite consent, then the
+/// round trip under the base `embedded_file_source_policy` installs.
+#[allow(clippy::too_many_arguments)]
+async fn run_load_statement_cli(
+    client: &client::GraphClient,
+    query_source: &str,
+    stmt: omnigraph_compiler::query::ast::LoadStmt,
+    branch: Option<&str>,
+    has_name_or_params: bool,
+    has_expected_head: bool,
+    yes: bool,
+    json: bool,
+    settings: &[(SettingId, SettingValue)],
+) -> Result<ChangeOutput> {
+    refuse_statement_envelope(false, has_name_or_params, has_expected_head)?;
+    if stmt.mode == omnigraph_compiler::query::ast::LoadStmtMode::Overwrite {
+        confirm_destructive("load csv (mode overwrite)", client.uri(), yes, json)?;
+    }
+    let policy = if client.is_remote() {
+        None
+    } else {
+        embedded_file_source_policy(&stmt.source)?
+    };
+    client
+        .load_statement(branch, query_source, stmt, policy, settings)
+        .await
+}
+
+/// One embedded-only base over a `file://` source's directory, so a direct
+/// run authorizes the statement by the policy's own rule (base outside the
+/// graph root included); any other scheme installs nothing.
+fn embedded_file_source_policy(source: &str) -> Result<Option<omnigraph::ExternalBlobPolicy>> {
+    let Some(path) = source.strip_prefix("file://") else {
+        return Ok(None);
+    };
+    let Some((parent, _)) = path.rsplit_once('/') else {
+        bail!("`load csv \"{source}\"`: a `file://` source is an absolute path to a file");
+    };
+    let base = omnigraph::ExternalBlobBase::new(
+        format!("file://{parent}/"),
+        omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+    )
+    .map_err(|error| color_eyre::eyre::eyre!("`load csv \"{source}\"`: {error}"))?;
+    Ok(Some(omnigraph::ExternalBlobPolicy::allow(vec![base])?))
 }
 
 #[cfg(test)]
@@ -2257,4 +2622,85 @@ fn report_deployment_lock(status: &omnigraph_cluster::DeploymentStatus) {
             omnigraph::storage::redacted_storage_uri(&status.canonical_root)
         );
     }
+}
+
+/// The page size the CLI asks for when it follows every page itself: the
+/// public maximum unless `--limit` sets one. Every page resolves its commits
+/// again and restarts its ordered walk after the previous page's last change,
+/// so the same changes cost less in fewer, larger pages.
+fn auto_page_limit(limit: Option<usize>) -> Option<usize> {
+    Some(limit.unwrap_or(omnigraph::changes::COMMIT_CHANGES_MAX_CHANGES))
+}
+
+/// Print a graph diff: one page when `page_token` is given (the raw escape
+/// hatch), otherwise every page in turn, each emitted before the next is
+/// fetched.
+#[allow(clippy::too_many_arguments)]
+async fn run_diff(
+    client: &client::GraphClient,
+    sides: client::DiffSidesArg<'_>,
+    page_token: Option<String>,
+    limit: Option<usize>,
+    kinds: Vec<cli::ChangeKindArg>,
+    types: Vec<String>,
+    ops: Vec<cli::ChangeOpArg>,
+    json: bool,
+) -> Result<()> {
+    let kinds: Vec<omnigraph_api_types::EntityKindOutput> =
+        kinds.into_iter().map(Into::into).collect();
+    let ops: Vec<omnigraph_api_types::ChangeOpOutput> = ops.into_iter().map(Into::into).collect();
+    let filter = client::ChangeFilterArgs {
+        kinds: &kinds,
+        types: &types,
+        ops: &ops,
+    };
+    if let Some(page_token) = page_token.as_deref() {
+        let page = client
+            .diff_page(sides, Some(page_token), limit, &filter)
+            .await?;
+        if json {
+            print_json(&page)?;
+        } else {
+            print_diff_human(&page);
+        }
+        return Ok(());
+    }
+    let mut next_page_token: Option<String> = None;
+    if json {
+        let mut output = DiffJsonStream::new(io::BufWriter::new(io::stdout()));
+        loop {
+            let page = client
+                .diff_page(
+                    sides,
+                    next_page_token.as_deref(),
+                    auto_page_limit(limit),
+                    &filter,
+                )
+                .await?;
+            next_page_token = page.next_page_token.clone();
+            output.write_page(&page)?;
+            if next_page_token.is_none() {
+                break;
+            }
+        }
+        let _ = output.finish()?;
+    } else {
+        let mut output = DiffHumanStream::new();
+        loop {
+            let page = client
+                .diff_page(
+                    sides,
+                    next_page_token.as_deref(),
+                    auto_page_limit(limit),
+                    &filter,
+                )
+                .await?;
+            next_page_token = page.next_page_token.clone();
+            output.write_page(&page)?;
+            if next_page_token.is_none() {
+                break;
+            }
+        }
+    }
+    Ok(())
 }

@@ -384,6 +384,7 @@ pub enum MeasurementPresenceV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MeasurementAbsenceReasonV1 {
+    ServerCountersNotExposed,
     PhysicalAttemptsNotObservableAtLogicalWrappingSeam,
     LogicalCalibrationNotRun,
     PhysicalCalibrationNotRun,
@@ -451,6 +452,14 @@ pub fn sut_identity_for_execution(execution: &RunExecution) -> RecordResult<SutI
 pub(crate) fn sut_identity_for_build(
     build: &crate::runner::BuildEvidence,
 ) -> RecordResult<SutIdentityV1> {
+    let sut = sut_identity_from_build(build)?;
+    validate_sut(&sut)?;
+    Ok(sut)
+}
+
+pub(crate) fn sut_identity_from_build(
+    build: &crate::runner::BuildEvidence,
+) -> RecordResult<SutIdentityV1> {
     let worker_executable_sha256 = build.worker_executable_sha256.clone().ok_or_else(|| {
         RecordError::new(
             "missing_worker_attestation",
@@ -483,7 +492,6 @@ pub(crate) fn sut_identity_for_build(
             lance_mem_pool_size: build.effective_lance_mem_pool_size.clone(),
         },
     };
-    validate_sut(&sut)?;
     Ok(sut)
 }
 
@@ -1018,15 +1026,7 @@ pub(crate) fn validate_sut(sut: &SutIdentityV1) -> RecordResult<()> {
         &sut.build.worker_executable_sha256,
         "sut.build.worker_executable_sha256",
     )?;
-    validate_sorted_strings(&sut.engine.feature_flags, "sut.engine.feature_flags")?;
-    validate_sorted_strings(
-        &sut.engine.enabled_techniques,
-        "sut.engine.enabled_techniques",
-    )?;
-    validate_effective_environment_value(
-        &sut.engine.lance_mem_pool_size,
-        "sut.engine.lance_mem_pool_size",
-    )?;
+    validate_engine_configuration(&sut.engine)?;
     let canonical = serde_json::to_vec(sut).map_err(|error| {
         RecordError::new(
             "sut_identity_serialization_failed",
@@ -1044,6 +1044,16 @@ pub(crate) fn validate_sut(sut: &SutIdentityV1) -> RecordResult<()> {
             ),
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn validate_engine_configuration(engine: &EngineConfigurationV1) -> RecordResult<()> {
+    validate_sorted_strings(&engine.feature_flags, "sut.engine.feature_flags")?;
+    validate_sorted_strings(&engine.enabled_techniques, "sut.engine.enabled_techniques")?;
+    validate_effective_environment_value(
+        &engine.lance_mem_pool_size,
+        "sut.engine.lance_mem_pool_size",
+    )?;
     Ok(())
 }
 
@@ -1570,7 +1580,7 @@ fn validate_sorted_strings(values: &[String], path: &str) -> RecordResult<()> {
     Ok(())
 }
 
-fn validate_text(value: &str, path: &str) -> RecordResult<()> {
+pub(crate) fn validate_text(value: &str, path: &str) -> RecordResult<()> {
     if value.is_empty()
         || value.len() > MAX_TEXT_BYTES
         || value.trim() != value
@@ -1658,7 +1668,7 @@ fn validate_image_digest(value: &str, path: &str) -> RecordResult<()> {
     Ok(())
 }
 
-fn valid_lower_hex(value: &str, lengths: &[usize]) -> bool {
+pub(crate) fn valid_lower_hex(value: &str, lengths: &[usize]) -> bool {
     lengths.contains(&value.len())
         && value
             .bytes()
@@ -1970,7 +1980,7 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
     fn legacy_archive_wrapper_matches_the_independent_legacy_serializer() {
         let record = valid_record();
         let old = canonical_record_bytes(&record).unwrap();
-        let wrapped = crate::gqt_record::AnyRunRecordV1::Legacy(record);
+        let wrapped = crate::gqt_record::AnyRunRecordV1::Legacy(Box::new(record));
         assert_eq!(crate::gqt_record::canonical_bytes(&wrapped).unwrap(), old);
         assert_eq!(crate::gqt_record::parse(&old).unwrap(), wrapped);
     }
@@ -2090,7 +2100,7 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
         assert_eq!(
             canonical_record_bytes(&record).unwrap(),
             crate::gqt_record::canonical_bytes(&crate::gqt_record::AnyRunRecordV1::Legacy(
-                record.clone()
+                Box::new(record.clone())
             ))
             .unwrap()
         );
@@ -2256,7 +2266,7 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
         assert_eq!(
             encoded,
             crate::gqt_record::canonical_bytes(&crate::gqt_record::AnyRunRecordV1::Legacy(
-                aged.clone()
+                Box::new(aged.clone())
             ))
             .unwrap()
         );

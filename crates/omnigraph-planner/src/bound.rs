@@ -15,7 +15,14 @@ use crate::mirror::BoundPlanMirror;
 use crate::physical::{NodeId, PhysicalPlan};
 
 /// Saved execution plans use a separate version from rendered explain output.
-pub const BOUND_PLAN_VERSION: u32 = 1;
+/// Version 7 adds `distinct` to every aggregate expression. Version 8 adds
+/// to version 7: a node's declared ordering is typed order keys (column,
+/// expression with direction and null placement, identity, fused rank)
+/// instead of their text; a ranked scan declares where it applies its
+/// eligibility and its nearest policy, and the assumptions record full-text
+/// coverage. Version 9 adds to version 8 every `AntiJoin`'s `strategy`
+/// (`correlated` or `key_set`).
+pub const BOUND_PLAN_VERSION: u32 = 9;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

@@ -105,7 +105,7 @@ pub(crate) fn spell_shape_line(line: &ShapeLine) -> String {
     }
 }
 
-fn is_type_name(s: &str) -> bool {
+pub(crate) fn is_type_name(s: &str) -> bool {
     let mut chars = s.chars();
     chars.next().is_some_and(|c| c.is_ascii_uppercase())
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -149,7 +149,7 @@ fn is_column_name(name: &str) -> bool {
 
 /// The `.pg` type of one shape line, through the product schema parser: the
 /// text is parsed as the one property of a `node Shape { }` declaration.
-fn parse_type(type_text: &str) -> Option<PropType> {
+pub(crate) fn parse_type(type_text: &str) -> Option<PropType> {
     let file = parse_schema(&format!("node Shape {{\n    v: {type_text}\n}}\n")).ok()?;
     let [SchemaDecl::Node(node)] = file.declarations.as_slice() else {
         return None;

@@ -15,8 +15,11 @@
 //! A `table` row fills the fields from `location` to `dropped_at`, the one
 //! `graph_commit` row and every `settled_commit` row fill the fields from
 //! `graph_branch` to `schema_content_hash`, and a `replaced_table` row fills the fields
-//! of a `table` row and `replaced_at`; the fields of the other row types are
-//! null.
+//! of a `table` row and `replaced_at`; a `history_block` row fills `block_id`,
+//! `first_slot`, `last_slot`, `generation` and `parent_commit_id`, a
+//! `history_merge` row `block_id`, `first_slot`, `last_slot`, `generation` and
+//! `merged_parent_commit_id`; the fields of the other row types are null. A
+//! stamp-14 record lacks the three registry children, read as null.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,15 +123,27 @@ pub(crate) const REPLACED_FIELDS: [(&str, FieldType); 2] = [
     ("registered_at", FieldType::UInt64),
 ];
 
-const RECORD_FIELD_COUNT: usize = TABLE_FIELDS.len() + COMMIT_FIELDS.len() + REPLACED_FIELDS.len();
+/// The fields a `history_block` or `history_merge` row holds beside the
+/// commit fields it reuses: the block, and the run of slots the row describes
+/// (a merge row's one slot is both ends). Stamp 15 added them after
+/// [`REPLACED_FIELDS`], so a stamp-14 record lacks exactly these children.
+pub(crate) const REGISTRY_FIELDS: [(&str, FieldType); 3] = [
+    ("block_id", FieldType::Utf8),
+    ("first_slot", FieldType::UInt64),
+    ("last_slot", FieldType::UInt64),
+];
 
-/// The logical fields folded into `record`, [`TABLE_FIELDS`], [`COMMIT_FIELDS`]
-/// then [`REPLACED_FIELDS`], in bit order and in the order of
-/// [`manifest_schema`] after `object_id` and `object_type`.
+const RECORD_FIELD_COUNT: usize =
+    TABLE_FIELDS.len() + COMMIT_FIELDS.len() + REPLACED_FIELDS.len() + REGISTRY_FIELDS.len();
+
+/// The logical fields folded into `record`, [`TABLE_FIELDS`], [`COMMIT_FIELDS`],
+/// [`REPLACED_FIELDS`] then [`REGISTRY_FIELDS`], in bit order and in the order
+/// of [`manifest_schema`] after `object_id` and `object_type`.
 pub(crate) const RECORD_FIELDS: [(&str, FieldType); RECORD_FIELD_COUNT] = {
     let mut fields = [("", FieldType::Utf8); RECORD_FIELD_COUNT];
     let commits = TABLE_FIELDS.len();
     let replaced = commits + COMMIT_FIELDS.len();
+    let registry = replaced + REPLACED_FIELDS.len();
     let mut next = 0;
     while next < commits {
         fields[next] = TABLE_FIELDS[next];
@@ -138,8 +153,12 @@ pub(crate) const RECORD_FIELDS: [(&str, FieldType); RECORD_FIELD_COUNT] = {
         fields[next] = COMMIT_FIELDS[next - commits];
         next += 1;
     }
-    while next < fields.len() {
+    while next < registry {
         fields[next] = REPLACED_FIELDS[next - replaced];
+        next += 1;
+    }
+    while next < fields.len() {
+        fields[next] = REGISTRY_FIELDS[next - registry];
         next += 1;
     }
     fields
@@ -408,11 +427,21 @@ pub(crate) fn expand_record(
     let mut columns = Vec::with_capacity(fields.len());
     for (bit, (name, field_type)) in fields.iter().enumerate() {
         let mask = 1u32 << bit;
-        let child = record.column_by_name(name).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
+        let Some(child) = record.column_by_name(name) else {
+            if REGISTRY_FIELDS.iter().any(|(registry, _)| registry == name) {
+                columns.push(match field_type {
+                    FieldType::Utf8 => Arc::new(StringArray::new_null(present.len())) as ArrayRef,
+                    FieldType::UInt64 => {
+                        Arc::new(arrow_array::UInt64Array::new_null(present.len()))
+                    }
+                    FieldType::Int64 => Arc::new(arrow_array::Int64Array::new_null(present.len())),
+                });
+                continue;
+            }
+            return Err(OmniError::manifest_internal(format!(
                 "manifest record struct is missing child '{name}'"
-            ))
-        })?;
+            )));
+        };
         require_type(name, child, *field_type)?;
         let mut nulls = NullBufferBuilder::new(present.len());
         for bits in present.values() {

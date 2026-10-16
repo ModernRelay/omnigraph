@@ -37,6 +37,26 @@ start; see [cluster deployments](../clusters/index.md).
 An unapplied resource edit does not activate it, although changing or breaking
 the directory's config can change where boot looks for applied state.
 
+For first boot of a fresh, empty S3 cluster initialized by the library, use
+`--bootstrap-handoff FILE` with its exact receipt. This is a one-time ownership
+claim, not a restart or recovery path; see
+[first boot from a bootstrap receipt](../clusters/index.md#first-boot-from-a-bootstrap-receipt).
+
+### Logs
+
+The server logs to standard output at `info` unless `RUST_LOG` sets other
+levels. `omnigraph_server::init_tracing()` limits three dependency targets, and
+their `::` children, to warnings and errors even with `RUST_LOG=trace`: `rmcp`,
+whose verbose SDK logs contain query arguments and results, and Lance's
+`lance::dataset_events` and `lance::file_audit`, which at `info` name every
+table's full storage URI, every file Lance creates or deletes, and each delete
+predicate with its entity IDs. Other targets keep their configured levels.
+Embedders using their own subscriber must enforce the same filter.
+
+A failed Blob delivery, change-route request or streamed response is logged by
+its error class, never by its message; see
+[HTTP errors](troubleshooting.md#http-errors).
+
 ## HTTP contract
 
 Upgrade the v0.13 CLI, server and HTTP integrations together. Every protected
@@ -54,7 +74,7 @@ means unknown effects, never permission to replay. Proxies must preserve it both
 
 Server URLs name the service root, including its proxy prefix. Select a graph
 with `--graph`, `default_graph` or `alias.graph`. Migrate graph-qualified server
-URLs to that root plus graph selection; the CLI never guesses a root from a path.
+URLs to that root plus graph selection; the CLI never guesses a root from a path. A `unix:///absolute/path.sock` URL names a Unix-domain socket instead: its whole path is the socket, so it has no proxy prefix, and requests carry `Host: localhost`; see [Unix-socket access](../deployment.md#unix-socket-access).
 
 Public `/healthz`, `/readyz` and `/openapi.json` need no header and identify the
 contract in their responses. Before every graph, registry or deployment request, the CLI sends
@@ -171,32 +191,10 @@ never fetch keys or call a control service, so publisher outages eventually
 prevent new OIDC access; accepted operations can finish. Admission refresh does
 not restart writers. Graph configuration retains its normal activation.
 
-With this profile configured, the server additionally exposes:
-
-- `GET /.well-known/oauth-protected-resource`: public resource identifier,
-  authorization server and supported bearer delivery, without identity lists.
-- `/mcp`: Streamable HTTP MCP using the maintained Rust SDK. Authentication
-  failures advertise protected-resource metadata for standard OAuth clients.
-
-The initial MCP tools are `graphs` (IDs and names), `queries` (permitted stored
-read names for one graph), and `query` (a named stored read with parameters and
-an optional branch). Mutation definitions are excluded and cannot be invoked
-through a read tool. These tools use the same actor and Cedar checks as HTTP
-graph requests. Limits are 30 seconds to wait, 16 concurrent executions,
-64 KiB requests and 1 MiB results. Cancelled or expired callers stop waiting;
-execution retains its input and slot until it finishes, with no later result
-lookup. See [admission and shutdown](../deployment.md).
-
-`omnigraph_server::init_tracing()` limits `rmcp` and `rmcp::*` logging to warnings
-and errors even with `RUST_LOG=trace`: verbose SDK logs contain query arguments
-and results. Other targets keep their configured levels. Embedders using their
-own subscriber must enforce the same SDK filter.
-
-Requests require the resource authority or a loopback host; browsers must use
-the resource origin, while native clients can omit `Origin`. The deployment
-must separately supply a reachable server URL and public metadata at the
-advertised resource location. Direct/static deployments without this option
-keep their existing routes and do not expose MCP.
+With this profile configured, the server also serves public
+protected-resource metadata and an OAuth challenge on its [`/mcp`](mcp.md)
+endpoint, so standard OAuth clients such as Claude can sign in. The [MCP guide](mcp.md) describes the
+endpoint, its tools, settings and limits.
 
 ## Route families
 
@@ -209,22 +207,22 @@ keep their existing routes and do not expose MCP.
 | `GET /graphs/discovery` | Graph IDs and display names only; requires an identity credential |
 | `POST /cluster/deployments` | Submit an exact-ID deployment: graph creation/deletion or schema, query, policy, provider and Blob-binding changes |
 | `GET /cluster/deployments`, `GET /cluster/deployments/{id}` | Authorized deployment status and current-process activation observation |
-| `GET /.well-known/oauth-protected-resource` | Public OIDC resource metadata; only when OIDC trust is configured |
-| `/mcp` | Stored reads and discovery over MCP; only when OIDC trust is configured |
+| `GET /.well-known/oauth-protected-resource`, also at the resource's path suffix | Public OIDC resource metadata; only when OIDC trust is configured |
+| `/mcp` | The [MCP endpoint](mcp.md); when static tokens, signed data tokens or OIDC trust are configured |
 | `/graphs/{id}/query`, `/mutate` | Run inline GQ source |
 | `/graphs/{id}/mutate/if-graph-commit` | Run an inline conditional mutation |
 | `/graphs/{id}/queries` | List and invoke stored queries, including conditional mutations |
 | `/graphs/{id}/load`, `/load/ndjson` | Bounded batch loading |
-| `/graphs/{id}/blob` | GET/HEAD one Blob cell |
-| `/graphs/{id}/branches` | Branch management and merge |
-| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, and per-commit changes |
-| `/graphs/{id}/changes` | Poll a branch feed or establish a baseline |
+| `/graphs/{id}/blob` | GET/HEAD one Blob cell; PUT/DELETE to replace or clear it |
+| `/graphs/{id}/branches` | Branch management and merge, a merge dry run (`dry_run: true`), a branch's diff against its merge base (`GET /branches/diff`) and that merge base (`GET /branches/merge-base`) |
+| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, per-commit changes, and the unpublished commits of a branch (`GET /commits?unpublished=true`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
+| `/graphs/{id}/changes`, `/diff` | Poll a branch feed, establish a baseline, or diff two points (branches or commit ids) |
 | `/graphs/{id}/schema` | Show the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
 
-`/query` also serves `branch list`, `show`, and [explain](../queries/explain.md).
-`/mutate` serves `branch create`, `branch delete`, and `branch merge`.
-See [Branching](../branching/index.md).
+`/query` also serves `branch list`, the branch reads (`branch diff`, `branch merge-base`, `branch merge … dry run`), `show`, and [explain](../queries/explain.md).
+`/mutate` serves `branch create`, `branch delete`, `branch merge`, `commit publish`,
+and `commit drop`. See [Branching](../branching/index.md).
 Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`
 takes an optional `settings` field, and the two GET change routes a `set=`
 parameter; see [Session settings](../queries/index.md#session-settings).
@@ -307,23 +305,23 @@ is an error unless the request supplies `from`. This differs from the CLI,
 where `--mode` is always required.
 
 See [Mutations and loading](../mutations/index.md) for the record shape and load
-modes.
+modes, including [CSV statements on `/mutate`](../mutations/index.md#csv-loading).
 
 ## Deliver Blob values
 
-`GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and
-`property`. They support managed ranges/ETag conditions and report external
-references without fetching them. See [Blob values](../blobs.md) for details
-and [Blob limits](../blobs.md#limits).
+`GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and `property`,
+support managed ranges/ETag conditions, and report external references without fetching
+them. `PUT` and `DELETE` replace or clear the cell; see [Blob values](../blobs.md),
+[Replacing one Blob value](../blobs.md#replacing-one-blob-value) and [Blob limits](../blobs.md#limits).
 
 ## Changes and baselines
 
 `GET /graphs/{id}/commits/{commit_id}/changes` compares a commit with its first
-parent. `GET /graphs/{id}/changes` polls complete branch commits; the terminal
-response supplies its durable cursor. Unreadable history returns `410 change_feed_gap`.
-`POST /graphs/{id}/changes/baseline` streams entities, then a snapshot commit and
-resume cursor. See [Changes and Change Feeds](../branching/changes.md) for
-pagination, checkpointing and recovery.
+parent, `GET /graphs/{id}/diff?from=&to=` any two points, and `/branches/diff`
+a branch with its merge base. `GET /graphs/{id}/changes` polls branch commits
+and returns a durable cursor; unreadable history returns `410 change_feed_gap`.
+`POST /graphs/{id}/changes/baseline` streams entities, a snapshot commit and a
+resume cursor ([Changes, Diffs and Change Feeds](../branching/changes.md)).
 
 ## Errors and retries
 

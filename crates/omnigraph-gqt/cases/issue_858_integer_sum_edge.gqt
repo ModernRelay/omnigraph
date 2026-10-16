@@ -1,0 +1,29 @@
+# issue: 858
+# red_on: 90b188bc
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+edge Pays: Person -> Person { amount: I64? }
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"edge":"Pays","from":"a","to":"b","data":{"amount":9007199254740993}}
+{"edge":"Pays","from":"b","to":"a","data":{"amount":-9007199254740992}}
+{"edge":"Pays","from":"a","to":"a"}
+--- query
+query edge_total() {
+    match { $p: Person $p $e:pays $q }
+    return { sum($e.amount) as total }
+}
+--- expect unordered
+{"total":1.0}
+--- expect shape
+total: F64
+--- expect plan
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?

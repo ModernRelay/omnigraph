@@ -51,7 +51,17 @@ five more changes like this one?**
    staged file nothing references, which a retry ignores. `cleanup`'s
    collector reclaims such a version only when the publication authority
    its transaction properties record is provably gone; age does not prove
-   abandonment. Published table effects and the accepted schema contract
+   abandonment. The two explicitly requested exceptions are the publishable
+   proposal (`as commit`, [RFC](../rfcs/2026-10-10-unpublished-graph-commits.md))
+   and the nonpublishable snapshot (`as unattached branch`,
+   [RFC](../rfcs/2026-10-11-unattached-graph-branches.md)): each writes a
+   detached `__manifest` version reachable by its graph commit id through a
+   reserved tag, `unpublished_<id>` for the proposal and
+   `unattached_<root>_<C>` for the snapshot, which acknowledges durable
+   snapshot addressability with `published: false` and never branch
+   visibility; the branch still changes only at the proposal's later ordinary
+   publication, the snapshot never publishes, and both tags expire with the
+   captured target authority. Published table effects and the accepted schema contract
    are complete in one manifest publication; no contract-file installation
    remains. There is no side record to classify. The collector holds two properties
    on every run: safety, that every pin of every retained `__manifest`
@@ -83,6 +93,18 @@ five more changes like this one?**
    mutations, polymorphism, policy predicates, and future planner capabilities
    belong in AST, IR, and typed plan structures. Do not smuggle semantics
    through strings, transport flags, global state, or side tables.
+   Expressions and parameter declarations retain the compiler's type.
+   Numeric comparison conversions are explicit Cast nodes; execution and scan
+   pushdown never select a domain from values. The internal exact integer
+   carrier cannot appear in a declared property, parameter or public result.
+   Mutation statements retain the compiler-selected node or edge target;
+   execution does not choose again when both namespaces contain the same name.
+   Binding validates every declared parameter, including unused declarations;
+   replay validates used values against the retained leaves. Projection fields
+   come from those declarations, including empty results. Opened Lance fields
+   must match the accepted storage schema in type and nullability. Derived
+   operator fields may widen nullable flags, but values may not violate a
+   declared non-null constraint.
 
 10. **Trust is established at the boundary and enforced at the engine.** HTTP
     resolves bearer tokens to actors; a client never supplies its trusted actor
@@ -154,8 +176,10 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
   unsupported; unexpected roots and schema drift refuse rather than infer
   identity from matching text.
   One outstanding durable authority owns completion/recovery. Generic drain
-  does not prove native-I/O settlement or authorize lock release; excluded raw
-  and older writers remain an operator obligation.
+  does not prove native-I/O settlement. Clean server release additionally closes
+  its explicit storage scope, drains accepted backend mutations and refuses
+  sticky uncertainty; S3 release/reacquisition uses the same lock key by CAS.
+  Excluding raw and older writers remains an operator obligation.
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity
   smoke proof is complete.

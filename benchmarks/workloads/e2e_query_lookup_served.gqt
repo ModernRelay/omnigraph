@@ -1,0 +1,32 @@
+# issue: none
+# notes: One checked warmup precedes one measured query against a long-running server; an exact result check follows.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- query
+query lookup() { match { $p: Person { name: "p000500" } } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"p000500","p.age":0}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- query
+query lookup() { match { $p: Person { name: "p000500" } } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"p000500","p.age":0}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- query
+query lookup() { match { $p: Person { name: "p000500" } } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"p000500","p.age":0}
+--- expect shape
+p.name: String
+p.age: I64

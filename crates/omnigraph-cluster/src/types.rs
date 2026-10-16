@@ -122,6 +122,15 @@ pub struct StateObservations {
 
 impl StateObservations {
     pub(crate) fn observe_lock_metadata(&mut self, lock: &StateLockFile) {
+        if lock.is_released() {
+            self.locked = false;
+            self.lock_id = None;
+            self.lock_operation = None;
+            self.lock_created_at = None;
+            self.lock_pid = None;
+            self.lock_age_seconds = None;
+            return;
+        }
         self.locked = true;
         self.lock_id = Some(lock.lock_id().to_string());
         self.lock_operation = Some(lock.operation().to_string());
@@ -526,11 +535,9 @@ fn secret_ref_name(value: &str) -> Result<&str, String> {
         .strip_prefix("${")
         .and_then(|s| s.strip_suffix('}'))
         .filter(|name| !name.trim().is_empty())
+        // Never echo the value: an inline one is the secret itself.
         .ok_or_else(|| {
-            format!(
-                "embedding api_key must be a ${{NAME}} env reference, got '{}'",
-                value.trim()
-            )
+            "embedding api_key must be a ${NAME} env reference, not an inline secret".to_string()
         })
 }
 
@@ -697,6 +704,10 @@ mod embedding_provider_config_tests {
         };
         let err = profile.resolve().unwrap_err();
         assert!(err.contains("${NAME}"), "got: {err}");
+        assert!(
+            !err.contains("sk-inline"),
+            "the refusal echoed the key: {err}"
+        );
     }
 
     #[test]

@@ -18,6 +18,8 @@ Graph-scoped actions:
 | `branch_create` | Branch creation |
 | `branch_delete` | Branch deletion |
 | `branch_merge` | Branch merge |
+| `commit_publish` | Publication of an unpublished commit onto its recorded target branch |
+| `commit_drop` | Drop of an unpublished commit |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved graph administration |
 
@@ -105,8 +107,32 @@ cluster APIs keep their explicit trust boundary.
 
 Graph rules may use `branch_scope` for a source branch or
 `target_branch_scope` for a destination branch. Values are `any`, `protected`,
-or `unprotected`; a rule may not set both. Server actions and graph-wide
-`invoke_query` rules do not take branch scopes.
+or `unprotected`; a rule may not set both. A branch is protected when the
+bundle's `protected_branches` list names it exactly:
+
+```yaml
+protected_branches: [main, release]
+```
+
+Branch names are compared as written. A `protected_branches` entry that is
+empty, has leading or trailing whitespace, or contains a control character
+fails policy validation, and a request naming such a branch is refused as a
+bad request before any rule is evaluated (see
+[branch names](../branching/index.md#branch-names)). Server actions and graph-wide
+`invoke_query` rules do not take branch scopes. `commit_publish` and
+`commit_drop` take `target_branch_scope`: the scope is the branch the
+unpublished commit recorded as its target. Writing an unpublished commit
+needs no new action: a mutation `as commit` is a `change` on its branch and a
+merge `as commit` is a `branch_merge`, so an actor with ordinary write rights
+can omit `as commit`; this is a voluntary review workflow, not an approval
+boundary (see [Unpublished graph commits](../../rfcs/2026-10-10-unpublished-graph-commits.md)).
+A mutation `as unattached branch` is likewise a `change` on the branch it
+records as its target: the first write's branch, and for a write `on "<id>"`
+the target the base snapshot recorded, whatever branch the request names.
+`commit list --unattached` and a query `--snapshot <id>` of an unattached
+snapshot need `read` on that recorded target; `commit show <id>` keeps its
+scope-free `read`; `commit drop` takes `commit_drop` on the recorded target as
+for an unpublished commit (see [Unattached graph branches](../../rfcs/2026-10-11-unattached-graph-branches.md)).
 
 ## Validate and test
 

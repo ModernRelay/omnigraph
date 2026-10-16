@@ -125,9 +125,9 @@ from a request`.
 A stored query takes no `--set`: `omnigraph query <name>` without `-e` or
 `--query` runs under the process defaults.
 
-## Read Blob values
+## Read and write Blob values
 
-Read a managed Blob cell to a file or inspect its metadata:
+Read a managed Blob cell to a file, inspect its metadata, or replace it:
 
 ```bash
 omnigraph blob get node Document doc-42 body \
@@ -135,11 +135,16 @@ omnigraph blob get node Document doc-42 body \
 
 omnigraph blob stat node Document doc-42 body \
   --store ./graph.omni --json
+
+omnigraph blob put node Document doc-42 body \
+  --store ./graph.omni --file body.bin
 ```
 
 `blob get` writes bytes to stdout when `--out` is omitted. Add `--offset` and
 `--length` for a range. The CLI reports external references but does not follow
-them. See [Blob values](../blobs.md) for the complete contract.
+them. `blob put` reads stdin when `--file` is omitted, and `blob clear` sets a
+nullable cell to null; both accept `--if-match`. See [Blob values](../blobs.md)
+for the complete contract.
 
 ## Inspect and maintain a graph
 
@@ -180,6 +185,36 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
 The token is stored separately from `config.yaml`. A server resolves the actor
 from the token; clients cannot override it with `--as`.
 
+## Use a server through a Unix socket
+
+A server may also be reached through a Unix-domain socket, for example a local
+gateway in front of `omnigraph-server`. A sandboxed agent that is denied network
+access may still be allowed to connect to one socket path. Address the socket
+with a `unix://` URL followed by its absolute path:
+
+```bash
+omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
+  --server unix:///run/omnigraph/server.sock --graph knowledge
+```
+
+```yaml
+# ~/.omnigraph/config.yaml
+servers:
+  local:
+    url: unix:///run/omnigraph/server.sock
+```
+
+The whole path names the socket, so a socket URL has no host, path prefix,
+query or fragment. A path may contain spaces, written as is or as `%20`. The
+CLI sends the same HTTP/1.1 requests over the socket as over TCP: the
+`HEAD /healthz` discovery, the contract header, the bearer token, and no
+redirects or automatic retries. Proxy settings do not apply. `unix://`
+addresses work on Unix platforms only.
+
+A `--server` value or server `url:` must use `http://`, `https://` or
+`unix://`. Any other scheme fails as an invalid server address; use `--store`
+for graph storage.
+
 ## Manage a cluster
 
 Self-hosted `cluster` commands read a directory containing `cluster.yaml`, or address
@@ -205,17 +240,18 @@ your config directory:
 omnigraph login --api https://control.example
 omnigraph use CLUSTER_ID --api https://control.example --config ./company-brain
 omnigraph cluster plan --managed --config ./company-brain --json > plan.json
-omnigraph cluster apply --managed --config ./company-brain --plan "$(jq -r .data.run_id plan.json)" --json
+omnigraph cluster apply --managed --config ./company-brain --plan "$(jq -r .data.preview_id plan.json)" --json
 omnigraph cluster status --managed --config ./company-brain --json
 omnigraph cluster history --managed --config ./company-brain --json
 omnigraph logout --api https://control.example
 ```
 
 Commit and push external configuration before planning. The API plans its
-bound head, or the pushed revision selected with `--rev`. Apply uses the exact
-saved plan and your current permissions. To release an unused plan, run
-`omnigraph cluster cancel --managed PLAN_RUN_ID --config ./company-brain`; its result
-remains in history and cannot be applied afterward.
+bound head, or the full pushed commit ID selected with `--rev`. Apply uses that
+exact preview and your current permissions. It waits for the native result,
+active runtime and archived evidence. `--no-wait` returns the reserved delivery
+ID; follow it with `cluster status --managed DEPLOYMENT_ID --wait`. Cancellation
+is available only before that delivery's first dispatch attempt.
 
 The explicit `--managed` flag uses the folder's `.omnigraph/context` to select
 the API and cluster. Without it, cluster commands ignore that context.
@@ -232,3 +268,21 @@ omnigraph queries validate --cluster ./company-brain --graph knowledge
 
 `lint` checks one `.gq` source. `queries validate` checks the applied stored
 query registry for a cluster graph.
+
+## Give an agent the matching skill
+
+The binary carries the `omnigraph` agent skill written for its own commands and
+HTTP contract. Export it where your agent loads skills:
+
+```bash
+omnigraph skill export ~/.claude/skills/omnigraph --force --json
+omnigraph skill show references/queries.md
+```
+
+`skill export` creates the directory and refuses to replace existing files
+unless `--force`. It records the files it wrote in `.omnigraph-skill.json`; a
+later `--force` export removes a recorded file this skill no longer has only
+while its bytes are unchanged, and touches no other file. `--json` reports the
+`files` written, `skill_version`, `cli_version` and `http_contract`.
+`skill show` prints `SKILL.md`, or the named skill file, to stdout. Neither
+command reads configuration or contacts a server.

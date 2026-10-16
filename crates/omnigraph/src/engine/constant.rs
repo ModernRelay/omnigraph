@@ -1,124 +1,142 @@
-//! Constants of the shared expression model: an assignment value and the
-//! right operand of an inline binding match are evaluated after parameter
-//! binding, under the three-valued rules every expression follows (RFC
-//! 2026-09-24-shared-expression-model). The rules are the compiler's
-//! `fold::evaluate`, the one home the compile-time fold shares; this module
-//! adds only what the compiler cannot decide, the order of Date and DateTime
-//! literals through the loader's parsers.
+//! Constants execute the same typed expressions as batch filters. Arrow values
+//! retain exact integer intermediates until a public result becomes a Literal.
 
-use std::cmp::Ordering;
+use std::sync::Arc;
 
-use omnigraph_compiler::ir::{IRExpr, IROp, ParamMap, QueryIR, fold};
-use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_schema::Schema;
+use datafusion::scalar::ScalarValue;
+use omnigraph_compiler::ir::{IRExpr, IROp, ParamMap, QueryIR};
+use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::types::{ExprType, ScalarType};
 
 use crate::error::{OmniError, Result};
 
-/// The value of a constant: a literal, a bound parameter (`now()` included),
-/// or comparisons and Boolean operators over those. `Literal::Null` is the
-/// one null result, typed later by the property it reaches.
-pub(crate) fn evaluate_constant(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
-    match expr {
-        IRExpr::Literal(lit) => Ok(lit.clone()),
-        IRExpr::Param(name) => params
-            .get(name)
-            .cloned()
-            .ok_or_else(|| OmniError::manifest(format!("parameter '{name}' not provided"))),
-        IRExpr::Not(inner) => match evaluate_constant(inner, params)? {
-            Literal::Bool(value) => Ok(Literal::Bool(!value)),
-            Literal::Null => Ok(Literal::Null),
-            other => Err(not_boolean("not", &other)),
-        },
-        IRExpr::IsNull { expr, negated } => {
-            let is_null = matches!(evaluate_constant(expr, params)?, Literal::Null);
-            Ok(Literal::Bool(is_null != *negated))
-        }
-        IRExpr::Binary { left, op, right } => {
-            let left = evaluate_constant(left, params)?;
-            let right = evaluate_constant(right, params)?;
-            if let Some(value) = fold::evaluate(*op, &left, &right) {
-                return Ok(value);
-            }
-            match (op, &left) {
-                (BinaryOp::And, _) => Err(not_boolean("and", non_boolean(&left, &right))),
-                (BinaryOp::Or, _) => Err(not_boolean("or", non_boolean(&left, &right))),
-                (BinaryOp::Compare(CompOp::Contains), Literal::List(items)) => {
-                    list_contains(items, &right)
-                }
-                (BinaryOp::Compare(op), _) => compare_dates(*op, &left, &right),
-            }
-        }
-        other => Err(OmniError::manifest(format!(
-            "`{other}` is not a constant; an assignment value or a binding match reads only \
+/// Evaluate one constant without converting typed intermediate values to Literal.
+pub(super) fn evaluate_constant_array(expr: &IRExpr, params: &ParamMap) -> Result<ArrayRef> {
+    expr.check_types()?;
+    if !is_constant(expr) {
+        return Err(OmniError::manifest(format!(
+            "`{expr}` is not a constant; an assignment value or a binding match reads only \
              literals, parameters and now()"
-        ))),
+        )));
     }
+    let batch = RecordBatch::try_new_with_options(
+        Arc::new(Schema::empty()),
+        Vec::new(),
+        &RecordBatchOptions::new().with_row_count(Some(1)),
+    )
+    .map_err(OmniError::arrow_internal)?;
+    super::expr::evaluate_expr(&batch, expr, params)
 }
 
-/// What `fold::evaluate` leaves to the engine: two Date or two DateTime
-/// literals ordered through the loader's parsers; any other pair it declined
-/// has no comparison.
-fn compare_dates(op: CompOp, left: &Literal, right: &Literal) -> Result<Literal> {
-    use crate::loader::{parse_date32_literal, parse_date64_literal};
-    let ordering = match (left, right) {
-        (Literal::Date(l), Literal::Date(r)) => {
-            parse_date32_literal(l)?.cmp(&parse_date32_literal(r)?)
-        }
-        (Literal::DateTime(l), Literal::DateTime(r)) => {
-            parse_date64_literal(l)?.cmp(&parse_date64_literal(r)?)
-        }
-        _ => return Err(incomparable(op, left, right)),
-    };
-    let holds = match op {
-        CompOp::Eq => ordering == Ordering::Equal,
-        CompOp::Ne => ordering != Ordering::Equal,
-        CompOp::Lt => ordering == Ordering::Less,
-        CompOp::Le => ordering != Ordering::Greater,
-        CompOp::Gt => ordering == Ordering::Greater,
-        CompOp::Ge => ordering != Ordering::Less,
-        CompOp::Contains | CompOp::StartsWith | CompOp::StringContains => {
-            return Err(incomparable(op, left, right));
-        }
-    };
-    Ok(Literal::Bool(holds))
-}
-
-/// Membership `fold::evaluate` declined, a list with a Date or DateTime
-/// element: each element against the needle by `=`.
-fn list_contains(items: &[Literal], needle: &Literal) -> Result<Literal> {
-    for item in items {
-        let equal = match fold::evaluate(BinaryOp::Compare(CompOp::Eq), item, needle) {
-            Some(value) => value,
-            None => compare_dates(CompOp::Eq, item, needle)?,
+/// A final constant for assignment, keeping Blob URI leaves at their write boundary.
+pub(crate) fn evaluate_constant(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
+    if matches!(expr.ty(), ExprType::ExactInteger { .. }) {
+        return Err(OmniError::manifest_internal(
+            "exact integer constant has no public literal representation",
+        ));
+    }
+    if let ExprType::Value {
+        scalar: ScalarType::Blob,
+        list: false,
+        nullable,
+    } = expr.ty()
+    {
+        let value = match expr {
+            IRExpr::Literal(value, _) => value,
+            IRExpr::Param(name, _) => params
+                .get(name)
+                .ok_or_else(|| OmniError::manifest(format!("parameter '{name}' not provided")))?,
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Search { .. }
+            | IRExpr::Fuzzy { .. }
+            | IRExpr::MatchText { .. }
+            | IRExpr::Bm25 { .. }
+            | IRExpr::Rrf { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(_, _)
+            | IRExpr::Binary { .. }
+            | IRExpr::Not(_, _)
+            | IRExpr::Cast { .. }
+            | IRExpr::IsNull { .. } => {
+                return Err(OmniError::manifest_internal(
+                    "Blob constant is not a URI leaf",
+                ));
+            }
         };
-        if equal == Literal::Bool(true) {
-            return Ok(Literal::Bool(true));
+        return if matches!(value, Literal::String(_)) || *nullable && matches!(value, Literal::Null)
+        {
+            Ok(value.clone())
+        } else {
+            Err(OmniError::manifest("expected blob URI string"))
+        };
+    }
+    let array = evaluate_constant_array(expr, params)?;
+    literal_from_scalar(
+        ScalarValue::try_from_array(array.as_ref(), 0).map_err(OmniError::datafusion)?,
+    )
+}
+
+fn literal_from_scalar(value: ScalarValue) -> Result<Literal> {
+    if value.is_null() {
+        return Ok(Literal::Null);
+    }
+    Ok(match value {
+        ScalarValue::Boolean(Some(value)) => Literal::Bool(value),
+        ScalarValue::Utf8(Some(value)) => Literal::String(value),
+        ScalarValue::Int32(Some(value)) => Literal::Integer(i64::from(value)),
+        ScalarValue::Int64(Some(value)) => Literal::Integer(value),
+        ScalarValue::UInt32(Some(value)) => Literal::Integer(i64::from(value)),
+        ScalarValue::UInt64(Some(value)) => {
+            Literal::Integer(i64::try_from(value).map_err(|_| {
+                OmniError::manifest("constant U64 result exceeds the public literal range")
+            })?)
         }
-    }
-    Ok(Literal::Bool(false))
+        ScalarValue::Float32(Some(value)) => Literal::Float(f64::from(value)),
+        ScalarValue::Float64(Some(value)) => Literal::Float(value),
+        ScalarValue::Date32(Some(value)) => {
+            let date =
+                arrow_array::temporal_conversions::date32_to_datetime(value).ok_or_else(|| {
+                    OmniError::manifest("constant Date result is outside the calendar range")
+                })?;
+            Literal::Date(date.date().format("%Y-%m-%d").to_string())
+        }
+        ScalarValue::Date64(Some(value)) => {
+            let date =
+                arrow_array::temporal_conversions::date64_to_datetime(value).ok_or_else(|| {
+                    OmniError::manifest("constant DateTime result is outside the calendar range")
+                })?;
+            Literal::DateTime(
+                date.and_utc()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+        }
+        ScalarValue::List(values) => literal_list(&values.value(0))?,
+        ScalarValue::FixedSizeList(values) => literal_list(&values.value(0))?,
+        other => {
+            return Err(OmniError::manifest_internal(format!(
+                "constant result {} has no public literal representation",
+                other.data_type()
+            )));
+        }
+    })
 }
 
-/// The operand an `and`/`or` the fold declined was refused for: the first
-/// that is neither Bool nor null.
-fn non_boolean<'a>(left: &'a Literal, right: &'a Literal) -> &'a Literal {
-    if matches!(left, Literal::Bool(_) | Literal::Null) {
-        right
-    } else {
-        left
-    }
+fn literal_list(values: &ArrayRef) -> Result<Literal> {
+    (0..values.len())
+        .map(|row| {
+            literal_from_scalar(
+                ScalarValue::try_from_array(values.as_ref(), row).map_err(OmniError::datafusion)?,
+            )
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Literal::List)
 }
 
-fn not_boolean(op: &str, operand: &Literal) -> OmniError {
-    OmniError::manifest(format!("`{op}` needs Bool operands, got {operand}"))
-}
-
-fn incomparable(op: CompOp, left: &Literal, right: &Literal) -> OmniError {
-    OmniError::manifest(format!("cannot evaluate {left} {op} {right}"))
-}
-
-/// `ir` with every constant subtree of a filter position evaluated to its
-/// literal, so both engine arms see the bound value where the query wrote
-/// `{ adult: true or $flag }`; a null result compares with null and selects
-/// no row.
+/// Fold bound constant filters without changing their compiler-selected types.
 pub(crate) fn fold_query_constants(ir: &QueryIR, params: &ParamMap) -> Result<QueryIR> {
     let mut folded = ir.clone();
     fold_pipeline(&mut folded.pipeline, params)?;
@@ -145,30 +163,188 @@ fn fold_pipeline(pipeline: &mut [IROp], params: &ParamMap) -> Result<()> {
 }
 
 fn fold_expr(expr: &IRExpr, params: &ParamMap) -> Result<IRExpr> {
-    if is_constant(expr) && !matches!(expr, IRExpr::Literal(_) | IRExpr::Param(_)) {
-        return Ok(IRExpr::Literal(evaluate_constant(expr, params)?));
+    if matches!(expr, IRExpr::Cast { .. }) {
+        return Ok(expr.clone());
+    }
+    if is_constant(expr) && !matches!(expr, IRExpr::Literal(_, _) | IRExpr::Param(_, _)) {
+        if matches!(expr.ty(), ExprType::ExactInteger { .. }) {
+            return Ok(expr.clone());
+        }
+        return Ok(IRExpr::Literal(
+            evaluate_constant(expr, params)?,
+            expr.ty().clone(),
+        ));
     }
     Ok(match expr {
-        IRExpr::Binary { left, op, right } => IRExpr::Binary {
+        IRExpr::Binary {
+            left,
+            op,
+            right,
+            ty,
+        } => IRExpr::Binary {
             left: Box::new(fold_expr(left, params)?),
             op: *op,
             right: Box::new(fold_expr(right, params)?),
+            ty: ty.clone(),
         },
-        IRExpr::Not(inner) => IRExpr::Not(Box::new(fold_expr(inner, params)?)),
-        IRExpr::IsNull { expr, negated } => IRExpr::IsNull {
+        IRExpr::Not(inner, ty) => IRExpr::Not(Box::new(fold_expr(inner, params)?), ty.clone()),
+        IRExpr::IsNull { expr, negated, ty } => IRExpr::IsNull {
             expr: Box::new(fold_expr(expr, params)?),
             negated: *negated,
+            ty: ty.clone(),
         },
-        other => other.clone(),
+        IRExpr::Cast { expr, ty } => IRExpr::Cast {
+            expr: Box::new(fold_expr(expr, params)?),
+            ty: ty.clone(),
+        },
+        IRExpr::PropAccess { .. }
+        | IRExpr::Nearest { .. }
+        | IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Param(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _) => expr.clone(),
     })
 }
 
-fn is_constant(expr: &IRExpr) -> bool {
+pub(super) fn is_constant(expr: &IRExpr) -> bool {
     match expr {
-        IRExpr::Literal(_) | IRExpr::Param(_) => true,
+        IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
         IRExpr::Binary { left, right, .. } => is_constant(left) && is_constant(right),
-        IRExpr::Not(inner) => is_constant(inner),
-        IRExpr::IsNull { expr, .. } => is_constant(expr),
-        _ => false,
+        IRExpr::Not(inner, _) => is_constant(inner),
+        IRExpr::IsNull { expr, .. } | IRExpr::Cast { expr, .. } => is_constant(expr),
+        IRExpr::PropAccess { .. }
+        | IRExpr::Nearest { .. }
+        | IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, Decimal128Array, Float64Array, ListArray};
+    use arrow_schema::{DataType, Field};
+    use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
+    use omnigraph_compiler::types::PropType;
+
+    fn scalar(kind: ScalarType, nullable: bool) -> ExprType {
+        ExprType::from_prop(&PropType::scalar(kind, nullable))
+    }
+
+    #[test]
+    fn constant_cast_executes_without_erasing_its_stored_witness() {
+        let cast = IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(
+                Literal::Float(30.0),
+                scalar(ScalarType::F64, false),
+            )),
+            ty: scalar(ScalarType::I64, false),
+        };
+        let params = ParamMap::new();
+        let values = evaluate_constant_array(&cast, &params).expect("exact literal narrowing");
+        assert_eq!(values.data_type(), &DataType::Int64);
+        assert_eq!(
+            evaluate_constant(&cast, &params).unwrap(),
+            Literal::Integer(30)
+        );
+        assert_eq!(fold_expr(&cast, &params).unwrap(), cast);
+    }
+
+    #[test]
+    fn constant_exact_intermediates_preserve_u64_values_and_list_nulls() {
+        let exact = ExprType::ExactInteger {
+            list: false,
+            nullable: false,
+        };
+        let cast = |expr| IRExpr::Cast {
+            expr: Box::new(expr),
+            ty: exact.clone(),
+        };
+        let signed = cast(IRExpr::Literal(
+            Literal::Integer(i64::MAX),
+            scalar(ScalarType::I64, false),
+        ));
+        let unsigned = cast(IRExpr::Param("wide".into(), scalar(ScalarType::U64, false)));
+        let params = ParamMap::from([("wide".into(), Literal::Float(2_f64.powi(63)))]);
+        let values = evaluate_constant_array(&unsigned, &params).unwrap();
+        assert_eq!(values.data_type(), &ExprType::exact_integer_arrow());
+        assert_eq!(
+            values
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            1_i128 << 63
+        );
+        assert!(evaluate_constant(&unsigned, &params).is_err());
+        let comparison = IRExpr::Binary {
+            left: Box::new(signed),
+            op: BinaryOp::Compare(CompOp::Lt),
+            right: Box::new(unsigned),
+            ty: scalar(ScalarType::Bool, false),
+        };
+        assert_eq!(
+            evaluate_constant(&comparison, &params).unwrap(),
+            Literal::Bool(true)
+        );
+
+        let list = IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(
+                Literal::List(vec![Literal::Integer(i64::MAX), Literal::Null]),
+                ExprType::from_prop(&PropType::list_of(ScalarType::I64, false)),
+            )),
+            ty: ExprType::ExactInteger {
+                list: true,
+                nullable: false,
+            },
+        };
+        let values = evaluate_constant_array(&list, &params).unwrap();
+        let values = values
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        let values = values.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!(values.value(0), i128::from(i64::MAX));
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn forged_nonconstant_float_narrowing_refuses_before_infinity_or_null() {
+        let cast = IRExpr::Cast {
+            expr: Box::new(IRExpr::PropAccess {
+                variable: "p".into(),
+                property: "amount".into(),
+                ty: scalar(ScalarType::F64, false),
+            }),
+            ty: scalar(ScalarType::F32, false),
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "p.amount",
+                DataType::Float64,
+                false,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![f64::MAX]))],
+        )
+        .unwrap();
+        let error = super::super::expr::evaluate_expr(&batch, &cast, &ParamMap::new()).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid recorded cast"),
+            "{error}"
+        );
+        assert!(super::super::scan::ir_expr_to_df_expr(&cast, &ParamMap::new(), None).is_none());
     }
 }

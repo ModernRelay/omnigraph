@@ -13,6 +13,7 @@ use omnigraph_gqt_core::{
     Case, ControlStep, ControlWrite, ExecutionHost, Item, QueryStep, Step, StepFail,
     canonical_json, case_session, parse_case, run_session, seed_case,
 };
+pub use omnigraph_gqt_core::{ServerTarget, admit_served};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::future::Future;
@@ -25,6 +26,7 @@ mod concurrent;
 mod discovery;
 mod dst_runner;
 mod measure;
+mod trace;
 pub use discovery::list_cases;
 pub use dst_runner::{
     MeasureOptions, replay_report, report_cli_refusal, run_corpus_case, run_selected,
@@ -85,18 +87,14 @@ impl ExecutionHost for GqtHost {
         &'a self,
         session: &'a Session,
         step: &'a QueryStep,
+        target: ReadTarget,
         params: &'a ParamMap,
     ) -> futures::future::BoxFuture<'a, Result<QueryResult, String>> {
         async move {
             session
                 .clone()
                 .with_read_executor(Arc::new(omnigraph_reference_engine::ReferenceEngine))
-                .query(
-                    ReadTarget::branch(&step.branch),
-                    &step.source,
-                    &step.name,
-                    params,
-                )
+                .query(target, &step.source, &step.name, params)
                 .await
                 .map_err(|error| error.to_string())
         }
@@ -140,9 +138,21 @@ async fn open_case_store(
     let db = Omnigraph::init(&uri, &fixture.schema)
         .await
         .map_err(|e| format!("init failed: {e}"))?;
+    let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case, engine)?;
     seed_case(&session, &fixture.seed, case.needs_indices).await?;
     Ok((session, uri, dir))
+}
+
+/// The case's materialized `--- csv` base, installed on a fresh handle so a
+/// `load csv` step reads its fixture under the same policy any source meets.
+fn with_case_external_blob_policy(db: Omnigraph, case: &Case) -> Result<Omnigraph, String> {
+    match &case.external_blob_policy {
+        Some(policy) => db
+            .with_external_blob_policy(policy.clone())
+            .map_err(|e| format!("csv fixture policy: {e}")),
+        None => Ok(db),
+    }
 }
 
 fn execute_case<'a>(
@@ -154,6 +164,25 @@ fn execute_case<'a>(
         Ok(engine) => execute_case_on_engine(case, path, bless, engine, None),
         Err(error) => futures::future::ready(Err(error)).boxed(),
     }
+}
+
+/// The in-process verdict of a parsed case on a fresh engine, as the
+/// corpus run reaches it, for a conformance test that compares executors.
+pub async fn execute_in_process(case: &Case, path: &Path) -> Result<(), String> {
+    execute_case(case, path, false).await
+}
+
+/// The served verdict of a parsed case against `target`, under the same
+/// host the corpus run uses.
+pub async fn execute_served(case: &Case, target: &ServerTarget) -> Result<(), String> {
+    execute_case_on_server(case, target).await
+}
+
+fn execute_case_on_server<'a>(
+    case: &'a Case,
+    target: &'a ServerTarget,
+) -> futures::future::BoxFuture<'a, Result<(), String>> {
+    omnigraph_gqt_core::execute_steps_served(case, target, &GqtHost)
 }
 
 fn execute_case_on_engine<'a>(
@@ -178,6 +207,7 @@ async fn execute_case_inner(
         let db = Omnigraph::open(uri)
             .await
             .map_err(|e| format!("open failed: {e}"))?;
+        let db = with_case_external_blob_policy(db, case)?;
         let session = case_session(db, case, engine)?;
         return omnigraph_gqt_core::execute_steps(case, path, bless, session, uri, None, &GqtHost)
             .await
@@ -205,6 +235,7 @@ async fn execute_case_with_storage(
         Omnigraph::init_with_storage(uri, &fixture.schema, storage.clone(), Default::default())
             .await
             .map_err(|e| format!("init failed: {e}"))?;
+    let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case, engine)?;
     seed_case(&session, &fixture.seed, case.needs_indices).await?;
     omnigraph_gqt_core::execute_steps(case, path, false, session, uri, Some(storage), &GqtHost)
@@ -293,7 +324,7 @@ fn record_concurrent_outcome(ordinal: usize, sessions: &[Value], block: &concurr
 pub async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
     let stem = stem_of(&path);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read case file: {e}"))?;
-    let case = parse_case(&stem, &text).map_err(|e| format!("refused: {e}"))?;
+    let mut case = parse_case(&stem, &text).map_err(|e| format!("refused: {e}"))?;
     case.admit_store(None)?;
     if case.runner.environments.len() != 1
         || !matches!(
@@ -304,6 +335,9 @@ pub async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
         return Err("DST cases require the file dispatcher; the async normal runner cannot execute mode: dst".into());
     }
     case.runner.environments[0].admit(case.needs_dst())?;
+    let csv_dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
+    case.materialize_csv_fixtures(csv_dir.path())
+        .map_err(|e| format!("refused: {e}"))?;
     execute_case(&case, &path, bless).await
 }
 

@@ -5,7 +5,7 @@ COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
 LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
-query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | explain_stmt ~ statement_trailer? | query_decl* ~ missing_param_list?) ~ EOI }
+query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | commit_stmt ~ ";"? ~ statement_trailer? | load_stmt ~ ";"? ~ statement_trailer? | explain_stmt ~ statement_trailer? | query_decl* ~ missing_param_list?) ~ EOI }
 // A declaration whose name is not followed by `(`, matched after the well
 // formed declarations so the parser refuses it at the name's end with the
 // one fix (`query name()`) instead of reporting the file's first position;
@@ -28,23 +28,71 @@ setting_value = { integer | ident | string_lit }
 // Statements: one per file, never beside a query declaration. Each keyword
 // is atomic and closed by a word boundary: an identifier character may not
 // follow it (`branch createb0` is a parse error), a quoted name may.
-branch_stmt   = { kw_branch ~ (branch_create | branch_delete | branch_merge | branch_list) }
+branch_stmt   = { kw_branch ~ (branch_create | branch_delete | branch_merge_base | branch_merge | branch_list | branch_diff) }
+// The two control writes on an unpublished commit, named by its full id.
+commit_stmt   = { kw_commit ~ (commit_publish | commit_drop) }
 // `explain` wraps the one read declaration whose plan is answered as rows.
 explain_stmt  = { kw_explain ~ query_decl }
 // Anything the file holds after its one statement, matched so the parser
 // refuses it by name instead of leaving `EOI` to report the expected tokens.
-statement_trailer = { (setting_stmt | show_stmt | branch_stmt | explain_stmt | query_decl)+ }
+statement_trailer = { (setting_stmt | show_stmt | branch_stmt | commit_stmt | load_stmt | explain_stmt | query_decl)+ }
+// `load csv "<uri>" into node:Person mode overwrite [delimiter "|"] [header]
+// [columns (a, b)]`: one CSV object, named by URI, into one declared type.
+// Every option is a keyword so a `.pg` property may carry any of these names.
+load_stmt      = { kw_load ~ kw_csv ~ string_lit ~ kw_into ~ load_target ~ load_option* }
+load_target    = { load_kind ~ ":" ~ type_name }
+load_kind      = @{ ("node" | "edge") ~ !(ASCII_ALPHANUMERIC | "_") }
+load_option    = { load_mode | load_delimiter | load_header | load_columns }
+load_mode      = { kw_mode ~ load_mode_name }
+load_mode_name = @{ ("overwrite" | "append" | "merge") ~ !(ASCII_ALPHANUMERIC | "_") }
+load_delimiter = { kw_delimiter ~ string_lit }
+load_header    = { kw_header }
+load_columns   = { kw_columns ~ "(" ~ ident ~ ("," ~ ident)* ~ ")" }
+kw_load      = @{ "load" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_csv       = @{ "csv" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_mode      = @{ "mode" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_delimiter = @{ "delimiter" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_header    = @{ "header" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_columns   = @{ "columns" ~ !(ASCII_ALPHANUMERIC | "_") }
 branch_create = { kw_create ~ branch_name ~ (kw_from ~ branch_name)? }
 branch_delete = { kw_delete ~ branch_name }
-branch_merge  = { kw_merge ~ branch_name ~ (kw_into ~ branch_name)? }
+branch_merge  = { kw_merge ~ branch_name ~ (kw_into ~ branch_name)? ~ (as_commit_clause | dry_run_clause)? }
 branch_list   = { kw_list }
-branch_name   = { ident | string_lit }
+// Control reads (RFC 0030 §8): the merge base of a merge, a branch's net
+// change since that base (`into`), or the net change between two points,
+// each a branch or a quoted commit id (`to`). `merge-base` is tried before
+// `merge`, which would otherwise take `merge` and fail on `-base`.
+branch_merge_base = { kw_merge_base ~ branch_name ~ (kw_into ~ branch_name)? }
+branch_diff   = { kw_diff ~ branch_name ~ ((kw_into | kw_to) ~ branch_name)? ~ diff_after_page? ~ diff_limit? }
+diff_after_page = { kw_after ~ kw_page ~ string_lit }
+diff_limit    = { kw_limit ~ integer }
+// `dry run`: the merge is decided and nothing is written.
+dry_run_clause = { kw_dry ~ kw_run }
+// A bare `as` followed by `commit`, or `dry` followed by `run`, is the
+// clause, never a branch named `as` or `dry`; quote the name for that.
+branch_name   = { !(kw_as ~ kw_commit) ~ !(kw_dry ~ kw_run) ~ (ident | string_lit) }
+commit_publish = { kw_publish ~ string_lit }
+commit_drop    = { kw_drop ~ string_lit }
+// `as commit`: the write's result is an unpublished commit.
+as_commit_clause = { kw_as ~ kw_commit }
+// `as unattached branch [on <base>]`: the write's result is an unattached
+// snapshot, a root of the request branch's head or a child of the named
+// unattached snapshot (a quoted id or a `String` parameter).
+as_unattached_clause = { kw_as ~ kw_unattached ~ kw_branch ~ (kw_on ~ (string_lit | variable))? }
 
 kw_branch = @{ "branch" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_explain = @{ "explain" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_create = @{ "create" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_delete = @{ "delete" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_merge  = @{ "merge" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_merge_base = @{ "merge-base" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_diff   = @{ "diff" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_to     = @{ "to" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_after  = @{ "after" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_page   = @{ "page" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_limit  = @{ "limit" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_dry    = @{ "dry" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_run    = @{ "run" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_list   = @{ "list" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_from   = @{ "from" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_into   = @{ "into" ~ !(ASCII_ALPHANUMERIC | "_") }
@@ -52,9 +100,15 @@ kw_set    = @{ "set" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_reset  = @{ "reset" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_show   = @{ "show" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_all    = @{ "all" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_as     = @{ "as" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_commit = @{ "commit" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_unattached = @{ "unattached" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_on     = @{ "on" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_publish = @{ "publish" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_drop   = @{ "drop" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 query_decl = {
-    "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ "{"
+    "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ (as_commit_clause | as_unattached_clause)? ~ "{"
         ~ query_body
     ~ "}"
 }
@@ -130,8 +184,10 @@ subquery_predicate = { agg_func ~ ("(" ~ expr ~ ")")? ~ subquery_block ~ comp_op
 exists_block = { "exists" ~ subquery_block }
 subquery_block = { "{" ~ clause+ ~ "}" }
 
-// Return clause — projections separated by commas or newlines
-return_clause = { "return" ~ "{" ~ projection+ ~ "}" }
+// Return clause — projections separated by commas or newlines; `distinct`
+// keeps one row per distinct projected tuple.
+return_clause = { "return" ~ kw_distinct? ~ "{" ~ projection+ ~ "}" }
+kw_distinct = @{ "distinct" ~ !(ASCII_ALPHANUMERIC | "_") }
 projection = { expr ~ ("as" ~ (reserved_alias | expr_ident))? ~ ","? }
 
 // Order clause
@@ -182,7 +238,9 @@ prop_access = { variable ~ "." ~ (meta_field | ident) }
 // Mutation predicates admit stored metadata. User properties use bare names.
 meta_field = @{ "@" ~ ident }
 
-agg_call = { agg_func ~ "(" ~ expr ~ ")" }
+// `count(distinct $x)`; the bare alternative keeps an alias named `distinct`
+// parseable as an argument.
+agg_call = { agg_func ~ "(" ~ ((kw_distinct ~ expr) | expr) ~ ")" }
 agg_func = { "count" | "sum" | "avg" | "min" | "max" }
 
 comp_op = { ">=" | "<=" | "!=" | ">" | "<" | "=" }

@@ -1,0 +1,78 @@
+# issue: none
+# red_on: 2026-10-09, upstream main: both engines accepted `asc` on a leading bm25()/rrf() key and returned most relevant first; only nearest refused a modifier.
+# notes: `asc` written on a leading `bm25`/`rrf` order key contradicts the fixed descending-relevance rank, so the type checker
+# notes: refuses it (T54; the parser refuses any modifier on `nearest`, which no case can pin since the harness parses every step
+# notes: up front). The bare key is the control (a outranks b: equal length, tf 2 vs 1); `desc` is redundant and stays accepted.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    embedding: Vector(2)
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","text":"needle needle","embedding":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"b","text":"needle hay","embedding":[1.0,0.0]}}
+
+--- query
+query bm25_bare() {
+    match { $d: Doc }
+    return { $d.slug }
+    order { bm25($d.text, "needle") }
+    limit 2
+}
+
+--- expect ordered
+{"d.slug": "a"}
+{"d.slug": "b"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query bm25_asc() {
+    match { $d: Doc }
+    return { $d.slug }
+    order { bm25($d.text, "needle") asc }
+    limit 2
+}
+
+--- expect error: T54: `bm25` ranks most relevant first; its order key does not accept the asc modifier
+
+--- query
+query rrf_asc($v: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $v), bm25($d.text, "needle")) asc }
+    limit 2
+}
+
+--- params
+{"v": [0.0, 0.0]}
+
+--- expect error: T54: `rrf` ranks most relevant first; its order key does not accept the asc modifier
+
+--- query
+query rrf_desc($v: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $v), bm25($d.text, "needle")) desc }
+    limit 2
+}
+
+--- params
+{"v": [0.0, 0.0]}
+
+--- expect ordered
+{"d.slug": "a"}
+{"d.slug": "b"}
+
+--- expect shape
+d.slug: String

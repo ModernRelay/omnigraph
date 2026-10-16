@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-seams"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 description = "One seam type for test-time behavior substitution: a named slot a test fills and the engine consults."
 license = "MIT"
@@ -23,7 +23,7 @@ decide = ["install"]
 # catalog, cluster and DST crates and the `.gqt` corpus (it decodes `--- seam` bodies the way
 # the GQT runner does), and its manifest test, which decodes this file.
 [dev-dependencies]
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 syn = { workspace = true }
 tempfile = { workspace = true }
 toml = "0.9"

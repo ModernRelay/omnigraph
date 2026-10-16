@@ -1,0 +1,1 @@
+- Saved query plans now use envelope version 7 to preserve distinct-count semantics. Regenerate plans saved with earlier binaries; older binaries reject version 7 plans.

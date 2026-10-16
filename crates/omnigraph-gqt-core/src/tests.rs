@@ -72,6 +72,107 @@ fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
     }
 }
 
+/// A `--- params generate` recipe supplies a step's parameters: its values
+/// reach the engine as a literal body's would, a Blob value included. The
+/// header takes `generate: v1` and a seed only, the recipe takes no `${`
+/// substitution, and its JSON bound is checked when the case parses.
+#[tokio::test]
+async fn generated_params_supply_a_step_and_are_refused_outside_their_contract() {
+    const GENERATED: &str =
+        "--- params generate: v1 seed: 7\nparams:\n  n: {kind: key, prefix: gen-, width: 3}\n";
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{MUTATE}{GENERATED}--- expect affected: nodes=1 edges=0\n\
+         --- query\nquery named() {{\n    match {{ $p: Person {{ name: \"gen-000\" }} }}\n    return {{ $p.name }}\n}}\n\
+         --- expect unordered\n{{\"p.name\": \"gen-000\"}}\n{SHAPE}"
+    );
+    let case = parse_case("generated_params", &text).unwrap();
+    execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap();
+
+    let blob = format!(
+        "{HDR}--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n\
+         --- schema\nnode Doc {{\n    slug: String @key\n    body: Blob?\n}}\n--- seed\n\
+         --- mutate\nquery put($slug: String, $body: Blob) {{\n    insert Doc {{ slug: $slug, body: $body }}\n}}\n\
+         --- params generate: v1 seed: 0\nparams:\n  slug: {{kind: literal, value: doc}}\n  body: {{kind: blob, byte: 1, length: 3}}\n\
+         --- expect affected: nodes=1 edges=0\n"
+    );
+    let case = parse_case("generated_blob_param", &blob).unwrap();
+    let [Item::Step(Step::Mutate(step))] = case.items.as_slice() else {
+        panic!("expected one mutate step");
+    };
+    let Some(ParamsInput::Generated(generated)) = step.params_raw.as_ref() else {
+        panic!("expected generated params");
+    };
+    assert_eq!(
+        generated.generate().unwrap(),
+        serde_json::json!({"slug": "doc", "body": "base64:AQEB"})
+    );
+    execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap();
+
+    // A Zipf endpoint is prepared as a table's is, under the same total
+    // bound, which is checked before any distribution is built.
+    let zipf = |name: &str, population: u64| {
+        format!(
+            "  {name}: {{kind: endpoint, prefix: s, width: 1, population: {population}, distribution: {{kind: zipf, exponent: 1.25}}}}\n"
+        )
+    };
+    let skewed = GeneratedParams::parse(
+        "generate: v1 seed: 0",
+        &format!("params:\n{}", zipf("s", 1)),
+    )
+    .unwrap();
+    assert_eq!(skewed.generate().unwrap(), serde_json::json!({"s": "s0"}));
+    let wide = (0..9)
+        .map(|i| zipf(&format!("s{i}"), 1_000_000))
+        .collect::<String>();
+    assert!(
+        GeneratedParams::parse("generate: v1 seed: 0", &format!("params:\n{wide}"))
+            .unwrap_err()
+            .contains("zipf tables exceed 8000000 entries")
+    );
+
+    for (from, to) in [
+        ("generate: v1", "generate: v2"),
+        (" seed: 7", ""),
+        ("seed: 7", "seed: 7 mode: merge"),
+        ("seed: 7", "seed: 7 branch: main"),
+        (
+            "{kind: key, prefix: gen-, width: 3}",
+            "{kind: key, prefix: gen-, width: 3, extra: 1}",
+        ),
+        (
+            "{kind: key, prefix: gen-, width: 3}",
+            "{kind: literal, value: \"${n}\"}",
+        ),
+        ("params:\n  n:", "params: {}\n  n:"),
+        (
+            "{kind: key, prefix: gen-, width: 3}",
+            "{kind: blob, byte: 0, length: 50331648}",
+        ),
+        ("--- expect affected", "--- params\n{}\n--- expect affected"),
+    ] {
+        let changed = text.replacen(from, to, 1);
+        assert_ne!(changed, text, "{from} must occur in the case");
+        assert!(
+            parse_case("generated_params", &changed).is_err(),
+            "{from} -> {to}"
+        );
+    }
+    assert!(
+        parse_case(
+            "generated_params",
+            &format!(
+                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append\n{GENERATED_PERSON}{GENERATED}{EXPECT_OK}"
+            )
+        )
+        .is_err(),
+        "a generated load takes no params"
+    );
+}
+
 #[test]
 fn empty_generated_seeds_are_admitted_but_empty_loads_are_refused() {
     for recipe in [
@@ -467,6 +568,55 @@ fn refuses_mutation_declaration_under_query() {
     assert!(refusal("x", &text).contains("use `--- mutate`"));
 }
 
+/// A branch control read is a `--- query` rows step whose shape is its own:
+/// it carries no shape section, takes `${name}` for a bound commit in its
+/// sides and its expected rows, and is refused under `--- mutate`, with an
+/// unbound name, or with a shape section.
+#[test]
+fn branch_read_steps_parse_and_refuse() {
+    const BIND: &str = "--- mutate\nquery ins() {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $c\n";
+    let accepted = format!(
+        "{HDR}{SCHEMA}{SEED}{BIND}\
+         --- query\nbranch diff \"${{c}}\" to main\n--- expect ordered\n\
+         --- query\nbranch merge-base main\n--- expect ordered\n\
+         {{\"source\": \"main\", \"target\": \"main\", \"source_commit_id\": \"${{c}}\", \"target_commit_id\": \"${{c}}\", \"merge_base_commit_id\": \"${{c}}\"}}\n\
+         --- query\nbranch merge main dry run\n--- expect error: nothing\n"
+    );
+    let case = parse_case("x", &accepted).unwrap();
+    let reads = case
+        .items
+        .iter()
+        .filter(|item| matches!(item, Item::Step(Step::BranchRead(_))))
+        .count();
+    assert_eq!(reads, 3);
+
+    for (step, want) in [
+        (
+            "--- mutate\nbranch diff feature\n--- expect ok\n".to_string(),
+            "`branch diff` under `--- mutate` is refused; use `--- query`",
+        ),
+        (
+            "--- query\nbranch diff \"${x}\" to main\n--- expect ordered\n".to_string(),
+            "`${x}` is not bound; `--- bind commit $x` must precede this step",
+        ),
+        (
+            "--- query\nbranch merge-base feature\n--- expect ok\n".to_string(),
+            "`branch merge-base` takes `unordered`, `ordered`, or `error:`",
+        ),
+    ] {
+        let text = format!("{HDR}{SCHEMA}{SEED}{step}");
+        assert_eq!(refusal("x", &text), want, "{step}");
+    }
+    let shaped = format!(
+        "{HDR}{SCHEMA}{SEED}--- query\nbranch merge feature dry run\n--- expect ordered\n--- expect shape\noutcome: String\n"
+    );
+    assert!(
+        refusal("x", &shaped)
+            .contains("answers its own columns; drop the `--- expect shape` section"),
+        "{shaped}"
+    );
+}
+
 const CREATE: &str = "--- mutate\nbranch create b0\n--- expect ok\n";
 const LIST: &str = "--- query\nbranch list\n--- expect unordered\n{\"name\": \"b0\"}\n{\"name\": \"main\"}\n--- expect shape\nname: String\n";
 
@@ -582,6 +732,7 @@ fn outcome_takes_the_three_merge_words() {
         let ControlWrite::Merge {
             source,
             into,
+            as_commit: _,
             expect: MergeExpect::Outcome(got),
         } = &step.write
         else {
@@ -678,6 +829,219 @@ fn refuses_substitution_marker_in_a_statement_body() {
     assert_eq!(
         refusal("x", &text),
         "line 16: `${` may appear only inside a params or expect body"
+    );
+}
+
+const PROPOSE: &str = "--- mutate\nquery propose() as commit {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n";
+const BIND: &str = "--- bind commit $c\n";
+
+/// `--- bind commit $name` attaches to the write before it, a `snapshot:
+/// $name` header and a quoted `"${name}"` commit operand consume it, and
+/// the `${` fence admits exactly that operand.
+#[test]
+fn bind_commit_names_a_write_and_its_consumers_resolve_it() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- query snapshot: $c\n{}{EXPECT}--- mutate\ncommit publish \"${{c}}\"\n{EXPECT_OK}--- mutate\nbranch merge b0 as commit\n--- expect outcome: merged\n--- bind commit $m\n--- mutate\ncommit drop \"${{m}}\"\n{EXPECT_OK}",
+        QUERY.trim_start_matches("--- query\n")
+    );
+    let case = parse_case("x", &text).unwrap();
+    let [
+        Item::Step(Step::Mutate(propose)),
+        Item::Step(Step::Query(read)),
+        Item::Step(Step::Control(publish)),
+        Item::Step(Step::Control(merge)),
+        Item::Step(Step::Control(drop)),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected five steps, got {:?}", case.items);
+    };
+    assert_eq!(propose.bind.as_deref(), Some("c"));
+    assert_eq!(read.snapshot.as_deref(), Some("c"));
+    assert_eq!(read.branch, "main");
+    assert!(matches!(
+        &publish.write,
+        ControlWrite::Publish { graph_commit_id, .. } if graph_commit_id == "${c}"
+    ));
+    assert_eq!(publish.bind, None);
+    assert_eq!(merge.bind.as_deref(), Some("m"));
+    assert!(matches!(
+        &drop.write,
+        ControlWrite::Drop { graph_commit_id, .. } if graph_commit_id == "${m}"
+    ));
+    let mut bindings = Bindings::new();
+    bindings.insert("c".into(), "hb1-c".into());
+    assert_eq!(resolve_operand("${c}", &bindings).unwrap(), "hb1-c");
+    assert_eq!(resolve_operand("literal", &bindings).unwrap(), "literal");
+    assert_eq!(
+        resolve_operand("${m}", &bindings).unwrap_err(),
+        "`${m}` is not bound at this step"
+    );
+    assert_eq!(
+        bound_snapshot(read, &bindings).unwrap().as_deref(),
+        Some("hb1-c")
+    );
+}
+
+/// Every misplacement of a binding is refused with the rule it broke.
+#[test]
+fn bind_commit_refusals() {
+    for (steps, want) in [
+        (
+            format!("{QUERY}{EXPECT}{BIND}"),
+            "`--- bind commit` follows a query step; bind a mutation, a `branch merge`, or a `commit publish`",
+        ),
+        (
+            format!("{MUTATE}{PARAMS}--- expect error: nope\n{BIND}"),
+            "`--- bind commit` follows a write expected to fail; a refused write binds nothing",
+        ),
+        (
+            format!("{CREATE}{BIND}"),
+            "`--- bind commit` follows `branch create`, which publishes no commit; bind a mutation, a `branch merge`, or a `commit publish`",
+        ),
+        (
+            format!("{PROPOSE}{BIND}{BIND}"),
+            "`--- bind commit $c` is declared twice; one binding per name",
+        ),
+        (
+            format!("{PROPOSE}{BIND}--- bind commit $d\n"),
+            "one write step binds one name",
+        ),
+        (
+            format!("{PROPOSE}--- bind commit c\n"),
+            "`--- bind commit c`: a name is $[a-z][a-z0-9_]*",
+        ),
+        (
+            format!("{PROPOSE}--- bind $c\n"),
+            "`--- bind` must be `bind commit $name`",
+        ),
+        (
+            format!("{PROPOSE}--- bind commit $c\nbody\n"),
+            "line 20: `--- bind` carries no body",
+        ),
+        (
+            format!("--- mutate\ncommit publish \"${{c}}\"\n{EXPECT_OK}"),
+            "`${c}` is not bound; `--- bind commit $c` must precede this step",
+        ),
+        (
+            format!(
+                "--- query snapshot: $c\n{}{EXPECT}",
+                QUERY.trim_start_matches("--- query\n")
+            ),
+            "`snapshot: $c` is not bound; `--- bind commit $c` must precede this step",
+        ),
+        (
+            format!("{PROPOSE}{BIND}--- query snapshot: $c\nbranch list\n{EXPECT}"),
+            "`snapshot:` selects a query declaration's read target; a statement takes no target",
+        ),
+        (
+            format!(
+                "--- mutate snapshot: $c\n{}",
+                MUTATE.trim_start_matches("--- mutate\n")
+            ),
+            "`--- mutate` takes no arguments but `branch: <name>`, got `snapshot: $c`",
+        ),
+        (
+            format!(
+                "--- query snapshot:\n{}",
+                QUERY.trim_start_matches("--- query\n")
+            ),
+            "`--- query snapshot:` needs a bound name, `$name`",
+        ),
+        (
+            format!(
+                "--- query snapshot: c\n{}",
+                QUERY.trim_start_matches("--- query\n")
+            ),
+            "`--- query snapshot: c` must name a binding, $[a-z][a-z0-9_]*",
+        ),
+        (
+            format!("--- foreach $i a b\n{PROPOSE}{BIND}--- endloop\n"),
+            "invalid_case: `--- bind` inside a loop is refused; a binding is one id for the case",
+        ),
+        (
+            BIND.to_string(),
+            "`--- bind commit` has no write step to follow",
+        ),
+    ] {
+        let text = format!("{HDR}{SCHEMA}{SEED}{steps}");
+        assert_eq!(refusal("x", &text), want, "{steps}");
+    }
+}
+
+/// The fence still refuses `${` outside a whole quoted commit operand.
+#[test]
+fn bind_fence_admits_only_a_whole_quoted_commit_operand() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\nbranch create \"${{c}}\"\n{EXPECT_OK}"
+    );
+    assert_eq!(
+        refusal("x", &text),
+        "line 21: `${` may appear only inside a params or expect body"
+    );
+}
+
+const ROOT: &str = "--- mutate\nquery root() as unattached branch {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $r\n";
+const CHILD: &str = "--- mutate\nquery child() as unattached branch on \"${r}\" {\n    insert Person { name: \"carol\" }\n}\n--- expect ok\n";
+
+/// A whole quoted `on "${name}"` base operand needs its binding first, is the
+/// id in the compiled source, and admits no other `${` in the body; a params
+/// body spells a bound name; a header records whether it spelled `branch:`.
+#[test]
+fn unattached_base_operand_resolves_its_binding() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{ROOT}{CHILD}--- mutate branch: feature\nquery by_param($base: String) as unattached branch on $base {{\n    insert Person {{ name: \"dave\" }}\n}}\n--- params\n{{\"base\": \"${{r}}\"}}\n{EXPECT_OK}"
+    );
+    let case = parse_case("x", &text).unwrap();
+    let [
+        Item::Step(Step::Mutate(root)),
+        Item::Step(Step::Mutate(child)),
+        Item::Step(Step::Mutate(by_param)),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected three mutate steps, got {:?}", case.items);
+    };
+    assert_eq!(root.base_binding, None);
+    assert!(!root.branch_spelled);
+    assert_eq!(child.base_binding.as_deref(), Some("r"));
+    assert!(!child.branch_spelled);
+    assert_eq!(by_param.base_binding, None);
+    assert!(by_param.branch_spelled);
+    assert_eq!(by_param.branch, "feature");
+    let mut bindings = Bindings::new();
+    assert_eq!(
+        bound_source(child, &bindings).unwrap_err(),
+        "`${r}` is not bound at this step"
+    );
+    bindings.insert("r".into(), "hb1-r".into());
+    let source = bound_source(child, &bindings).unwrap();
+    assert!(
+        source.contains("as unattached branch on \"hb1-r\" {"),
+        "{source}"
+    );
+    assert!(!source.contains("${"));
+    assert_eq!(bound_source(root, &bindings).unwrap(), root.source.as_str());
+    let params = build_params(
+        by_param.params_raw.as_ref(),
+        &by_param.ast_params,
+        None,
+        &bindings,
+    )
+    .unwrap();
+    assert_eq!(params.get("base"), Some(&Literal::String("hb1-r".into())));
+    assert_eq!(
+        refusal("x", &format!("{HDR}{SCHEMA}{SEED}{CHILD}")),
+        "`${r}` is not bound; `--- bind commit $r` must precede this step"
+    );
+    let elsewhere = CHILD.replace("name: \"carol\"", "name: \"${r}\"");
+    assert_eq!(
+        refusal("x", &format!("{HDR}{SCHEMA}{SEED}{ROOT}{elsewhere}")),
+        "line 21: `${` may appear only inside a params or expect body"
+    );
+    let unbound_param =
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}--- params\n{{\"n\": \"${{r}}\"}}\n{EXPECT_OK}");
+    assert_eq!(
+        refusal("x", &unbound_param),
+        "`${` in a params or expect body is refused outside a loop"
     );
 }
 
@@ -1218,6 +1582,448 @@ mod schema_drift {
     }
 }
 
+mod result_contract {
+    use arrow_array::{Float64Array, Int32Array, Int64Array, StructArray};
+    use omnigraph_compiler::ir::{IRExpr, IRProjection};
+    use omnigraph_compiler::{ExprType, PropType, ScalarType};
+    use omnigraph_planner::{Estimate, NodeObjectType, PhysicalNode, PhysicalPlan, Properties};
+
+    use super::*;
+
+    fn node_fields() -> arrow_schema::Fields {
+        vec![
+            Field::new("@id", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, true),
+        ]
+        .into()
+    }
+
+    fn plan(nullable: bool) -> BoundPlan {
+        let mut plan = PhysicalPlan::new();
+        let input = plan.add(PhysicalNode::OuterReference {
+            outer_var: "p".into(),
+        });
+        let root = plan.add(PhysicalNode::Projection {
+            input,
+            return_exprs: vec![
+                IRProjection {
+                    expr: IRExpr::Literal(
+                        Literal::Float(1.0),
+                        ExprType::from_prop(&PropType::scalar(ScalarType::F64, nullable)),
+                    ),
+                    alias: Some("total".into()),
+                    column: "total".into(),
+                    ty: ExprType::from_prop(&PropType::scalar(ScalarType::F64, nullable)),
+                },
+                IRProjection {
+                    expr: IRExpr::Variable(
+                        "p".into(),
+                        omnigraph_compiler::types::ExprType::Node {
+                            type_name: "Person".into(),
+                        },
+                    ),
+                    alias: Some("person".into()),
+                    column: "person".into(),
+                    ty: ExprType::Node {
+                        type_name: "Person".into(),
+                    },
+                },
+            ],
+            node_objects: vec![NodeObjectType {
+                type_name: "Person".into(),
+                fields: node_fields(),
+            }],
+        });
+        plan.set_properties(
+            root,
+            Properties {
+                schema: Arc::new(Schema::new(vec![
+                    Field::new("total", DataType::Float64, nullable),
+                    Field::new("person", DataType::Struct(node_fields()), false),
+                ])),
+                ordering: None,
+                rows: Estimate::Unknown,
+                work_bytes: Estimate::Unknown,
+                retained_limit: None,
+                sources: vec![],
+            },
+        );
+        plan.set_root(root);
+        BoundPlan {
+            plan,
+            values: Default::default(),
+        }
+    }
+
+    fn decl() -> QueryDecl {
+        parse_query(
+            "query q() { match { $p: Person } return { sum($p.age) as total, $p as person } }",
+        )
+        .unwrap()
+        .single_decl()
+        .clone()
+    }
+
+    fn result(total: ArrayRef, age: ArrayRef) -> QueryResult {
+        let fields = vec![
+            Field::new("@id", DataType::Utf8, false),
+            Field::new("age", age.data_type().clone(), true),
+        ]
+        .into();
+        let person: ArrayRef = Arc::new(StructArray::new(
+            fields,
+            vec![Arc::new(StringArray::from(vec!["alice"])), age],
+            None,
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("total", total.data_type().clone(), true),
+            Field::new("person", person.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![total, person]).unwrap();
+        QueryResult::new(schema, vec![batch])
+    }
+
+    fn matching() -> QueryResult {
+        result(
+            Arc::new(Float64Array::from(vec![1.0])),
+            Arc::new(Int32Array::from(vec![30])),
+        )
+    }
+
+    #[test]
+    fn planned_results_require_order_names_and_full_node_types() {
+        let bound = plan(true);
+        assert_eq!(check_planned_results(&bound, &matching()), Ok(()));
+        let wrong = result(
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![30])),
+        );
+        assert!(
+            check_planned_results(&bound, &wrong)
+                .unwrap_err()
+                .contains("`total`")
+        );
+        let wrong = result(
+            Arc::new(Float64Array::from(vec![1.0])),
+            Arc::new(Int64Array::from(vec![30])),
+        );
+        assert!(
+            check_planned_results(&bound, &wrong)
+                .unwrap_err()
+                .contains("`person`")
+        );
+        let reversed = matching().batches()[0].project(&[1, 0]).unwrap();
+        let reversed = QueryResult::new(reversed.schema(), vec![reversed]);
+        assert!(check_planned_results(&bound, &reversed).is_err());
+        let mut wrong_name = plan(true);
+        let root = wrong_name.plan.root();
+        let mut properties = wrong_name.plan.properties(root).unwrap().clone();
+        properties.schema = Arc::new(Schema::new(vec![
+            Field::new("other", DataType::Float64, true),
+            Field::new("person", DataType::Struct(node_fields()), false),
+        ]));
+        wrong_name.plan.set_properties(root, properties);
+        assert!(check_planned_results(&wrong_name, &matching()).is_err());
+    }
+
+    #[test]
+    fn planned_nullability_checks_cells_and_inference_checks_flags() {
+        assert_eq!(check_planned_results(&plan(false), &matching()), Ok(()));
+        let null = result(
+            Arc::new(Float64Array::from(vec![None::<f64>])),
+            Arc::new(Int32Array::from(vec![30])),
+        );
+        assert!(
+            check_planned_results(&plan(false), &null)
+                .unwrap_err()
+                .contains("returned 1 null(s)")
+        );
+        assert_eq!(check_planned_results(&plan(true), &null), Ok(()));
+        let bound = plan(true);
+        assert_eq!(
+            check_inferred_results(&decl(), declared_result_schema(&bound).unwrap(), &bound),
+            Ok(())
+        );
+        assert!(
+            check_inferred_results(
+                &decl(),
+                declared_result_schema(&plan(false)).unwrap(),
+                &bound
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn round_trip_checks_stored_shapes_even_when_explain_is_equal() {
+        let original = plan(true);
+        let mut restored = original.clone();
+        let root = restored.plan.root();
+        let mut properties = restored.plan.properties(root).unwrap().clone();
+        properties.schema = Arc::new(Schema::new(vec![
+            Field::new("total", DataType::Float64, false),
+            Field::new("person", DataType::Struct(node_fields()), false),
+        ]));
+        restored.plan.set_properties(root, properties);
+        assert_eq!(original.plan.to_json(), restored.plan.to_json());
+        assert!(
+            check_restored_plan(&original, &restored)
+                .unwrap_err()
+                .contains("schema")
+        );
+        let mut restored = original.clone();
+        let Some(PhysicalNode::Projection { node_objects, .. }) = restored.plan.node_mut(root)
+        else {
+            panic!("projection");
+        };
+        node_objects[0].fields = vec![
+            Field::new("@id", DataType::Int64, false),
+            Field::new("age", DataType::Int32, true),
+        ]
+        .into();
+        assert_eq!(original.plan.to_json(), restored.plan.to_json());
+        assert!(
+            check_restored_plan(&original, &restored)
+                .unwrap_err()
+                .contains("typed declarations")
+        );
+    }
+
+    #[test]
+    fn planner_typed_renderer_and_gqt_validator_agree_on_every_expression_kind() {
+        use omnigraph_compiler::query::ast::{AggFunc, CompOp};
+        use omnigraph_compiler::types::AggSignature;
+        let ty = |scalar, nullable| ExprType::from_prop(&PropType::scalar(scalar, nullable));
+        let text = || {
+            IRExpr::Literal(
+                Literal::String("needle".into()),
+                ty(ScalarType::String, false),
+            )
+        };
+        let property = || IRExpr::PropAccess {
+            variable: "p".into(),
+            property: "name".into(),
+            ty: ty(ScalarType::String, true),
+        };
+        let node = || {
+            IRExpr::Variable(
+                "p".into(),
+                ExprType::Node {
+                    type_name: "Person".into(),
+                },
+            )
+        };
+        let rank = || IRExpr::Bm25 {
+            field: Box::new(property()),
+            query: Box::new(text()),
+            ty: ty(ScalarType::F32, false),
+        };
+        let expressions = vec![
+            property(),
+            text(),
+            node(),
+            IRExpr::Param("term".into(), ty(ScalarType::String, false)),
+            IRExpr::AliasRef("term".into(), ty(ScalarType::String, false)),
+            IRExpr::Nearest {
+                variable: "p".into(),
+                property: "embedding".into(),
+                query: Box::new(text()),
+                ty: ty(ScalarType::F32, false),
+            },
+            IRExpr::Search {
+                field: Box::new(property()),
+                query: Box::new(text()),
+                ty: ty(ScalarType::Bool, false),
+            },
+            IRExpr::Fuzzy {
+                field: Box::new(property()),
+                query: Box::new(text()),
+                max_edits: Some(Box::new(IRExpr::Literal(
+                    Literal::Integer(1),
+                    ty(ScalarType::I64, false),
+                ))),
+                ty: ty(ScalarType::Bool, false),
+            },
+            IRExpr::MatchText {
+                field: Box::new(property()),
+                query: Box::new(text()),
+                ty: ty(ScalarType::Bool, false),
+            },
+            rank(),
+            IRExpr::Rrf {
+                primary: Box::new(rank()),
+                secondary: Box::new(rank()),
+                k: None,
+                ty: ty(ScalarType::F64, false),
+            },
+            IRExpr::Aggregate {
+                func: AggFunc::Count,
+                distinct: false,
+                arg: Box::new(node()),
+                signature: AggSignature {
+                    arg: ExprType::Node {
+                        type_name: "Person".into(),
+                    },
+                    result: ty(ScalarType::I64, true),
+                },
+            },
+            IRExpr::comparison(property(), CompOp::Eq, text()),
+            IRExpr::Not(
+                Box::new(IRExpr::Param("flag".into(), ty(ScalarType::Bool, true))),
+                ty(ScalarType::Bool, true),
+            ),
+            IRExpr::IsNull {
+                expr: Box::new(property()),
+                negated: false,
+                ty: ty(ScalarType::Bool, false),
+            },
+            IRExpr::Cast {
+                expr: Box::new(IRExpr::Literal(
+                    Literal::Integer(1),
+                    ty(ScalarType::I64, false),
+                )),
+                ty: ty(ScalarType::F64, false),
+            },
+        ];
+        for expression in expressions {
+            let mut bound = plan(false);
+            let root = bound.plan.root();
+            let Some(PhysicalNode::Projection { return_exprs, .. }) = bound.plan.node_mut(root)
+            else {
+                panic!("projection");
+            };
+            return_exprs[0].ty = expression.ty().clone();
+            return_exprs[0].expr = expression;
+            let rendered = bound.plan.to_json();
+            assert_eq!(plan::validate_typed_plan(&rendered), Ok(()), "{rendered}");
+            assert_eq!(check_bound_plan_round_trip(&bound), Ok(()), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn block_typed_trees_and_specs_survive_every_row_round_trip_guard() {
+        use omnigraph_compiler::AggSignature;
+        use omnigraph_compiler::ir::{BlockAggregateExpr, SubqueryPredicate};
+        use omnigraph_compiler::query::ast::{AggFunc, CompOp};
+        let ty = |scalar, nullable| ExprType::from_prop(&PropType::scalar(scalar, nullable));
+        let leaf = BlockAggregateExpr::Aggregate {
+            func: AggFunc::Sum,
+            arg: Box::new(IRExpr::PropAccess {
+                variable: "p".into(),
+                property: "age".into(),
+                ty: ty(ScalarType::I64, true),
+            }),
+            signature: AggSignature {
+                arg: ty(ScalarType::I64, true),
+                result: ty(ScalarType::F64, true),
+            },
+        };
+        let cases = vec![
+            (
+                leaf,
+                IRExpr::Literal(Literal::Float(0.0), ty(ScalarType::F64, false)),
+            ),
+            (
+                BlockAggregateExpr::CountRows {
+                    ty: ty(ScalarType::I64, false),
+                },
+                IRExpr::Literal(Literal::Integer(0), ty(ScalarType::I64, false)),
+            ),
+            (
+                BlockAggregateExpr::Cast {
+                    expr: Box::new(BlockAggregateExpr::CountRows {
+                        ty: ty(ScalarType::I64, false),
+                    }),
+                    ty: ty(ScalarType::F64, false),
+                },
+                IRExpr::Param("bound".into(), ty(ScalarType::F64, false)),
+            ),
+        ];
+        for (left, right) in cases {
+            let mut bound = plan(false);
+            let input = bound.plan.root();
+            let aggregate = omnigraph_planner::plan_block_aggregate(&left).unwrap();
+            let id = bound.plan.add(PhysicalNode::AntiJoin {
+                input,
+                inner: input,
+                outer_var: "p".into(),
+                aggregate,
+                predicate: SubqueryPredicate {
+                    left,
+                    op: CompOp::Gt,
+                    right,
+                },
+                strategy: omnigraph_planner::AntiJoinStrategy::Correlated,
+            });
+            bound.plan.set_root(id);
+            assert_eq!(check_bound_plan_round_trip(&bound), Ok(()));
+            let mut wrong = bound.clone();
+            let Some(PhysicalNode::AntiJoin { aggregate, .. }) = wrong.plan.node_mut(id) else {
+                panic!("block");
+            };
+            *aggregate = Some(omnigraph_planner::AggregateSpec {
+                accumulator: omnigraph_planner::Accumulator::Float64,
+                overflow: omnigraph_planner::Overflow::Error,
+            });
+            assert!(check_restored_plan(&bound, &wrong).is_err());
+        }
+    }
+
+    #[test]
+    fn round_trip_detects_cast_child_type_loss_with_unchanged_gq() {
+        let mut original = plan(false);
+        let root = original.plan.root();
+        let Some(PhysicalNode::Projection { return_exprs, .. }) = original.plan.node_mut(root)
+        else {
+            panic!("projection");
+        };
+        return_exprs[0].expr = IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(
+                Literal::Integer(1),
+                ExprType::from_prop(&PropType::scalar(ScalarType::I64, false)),
+            )),
+            ty: return_exprs[0].ty.clone(),
+        };
+        assert_eq!(check_bound_plan_round_trip(&original), Ok(()));
+        let mut restored = original.clone();
+        let Some(PhysicalNode::Projection { return_exprs, .. }) = restored.plan.node_mut(root)
+        else {
+            panic!("projection");
+        };
+        let IRExpr::Cast { expr, .. } = &mut return_exprs[0].expr else {
+            panic!("cast");
+        };
+        let IRExpr::Literal(_, ty) = expr.as_mut() else {
+            panic!("literal");
+        };
+        *ty = ExprType::from_prop(&PropType::scalar(ScalarType::I32, false));
+        assert_eq!(
+            original.plan.to_json()["exprs"],
+            restored.plan.to_json()["exprs"]
+        );
+        assert!(
+            check_restored_plan(&original, &restored)
+                .unwrap_err()
+                .contains("explain")
+        );
+    }
+
+    #[test]
+    fn bound_plan_round_trip_preserves_return_types_and_node_declarations() {
+        let bound = plan(true);
+        omnigraph_planner::validate_output_schemas(&bound.plan).unwrap();
+        assert_eq!(check_bound_plan_round_trip(&bound), Ok(()));
+        let restored: BoundPlan =
+            serde_json::from_slice(&serde_json::to_vec(&bound).unwrap()).unwrap();
+        assert_eq!(restored, bound);
+        omnigraph_planner::validate_output_schemas(&restored.plan).unwrap();
+        assert_eq!(
+            bound.plan.to_json()["columns"],
+            serde_json::json!(["total: F64?", "person: Person"])
+        );
+    }
+}
+
 mod shape_section {
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Fields};
@@ -1750,10 +2556,12 @@ fn refuses_nearest_over_a_string_property() {
 
 #[test]
 fn traversal_header_forces_index_builds() {
-    let text = format!("{HDR}# traversal: indexed\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    let case = parse_case("x", &text).unwrap();
-    assert!(case.needs_indices);
-    assert_eq!(case.traversal, Some("indexed"));
+    for mode in ["auto", "indexed", "csr"] {
+        let text = format!("{HDR}# traversal: {mode}\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+        let case = parse_case("x", &text).unwrap();
+        assert!(case.needs_indices);
+        assert_eq!(case.traversal, Some(mode));
+    }
 }
 
 #[test]
@@ -1824,7 +2632,13 @@ async fn pinned_step_runs_only_its_pinned_path() {
         let Some(Item::Step(Step::Query(step))) = case.items.first() else {
             panic!("first item is the query step");
         };
-        let params = build_params(step.params_raw.as_ref(), &step.decl.params, None).unwrap();
+        let params = build_params(
+            step.params_raw.as_ref(),
+            &step.decl.params,
+            None,
+            &Bindings::new(),
+        )
+        .unwrap();
         let (outcome, counts) = under_traversal(
             Some(mode),
             session.query(
@@ -1911,7 +2725,13 @@ async fn traversal_pin_survives_settings_steps_and_rebind() {
 /// own pin plumbing expands on the csr path only.
 async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
     assert_eq!(session.settings().traversal(), Traversal::Csr, "{stage}");
-    let params = build_params(step.params_raw.as_ref(), &step.decl.params, None).unwrap();
+    let params = build_params(
+        step.params_raw.as_ref(),
+        &step.decl.params,
+        None,
+        &Bindings::new(),
+    )
+    .unwrap();
     let (outcome, counts) = under_traversal(
         pinned_mode(session),
         session.query(
@@ -1935,17 +2755,6 @@ async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
 }
 
 #[test]
-fn refuses_ordered_expect_on_an_rrf_led_order() {
-    let query = "--- query\nquery q($v: Vector(4), $t: String) {\n    match { $p: Person }\n    \
-                 return { $p.name }\n    order { rrf(nearest($p.vec, $v), bm25($p.name, $t)) }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
-    let message = refusal("x", &text);
-    assert!(message.contains("led by `rrf()`"), "{message}");
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n{SHAPE}");
-    parse_case("x", &text).unwrap();
-}
-
-#[test]
 fn refuses_ordered_expect_with_an_aggregate_in_return() {
     let query = "--- query\nquery q($t: String) {\n    match { $p: Person\n        search($p.name, $t) }\n    \
                  return { count($p) as total }\n    order { bm25($p.name, $t) }\n}\n";
@@ -1954,6 +2763,39 @@ fn refuses_ordered_expect_with_an_aggregate_in_return() {
     let text =
         format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n--- expect shape\ntotal: I64?\n");
     parse_case("x", &text).unwrap();
+    let query = "--- query\nquery q($t: String) {\n    match { $p: Person }\n    \
+                 return { $p.name, count($p) as total }\n    order { bm25($p.name, $t), total desc }\n    limit 3\n}\n";
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n--- expect shape\np.name: String\ntotal: I64?\n"
+    );
+    parse_case("x", &text).unwrap();
+}
+
+#[test]
+fn refuses_ordered_expect_with_rank_only_distinct_issue_953() {
+    for ranking in [
+        "nearest($p.vec, $v)",
+        "bm25($p.name, $t)",
+        "rrf(nearest($p.vec, $v), bm25($p.name, $t))",
+    ] {
+        let query = format!(
+            "--- query\nquery q($v: Vector(4), $t: String) {{\n\
+             match {{ $p: Person }}\nreturn distinct {{ $p.name }}\n\
+             order {{ {ranking} }}\nlimit 3\n}}\n"
+        );
+        let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n{SHAPE}");
+        assert!(refusal("x", &text).contains("rank-only `return distinct`"));
+        let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n{SHAPE}");
+        parse_case("x", &text).unwrap();
+        for accepted in [
+            query.replace("return distinct", "return"),
+            query.replace(ranking, &format!("{ranking}, $p.name")),
+            query.replace(ranking, "$p.name"),
+        ] {
+            let text = format!("{HDR}{SCHEMA}{SEED}{accepted}--- expect ordered\n{SHAPE}");
+            parse_case("x", &text).unwrap();
+        }
+    }
 }
 
 const SET_MERGE_OFF: &str = "--- mutate\nset merge_lineage = off;\n--- expect ok\n";

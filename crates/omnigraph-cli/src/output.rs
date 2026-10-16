@@ -711,6 +711,39 @@ pub(crate) fn print_snapshot_human(
     }
 }
 
+/// A Blob write receipt: the cell, the state it was left in and the commit
+/// that published it, or that nothing was published.
+pub(crate) fn print_blob_write_human(output: &omnigraph_api_types::BlobWriteOutput) {
+    let entity = match output.selector.entity {
+        omnigraph_api_types::BlobEntityKind::Node => "node",
+        omnigraph_api_types::BlobEntityKind::Edge => "edge",
+    };
+    println!("entity: {entity}");
+    println!("type: {}", output.selector.r#type);
+    println!("id: {}", output.selector.id);
+    println!("property: {}", output.selector.property);
+    println!("branch: {}", output.branch);
+    match output.kind {
+        omnigraph_api_types::BlobWriteStateOutput::Managed => {
+            println!("kind: managed");
+            if let Some(size) = output.size {
+                println!("size: {size}");
+            }
+            if let Some(etag) = output.etag.as_deref() {
+                println!("etag: {etag}");
+            }
+        }
+        omnigraph_api_types::BlobWriteStateOutput::Null => println!("kind: null"),
+    }
+    if let Some(actor) = output.actor_id.as_deref() {
+        println!("actor: {actor}");
+    }
+    match &output.commit {
+        Some(commit) => println!("commit: {}", commit.graph_commit_id),
+        None => println!("commit: none (the cell was already null)"),
+    }
+}
+
 pub(crate) fn print_blob_stat_human(output: &BlobStatOutput) {
     let entity = match output.selector.entity {
         omnigraph_api_types::BlobEntityKind::Node => "node",
@@ -767,6 +800,17 @@ pub(crate) fn print_change_human(output: &ChangeOutput) {
             target,
             merge,
         }) => println!("merged {source} into {target}: {}", merge.as_str()),
+        Some(BranchOutcomeOutput::Published) => println!(
+            "published commit {} on {}",
+            output
+                .commit
+                .as_ref()
+                .map_or("?", |commit| commit.graph_commit_id.as_str()),
+            output.branch
+        ),
+        Some(BranchOutcomeOutput::Dropped { graph_commit_id }) => {
+            println!("dropped commit {graph_commit_id} on {}", output.branch)
+        }
         None => println!(
             "changed {} via {}: {} nodes, {} edges",
             output.branch, output.query_name, output.affected_nodes, output.affected_edges
@@ -781,7 +825,7 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
     for commit in commits {
         let branch = commit.graph_branch.as_deref().unwrap_or("main");
         println!(
-            "{} graph_branch={} graph_manifest_version={}{}",
+            "{} graph_branch={} graph_manifest_version={}{}{}",
             commit.graph_commit_id,
             branch,
             commit.graph_manifest_version,
@@ -789,8 +833,21 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
                 .actor_id
                 .as_deref()
                 .map(|actor| format!(" actor={}", actor))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            commit_kind_suffix(commit),
         );
+    }
+}
+
+/// ` kind=unattached root=<id>` for an unattached snapshot, empty otherwise:
+/// `published: false` alone does not say whether an id can publish.
+fn commit_kind_suffix(commit: &CommitOutput) -> String {
+    match commit.kind {
+        CommitKindOutput::Unattached => format!(
+            " kind=unattached root={}",
+            commit.root_commit_id.as_deref().unwrap_or("?")
+        ),
+        CommitKindOutput::Published | CommitKindOutput::Unpublished => String::new(),
     }
 }
 
@@ -801,6 +858,20 @@ pub(crate) fn print_commit_human(commit: &CommitOutput) {
         commit.graph_branch.as_deref().unwrap_or("main")
     );
     println!("graph_manifest_version: {}", commit.graph_manifest_version);
+    if !commit.published {
+        println!("published: false");
+    }
+    println!(
+        "kind: {}",
+        match commit.kind {
+            CommitKindOutput::Published => "published",
+            CommitKindOutput::Unpublished => "unpublished",
+            CommitKindOutput::Unattached => "unattached",
+        }
+    );
+    if let Some(root_commit_id) = &commit.root_commit_id {
+        println!("root_commit_id: {}", root_commit_id);
+    }
     if let Some(parent_commit_id) = &commit.parent_commit_id {
         println!("parent_commit_id: {}", parent_commit_id);
     }
@@ -997,6 +1068,64 @@ pub(crate) fn print_profile_detail(detail: &ProfileDetail, json: bool) -> Result
     if let Some(format) = &detail.output_format {
         println!("  output: {format}");
     }
+    Ok(())
+}
+
+/// What this binary speaks, learned without contacting a server: the
+/// `omnigraph-http-api` value a server must match exactly, and the storage
+/// formats it writes and serves.
+#[derive(Debug, Serialize)]
+pub(crate) struct VersionOutput {
+    pub(crate) version: &'static str,
+    pub(crate) http_contract: &'static str,
+    pub(crate) internal_schema: InternalSchemaOutput,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct InternalSchemaOutput {
+    /// The stamp this binary's publications write.
+    pub(crate) writes: u32,
+    /// The inclusive range of stamps normal open serves, lowest first.
+    pub(crate) serves: [u32; 2],
+}
+
+impl InternalSchemaOutput {
+    /// The line `omnigraph version` prints; the agent skill states it verbatim.
+    pub(crate) fn line(&self) -> String {
+        let [lowest, highest] = self.serves;
+        format!(
+            "internal-schema {} (serves v{lowest} to v{highest})",
+            self.writes
+        )
+    }
+}
+
+impl VersionOutput {
+    pub(crate) fn current() -> Self {
+        use omnigraph::db::manifest::{
+            INTERNAL_MANIFEST_SCHEMA_VERSION, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+        };
+        Self {
+            version: env!("CARGO_PKG_VERSION"),
+            http_contract: omnigraph_api_types::HTTP_API_CONTRACT,
+            internal_schema: InternalSchemaOutput {
+                writes: INTERNAL_MANIFEST_SCHEMA_VERSION,
+                serves: [
+                    MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+                    INTERNAL_MANIFEST_SCHEMA_VERSION,
+                ],
+            },
+        }
+    }
+}
+
+pub(crate) fn print_version(output: &VersionOutput, json: bool) -> Result<()> {
+    if json {
+        return print_json(output);
+    }
+    println!("omnigraph {}", output.version);
+    println!("{}", output.internal_schema.line());
+    println!("http-contract {}", output.http_contract);
     Ok(())
 }
 
@@ -1284,6 +1413,140 @@ impl CommitChangesHumanStream {
         io::stdout().flush()?;
         Ok(())
     }
+}
+
+/// The endpoints a graph diff page names; every page of one auto-paginated
+/// diff must name the same ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DiffEndpointsHeader {
+    from_commit_id: String,
+    to_commit_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_commit_id: Option<String>,
+}
+
+impl DiffEndpointsHeader {
+    fn of(page: &omnigraph_api_types::DiffOutput) -> Self {
+        Self {
+            from_commit_id: page.from_commit_id.clone(),
+            to_commit_id: page.to_commit_id.clone(),
+            base_commit_id: page.base_commit_id.clone(),
+        }
+    }
+}
+
+fn print_diff_endpoints_human(header: &DiffEndpointsHeader) {
+    if let Some(base_commit_id) = &header.base_commit_id {
+        println!("merge_base: {base_commit_id}");
+    }
+    println!("from: {}", header.from_commit_id);
+    println!("to: {}", header.to_commit_id);
+}
+
+pub(crate) fn print_diff_human(page: &omnigraph_api_types::DiffOutput) {
+    print_diff_endpoints_human(&DiffEndpointsHeader::of(page));
+    for change in &page.changes {
+        print_entity_change_row(change);
+    }
+    if let Some(next_page_token) = &page.next_page_token {
+        println!("next_page_token: {}", next_page_token);
+    }
+}
+
+/// Incremental JSON rendering for an auto-paginated graph diff: the endpoint
+/// fields once, then one open `changes` array, each change serialized as its
+/// page arrives.
+pub(crate) struct DiffJsonStream<W: Write> {
+    writer: W,
+    header: Option<DiffEndpointsHeader>,
+    first_change: bool,
+}
+
+impl<W: Write> DiffJsonStream<W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
+            writer,
+            header: None,
+            first_change: true,
+        }
+    }
+
+    pub(crate) fn write_page(&mut self, page: &omnigraph_api_types::DiffOutput) -> Result<()> {
+        let header = DiffEndpointsHeader::of(page);
+        match &self.header {
+            None => {
+                self.writer.write_all(b"{\n  \"from_commit_id\": ")?;
+                serde_json::to_writer(&mut self.writer, &header.from_commit_id)?;
+                self.writer.write_all(b",\n  \"to_commit_id\": ")?;
+                serde_json::to_writer(&mut self.writer, &header.to_commit_id)?;
+                if let Some(base_commit_id) = &header.base_commit_id {
+                    self.writer.write_all(b",\n  \"base_commit_id\": ")?;
+                    serde_json::to_writer(&mut self.writer, base_commit_id)?;
+                }
+                self.writer.write_all(b",\n  \"changes\": [")?;
+                self.header = Some(header);
+            }
+            Some(seen) if seen == &header => {}
+            Some(_) => bail!("diff continuation changed its endpoints while auto-paginating"),
+        }
+        for change in &page.changes {
+            if !self.first_change {
+                self.writer.write_all(b",")?;
+            }
+            self.writer.write_all(b"\n    ")?;
+            write_pretty_inline(&mut self.writer, change, 4)?;
+            self.first_change = false;
+        }
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<W> {
+        if self.header.is_none() {
+            bail!("diff auto-pagination completed without a page");
+        }
+        if self.first_change {
+            self.writer.write_all(b"]\n}\n")?;
+        } else {
+            self.writer.write_all(b"\n  ]\n}\n")?;
+        }
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+}
+
+/// Incremental human rendering for an auto-paginated graph diff.
+pub(crate) struct DiffHumanStream {
+    header: Option<DiffEndpointsHeader>,
+}
+
+impl DiffHumanStream {
+    pub(crate) fn new() -> Self {
+        Self { header: None }
+    }
+
+    pub(crate) fn write_page(&mut self, page: &omnigraph_api_types::DiffOutput) -> Result<()> {
+        let header = DiffEndpointsHeader::of(page);
+        match &self.header {
+            None => {
+                print_diff_endpoints_human(&header);
+                self.header = Some(header);
+            }
+            Some(seen) if seen == &header => {}
+            Some(_) => bail!("diff continuation changed its endpoints while auto-paginating"),
+        }
+        for change in &page.changes {
+            print_entity_change_row(change);
+        }
+        io::stdout().flush()?;
+        Ok(())
+    }
+}
+
+pub(crate) fn print_merge_base_human(output: &omnigraph_api_types::MergeBaseOutput) {
+    println!("merge_base: {}", output.merge_base.graph_commit_id);
+    println!("source: {} at {}", output.source, output.source_commit_id);
+    println!("target: {} at {}", output.target, output.target_commit_id);
 }
 
 /// Incremental JSON rendering for one auto-paginated feed poll.

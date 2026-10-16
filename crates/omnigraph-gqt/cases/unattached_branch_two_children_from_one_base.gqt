@@ -1,0 +1,127 @@
+# issue: none
+# notes: Two children of one root are independent: each snapshot holds the root's rows and its own write only,
+# notes: and dropping one leaves the sibling and the root readable while the recorded target is unchanged.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query root_bob() as unattached branch {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $r
+
+--- mutate
+query child_carol() as unattached branch on "${r}" {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $a
+
+--- mutate
+query child_dave() as unattached branch on "${r}" {
+    insert Person { name: "dave", age: 63 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $b
+
+--- query snapshot: $a
+query names_at_a() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- query snapshot: $b
+query names_at_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "dave"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+commit drop "${a}"
+
+--- expect ok
+
+--- query snapshot: $a
+query names_at_dropped_a() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: not found
+
+--- query snapshot: $b
+query names_at_b_after_drop() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "dave"}
+
+--- expect shape
+p.name: String
+
+--- query snapshot: $r
+query names_at_root_after_drop() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

@@ -174,7 +174,10 @@ pub(super) fn record(config: &Path, api: &str, identity: &Identity) -> Result<()
 
 pub(super) fn bind(config: &Path, context: &Context) -> Result<()> {
     if let Some(existing) = read_context(config)? {
-        if existing.api == context.api && existing.cluster == context.cluster {
+        if existing.api == context.api
+            && existing.cluster == context.cluster
+            && existing.organization_id == context.organization_id
+        {
             return Ok(());
         }
         return Err(Failure::refused(
@@ -185,7 +188,7 @@ pub(super) fn bind(config: &Path, context: &Context) -> Result<()> {
     let dir = config.join(".omnigraph");
     let mut file = tempfile::NamedTempFile::new_in(&dir).map_err(|_| failure())?;
     file.write_all(
-        serde_yaml::to_string(context)
+        yaml_serde::to_string(context)
             .map_err(|_| failure())?
             .as_bytes(),
     )

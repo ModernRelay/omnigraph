@@ -456,7 +456,12 @@ async fn maintain_indices_for_branch(
             let witness = txn.authority.staging_witness()?;
             let (detached, identity) = db
                 .storage()
-                .commit_staged_detached(ds, staged, &witness)
+                .commit_staged_detached(
+                    ds,
+                    staged,
+                    &witness,
+                    &declared_full_text_columns(&catalog, &target.table_key),
+                )
                 .await?;
             let state = db
                 .storage()
@@ -488,6 +493,7 @@ async fn maintain_indices_for_branch(
             actor,
             &txn,
             lineage,
+            Publication::Publish,
         )
         .await?;
         Some(published.graph_commit_id)
@@ -538,6 +544,39 @@ enum NodePropIndexKind {
     Btree,
     Fts,
     Vector,
+}
+
+/// The columns of `table_key` that carry a declared full-text index: every
+/// one-column `@index`/`@key` node property [`node_prop_index_kind`] maps to
+/// full text, the same rule the index builder follows. Edges declare none.
+/// Every detached commit a writer publishes declares them
+/// (`TableStore::commit_staged_detached`).
+pub(crate) fn declared_full_text_columns(catalog: &Catalog, table_key: &str) -> Vec<String> {
+    let Some(node_type) = table_key
+        .strip_prefix("node:")
+        .and_then(|type_name| catalog.node_types.get(type_name))
+    else {
+        return Vec::new();
+    };
+    let mut columns: Vec<String> = node_type
+        .indices
+        .iter()
+        .filter_map(|index_cols| match index_cols.as_slice() {
+            [property] => Some(property),
+            _ => None,
+        })
+        .filter(|property| {
+            node_type
+                .properties
+                .get(*property)
+                .and_then(node_prop_index_kind)
+                == Some(NodePropIndexKind::Fts)
+        })
+        .cloned()
+        .collect();
+    columns.sort();
+    columns.dedup();
+    columns
 }
 
 fn node_prop_index_kind(prop_type: &PropType) -> Option<NodePropIndexKind> {
@@ -765,8 +804,11 @@ async fn plan_index_work_node(
             continue;
         };
         match node_prop_index_kind(prop_type) {
+            // An untrained segment only declares the analyzer
+            // (`TableStore::commit_staged_detached`); the postings are built
+            // here once no segment covers a fragment.
             Some(NodePropIndexKind::Fts) => {
-                if !db.storage().has_fts_index(ds, prop_name).await? {
+                if !db.storage().has_fts_postings(ds, prop_name).await? {
                     work.push_spec(crate::storage_layer::IndexBuildSpec::FullText {
                         column: prop_name.clone(),
                     });
@@ -1275,9 +1317,75 @@ pub(super) async fn commit_updates(
     commit_prepared_updates(db, &prepared, None).await
 }
 
+/// Where a prepared write's publication lands.
+pub(crate) enum Publication {
+    /// Advance the branch head: the ordinary publish.
+    Publish,
+    /// Write an unpublished commit (RFC "Unpublished graph commits"): the
+    /// branch head is unchanged, and a merge carries its held inputs.
+    Propose(Option<crate::db::manifest::UnpublishedMergeInputs>),
+    /// Write an unattached snapshot (RFC "Unattached graph branches"): a
+    /// root over the live head or a child over its base snapshot; the branch
+    /// head is unchanged and the snapshot never publishes.
+    Unattached(crate::db::manifest::UnattachedWriteBase),
+}
+
+async fn publish_prepared(
+    coordinator: &mut crate::db::graph_coordinator::GraphCoordinator,
+    changes: &[ManifestChange],
+    expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
+    lineage_intent: crate::db::manifest::LineageIntent,
+    expectation: crate::db::manifest::GraphHeadExpectation,
+    publication: Publication,
+) -> Result<crate::db::GraphCommit> {
+    match publication {
+        Publication::Publish => {
+            let precondition =
+                crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation);
+            Ok(coordinator
+                .commit_changes_with_intent_and_expected(
+                    changes,
+                    expected_table_versions,
+                    lineage_intent,
+                    &precondition,
+                )
+                .await?
+                .commit)
+        }
+        Publication::Propose(merge) => {
+            coordinator
+                .propose_changes(
+                    changes,
+                    expected_table_versions,
+                    &lineage_intent,
+                    &expectation,
+                    merge,
+                )
+                .await
+        }
+        Publication::Unattached(base) => {
+            let intent = crate::db::manifest::UnattachedIntent {
+                branch: expectation.branch.clone(),
+                actor_id: lineage_intent.actor_id.clone(),
+                created_at: lineage_intent.created_at,
+            };
+            coordinator
+                .propose_unattached(
+                    changes,
+                    expected_table_versions,
+                    &intent,
+                    &expectation,
+                    &base,
+                )
+                .await
+        }
+    }
+}
+
 /// Commit updates with a publisher-level OCC fence. The
 /// `expected_table_versions` map asserts the manifest's pre-write per-table
 /// versions; mismatches surface as `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
+/// `publication` chooses the head-advancing publish or an unpublished commit.
 pub(super) async fn commit_updates_on_branch_with_expected(
     db: &Omnigraph,
     branch: Option<&str>,
@@ -1286,6 +1394,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     actor_id: Option<&str>,
     txn: &crate::db::WriteTxn,
     lineage_intent: crate::db::manifest::LineageIntent,
+    publication: Publication,
 ) -> Result<crate::db::GraphCommit> {
     if branch != txn.branch.as_deref() {
         return Err(OmniError::manifest_internal(
@@ -1305,7 +1414,6 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         txn.authority.branch_identifier.clone(),
         txn.authority.graph_head.clone(),
     );
-    let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation);
 
     // Choose and publish through one coordinator lock. A same-name cached
     // coordinator can still hold another incarnation or incomplete lineage,
@@ -1321,14 +1429,15 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             // The publisher still reads fresh authority and applies its CAS.
             *active = db.open_coordinator_for_branch(branch).await?;
         }
-        active
-            .commit_changes_with_intent_and_expected(
-                &changes,
-                expected_table_versions,
-                lineage_intent,
-                &precondition,
-            )
-            .await?
+        publish_prepared(
+            &mut active,
+            &changes,
+            expected_table_versions,
+            lineage_intent,
+            expectation,
+            publication,
+        )
+        .await?
     } else {
         // An operation on a non-bound branch owns its coordinator locally;
         // it must never temporarily change this handle's query/write binding.
@@ -1359,18 +1468,19 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         // publisher still reads fresh state and enforces ExactGraphHead on
         // every CAS attempt. On error, drop a taken cache view; the next
         // capture must resolve any ambiguous durable publication.
-        let published = coordinator
-            .commit_changes_with_intent_and_expected(
-                &changes,
-                expected_table_versions,
-                lineage_intent,
-                &precondition,
-            )
-            .await?;
+        let published = publish_prepared(
+            &mut coordinator,
+            &changes,
+            expected_table_versions,
+            lineage_intent,
+            expectation,
+            publication,
+        )
+        .await?;
         *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
         published
     };
-    Ok(published.commit)
+    Ok(published)
 }
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {

@@ -63,6 +63,8 @@ const OLDEST_RETIRED_HEAD_STAMP: u32 = 8;
 const OLDEST_VERSION_STAMP: u32 = 6;
 /// What an unstamped bootstrap version admits as: the stamp an absent key means (`guard_stamp`).
 const ABSENT_STAMP: u32 = 1;
+/// Native commit records replace archived legacy layout starting at this stamp.
+const NATIVE_HISTORY_SCHEMA_VERSION: u32 = 14;
 /// The stamps [`RootContractSource`] reads a live head at: the upgrade sources
 /// below the one whose contract is a row.
 const ROOT_CONTRACT_STAMPS: [u32; 2] = {
@@ -475,8 +477,8 @@ pub(crate) enum RetiredHead {
 }
 
 /// `Some` when `dataset`'s version is read from the legacy history of a root
-/// that has one: it is unstamped, stamped below this build's stamp, or main's
-/// conversion under the pending key. The value says whether it carries the key.
+/// that has one: it predates native commit records, or is a supported pending
+/// conversion. The value says whether it carries the pending key.
 fn legacy_version(dataset: &Dataset) -> Option<bool> {
     let metadata = &dataset.schema().metadata;
     let fenced = metadata.contains_key(UPGRADE_PENDING_KEY);
@@ -486,8 +488,10 @@ fn legacy_version(dataset: &Dataset) -> Option<bool> {
     {
         None => true,
         Some(Ok(stamp)) => {
-            stamp < INTERNAL_MANIFEST_SCHEMA_VERSION
-                || (stamp == INTERNAL_MANIFEST_SCHEMA_VERSION && fenced)
+            stamp < NATIVE_HISTORY_SCHEMA_VERSION
+                || ((NATIVE_HISTORY_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION)
+                    .contains(&stamp)
+                    && fenced)
         }
         Some(Err(_)) => false,
     };

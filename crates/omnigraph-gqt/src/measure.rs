@@ -768,6 +768,15 @@ impl Measure {
         bytes: u64,
         range: Option<String>,
     ) -> usize {
+        crate::trace::store_request(
+            verb,
+            &object.class,
+            &object.dataset,
+            &object.path,
+            range.as_deref(),
+            bytes,
+            started.label.slot,
+        );
         let mut ledger = self.ledger.lock().unwrap();
         ledger.push(Request {
             verb,

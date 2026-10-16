@@ -1,6 +1,174 @@
-use omnigraph_planner::{RuntimeFilterKind, RuntimeFilterSpec};
+use omnigraph_planner::{
+    CoverageProvenance, FragmentCoverage, IndexCoverage, IndexFact, IndexKind, RuntimeFilterKind,
+    RuntimeFilterSpec,
+};
 
 use super::*;
+
+fn btree(column: &str, covered: u64) -> IndexFact {
+    IndexFact {
+        name: format!("{column}_idx"),
+        column: column.into(),
+        kind: IndexKind::Btree { usable: true },
+        coverage: Some(FragmentCoverage { covered, total: 2 }),
+    }
+}
+
+fn expand_inputs(plan: &PhysicalPlan) -> &omnigraph_planner::ExpandCostInputs {
+    plan.live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::Expand { policy, .. } => policy.cost(),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn coverage_requires_every_endpoint_and_every_candidate_to_be_complete() {
+    for columns in [SYSTEM_COLUMNS_V3, omnigraph_compiler::SYSTEM_COLUMNS_LEGACY] {
+        let mut ty = node_type("T", Some(1));
+        ty.columns = columns;
+        let fields: Vec<Field> = ty
+            .schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == SYSTEM_COLUMNS_V3.id {
+                    Field::new(columns.id, DataType::Utf8, false)
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        ty.schema = Arc::new(Schema::new(fields));
+        for direction in [Direction::Out, Direction::In, Direction::Both] {
+            let src = btree(columns.src, 2);
+            let dst = btree(columns.dst, 2);
+            let mut duplicate = src.clone();
+            duplicate.name = "other_src".into();
+            duplicate.coverage.as_mut().unwrap().covered = 1;
+            let mut unknown = src.clone();
+            unknown.coverage = None;
+            let mut unusable = src.clone();
+            unusable.kind = IndexKind::Btree { usable: false };
+            for (facts, expected) in [
+                (vec![], false),
+                (vec![src.clone()], direction == Direction::Out),
+                (vec![dst.clone()], direction == Direction::In),
+                (vec![src.clone(), dst.clone()], true),
+                (
+                    vec![btree(columns.src, 1), dst.clone()],
+                    direction == Direction::In,
+                ),
+                (vec![unknown, dst.clone()], direction == Direction::In),
+                (vec![unusable, dst.clone()], direction == Direction::In),
+                (vec![src, duplicate, dst], direction == Direction::In),
+            ] {
+                let mut hop = expand("a", "b", vec![]);
+                let IROp::Expand { edges, .. } = &mut hop else {
+                    unreachable!()
+                };
+                *edges = EdgeSelection::Named(EdgeMember {
+                    edge_type: "knows".into(),
+                    direction,
+                });
+                let op = ir(vec![scan("a"), hop], vec![prop("b", "slug")], vec![]);
+                let source = MemorySource::default()
+                    .with_node_type("T", ty.clone())
+                    .with_expand_statistics("knows", direction, knows_statistics(1))
+                    .with_index_facts("edge:knows", facts.clone());
+                let (plan, _) = physical(&op, &source);
+                let inputs = expand_inputs(&plan);
+                assert_eq!(
+                    inputs.coverage == IndexCoverage::Indexed,
+                    expected,
+                    "{columns:?} {direction:?} {facts:?}"
+                );
+                assert_eq!(
+                    inputs.coverage_provenance,
+                    CoverageProvenance::PinnedIndexFacts
+                );
+            }
+        }
+    }
+}
+
+/// GQT cannot omit fields from an accepted saved-plan envelope.
+#[test]
+fn bound_expand_coverage_defaults_only_missing_provenance_to_legacy() {
+    let op = ir(
+        vec![scan("a"), expand("a", "b", vec![])],
+        vec![prop("b", "slug")],
+        vec![],
+    );
+    let source = source_with_rows(Some(1)).with_expand_statistics(
+        "knows",
+        Direction::Out,
+        knows_statistics(1),
+    );
+    let (plan, _) = physical(&op, &source);
+    let bound = omnigraph_planner::BoundPlan {
+        plan,
+        values: Default::default(),
+    };
+    let encoded = serde_json::to_value(&bound).unwrap();
+    fn edit(value: &mut serde_json::Value, coverage: IndexCoverage, provenance: Option<&str>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object.contains_key("coverage_provenance") {
+                    object.insert("coverage".into(), serde_json::json!(coverage));
+                    match provenance {
+                        Some(p) => {
+                            object.insert("coverage_provenance".into(), serde_json::json!(p));
+                        }
+                        None => {
+                            object.remove("coverage_provenance");
+                        }
+                    }
+                }
+                for child in object.values_mut() {
+                    edit(child, coverage, provenance);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    edit(child, coverage, provenance);
+                }
+            }
+            _ => {}
+        }
+    }
+    for coverage in [IndexCoverage::Indexed, IndexCoverage::Degraded] {
+        for (provenance, expected) in [
+            (None, CoverageProvenance::LegacyAssumed),
+            (Some("legacy_assumed"), CoverageProvenance::LegacyAssumed),
+            (
+                Some("pinned_index_facts"),
+                CoverageProvenance::PinnedIndexFacts,
+            ),
+        ] {
+            let mut bytes = encoded.clone();
+            edit(&mut bytes, coverage, provenance);
+            let decoded: omnigraph_planner::BoundPlan = serde_json::from_value(bytes).unwrap();
+            assert_eq!(expand_inputs(&decoded.plan).coverage, coverage);
+            assert_eq!(expand_inputs(&decoded.plan).coverage_provenance, expected);
+            assert_eq!(
+                serde_json::from_value::<omnigraph_planner::BoundPlan>(
+                    serde_json::to_value(&decoded).unwrap()
+                )
+                .unwrap(),
+                decoded
+            );
+        }
+    }
+    let mut invalid = encoded;
+    edit(
+        &mut invalid,
+        IndexCoverage::Indexed,
+        Some("future_provenance"),
+    );
+    assert!(serde_json::from_value::<omnigraph_planner::BoundPlan>(invalid).is_err());
+}
 
 #[test]
 fn expand_mode_records_the_frontier_and_applies_its_hard_cap() {
@@ -131,7 +299,6 @@ fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
         edge_count,
         src_node_count,
         dst_node_count,
-        same_type: src_node_count == dst_node_count,
         max_frontier_cap: 1 << 20,
         max_hops_cap: 6,
     };
@@ -197,7 +364,6 @@ fn access_path_looks_ids_up_when_the_build_side_does_not_fit_the_pool() {
                 edge_count: 100_000,
                 src_node_count: 20_000,
                 dst_node_count: 20_000,
-                same_type: true,
                 max_frontier_cap: 1 << 20,
                 max_hops_cap: 6,
             },
@@ -281,7 +447,6 @@ fn access_path_sizes_only_projected_columns() {
                 edge_count: 100_000,
                 src_node_count: 20_000,
                 dst_node_count: 20_000,
-                same_type: true,
                 max_frontier_cap: 1 << 20,
                 max_hops_cap: 6,
             },
@@ -368,7 +533,10 @@ fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
                     filters: vec![IRExpr::comparison(
                         prop("a", property),
                         CompOp::Eq,
-                        IRExpr::Literal(Literal::String("x".into())),
+                        IRExpr::Literal(
+                            Literal::String("x".into()),
+                            value_type(ScalarType::String, false),
+                        ),
                     )],
                 },
                 expand("a", "b", vec![]),
@@ -679,4 +847,540 @@ fn find_node<'j>(node: &'j serde_json::Value, name: &str) -> Option<&'j serde_js
         .into_iter()
         .flatten()
         .find_map(|input| find_node(input, name))
+}
+
+/// The physical scan of `binding`'s projection after every pass.
+fn physical_projection(plan: &PhysicalPlan, binding: &str) -> BTreeSet<String> {
+    plan.live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::Scan { spec, .. } if spec.binding.as_deref() == Some(binding) => {
+                spec.projection.clone()
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no physical scan bound to `{binding}`"))
+        .into_iter()
+        .collect()
+}
+
+/// One hydrated binding: its name and `(return position, property)` per
+/// fetched column.
+type Hydrated = (String, Vec<(usize, String)>);
+
+/// The root `HydrateColumns`: per binding, the properties it fetches with
+/// the return positions they fill.
+fn root_hydration(plan: &PhysicalPlan) -> Option<Vec<Hydrated>> {
+    match plan.node(plan.root()) {
+        Some(PhysicalNode::HydrateColumns { bindings, .. }) => Some(
+            bindings
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.binding.clone(),
+                        binding
+                            .columns
+                            .iter()
+                            .map(|column| (column.position, column.property.clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// A top-k over a table four times its limit or larger, or of unknown size,
+/// fetches the column only its output reads by row address above the limit;
+/// the scan reads the row address in its place. The logical plan keeps the
+/// column, and a table within four times the limit keeps it on the scan.
+#[test]
+fn a_top_k_fetches_its_return_only_column_by_row_address() {
+    let op = ir(
+        vec![scan("c")],
+        vec![prop("c", "slug"), prop("c", "body"), prop("c", "rank")],
+        vec![prop("c", "rank")],
+    );
+    for rows in [Some(41), None] {
+        let source = source_with_rows(rows);
+        let mut logical = resolve(&op, &source).expect("resolve");
+        let fired = rewrite(&mut logical, &source).expect("rewrite");
+        let optimized = omnigraph_planner::physical_plan(&mut logical, &source, &bounds(), fired)
+            .expect("lower");
+        let plan = optimized.physical;
+        assert!(
+            optimized.fired.contains(&"late_materialization"),
+            "{rows:?}: {:?}",
+            optimized.fired
+        );
+        assert_eq!(
+            root_hydration(&plan),
+            Some(vec![("c".to_string(), vec![(1, "body".to_string())])]),
+            "{rows:?}"
+        );
+        assert_eq!(
+            physical_projection(&plan, "c"),
+            set(&["__id", "slug", "rank", "_rowaddr"])
+        );
+        assert_eq!(
+            projection_of(&logical, "c"),
+            set(&["__id", "slug", "rank", "body"])
+        );
+        let json = plan.to_json();
+        assert_eq!(json["node"], "HydrateColumns");
+        assert_eq!(json["bindings"][0]["columns"], serde_json::json!(["body"]));
+        assert!(json["properties"]["retained_limit"].as_u64().is_some());
+    }
+    let (plan, fired) = physical(&op, &source_with_rows(Some(40)));
+    assert!(!fired.contains(&"late_materialization"), "{fired:?}");
+    assert_eq!(root_hydration(&plan), None);
+    assert_eq!(
+        physical_projection(&plan, "c"),
+        set(&["__id", "slug", "rank", "body"])
+    );
+}
+
+/// A return item typed as its expression, named `column` (the alias when it
+/// has one).
+fn returned(expr: IRExpr, alias: Option<&str>, column: &str) -> IRProjection {
+    IRProjection {
+        ty: expr.ty().clone(),
+        expr,
+        alias: alias.map(str::to_string),
+        column: column.to_string(),
+    }
+}
+
+/// Under a limit, a scan whose row estimate is above four times the limit
+/// hydrates its return-only column, a bare table scan as much as a traversal
+/// destination: Lance reads ahead of a consumer that stops early. A scan a key
+/// equality bounds to one row keeps its column.
+#[test]
+fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
+    let bare = ir(vec![scan("c")], vec![prop("c", "body")], vec![]);
+    let (plan, fired) = physical(&bare, &source_with_rows(Some(1_000)));
+    assert!(fired.contains(&"late_materialization"), "{fired:?}");
+    assert_eq!(
+        root_hydration(&plan),
+        Some(vec![("c".to_string(), vec![(0, "body".to_string())])])
+    );
+
+    let lookup = ir(
+        vec![IROp::NodeScan {
+            variable: "c".to_string(),
+            type_name: "T".to_string(),
+            filters: vec![IRExpr::comparison(
+                prop("c", "slug"),
+                CompOp::Eq,
+                IRExpr::Literal(
+                    Literal::String("one".to_string()),
+                    value_type(ScalarType::String, false),
+                ),
+            )],
+        }],
+        vec![prop("c", "body")],
+        vec![],
+    );
+    let (plan, fired) = physical(&lookup, &source_with_rows(Some(1_000)));
+    assert!(!fired.contains(&"late_materialization"), "{fired:?}");
+    assert_eq!(root_hydration(&plan), None);
+
+    let traversal = ir(
+        vec![scan("a"), expand("a", "b", vec![])],
+        vec![prop("a", "slug"), prop("b", "body")],
+        vec![],
+    );
+    let (plan, fired) = physical(&traversal, &source_with_rows(Some(1_000)));
+    assert!(fired.contains(&"late_materialization"), "{fired:?}");
+    assert_eq!(
+        root_hydration(&plan),
+        Some(vec![("b".to_string(), vec![(1, "body".to_string())])])
+    );
+    assert!(physical_projection(&plan, "b").contains("_rowaddr"));
+    assert!(!physical_projection(&plan, "b").contains("body"));
+}
+
+/// Only a bare return-only property is hydrated: the key, a sort key, a
+/// column a filter reads, a computed return (named or not) and a return the
+/// sort orders by alias stay on the scan, and an unnamed computed return does
+/// not keep the others from hydrating.
+#[test]
+fn hydration_keeps_every_column_something_besides_the_output_reads() {
+    let op = Operation::Query(Box::new(QueryIR {
+        name: "q".to_string(),
+        params: vec![],
+        pipeline: vec![IROp::NodeScan {
+            variable: "c".to_string(),
+            type_name: "T".to_string(),
+            filters: vec![IRExpr::comparison(
+                prop("c", "state"),
+                CompOp::Eq,
+                IRExpr::Literal(
+                    Literal::String("open".to_string()),
+                    value_type(ScalarType::String, false),
+                ),
+            )],
+        }],
+        return_exprs: vec![
+            returned(prop("c", "slug"), None, "c.slug"),
+            returned(prop("c", "rank"), None, "c.rank"),
+            returned(prop("c", "state"), None, "c.state"),
+            returned(prop("c", "title"), Some("t"), "t"),
+            returned(
+                IRExpr::comparison(
+                    prop("c", "kind"),
+                    CompOp::Eq,
+                    IRExpr::Literal(
+                        Literal::String("x".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
+                ),
+                Some("is_x"),
+                "is_x",
+            ),
+            returned(
+                IRExpr::comparison(
+                    prop("c", "edits"),
+                    CompOp::Eq,
+                    IRExpr::Literal(
+                        Literal::String("0".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
+                ),
+                None,
+                "edits_eq",
+            ),
+            returned(prop("c", "body"), Some("text"), "text"),
+        ],
+        distinct: false,
+        order_by: vec![
+            IROrdering {
+                expr: prop("c", "rank"),
+                descending: false,
+            },
+            IROrdering {
+                expr: IRExpr::AliasRef("t".to_string(), property_type("title")),
+                descending: true,
+            },
+        ],
+        limit: Some(5),
+    }));
+    let (plan, fired) = physical(&op, &source_with_rows(Some(1_000)));
+    assert!(fired.contains(&"late_materialization"), "{fired:?}");
+    assert_eq!(
+        root_hydration(&plan),
+        Some(vec![("c".to_string(), vec![(6, "body".to_string())])])
+    );
+    assert_eq!(
+        physical_projection(&plan, "c"),
+        set(&[
+            "__id", "slug", "rank", "state", "title", "kind", "edits", "_rowaddr"
+        ])
+    );
+}
+
+/// `$x.prop = "value"`, a bound equality on one binding.
+fn equals(variable: &str, property: &str, value: &str) -> IRExpr {
+    IRExpr::comparison(
+        prop(variable, property),
+        CompOp::Eq,
+        IRExpr::Literal(
+            Literal::String(value.to_string()),
+            value_type(ScalarType::String, false),
+        ),
+    )
+}
+
+/// `not { $a knows $m  $m knows $k  <inner filters> }` over every `T` as `$a`,
+/// `$k`'s own filters `k_filters`.
+fn negated_two_hops(
+    outer_filters: Vec<IRExpr>,
+    k_filters: Vec<IRExpr>,
+    inner_filters: Vec<IROp>,
+) -> Operation {
+    let mut inner = vec![expand("a", "m", vec![]), expand("m", "k", k_filters)];
+    inner.extend(inner_filters);
+    let outer = IROp::NodeScan {
+        variable: "a".to_string(),
+        type_name: "T".to_string(),
+        filters: outer_filters,
+    };
+    ir(
+        vec![
+            outer,
+            IROp::AntiJoin {
+                outer_var: "a".to_string(),
+                inner,
+                predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
+            },
+        ],
+        vec![prop("a", "slug")],
+        vec![],
+    )
+}
+
+/// 1,000 `T` rows; `knows` fans out ten per source going out and `in_fanout`
+/// per destination coming in.
+fn anti_join_source(in_fanout: u64) -> MemorySource {
+    MemorySource::default()
+        .with_node_type("T", node_type("T", Some(1_000)))
+        .with_expand_statistics("knows", Direction::Out, knows_statistics(1_000))
+        .with_expand_statistics(
+            "knows",
+            Direction::In,
+            ExpandStatistics {
+                edge_count: 10_000,
+                src_node_count: 10_000 / in_fanout,
+                dst_node_count: 1_000,
+                max_frontier_cap: 1024,
+                max_hops_cap: 6,
+            },
+        )
+}
+
+/// The block's strategy and its inner tree's nodes, in pre-order.
+fn anti_join_of(plan: &PhysicalPlan) -> (omnigraph_planner::AntiJoinStrategy, Vec<&PhysicalNode>) {
+    let (strategy, inner) = plan
+        .live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::AntiJoin {
+                strategy, inner, ..
+            } => Some((*strategy, *inner)),
+            _ => None,
+        })
+        .expect("the plan holds the block's AntiJoin");
+    let mut nodes = Vec::new();
+    let mut pending = vec![inner];
+    while let Some(id) = pending.pop() {
+        let node = plan.node(id).unwrap();
+        nodes.push(node);
+        pending.extend(node.inputs().into_iter().rev());
+    }
+    (strategy, nodes)
+}
+
+/// A block bounded by a key equality on its own binding runs from it when its
+/// chain produces fewer rows: one `$k`, ten `$m`, a hundred `$a` keys against
+/// the correlated 1,000 outer rows expanded twice. The key-set tree is a
+/// table scan of `$k` under the pushed equality, then both hops reversed,
+/// ending on `$a` with no scan of it and no `OuterReference`.
+#[test]
+fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
+    use omnigraph_planner::AntiJoinStrategy;
+
+    let source = anti_join_source(10);
+    let op = negated_two_hops(vec![], vec![equals("k", "slug", "k1")], vec![]);
+    let mut plan = resolve(&op, &source).expect("resolve");
+    let fired = rewrite(&mut plan, &source).expect("rewrite");
+    let optimized =
+        omnigraph_planner::physical_plan(&mut plan, &source, &bounds(), fired).expect("lower");
+    assert!(optimized.fired.contains(&"anti_join_strategy"));
+    assert!(
+        optimized.statistics.iter().any(|statistic| {
+            statistic.statistic == "anti_join_rows($a)"
+                && statistic.value == "correlated 4001 estimated, key_set 121 estimated"
+        }),
+        "{:?}",
+        optimized.statistics
+    );
+    let (strategy, inner) = anti_join_of(&optimized.physical);
+    assert_eq!(strategy, AntiJoinStrategy::KeySet);
+    let shape: Vec<String> = inner
+        .iter()
+        .map(|node| match node {
+            PhysicalNode::Scan {
+                source: omnigraph_planner::ScanInput::Table,
+                spec,
+                ..
+            } => format!(
+                "table scan ${} filtered {}",
+                spec.binding.as_deref().unwrap_or_default(),
+                spec.filter.is_some()
+            ),
+            PhysicalNode::Scan { spec, .. } => format!(
+                "dependent scan ${}",
+                spec.binding.as_deref().unwrap_or_default()
+            ),
+            PhysicalNode::Expand {
+                src, dst, edges, ..
+            } => format!(
+                "expand ${src} {:?} ${dst}",
+                edges.named().map(|member| member.direction)
+            ),
+            other => other.name().to_string(),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            "expand $m Some(In) $a",
+            "dependent scan $m",
+            "expand $k Some(In) $m",
+            "table scan $k filtered true",
+        ]
+    );
+    let json = optimized.physical.to_json();
+    assert_eq!(
+        json["inputs"][0]["inputs"][0]["strategy"], "key_set",
+        "{json}"
+    );
+}
+
+/// The same block over one outer row stays correlated: its 122 rows beat the
+/// 1,201 the key set reaches when each destination has a hundred sources.
+#[test]
+fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
+    use omnigraph_planner::AntiJoinStrategy;
+
+    let source = anti_join_source(100);
+    let op = negated_two_hops(
+        vec![equals("a", "slug", "a1")],
+        vec![equals("k", "slug", "k1")],
+        vec![],
+    );
+    let mut plan = resolve(&op, &source).expect("resolve");
+    let fired = rewrite(&mut plan, &source).expect("rewrite");
+    let optimized =
+        omnigraph_planner::physical_plan(&mut plan, &source, &bounds(), fired).expect("lower");
+    assert!(optimized.fired.contains(&"anti_join_strategy"));
+    assert!(
+        optimized.statistics.iter().any(|statistic| {
+            statistic.statistic == "anti_join_rows($a)"
+                && statistic.value == "correlated 122 estimated, key_set 1201 estimated"
+        }),
+        "{:?}",
+        optimized.statistics
+    );
+    let (strategy, inner) = anti_join_of(&optimized.physical);
+    assert_eq!(strategy, AntiJoinStrategy::Correlated);
+    assert!(
+        inner
+            .iter()
+            .any(|node| matches!(node, PhysicalNode::OuterReference { .. }))
+    );
+}
+
+/// No key set without a bounded binding, or when the block reads the outer
+/// rows beyond the correlation binding's identity: the planner does not
+/// price it, and the block keeps its correlated tree.
+#[test]
+fn unbounded_or_outer_reading_blocks_stay_correlated() {
+    use omnigraph_planner::AntiJoinStrategy;
+
+    let reads_outer = IROp::Filter(IRExpr::comparison(
+        prop("m", "state"),
+        CompOp::Eq,
+        prop("a", "state"),
+    ));
+    for (what, op) in [
+        (
+            "a non-key filter bounds nothing",
+            negated_two_hops(vec![], vec![equals("k", "state", "open")], vec![]),
+        ),
+        (
+            "a filter reads the outer row",
+            negated_two_hops(vec![], vec![equals("k", "slug", "k1")], vec![reads_outer]),
+        ),
+    ] {
+        let source = anti_join_source(10);
+        let (plan, fired) = physical(&op, &source);
+        assert!(!fired.contains(&"anti_join_strategy"), "{what}: {fired:?}");
+        let (strategy, inner) = anti_join_of(&plan);
+        assert_eq!(strategy, AntiJoinStrategy::Correlated, "{what}");
+        assert!(
+            inner
+                .iter()
+                .any(|node| matches!(node, PhysicalNode::OuterReference { .. })),
+            "{what}"
+        );
+    }
+}
+
+/// `$x.prop` in a list of `values`, a binding bounded to that many rows.
+fn member_of(variable: &str, property: &str, values: &[&str]) -> IRExpr {
+    IRExpr::comparison(
+        IRExpr::Literal(
+            Literal::List(
+                values
+                    .iter()
+                    .map(|value| Literal::String(value.to_string()))
+                    .collect(),
+            ),
+            ExprType::Value {
+                scalar: ScalarType::String,
+                list: true,
+                nullable: false,
+            },
+        ),
+        CompOp::Contains,
+        prop(variable, property),
+    )
+}
+
+/// The binding of the table scan a key-set tree starts from.
+fn key_set_root(plan: &PhysicalPlan) -> String {
+    let (strategy, inner) = anti_join_of(plan);
+    assert_eq!(strategy, omnigraph_planner::AntiJoinStrategy::KeySet);
+    inner
+        .iter()
+        .find_map(|node| match node {
+            PhysicalNode::Scan {
+                source: omnigraph_planner::ScanInput::Table,
+                spec,
+                ..
+            } => spec.binding.clone(),
+            _ => None,
+        })
+        .expect("a key-set tree starts from a table scan")
+}
+
+/// The key set starts from the binding with the fewest estimated rows: `$k`
+/// under a key equality (one row) over `$m` in a three-value list; between
+/// two equal bounds, from the binding the correlated tree reaches first.
+#[test]
+fn key_set_starts_from_the_most_bounded_binding_and_the_first_on_a_tie() {
+    let block = |m_filters: Vec<IRExpr>, k_filters: Vec<IRExpr>| {
+        ir(
+            vec![
+                scan("a"),
+                IROp::AntiJoin {
+                    outer_var: "a".to_string(),
+                    inner: vec![expand("a", "m", m_filters), expand("m", "k", k_filters)],
+                    predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
+                },
+            ],
+            vec![prop("a", "slug")],
+            vec![],
+        )
+    };
+    let source = anti_join_source(10);
+    for (what, op, root) in [
+        (
+            "a key equality over a list",
+            block(
+                vec![member_of("m", "slug", &["m1", "m2", "m3"])],
+                vec![equals("k", "slug", "k1")],
+            ),
+            "k",
+        ),
+        (
+            "a list under a key equality",
+            block(
+                vec![equals("m", "slug", "m1")],
+                vec![member_of("k", "slug", &["k1", "k2", "k3"])],
+            ),
+            "m",
+        ),
+        (
+            "two key equalities",
+            block(
+                vec![equals("m", "slug", "m1")],
+                vec![equals("k", "slug", "k1")],
+            ),
+            "m",
+        ),
+    ] {
+        let (plan, _) = physical(&op, &source);
+        assert_eq!(key_set_root(&plan), root, "{what}");
+    }
 }

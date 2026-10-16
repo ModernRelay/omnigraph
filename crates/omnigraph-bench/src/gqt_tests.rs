@@ -2,6 +2,7 @@
 use crate::gqt_case::*;
 use crate::gqt_runner::{execute_gqt_rep_signaled, validate_sample};
 use crate::runner::{MeasurementSignals, RunnerResult};
+use omnigraph::db::{GraphCommit, GraphCommitKind, Omnigraph};
 use omnigraph_gqt_core::StepKind;
 use std::path::{Path, PathBuf};
 
@@ -52,14 +53,33 @@ fn query_shape_cases() -> impl Iterator<Item = (&'static str, bool)> {
         .chain(TRAVERSAL_SHAPES)
 }
 
+macro_rules! scenario_tests {
+    ($run:ident, $covered:ident, [$($test:ident => $name:literal),* $(,)?]) => {
+        $(
+            #[tokio::test]
+            async fn $test() {
+                $run($name).await;
+            }
+        )*
+        const $covered: &[&str] = &[$($name),*];
+    };
+}
+
 fn catalog() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks")
 }
+fn recorded_catalog() -> crate::catalog::Catalog {
+    let mut catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
+    catalog.definition.defaults.environment =
+        Some(GqtEnvironment::embedded(crate::case::Backend::LocalFs {
+            filesystem: crate::case::LocalFilesystem::Apfs,
+            storage_class: crate::case::LocalStorageClass::NvmeSsd,
+        }));
+    catalog.definition.defaults.protocol.reset = Some(crate::case::ResetMode::LocalClonefile);
+    catalog
+}
 fn plan(name: &str) -> PlannedGqt {
-    crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml"))
-        .unwrap()
-        .plan(name)
-        .unwrap()
+    recorded_catalog().plan(name).unwrap()
 }
 #[derive(Debug, Default)]
 struct Signals {
@@ -99,13 +119,18 @@ async fn run_sample_with_logical(
     let scratch = directory.path().join("scratch");
     std::fs::create_dir(&scratch).unwrap();
     let (logical, _) = crate::dataset_worker::build_dataset(
-        &plan.dataset_build_plan(),
+        &plan.dataset_build_plan().unwrap(),
         root.to_str().unwrap(),
         &scratch,
         None,
     )
     .await
     .unwrap();
+    let retained_chain = if plan.definition.id == "unattached-chain-32-write" {
+        Some(retained_unattached_chain(&root).await)
+    } else {
+        None
+    };
     let physical =
         crate::reset::digest_physical_tree(&root, crate::reset::TraversalLimits::default())
             .unwrap();
@@ -118,14 +143,58 @@ async fn run_sample_with_logical(
     let mut signals = Signals::default();
     let sample =
         execute_gqt_rep_signaled(1, &root, &physical, &metadata, &bound, &mut signals).await?;
-    validate_sample(&sample, &bound, 1, &physical, sample.elapsed_us, false).unwrap();
+    validate_sample(
+        &sample,
+        &bound,
+        1,
+        &crate::gqt_protocol::PreparationProofV2::Embedded {
+            physical_digest: physical,
+            metadata_digest: metadata,
+        },
+        sample.elapsed_us,
+        false,
+    )
+    .unwrap();
     assert_eq!(signals.events, vec!["ready", "settled"]);
     assert_eq!(signals.elapsed, Some(sample.elapsed_us));
+    if let Some(before) = retained_chain {
+        assert_eq!(
+            retained_unattached_chain(&root).await,
+            before,
+            "the workload must preserve the retained chain and published history"
+        );
+    }
     Ok((sample, signals, logical))
+}
+
+async fn retained_unattached_chain(root: &Path) -> (Vec<GraphCommit>, Vec<GraphCommit>) {
+    let db = Omnigraph::open_read_only(root.to_str().unwrap())
+        .await
+        .unwrap();
+    let published = db.list_commits(None).await.unwrap();
+    let mut chain = db.list_unattached_commits(None).await.unwrap();
+    assert_eq!(chain.len(), 32, "the fixture must retain all 32 snapshots");
+    chain.sort_by_key(|commit| commit.generation);
+    let root_id = &chain[0].graph_commit_id;
+    let mut parent = published.first().unwrap();
+    for commit in &chain {
+        assert_eq!(commit.kind, GraphCommitKind::Unattached);
+        assert!(!commit.published);
+        assert_eq!(commit.root_commit_id.as_ref(), Some(root_id));
+        assert_eq!(
+            commit.parent_commit_id.as_ref(),
+            Some(&parent.graph_commit_id),
+            "the retained snapshots must form one chain starting at main"
+        );
+        assert!(commit.merged_parent_commit_id.is_none());
+        assert_eq!(commit.generation, parent.generation + 1);
+        parent = commit;
+    }
+    (chain, published)
 }
 #[test]
 fn original_pairs_and_groups_preserve_pre_migration_identity() {
-    let catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
+    let catalog = recorded_catalog();
     let baseline: serde_json::Value =
         serde_json::from_str(include_str!("../tests/fixtures/gqt-catalog-identity.json")).unwrap();
     let baseline = baseline.as_object().unwrap();
@@ -220,7 +289,7 @@ fn end_to_end_catalog_selects_complete_public_operations() {
     for (name, kind) in END_TO_END {
         let p = catalog.plan(name).unwrap();
         p.revalidate().unwrap();
-        p.dataset_build_plan().revalidate().unwrap();
+        p.dataset_build_plan().unwrap().revalidate().unwrap();
         crate::gqt_runner::preflight_acquisition_budget(&p, 1).unwrap();
         let parsed = p.queries.parse().unwrap();
         let steps = workload_steps(&parsed).unwrap();
@@ -251,27 +320,58 @@ fn end_to_end_catalog_selects_complete_public_operations() {
     }
 }
 
-#[tokio::test]
-async fn end_to_end_catalog_executes_exact_rows_and_fresh_handle_isolation() {
-    for (name, kind) in END_TO_END {
-        let p = plan(name);
-        let (sample, _) = run_sample(&p)
-            .await
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(sample.outcome, "expectations-passed", "{name}");
-        assert!(sample.verification.selected_assertion_passed, "{name}");
-        assert!(sample.verification.following_assertions > 0, "{name}");
-        assert_eq!(
-            sample.steps.iter().filter(|step| step.ordinal == 1).count(),
-            1,
-            "{name}: one complete public operation is measured"
-        );
-        assert_eq!(
-            sample.merge.is_some(),
-            kind == StepKind::BranchMerge,
-            "{name}"
-        );
-    }
+async fn end_to_end_scenario(name: &str) {
+    let kind = END_TO_END
+        .iter()
+        .find(|(id, _)| *id == name)
+        .unwrap_or_else(|| panic!("{name}: not an END_TO_END scenario"))
+        .1;
+    let p = plan(name);
+    let (sample, _) = run_sample(&p)
+        .await
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+    assert_eq!(sample.outcome, "expectations-passed", "{name}");
+    assert!(sample.verification.selected_assertion_passed, "{name}");
+    assert!(sample.verification.following_assertions > 0, "{name}");
+    assert_eq!(
+        sample.steps.iter().filter(|step| step.ordinal == 1).count(),
+        1,
+        "{name}: one complete public operation is measured"
+    );
+    assert_eq!(
+        sample.merge.is_some(),
+        kind == StepKind::BranchMerge,
+        "{name}"
+    );
+}
+
+scenario_tests!(
+    end_to_end_scenario,
+    END_TO_END_SCENARIO_TESTS,
+    [
+        end_to_end_e2e_merge_all_changed => "e2e-merge-all-changed",
+        end_to_end_e2e_merge_all_new => "e2e-merge-all-new",
+        end_to_end_e2e_merge_diverged_updates => "e2e-merge-diverged-updates",
+        end_to_end_e2e_mixed_load => "e2e-mixed-load",
+        end_to_end_e2e_branch_create => "e2e-branch-create",
+        end_to_end_e2e_branch_create_from => "e2e-branch-create-from",
+        end_to_end_e2e_branch_list => "e2e-branch-list",
+        end_to_end_e2e_branch_delete => "e2e-branch-delete",
+        end_to_end_e2e_branch_adopt_untouched => "e2e-branch-adopt-untouched",
+        end_to_end_e2e_branch_adopt_written => "e2e-branch-adopt-written",
+        end_to_end_e2e_branch_first_write => "e2e-branch-first-write",
+        end_to_end_e2e_nearest_prefilter => "e2e-nearest-prefilter",
+        end_to_end_e2e_nearest_nprobes_one => "e2e-nearest-nprobes-one",
+        end_to_end_e2e_rrf_traversal => "e2e-rrf-traversal",
+    ]
+);
+
+#[test]
+fn end_to_end_scenario_tests_cover_every_catalog_scenario() {
+    assert_eq!(
+        END_TO_END_SCENARIO_TESTS,
+        END_TO_END.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -300,7 +400,7 @@ fn query_shape_catalog_selects_complete_queries_with_bounded_plans() {
     for (name, warm) in query_shape_cases() {
         let p = catalog.plan(name).unwrap();
         p.revalidate().unwrap();
-        p.dataset_build_plan().revalidate().unwrap();
+        p.dataset_build_plan().unwrap().revalidate().unwrap();
         crate::gqt_runner::preflight_acquisition_budget(&p, 1).unwrap();
         let parsed = p.queries.parse().unwrap();
         let steps = workload_steps(&parsed).unwrap();
@@ -361,27 +461,58 @@ fn query_shape_catalog_selects_complete_queries_with_bounded_plans() {
     }
 }
 
-#[tokio::test]
-async fn query_shape_catalog_executes_exact_rows_and_fresh_handle_isolation() {
-    for (name, _) in query_shape_cases() {
-        let p = plan(name);
-        let (sample, _) = run_sample(&p)
-            .await
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(sample.outcome, "expectations-passed", "{name}");
-        assert!(sample.verification.selected_assertion_passed, "{name}");
-        assert!(sample.verification.following_assertions > 0, "{name}");
-        assert_eq!(
-            sample
-                .steps
-                .iter()
-                .filter(|step| step.ordinal == p.definition.workload.measured_step.ordinal)
-                .count(),
-            1,
-            "{name}: one complete query is measured"
-        );
-        assert!(sample.merge.is_none(), "{name}");
-    }
+async fn query_shape_scenario(name: &str) {
+    let p = plan(name);
+    let (sample, _) = run_sample(&p)
+        .await
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+    assert_eq!(sample.outcome, "expectations-passed", "{name}");
+    assert!(sample.verification.selected_assertion_passed, "{name}");
+    assert!(sample.verification.following_assertions > 0, "{name}");
+    assert_eq!(
+        sample
+            .steps
+            .iter()
+            .filter(|step| step.ordinal == p.definition.workload.measured_step.ordinal)
+            .count(),
+        1,
+        "{name}: one complete query is measured"
+    );
+    assert!(sample.merge.is_none(), "{name}");
+}
+
+scenario_tests!(
+    query_shape_scenario,
+    QUERY_SHAPE_SCENARIO_TESTS,
+    [
+        query_shape_e2e_query_scan => "e2e-query-scan",
+        query_shape_e2e_query_wide_scan => "e2e-query-wide-scan",
+        query_shape_e2e_query_filter => "e2e-query-filter",
+        query_shape_e2e_query_lookup => "e2e-query-lookup",
+        query_shape_e2e_query_count => "e2e-query-count",
+        query_shape_e2e_query_grouped => "e2e-query-grouped",
+        query_shape_e2e_query_top_people => "e2e-query-top-people",
+        query_shape_e2e_query_friends => "e2e-query-friends",
+        query_shape_e2e_query_filtered_friends => "e2e-query-filtered-friends",
+        query_shape_e2e_query_no_friends => "e2e-query-no-friends",
+        query_shape_e2e_query_count_bare => "e2e-query-count-bare",
+        query_shape_e2e_query_destination_projection => "e2e-query-destination-projection",
+        query_shape_e2e_query_grouped_fanout => "e2e-query-grouped-fanout",
+        query_shape_e2e_query_destination_search => "e2e-query-destination-search",
+        query_shape_e2e_traversal_hop1 => "e2e-traversal-hop1",
+        query_shape_e2e_traversal_hop2 => "e2e-traversal-hop2",
+        query_shape_e2e_traversal_hop3 => "e2e-traversal-hop3",
+        query_shape_e2e_traversal_selective_csr => "e2e-traversal-selective-csr",
+        query_shape_e2e_traversal_selective_indexed => "e2e-traversal-selective-indexed",
+    ]
+);
+
+#[test]
+fn query_shape_scenario_tests_cover_every_catalog_scenario() {
+    assert_eq!(
+        QUERY_SHAPE_SCENARIO_TESTS,
+        query_shape_cases().map(|(id, _)| id).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -476,6 +607,7 @@ async fn selected_read_restart_mutation_branch_and_single_load_use_engine_receip
         "tiny-restart",
         "tiny-post-reopen",
         "tiny-mutate",
+        "tiny-mutate-unattached",
         "tiny-branch",
         "tiny-load",
     ] {
@@ -495,43 +627,70 @@ async fn selected_read_restart_mutation_branch_and_single_load_use_engine_receip
         assert!(sample.merge.is_none());
     }
 }
+async fn bounded_scenario(name: &str) -> crate::dataset_identity::DatasetLogicalV1 {
+    let p = plan(name);
+    let (sample, _, logical) = run_sample_with_logical(&p)
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert!(sample.verification.following_assertions > 0, "{name}");
+    let main = logical.branches.iter().find(|b| b.name == "main").unwrap();
+    if name.starts_with("very-long-history-32-") {
+        assert_eq!(main.history_commits, 34, "{name}");
+    }
+    if name == "unattached-chain-32-write" {
+        assert_eq!(
+            main.history_commits, 2,
+            "{name}: the chain never publishes on main"
+        );
+    }
+    logical
+}
+
+scenario_tests!(
+    bounded_scenario,
+    BOUNDED_SCENARIO_TESTS,
+    [
+        bounded_very_long_history_32_read => "very-long-history-32-read",
+        bounded_very_long_history_32_write => "very-long-history-32-write",
+        bounded_very_long_history_32_reopen => "very-long-history-32-reopen",
+        bounded_hot_table_idle_base => "hot-table-idle-base",
+        bounded_hot_table_idle_tables_4 => "hot-table-idle-tables-4",
+        bounded_hot_table_idle_branches_4 => "hot-table-idle-branches-4",
+        bounded_hot_table_idle_branches_4_aged => "hot-table-idle-branches-4-aged",
+        bounded_parallel_tables_1 => "parallel-tables-1",
+        bounded_parallel_tables_2 => "parallel-tables-2",
+        bounded_parallel_tables_4 => "parallel-tables-4",
+        bounded_identity_lifecycle => "identity-lifecycle",
+        bounded_repeated_deletion_recreation_rows => "repeated-deletion-recreation-rows",
+        bounded_repeated_deletion_recreation_branches => "repeated-deletion-recreation-branches",
+        bounded_threshold_crossings_before => "threshold-crossings-before",
+        bounded_threshold_crossings_at => "threshold-crossings-at",
+        bounded_threshold_crossings_after => "threshold-crossings-after",
+        bounded_threshold_crossings_production_control => "threshold-crossings-production-control",
+        bounded_very_long_history_32_write_unattached => "very-long-history-32-write-unattached",
+        bounded_unattached_chain_32_write => "unattached-chain-32-write",
+    ]
+);
+
+/// Equal current content across three different histories is one claim, so
+/// the three `equal-current-*` scenarios stay in one test.
 #[tokio::test]
-async fn bounded_scenario_catalog_executes_exact_postconditions_and_retained_history() {
+async fn bounded_equal_current_histories_share_content_identity() {
+    assert!(
+        BOUNDED_SCENARIO_TESTS
+            .iter()
+            .all(|name| !name.starts_with("equal-current-")),
+        "an equal-current scenario outside this test loses its cross-history claim"
+    );
     let mut equal_current = Vec::new();
     for name in [
-        "very-long-history-32-read",
-        "very-long-history-32-write",
-        "very-long-history-32-reopen",
-        "hot-table-idle-base",
-        "hot-table-idle-tables-4",
-        "hot-table-idle-branches-4",
-        "hot-table-idle-branches-4-aged",
-        "parallel-tables-1",
-        "parallel-tables-2",
-        "parallel-tables-4",
-        "identity-lifecycle",
-        "repeated-deletion-recreation-rows",
-        "repeated-deletion-recreation-branches",
-        "threshold-crossings-before",
-        "threshold-crossings-at",
-        "threshold-crossings-after",
-        "threshold-crossings-production-control",
         "equal-current-narrow-one-batch",
         "equal-current-wide-one-batch",
         "equal-current-wide-four-batches",
     ] {
-        let p = plan(name);
-        let (sample, _, logical) = run_sample_with_logical(&p)
-            .await
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert!(sample.verification.following_assertions > 0, "{name}");
+        let logical = bounded_scenario(name).await;
         let main = logical.branches.iter().find(|b| b.name == "main").unwrap();
-        if name.starts_with("very-long-history-32-") {
-            assert_eq!(main.history_commits, 34, "{name}");
-        }
-        if name.starts_with("equal-current-") {
-            equal_current.push((name, main.clone()));
-        }
+        equal_current.push((name, main.clone()));
     }
     assert_eq!(equal_current.len(), 3);
     let narrow = &equal_current[0].1;
@@ -587,7 +746,7 @@ async fn empty_seed_and_unwritten_child_have_reproducible_dataset_identity() {
         let scratch = directory.path().join(format!("scratch{index}"));
         std::fs::create_dir(&scratch).unwrap();
         let (logical, _) = crate::dataset_worker::build_dataset(
-            &p.dataset_build_plan(),
+            &p.dataset_build_plan().unwrap(),
             active.to_str().unwrap(),
             &scratch,
             None,
@@ -627,7 +786,7 @@ async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
     let scratch = directory.path().join("scratch");
     std::fs::create_dir(&scratch).unwrap();
     let (summary, registered_source_identity) = crate::dataset_worker::build_dataset(
-        &plan.dataset_build_plan(),
+        &plan.dataset_build_plan().unwrap(),
         active.to_str().unwrap(),
         &scratch,
         None,
@@ -669,10 +828,10 @@ async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
             case_digest: plan.case_digest.clone(),
             run_spec: bound.identity,
         },
-        sut: legacy.sut,
-        machine: legacy.machine,
-        backend: legacy.backend,
-        fixture: crate::dataset_cache::DatasetManifestV1 {
+        sut: crate::gqt_record::GqtSutIdentityV1::Embedded(Box::new(legacy.sut)),
+        machine: Some(legacy.machine),
+        backend: Some(legacy.backend),
+        fixture: Some(crate::dataset_cache::DatasetManifestV1 {
             format_version: 1,
             key: "a".repeat(64),
             recipe_sha256: plan.recipe_sha256,
@@ -685,8 +844,8 @@ async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
                 physical,
                 template_metadata,
             },
-        },
-        dataset_cache_hit: true,
+        }),
+        dataset_cache_hit: Some(true),
         acquisition: AcquisitionV1 {
             status: AcquisitionStatusV1::Complete,
             requested_repetitions: 1,
@@ -722,23 +881,36 @@ fn rehash_record(record: &mut crate::gqt_record::GqtRunRecordV1) {
 async fn gqt_authority_refuses_invalid_machine_counters_dataset_and_treatment() {
     let record = authority_fixture().await;
     let mutations: &[fn(&mut crate::gqt_record::GqtRunRecordV1)] = &[
-        |r| r.machine.logical_cores = 0,
+        |r| r.machine.as_mut().unwrap().logical_cores = 0,
         |r| {
             r.measurements.raw_samples[0]
                 .logical_store_calls
+                .as_mut()
+                .unwrap()
                 .manifest
                 .get = u64::MAX;
-            r.measurements.raw_samples[0].logical_store_calls.table.get = 1;
+            r.measurements.raw_samples[0]
+                .logical_store_calls
+                .as_mut()
+                .unwrap()
+                .table
+                .get = 1;
         },
         |r| {
-            r.measurements.raw_samples[0].control_store_calls.write_text = 1;
             r.measurements.raw_samples[0]
                 .control_store_calls
+                .as_mut()
+                .unwrap()
+                .write_text = 1;
+            r.measurements.raw_samples[0]
+                .control_store_calls
+                .as_mut()
+                .unwrap()
                 .mutation_calls = 0;
         },
-        |r| r.fixture.handoff.summary.branches.clear(),
-        |r| r.fixture.handoff.summary.algorithm = "unknown".into(),
-        |r| r.fixture.handoff.template_metadata.files += 1,
+        |r| r.fixture.as_mut().unwrap().handoff.summary.branches.clear(),
+        |r| r.fixture.as_mut().unwrap().handoff.summary.algorithm = "unknown".into(),
+        |r| r.fixture.as_mut().unwrap().handoff.template_metadata.files += 1,
         |r| r.run.run_spec.protocol.deadline_seconds = Some(0),
         |r| {
             r.run.run_spec.measured_step.text =
@@ -791,7 +963,7 @@ async fn mixed_legacy_and_gqt_archive_rebuilds_and_queries_both_points() {
     let canonical = crate::gqt_record::canonical_bytes(&gqt).unwrap();
     assert_eq!(
         crate::gqt_record::parse(&canonical).unwrap(),
-        crate::gqt_record::AnyRunRecordV1::Gqt(gqt.clone())
+        crate::gqt_record::AnyRunRecordV1::Gqt(Box::new(gqt.clone()))
     );
     crate::archive::publish_record(&archive, &legacy).unwrap();
     let receipt = crate::archive::publish_record(&archive, &gqt).unwrap();
@@ -834,7 +1006,7 @@ fn raw_dataset_plan_needs_no_measured_operation_and_unions_query_indexes() {
     .unwrap();
     assert!(indexed.needs_indices);
     assert_eq!(indexed.recipe_sha256, measured.recipe_sha256);
-    assert_eq!(indexed, measured.dataset_build_plan());
+    assert_eq!(indexed, measured.dataset_build_plan().unwrap());
 }
 #[test]
 fn acquisition_receipts_fit_before_dataset_io() {
@@ -872,7 +1044,7 @@ fn acquisition_receipts_fit_before_dataset_io() {
 async fn completed_gqt_prefix_has_one_owner_and_failed_repetition_is_retained() {
     let record = authority_fixture().await;
     let p = plan("tiny-read");
-    let logical = &record.fixture.handoff.summary;
+    let logical = &record.fixture.as_ref().unwrap().handoff.summary;
     let bound = p
         .bind(&logical.logical_content_sha256, &logical.algorithm)
         .unwrap();
@@ -886,17 +1058,18 @@ async fn completed_gqt_prefix_has_one_owner_and_failed_repetition_is_retained() 
         requested_repetitions: 2,
         bound,
         build: crate::runner::build_evidence(None).unwrap(),
-        machine: record.machine,
-        environment: crate::environment::LocalEnvironmentEvidence {
+        machine: record.machine.unwrap(),
+        environment: Some(crate::environment::LocalEnvironmentEvidence {
             filesystem: "apfs".into(),
             storage_class: "nvme-ssd".into(),
             mount_point: "/test".into(),
             storage_protocol: "local".into(),
             available_bytes: 1024,
             probe: "test",
-        },
+        }),
         fixture: record.fixture,
-        dataset_cache_hit: true,
+        dataset_cache_hit: Some(true),
+        server_receipt: None,
         samples: vec![sample.clone()],
         wall_clock: crate::runner::WallClockSummary {
             observed_repetitions: 1,
@@ -966,7 +1139,7 @@ fn nested_and_relocated_catalogs_keep_content_identity_and_refuse_aliases() {
         path: "../fixtures/tiny_graph.gqt".into(),
     };
     definition.workload.queries = "../workloads/tiny_read.gqt".into();
-    let original = serde_yaml::to_string(&definition).unwrap();
+    let original = yaml_serde::to_string(&definition).unwrap();
     let nested = original
         .replace("../fixtures/", "../../fixtures/")
         .replace("../workloads/", "../../workloads/");
@@ -1019,4 +1192,88 @@ async fn expected_parameter_error_does_not_claim_a_warming_engine_read() {
     let error = run_sample(&p).await.unwrap_err();
     assert_eq!(error.code, "gqt_prepare_failed");
     assert!(error.context.gqt_settled_sample.is_none());
+}
+
+#[path = "gqt_served_tests.rs"]
+mod served;
+
+#[tokio::test]
+async fn gqt_record_build_rejects_receipts_outside_the_frozen_program() {
+    use crate::gqt_record::GqtSutIdentityV1;
+    use crate::gqt_runner::RunExecution;
+    use crate::runner::{BuildEvidence, WallClockSummary};
+
+    let record = authority_fixture().await;
+    let GqtSutIdentityV1::Embedded(sut) = &record.sut else {
+        panic!("expected embedded fixture");
+    };
+    let build = &sut.build;
+    let plan = plan("tiny-read");
+    let bound = plan
+        .bind(
+            &record.run.run_spec.dataset_logical_digest,
+            &record.run.run_spec.dataset_identity_algorithm,
+        )
+        .unwrap();
+    let wall = &record.measurements.wall_clock;
+    let mut execution = RunExecution {
+        runner_output_version: 1,
+        case_id: record.run.case_id.clone(),
+        case_path: std::path::PathBuf::from("fixture"),
+        point_id: bound.point_id.clone(),
+        point_name: bound.point_name.clone(),
+        requested_repetitions: 1,
+        bound,
+        build: BuildEvidence {
+            source_commit: sut.source_commit.clone(),
+            source_tree_dirty: sut.source_tree_dirty,
+            cargo_profile: build.profile.clone(),
+            cargo_opt_level: build.cargo_opt_level.clone(),
+            debug_assertions: build.debug_assertions,
+            effective_lance_mem_pool_size: sut.engine.lance_mem_pool_size.clone(),
+            target_triple: build.target_triple.clone(),
+            rustc_version: build.rustc_version.clone(),
+            declared_release_lto: build.declared_release_lto.clone(),
+            declared_release_codegen_units: build.declared_release_codegen_units,
+            declared_release_strip: build.declared_release_strip,
+            cargo_encoded_rustflags_present: build.cargo_encoded_rustflags_present,
+            release_profile_environment_overrides_supported: build
+                .release_profile_environment_overrides_supported,
+            effective_codegen_options_proved: build.effective_codegen_options_proved,
+            engine_feature_flags: sut.engine.feature_flags.clone(),
+            enabled_techniques: sut.engine.enabled_techniques.clone(),
+            worker_executable_sha256: Some(build.worker_executable_sha256.clone()),
+        },
+        machine: record.machine.clone().unwrap(),
+        environment: Some(crate::environment::LocalEnvironmentEvidence {
+            filesystem: "apfs".into(),
+            storage_class: "nvme-ssd".into(),
+            mount_point: "/fixture".into(),
+            storage_protocol: "fixture".into(),
+            available_bytes: 1,
+            probe: "fixture",
+        }),
+        fixture: record.fixture.clone(),
+        dataset_cache_hit: record.dataset_cache_hit,
+        server_receipt: None,
+        samples: record.measurements.raw_samples.clone(),
+        wall_clock: WallClockSummary {
+            observed_repetitions: 1,
+            min_us: wall.min_us,
+            p50_us: wall.p50_us,
+            max_us: wall.max_us,
+            p95_us: wall.p95_us,
+            p95_supported: wall.p95_supported,
+        },
+        durable_record: false,
+    };
+    crate::gqt_record::build(&execution, record.invocation.clone(), None).unwrap();
+    let suffix = execution.samples[0].steps.last_mut().unwrap();
+    assert!(suffix.ordinal > execution.bound.identity.measured_step.ordinal);
+    suffix.ordinal = 999;
+    let error = crate::gqt_record::build(&execution, record.invocation, None).unwrap_err();
+    assert!(
+        error.to_string().contains("unknown receipt ordinal"),
+        "{error}"
+    );
 }

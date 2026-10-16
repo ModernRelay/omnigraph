@@ -51,6 +51,7 @@ jobs:
         run: |
           cargo run -p omnigraph-gqt --locked --bin omnigraph-gqt -- \
             benchmarks/fixtures/branch_merge_d50.gqt \
+            benchmarks/fixtures/branch_merge_d50_history64.gqt \
             benchmarks/fixtures/equal_current_narrow_one_batch.gqt \
             benchmarks/fixtures/equal_current_wide_four_batches.gqt \
             benchmarks/fixtures/equal_current_wide_one_batch.gqt \

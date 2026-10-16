@@ -34,8 +34,9 @@ pub struct IntentReply {
     pub body: Vec<u8>,
 }
 
-/// Delivery faults applied only after a real server's successful merge reply
-/// has been fully read. They cannot stand in for cancelling a server request.
+/// Delivery faults applied only after a real server's successful merge or
+/// Blob write reply has been fully read. They cannot stand in for cancelling a
+/// server request.
 #[derive(Debug, Clone, Copy)]
 pub enum MergeDeliveryFault {
     Disconnect,
@@ -113,6 +114,12 @@ impl IntentApiFixture {
             true,
             Some(Forwarding::Merge(upstream.to_owned(), fault)),
         )
+    }
+
+    /// Forward discovery and one Blob put or clear to an actual server, then
+    /// break only delivery of its successful receipt.
+    pub fn graph_blob_write_proxy(upstream: &str, fault: MergeDeliveryFault) -> Self {
+        Self::graph_merge_proxy(upstream, fault)
     }
 
     pub fn graph_deployment_proxy(upstream: &str, fault: DeploymentDeliveryFault) -> Self {
@@ -214,17 +221,22 @@ impl IntentApiFixture {
                 let length = headers
                     .get("content-length")
                     .map_or(0, |n| n.parse::<usize>().unwrap());
-                assert!(length <= 1024 * 1024, "fixture request body bound");
+                // A Blob put carries up to 32 MiB of raw bytes; every other
+                // request stays within the JSON bound.
+                assert!(length <= 33 * 1024 * 1024, "fixture request body bound");
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
-                let ndjson = headers
-                    .get("content-type")
-                    .is_some_and(|value| value == "application/x-ndjson");
+                let raw = headers.get("content-type").is_some_and(|value| {
+                    value == "application/x-ndjson" || value == "application/octet-stream"
+                });
+                if !raw {
+                    assert!(length <= 1024 * 1024, "fixture JSON request body bound");
+                }
                 let request = IntentRequest {
                     method: request_line[0].clone(),
                     path: request_line[1].clone(),
                     headers,
-                    body: if body.is_empty() || ndjson {
+                    body: if body.is_empty() || raw {
                         Value::Null
                     } else {
                         serde_json::from_slice(&body).unwrap()
@@ -346,12 +358,19 @@ impl IntentApiFixture {
                         headers,
                         body,
                     };
+                    let blob_write = matches!(request.method.as_str(), "PUT" | "DELETE")
+                        && request
+                            .path
+                            .split('?')
+                            .next()
+                            .is_some_and(|path| path.ends_with("/blob"));
                     if let Forwarding::Merge(_, fault) = forwarding
-                        && request.method == "POST"
-                        && (request.path.ends_with("/branches/merge")
-                            || request.path.ends_with("/mutate"))
+                        && ((request.method == "POST"
+                            && (request.path.ends_with("/branches/merge")
+                                || request.path.ends_with("/mutate")))
+                            || blob_write)
                     {
-                        assert_eq!(reply.status, 200, "upstream merge must succeed");
+                        assert_eq!(reply.status, 200, "upstream write must succeed");
                         captured_responses.lock().unwrap().push(reply.clone());
                         match fault {
                             MergeDeliveryFault::Disconnect => continue,
@@ -367,12 +386,7 @@ impl IntentApiFixture {
                                     br#"{"error":"proxy lost upstream response"}"#.to_vec();
                             }
                             MergeDeliveryFault::CallerWait => {
-                                let until = std::time::Instant::now() + Duration::from_secs(32);
-                                while !stopped.load(Ordering::SeqCst)
-                                    && std::time::Instant::now() < until
-                                {
-                                    sleep(Duration::from_millis(2));
-                                }
+                                hold_consumed_reply(&mut stream, &stopped, Duration::from_secs(32));
                                 continue;
                             }
                         }
@@ -387,12 +401,7 @@ impl IntentApiFixture {
                         match fault {
                             DeploymentDeliveryFault::DisconnectAfterAcceptance => continue,
                             DeploymentDeliveryFault::WaitAfterAcceptance => {
-                                let until = std::time::Instant::now() + Duration::from_secs(4);
-                                while !stopped.load(Ordering::SeqCst)
-                                    && std::time::Instant::now() < until
-                                {
-                                    sleep(Duration::from_millis(2));
-                                }
+                                hold_consumed_reply(&mut stream, &stopped, Duration::from_secs(4));
                                 continue;
                             }
                             DeploymentDeliveryFault::PassThrough => {}
@@ -495,6 +504,34 @@ impl IntentApiFixture {
                 1,
                 "a deployment is submitted once, regardless of lost delivery"
             );
+        }
+    }
+}
+
+/// Hold a consumed upstream reply until the caller hangs up, the fixture
+/// stops, or `bound` elapses: the caller's abandonment ends it, not a timer.
+fn hold_consumed_reply(
+    stream: &mut std::net::TcpStream,
+    stopped: &std::sync::atomic::AtomicBool,
+    bound: Duration,
+) {
+    use std::sync::atomic::Ordering;
+
+    let until = std::time::Instant::now() + bound;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(2)))
+        .unwrap();
+    let mut probe = [0u8; 64];
+    while !stopped.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+        match stream.read(&mut probe) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
         }
     }
 }

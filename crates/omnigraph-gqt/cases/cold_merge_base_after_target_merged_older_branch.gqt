@@ -1,0 +1,92 @@
+# issue: none
+# notes: The issue 773 shape with a cold base: b0 forks before w2, b1 after; four bumps on main under
+# notes: set history_release_bytes = 2048 release b1's fork point into __history before main merges b0.
+# notes: After a restart the merge of b1 must still base on that fork point (w2 present) and apply the delete.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":0}}
+
+--- mutate
+set history_release_bytes = 2048;
+
+--- expect ok
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate
+query insert_w2() {
+    insert Person { name: "w2", age: 0 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create b1
+
+--- expect ok
+
+--- loop $i 1 5
+--- mutate
+query bump_alice($n: I32) {
+    update Person set { age: $n } where name = "alice"
+}
+--- params
+{"n": ${i}}
+--- expect affected: nodes=1 edges=0
+--- endloop
+
+--- mutate branch: b0
+query insert_y() {
+    insert Person { name: "y", age: 0 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b0
+
+--- expect outcome: merged
+
+--- mutate branch: b1
+query delete_w2() {
+    delete Person where name = "w2"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- mutate
+branch merge b1
+
+--- expect outcome: merged
+
+--- query
+query people_on_main() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":4}
+{"p.name":"y","p.age":0}
+
+--- expect shape
+p.name: String
+p.age: I32

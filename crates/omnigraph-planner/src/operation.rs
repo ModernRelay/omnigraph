@@ -59,7 +59,8 @@ pub enum Operation {
         resume: Option<String>,
         budget: PageBudgetSpec,
     },
-    /// The unpaged `diff_commits` pair, arbitrary and cross-branch.
+    /// The graph diff's two endpoints (`Omnigraph::diff_page`), arbitrary and
+    /// cross-branch.
     SnapshotDiff { from: Side, to: Side },
     /// The three merge cursors (milestone 2).
     MergeClassify {

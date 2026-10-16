@@ -1,0 +1,233 @@
+# issue: 953
+# red_on: d6604a19
+# notes: `return distinct { ... }` keeps one row per distinct projected tuple:
+# notes: fan-in through a traversal and equal values on different entities
+# notes: collapse, nulls compare equal, deduplication runs before `order` and
+# notes: `limit`, and the order stays total through the projected values
+# notes: alone. `distinct` on an aggregated return and an order key outside
+# notes: the projection are refused at compile time.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    city: String?
+    age: I64
+}
+
+node Forum {
+    slug: String @key
+    title: String
+}
+
+edge HasMember: Forum -> Person
+
+--- seed
+{"type":"Person","data":{"slug":"ann1","name":"Ann Lee","city":"Berlin","age":30}}
+{"type":"Person","data":{"slug":"ann2","name":"Ann Lee","age":40}}
+{"type":"Person","data":{"slug":"bob","name":"Bob Ray","age":30}}
+{"type":"Person","data":{"slug":"cyd","name":"Cyd Vox","city":"Berlin","age":50}}
+{"type":"Forum","data":{"slug":"f1","title":"graph club"}}
+{"type":"Forum","data":{"slug":"f2","title":"graph meetup"}}
+{"type":"Forum","data":{"slug":"f3","title":"chess"}}
+{"edge":"HasMember","from":"f1","to":"ann1"}
+{"edge":"HasMember","from":"f2","to":"ann1"}
+{"edge":"HasMember","from":"f1","to":"ann2"}
+{"edge":"HasMember","from":"f1","to":"bob"}
+{"edge":"HasMember","from":"f2","to":"bob"}
+{"edge":"HasMember","from":"f2","to":"cyd"}
+{"edge":"HasMember","from":"f3","to":"cyd"}
+
+--- query
+set engine = v2;
+query members_plain() {
+    match {
+        $f: Forum
+        $f hasMember $p
+        $f.title contains "graph"
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Ann Lee"}
+{"p.name": "Ann Lee"}
+{"p.name": "Ann Lee"}
+{"p.name": "Bob Ray"}
+{"p.name": "Bob Ray"}
+{"p.name": "Cyd Vox"}
+
+--- expect shape
+p.name: String
+
+--- query
+set engine = v2;
+query members_distinct() {
+    match {
+        $f: Forum
+        $f hasMember $p
+        $f.title contains "graph"
+    }
+    return distinct { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Ann Lee"}
+{"p.name": "Bob Ray"}
+{"p.name": "Cyd Vox"}
+
+--- expect shape
+p.name: String
+
+--- query
+set engine = v2;
+query nulls_collapse() {
+    match { $p: Person }
+    return distinct { $p.city }
+}
+
+--- expect unordered
+{"p.city": "Berlin"}
+{}
+
+--- expect shape
+p.city: String?
+
+--- query
+set engine = v2;
+query first_two_names() {
+    match {
+        $f: Forum
+        $f hasMember $p
+        $f.title contains "graph"
+    }
+    return distinct { $p.name }
+    order { $p.name asc }
+    limit 2
+}
+
+--- expect ordered
+{"p.name": "Ann Lee"}
+{"p.name": "Bob Ray"}
+
+--- expect shape
+p.name: String
+
+--- query
+set engine = v2;
+query ages_then_names() {
+    match { $p: Person }
+    return distinct { $p.age as age, $p.name as name }
+    order { $p.age desc }
+}
+
+--- expect ordered
+{"age": 50, "name": "Cyd Vox"}
+{"age": 40, "name": "Ann Lee"}
+{"age": 30, "name": "Ann Lee"}
+{"age": 30, "name": "Bob Ray"}
+
+--- expect shape
+age: I64
+name: String
+
+--- query
+set engine = v2;
+query members_as_nodes() {
+    match {
+        $f: Forum
+        $f hasMember $p
+        $f.title contains "graph"
+    }
+    return distinct { $p }
+    order { $p }
+}
+
+--- expect ordered
+{"p": {"@id": "ann1", "slug": "ann1", "name": "Ann Lee", "city": "Berlin", "age": 30}}
+{"p": {"@id": "ann2", "slug": "ann2", "name": "Ann Lee", "age": 40}}
+{"p": {"@id": "bob", "slug": "bob", "name": "Bob Ray", "age": 30}}
+{"p": {"@id": "cyd", "slug": "cyd", "name": "Cyd Vox", "city": "Berlin", "age": 50}}
+
+--- expect shape
+p: Person
+
+--- query
+set engine = v2;
+query seniority() {
+    match { $p: Person }
+    return distinct { $p.age > 35 as senior }
+}
+
+--- expect unordered
+{"senior": true}
+{"senior": false}
+
+--- expect shape
+senior: Bool
+
+--- query
+set engine = v2;
+query distinct_with_aggregate() {
+    match { $p: Person }
+    return distinct { $p.name, count($p) as n }
+}
+
+--- expect error: `distinct` on an aggregated return
+
+--- query
+set engine = v2;
+query order_key_outside_projection() {
+    match { $p: Person }
+    return distinct { $p.name }
+    order { $p.age }
+}
+
+--- expect error: order key `$p.age` does not appear in return
+
+--- query
+set engine = v2;
+query projected_identity() {
+    match { $p: Person }
+    return distinct { $p.@id, $p.@id as id }
+    order { $p.@id }
+}
+
+--- expect ordered
+{"p.@id": "ann1", "id": "ann1"}
+{"p.@id": "ann2", "id": "ann2"}
+{"p.@id": "bob", "id": "bob"}
+{"p.@id": "cyd", "id": "cyd"}
+
+--- expect shape
+p.@id: String
+id: String
+
+--- query
+set engine = v2;
+query projected_endpoints() {
+    match { $f: Forum $f $e:hasMember $p }
+    return distinct { $e.@src, $e.@dst as member }
+    order { $e.@src, $e.@dst }
+}
+
+--- expect ordered
+{"e.@src": "f1", "member": "ann1"}
+{"e.@src": "f1", "member": "ann2"}
+{"e.@src": "f1", "member": "bob"}
+{"e.@src": "f2", "member": "ann1"}
+{"e.@src": "f2", "member": "bob"}
+{"e.@src": "f2", "member": "cyd"}
+{"e.@src": "f3", "member": "cyd"}
+
+--- expect shape
+e.@src: String
+member: String

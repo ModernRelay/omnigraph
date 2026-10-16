@@ -12,7 +12,7 @@ mod system_roles_tests;
 pub(crate) mod upgrade;
 pub(crate) mod write_queue;
 
-pub use commit_graph::GraphCommit;
+pub use commit_graph::{GraphCommit, GraphCommitKind};
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{DatasetEntry, DatasetUpdate};
 pub use omnigraph::{
@@ -20,15 +20,16 @@ pub use omnigraph::{
     CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
     EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, GraphCreateReconciliation,
     InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedGraphCreate,
-    PreparedSchemaApply, PreparedSchemaSettlement, RebuiltFullTextIndex, RepairAction,
+    PreparedSchemaApply, PreparedSchemaSettlement, ReadCheck, RebuiltFullTextIndex, RepairAction,
     RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
     SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
     SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
     SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
-    SystemColumnUpgradeReport, TableCollectionPlan, UnpublishedManifest,
+    SystemColumnUpgradeReport, TableCollectionPlan, UnattachedTagRecord, UnpublishedManifest,
+    unattached_release_order,
 };
 pub(crate) use omnigraph::{
-    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+    LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
 pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph_core::metadata::now_micros;

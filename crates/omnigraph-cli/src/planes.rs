@@ -13,8 +13,8 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use crate::cli::{
-    BlobCommand, ChangesCommand, Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand,
-    SchemaCommand,
+    BlobCommand, BranchCommand, ChangesCommand, Cli, ClusterCommand, Command, GraphsCommand,
+    QueriesCommand, SchemaCommand, SkillCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,7 +182,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Served | Control | Local => false,
         },
         // The actor rides direct-engine writes (`any` via --store) and cluster
-        // writes; Blob get/stat are reads and never consume it. Served writes
+        // writes; Blob get/stat are reads and never consume it, while Blob
+        // put/clear are writes and do. Served writes
         // resolve the actor from the bearer token
         // (rejected downstream with its own message). On `direct`, full-text
         // rebuild attributes its graph publication; other maintenance verbs
@@ -196,9 +197,14 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             // so accepting `--as` there is a silent no-op — reject it instead.
             Any => !matches!(
                 cmd,
-                Command::Blob { .. }
-                    | Command::Changes { .. }
+                Command::Blob {
+                    command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
+                } | Command::Changes { .. }
                     | Command::Commit { .. }
+                    | Command::Diff { .. }
+                    | Command::Branch {
+                        command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
+                    }
                     | Command::Query { .. }
             ),
             Control => matches!(
@@ -269,6 +275,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Export { .. }
         | Command::Blob { .. }
         | Command::Commit { .. }
+        | Command::Diff { .. }
         | Command::Changes { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
@@ -299,7 +306,8 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Logout { .. }
         | Command::Use { .. }
         | Command::Profile { .. }
-        | Command::Version => Plane::Session,
+        | Command::Skill { .. }
+        | Command::Version { .. } => Plane::Session,
     }
 }
 
@@ -307,11 +315,15 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
 /// families so messages read `schema plan`, `queries validate`, etc.).
 pub(crate) fn command_label(cmd: &Command) -> &'static str {
     match cmd {
-        Command::Version => "version",
+        Command::Version { .. } => "version",
         Command::Login { .. } => "login",
         Command::Logout { .. } => "logout",
         Command::Use { .. } => "use",
         Command::Profile { .. } => "profile",
+        Command::Skill { command } => match command {
+            SkillCommand::Export { .. } => "skill export",
+            SkillCommand::Show { .. } => "skill show",
+        },
         Command::Embed(_) => "embed",
         Command::Init { .. } => "init",
         Command::Load { .. } => "load",
@@ -332,8 +344,11 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Blob { command } => match command {
             BlobCommand::Get { .. } => "blob get",
             BlobCommand::Stat { .. } => "blob stat",
+            BlobCommand::Put { .. } => "blob put",
+            BlobCommand::Clear { .. } => "blob clear",
         },
         Command::Commit { .. } => "commit",
+        Command::Diff { .. } => "diff",
         Command::Changes { command } => match command {
             ChangesCommand::Poll { .. } => "changes poll",
             ChangesCommand::Baseline { .. } => "changes baseline",
@@ -600,6 +615,10 @@ mod tests {
                 parse(&["omnigraph", "version"]),
                 [false, false, false, false, false, false],
             ),
+            (
+                parse(&["omnigraph", "skill", "export", "skills/omnigraph"]),
+                [false, false, false, false, false, false],
+            ),
         ];
         for (cmd, expected) in &rows {
             let capability = command_capability(cmd);
@@ -688,6 +707,7 @@ mod tests {
             Capability::Control
         );
         assert_eq!(cap(&["omnigraph", "version"]), Capability::Local);
+        assert_eq!(cap(&["omnigraph", "skill", "show"]), Capability::Local);
         // `queries`/`policy` tooling reads cluster state now (control plane).
         assert_eq!(cap(&["omnigraph", "queries", "list"]), Capability::Control);
         assert_eq!(
