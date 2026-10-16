@@ -456,7 +456,8 @@ def failure_message(n: str, code_paths: list[str], hints: list[str]) -> str:
         f"    1. add {CORPUS_DIR_PREFIX}issue_{n}_<short_name>.gqt: the query that went wrong "
         "before the fix, with the rows it returns after (the corpus runs it on every PR)",
         f"    2. add a #[test] function named for issue_{n} in crates/*/tests/<name>.rs, "
-        "tools/*/tests/<name>.rs, their tests/integration/main.rs or its bare declared modules, or their src/",
+        "tools/*/tests/<name>.rs, skills/tests/<name>.rs, their tests/integration/main.rs "
+        "or its bare declared modules, or their src/",
         f"    3. extend an existing test: rename it to carry issue_{n} and add the assertion",
         f"    4. no test can exist (perf-only, a race, a removal, a docs-only change inside "
         f"a crate such as rustdoc): ask a maintainer for the `{WAIVER_LABEL}` label",
@@ -662,8 +663,8 @@ def run_gate(body: str, labels: list[str], range_: str, repo: str | None) -> int
         if not code_paths:
             closed = ", ".join(f"#{n}" for n in issues)
             message = (
-                f"ok: the body closes {closed} but the diff changes no path under crates/ "
-                "or tools/ (Markdown aside) and neither Cargo.toml nor Cargo.lock, so no "
+                f"ok: the body closes {closed} but the diff changes no path under crates/, "
+                "tools/, or skills/ (Markdown aside) and neither Cargo.toml nor Cargo.lock, so no "
                 "logic or Rust test can witness the fix; the closed issues pass UNEXAMINED"
             )
             print(message)
