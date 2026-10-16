@@ -72,7 +72,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Export and lineage | `integration/export.rs`, `integration/lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `integration/legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
 | System-column upgrade (RFC 0040 step 3: respelling in place on a supported standalone graph; vintage is independent of the storage stamp) | `system_column_upgrade.rs`: check and execute, preflight refusals, every window before the manifest commit leaving no residue, a complete contract and table state after a post-commit failure, same-handle retry, the control-object cost; needs `--features failpoints` |
-| Cost and benchmark contracts | `integration/write_cost.rs`, `integration/write_cost_s3.rs`, `integration/warm_read_cost.rs`, `integration/branch_control_cost.rs`, `integration/merge_cost.rs`, `integration/changes_cost.rs`, the checkpoint/head lookup instruments, the correlated-block strategy instrument `integration/anti_join_cost.rs`, and the GQT benchmark adapter tests in `omnigraph-bench` |
+| Cost and benchmark contracts | `integration/write_cost.rs`, `integration/write_cost_s3.rs`, `integration/warm_read_cost.rs`, `integration/branch_control_cost.rs`, `integration/merge_cost.rs`, `integration/changes_cost.rs`, the checkpoint/head lookup instruments, the correlated-block strategy instrument `integration/anti_join_cost.rs`, the GQT benchmark adapter tests in `omnigraph-bench`, and, for the exact storage calls of one operation, the [DST storage-cost golden](#dst-storage-cost-golden) |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`; graphs whose rows trip the ordered-scan sorter cap belong in `tests/helpers/wide_rows.rs`.
 
@@ -509,6 +509,49 @@ Historical HTTP records remain readable by `scripts/analyze-http-perf.py` and
 is available for GQT query and traversal workloads.
 
 Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; deterministic engine cost contracts remain in `crates/omnigraph/tests/`.
+
+### DST storage-cost golden
+
+`crates/omnigraph-dst/cost_table.txt` records the exact object-store calls of
+each labeled operation on deterministic memory storage: `l.` verbs reach Lance
+(`__manifest`, `__history` and the table datasets), `a.` verbs the control
+objects behind `StorageAdapter`. `dst_bench_cost_count_golden` in
+`crates/omnigraph-dst/tests/scenarios.rs` builds the table from a seeded run of
+random operations and from labeled scenarios (`labeled_cost_rows`), refuses a
+build that does not replay identically, and compares it with the file, so a
+cost change fails as a named line. The `DST pinned suite` job of `dst.yml` runs
+it on every pull request that changes engine input, as a reporting context.
+
+Add or update a row when:
+
+- a change adds an operation whose storage cost is part of its contract, or
+  changes what an existing one reads or writes: a route, a page or
+  continuation, a write path, a maintenance step. Add a labeled scenario that
+  measures that one operation on a reopened handle, with setup and
+  verification under `_`-prefixed labels, as `merge_history_cost_rows` does;
+- the contract is that a cost stays flat in something (history depth, live
+  branches, rows): record the operation at two sizes of it under two labels,
+  as `MergeTargetHistory2` and `MergeTargetHistory32` do. Equal rows show the
+  claim in the golden itself.
+
+A changed line is a cost change. Regenerate only on purpose, and say in the
+pull request why each changed line moved; a line that moved for no stated
+reason is a regression to find, not a golden to refresh.
+
+The golden pins exact counts on one backend. It does not replace the curve
+tests in `crates/omnigraph/tests/` (`write_cost.rs`, `warm_read_cost.rs`,
+`changes_cost.rs` and the other cost owners above), which assert a shape (flat
+or growing) through the `IoCounts` harness; a storage-cost contract has both.
+Query operator cost belongs to GQT (`--measure`), and wall time and memory to
+the benchmark harness.
+
+Regenerate, then verify, from `crates/omnigraph-dst`, whose Cargo
+configuration the suite needs:
+
+```bash
+DST_REGEN_COSTS=1 cargo test --locked --test scenarios dst_bench_cost_count_golden
+cargo test --locked --test scenarios dst_bench_cost_count_golden
+```
 
 For embedded execution, the benchmark runner executes `gqt-v1` dataset/query
 pairs through the same
