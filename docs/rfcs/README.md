@@ -249,3 +249,4 @@ then dated RFCs by date.
 | [2026-10-11](2026-10-11-unattached-graph-branches.md) | Unattached graph branches | maintainer | draft | not-started |
 | [2026-10-15](2026-10-15-bulk-load-as-a-query-plan.md) | Bulk load as a query plan | maintainer | draft | not-started |
 | [2026-10-16](2026-10-16-engine-catalogue.md) | Engine catalogue | maintainer | draft | in-progress |
+| [2026-10-16](2026-10-16-local-sessions-and-client-access.md) | Local graph sessions and client access | maintainer | draft | not-started |
