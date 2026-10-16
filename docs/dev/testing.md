@@ -413,8 +413,12 @@ case-only pull request needs no Rust change, and `cargo-nextest` sees each
 case (an IDE's test-results view lists cases from the
 libtest-shaped output; no per-case gutter runnable exists, since no source
 item does). `--test-threads=<n>` bounds how many cases run
-concurrently (default: the machine's available parallelism); each case fails
-if it exceeds `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>` seconds (default 10);
+concurrently (default: the machine's available parallelism). Each case fails
+when it runs past the `timeout_ms` its `--- runner` section declares; the field
+is required, and the corpus refuses a value above 10000 before the case runs.
+No environment variable changes a budget: a set
+`OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` makes every case fail with `invalid_case`. On
+a loaded host, run fewer cases at once with a lower `--test-threads`.
 `OMNIGRAPH_GQ_BLESS=1` rewrites the failing step's expect rows, or its shape
 lines, in place (local workflow only, never CI). Every rows step carries a `--- expect shape`
 section, one `<name>: <type>` line per result column in `.pg` property syntax
