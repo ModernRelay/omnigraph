@@ -13,6 +13,9 @@ WORKFLOW_ROOT = REPO_ROOT / ".github" / "workflows"
 JOB_RE = re.compile(r"^  ([a-zA-Z0-9_]+):\s*$", re.MULTILINE)
 # Publishers of the platform archives, built once by `build-release-archives.yml`.
 ARCHIVE_PUBLISHERS = ("release-edge.yml", "release.yml")
+# Publishers that attest what they publish; the attestation names the run's
+# commit, so each must refuse to attest a build of another one.
+ATTESTING_PUBLISHERS = ("release-edge.yml", "release.yml", "publish-image.yml")
 # Publishers that run on a schedule, auditing the commit they select, instead
 # of being called by the CI run that audited it.
 SCHEDULED_PUBLISHERS = ("release-edge.yml",)
@@ -122,8 +125,10 @@ def main() -> int:
                 f"{filename}: publication must select only the shared build's release artifacts",
                 failures,
             )
+        if filename in ATTESTING_PUBLISHERS:
             require(
-                '"$GITHUB_SHA" == "$SOURCE_SHA"' in text,
+                '"$GITHUB_SHA" == "$SOURCE_SHA"' in text
+                and "uses: actions/attest-build-provenance@" in text,
                 f"{filename}: provenance must name the built commit, the run's own",
                 failures,
             )

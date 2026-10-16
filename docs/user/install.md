@@ -162,4 +162,14 @@ repository's release workflow, and from which commit:
 gh attestation verify omnigraph-linux-x86_64.tar.gz --repo ModernRelay/omnigraph
 ```
 
+The [container image](deployment.md#container) carries the same stamp from
+v0.14.0, and its GHCR digest carries the attestation:
+
+```bash
+docker run --rm --entrypoint /usr/local/bin/omnigraph \
+  ghcr.io/modernrelay/omnigraph-server:<tag> version
+gh attestation verify oci://ghcr.io/modernrelay/omnigraph-server:<tag> \
+  --repo ModernRelay/omnigraph
+```
+
 Continue with the [quickstart](quickstart.md).

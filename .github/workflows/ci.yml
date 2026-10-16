@@ -441,10 +441,13 @@ jobs:
     name: Publish tag image after vocabulary audit
     needs: graph_vocabulary_guard
     if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    # The called publisher attests the pushed image's build provenance.
     permissions:
       actions: read
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/publish-image.yml
     with:
       tag: ${{ github.ref_name }}
