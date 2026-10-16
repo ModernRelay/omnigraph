@@ -370,9 +370,9 @@ pub(crate) fn token_env_name(server: &str) -> String {
 
 /// The keyed token chain for a named server (§D4 steps 1–2):
 /// `OMNIGRAPH_TOKEN_<NAME>` env → `[<name>]` in the credentials file.
-/// `Ok(None)` means "no keyed token" — callers fall through to the legacy
-/// chain; a present-but-unreadable/over-permissive credentials file is a
-/// loud error, never a silent skip.
+/// `Ok(None)` means "no keyed token": the request carries no credential. A
+/// present-but-unreadable/over-permissive credentials file is a loud error,
+/// never a silent skip.
 pub(crate) fn resolve_keyed_token(server: &str) -> Result<Option<String>> {
     if let Ok(token) = env::var(token_env_name(server)) {
         let token = token.trim();

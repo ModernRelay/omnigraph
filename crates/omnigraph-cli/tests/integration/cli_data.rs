@@ -2393,7 +2393,6 @@ fn remote_json_errors_preserve_server_codes_and_details() {
         |(arguments, status, body, exit, format)| {
             let server = IntentApiFixture::graph(vec![IntentReply::json(status, body.clone())]);
             let output = cli()
-                .env_remove("OMNIGRAPH_BEARER_TOKEN")
                 .args(["--server", &server.origin, "--graph", "knowledge"])
                 .args(&arguments)
                 .args(format)
@@ -2585,7 +2584,6 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             reply.headers.push(("Retry-After".into(), "17".into()));
             let server = IntentApiFixture::graph(vec![reply]);
             let output = cli()
-                .env_remove("OMNIGRAPH_BEARER_TOKEN")
                 .args([
                     "--quiet",
                     "--server",
@@ -2613,7 +2611,20 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             fields.remove("command_outcome");
             fields.remove("http_status");
             fields.remove("retry_after");
-            assert_eq!(&actual, body, "preserve every typed detail");
+            let mut expected = body.clone();
+            if *status == 401 {
+                // No credential is bound to the fixture's URL, so the refusal
+                // says how to bind one.
+                expected["error"] = format!(
+                    "{}\nno credential is bound to {}: declare it under `servers:` in \
+                     {HERMETIC_OPERATOR_HOME}/config.yaml, then run `omnigraph login <name>` \
+                     or set OMNIGRAPH_TOKEN_<NAME>",
+                    body["error"].as_str().unwrap(),
+                    server.origin
+                )
+                .into();
+            }
+            assert_eq!(actual, expected, "preserve every typed detail");
             assert_eq!(
                 server.requests().len(),
                 2,
@@ -2699,7 +2710,6 @@ fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
             ]);
         let mut command = cli();
         command
-            .env_remove("OMNIGRAPH_BEARER_TOKEN")
             .args(["--server", &server.origin, "--graph", "knowledge"])
             .args(&arguments);
         let output = command.output().unwrap();
@@ -2766,7 +2776,7 @@ fn remote_human_and_invalid_json_errors_remain_diagnostics() {
             body: body.as_bytes().to_vec(),
         }]);
         let mut command = cli();
-        command.env_remove("OMNIGRAPH_BEARER_TOKEN").args([
+        command.args([
             "--server",
             &server.origin,
             "--graph",
@@ -4571,9 +4581,7 @@ fn remote_catalogue_reads_preserve_optional_targets() {
                     query.to_string()
                 };
                 let mut command = cli();
-                command
-                    .env("OMNIGRAPH_HOME", home.path())
-                    .env_remove("OMNIGRAPH_BEARER_TOKEN");
+                command.env("OMNIGRAPH_HOME", home.path());
                 if profile {
                     command.args(["--profile", "catalogue"]);
                 } else {

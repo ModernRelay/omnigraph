@@ -8,6 +8,8 @@ use omnigraph_api_types::{ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER
 use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 
+use crate::helpers::MissingCredential;
+
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schemes of a server address. `http` and `https` reach the server over
@@ -204,6 +206,9 @@ pub(crate) struct GraphHttpClient {
     client: reqwest::Client,
     transport: ServerTransport,
     health_url: Url,
+    /// Why this client's requests carry no credential, attached to a 401
+    /// response so its refusal says how to bind one.
+    missing_credential: Option<Box<MissingCredential>>,
 }
 
 impl GraphHttpClient {
@@ -248,7 +253,13 @@ impl GraphHttpClient {
             client: Self::build(&transport, managed)?,
             transport,
             health_url,
+            missing_credential: None,
         })
+    }
+
+    pub(crate) fn with_missing_credential(mut self, missing: MissingCredential) -> Self {
+        self.missing_credential = Some(Box::new(missing));
+        self
     }
 
     /// Blob delivery retains its existing streaming deadline instead of
@@ -258,6 +269,7 @@ impl GraphHttpClient {
             client: Self::build(&self.transport, false)?,
             transport: self.transport.clone(),
             health_url: self.health_url.clone(),
+            missing_credential: self.missing_credential.clone(),
         })
     }
 
@@ -291,10 +303,16 @@ impl GraphHttpClient {
             .and_then(|value| value.strip_prefix("Bearer "))
             .map(str::to_owned);
         crate::command_outcome::dispatched(request.method());
-        let response = self.client.execute(request).await?;
+        let mut response = self.client.execute(request).await?;
         crate::command_outcome::response(response.status(), response.headers(), bearer.as_deref());
         if !has_contract(&response) {
             return Err(ApiContractError::response(response.status()).into());
+        }
+        if response.status() == StatusCode::UNAUTHORIZED
+            && bearer.is_none()
+            && let Some(missing) = &self.missing_credential
+        {
+            response.extensions_mut().insert(MissingCredential::clone(missing));
         }
         Ok(response)
     }

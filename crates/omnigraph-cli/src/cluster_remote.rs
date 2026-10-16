@@ -14,7 +14,7 @@ use crate::cli::{Cli, ClusterCommand, Command};
 use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::helpers::{
     RemoteErrorCli, apply_bearer_token, remote_response_json_bounded, remote_url,
-    resolve_remote_bearer_token, resolve_server_flag,
+    resolve_server_flag, served_client,
 };
 
 const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
@@ -139,8 +139,7 @@ struct RemoteCluster {
 impl RemoteCluster {
     fn new(server: &str) -> Result<Self> {
         let root = resolve_server_flag(Some(server), None)?.expect("explicit server");
-        let token = resolve_remote_bearer_token(Some(&root))?;
-        let client = GraphHttpClient::new(&root)?;
+        let (client, token) = served_client(&root, &root)?;
         Ok(Self {
             root,
             token,

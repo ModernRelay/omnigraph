@@ -190,6 +190,15 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
 The token is stored separately from `config.yaml`. A server resolves the actor
 from the token; clients cannot override it with `--as`.
 
+`login` writes the token to `~/.omnigraph/credentials` with mode `0600`.
+`OMNIGRAPH_TOKEN_<NAME>`, the server name uppercased with `-` written as `_`,
+supplies it instead and outranks the stored one: `OMNIGRAPH_TOKEN_PROD` here.
+
+The CLI sends the `prod` token only to URLs under its `url`. Any other request
+carries no credential, including a literal `--server https://…` URL that
+matches no declared server. If such a request gets HTTP 401, the error names
+the server to declare or the `omnigraph login` command to run.
+
 ## Use a server through a Unix socket
 
 A server may also be reached through a Unix-domain socket, for example a local

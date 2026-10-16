@@ -2,8 +2,8 @@
 //! main.rs; `use super::*` resolves through the #[path] declaration).
 
 use super::{
-    DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, branch_statement_change_request,
-    branch_statement_query_request, normalize_bearer_token, resolve_remote_bearer_token, sync_dir,
+    MissingCredential, RemoteCredential, apply_bearer_token, branch_statement_change_request,
+    branch_statement_query_request, normalize_bearer_token, resolve_remote_credential, sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -114,38 +114,96 @@ fn normalize_bearer_token_trims_and_filters_blank_values() {
     );
 }
 
+/// Sets process environment variables for one test and restores the previous
+/// values when dropped, including on a failed assertion.
+struct ScopedEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl ScopedEnv {
+    fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in vars {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
 #[test]
-fn resolve_remote_bearer_token_falls_back_to_default_env() {
-    // RFC-011: with no operator server matching the URL, the only chain
-    // left is the default `OMNIGRAPH_BEARER_TOKEN` env (no omnigraph.yaml
-    // scoped chain). Hermetic: no operator config is read for a literal URL
-    // that matches no `servers:` entry.
-    let previous = std::env::var_os(DEFAULT_BEARER_TOKEN_ENV);
-    let previous_home = std::env::var_os("OMNIGRAPH_HOME");
-    unsafe {
-        std::env::set_var(DEFAULT_BEARER_TOKEN_ENV, "global-token");
-        std::env::set_var("OMNIGRAPH_HOME", "/nonexistent/omnigraph-test-home");
-    }
+fn resolve_remote_credential_sends_no_unkeyed_token_issue_1022() {
+    // A token reaches only the operator server it is keyed to. The unkeyed
+    // `OMNIGRAPH_BEARER_TOKEN` is never a credential: a URL that matches no
+    // `servers:` entry, and a declared server with no keyed token, both get
+    // none.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "servers:\n  \
+           unkeyed:\n    url: https://unkeyed.example.com\n  \
+           keyed:\n    url: https://keyed.example.com\n",
+    )
+    .unwrap();
+    let home_path = home.path().to_str().unwrap();
+    let _env = ScopedEnv::set(&[
+        ("OMNIGRAPH_HOME", Some(home_path)),
+        ("OMNIGRAPH_BEARER_TOKEN", Some("global-token")),
+        ("OMNIGRAPH_TOKEN_KEYED", Some("keyed-token")),
+        ("OMNIGRAPH_TOKEN_UNKEYED", None),
+    ]);
 
+    // The whole URL is the address here; served clients pass the server root
+    // and a graph URL under it.
+    let credential = |url: &str| match resolve_remote_credential(url, url).unwrap() {
+        RemoteCredential::Keyed(token) => Ok(token),
+        RemoteCredential::Missing(missing) => Err(missing),
+    };
+    let unbound = |server_root: &str| {
+        Err(MissingCredential::Unbound {
+            server_root: server_root.to_string(),
+            config: Some(home.path().join("config.yaml")),
+        })
+    };
     assert_eq!(
-        resolve_remote_bearer_token(Some("https://override.example.com"))
-            .unwrap()
-            .as_deref(),
-        Some("global-token")
+        credential("https://override.example.com"),
+        unbound("https://override.example.com")
     );
-
-    unsafe {
-        if let Some(value) = previous {
-            std::env::set_var(DEFAULT_BEARER_TOKEN_ENV, value);
-        } else {
-            std::env::remove_var(DEFAULT_BEARER_TOKEN_ENV);
-        }
-        if let Some(value) = previous_home {
-            std::env::set_var("OMNIGRAPH_HOME", value);
-        } else {
-            std::env::remove_var("OMNIGRAPH_HOME");
-        }
-    }
+    assert_eq!(
+        credential("https://unkeyed.example.com/graphs/knowledge"),
+        Err(MissingCredential::Server("unkeyed".to_string()))
+    );
+    assert_eq!(
+        credential("https://keyed.example.com-evil/graphs/knowledge"),
+        unbound("https://keyed.example.com-evil/graphs/knowledge")
+    );
+    assert_eq!(
+        credential("https://keyed.example.com/graphs/knowledge"),
+        Ok("keyed-token".to_string())
+    );
+    // A refusal names the address without credentials written into its URL.
+    assert_eq!(
+        credential("https://user:secret@override.example.com"),
+        unbound("https://override.example.com/")
+    );
 }
 
 #[cfg(unix)]
