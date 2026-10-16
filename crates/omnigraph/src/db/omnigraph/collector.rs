@@ -341,7 +341,10 @@ fn location_base(dataset: &lance::Dataset) -> object_store::path::Path {
 
 /// Delete the location-relative `paths` (never an inherited `base:` file),
 /// an `_indices/<uuid>` entry as a directory; returns the bytes freed,
-/// with a file an earlier pass already removed counting nothing.
+/// with a file an earlier pass already removed counting nothing. A pass
+/// that stops between these files and their manifest plans the manifest
+/// again, so an absent index directory is already deleted, not an error
+/// (the local store reports one as `NotFound`; object stores list it empty).
 async fn delete_paths(
     store: &lance::io::ObjectStore,
     base: &object_store::path::Path,
@@ -357,10 +360,10 @@ async fn delete_paths(
             .chain(object_store::path::Path::from(path.as_str()).parts())
             .collect();
         if path.starts_with("_indices/") {
-            store
-                .remove_dir_all(full)
-                .await
-                .map_err(OmniError::storage)?;
+            match store.remove_dir_all(full).await {
+                Ok(()) | Err(lance::Error::NotFound { .. }) => {}
+                Err(error) => return Err(OmniError::storage(error)),
+            }
             continue;
         }
         bytes += delete_object(store, &full, None).await?;
