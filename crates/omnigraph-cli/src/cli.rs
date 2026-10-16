@@ -1071,6 +1071,10 @@ pub(crate) enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
+        /// Also report each branch's head, the branch and commit it was
+        /// created from, who created it and when, and when it last moved
+        #[arg(long)]
+        detail: bool,
         #[arg(long)]
         json: bool,
     },

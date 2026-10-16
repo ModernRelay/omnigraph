@@ -21,7 +21,11 @@
 
 use std::future::Future;
 
-use crate::helpers::cost::{IoCounts, cost_harness, local_graph, measure};
+use crate::helpers::cost::{
+    DEEP_HISTORY_DEPTH, IoCounts, assert_flat, cost_harness, local_graph, measure, s3_graph,
+};
+use crate::helpers::{MUTATION_QUERIES, mixed_params};
+use omnigraph::db::BranchListing;
 
 /// Run an async test body on a thread with a large stack (see module docs).
 fn on_big_stack<F>(body: impl FnOnce() -> F + Send + 'static)
@@ -108,4 +112,112 @@ fn branch_delete_manifest_reads_bounded_per_surviving_branch() {
             );
         })
     });
+}
+
+/// `__manifest` reads `branch_list_detailed` may spend per listed branch that has
+/// written a commit: a checkout of its latest version and of the version it was
+/// created from, each with one scan of the rows. Measured at exactly 8 requests
+/// on an S3 emulator (5 for a branch that has written none); a local store
+/// counts 3, because Lance reads local files without the counting wrapper.
+const DETAILS_PER_BRANCH_BUDGET: u64 = 8;
+
+async fn insert_on(db: &omnigraph::Session, branch: &str, name: &str) {
+    db.mutate(
+        branch,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", name)], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+}
+
+async fn measured_details(db: &omnigraph::Session) -> (BranchListing, IoCounts) {
+    let (listing, io) = measure(db.branch_list_detailed(&mut |_| true)).await;
+    (listing.unwrap(), io)
+}
+
+/// A detailed branch listing reads each listed branch's `__manifest` a bounded
+/// number of times, never its lineage: the reads per added branch stay within
+/// `DETAILS_PER_BRANCH_BUDGET`, and a branch and main that wrote
+/// `DEEP_HISTORY_DEPTH` commits cost what they cost after one.
+#[test]
+fn branch_list_detailed_reads_bounded_per_branch_and_flat_in_history() {
+    on_big_stack(|| {
+        cost_harness(async {
+            let dir = tempfile::tempdir().unwrap();
+            assert_branch_list_detailed_cost(local_graph(&dir).await).await;
+        })
+    });
+}
+
+/// The same gate on an object store, where every `__manifest` read is a
+/// request. Skips without `OMNIGRAPH_S3_TEST_BUCKET`.
+#[test]
+fn branch_list_detailed_reads_bounded_per_branch_and_flat_in_history_s3() {
+    on_big_stack(|| {
+        cost_harness(async {
+            let Some(db) = s3_graph("branch-details").await else {
+                eprintln!("skipping: OMNIGRAPH_S3_TEST_BUCKET is not set");
+                return;
+            };
+            assert_branch_list_detailed_cost(db).await;
+        })
+    });
+}
+
+async fn assert_branch_list_detailed_cost(db: omnigraph::Session) {
+    db.branch_create("unwritten").await.unwrap();
+    let (_, before) = measured_details(&db).await;
+    db.branch_create("unwritten_2").await.unwrap();
+    let (_, after) = measured_details(&db).await;
+    eprintln!(
+        "one added unwritten branch: LIST DETAILED manifest_reads +{}",
+        after.manifest_reads - before.manifest_reads
+    );
+    db.branch_delete("unwritten").await.unwrap();
+    db.branch_delete("unwritten_2").await.unwrap();
+
+    let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+    let mut created = 0u64;
+    for n in [2u64, 6] {
+        while created < n {
+            let name = format!("b{created}");
+            db.branch_create(&name).await.unwrap();
+            insert_on(&db, &name, &format!("{name}_0")).await;
+            created += 1;
+        }
+        let (listing, io) = measured_details(&db).await;
+        assert_eq!(listing.details.len() as u64, n + 1);
+        eprintln!(
+            "written branches={n} (+main): LIST DETAILED manifest_reads={} manifest_scans={} \
+             internal_opens={}",
+            io.manifest_reads, io.manifest_scan_count, io.internal_open_count
+        );
+        curve.push((n, io));
+    }
+    let added = curve[1].0 - curve[0].0;
+    let per_branch = (curve[1].1.manifest_reads - curve[0].1.manifest_reads).div_ceil(added);
+    assert!(
+        per_branch <= DETAILS_PER_BRANCH_BUDGET,
+        "branch_list_detailed read {per_branch} __manifest objects per written branch \
+         (budget {DETAILS_PER_BRANCH_BUDGET}): it must read each branch's latest and \
+         creation versions, not its lineage",
+    );
+
+    for i in 1..DEEP_HISTORY_DEPTH {
+        insert_on(&db, "b0", &format!("b0_{i}")).await;
+        insert_on(&db, "main", &format!("main_{i}")).await;
+    }
+    let (_, deep) = measured_details(&db).await;
+    eprintln!(
+        "after {DEEP_HISTORY_DEPTH} commits on b0 and main: LIST DETAILED manifest_reads={}",
+        deep.manifest_reads
+    );
+    assert_flat(
+        &[(1, curve[1].1), (DEEP_HISTORY_DEPTH, deep)],
+        |io| io.manifest_reads,
+        SLOPE_SLACK,
+        "branch_list_detailed __manifest reads against branch history depth",
+    );
 }

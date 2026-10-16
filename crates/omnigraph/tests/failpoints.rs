@@ -434,6 +434,56 @@ async fn native_branch_controls_reclassify_lost_acknowledgements() {
     );
 }
 
+// Creation records its actor with a second write of the new ref. A failure
+// before that write leaves a usable branch that lists with no actor, and the
+// create reports uncertain completion rather than success or a clean refusal.
+#[tokio::test]
+#[serial]
+async fn branch_create_reports_an_unrecorded_creator_as_uncertain() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+
+    {
+        let _fp = catalog::BRANCH_CREATE_PRE_CREATOR.fire_always();
+        let error = db
+            .branch_create_as("feature", Some("act-alice"))
+            .await
+            .expect_err("a create whose actor was not recorded must not report success");
+        assert_eq!(
+            error.completion_evidence(),
+            Some(CompletionEvidence::Uncertain),
+            "{error}"
+        );
+    }
+    db.branch_create_as("recorded", Some("act-alice"))
+        .await
+        .unwrap();
+    helpers::mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .expect("the branch exists and takes writes");
+    let listing = db.branch_list_detailed(&mut |_| true).await.unwrap();
+    let actors: Vec<_> = listing
+        .details
+        .iter()
+        .map(|detail| (detail.name.as_str(), detail.actor_id.as_deref()))
+        .collect();
+    assert_eq!(
+        actors,
+        [
+            ("main", None),
+            ("feature", None),
+            ("recorded", Some("act-alice"))
+        ]
+    );
+}
+
 /// Branch delete leaves the deleted branch's detached staging for `cleanup`:
 /// a failed collection keeps it and the retry reclaims it.
 #[tokio::test]

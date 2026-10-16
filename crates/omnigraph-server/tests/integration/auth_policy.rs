@@ -2276,6 +2276,16 @@ async fn branch_statements_take_their_routes_policy_decision() {
     assert_forbidden(status, body, "branch list by an actor with no read rule");
     let (status, body) = json_response(&app, get_request(&g("/branches"), "reader-token")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // The detailed listing names the actor the create receipt named.
+    let (status, body) = json_response(
+        &app,
+        get_request(&g("/branches?detail=true"), "reader-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["details"][0]["name"], "feature", "{body}");
+    assert_eq!(body["details"][0]["actor_id"], "act-ragnor", "{body}");
+    assert_eq!(body["details"][1]["actor_id"], Value::Null, "{body}");
     let (status, body) = json_response(&app, get_request(&g("/branches"), "admin-token")).await;
     assert_forbidden(status, body, "GET /branches by an actor with no read rule");
 
@@ -2331,12 +2341,14 @@ async fn branch_list_is_denied_by_a_branch_scoped_read_rule_as_the_route_is() {
             &format!("{statement} under a protected-only read rule"),
         );
     }
-    let (status, body) = json_response(&app, get_request(&g("/branches"), "team-token")).await;
-    assert_forbidden(
-        status,
-        body,
-        "GET /branches under a protected-only read rule",
-    );
+    for route in ["/branches", "/branches?detail=true"] {
+        let (status, body) = json_response(&app, get_request(&g(route), "team-token")).await;
+        assert_forbidden(
+            status,
+            body,
+            &format!("GET {route} under a protected-only read rule"),
+        );
+    }
 }
 
 const SHOW_SOURCES: [&str; 1] = ["show all;"];

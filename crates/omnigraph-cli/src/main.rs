@@ -5,9 +5,9 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
-    BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
-    CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput,
-    SchemaApplyOutput, SnapshotDatasetOutput, query_file_refusals,
+    BlobContentKindOutput, BlobStatOutput, BranchListOutput, BranchOutcomeOutput, ChangeOutput,
+    CommitKindOutput, CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput,
+    ReadOutput, SchemaApplyOutput, SnapshotDatasetOutput, query_file_refusals,
 };
 use omnigraph_cluster::{
     DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
@@ -737,7 +737,7 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("created branch {} from {}", payload.name, payload.from);
                 }
             }
-            BranchCommand::List { uri, json } => {
+            BranchCommand::List { uri, detail, json } => {
                 let client = client::GraphClient::resolve(
                     capability,
                     cli.server.as_deref(),
@@ -747,13 +747,15 @@ async fn run(cli: Cli) -> Result<()> {
                     cli.store.as_deref(),
                 )
                 .await?;
-                let payload = client.branch_list().await?;
+                let payload = if detail {
+                    client.branch_list_detailed().await?
+                } else {
+                    client.branch_list().await?
+                };
                 if json {
                     print_json(&payload)?;
                 } else {
-                    for branch in payload.branches {
-                        println!("{}", branch);
-                    }
+                    print_branch_list_human(&payload);
                 }
             }
             BranchCommand::Delete { uri, name, json } => {

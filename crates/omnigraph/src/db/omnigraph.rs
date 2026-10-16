@@ -3523,7 +3523,7 @@ impl Omnigraph {
             )
             .await
             .map_err(OmniError::before_effect)?;
-        source_coord.branch_create(&target).await?;
+        source_coord.branch_create(&target, actor).await?;
         self.invalidate_read_caches().await;
         Ok(())
     }
@@ -3562,10 +3562,15 @@ impl Omnigraph {
             },
             actor,
         )?;
-        self.branch_create_from_impl(target, name).await
+        self.branch_create_from_impl(target, name, actor).await
     }
 
-    async fn branch_create_from_impl(&self, from: impl Into<ReadTarget>, name: &str) -> Result<()> {
+    async fn branch_create_from_impl(
+        &self,
+        from: impl Into<ReadTarget>,
+        name: &str,
+        actor: Option<&str>,
+    ) -> Result<()> {
         let target = from.into();
         let ReadTarget::Branch(branch_name) = target else {
             return Err(OmniError::manifest(
@@ -3614,7 +3619,7 @@ impl Omnigraph {
         // A locally owned source coordinator cannot be swapped by a concurrent
         // `branch_create_from`; the ref write is durable whichever handle
         // issued it.
-        source_coord.branch_create(&target_branch).await?;
+        source_coord.branch_create(&target_branch, actor).await?;
         self.invalidate_read_caches().await;
         Ok(())
     }
@@ -3622,6 +3627,35 @@ impl Omnigraph {
     pub async fn branch_list(&self) -> Result<Vec<String>> {
         self.ensure_schema_state_valid().await?;
         self.coordinator.read().await.branch_list().await
+    }
+
+    /// [`Self::branch_list`] with the details of each branch `can_read`
+    /// admits: its head, the branch and commit its current lifetime was
+    /// created from, and when and by whom that lifetime was created. One
+    /// listing of the branch refs; `can_read` is asked once per branch, before
+    /// any read of that branch. Each admitted branch costs a read of its
+    /// latest `__manifest` version and, when it has written a commit, of the
+    /// version it was created from; never a read of its lineage. A branch
+    /// deleted after the listing keeps its name and has no details.
+    pub async fn branch_list_detailed(
+        &self,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<BranchListing> {
+        self.ensure_schema_state_valid().await?;
+        let listing = crate::db::manifest::list_graph_branches_detailed(
+            self.uri(),
+            &self.control_session(),
+            can_read,
+        )
+        .await?;
+        Ok(BranchListing {
+            branches: listing.branches,
+            details: listing
+                .details
+                .into_iter()
+                .map(BranchDetail::from_catalog)
+                .collect(),
+        })
     }
 
     pub async fn branch_delete(&self, name: &str) -> Result<()> {
@@ -4589,8 +4623,72 @@ pub(crate) fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result
 }
 
 /// A caller's answer to "may it read this branch?", asked once per two-point
-/// graph diff side; see [`Omnigraph::diff_page_readable`].
+/// graph diff side ([`Omnigraph::diff_page_readable`]) and once per listed
+/// branch ([`Omnigraph::branch_list_detailed`]).
 pub type ReadCheck<'a> = dyn FnMut(&str) -> bool + Send + 'a;
+
+/// The live graph branches, as [`Omnigraph::branch_list_detailed`] lists them.
+#[derive(Debug, Clone)]
+pub struct BranchListing {
+    /// Every live branch, `main` first and the rest by name.
+    pub branches: Vec<String>,
+    /// One entry per branch the caller may read, in the order of `branches`.
+    pub details: Vec<BranchDetail>,
+}
+
+/// One live graph branch, as [`Omnigraph::branch_list_detailed`] reports it.
+/// `from`, `actor_id` and `created_at` describe the branch's creation as its
+/// create receipt did. A branch deleted and created again under the same name
+/// is a new lifetime: its creation and fork are the new lifetime's.
+#[derive(Debug, Clone)]
+pub struct BranchDetail {
+    pub name: String,
+    /// The commit a read of the branch sees: its newest commit, or `fork`
+    /// while it has written none.
+    pub head: GraphCommit,
+    /// The branch this one was created from, as that branch was named then;
+    /// it may since have been deleted or recreated. `None` on `main`.
+    pub from: Option<String>,
+    /// The head of `from` when this branch was created. Fixed for the
+    /// branch's lifetime: unlike the merge base, a later merge does not move
+    /// it. `None` on `main`.
+    pub fork: Option<GraphCommit>,
+    /// The actor that created the branch; `None` on `main` and when the
+    /// creation recorded no actor.
+    pub actor_id: Option<String>,
+    /// When the branch was created, in Unix microseconds recorded to the
+    /// second; `None` on `main`.
+    pub created_at: Option<i64>,
+    /// When the head last moved, in Unix microseconds: the time of the
+    /// branch's newest commit, or `created_at` while it has written none.
+    pub updated_at: i64,
+}
+
+impl BranchDetail {
+    fn from_catalog(detail: crate::db::manifest::GraphBranchDetail) -> Self {
+        let head = crate::db::commit_graph::graph_commit_from_manifest_row(detail.head);
+        let created_at = detail.created_at_seconds.map(|seconds| {
+            i64::try_from(seconds)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000)
+        });
+        let updated_at = match created_at {
+            Some(created_at) if !detail.head_is_own => created_at,
+            _ => head.created_at,
+        };
+        Self {
+            name: detail.name,
+            head,
+            from: detail.from,
+            fork: detail
+                .fork
+                .map(crate::db::commit_graph::graph_commit_from_manifest_row),
+            actor_id: detail.actor_id,
+            created_at,
+            updated_at,
+        }
+    }
+}
 
 /// What one graph diff endpoint names.
 enum DiffReadTarget {

@@ -438,7 +438,7 @@ impl GraphCoordinator {
         self.manifest.native_branch()
     }
 
-    pub(crate) async fn branch_create(&mut self, name: &str) -> Result<()> {
+    pub(crate) async fn branch_create(&mut self, name: &str, actor: Option<&str>) -> Result<()> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
 
@@ -446,7 +446,7 @@ impl GraphCoordinator {
         // it in two physical phases (shallow clone, then BranchContents); the
         // manifest coordinator classifies/reclaims a clone-only zombie before
         // a bounded retry. No graph-lineage branch is created or rolled back.
-        self.manifest.create_branch(&branch).await
+        self.manifest.create_branch_as(&branch, actor).await
     }
 
     /// Delete the branch represented by an operation-local post-gate capture.
