@@ -345,12 +345,13 @@ Automatic versioned publication is a set of jobs in the same CI run and cannot
 start until that run's vocabulary audit succeeds. Each publishing workflow then
 re-verifies the authorizing CI run, resolves its source once to an immutable
 commit, and builds only that commit. Version tags are checked again immediately
-before publication. The daily edge build has no authorizing run: its gate walks
-back from the tip of `main`, at most 20 first-parent commits, to the newest
-commit with a successful non-PR vocabulary audit, since the newest commits may
-still be queued behind earlier CI runs, and builds that commit; the rolling
-`edge` tag never moves backward. A manual backfill must already have a
-successful non-PR vocabulary audit for the exact commit. The current manual workflows therefore fail closed
+before publication. The daily edge build has no authorizing run: it builds its
+own commit, the tip of `main` when the schedule fired, and its gate waits up to
+90 minutes for that commit's CI run, which may be queued behind earlier runs on
+`main`, to pass the vocabulary audit. A run builds only its own commit because
+its build provenance names that commit; the rolling `edge` tag never moves
+backward. A manual backfill must already have a successful non-PR vocabulary
+audit for the exact commit. The current manual workflows therefore fail closed
 for historical pre-guard tags rather than offering a force bypass.
 
 GitHub evaluates a tag-push workflow from the commit selected by that tag. A
@@ -647,8 +648,8 @@ before the unreleased preview rendered at the build's commit.
 | Workflow | Trigger and output |
 |---|---|
 | `build-release-archives.yml` | Called by the two release workflows only; builds the four platform archives stamped with their commit and channel (`OMNIGRAPH_SOURCE_VERSION`, `OMNIGRAPH_RELEASE_CHANNEL`), runs each on its platform, and verifies the exact archive set and checksums. It uploads workflow artifacts and writes no release. |
-| `release-edge.yml` | Daily at 04:17 UTC, and by manual dispatch for a named commit on `main`; builds the newest audited commit on `main` unless `edge` already holds it. After every archive is built, one job attests their provenance and publishes the build as its own prerelease, `edge-<commit date>-<short commit>`, which never changes once published, then copies that release's archives to the rolling `edge` release when `edge` holds an ancestor of the build and the build is still on `main`; it keeps the 30 newest edge builds and smoke-tests both through the installers on every platform. A day whose new commits change only documentation still gets a build; the container image is published from tags only. |
-| `release.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds platform archives, attests their provenance, publishes the GitHub release, updates Homebrew when credentials are available, and smoke-tests the installers on every platform. A backfill of a tag before v0.14.0 builds a source that predates the commit stamp, so its archives are run but their stamp is not checked. |
+| `release-edge.yml` | Daily at 04:17 UTC, and by manual dispatch on `main`; builds the run's commit, the tip of `main`, once its vocabulary audit passes, unless `edge` already holds it. After every archive is built, one job attests their provenance and publishes the build as its own prerelease, `edge-<commit date>-<short commit>`, which never changes once published, then copies that release's archives to the rolling `edge` release when `edge` holds an ancestor of the build and the build is still on `main`; it keeps the 30 newest edge builds and smoke-tests both through the installers on every platform. A day whose new commits change only documentation still gets a build; the container image is published from tags only. |
+| `release.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds platform archives, attests their provenance, publishes the GitHub release, updates Homebrew when credentials are available, and smoke-tests the installers on every platform. The provenance names the run's commit, so a manual backfill is dispatched at the tag itself (`gh workflow run release.yml --ref <tag> -f tag=<tag>`); from v0.14.0 a backfill run at any other commit is refused. A backfill of a tag before v0.14.0 builds a source that predates the commit stamp, so its archives are run but their stamp is not checked, and it publishes without provenance when run at another commit. |
 | `publish-crates.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; publication remains paused until the registry-ownership policy changes. |
 | `publish-image.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds the bookworm-compatible public server image for GHCR and, when configured, Docker Hub. Manual backfills do not move `latest`. |
 | `package.yml` / `omnigraph-package.yml` | Manual AWS CodeBuild packaging for default and AWS-feature artifacts, with checksums, digests, and attestations. |

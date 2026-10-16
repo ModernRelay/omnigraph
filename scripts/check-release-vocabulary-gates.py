@@ -72,7 +72,7 @@ def main() -> int:
         )
 
     publishers = {
-        "release-edge.yml": ("prepare_edge_release", "build_release", "publish_edge_release"),
+        "release-edge.yml": ("build_release", "publish_edge_release"),
         "release.yml": ("build_release", "publish_release", "update_homebrew_tap"),
         "publish-image.yml": ("publish_image",),
         "publish-crates.yml": ("publish_crates",),
@@ -122,6 +122,11 @@ def main() -> int:
                 f"{filename}: publication must select only the shared build's release artifacts",
                 failures,
             )
+            require(
+                '"$GITHUB_SHA" == "$SOURCE_SHA"' in text,
+                f"{filename}: provenance must name the built commit, the run's own",
+                failures,
+            )
         if filename == "release-edge.yml":
             require(
                 "git ls-remote origin refs/heads/main" in text
@@ -129,9 +134,10 @@ def main() -> int:
                 "release-edge.yml: only an audited commit on main may be published",
                 failures,
             )
+            gate_call = job_block(text, "vocabulary_gate")
             require(
-                "walk_back:" in job_block(text, "vocabulary_gate"),
-                "release-edge.yml: a scheduled build must select the newest audited commit",
+                "source_ref: ${{ github.sha }}" in gate_call and "wait_minutes:" in gate_call,
+                "release-edge.yml: a scheduled build audits its own commit, waiting for its CI run",
                 failures,
             )
             require(
@@ -192,8 +198,8 @@ def main() -> int:
         failures,
     )
     require(
-        "git rev-list --first-parent" in gate and "walk_back needs no ci_run_id" in gate,
-        "release-vocabulary-gate.yml: a selected source must be an audited first-parent ancestor",
+        "deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))" in gate,
+        "release-vocabulary-gate.yml: waiting for an audit must be bounded",
         failures,
     )
 

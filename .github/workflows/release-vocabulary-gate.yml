@@ -12,10 +12,11 @@ on:
         required: false
         default: ""
         type: string
-      walk_back:
+      wait_minutes:
         description: >-
-          Without ci_run_id, select the newest audited commit among this many
-          first-parent commits ending at source_ref; 0 audits source_ref alone.
+          Without ci_run_id, wait up to this many minutes for a CI run of the
+          exact commit that has not finished yet; 0 decides from the runs
+          already finished.
         required: false
         default: 0
         type: number
@@ -38,37 +39,25 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ inputs.source_ref }}
-          fetch-depth: ${{ inputs.walk_back > 0 && inputs.walk_back || 1 }}
+          fetch-depth: 1
           persist-credentials: false
 
-      - name: Record immutable source candidates
-        id: candidates
-        env:
-          CI_RUN_ID: ${{ inputs.ci_run_id }}
-          WALK_BACK: ${{ inputs.walk_back }}
+      - name: Record immutable source commit
+        id: source
         run: |
           set -euo pipefail
-          [[ "$WALK_BACK" =~ ^[0-9]+$ ]]
-          if [[ "$WALK_BACK" -gt 0 && -n "$CI_RUN_ID" ]]; then
-            echo "::error::a CI run authorizes exactly one commit; walk_back needs no ci_run_id"
-            exit 1
-          fi
-          count=$(( WALK_BACK > 0 ? WALK_BACK : 1 ))
-          git rev-list --first-parent -n "$count" 'HEAD^{commit}' > "$RUNNER_TEMP/candidates"
-          while read -r sha; do
-            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
-          done < "$RUNNER_TEMP/candidates"
-          echo "path=$RUNNER_TEMP/candidates" >> "$GITHUB_OUTPUT"
+          sha="$(git rev-parse 'HEAD^{commit}')"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Require successful vocabulary audit
-        id: source
         env:
-          CANDIDATES: ${{ steps.candidates.outputs.path }}
           CI_RUN_ID: ${{ inputs.ci_run_id }}
           GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          WAIT_MINUTES: ${{ inputs.wait_minutes }}
         run: |
           set -euo pipefail
-          SOURCE_SHA="$(head -n 1 "$CANDIDATES")"
 
           audit_succeeded_in_run() {
             local run_id="$1"
@@ -100,7 +89,6 @@ jobs:
             # REST view a short consistency window before failing closed.
             for _ in $(seq 1 12); do
               if audit_succeeded_in_run "$CI_RUN_ID"; then
-                echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
               sleep 5
@@ -111,23 +99,27 @@ jobs:
 
           # Manual backfills and scheduled builds may reuse an earlier audit of
           # the exact commit, but a skipped pull-request context never
-          # qualifies. With walk_back, the newest audited candidate wins.
-          mapfile -t candidates < "$CANDIDATES"
-          for SOURCE_SHA in "${candidates[@]}"; do
-            mapfile -t run_ids < <(
-              gh api \
-                "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SOURCE_SHA}&per_page=100" \
-                --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | .id'
-            )
+          # qualifies. A scheduled build may wait, bounded, for the run of a
+          # commit that is still queued behind earlier CI runs on main.
+          [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]]
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          while :; do
+            runs="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SOURCE_SHA}&per_page=100" \
+              --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | {id, status}]')"
+            mapfile -t run_ids < <(jq -r '.[].id' <<<"$runs")
             for run_id in "${run_ids[@]}"; do
               if audit_succeeded_in_run "$run_id"; then
-                echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
             done
+            unfinished="$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")"
+            if [[ ( "${#run_ids[@]}" -gt 0 && "$unfinished" -eq 0 ) || "$(date +%s)" -ge "$deadline" ]]; then
+              break
+            fi
+            sleep 60
           done
-          SOURCE_SHA="${candidates[0]}"
 
-          echo "::error::source ${SOURCE_SHA} and the commits searched before it have no successful non-PR Graph Vocabulary Guard"
+          echo "::error::source ${SOURCE_SHA} has no successful non-PR Graph Vocabulary Guard"
           echo "Audit the exact ref first, then retry the manual release. Historical pre-guard tags require an explicit policy decision."
           exit 1

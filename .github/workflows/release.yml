@@ -42,8 +42,9 @@ jobs:
       source_ref: ${{ inputs.source_ref || format('refs/tags/{0}', inputs.tag) }}
       ci_run_id: ${{ inputs.ci_run_id || '' }}
 
-  # Releases before v0.14.0 predate the commit and channel stamp; a manual
-  # backfill of one checks that its archives run, not what they report.
+  # Releases before v0.14.0 predate the commit and channel stamp and release
+  # attestations; a manual backfill of one checks that its archives run, not
+  # what they report, and may publish without provenance.
   release_source:
     name: Classify release source
     needs: vocabulary_gate
@@ -83,7 +84,7 @@ jobs:
 
   publish_release:
     name: Publish GitHub release
-    needs: [vocabulary_gate, build_release]
+    needs: [vocabulary_gate, release_source, build_release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -122,8 +123,30 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # The provenance predicate names the run's commit (its OIDC `sha`
+      # claim), not the checkout. A tag push runs at the tagged commit; a
+      # manual backfill attests only when dispatched at the tag itself.
+      - name: Require the run's commit to be the built commit
+        id: provenance
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
+          REQUIRE_ATTESTATION: ${{ needs.release_source.outputs.check_stamp }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]]; then
+            echo "attest=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$REQUIRE_ATTESTATION" == true ]]; then
+            echo "::error::this run is for ${GITHUB_SHA}, not ${RELEASE_TAG} (${SOURCE_SHA}); dispatch the backfill at refs/tags/${RELEASE_TAG} so its provenance names the built commit"
+            exit 1
+          else
+            echo "::warning::${RELEASE_TAG} predates release attestations and this run is for ${GITHUB_SHA}; publishing without provenance"
+            echo "attest=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # `build-release-archives.yml` verified this exact set and its checksums.
       - name: Attest build provenance
+        if: steps.provenance.outputs.attest == 'true'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |

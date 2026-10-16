@@ -1,5 +1,5 @@
-- Edge builds are now made once a day, from the newest audited commit on
-  `main`, and each is published as its own prerelease,
+- Edge builds are now made once a day from the tip of `main`, and each is
+  published as its own prerelease,
   `edge-<commit date>-<commit>`, whose archives never change, so a deployment
   can pin it with `VERSION=edge-…` (`-Version` on Windows) and return to it
   later; the 30 newest are kept. The rolling `edge` release still holds the

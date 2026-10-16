@@ -1,7 +1,8 @@
 name: Release Edge
 
-# Once a day, the newest commit on `main` whose vocabulary audit passed is
-# built and published twice, unless `edge` already holds it. Its own
+# Once a day, the tip of `main` is built and published twice once its
+# vocabulary audit passes, unless `edge` already holds it. A run builds only
+# its own commit, the one its build provenance names. Its own
 # prerelease, `edge-<commit date>-<short commit>`, never changes once
 # published, so a deployment can pin it and roll back to it; the rolling `edge`
 # release always holds the newest such build for the installers' edge
@@ -14,29 +15,13 @@ on:
   schedule:
     # Daily, off the hour that scheduled workflows crowd.
     - cron: "17 4 * * *"
+  # Manual dispatch on `main` builds its tip now.
   workflow_dispatch:
-    inputs:
-      source_ref:
-        description: Commit on main to release. Defaults to the newest audited commit on main.
-        required: false
-        type: string
 
 jobs:
-  vocabulary_gate:
-    name: Require audited edge source
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/release-vocabulary-gate.yml
-    with:
-      source_ref: ${{ inputs.source_ref || 'refs/heads/main' }}
-      # The newest commits on main may still be queued behind earlier CI runs;
-      # a named commit is audited alone.
-      walk_back: ${{ !inputs.source_ref && 20 || 0 }}
-
+  # Decided before the audit gate, which may wait for the commit's CI run.
   prepare_edge_release:
     name: Prepare edge release
-    needs: vocabulary_gate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -47,14 +32,14 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
-          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
+          ref: ${{ github.sha }}
           # Ancestry against main and the current edge build.
           fetch-depth: 0
 
       - name: Reject a source edge already holds
         id: freshness
         env:
-          SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           current_main="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
@@ -76,11 +61,24 @@ jobs:
       - name: Name the edge build
         id: name
         env:
-          SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           day="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d "$SOURCE_SHA")"
           echo "build_tag=edge-${day}-${SOURCE_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+  vocabulary_gate:
+    name: Require audited edge source
+    needs: prepare_edge_release
+    if: needs.prepare_edge_release.outputs.publish == 'true'
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-vocabulary-gate.yml
+    with:
+      source_ref: ${{ github.sha }}
+      # The tip's CI run may still be queued behind earlier runs on main.
+      wait_minutes: 90
 
   build_release:
     name: Build edge archives
@@ -155,6 +153,15 @@ jobs:
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # The provenance predicate names the run's commit (its OIDC `sha`
+      # claim), not the checkout, so the two must be the same commit.
+      - name: Require the run's commit to be the built commit
+        run: |
+          [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]] || {
+            echo "::error::this run is for ${GITHUB_SHA} but built ${SOURCE_SHA}; its provenance would name the wrong commit"
+            exit 1
+          }
 
       - name: Attest build provenance
         if: steps.existing.outputs.published != 'true'

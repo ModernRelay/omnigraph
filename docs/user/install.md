@@ -32,8 +32,8 @@ Binaries are installed in `%USERPROFILE%\.local\bin`.
 The default is the latest stable release; if none exists, the installer falls
 back to `edge`.
 
-Edge builds are prereleases built once a day from the newest commit on `main`
-that passed CI's audit, when `main` has moved since the last one. Each is
+Edge builds are prereleases built once a day from the tip of `main`, after its
+CI audit passes, when `main` has moved since the last one. Each is
 published as its own release, `edge-<commit date>-<commit>` (for example
 `edge-20261016-9c2b367`), whose files never change; the rolling `edge` release
 always holds the newest one. The 30 newest edge builds are kept. To install the
