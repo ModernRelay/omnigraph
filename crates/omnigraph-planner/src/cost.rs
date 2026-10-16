@@ -129,6 +129,31 @@ pub fn choose_access_path(
     })
 }
 
+/// How a correlated block (`not { … }`, `count { … } > 2`) reaches the
+/// inner matches of its outer rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AntiJoinStrategy {
+    /// The inner tree runs once over the outer rows, starting from them: work
+    /// scales with the outer rows times the correlation binding's fanout.
+    #[default]
+    Correlated,
+    /// The inner tree runs once from its most bounded binding, with no outer
+    /// rows, and ends on the correlation binding; the outer rows are kept by
+    /// the aggregate of their key's matches. Work scales with the block alone.
+    KeySet,
+}
+
+/// The strategy of a correlated block from the summed row estimates of its two
+/// inner trees (`chain_rows`): the key set only when it produces fewer rows.
+pub fn choose_anti_join_strategy(correlated_rows: u64, key_set_rows: u64) -> AntiJoinStrategy {
+    if key_set_rows < correlated_rows {
+        AntiJoinStrategy::KeySet
+    } else {
+        AntiJoinStrategy::Correlated
+    }
+}
+
 /// Whether the per-hop `key_col IN (...)` scan is served by the BTREE
 /// (`Indexed`) or falls back to a full scan (`Degraded`). New plans derive this
 /// from pinned index facts; legacy plans retain the runtime coverage probe.
@@ -379,6 +404,43 @@ fn bounded_property<'a>(
 /// destination type's row count, so a hub can exceed it. `None` where the
 /// source holds no statistic for a node the estimate depends on.
 pub fn estimate_rows(plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSource) -> Option<u64> {
+    estimate_rows_over(plan, node, source, None)
+}
+
+/// The rows a correlated block's single-input chain produces, summed from
+/// `top` down to its leaf: the `OuterReference` leaf counts `outer_rows`, a
+/// key-set tree's root scan its own estimate. The anti-join cost measure:
+/// every row a chain node emits is a row the next node reads. `None` when a
+/// node has another shape or any estimate is unknown.
+pub fn chain_rows(
+    plan: &LogicalPlan,
+    top: LogicalId,
+    source: &dyn PlanSource,
+    outer_rows: Option<u64>,
+) -> Option<u64> {
+    let mut total = 0u64;
+    let mut node = Some(top);
+    while let Some(id) = node {
+        total = total.saturating_add(estimate_rows_over(plan, id, source, outer_rows)?);
+        node = match plan.node(id)? {
+            LogicalNode::TableScan { input, .. } => *input,
+            LogicalNode::Expand { input, .. } | LogicalNode::Filter { input, .. } => Some(*input),
+            LogicalNode::OuterReference { .. } => None,
+            _ => return None,
+        };
+    }
+    Some(total)
+}
+
+fn estimate_rows_over(
+    plan: &LogicalPlan,
+    node: LogicalId,
+    source: &dyn PlanSource,
+    outer_rows: Option<u64>,
+) -> Option<u64> {
+    let estimate_rows = |plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSource| {
+        estimate_rows_over(plan, node, source, outer_rows)
+    };
     match plan.node(node)? {
         LogicalNode::TableScan { input, spec } => {
             let rows = scan_row_estimate(spec, source)?;
@@ -433,7 +495,8 @@ pub fn estimate_rows(plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSourc
             estimate_rows(plan, *left, source)?
                 .saturating_mul(estimate_rows(plan, *right, source)?),
         ),
-        LogicalNode::OuterReference { .. } | LogicalNode::MergeClassify { .. } => None,
+        LogicalNode::OuterReference { .. } => outer_rows,
+        LogicalNode::MergeClassify { .. } => None,
     }
 }
 

@@ -95,7 +95,17 @@ physical
 `RankFuse` row has two inputs, one subtree per arm, each with its own ranked
 `Scan`; it carries `arms` (binding and kind per arm), `k`, `limit` (the
 query's, which sizes the nearest arm's candidate window; the fused rows are
-cut by the `Limit` above the `Sort`) and `row_tiebreak`. These downstream
+cut by the `Limit` above the `Sort`) and `row_tiebreak`. A physical `AntiJoin`
+row (a correlated block: `not`, `exists`, `count` and the column aggregates)
+carries `strategy`: `correlated` when its second input starts from the outer
+rows through an `OuterReference`, `key_set` when the block's pattern runs once
+from its own most bounded binding (a key or unique equality or a list
+membership) and ends on the correlation binding, whose identity keeps or drops
+each outer row. The planner chooses `key_set` only for a block that reads
+nothing of the outer rows but that identity, and only when its row estimate is
+lower; it then records the pass `anti_join_strategy` and the statistic
+`anti_join_rows($x)` with both estimates. Either strategy returns the same
+rows. These downstream
 row keys follow the arm's score and fused node ID; selected edges use
 `$e.@type` before `$e.@id`. Fusion still scores the ranked node by its ID and
 appends the fused score as `<binding>._rrf`. A
@@ -176,7 +186,7 @@ row per operator with `depth` from
 its nesting and `detail` the operator's own text (a filter's predicate, a
 sort's keys, a scan's columns; `AntiJoinMaskExec` serves every correlated
 block, `not`, `exists`, `count` and the column aggregates, and prints its
-predicate). It is the tree of the query's first pass; a
+predicate, then `key_set` under that strategy). It is the tree of the query's first pass; a
 search that widens its scan after a short answer lowers it again. An
 `explain` runs nothing, so when the lowering would need the embedding client
 (a `nearest()` whose query is a string), the tree is left out and one `plan`
@@ -211,9 +221,11 @@ overfetch `rung`. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
 `Executed::profile`). The row schema is `explain_version` 4. Saved physical
-plans use a `bound_plan_version: 8` envelope whose `body` contains `plan` and
-`values`; version 7 records each aggregate's `distinct` flag, and version 8
-types each node's ordering and declares ranked scans' eligibility and policy. Older unversioned plans and unsupported versions are refused with a
+plans use a `bound_plan_version: 9` envelope whose `body` contains `plan` and
+`values`; version 7 records each aggregate's `distinct` flag, version 8
+types each node's ordering and declares ranked scans' eligibility and policy,
+and version 9 records each `AntiJoin`'s `strategy`. Older unversioned plans and
+unsupported versions are refused with a
 regeneration instruction, including plans without traversal nodes.
 
 An `Aggregate` node's `aggregates` array aligns with `exprs`, with `null` for
@@ -227,7 +239,8 @@ such as `["total: F64?", "person: Person"]`. Names match executed result columns
 `?` records declared nullability, so `count` is `I64?` even when execution
 returns no nulls. A node type names its complete projected object, excluding
 Blob and Vector properties. Saved version 1 through 5 plans must be regenerated
-for the current typed expression declarations.
+for the current typed expression declarations, and version 6 to 8 plans for
+the fields versions 7 to 9 added.
 
 Expression-bearing plan fields have additive `typed_*` counterparts. Each
 expression tree records `op`, the existing GQ text in `gq`, its stored `type`,

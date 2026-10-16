@@ -20,8 +20,9 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// expression with direction and null placement, identity, fused rank)
 /// instead of their text; a ranked scan declares where it applies its
 /// eligibility and its nearest policy, and the assumptions record full-text
-/// coverage.
-pub const BOUND_PLAN_VERSION: u32 = 8;
+/// coverage. Version 9 adds to version 8 every `AntiJoin`'s `strategy`
+/// (`correlated` or `key_set`).
+pub const BOUND_PLAN_VERSION: u32 = 9;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

@@ -3206,14 +3206,16 @@ fn check_restored_plan(bound: &BoundPlan, restored: &BoundPlan) -> Result<(), St
                 PhysicalNode::AntiJoin {
                     predicate,
                     aggregate,
+                    strategy,
                     ..
                 },
                 Some(PhysicalNode::AntiJoin {
                     predicate: back,
                     aggregate: back_spec,
+                    strategy: back_strategy,
                     ..
                 }),
-            ) => predicate == back && aggregate == back_spec,
+            ) => predicate == back && aggregate == back_spec && strategy == back_strategy,
             (
                 PhysicalNode::Projection { .. }
                 | PhysicalNode::Aggregate { .. }

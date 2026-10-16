@@ -1061,7 +1061,47 @@ async fn mcp_resources_read_graphs_schema_and_branches_under_policy() {
         .iter()
         .map(|r| r["uri"].as_str().unwrap())
         .collect();
-    assert_eq!(uris, vec!["omnigraph://graphs"]);
+    assert_eq!(
+        uris,
+        vec![
+            "omnigraph://graphs",
+            "omnigraph://best-practices/index",
+            "omnigraph://best-practices/queries",
+            "omnigraph://best-practices/data",
+            "omnigraph://best-practices/schema",
+            "omnigraph://best-practices/search",
+            "omnigraph://best-practices/changes",
+        ]
+    );
+    // The references are the agent skill's own files, byte for byte.
+    let skill =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/omnigraph/references");
+    for topic in ["queries", "data", "schema", "search", "changes"] {
+        let uri = format!("omnigraph://best-practices/{topic}");
+        let (_, body) =
+            json_response(&app, rpc(Some(&bob), "resources/read", json!({"uri":uri}))).await;
+        assert_eq!(body["result"]["contents"][0]["mimeType"], "text/markdown");
+        assert_eq!(
+            body["result"]["contents"][0]["text"],
+            std::fs::read_to_string(skill.join(format!("{topic}.md"))).unwrap(),
+            "{topic}"
+        );
+    }
+    let (_, index) = json_response(
+        &app,
+        rpc(
+            Some(&bob),
+            "resources/read",
+            json!({"uri":"omnigraph://best-practices/index"}),
+        ),
+    )
+    .await;
+    assert!(
+        index["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("omnigraph://best-practices/search")
+    );
     let (_, templates) = json_response(
         &app,
         rpc(Some(&alice), "resources/templates/list", json!({})),

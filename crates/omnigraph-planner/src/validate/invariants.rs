@@ -24,6 +24,7 @@ use omnigraph_compiler::types::{ExprType, ScalarType};
 use super::budget::Budget;
 use super::requirements::{Requirements, Retrieval, Search, constant_true};
 use super::{AcceptInput, ValidationError};
+use crate::cost::AntiJoinStrategy;
 use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use crate::optimizer::{RRF_NEAREST_ARM_K, contains_aggregate, derived_order};
 use crate::physical::{
@@ -53,6 +54,51 @@ fn pipeline(
         }
     }
     Ok(nodes)
+}
+
+/// A block's inner tree has the shape its strategy declares
+/// (`PhysicalNode::AntiJoin`): under `correlated` its pipeline reaches the
+/// `OuterReference` to the block's binding; under `key_set` it reaches no
+/// `OuterReference` and an `Expand` introduces the binding, whose identity
+/// keys the outer rows. Refused here, a mismatched saved or edited plan never
+/// reaches the operator, where it would fail on a missing outer batch or
+/// correlation column.
+fn check_block_strategy(
+    plan: &PhysicalPlan,
+    id: NodeId,
+    outer_var: &str,
+    inner: NodeId,
+    strategy: AntiJoinStrategy,
+    budget: &mut Budget,
+) -> Result<(), ValidationError> {
+    let nodes = pipeline(plan, inner, budget)?;
+    let reaches = |want: &dyn Fn(&PhysicalNode) -> bool| {
+        nodes.iter().any(|node| plan.node(*node).is_some_and(want))
+    };
+    let holds = match strategy {
+        AntiJoinStrategy::Correlated => reaches(
+            &|node| matches!(node, PhysicalNode::OuterReference { outer_var: leaf } if leaf == outer_var),
+        ),
+        AntiJoinStrategy::KeySet => {
+            !reaches(&|node| matches!(node, PhysicalNode::OuterReference { .. }))
+                && reaches(
+                    &|node| matches!(node, PhysicalNode::Expand { dst, .. } if dst == outer_var),
+                )
+        }
+    };
+    if holds {
+        return Ok(());
+    }
+    Err(ValidationError::violated(
+        "block strategy",
+        format!(
+            "node {id} declares the `{}` strategy for its block over `${outer_var}`, which its inner tree does not have",
+            match strategy {
+                AntiJoinStrategy::Correlated => "correlated",
+                AntiJoinStrategy::KeySet => "key_set",
+            }
+        ),
+    ))
 }
 
 /// One pipeline a query's eligibility constrains: `own`, the nodes that
@@ -194,7 +240,7 @@ impl Requirements {
             let reached = pipeline.reached();
             self.check_bindings(plan, &reached)?;
             self.check_eligibility(plan, &pipeline.own, &reached, input, budget)?;
-            self.check_blocks(plan, &pipeline.own)?;
+            self.check_blocks(plan, &pipeline.own, budget)?;
             if let Some(id) = pipeline
                 .after
                 .iter()
@@ -404,18 +450,26 @@ impl Requirements {
     /// The correlated blocks of each pipeline the query's rows come from are
     /// exactly the written ones, each over its outer binding with the
     /// predicate the query states.
-    fn check_blocks(&self, plan: &PhysicalPlan, nodes: &[NodeId]) -> Result<(), ValidationError> {
-        let mut planned: Vec<(&String, &omnigraph_compiler::ir::SubqueryPredicate)> = nodes
-            .iter()
-            .filter_map(|id| match plan.node(*id) {
-                Some(PhysicalNode::AntiJoin {
-                    outer_var,
-                    predicate,
-                    ..
-                }) => Some((outer_var, predicate)),
-                _ => None,
-            })
-            .collect();
+    fn check_blocks(
+        &self,
+        plan: &PhysicalPlan,
+        nodes: &[NodeId],
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        let mut planned: Vec<(&String, &omnigraph_compiler::ir::SubqueryPredicate)> = Vec::new();
+        for id in nodes {
+            if let Some(PhysicalNode::AntiJoin {
+                outer_var,
+                predicate,
+                inner,
+                strategy,
+                ..
+            }) = plan.node(*id)
+            {
+                check_block_strategy(plan, *id, outer_var, *inner, *strategy, budget)?;
+                planned.push((outer_var, predicate));
+            }
+        }
         if planned.len() != self.blocks.len() {
             return Err(ValidationError::violated(
                 "predicate retention",

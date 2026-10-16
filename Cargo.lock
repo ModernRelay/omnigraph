@@ -5925,6 +5925,7 @@ dependencies = [
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-policy",
+ "omnigraph-skill",
  "p256",
  "regex",
  "reqwest 0.12.28",
