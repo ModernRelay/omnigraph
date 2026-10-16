@@ -4641,6 +4641,46 @@ async fn graph_diff_pages_answer_for_the_first_pages_endpoints() {
         db.diff_page(&other_sides).await.unwrap_err(),
         OmniError::ChangeCursorRejected { .. }
     ));
+    // A token is checksummed, not signed: one re-signed to name a commit its
+    // sides do not reach is refused on the embedded door too, where every
+    // branch is readable. The `from` side is spelled as a commit, which never
+    // moves.
+    let forged = resign_change_token(&token, |payload| {
+        payload["from_commit_id"] = serde_json::json!(first.to_commit_id);
+    });
+    let mut forged_request = diff_request(between(&start, "main"), Some(2));
+    forged_request.page_token = Some(forged);
+    match db.diff_page(&forged_request).await.unwrap_err() {
+        OmniError::ChangeCursorRejected { reason } => assert_eq!(
+            reason,
+            "diff page token names a commit its sides do not reach"
+        ),
+        other => panic!("expected ChangeCursorRejected, got {other:?}"),
+    }
+    // `main` moved, so its `to` is checked on the commit's own branch: one the
+    // caller may not read is refused, after `can_read` is asked for it.
+    db.branch_create("side").await.unwrap();
+    let on_side = write_on(&db, "side", "insert_person", &person("Sid", 4)).await;
+    let forged = resign_change_token(&token, |payload| {
+        payload["to_commit_id"] = serde_json::json!(on_side.graph_commit_id);
+    });
+    forged_request.page_token = Some(forged);
+    let mut asked = Vec::new();
+    match db
+        .diff_page_readable(&forged_request, &mut |branch: &str| {
+            asked.push(branch.to_string());
+            branch != "side"
+        })
+        .await
+        .unwrap_err()
+    {
+        OmniError::ChangeCursorRejected { reason } => assert_eq!(
+            reason,
+            "diff page token names a commit its sides do not reach"
+        ),
+        other => panic!("expected ChangeCursorRejected, got {other:?}"),
+    }
+    assert_eq!(asked.last().map(String::as_str), Some("side"), "{asked:?}");
     let mut other_scope = diff_request(between(&start, "main"), Some(2));
     other_scope.page_token = Some(token.clone());
     other_scope.scope = ChangeFeedScope {
@@ -4694,4 +4734,20 @@ async fn graph_diff_pages_answer_for_the_first_pages_endpoints() {
         .unwrap_err(),
         OmniError::ChangeCursorRejected { .. }
     ));
+}
+
+/// `token` with its payload edited and its checksum recomputed, as any caller
+/// can: a continuation's envelope is `base64url(json ‖ sha256(json))`.
+fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let bytes = engine.decode(token).unwrap();
+    let (payload, _) = bytes.split_at(bytes.len() - 32);
+    let mut payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    edit(&mut payload);
+    let mut encoded = serde_json::to_vec(&payload).unwrap();
+    let checksum = sha2::Sha256::digest(&encoded);
+    encoded.extend_from_slice(&checksum);
+    engine.encode(encoded)
 }

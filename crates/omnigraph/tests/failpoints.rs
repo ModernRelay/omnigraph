@@ -9704,6 +9704,84 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
     assert_eq!(plan.roots, std::collections::BTreeSet::from([chain[2]]));
 }
 
+/// A pass stopped after its file deletions and before the manifest that names
+/// them leaves that manifest with an index directory already gone. The next
+/// pass plans the same manifest again; deleting a directory an earlier pass
+/// removed is already done, so it removes the manifest and converges.
+#[tokio::test]
+#[serial]
+async fn collector_retry_treats_an_index_directory_an_interrupted_pass_removed_as_swept() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let before = detached_versions(&person_uri).await;
+    insert_person(&db, "main", "swept-first").await;
+    let first = staged_since(&person_uri, &before).await;
+    insert_person(&db, "main", "swept-second").await;
+    let rows = count_rows(&db, "node:Person").await;
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.sweep.contains(&first), "{:?}", plan.sweep);
+    let swept_indices: Vec<_> = plan
+        .sweep_paths
+        .iter()
+        .filter(|path| path.starts_with("_indices/"))
+        .cloned()
+        .collect();
+    assert!(
+        !swept_indices.is_empty(),
+        "the fixture must sweep an index directory only the pruned pin names: {:?}",
+        plan.sweep_paths
+    );
+
+    let stats = {
+        let _fp = catalog::CLEANUP_SWEEP_PRE_MANIFEST_DELETE.fire_always();
+        db.cleanup(keep_one()).await.unwrap()
+    };
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|error| error.contains("cleanup.sweep_pre_manifest_delete")),
+        "the interrupted pass reports the window: {row:?}"
+    );
+    assert_eq!(row.manifests_removed, 0, "{row:?}");
+    assert!(detached_versions(&person_uri).await.contains(&first));
+    for path in &swept_indices {
+        assert!(
+            !std::path::Path::new(&person_uri).join(path).exists(),
+            "the interrupted pass deleted the files before stopping: {path}"
+        );
+    }
+
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(row.error.is_none(), "{row:?}");
+    assert!(row.manifests_removed >= 1, "{row:?}");
+    assert!(
+        !detached_versions(&person_uri).await.contains(&first),
+        "the retry removes the half-swept manifest"
+    );
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert!(plan.would_remove().is_empty(), "{:?}", plan.would_remove());
+    assert_eq!(
+        db.cleanup_plan_missing_paths(&report).await.unwrap(),
+        Vec::<(String, String)>::new(),
+        "every retained root's paths still exist"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, rows);
+}
+
 /// A failed publish acknowledgement and unavailable readback leave publication
 /// indeterminate. Its input protection survives the returned error until cleanup
 /// observes the target publication and can safely expire the old witness.
