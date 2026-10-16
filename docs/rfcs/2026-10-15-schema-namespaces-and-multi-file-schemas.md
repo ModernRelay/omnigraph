@@ -157,6 +157,10 @@ node Note { body: String }               // the root namespace: today's schemas
   namespace, where every existing schema already sits.
 - **Reserved names.** `omnigraph`, `std` and segments that start with `_` are
   reserved for future built-ins.
+- **`namespace` is a keyword only at the top level.** It starts a declaration
+  only where `node`, `edge` and `interface` can, so a property named
+  `namespace` stays valid. Type names start with an uppercase letter, so no
+  existing type name can collide with it.
 - **Kinds.** Node and edge names stay separate per kind, as today, inside each
   namespace. The interface rule of
   [Polymorphic types](https://github.com/ModernRelay/omnigraph/pull/884) (a new
@@ -194,6 +198,14 @@ query open_deals() {
 - **`use` lines.** They come at the top of a query text and apply to every query
   in it. A stored query's payload is its whole file, so the lines are stored
   with it.
+- **`use` is not a reserved word.**
+  - It is recognized only in the leading-statement position where `set …;`
+    lines already sit (`query_file` in `query.pest`), before the first query
+    declaration.
+  - It does not join the reserved words that edge, property and alias names
+    exclude (`and`, `or`, `not`, `is`, `null`, `in`). An edge named `Use`, a
+    property `use` and an alias `as use` therefore keep working, and no
+    existing query text changes meaning.
 - **Name resolution.**
   - A qualified name resolves exactly.
   - An unqualified name must match exactly one type among the root namespace and
@@ -497,7 +509,8 @@ with a one-component id.
   compatibility-surfaces RFC.
 - **Namespaces.**
   - PG and GQ grammars gain a block, a `use` line and qualified names, all minor
-    changes.
+    changes. Neither adds a reserved word, so every accepted schema and query
+    text parses as before.
   - The `namespaces` IR feature makes older binaries refuse a graph that uses it.
   - Wire shapes do not change, but values may contain `::`. A client that
     validates type names against `^[A-Z]\w*$` must widen its pattern.
@@ -623,4 +636,5 @@ Rust, TypeScript and Go modules, Terraform `moved` blocks, dbt and LinkML.
 one type-reference rule for unions, `implements`, type tests and typed
 endpoints; interfaces spanning namespaces; moves keeping `StableTypeId` and
 `@type_id`; registry pinning as the guard against re-resolution; namespaces
-conferring no visibility.
+conferring no visibility. Also stated that `use` and `namespace` are positional
+keywords, not reserved words, so existing names keep parsing.
