@@ -28,7 +28,7 @@ listing prints them:
 
 | Column | Type | Meaning |
 |---|---|---|
-| `tree` | `String` | `logical`, `physical` or `datafusion` for a plan node; `plan` for the rows after the trees |
+| `tree` | `String` | `logical_initial`, `logical`, `physical` or `datafusion` for a plan node; `plan` for the rows after the trees |
 | `depth` | `I64` | the node's depth from its tree's root; absent on `plan` rows |
 | `node` | `String` | the node kind (`TableScan`, `Filter`, `Expand`, `Projection`, …) or the operator (`ScanExec`, `FilterExec`, …); on `plan` rows the field name (`pass`, `route`, `logical_hash`, …) |
 | `detail` | `String` | the node's own fields as JSON, without its children; an operator's own text; on `plan` rows the field's value, a string bare and anything else as JSON |
@@ -47,7 +47,9 @@ A bare equality on a single String key can gain an identity predicate when
 its ID index is usable. The written equality remains. Other key types are
 not narrowed because supported historical IDs may use different spellings.
 
-The logical tree comes first, then the physical tree, then the `datafusion`
+The `logical_initial` tree comes first (the logical plan as resolved, before
+rewrite passes ran; the document's `logical_plan_initial`), then the rewritten
+logical tree, then the physical tree, then the `datafusion`
 tree, each in pre-order, so a node's children are the rows one level deeper
 that follow it and the tree is rebuilt from the rows without loss. Every
 physical row's `detail` carries `id`, the node's integer id in the physical
@@ -220,7 +222,10 @@ declared policy: `node` `gate` (a pre-pass gate's `plan`, `prefilter`,
 overfetch `rung`. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
-`Executed::profile`). The row schema is `explain_version` 4. Saved physical
+`Executed::profile`). The row schema is `explain_version` 5: `pipelines`
+entries (present on planner-routed diff and merge documents, never on a
+query's) carry a pipeline `id` and `depends_on`, with `source`, `operators`
+and `sink` as objects whose `id` joins the `physical_plan` node ids. Saved physical
 plans use a `bound_plan_version: 9` envelope whose `body` contains `plan` and
 `values`; version 7 records each aggregate's `distinct` flag, version 8
 types each node's ordering and declares ranked scans' eligibility and policy,

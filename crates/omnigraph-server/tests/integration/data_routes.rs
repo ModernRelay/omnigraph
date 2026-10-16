@@ -4037,6 +4037,7 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "default",
                 "request"
             ),
+            show_row("explain_dump_dir", "", "", "default", "process"),
         ])
     );
 }
@@ -4448,7 +4449,16 @@ async fn query_endpoint_answers_an_explain_statement_as_rows() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["query_name"], "adults");
     assert_eq!(body["columns"], json!(["tree", "depth", "node", "detail"]));
-    assert_eq!(body["rows"][0]["tree"], "logical", "{body}");
+    assert_eq!(body["rows"][0]["tree"], "logical_initial", "{body}");
+    let initial = explain_tree(&body, "logical_initial");
+    assert_eq!(
+        initial["inputs"][0]["node"], "Filter",
+        "before the passes ran the age filter is its own node: {initial}"
+    );
+    assert!(
+        initial["inputs"][0]["inputs"][0]["filter"].is_null(),
+        "the initial scan carries no pushed filter: {initial}"
+    );
     let logical = explain_tree(&body, "logical");
     assert!(logical["node"].is_string(), "{logical}");
     assert_eq!(
@@ -4536,8 +4546,14 @@ async fn query_endpoint_explain_lists_the_lowered_datafusion_tree() {
     }
     assert_eq!(
         trees,
-        vec!["logical", "physical", "datafusion", "plan"],
-        "the three trees then the plan rows: {body}"
+        vec![
+            "logical_initial",
+            "logical",
+            "physical",
+            "datafusion",
+            "plan"
+        ],
+        "the four trees then the plan rows: {body}"
     );
     let datafusion: Vec<&Value> = rows
         .iter()

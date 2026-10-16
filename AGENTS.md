@@ -39,7 +39,9 @@ Tools that support `@` imports include these automatically:
   `omnigraph-catalog` (the `__manifest` catalog: graph branch registrations
   and lineage, the publish), `omnigraph-seams` (the one seam type every
   test-time substitution uses; RFC 0066), engine (`omnigraph-engine`
-  package), policy, API types, cluster, CLI, server, Azure admission
+  package), policy, API types, cluster, CLI,
+  `omnigraph-skill` (rooted at `skills/`; embeds the `skills/omnigraph` agent
+  skill in the CLI), server, Azure admission
   wrapper, benchmark harness,
   `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
   test per case), and `omnigraph-dst` (deterministic simulation testing; needs

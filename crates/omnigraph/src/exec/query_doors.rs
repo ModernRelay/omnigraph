@@ -74,8 +74,9 @@ impl Session {
         )?;
         let head = resolved.graph_commit_id.clone();
         if let CompiledRead::Explain(query) = &compiled {
-            let rows = engine::explain_rows(query, params, &resolved.snapshot, &catalog, &settings)
-                .await?;
+            let rows =
+                engine::explain_rows(query, params, Some(&resolved.snapshot), &catalog, &settings)
+                    .await?;
             return Ok((rows, head));
         }
         let result = self
@@ -108,7 +109,7 @@ impl Session {
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
         admit_wildcard_target(true, compiled.ir().has_wildcard_traversal())?;
         if let CompiledRead::Explain(query) = &compiled {
-            return engine::explain_rows(query, params, &snapshot, &catalog, &settings).await;
+            return engine::explain_rows(query, params, Some(&snapshot), &catalog, &settings).await;
         }
         self.execute_on_route(
             &settings,
@@ -152,7 +153,7 @@ impl Session {
             compiled.query(),
             params,
             &catalog,
-            &resolved.snapshot,
+            Some(&resolved.snapshot),
             &settings,
         )
         .await
@@ -204,7 +205,7 @@ impl Session {
         engine::execute_query_inspected(
             &query,
             params,
-            &resolved.snapshot,
+            Some(&resolved.snapshot),
             graph_index,
             &catalog,
             &engine::EmbeddingResolver::new(self.embedding_cell(), self.embedding_config_ref()),
@@ -253,7 +254,7 @@ impl Session {
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
             has_wildcard,
         )?;
-        engine::plan_pins_snapshot(plan, &resolved.snapshot)?;
+        engine::plan_pins_snapshot(plan, Some(&resolved.snapshot))?;
         engine::replayed_coverage_holds(plan, &resolved.snapshot).await?;
         let CompiledRead::Query(query) =
             self.compile_named_query(&catalog, &envelope.query.source, &envelope.query.name)?
@@ -275,7 +276,7 @@ impl Session {
             engine::GraphIndexHandle::none()
         };
         let context = engine::EngineContext {
-            snapshot: &resolved.snapshot,
+            snapshot: Some(&resolved.snapshot),
             catalog: &catalog,
             graph_index: Arc::new(graph_index),
         };
@@ -328,7 +329,7 @@ impl Session {
         engine::execute_query(
             query,
             params,
-            snapshot,
+            Some(snapshot),
             graph_index,
             catalog,
             &engine::EmbeddingResolver::new(self.embedding_cell(), self.embedding_config_ref()),

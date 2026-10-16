@@ -413,7 +413,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
     let client = load(&data_store, &context, "knowledge").unwrap();
     let result = client
         .query(
-            ReadTarget::Branch("main".into()),
+            Some(ReadTarget::Branch("main".into())),
             "query q() { return { 42 as value } }",
             Some("q"),
             None,
@@ -1143,7 +1143,7 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                 "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
                 _ => client
                     .query(
-                        ReadTarget::Branch("main".into()),
+                        Some(ReadTarget::Branch("main".into())),
                         "query q() {}",
                         Some("q"),
                         None,

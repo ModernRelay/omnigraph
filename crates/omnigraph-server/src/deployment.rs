@@ -622,10 +622,13 @@ async fn execute(
     let crate::ServerConfigMode::Multi {
         graphs,
         server_policy,
+        catalogue_policy,
         ..
     } = settings.mode;
     let server_policy =
         prepare_management_policy(server_policy).map_err(|error| uncertain(error.message))?;
+    let catalogue_policy = crate::load_catalogue_policy(catalogue_policy.as_ref())
+        .map_err(|error| uncertain(format!("invalid catalogue policy: {error}")))?;
     let mut handles = Vec::new();
     let mut unavailable = Vec::new();
     for graph in graphs {
@@ -727,7 +730,14 @@ async fn execute(
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     transition
-        .activate_deployment(handles, unavailable, deleted, server_policy, activation)
+        .activate_deployment(
+            handles,
+            unavailable,
+            deleted,
+            server_policy,
+            catalogue_policy.map(Arc::new),
+            activation,
+        )
         .map_err(|error| uncertain(format!("deployment applied; activation refused: {error}")))?;
     Ok(DeploymentResponse {
         active: active_result(&state, Some(&applied), result.result_revision),
@@ -759,9 +769,12 @@ fn validate_serving_candidate(
     let crate::ServerConfigMode::Multi {
         graphs,
         server_policy,
+        catalogue_policy,
         ..
     } = settings.mode;
     prepare_management_policy(server_policy)?;
+    crate::load_catalogue_policy(catalogue_policy.as_ref())
+        .map_err(|error| ApiError::conflict(format!("invalid catalogue policy: {error}")))?;
     for graph in graphs {
         let prepared = crate::prepare_single_graph(graph, None).map_err(|error| {
             ApiError::conflict(format!("deployment serving preparation failed: {error}"))

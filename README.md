@@ -66,14 +66,19 @@ brew install ModernRelay/tap/omnigraph
 
 Omnigraph is built to be run by coding agents. Two ways in:
 
-**Teach your agent the playbook.** This repo ships the
-[**`omnigraph` agent skill**](skills/omnigraph): the operational playbook
-covering cluster mode, the two config surfaces, schema evolution, query linting,
-data writes, branches, Cedar policy, and the common gotchas.
+**Teach your agent the playbook.** The `omnigraph` binary carries the
+[**`omnigraph` agent skill**](skills/omnigraph) written for it: the operational
+playbook covering cluster mode, the two config surfaces, schema evolution, query
+linting, data writes, branches, Cedar policy, and the common gotchas. Export it
+where your agent loads skills, so the skill always matches the installed CLI:
 
 ```bash
-npx skills add ModernRelay/omnigraph@omnigraph
+omnigraph skill export ~/.claude/skills/omnigraph --force
 ```
+
+With an older CLI that has no `skill` command, or none installed,
+`npx skills add ModernRelay/omnigraph@omnigraph` installs the copy on the
+default branch instead.
 
 **Or have an agent set it up from scratch.** Paste this into Claude Code,
 Codex, or any agent that can read a URL and run a shell command:

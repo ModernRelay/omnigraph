@@ -1,0 +1,112 @@
+# issue: none
+# notes: The engine catalogue read as `@` types beside a user type: every physical operator
+# notes: name with its admitted input counts, every pass at its reporting position, and the
+# notes: logical kinds with their routing coverage. The rows are derived from the registries
+# notes: the binary executes with; a registry change rewrites this case.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"ann"}}
+
+--- query
+set engine = v2;
+query operators() {
+    match { $o: @Operator }
+    return { $o.name, $o.inputs }
+}
+
+--- expect unordered
+{"o.name":"MetadataCount","o.inputs":[0]}
+{"o.name":"Scan","o.inputs":[0,1]}
+{"o.name":"SortMergeJoin","o.inputs":[2]}
+{"o.name":"HashJoin","o.inputs":[2]}
+{"o.name":"HydrateByAddress","o.inputs":[1]}
+{"o.name":"HydrateColumns","o.inputs":[1]}
+{"o.name":"RowCompare","o.inputs":[1]}
+{"o.name":"ClassifyThreeWay","o.inputs":[1]}
+{"o.name":"Page","o.inputs":[1]}
+{"o.name":"CrossJoin","o.inputs":[2]}
+{"o.name":"ContainsJoin","o.inputs":[2]}
+{"o.name":"Filter","o.inputs":[1]}
+{"o.name":"Expand","o.inputs":[1]}
+{"o.name":"AntiJoin","o.inputs":[2]}
+{"o.name":"OuterReference","o.inputs":[0]}
+{"o.name":"RankFuse","o.inputs":[2]}
+{"o.name":"Projection","o.inputs":[1]}
+{"o.name":"Aggregate","o.inputs":[1]}
+{"o.name":"Sort","o.inputs":[1]}
+
+--- expect shape
+o.name: String
+o.inputs: [I64]
+
+--- expect plan
+scan @Operator as $o: columns [name, inputs]
+scan @Operator as $o: access sequential
+not pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query passes_in_order() {
+    match { $p: @Pass }
+    return { $p.position, $p.name }
+    order { $p.position }
+}
+
+--- expect ordered
+{"p.position":0,"p.name":"resolve"}
+{"p.position":1,"p.name":"predicate_pushdown"}
+{"p.position":2,"p.name":"aggregate_pushdown"}
+{"p.position":3,"p.name":"projection_pushdown"}
+{"p.position":4,"p.name":"fragment_scope"}
+{"p.position":5,"p.name":"address_short_circuit"}
+{"p.position":6,"p.name":"late_materialization"}
+{"p.position":7,"p.name":"join_algorithm"}
+{"p.position":8,"p.name":"expand_mode"}
+{"p.position":9,"p.name":"access_path"}
+{"p.position":10,"p.name":"anti_join_strategy"}
+{"p.position":11,"p.name":"key_to_id"}
+{"p.position":12,"p.name":"scan_access"}
+
+--- expect shape
+p.position: I64
+p.name: String
+
+--- query
+set engine = v2;
+query logical_kinds() {
+    match { $k: @LogicalKind }
+    return { $k.name, $k.coverage }
+}
+
+--- expect unordered
+{"k.name":"Aggregate","k.coverage":"refused_by_name"}
+{"k.name":"AntiJoin","k.coverage":"refused_by_name"}
+{"k.name":"Expand","k.coverage":"refused_by_name"}
+{"k.name":"Filter","k.coverage":"routable"}
+{"k.name":"Join","k.coverage":"routable"}
+{"k.name":"Limit","k.coverage":"routable"}
+{"k.name":"MergeClassify","k.coverage":"routable"}
+{"k.name":"MetadataCount","k.coverage":"refused_by_name"}
+{"k.name":"Nearest","k.coverage":"refused_by_name"}
+{"k.name":"OuterReference","k.coverage":"refused_by_name"}
+{"k.name":"Projection","k.coverage":"routable"}
+{"k.name":"RankFuse","k.coverage":"refused_by_name"}
+{"k.name":"RowDiff","k.coverage":"routable"}
+{"k.name":"Sort","k.coverage":"routable"}
+{"k.name":"TableScan","k.coverage":"routable"}
+{"k.name":"TextSearch","k.coverage":"refused_by_name"}
+
+--- expect shape
+k.name: String
+k.coverage: String

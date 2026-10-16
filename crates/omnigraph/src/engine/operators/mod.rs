@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{OmniError, Result};
 
 mod anti_join;
+mod catalogue;
 mod contains_join;
 mod cross_join;
 mod expand;
@@ -53,6 +54,7 @@ mod text_match;
 pub(super) use anti_join::{
     AntiJoinMaskExec, OuterReferenceExec, OuterSlot, fresh_tag_column, tagged_schema,
 };
+pub(super) use catalogue::CatalogueExec;
 pub(super) use contains_join::ContainsJoinExec;
 pub(super) use cross_join::CrossJoinExec;
 pub(super) use expand::{

@@ -181,6 +181,7 @@ fn settings_from_snapshot_inner(
         }
     }
 
+    let catalogue_policy = graph_policies.remove(omnigraph_compiler::CATALOGUE_SCOPE);
     let mut graphs = Vec::new();
     let mut skipped_graphs = Vec::new();
     for graph in &snapshot.quarantined_graphs {
@@ -294,6 +295,7 @@ fn settings_from_snapshot_inner(
             graphs,
             config_path: cluster_dir.to_path_buf(),
             server_policy,
+            catalogue_policy,
         },
         bind: cli_bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
         allow_unauthenticated: cli_allow_unauthenticated || env_unauth,
@@ -871,6 +873,7 @@ mod tests {
             graphs,
             config_path,
             server_policy,
+            ..
         } = config.mode;
         assert!(graphs.is_empty());
         let state = super::open_multi_graph_state_admitted(
@@ -1279,6 +1282,7 @@ mod tests {
                 }],
                 config_path: temp.path().join("omnigraph.yaml"),
                 server_policy: Some(crate::PolicySource::File(policy_path)),
+                catalogue_policy: None,
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
@@ -1337,6 +1341,7 @@ mod tests {
                 }],
                 config_path: temp.path().join("cluster"),
                 server_policy: None,
+                catalogue_policy: None,
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
@@ -1585,6 +1590,7 @@ graphs:
             mut graphs,
             config_path,
             server_policy,
+            ..
         } = config.mode;
         assert_eq!(
             graphs
@@ -1686,6 +1692,7 @@ graphs:
                 graphs,
                 config_path,
                 server_policy,
+                ..
             } = config.mode;
             assert_eq!(graphs.len(), 2);
             let state = open_multi_graph_state(

@@ -35,11 +35,6 @@
 
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_planner::ValidationScope;
-use omnigraph_planner::optimizer::{
-    PASS_ACCESS_PATH, PASS_ADDRESS_SHORT_CIRCUIT, PASS_AGGREGATE_PUSHDOWN, PASS_ANTI_JOIN_STRATEGY,
-    PASS_EXPAND_MODE, PASS_FRAGMENT_SCOPE, PASS_JOIN_ALGORITHM, PASS_LATE_MATERIALIZATION,
-    PASS_PREDICATE_PUSHDOWN, PASS_PROJECTION_PUSHDOWN, PASS_RESOLVE,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -235,23 +230,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
         {
             let (name, negated) = name;
             let name = name.trim();
-            if ![
-                PASS_RESOLVE,
-                PASS_PREDICATE_PUSHDOWN,
-                PASS_AGGREGATE_PUSHDOWN,
-                PASS_PROJECTION_PUSHDOWN,
-                PASS_FRAGMENT_SCOPE,
-                PASS_ADDRESS_SHORT_CIRCUIT,
-                PASS_LATE_MATERIALIZATION,
-                PASS_JOIN_ALGORITHM,
-                PASS_EXPAND_MODE,
-                PASS_ACCESS_PATH,
-                PASS_ANTI_JOIN_STRATEGY,
-                omnigraph_planner::scan_access::PASS_SCAN_ACCESS,
-                omnigraph_planner::scan_access::PASS_KEY_TO_ID,
-            ]
-            .contains(&name)
-            {
+            if omnigraph_planner::PassId::parse(name).is_none() {
                 return Err(refused("names a known optimizer pass"));
             }
             lines.push(PlanLine::Pass {
@@ -607,7 +586,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
         if binding.as_ref().is_some_and(|name| !identifier(name)) {
             return Err(refused("names one nonempty binding"));
         }
-        if !identifier(&type_name) {
+        if !crate::shape::is_type_name(&type_name) {
             return Err(refused("names one node type"));
         }
         let claim = claim.trim();
@@ -825,7 +804,7 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
         for ty in types {
             if crate::shape::is_type_name(ty)
                 && crate::shape::parse_type(ty).is_none()
-                && !catalog.node_types.contains_key(ty)
+                && catalog.query_node_type(ty).is_none()
             {
                 return Err(format!("expect plan: unknown node type `{ty}`"));
             }
@@ -835,7 +814,7 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
                 let parsed = crate::shape::parse_shape_body(&[(0, column)])?;
                 for field in parsed {
                     if let crate::shape::ShapeType::Node(name) = field.shape_type
-                        && !catalog.node_types.contains_key(&name)
+                        && catalog.query_node_type(&name).is_none()
                     {
                         return Err(format!("expect plan: unknown node type `{name}`"));
                     }
@@ -846,7 +825,7 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
             for ty in [&claim.input, &claim.result] {
                 if ty != "exact_integer"
                     && crate::shape::parse_type(ty).is_none()
-                    && !catalog.node_types.contains_key(ty)
+                    && catalog.query_node_type(ty).is_none()
                 {
                     return Err(format!("expect plan: unknown node type `{ty}`"));
                 }
@@ -861,8 +840,7 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
             continue;
         };
         let node = catalog
-            .node_types
-            .get(type_name)
+            .query_node_type(type_name)
             .ok_or_else(|| format!("expect plan: unknown node type `{type_name}`"))?;
         for column in columns {
             if node.arrow_schema.field_with_name(column).is_err() {

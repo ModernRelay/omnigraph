@@ -66,7 +66,7 @@ async fn run_with_access(
             checked,
         };
         let settings = SessionSettings::default();
-        let source = QuerySource::gather(&query, catalog, &snapshot, params, &settings)
+        let source = QuerySource::gather(&query, catalog, Some(&snapshot), params, &settings)
             .await
             .unwrap();
         assert!(
@@ -107,7 +107,7 @@ async fn run_with_access(
         );
         let planning = drain(&stores);
         let context = EngineContext {
-            snapshot: &snapshot,
+            snapshot: Some(&snapshot),
             catalog,
             graph_index: Arc::new(GraphIndexHandle::none()),
         };

@@ -10,6 +10,7 @@
 pub(crate) mod blob;
 pub(crate) use omnigraph_core::branch_control;
 use omnigraph_core::branch_names;
+pub mod catalogue;
 pub mod changes;
 #[cfg(test)]
 mod core_tests;

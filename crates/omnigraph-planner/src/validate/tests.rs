@@ -70,11 +70,7 @@ impl Fixture {
             source = source.with_node_type(
                 name,
                 NodeTypeSpec {
-                    table: TableRef {
-                        type_key: format!("node:{name}"),
-                        dataset_path: format!("node/{name}"),
-                        native_branch: None,
-                    },
+                    table: TableRef::dataset(format!("node:{name}"), format!("node/{name}"), None),
                     version: Some(1),
                     columns: catalog.system_columns,
                     schema: Arc::clone(&node_type.arrow_schema),
@@ -103,7 +99,7 @@ impl Fixture {
     }
 
     fn traced(&self) -> crate::gate::Traced {
-        crate::gate::plan_traced(&self.ir, &self.source, &BOUNDS).expect("the query plans")
+        crate::gate::plan_traced(&self.ir, &self.source, &BOUNDS, false).expect("the query plans")
     }
 
     fn plan(&self) -> PhysicalPlan {

@@ -58,7 +58,7 @@ impl ProjectionContext {
 
     /// The node type bound to `variable`, when the catalog declares it.
     pub(super) fn node_type(&self, variable: &str) -> Option<&NodeType> {
-        self.catalog.node_types.get(self.bindings.get(variable)?)
+        self.catalog.query_node_type(self.bindings.get(variable)?)
     }
 
     pub(super) fn declared_field(
@@ -78,7 +78,7 @@ impl ProjectionContext {
                 "internal exact integer cannot be a public result field",
             )),
             ExprType::Node { type_name } => {
-                let node = self.catalog.node_types.get(type_name).ok_or_else(|| {
+                let node = self.catalog.query_node_type(type_name).ok_or_else(|| {
                     OmniError::manifest_internal(format!("node type {type_name} is absent"))
                 })?;
                 let fields: Vec<_> = node

@@ -5,11 +5,12 @@ use omnigraph_compiler::{ExprType, ScalarType};
 use crate::error::PlanError;
 use crate::logical::{RuntimeInput, ScanAccess, ScanSpec};
 use crate::optimizer::{Optimized, gq_conjunct};
+use crate::passes::{PassId, PassStage};
 use crate::physical::{PhysicalNode, RankKind, ScanInput};
 use crate::source::{IndexFact, IndexKind, PlanSource};
 
-pub const PASS_SCAN_ACCESS: &str = "scan_access";
-pub const PASS_KEY_TO_ID: &str = "key_to_id";
+pub const PASS_SCAN_ACCESS: &str = PassId::ScanAccess.name();
+pub const PASS_KEY_TO_ID: &str = PassId::KeyToId.name();
 
 /// Record every fresh scan's access, and return the identity conjuncts the
 /// key narrowing added (one per narrowed scan), which acceptance re-derives.
@@ -33,6 +34,10 @@ pub async fn finalize_scan_access(
         else {
             continue;
         };
+        if spec.table.is_catalogue() {
+            spec.access = Some(ScanAccess::Sequential);
+            continue;
+        }
         let facts = source.index_facts(&spec.table.type_key);
         let access = if matches!(input, ScanInput::Dependent { .. }) {
             ScanAccess::IdLookup {
@@ -70,11 +75,25 @@ pub async fn finalize_scan_access(
         };
         spec.access = Some(access);
     }
-    if !narrowed.is_empty() {
-        optimized.fired.push(PASS_KEY_TO_ID);
-    }
-    if !scans.is_empty() {
-        optimized.fired.push(PASS_SCAN_ACCESS);
+    for pass in PassId::of_stage(PassStage::Finalize) {
+        let applied = match pass {
+            PassId::KeyToId => !narrowed.is_empty(),
+            PassId::ScanAccess => !scans.is_empty(),
+            PassId::Resolve
+            | PassId::PredicatePushdown
+            | PassId::AggregatePushdown
+            | PassId::ProjectionPushdown
+            | PassId::FragmentScope
+            | PassId::AddressShortCircuit
+            | PassId::LateMaterialization
+            | PassId::JoinAlgorithm
+            | PassId::ExpandMode
+            | PassId::AccessPath
+            | PassId::AntiJoinStrategy => continue,
+        };
+        if applied {
+            optimized.fired.push(pass.name());
+        }
     }
     Ok(narrowed)
 }

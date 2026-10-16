@@ -210,67 +210,68 @@ impl fmt::Display for ColumnRef {
     }
 }
 
-/// Every logical node kind, declared in the order the census sorts them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub enum LogicalKind {
-    Aggregate,
-    AntiJoin,
-    Expand,
-    Filter,
-    Join,
-    Limit,
-    MergeClassify,
-    MetadataCount,
-    Nearest,
-    OuterReference,
-    Projection,
-    RankFuse,
-    RowDiff,
-    Sort,
-    TableScan,
-    TextSearch,
+/// Whether a logical node kind may appear in a routed change-feed or merge
+/// plan at all. Read queries bypass this: a kind refused by name still
+/// plans and runs in a read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    Routable,
+    RefusedByName,
 }
 
-impl LogicalKind {
-    pub const ALL: [LogicalKind; 16] = [
-        LogicalKind::Aggregate,
-        LogicalKind::AntiJoin,
-        LogicalKind::Expand,
-        LogicalKind::Filter,
-        LogicalKind::Join,
-        LogicalKind::Limit,
-        LogicalKind::MergeClassify,
-        LogicalKind::MetadataCount,
-        LogicalKind::Nearest,
-        LogicalKind::OuterReference,
-        LogicalKind::Projection,
-        LogicalKind::RankFuse,
-        LogicalKind::RowDiff,
-        LogicalKind::Sort,
-        LogicalKind::TableScan,
-        LogicalKind::TextSearch,
-    ];
-
-    pub fn name(self) -> &'static str {
+impl Coverage {
+    /// The `@LogicalKind.coverage` spelling.
+    pub const fn name(self) -> &'static str {
         match self {
-            Self::Aggregate => "Aggregate",
-            Self::AntiJoin => "AntiJoin",
-            Self::Expand => "Expand",
-            Self::Filter => "Filter",
-            Self::Join => "Join",
-            Self::Limit => "Limit",
-            Self::MergeClassify => "MergeClassify",
-            Self::MetadataCount => "MetadataCount",
-            Self::Nearest => "Nearest",
-            Self::OuterReference => "OuterReference",
-            Self::Projection => "Projection",
-            Self::RankFuse => "RankFuse",
-            Self::RowDiff => "RowDiff",
-            Self::Sort => "Sort",
-            Self::TableScan => "TableScan",
-            Self::TextSearch => "TextSearch",
+            Self::Routable => "routable",
+            Self::RefusedByName => "refused_by_name",
         }
     }
+}
+
+/// Declares every logical node kind once, in census order, with its explain
+/// name and routing coverage: the enum, `ALL`, `name` and `coverage` come from
+/// the one list, so a kind cannot lack a coverage or be enumerated twice.
+macro_rules! logical_kinds {
+    ( $( $variant:ident => $name:literal, $coverage:ident; )* ) => {
+        /// Every logical node kind, declared in the order the census sorts them.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        pub enum LogicalKind {
+            $( $variant, )*
+        }
+
+        impl LogicalKind {
+            pub const ALL: &'static [LogicalKind] = &[ $( LogicalKind::$variant, )* ];
+
+            pub const fn name(self) -> &'static str {
+                match self { $( Self::$variant => $name, )* }
+            }
+
+            /// The kind's change-feed and merge routing coverage.
+            pub const fn coverage(self) -> Coverage {
+                match self { $( Self::$variant => Coverage::$coverage, )* }
+            }
+        }
+    };
+}
+
+logical_kinds! {
+    Aggregate => "Aggregate", RefusedByName;
+    AntiJoin => "AntiJoin", RefusedByName;
+    Expand => "Expand", RefusedByName;
+    Filter => "Filter", Routable;
+    Join => "Join", Routable;
+    Limit => "Limit", Routable;
+    MergeClassify => "MergeClassify", Routable;
+    MetadataCount => "MetadataCount", RefusedByName;
+    Nearest => "Nearest", RefusedByName;
+    OuterReference => "OuterReference", RefusedByName;
+    Projection => "Projection", Routable;
+    RankFuse => "RankFuse", RefusedByName;
+    RowDiff => "RowDiff", Routable;
+    Sort => "Sort", Routable;
+    TableScan => "TableScan", Routable;
+    TextSearch => "TextSearch", RefusedByName;
 }
 
 /// The scalar-index query Lance's scanner built for a scan's pushed filter,
@@ -991,6 +992,7 @@ pub(crate) fn scan_json(name: &str, spec: &ScanSpec) -> Value {
             "node": name,
             "binding": binding,
             "table": spec.table.type_key,
+            "source": spec.table.source.name(),
             "version": spec.version,
             "projection": spec.projection,
             "filter": spec.filter,

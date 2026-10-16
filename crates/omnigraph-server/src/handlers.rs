@@ -41,7 +41,9 @@ where
         .await
 }
 
+pub(crate) mod catalogue;
 mod dispatch;
+
 use dispatch::{
     CommitControlOutcome, Door, ReadDispatch, branch_read_body, classify, commit_control_body,
     commit_write_at_read_door, control_write_at_read_door, explain_at_write_door,
@@ -2380,6 +2382,7 @@ pub(crate) async fn server_schema_get(
     Ok(Json(SchemaOutput {
         schema_source,
         system_columns: Some(system_columns.into()),
+        catalogue_source: Some(omnigraph_compiler::catalogue_declarations()),
     }))
 }
 

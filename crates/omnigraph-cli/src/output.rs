@@ -1093,6 +1093,17 @@ pub(crate) struct InternalSchemaOutput {
     pub(crate) serves: [u32; 2],
 }
 
+impl InternalSchemaOutput {
+    /// The line `omnigraph version` prints; the agent skill states it verbatim.
+    pub(crate) fn line(&self) -> String {
+        let [lowest, highest] = self.serves;
+        format!(
+            "internal-schema {} (serves v{lowest} to v{highest})",
+            self.writes
+        )
+    }
+}
+
 impl VersionOutput {
     pub(crate) fn current() -> Self {
         use omnigraph::db::manifest::{
@@ -1116,12 +1127,8 @@ pub(crate) fn print_version(output: &VersionOutput, json: bool) -> Result<()> {
     if json {
         return print_json(output);
     }
-    let [lowest, highest] = output.internal_schema.serves;
     println!("omnigraph {}", output.version);
-    println!(
-        "internal-schema {} (serves v{lowest} to v{highest})",
-        output.internal_schema.writes
-    );
+    println!("{}", output.internal_schema.line());
     println!("http-contract {}", output.http_contract);
     Ok(())
 }

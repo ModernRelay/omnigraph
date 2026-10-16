@@ -35,6 +35,7 @@ show all;
 {"name": "load_source_max_bytes", "value": "33554432", "default": "33554432", "source": "default", "scope": "request"}
 {"name": "query_memory_bytes", "value": "157286400", "default": "157286400", "source": "default", "scope": "request"}
 {"name": "history_release_bytes", "value": "262144", "default": "262144", "source": "default", "scope": "request"}
+{"name": "explain_dump_dir", "value": "", "default": "", "source": "default", "scope": "process"}
 
 --- query
 show merge_lineage;
