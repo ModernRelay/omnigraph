@@ -1071,12 +1071,78 @@ pub(crate) fn print_profile_detail(detail: &ProfileDetail, json: bool) -> Result
     Ok(())
 }
 
+/// The release channel a release workflow stamps at compile time
+/// (`.github/workflows/build-release-archives.yml`): `stable` or `edge`. A
+/// local or source build carries none.
+const RELEASE_CHANNEL: Option<&str> = option_env!("OMNIGRAPH_RELEASE_CHANNEL");
+/// The full commit a packaged build was compiled from, the same stamp the
+/// server reports as `source_version` on `/healthz`.
+const SOURCE_COMMIT: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
+
+const fn is_full_commit(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 40 {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        if !matches!(bytes[index], b'0'..=b'9' | b'a'..=b'f') {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+const fn is_release_channel(value: &[u8]) -> bool {
+    matches!(value, b"stable" | b"edge")
+}
+
+// A malformed stamp fails the build instead of printing a version no
+// release has.
+const _: () = {
+    if let Some(commit) = SOURCE_COMMIT {
+        assert!(
+            is_full_commit(commit),
+            "OMNIGRAPH_SOURCE_VERSION must be a full lowercase commit id"
+        );
+    }
+    if let Some(channel) = RELEASE_CHANNEL {
+        assert!(
+            is_release_channel(channel.as_bytes()),
+            "OMNIGRAPH_RELEASE_CHANNEL must be stable or edge"
+        );
+        assert!(
+            SOURCE_COMMIT.is_some(),
+            "OMNIGRAPH_RELEASE_CHANNEL requires OMNIGRAPH_SOURCE_VERSION"
+        );
+    }
+};
+
+/// The version this binary reports, `omnigraph --version` included. An edge
+/// build is a SemVer pre-release of the package version, `0.14.0-edge+9c2b367`,
+/// so it sorts before the release it precedes and names its commit.
+pub(crate) static PACKAGE_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    package_version(env!("CARGO_PKG_VERSION"), RELEASE_CHANNEL, SOURCE_COMMIT)
+});
+
+fn package_version(package: &str, channel: Option<&str>, commit: Option<&str>) -> String {
+    match (channel, commit) {
+        (Some("edge"), Some(commit)) => format!("{package}-edge+{}", &commit[..7]),
+        _ => package.to_string(),
+    }
+}
+
 /// What this binary speaks, learned without contacting a server: the
 /// `omnigraph-http-api` value a server must match exactly, and the storage
 /// formats it writes and serves.
 #[derive(Debug, Serialize)]
 pub(crate) struct VersionOutput {
-    pub(crate) version: &'static str,
+    pub(crate) version: String,
+    /// `stable` or `edge` for a release archive; null for any other build.
+    pub(crate) channel: Option<&'static str>,
+    /// The full commit a packaged build was compiled from; null otherwise.
+    pub(crate) commit: Option<&'static str>,
     pub(crate) http_contract: &'static str,
     pub(crate) internal_schema: InternalSchemaOutput,
 }
@@ -1106,7 +1172,9 @@ impl VersionOutput {
             INTERNAL_MANIFEST_SCHEMA_VERSION, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
         };
         Self {
-            version: env!("CARGO_PKG_VERSION"),
+            version: PACKAGE_VERSION.clone(),
+            channel: RELEASE_CHANNEL,
+            commit: SOURCE_COMMIT,
             http_contract: omnigraph_api_types::HTTP_API_CONTRACT,
             internal_schema: InternalSchemaOutput {
                 writes: INTERNAL_MANIFEST_SCHEMA_VERSION,
@@ -1126,6 +1194,9 @@ pub(crate) fn print_version(output: &VersionOutput, json: bool) -> Result<()> {
     println!("omnigraph {}", output.version);
     println!("{}", output.internal_schema.line());
     println!("http-contract {}", output.http_contract);
+    if let Some(commit) = output.commit {
+        println!("commit {commit}");
+    }
     Ok(())
 }
 
@@ -1725,8 +1796,42 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        ChangeFeedJsonStream, CommitChangesJsonStream, graph_type_subject, render_annotations,
+        ChangeFeedJsonStream, CommitChangesJsonStream, graph_type_subject, is_full_commit,
+        is_release_channel, package_version, render_annotations,
     };
+
+    #[test]
+    fn edge_builds_report_a_prerelease_naming_their_commit() {
+        let commit = "9c2b3679e8f66062252e7ed6270a9478b4b77413";
+        assert_eq!(
+            package_version("0.14.0", Some("edge"), Some(commit)),
+            "0.14.0-edge+9c2b367"
+        );
+        assert_eq!(
+            package_version("0.14.0", Some("stable"), Some(commit)),
+            "0.14.0"
+        );
+        assert_eq!(package_version("0.14.0", None, Some(commit)), "0.14.0");
+        assert_eq!(package_version("0.14.0", None, None), "0.14.0");
+    }
+
+    #[test]
+    fn build_stamps_accept_only_full_commits_and_known_channels() {
+        assert!(is_full_commit("9c2b3679e8f66062252e7ed6270a9478b4b77413"));
+        for commit in [
+            "9c2b367",
+            "9C2B3679E8F66062252E7ED6270A9478B4B77413",
+            "9c2b3679e8f66062252e7ed6270a9478b4b7741g",
+            "",
+        ] {
+            assert!(!is_full_commit(commit), "{commit:?}");
+        }
+        assert!(is_release_channel(b"stable"));
+        assert!(is_release_channel(b"edge"));
+        for channel in ["nightly", "Edge", ""] {
+            assert!(!is_release_channel(channel.as_bytes()), "{channel:?}");
+        }
+    }
 
     #[test]
     fn graph_type_subject_hides_type_key_syntax() {

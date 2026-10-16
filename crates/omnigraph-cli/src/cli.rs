@@ -8,7 +8,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]
-#[command(version = env!("CARGO_PKG_VERSION"), disable_version_flag = true)]
+#[command(version = crate::output::PACKAGE_VERSION.as_str(), disable_version_flag = true)]
 // Subcommands render in declaration order (clap can't print labeled headings
 // between groups), so this legend names the capability each command needs —
 // the user-facing vocabulary (RFC-011). `Plane` stays the internal classifier.

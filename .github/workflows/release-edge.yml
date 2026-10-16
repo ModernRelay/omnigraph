@@ -1,22 +1,23 @@
 name: Release Edge
 
+# Once a day, the newest commit on `main` whose vocabulary audit passed is
+# built and published twice, unless `edge` already holds it. Its own
+# prerelease, `edge-<commit date>-<short commit>`, never changes once
+# published, so a deployment can pin it and roll back to it; the rolling `edge`
+# release always holds the newest such build for the installers' edge
+# channel. The build matrix only uploads workflow artifacts; the single
+# `publish_edge_release` job writes both releases, after every archive is
+# built, run on its platform and verified as a set. The rolling release only
+# moves forward along `main`.
+
 on:
-  workflow_call:
-    inputs:
-      source_ref:
-        required: true
-        type: string
-      ci_run_id:
-        required: true
-        type: string
+  schedule:
+    # Daily, off the hour that scheduled workflows crowd.
+    - cron: "17 4 * * *"
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Current main ref or commit to release. Defaults to the selected workflow ref.
-        required: false
-        type: string
-      ci_run_id:
-        description: Optional CI run that contains the successful exact-SHA vocabulary audit.
+        description: Commit on main to release. Defaults to the newest audited commit on main.
         required: false
         type: string
 
@@ -28,173 +29,325 @@ jobs:
       contents: read
     uses: ./.github/workflows/release-vocabulary-gate.yml
     with:
-      source_ref: ${{ inputs.source_ref || github.sha }}
-      ci_run_id: ${{ inputs.ci_run_id || '' }}
+      source_ref: ${{ inputs.source_ref || 'refs/heads/main' }}
+      # The newest commits on main may still be queued behind earlier CI runs;
+      # a named commit is audited alone.
+      walk_back: ${{ !inputs.source_ref && 20 || 0 }}
 
   prepare_edge_release:
     name: Prepare edge release
     needs: vocabulary_gate
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     outputs:
       publish: ${{ steps.freshness.outputs.publish }}
+      build_tag: ${{ steps.name.outputs.build_tag }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
+          # Ancestry against main and the current edge build.
           fetch-depth: 0
 
-      - name: Reject a stale edge source
+      - name: Reject a source edge already holds
         id: freshness
         env:
           SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
         run: |
           set -euo pipefail
           current_main="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
-          if [[ "$current_main" != "$SOURCE_SHA" ]]; then
-            echo "::notice::main advanced to ${current_main}; skipping stale edge source ${SOURCE_SHA}"
+          current_edge="$(git ls-remote origin refs/tags/edge | awk '{print $1}')"
+          git fetch --quiet --force --tags origin main
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" "$current_main"; then
+            echo "::notice::${SOURCE_SHA} is not on main (${current_main}); nothing to publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ -n "$current_edge" ]] && git merge-base --is-ancestor "$SOURCE_SHA" "$current_edge"; then
+            echo "::notice::edge already holds ${current_edge}, which includes ${SOURCE_SHA}; nothing to publish"
             echo "publish=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
-      - name: Force-update edge tag
-        if: steps.freshness.outputs.publish == 'true'
+      # The commit's own date, not the run's, so a rerun names the same build.
+      - name: Name the edge build
+        id: name
         env:
           SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
         run: |
-          git tag -f edge "$SOURCE_SHA"
-          git push origin refs/tags/edge --force
+          set -euo pipefail
+          day="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d "$SOURCE_SHA")"
+          echo "build_tag=edge-${day}-${SOURCE_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
   build_release:
-    name: Build edge ${{ matrix.asset_name }}
+    name: Build edge archives
     needs: [vocabulary_gate, prepare_edge_release]
     if: needs.prepare_edge_release.outputs.publish == 'true'
-    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-release-archives.yml
+    with:
+      source_sha: ${{ needs.vocabulary_gate.outputs.source_sha }}
+      channel: edge
+      check_stamp: true
+
+  publish_edge_release:
+    name: Publish edge release
+    needs: [vocabulary_gate, prepare_edge_release, build_release]
+    runs-on: ubuntu-latest
+    # One writer of the edge releases at a time, across CI calls and manual
+    # dispatches.
+    concurrency:
+      group: release-edge-publication
+      cancel-in-progress: false
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      moved: ${{ steps.rolling.outputs.moved }}
+    env:
+      BUILD_TAG: ${{ needs.prepare_edge_release.outputs.build_tag }}
+      SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # Edge builds kept as their own prereleases; older ones are deleted.
+      EDGE_BUILDS_RETAINED: "30"
+    steps:
+      - name: Checkout audited source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
+          # The rolling tag's ancestry and the release-note base need history.
+          fetch-depth: 0
+
+      - name: Download release build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-omnigraph-*
+          path: dist
+          merge-multiple: true
+
+      # A rerun of a published build keeps its first archives: the build
+      # release never changes once published, and the rolling release copies
+      # its bytes. An earlier attempt's draft is removed first, because gh
+      # resolves a tag to a draft or a published release, whichever answers
+      # first; the by-tag REST lookup sees published releases only.
+      - name: Check for an existing build release
+        id: existing
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_TAG" =~ ^edge-[0-9]{8}-[0-9a-f]{7}$ && "$BUILD_TAG" == *"${SOURCE_SHA:0:7}" ]]
+          tag_sha="$(git ls-remote origin "refs/tags/${BUILD_TAG}" | awk '{print $1}')"
+          if [[ -n "$tag_sha" && "$tag_sha" != "$SOURCE_SHA" ]]; then
+            echo "::error::${BUILD_TAG} already names ${tag_sha}, not ${SOURCE_SHA}"
+            exit 1
+          fi
+          for draft in $(gh api "repos/${GH_REPO}/releases" --paginate \
+              --jq ".[] | select(.draft and .tag_name == \"${BUILD_TAG}\") | .id"); do
+            gh api -X DELETE "repos/${GH_REPO}/releases/${draft}"
+          done
+          if gh api "repos/${GH_REPO}/releases/tags/${BUILD_TAG}" > /dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attest build provenance
+        if: steps.existing.outputs.published != 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+      - name: Read this build's and the latest stable release's facts
+        id: facts
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/edge-bin"
+          tar -C "$RUNNER_TEMP/edge-bin" -xzf dist/omnigraph-linux-x86_64.tar.gz
+          "$RUNNER_TEMP/edge-bin/omnigraph" version --json > "$RUNNER_TEMP/build-version.json"
+          stable_tag="$(gh release view --json tagName --jq '.tagName' 2>/dev/null || true)"
+          if [[ -n "$stable_tag" ]]; then
+            [[ "$stable_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            VERSION="$stable_tag" INSTALL_DIR="$RUNNER_TEMP/stable-bin" bash scripts/install.sh
+            # Releases before 0.14 print text only.
+            "$RUNNER_TEMP/stable-bin/omnigraph" version --json > "$RUNNER_TEMP/stable-version.out" 2>/dev/null \
+              || "$RUNNER_TEMP/stable-bin/omnigraph" version > "$RUNNER_TEMP/stable-version.out"
+          fi
+          echo "stable_tag=${stable_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Compose release text
+        env:
+          STABLE_TAG: ${{ steps.facts.outputs.stable_tag }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/release-notes-venv"
+          python="$RUNNER_TEMP/release-notes-venv/bin/python"
+          "$python" -m pip install --disable-pip-version-check -r scripts/requirements-docs.txt
+          "$python" scripts/release_notes.py preview --target "$SOURCE_SHA" > "$RUNNER_TEMP/notes.md"
+          stable=()
+          if [[ -n "$STABLE_TAG" ]]; then
+            stable=(--stable-tag "$STABLE_TAG" --stable-version "$RUNNER_TEMP/stable-version.out")
+          fi
+          for kind in build rolling; do
+            rolling=()
+            [[ "$kind" == rolling ]] && rolling=(--rolling)
+            python3 scripts/edge_release_body.py \
+              --repository "$GH_REPO" --commit "$SOURCE_SHA" --build-tag "$BUILD_TAG" \
+              --build-version "$RUNNER_TEMP/build-version.json" --notes "$RUNNER_TEMP/notes.md" \
+              "${stable[@]}" "${rolling[@]}" > "$RUNNER_TEMP/${kind}-body.md"
+          done
+
+      # The tag is pushed first, so the release never depends on GitHub
+      # creating it; a draft is invisible until published, so the build
+      # release appears with every archive or not at all.
+      - name: Publish the build release
+        if: steps.existing.outputs.published != 'true'
+        run: |
+          set -euo pipefail
+          if [[ -z "$(git ls-remote origin "refs/tags/${BUILD_TAG}")" ]]; then
+            git tag "$BUILD_TAG" "$SOURCE_SHA"
+            git push origin "refs/tags/${BUILD_TAG}"
+          fi
+          gh release create "$BUILD_TAG" dist/* \
+            --draft --prerelease --latest=false --verify-tag \
+            --title "Edge ${BUILD_TAG}" \
+            --notes-file "$RUNNER_TEMP/build-body.md"
+          gh release edit "$BUILD_TAG" --draft=false
+
+      - name: Verify the published build release
+        run: |
+          set -euo pipefail
+          gh release download "$BUILD_TAG" --dir published
+          python3 - <<'PY'
+          from pathlib import Path
+
+          expected = {path.name for path in Path("dist").iterdir()}
+          actual = {path.name for path in Path("published").iterdir()}
+          if actual != expected:
+              raise SystemExit(f"{actual ^ expected} differ between the build release and this build")
+          PY
+          (cd published && sha256sum --strict -c ./*.sha256)
+          tag_sha="$(git ls-remote origin "refs/tags/${BUILD_TAG}" | awk '{print $1}')"
+          [[ "$tag_sha" == "$SOURCE_SHA" ]] || {
+            echo "::error::${BUILD_TAG} names ${tag_sha:-nothing}, expected ${SOURCE_SHA}"
+            exit 1
+          }
+
+      # Forward only: a build moves `edge` when the commit it holds is an
+      # ancestor of this one and this one is still on `main`. The update is in
+      # place, which the repository's immutable-releases setting would refuse.
+      - name: Move the rolling edge release
+        id: rolling
+        run: |
+          set -euo pipefail
+          git fetch --quiet --force --tags origin main
+          current="$(git ls-remote origin refs/tags/edge | awk '{print $1}')"
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" origin/main; then
+            echo "::notice::${SOURCE_SHA} is no longer on main; edge stays at ${current:-nothing}"
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ -n "$current" ]] && ! git merge-base --is-ancestor "$current" "$SOURCE_SHA"; then
+            echo "::notice::edge already holds ${current}, which ${SOURCE_SHA} does not descend from"
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! gh release view edge > /dev/null 2>&1; then
+            gh release create edge published/* --prerelease --latest=false \
+              --target "$SOURCE_SHA" --title Edge --notes-file "$RUNNER_TEMP/rolling-body.md"
+          else
+            gh release upload edge published/* --clobber
+            for asset in $(gh release view edge --json assets --jq '.assets[].name'); do
+              if [[ ! -e "published/${asset}" ]]; then
+                gh release delete-asset edge "$asset" --yes
+              fi
+            done
+            gh release edit edge --title Edge --prerelease --notes-file "$RUNNER_TEMP/rolling-body.md"
+          fi
+          git tag -f edge "$SOURCE_SHA"
+          git push origin refs/tags/edge --force
+          echo "moved=true" >> "$GITHUB_OUTPUT"
+
+      - name: Delete edge builds beyond the retained count
+        run: |
+          set -euo pipefail
+          gh release list --limit 1000 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | test("^edge-[0-9]{8}-[0-9a-f]{7}$"))] | sort_by(.createdAt) | reverse | .[].tagName' \
+            > "$RUNNER_TEMP/edge-builds.txt"
+          tail -n +"$((EDGE_BUILDS_RETAINED + 1))" "$RUNNER_TEMP/edge-builds.txt" | while read -r tag; do
+            [[ "$tag" =~ ^edge-[0-9]{8}-[0-9a-f]{7}$ && "$tag" != "$BUILD_TAG" ]] || continue
+            gh release delete "$tag" --cleanup-tag --yes
+          done
+
+  smoke_installers:
+    name: Smoke ${{ matrix.runner }} installer
+    needs: [vocabulary_gate, prepare_edge_release, publish_edge_release]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-latest
-            asset_name: omnigraph-linux-x86_64
-          - runner: ubuntu-24.04-arm
-            asset_name: omnigraph-linux-arm64
-          - runner: macos-14
-            asset_name: omnigraph-macos-arm64
-            # OmniGraph's release text exceeds arm64's +/-128 MiB direct-branch
-            # range. Use long calls instead of relying on ld branch islands.
-            rustflags: -C code-model=large
-          - runner: windows-latest
-            asset_name: omnigraph-windows-x86_64
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
     env:
-      CARGO_TERM_COLOR: always
-      # A set RUSTFLAGS, empty included, replaces the workspace `[build]
-      # rustflags` (.cargo/config.toml): archives build without the cfg.
-      RUSTFLAGS: ${{ matrix.rustflags || '' }}
+      BUILD_TAG: ${{ needs.prepare_edge_release.outputs.build_tag }}
+      SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
+      MOVED: ${{ needs.publish_edge_release.outputs.moved }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
+          persist-credentials: false
 
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-
-      - name: Install macOS dependencies
-        if: runner.os == 'macOS'
-        run: brew install protobuf
-
-      - name: Install Windows dependencies
-        if: runner.os == 'Windows'
-        run: choco install protoc -y
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: stable
-
-      - name: Cache Rust build data
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: |
-            . -> target
-
-      - name: Build release binaries
-        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission
-
-      - name: Package Unix release archive
+      - name: Install the pinned build and the edge channel
         if: runner.os != 'Windows'
         run: |
-          mkdir -p release
-          install -m 0755 target/release/omnigraph release/omnigraph
-          install -m 0755 target/release/omnigraph-server release/omnigraph-server
-          install -m 0755 target/release/omnigraph-azure-admission release/omnigraph-azure-admission
-          tar -C release -czf "${{ matrix.asset_name }}.tar.gz" omnigraph omnigraph-server omnigraph-azure-admission
-          shasum -a 256 "${{ matrix.asset_name }}.tar.gz" > "${{ matrix.asset_name }}.sha256"
+          set -euo pipefail
+          check() {
+            "$1/omnigraph" version
+            "$1/omnigraph" version --json > "$1/version.json"
+            python3 - "$1/version.json" <<'PY'
+          import json, os, sys
+          facts = json.load(open(sys.argv[1]))
+          expected = ("edge", os.environ["SOURCE_SHA"])
+          if (facts["channel"], facts["commit"]) != expected:
+              raise SystemExit(f"installed {facts['channel']}/{facts['commit']}, expected {expected}")
+          PY
+            "$1/omnigraph-server" --help > /dev/null
+            "$1/omnigraph-azure-admission" --help > /dev/null
+          }
+          VERSION="$BUILD_TAG" INSTALL_DIR="$RUNNER_TEMP/pinned" bash scripts/install.sh
+          check "$RUNNER_TEMP/pinned"
+          if [[ "$MOVED" == true ]]; then
+            RELEASE_CHANNEL=edge INSTALL_DIR="$RUNNER_TEMP/channel" bash scripts/install.sh
+            check "$RUNNER_TEMP/channel"
+          fi
 
-      - name: Package Windows release archive
+      - name: Install the pinned build and the edge channel
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Copy-Item target/release/omnigraph.exe release/omnigraph.exe
-          Copy-Item target/release/omnigraph-server.exe release/omnigraph-server.exe
-          Copy-Item target/release/omnigraph-azure-admission.exe release/omnigraph-azure-admission.exe
-          Compress-Archive -Path release/omnigraph.exe, release/omnigraph-server.exe, release/omnigraph-azure-admission.exe -DestinationPath "${{ matrix.asset_name }}.zip" -Force
-          $hash = (Get-FileHash "${{ matrix.asset_name }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          $checksumPath = Join-Path (Get-Location) "${{ matrix.asset_name }}.sha256"
-          [System.IO.File]::WriteAllText(
-            $checksumPath,
-            "$hash  ${{ matrix.asset_name }}.zip`n",
-            [System.Text.UTF8Encoding]::new($false)
-          )
-          $checksumBytes = [System.IO.File]::ReadAllBytes($checksumPath)
-          if ($checksumBytes -contains 13) {
-            throw "Windows checksum manifest contains CR; expected LF-only"
+          function Test-Installed([string]$Dir) {
+            & "$Dir/omnigraph.exe" version
+            $facts = & "$Dir/omnigraph.exe" version --json | Out-String | ConvertFrom-Json
+            if ($facts.channel -ne "edge" -or $facts.commit -ne $env:SOURCE_SHA) {
+              throw "installed $($facts.channel)/$($facts.commit), expected edge/$env:SOURCE_SHA"
+            }
+            & "$Dir/omnigraph-server.exe" --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "omnigraph-server --help failed" }
+            & "$Dir/omnigraph-azure-admission.exe" --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "omnigraph-azure-admission --help failed" }
           }
-          New-Item -ItemType Directory -Force -Path verify | Out-Null
-          Expand-Archive -Path "${{ matrix.asset_name }}.zip" -DestinationPath verify -Force
-          $items = Get-ChildItem -Path verify -File
-          if ($items.Count -ne 3 -or !(Test-Path verify/omnigraph.exe) -or !(Test-Path verify/omnigraph-server.exe) -or !(Test-Path verify/omnigraph-azure-admission.exe)) {
-            throw "Windows release archive is missing expected binaries"
+          ./scripts/install.ps1 -Version $env:BUILD_TAG -InstallDir "$env:RUNNER_TEMP/pinned"
+          Test-Installed "$env:RUNNER_TEMP/pinned"
+          if ($env:MOVED -eq "true") {
+            ./scripts/install.ps1 -ReleaseChannel edge -InstallDir "$env:RUNNER_TEMP/channel"
+            Test-Installed "$env:RUNNER_TEMP/channel"
           }
-
-      - name: Publish edge release assets
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          tag_name: edge
-          name: Edge
-          prerelease: true
-          make_latest: false
-          body: |
-            Rolling prerelease from `${{ needs.vocabulary_gate.outputs.source_sha }}`.
-          files: |
-            ${{ matrix.asset_name }}.*
-
-  smoke_windows_installer:
-    name: Smoke Windows installer
-    needs: [vocabulary_gate, build_release]
-    runs-on: windows-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
-
-      - name: Install from edge release
-        run: ./scripts/install.ps1 -ReleaseChannel edge -InstallDir "$env:RUNNER_TEMP/omnigraph-bin"
-
-      - name: Smoke installed binaries
-        run: |
-          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph.exe" version
-          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph-server.exe" --help
-          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph-azure-admission.exe" --help

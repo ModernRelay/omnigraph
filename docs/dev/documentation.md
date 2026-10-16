@@ -194,7 +194,9 @@ validates the version documents before atomically replacing the existing index.
 
 The stable publisher validates the snapshot from its audited checkout and renders
 its local links at the release tag. Versions before v0.12.0 retain asset-only
-backfills; v0.12.0 onward require a valid snapshot. Edge releases are unchanged.
+backfills; v0.12.0 onward require a valid snapshot. Edge releases need no
+snapshot: each shows the unreleased preview at its commit
+([release workflows](ci.md#release-workflows)).
 After publication, update the configuration for the next release: set its base
 to the release just published, advance the version and set `legacy` to `null`.
 

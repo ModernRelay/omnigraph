@@ -4,8 +4,9 @@ name: Release
 # from a single job. The matrix used to call `softprops/action-gh-release`
 # concurrently — three jobs racing to create/finalize the same release, which
 # exhausted the action's finalize retries and dropped whole platforms' assets.
-# The matrix now only uploads workflow artifacts; `publish_release` is the sole
-# writer of the release (no race).
+# The matrix (`build-release-archives.yml`, shared with edge releases) now only
+# uploads workflow artifacts; `publish_release` is the sole writer of the
+# release (no race).
 #
 # Automatic tag releases are called by CI only after the exact commit passes
 # the vocabulary audit. Manual backfills retain the same gate and fail closed
@@ -41,113 +42,44 @@ jobs:
       source_ref: ${{ inputs.source_ref || format('refs/tags/{0}', inputs.tag) }}
       ci_run_id: ${{ inputs.ci_run_id || '' }}
 
-  build_release:
-    name: Build ${{ matrix.asset_name }}
+  # Releases before v0.14.0 predate the commit and channel stamp; a manual
+  # backfill of one checks that its archives run, not what they report.
+  release_source:
+    name: Classify release source
     needs: vocabulary_gate
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      check_stamp: ${{ steps.classify.outputs.check_stamp }}
+    steps:
+      - name: Classify release tag
+        id: classify
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          tag = os.environ["RELEASE_TAG"]
+          match = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag)
+          if not match:
+              raise SystemExit("stable release tags must use vMAJOR.MINOR.PATCH")
+          stamped = tuple(map(int, match.groups())) >= (0, 14, 0)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as outputs:
+              print(f"check_stamp={'true' if stamped else 'false'}", file=outputs)
+          PY
+
+  build_release:
+    name: Build release archives
+    needs: [vocabulary_gate, release_source]
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            asset_name: omnigraph-linux-x86_64
-          - runner: ubuntu-24.04-arm
-            asset_name: omnigraph-linux-arm64
-          - runner: macos-14
-            asset_name: omnigraph-macos-arm64
-            # OmniGraph's release text exceeds arm64's +/-128 MiB direct-branch
-            # range. Use long calls instead of relying on ld branch islands.
-            rustflags: -C code-model=large
-          - runner: windows-latest
-            asset_name: omnigraph-windows-x86_64
-    env:
-      CARGO_TERM_COLOR: always
-      # A set RUSTFLAGS, empty included, replaces the workspace `[build]
-      # rustflags` (.cargo/config.toml): archives build without the cfg.
-      RUSTFLAGS: ${{ matrix.rustflags || '' }}
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-
-      - name: Install macOS dependencies
-        if: runner.os == 'macOS'
-        run: brew install protobuf
-
-      - name: Install Windows dependencies
-        if: runner.os == 'Windows'
-        run: choco install protoc -y
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: stable
-
-      - name: Cache Rust build data
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: |
-            . -> target
-
-      - name: Build release binaries
-        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission
-
-      - name: Package Unix release archive
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p release
-          install -m 0755 target/release/omnigraph release/omnigraph
-          install -m 0755 target/release/omnigraph-server release/omnigraph-server
-          install -m 0755 target/release/omnigraph-azure-admission release/omnigraph-azure-admission
-          tar -C release -czf "${{ matrix.asset_name }}.tar.gz" omnigraph omnigraph-server omnigraph-azure-admission
-          shasum -a 256 "${{ matrix.asset_name }}.tar.gz" > "${{ matrix.asset_name }}.sha256"
-
-      - name: Package Windows release archive
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Copy-Item target/release/omnigraph.exe release/omnigraph.exe
-          Copy-Item target/release/omnigraph-server.exe release/omnigraph-server.exe
-          Copy-Item target/release/omnigraph-azure-admission.exe release/omnigraph-azure-admission.exe
-          Compress-Archive -Path release/omnigraph.exe, release/omnigraph-server.exe, release/omnigraph-azure-admission.exe -DestinationPath "${{ matrix.asset_name }}.zip" -Force
-          $hash = (Get-FileHash "${{ matrix.asset_name }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          $checksumPath = Join-Path (Get-Location) "${{ matrix.asset_name }}.sha256"
-          [System.IO.File]::WriteAllText(
-            $checksumPath,
-            "$hash  ${{ matrix.asset_name }}.zip`n",
-            [System.Text.UTF8Encoding]::new($false)
-          )
-          $checksumBytes = [System.IO.File]::ReadAllBytes($checksumPath)
-          if ($checksumBytes -contains 13) {
-            throw "Windows checksum manifest contains CR; expected LF-only"
-          }
-          New-Item -ItemType Directory -Force -Path verify | Out-Null
-          Expand-Archive -Path "${{ matrix.asset_name }}.zip" -DestinationPath verify -Force
-          $items = Get-ChildItem -Path verify -File
-          if ($items.Count -ne 3 -or !(Test-Path verify/omnigraph.exe) -or !(Test-Path verify/omnigraph-server.exe) -or !(Test-Path verify/omnigraph-azure-admission.exe)) {
-            throw "Windows release archive is missing expected binaries"
-          }
-
-      # Upload artifacts only — the single `publish_release` job attaches them to
-      # the release, so no two jobs ever write the release concurrently.
-      - name: Upload build artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-${{ matrix.asset_name }}
-          path: |
-            ${{ matrix.asset_name }}.*
-          if-no-files-found: error
-          retention-days: 1
+    uses: ./.github/workflows/build-release-archives.yml
+    with:
+      source_sha: ${{ needs.vocabulary_gate.outputs.source_sha }}
+      channel: stable
+      check_stamp: ${{ needs.release_source.outputs.check_stamp == 'true' }}
 
   publish_release:
     name: Publish GitHub release
@@ -155,6 +87,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout audited source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -188,47 +122,13 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Verify exact release artifact set
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          expected = {
-              "omnigraph-linux-arm64.sha256",
-              "omnigraph-linux-arm64.tar.gz",
-              "omnigraph-linux-x86_64.sha256",
-              "omnigraph-linux-x86_64.tar.gz",
-              "omnigraph-macos-arm64.sha256",
-              "omnigraph-macos-arm64.tar.gz",
-              "omnigraph-windows-x86_64.sha256",
-              "omnigraph-windows-x86_64.zip",
-          }
-          actual = {
-              str(path.relative_to("dist"))
-              for path in Path("dist").rglob("*")
-              if path.is_file()
-          }
-          if actual != expected:
-              missing = sorted(expected - actual)
-              unexpected = sorted(actual - expected)
-              raise SystemExit(
-                  f"invalid release artifact set: missing={missing}, unexpected={unexpected}"
-              )
-          PY
-
-
-      - name: Verify checksum manifests are Unix-portable
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          for path in sorted(Path("dist").glob("*.sha256")):
-              data = path.read_bytes()
-              if b"\r" in data:
-                  raise SystemExit(f"{path} contains CR; checksums must be LF-only")
-          PY
-          cd dist
-          sha256sum --strict -c ./*.sha256
+      # `build-release-archives.yml` verified this exact set and its checksums.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
 
       - name: Validate and prepare release notes
         id: release_notes
@@ -353,25 +253,66 @@ jobs:
           git commit -m "Update Omnigraph formula to ${RELEASE_TAG}"
           git push origin HEAD:main
 
-  smoke_windows_installer:
-    name: Smoke Windows installer
-    needs: [vocabulary_gate, publish_release]
-    runs-on: windows-latest
+  smoke_installers:
+    name: Smoke ${{ matrix.runner }} installer
+    needs: [vocabulary_gate, release_source, publish_release]
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
     env:
       RELEASE_TAG: ${{ inputs.tag }}
+      SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
+      CHECK_STAMP: ${{ needs.release_source.outputs.check_stamp }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
+          persist-credentials: false
 
       - name: Install from tagged release
-        run: ./scripts/install.ps1 -Version "$env:RELEASE_TAG" -InstallDir "$env:RUNNER_TEMP/omnigraph-bin"
-
-      - name: Smoke installed binaries
+        if: runner.os != 'Windows'
         run: |
-          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph.exe" version
-          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph-server.exe" --help
-          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph-azure-admission.exe" --help
+          set -euo pipefail
+          dir="$RUNNER_TEMP/omnigraph-bin"
+          VERSION="$RELEASE_TAG" INSTALL_DIR="$dir" bash scripts/install.sh
+          if [[ "$CHECK_STAMP" == true ]]; then
+            "$dir/omnigraph" version
+            "$dir/omnigraph" version --json > "$RUNNER_TEMP/version.json"
+            python3 - "$RUNNER_TEMP/version.json" <<'PY'
+          import json, os, sys
+          facts = json.load(open(sys.argv[1]))
+          expected = ("stable", os.environ["SOURCE_SHA"])
+          if (facts["channel"], facts["commit"]) != expected:
+              raise SystemExit(f"installed {facts['channel']}/{facts['commit']}, expected {expected}")
+          PY
+          else
+            "$dir/omnigraph" --help > /dev/null
+          fi
+          "$dir/omnigraph-server" --help > /dev/null
+          "$dir/omnigraph-azure-admission" --help > /dev/null
+
+      - name: Install from tagged release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP/omnigraph-bin"
+          ./scripts/install.ps1 -Version "$env:RELEASE_TAG" -InstallDir $dir
+          if ($env:CHECK_STAMP -eq "true") {
+            & "$dir/omnigraph.exe" version
+            $facts = & "$dir/omnigraph.exe" version --json | Out-String | ConvertFrom-Json
+            if ($facts.channel -ne "stable" -or $facts.commit -ne $env:SOURCE_SHA) {
+              throw "installed $($facts.channel)/$($facts.commit), expected stable/$env:SOURCE_SHA"
+            }
+          } else {
+            & "$dir/omnigraph.exe" --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "omnigraph --help failed" }
+          }
+          & "$dir/omnigraph-server.exe" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "omnigraph-server --help failed" }
+          & "$dir/omnigraph-azure-admission.exe" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "omnigraph-azure-admission --help failed" }
