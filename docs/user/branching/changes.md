@@ -73,10 +73,12 @@ branches diverged, reversed. To review a branch, use the branch form below.
 The kind, type and operation filters, `--limit` and `--page-token` work as for
 `commit changes`. A page token keeps the commits the first page resolved, so
 later pages answer for them even after the branches move. Each continuation is
-checked against the request's sides: it reads a commit only when its side
-resolves to it now or, for a branch that moved, when the caller may read that
-commit as a side of its own. Any other token is refused with `400`; start the
-diff again without it. A diff across a
+checked against the request's sides, on the server and in the embedded CLI
+alike. A side spelled as a commit id reaches only that commit. A branch side
+reaches its head now, any of its earlier heads within its last 1,024 commits,
+and any commit the caller may read as a side of its own. A token naming any
+other commit is refused with `400`; start the diff again without it. A diff
+across a
 schema change returns `409` with reason `schema_boundary`, and a side whose
 history was reclaimed returns `410` with `change_feed_gap`.
 
@@ -202,7 +204,9 @@ names. A commit whose branch was deleted answers the same `404`.
 `branch diff` and `branch merge-base` need `read` on both branches, every
 page included, and answer `403` otherwise. On a later page, a commit the
 token names that its side no longer resolves to needs `read` on the branch
-that wrote it; an unknown or unreadable one answers the same `400`.
+that wrote it, unless it was an earlier head of the side's branch, such as a
+fork's first head that `main` wrote. An unknown or unreadable one answers the
+same `400`.
 
 The CLI's durable `--out` installation is available on POSIX platforms. The
 file contains only snapshot entity records, not the terminal handshake. The CLI
