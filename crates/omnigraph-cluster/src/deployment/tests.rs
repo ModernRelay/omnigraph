@@ -1488,3 +1488,69 @@ async fn configuration_management_does_not_require_unrelated_graph_data_read() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn catalogue_policy_deploys_without_a_managed_graph_and_survives_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let config = dir.path().join(CLUSTER_CONFIG_FILE);
+    let policy = dir.path().join("catalogue.policy.yaml");
+    fs::write(
+        &config,
+        "version: 1\npolicies:\n  catalogue:\n    file: ./catalogue.policy.yaml\n    applies_to: [graph.og_catalog]\n",
+    )
+    .unwrap();
+    fs::write(&policy, "version: 1\nrules: []\n").unwrap();
+    let captured = capture_deployment(dir.path()).unwrap();
+    assert!(captured.graph_ids().is_empty());
+    let first = bootstrap(dir.path()).await;
+    assert!(first.graphs.is_empty());
+    assert!(!dir.path().join("graphs/og_catalog.omni").exists());
+
+    for snapshot in [
+        read_serving_snapshot_from_storage(root).await.unwrap(),
+        read_deployment_serving_snapshot(root, &[]).await.unwrap(),
+        read_deployment_serving_snapshot(root, &["unrelated".into()])
+            .await
+            .unwrap(),
+    ] {
+        assert!(snapshot.graphs.is_empty());
+        assert!(snapshot.applied_graphs.is_empty());
+        assert_eq!(snapshot.policies.len(), 1);
+        assert_eq!(snapshot.policies[0].applies_to, ["graph.og_catalog"]);
+    }
+    unlock(root).await;
+    fs::write(&policy, "version: 1\nrules: []\n# updated\n").unwrap();
+    let second = bootstrap(dir.path()).await;
+    assert!(second.graphs.is_empty());
+    let snapshot = read_serving_snapshot_from_storage(root).await.unwrap();
+    assert_eq!(
+        snapshot.policies[0].source,
+        fs::read_to_string(&policy).unwrap()
+    );
+    unlock(root).await;
+
+    fs::write(&config, "version: 1\n").unwrap();
+    let removed = bootstrap(dir.path()).await;
+    assert!(removed.graphs.is_empty());
+    assert!(
+        read_serving_snapshot_from_storage(root)
+            .await
+            .unwrap()
+            .policies
+            .is_empty()
+    );
+    unlock(root).await;
+
+    fs::write(dir.path().join("people.pg"), crate::tests::SCHEMA).unwrap();
+    fs::write(
+        &config,
+        "version: 1\ngraphs:\n  og_reserved:\n    schema: ./people.pg\n",
+    )
+    .unwrap();
+    let error = apply_deployment(dir.path(), None, &owner(), |_, _, _| {})
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "reserved_graph_id");
+    assert!(!dir.path().join("graphs/og_reserved.omni").exists());
+}

@@ -30,6 +30,7 @@ use super::requirements::Requirements;
 use super::{AcceptInput, ValidationError};
 use crate::logical::{ColumnRef, IDENTITY_MEMBER, LogicalNode, LogicalPlan};
 use crate::mirror::{ExprMirror, OrderingMirror, ProjectionMirror};
+use crate::operation::TableSource;
 use crate::optimizer::ROW_ADDR;
 use crate::physical::{
     Eligibility, HydratedColumn, PhysicalNode, PhysicalPlan, RankKind, RankScope, ScanInput,
@@ -1296,13 +1297,24 @@ fn chain_of(
                 keys_only: false,
                 ranked,
             } => {
-                let same_table = match plan.assumptions().datasets.get(&spec.table.type_key) {
-                    Some(Some(pin)) => {
-                        pin.dataset_path == spec.table.dataset_path
-                            && pin.native_branch == spec.table.native_branch
+                let same_table = match &spec.table.source {
+                    TableSource::Dataset {
+                        dataset_path,
+                        native_branch,
+                    } => match plan.assumptions().datasets.get(&spec.table.type_key) {
+                        Some(Some(pin)) => {
+                            pin.dataset_path == *dataset_path && pin.native_branch == *native_branch
+                        }
+                        Some(None) => spec.version.is_none(),
+                        None => false,
+                    },
+                    TableSource::Catalogue => {
+                        spec.version.is_none()
+                            && plan
+                                .assumptions()
+                                .catalogue
+                                .contains_key(&spec.table.type_key)
                     }
-                    Some(None) => spec.version.is_none(),
-                    None => false,
                 };
                 if !same_table
                     || hydrated_table.is_some_and(|table| *table != spec.table)

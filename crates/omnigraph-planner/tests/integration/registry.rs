@@ -9,7 +9,7 @@ use arrow_schema::{DataType, Field, Schema};
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::ir::{IRExpr, IROp, IRProjection, QueryIR};
 use omnigraph_planner::optimizer::resolve;
-use omnigraph_planner::registry::{COVERAGE, Coverage, REGISTRY, Route, lookup};
+use omnigraph_planner::registry::{Coverage, REGISTRY, Route, lookup};
 use omnigraph_planner::{
     AdjacencyProof, Census, Decision, JoinKind, LogicalKind, MemorySource, NodeTypeSpec, Operation,
     PageBudgetSpec, RouteOverride, ScopeSpec, Side, SideId, TableRef, Unrouted, route,
@@ -162,17 +162,15 @@ fn every_negative_case_reaches_the_executor() {
 }
 
 #[test]
-fn every_logical_kind_is_in_the_coverage_list_once() {
+fn every_logical_kind_declares_its_coverage_once() {
+    let mut names: Vec<_> = LogicalKind::ALL.iter().map(|kind| kind.name()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), LogicalKind::ALL.len(), "a kind name repeats");
     for kind in LogicalKind::ALL {
-        let count = COVERAGE
-            .iter()
-            .filter(|(candidate, _)| *candidate == kind)
-            .count();
         assert_eq!(
-            count,
-            1,
-            "logical kind {} appears {count} times in the coverage list",
-            kind.name()
+            omnigraph_planner::registry::coverage(*kind),
+            kind.coverage()
         );
     }
 }
@@ -211,11 +209,7 @@ fn major_minor(version: &str) -> (u64, u64) {
 
 fn side(version: u64) -> Side {
     Side {
-        table: TableRef {
-            type_key: "node:Doc".to_string(),
-            dataset_path: "tables/node_Doc".to_string(),
-            native_branch: None,
-        },
+        table: TableRef::dataset("node:Doc", "tables/node_Doc", None),
         version,
         columns: SystemColumns {
             id: "id",
@@ -573,8 +567,8 @@ fn census_display_preserves_join_kinds_after_other_nodes() {
 
 #[test]
 fn refused_by_name_kinds_never_match_an_entry() {
-    for (kind, coverage) in COVERAGE {
-        if *coverage != Coverage::RefusedByName {
+    for kind in LogicalKind::ALL {
+        if kind.coverage() != Coverage::RefusedByName {
             continue;
         }
         for entry in REGISTRY {

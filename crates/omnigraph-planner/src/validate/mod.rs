@@ -17,6 +17,7 @@ mod invariants;
 mod replay;
 mod requirements;
 mod returns;
+mod source;
 pub(crate) mod subset;
 
 pub use budget::{Budget, ValidationLimits};
@@ -253,6 +254,7 @@ pub(crate) fn check(
         "fusion row keys",
         crate::optimizer::validate_rank_fuse_row_tiebreaks(plan),
     )?;
+    formed("catalogue source", source::validate_catalogue_sources(plan))?;
     let requirements = Requirements::derive(input, budget)?;
     requirements.check(plan, input, budget)?;
     let Some(member) = subset::membership(input) else {

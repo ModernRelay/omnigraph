@@ -602,6 +602,22 @@ the scan's own `runtime_filter` marker when it lowers the scan and hands it to
 the join by the scan's node id, so nothing is re-derived from the join's
 conjuncts.
 
+A scan's `TableRef` carries a `TableSource`: `Dataset`, the pinned Lance
+dataset and branch, or `Catalogue`, a built-in `@` type whose rows the
+binary derives from its registries (`crates/omnigraph/src/engine/catalogue.rs`).
+`Lower::scan` dispatches on the source before any dataset lookup: a
+catalogue scan lowers to `CatalogueExec`, a leaf over the registry rows
+projected and prefixed like a stored scan, with no storage handle and no
+fallback. The planner's storage-dependent passes (metadata counts, late
+hydration, contains joins, filter pushdown, index access) check the source
+and leave catalogue scans alone; acceptance refuses a catalogue-bound storage
+node before lowering; a plan records each catalogue table's fingerprint in
+its assumptions, and a replay on a binary with another fingerprint is
+refused. The `og_catalog` scope (`crates/omnigraph/src/catalogue.rs`) runs
+the same path with no snapshot: `EngineContext`, `QuerySource` and
+`Lowering` hold the snapshot as an option, and a node that asks for it fails
+its lowering by name.
+
 The values a run needs ride beside the plan in a `BoundPlan`
 (`omnigraph-planner/src/bound.rs`): the resolved parameters (`now()` among
 them) and, per `nearest` scan, its query vector keyed by node id. `bind`

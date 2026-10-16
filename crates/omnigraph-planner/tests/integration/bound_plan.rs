@@ -30,11 +30,7 @@ fn source() -> MemorySource {
     MemorySource::default().with_node_type(
         "Doc",
         NodeTypeSpec {
-            table: TableRef {
-                type_key: "node:Doc".to_string(),
-                dataset_path: "node/Doc".to_string(),
-                native_branch: None,
-            },
+            table: TableRef::dataset("node:Doc", "node/Doc", None),
             version: Some(3),
             columns: SYSTEM_COLUMNS_V3,
             schema,

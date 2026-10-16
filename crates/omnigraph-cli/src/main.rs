@@ -1406,7 +1406,13 @@ async fn run(cli: Cli) -> Result<()> {
                 if json {
                     print_json(&output)?;
                 } else {
-                    println!("{}", output.schema_source);
+                    if !output.schema_source.trim().is_empty() {
+                        println!("{}", output.schema_source);
+                    }
+                    if let Some(catalogue) = &output.catalogue_source {
+                        println!("// engine catalogue (read-only, derived from this binary)");
+                        println!("{catalogue}");
+                    }
                 }
             }
         },
@@ -1652,6 +1658,12 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let params_json = load_params_json(&params)?;
             let has_target = branch.is_some() || snapshot.is_some();
+            if has_target && matches!(client, client::GraphClient::Catalogue) {
+                bail!(
+                    "`{}` has no branches or snapshots; drop --branch and --snapshot",
+                    omnigraph::catalogue::CATALOGUE_SCOPE
+                );
+            }
             let target = resolve_read_target(branch, snapshot, None)?;
             let output: ReadOutput = if query.is_some() || query_string.is_some() {
                 // Ad-hoc lane: run the source; the positional `name` selects
@@ -1705,7 +1717,7 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                         client
                             .query(
-                                target,
+                                has_target.then_some(target),
                                 &query_source,
                                 name.as_deref(),
                                 params_json.as_ref(),

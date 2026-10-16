@@ -1026,6 +1026,11 @@ fn typecheck_mutation(
     mutation: &Mutation,
     param_types: &HashMap<String, PropType>,
 ) -> Result<CheckedMutationOp> {
+    refuse_catalogue_write(match mutation {
+        Mutation::Insert(insert) => &insert.type_name,
+        Mutation::Update(update) => &update.type_name,
+        Mutation::Delete(delete) => &delete.type_name,
+    })?;
     match mutation {
         Mutation::Insert(insert) => {
             if insert.assignments.is_empty() {
@@ -1397,6 +1402,18 @@ fn mutation_property_type(
         ));
     }
     Ok(prop_type.clone())
+}
+
+/// A catalogue type is read-only: no insert, update, delete or load targets
+/// it, whether or not the name is a declared catalogue type.
+pub(crate) fn refuse_catalogue_write(type_name: &str) -> Result<()> {
+    if crate::catalog::catalogue::is_catalogue_type_name(type_name) {
+        return Err(CompilerError::typed(
+            T10,
+            format!("catalogue type `{type_name}` is read-only; the engine owns its rows"),
+        ));
+    }
+    Ok(())
 }
 
 /// The user property `property` of the mutation target's own namespace.
@@ -1864,14 +1881,12 @@ fn typecheck_binding(
     params: &HashMap<String, PropType>,
 ) -> Result<Vec<CheckedPropMatch>> {
     // T1: binding type must exist in catalog
-    if !catalog.node_types.contains_key(&binding.type_name) {
+    let Some(node_type) = catalog.query_node_type(&binding.type_name) else {
         return Err(CompilerError::typed(
             T1,
             format!("unknown node type `{}`", binding.type_name),
         ));
-    }
-
-    let node_type = &catalog.node_types[&binding.type_name];
+    };
 
     // T2 + T3: property match fields must exist and have correct types
     let mut matches = Vec::with_capacity(binding.prop_matches.len());
@@ -2762,7 +2777,9 @@ fn reject_edge_binding_search_field(ctx: &TypeContext, field: &Expr, func: &str)
         && let Some(bv) = ctx.bindings.get(variable)
     {
         match bv {
-            BoundVariable::Node { .. } => {}
+            BoundVariable::Node { type_name } => {
+                reject_catalogue_search(type_name, variable, func)?;
+            }
             BoundVariable::Edge { .. } => {
                 return Err(CompilerError::typed(
                     T23,
@@ -2773,6 +2790,21 @@ fn reject_edge_binding_search_field(ctx: &TypeContext, field: &Expr, func: &str)
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// A catalogue type has no index: text and rank search over its rows is
+/// refused at the check, before any storage planning. Scalar predicates,
+/// projection, aggregation, ordering and joins stay available.
+fn reject_catalogue_search(type_name: &str, variable: &str, func: &str) -> Result<()> {
+    if crate::catalog::catalogue::is_catalogue_type_name(type_name) {
+        return Err(CompilerError::typed(
+            T23,
+            format!(
+                "{func} cannot target catalogue binding `${variable}: {type_name}`; catalogue rows have no search index"
+            ),
+        ));
     }
     Ok(())
 }
@@ -2814,7 +2846,7 @@ fn read_property_type(
 
     let prop = match bv {
         BoundVariable::Node { type_name } => {
-            let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+            let node_type = catalog.query_node_type(type_name).ok_or_else(|| {
                 CompilerError::typed(T6, format!("type `{}` not found in catalog", type_name))
             })?;
             node_type.properties.get(property).ok_or_else(|| {
@@ -2948,7 +2980,8 @@ fn resolve_expr(
                     ));
                 }
             };
-            let node_type = catalog.node_types.get(node_type_name).ok_or_else(|| {
+            reject_catalogue_search(node_type_name, variable, "nearest")?;
+            let node_type = catalog.query_node_type(node_type_name).ok_or_else(|| {
                 CompilerError::typed(
                     T15,
                     format!("type `{}` not found in catalog", node_type_name),
@@ -3791,7 +3824,7 @@ pub(crate) fn projection_field(catalog: &Catalog, name: &str, ty: &ExprType) -> 
             ));
         }
         ExprType::Node { type_name } => {
-            let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+            let node_type = catalog.query_node_type(type_name).ok_or_else(|| {
                 CompilerError::typed(T51, format!("type `{}` not found in catalog", type_name))
             })?;
             let fields: Vec<Field> = node_type

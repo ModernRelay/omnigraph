@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::error::PlanError;
 use crate::explain::{EntrySummary, Explain, OperationSummary};
 use crate::logical::{Census, LogicalPlan};
-use crate::operation::Operation;
+use crate::operation::{Operation, TableSource};
 use crate::optimizer::{
     Bounds, Optimized, physical_plan, physical_plan_with, resolve, rewrite, rewrite_with,
 };
@@ -117,15 +117,40 @@ impl PlanSource for Recorded<'_> {
 
     fn node_type(&self, type_name: &str) -> Result<NodeTypeSpec, PlanError> {
         let spec = self.source.node_type(type_name)?;
-        self.read.borrow_mut().datasets.insert(
-            spec.table.type_key.clone(),
-            spec.version.map(|version| DatasetPin {
-                dataset_path: spec.table.dataset_path.clone(),
-                native_branch: spec.table.native_branch.clone(),
-                version,
-            }),
-        );
+        let mut read = self.read.borrow_mut();
+        match &spec.table.source {
+            TableSource::Dataset {
+                dataset_path,
+                native_branch,
+            } => {
+                read.datasets.insert(
+                    spec.table.type_key.clone(),
+                    spec.version.map(|version| DatasetPin {
+                        dataset_path: dataset_path.clone(),
+                        native_branch: native_branch.clone(),
+                        version,
+                    }),
+                );
+            }
+            TableSource::Catalogue => {
+                let fingerprint = self
+                    .source
+                    .catalogue_fingerprint(&spec.table.type_key)
+                    .ok_or_else(|| PlanError::Unresolved {
+                        detail: format!(
+                            "catalogue table `{}` has no fingerprint at this source",
+                            spec.table.type_key
+                        ),
+                    })?;
+                read.catalogue
+                    .insert(spec.table.type_key.clone(), fingerprint);
+            }
+        }
         Ok(spec)
+    }
+
+    fn catalogue_fingerprint(&self, type_key: &str) -> Option<String> {
+        self.source.catalogue_fingerprint(type_key)
     }
 
     fn filter_pushable(&self, filter: &IRExpr) -> bool {
@@ -877,11 +902,7 @@ mod tests {
         let source = MemorySource::default().with_node_type(
             "Doc",
             NodeTypeSpec {
-                table: TableRef {
-                    type_key: "node:Doc".into(),
-                    dataset_path: "node/Doc".into(),
-                    native_branch: None,
-                },
+                table: TableRef::dataset("node:Doc", "node/Doc", None),
                 version: Some(1),
                 columns: SYSTEM_COLUMNS_V3,
                 schema: Arc::new(Schema::new(vec![Field::new("__id", DataType::Utf8, false)])),

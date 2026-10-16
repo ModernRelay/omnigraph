@@ -1670,6 +1670,12 @@ pub struct SchemaOutput {
     /// compatibility with servers predating the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_columns: Option<SystemColumnsOutput>,
+    /// The engine catalogue's built-in `@` types as `.pg`-style
+    /// declarations, listed beside the graph's own schema: read-only rows
+    /// the binary derives from its registries, never part of the schema
+    /// source above. Optional for compatibility with servers predating it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalogue_source: Option<String>,
 }
 
 /// A graph's system column spellings (see `SchemaOutput::system_columns`).

@@ -473,11 +473,7 @@ mod tests {
             spec: Box::new(ScanSpec {
                 access: None,
                 side,
-                table: TableRef {
-                    type_key: "node:Doc".into(),
-                    dataset_path: "node/Doc".into(),
-                    native_branch: None,
-                },
+                table: TableRef::dataset("node:Doc", "node/Doc", None),
                 version: None,
                 columns: SYSTEM_COLUMNS_V3,
                 fragments: None,

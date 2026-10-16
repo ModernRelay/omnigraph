@@ -358,7 +358,7 @@ pub(super) fn nearest_property_dim_and_model(
     type_name: &str,
     property: &str,
 ) -> Result<(usize, Option<String>)> {
-    let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+    let node_type = catalog.query_node_type(type_name).ok_or_else(|| {
         OmniError::manifest_internal(format!(
             "nearest() scan resolved unknown node type '{type_name}'"
         ))
@@ -447,8 +447,10 @@ pub(super) async fn rrf_prefilter_gate(
     }
     let ranked_type = prefilter.ranked_type.as_str();
     let node_key = format!("node:{ranked_type}");
-    let snapshot = context.snapshot;
-    let Some(node_entry) = snapshot.dataset(&node_key) else {
+    let Some(node_entry) = context
+        .snapshot
+        .and_then(|snapshot| snapshot.dataset(&node_key))
+    else {
         return fall_back(RrfGateFallback::Shape, forced, None, None);
     };
     let corpus = node_entry.entity_count;
@@ -631,7 +633,10 @@ pub(super) async fn nearest_prefilter_gate(
     }
     let ranked_type = prefilter.ranked_type.as_str();
     let node_key = format!("node:{ranked_type}");
-    let Some(node_entry) = context.snapshot.dataset(&node_key) else {
+    let Some(node_entry) = context
+        .snapshot
+        .and_then(|snapshot| snapshot.dataset(&node_key))
+    else {
         let verdict = fall_back(RrfGateFallback::Shape, None, None);
         return (NearestGatePlan::Postfilter, verdict);
     };

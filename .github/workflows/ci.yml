@@ -99,6 +99,7 @@ jobs:
           run_deployment=false
           for path in "${changed[@]}"; do
             case "$path" in
+              docs/user/queries/catalogue.md) run_full_ci=true ;;
               docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc|changelog.d/*.md|changelog.d/release.json) ;;
               README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
               LICENSE|LICENSE.md) ;;
@@ -680,6 +681,9 @@ jobs:
         run: |
           cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --no-run --timings \
             --features "$FAILPOINT_FEATURES"
+
+      - name: Verify catalogue inventories against the built CLI
+        run: python3 scripts/check-catalogue-docs.py --binary target/debug/omnigraph
 
       - name: Install genuine v0.9 release for upgrade regression
         run: |

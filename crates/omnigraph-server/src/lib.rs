@@ -64,7 +64,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
@@ -333,8 +333,15 @@ pub enum ServerConfigMode {
         /// Server-level Cedar policy for the management endpoints
         /// (`GET /graphs`). Wired into `GET /graphs` authorization.
         server_policy: Option<PolicySource>,
+        /// The policy bound to `graph.og_catalog`: it governs reads of the
+        /// engine catalogue scope, which every binary serves and no
+        /// deployment creates.
+        catalogue_policy: Option<PolicySource>,
     },
 }
+
+/// The route prefix of the engine catalogue scope, `/graphs/og_catalog`.
+pub(crate) const CATALOGUE_ROUTE_PREFIX: &str = "/graphs/og_catalog";
 
 /// Where a Cedar policy bundle comes from at startup. Cluster-local files are
 /// used during config application; inline digest-verified catalog content is
@@ -843,6 +850,22 @@ impl AppState {
         })
     }
 
+    /// Install the policy of the engine catalogue scope; `serve` passes the
+    /// `graph.og_catalog` binding's, a deployment activation replaces it.
+    pub fn set_catalogue_policy(&self, policy: Option<PolicyEngine>) {
+        self.routing
+            .registry
+            .initialize_catalogue_policy(policy.map(Arc::new));
+    }
+
+    pub(crate) fn catalogue_policy(&self) -> Option<Arc<PolicyEngine>> {
+        self.routing
+            .registry
+            .snapshot_ref()
+            .catalogue_policy
+            .clone()
+    }
+
     /// Attach the boot witness `/readyz` reports and the flag shutdown sets
     /// (RFC 0049). `serve` calls this; a test may build its own.
     #[must_use]
@@ -965,7 +988,7 @@ impl AppState {
             return true;
         }
         let snapshot = self.routing.registry.snapshot_ref();
-        if snapshot.server_policy.is_some() {
+        if snapshot.server_policy.is_some() || snapshot.catalogue_policy.is_some() {
             return true;
         }
         // Any per-graph policy also requires auth — otherwise the
@@ -2750,9 +2773,27 @@ pub fn build_app(state: AppState) -> Router {
             require_bearer_auth,
         ));
 
+    let catalogue = Router::new()
+        .route("/query", post(handlers::catalogue::catalogue_query))
+        .route("/schema", get(handlers::catalogue::catalogue_schema))
+        .route("/{*rest}", any(handlers::catalogue::catalogue_refused))
+        .route("/", any(handlers::catalogue::catalogue_refused))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            |State(state): State<AppState>, request: Request, next: Next| async move {
+                ingress::admit(&state, request, next).await
+            },
+        ))
+        .route_layer(middleware::from_fn(http_contract::require_contract))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_auth,
+        ));
+
     // RFC-011 cluster-only: per-graph routes always nest under
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
     let protected: Router<AppState> = Router::new()
+        .nest(CATALOGUE_ROUTE_PREFIX, catalogue)
         .nest("/graphs/{graph_id}", per_graph_protected)
         .merge(management)
         .merge(deployments);
@@ -2835,8 +2876,13 @@ async fn serve_config(
         ServerConfigMode::Multi {
             graphs,
             server_policy,
+            catalogue_policy,
             ..
-        } => server_policy.is_some() || graphs.iter().any(|g| g.policy.is_some()),
+        } => {
+            server_policy.is_some()
+                || catalogue_policy.is_some()
+                || graphs.iter().any(|g| g.policy.is_some())
+        }
     };
     let runtime_state = classify_server_runtime_state(
         !tokens.is_empty() || data_token_trust.is_some() || oidc_identity_trust.is_some(),
@@ -2865,6 +2911,7 @@ async fn serve_config(
             graphs,
             config_path,
             server_policy,
+            catalogue_policy,
         } => {
             info!(
                 bind = %bind,
@@ -2873,14 +2920,16 @@ async fn serve_config(
                 config = %config_path.display(),
                 "serving omnigraph"
             );
-            prepare_multi_graph_state(
+            let (state, prepared) = prepare_multi_graph_state(
                 graphs,
                 tokens,
                 server_policy.as_ref(),
                 config_path,
                 config.cluster_admission,
             )
-            .await?
+            .await?;
+            state.set_catalogue_policy(load_catalogue_policy(catalogue_policy.as_ref())?);
+            (state, prepared)
         }
     };
 
@@ -2991,6 +3040,14 @@ fn load_graph_policy(source: &PolicySource, graph_id: &str) -> Result<PolicyEngi
         PolicySource::File(path) => Ok(PolicyEngine::load_graph(path, graph_id)?),
         PolicySource::Inline(text) => Ok(PolicyEngine::load_graph_from_source(text, graph_id)?),
     }
+}
+
+/// The engine catalogue scope's policy, compiled against the resource
+/// `Graph::"og_catalog"` like any graph binding.
+pub(crate) fn load_catalogue_policy(source: Option<&PolicySource>) -> Result<Option<PolicyEngine>> {
+    source
+        .map(|source| load_graph_policy(source, omnigraph_compiler::CATALOGUE_SCOPE))
+        .transpose()
 }
 
 /// Parallel open of every graph in the startup config, with bounded

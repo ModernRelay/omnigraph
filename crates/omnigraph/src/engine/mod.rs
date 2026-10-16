@@ -37,6 +37,7 @@ use crate::runtime_cache::CompiledQuery;
 
 mod adapters;
 mod bind;
+pub(crate) mod catalogue;
 mod constant;
 mod context;
 mod exact_aggregate;
@@ -82,11 +83,21 @@ pub(crate) use search::referenced_edge_types;
 /// What `execute` takes beside the bound plan, each member data and not a
 /// decision: the read-consistency unit, the type metadata the lowered
 /// operators read back, and the built index state. No session setting: every
-/// setting the run needs is a field of the plan.
+/// setting the run needs is a field of the plan. A catalogue-only query has
+/// no snapshot: every scan of it reads the engine catalogue, and a node that
+/// asks for storage fails its lowering.
 pub(crate) struct EngineContext<'a> {
-    pub(crate) snapshot: &'a Snapshot,
+    pub(crate) snapshot: Option<&'a Snapshot>,
     pub(crate) catalog: &'a Arc<Catalog>,
     pub(crate) graph_index: Arc<GraphIndexHandle>,
+}
+
+/// The refusal every storage request of a catalogue-only query meets.
+pub(crate) fn no_graph_storage(what: &str) -> OmniError {
+    OmniError::manifest_internal(format!(
+        "{what} needs graph storage; a query under `{}` reads only the engine catalogue",
+        omnigraph_compiler::CATALOGUE_SCOPE
+    ))
 }
 
 /// The identity of a snapshot's dataset entry as a plan pins it.
@@ -104,9 +115,27 @@ pub(crate) fn dataset_pin(entry: &DatasetEntry) -> DatasetPin {
 /// Refuse a snapshot that is not the one `plan` was built on: the planner
 /// recorded every dataset it read in the plan's `Assumptions`, by path,
 /// branch and version, and a replay reads exactly those or nothing. A
-/// changed prerequisite is a conflict: replan against the current view.
-pub(crate) fn plan_pins_snapshot(plan: &PhysicalPlan, snapshot: &Snapshot) -> Result<()> {
+/// changed prerequisite is a conflict: replan against the current view. The
+/// catalogue tables the plan read are checked against this binary's
+/// fingerprints the same way; a plan that pinned a dataset cannot replay
+/// without a snapshot.
+pub(crate) fn plan_pins_snapshot(plan: &PhysicalPlan, snapshot: Option<&Snapshot>) -> Result<()> {
+    for (table, recorded) in &plan.assumptions().catalogue {
+        let current = catalogue::table_of_key(table).map(|table| table.fingerprint.as_str());
+        if current != Some(recorded.as_str()) {
+            return Err(OmniError::manifest_conflict(format!(
+                "`{table}` was planned against catalogue fingerprint {recorded}; this binary holds {}",
+                current.unwrap_or("no such catalogue table")
+            )));
+        }
+    }
     for (table, planned) in &plan.assumptions().datasets {
+        let snapshot = snapshot.ok_or_else(|| {
+            OmniError::manifest_conflict(format!(
+                "`{table}` was planned against a dataset; a query under `{}` pins none",
+                omnigraph_compiler::CATALOGUE_SCOPE
+            ))
+        })?;
         let pinned = snapshot.dataset(table).map(dataset_pin);
         if pinned != *planned {
             let spell = |pin: &Option<DatasetPin>| match pin {
@@ -271,7 +300,7 @@ impl ResolvedParams {
 pub(crate) async fn execute_query(
     query: &CompiledQuery,
     params: &ParamMap,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     graph_index: GraphIndexHandle,
     catalog: &Arc<Catalog>,
     embedding: &EmbeddingResolver<'_>,
@@ -296,7 +325,7 @@ pub(crate) async fn execute_query(
 pub(crate) async fn execute_query_inspected(
     query: &CompiledQuery,
     params: &ParamMap,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     graph_index: GraphIndexHandle,
     catalog: &Arc<Catalog>,
     embedding: &EmbeddingResolver<'_>,
@@ -779,11 +808,7 @@ mod traversal_admission_tests {
             spec: Box::new(ScanSpec {
                 access: None,
                 side: SideId::Base,
-                table: TableRef {
-                    type_key: "node:Person".into(),
-                    dataset_path: "node_Person".into(),
-                    native_branch: None,
-                },
+                table: TableRef::dataset("node:Person", "node_Person", None),
                 version: None,
                 columns: SystemColumns {
                     id: "__id",

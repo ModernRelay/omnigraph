@@ -18,7 +18,7 @@ pub(crate) async fn explain_document(
     query: &CompiledQuery,
     params: &ParamMap,
     catalog: &Arc<Catalog>,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     settings: &SessionSettings,
 ) -> Result<serde_json::Value> {
     let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
@@ -215,7 +215,7 @@ fn explain_detail(value: &serde_json::Value) -> String {
 pub(crate) async fn explain_rows(
     query: &CompiledQuery,
     params: &ParamMap,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     catalog: &Arc<Catalog>,
     settings: &SessionSettings,
 ) -> Result<QueryResult> {

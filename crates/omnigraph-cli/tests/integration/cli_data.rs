@@ -4438,3 +4438,194 @@ fn changes_baseline_failure_preserves_existing_out_file() {
         .collect();
     assert!(residue.is_empty(), "no staging-file residue: {residue:?}");
 }
+
+#[test]
+fn catalogue_scope_reads_the_binary_registries_without_a_store() {
+    let operators = "query operators() { match { $o: @Operator } return { $o.name, $o.inputs } }";
+    let output = output_success(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg("og_catalog")
+            .arg("-e")
+            .arg(operators)
+            .arg("--json"),
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["row_count"].as_u64().unwrap() > 0, "{value}");
+    assert!(value["target"]["branch"].is_null(), "{value}");
+    assert!(value["graph_commit_id"].is_null(), "{value}");
+    assert!(
+        value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["o.name"] == "Scan"),
+        "{value}"
+    );
+
+    let schema = output_success(cli().arg("schema").arg("show").arg("og_catalog"));
+    let listing = String::from_utf8_lossy(&schema.stdout);
+    assert!(listing.contains("node @Operator"), "{listing}");
+
+    for reset in ["reset query_memory_bytes;", "reset all;"] {
+        let output = output_success(
+            cli()
+                .args([
+                    "query",
+                    "--store",
+                    "og_catalog",
+                    "--set",
+                    "query_memory_bytes=1",
+                ])
+                .arg("-e")
+                .arg(format!("{reset} {operators}"))
+                .arg("--json"),
+        );
+        let reset_value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(reset_value["rows"], value["rows"]);
+    }
+
+    let with_branch = output_failure(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg("og_catalog")
+            .arg("--branch")
+            .arg("main")
+            .arg("-e")
+            .arg(operators),
+    );
+    let stderr = String::from_utf8_lossy(&with_branch.stderr);
+    assert!(stderr.contains("no branches or snapshots"), "{stderr}");
+
+    let write = output_failure(
+        cli()
+            .arg("mutate")
+            .arg("--store")
+            .arg("og_catalog")
+            .arg("-e")
+            .arg("query add() { insert @Operator { name: \"Teleport\" } }"),
+    );
+    let stderr = String::from_utf8_lossy(&write.stderr);
+    assert!(
+        stderr.contains("not available under `og_catalog`"),
+        "{stderr}"
+    );
+
+    let temp = tempdir().unwrap();
+    let relative = output_failure(
+        cli()
+            .current_dir(temp.path())
+            .arg("query")
+            .arg("--store")
+            .arg("./og_catalog")
+            .arg("-e")
+            .arg(operators),
+    );
+    let stderr = String::from_utf8_lossy(&relative.stderr);
+    assert!(!stderr.contains("not available under"), "{stderr}");
+}
+
+#[test]
+fn remote_catalogue_reads_preserve_optional_targets() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
+    let query = "query engine() { match { $e: @Engine } return { $e.version } }";
+    for profile in [false, true] {
+        for explain in [false, true] {
+            for selector in [
+                None,
+                Some(("--branch", "main")),
+                Some(("--snapshot", "saved")),
+            ] {
+                let response = if selector.is_some() {
+                    json!({
+                        "code": "bad_request",
+                        "error": "`og_catalog` has no branches or snapshots"
+                    })
+                } else {
+                    json!({
+                        "query_name": "engine",
+                        "target": {"branch": null, "snapshot": null},
+                        "row_count": 1,
+                        "rows": [{"e.version": "catalogue-reply"}]
+                    })
+                };
+                let server = IntentApiFixture::graph(vec![IntentReply::json(
+                    if selector.is_some() { 400 } else { 200 },
+                    response,
+                )]);
+                let home = tempdir().unwrap();
+                fs::write(
+                    home.path().join("config.yaml"),
+                    format!(
+                        "servers:\n  local:\n    url: '{}'\nprofiles:\n  catalogue:\n    server: local\n    default_graph: og_catalog\n",
+                        server.origin
+                    ),
+                )
+                .unwrap();
+                let source = if explain {
+                    format!("explain {query}")
+                } else {
+                    query.to_string()
+                };
+                let mut command = cli();
+                command
+                    .env("OMNIGRAPH_HOME", home.path())
+                    .env_remove("OMNIGRAPH_BEARER_TOKEN");
+                if profile {
+                    command.args(["--profile", "catalogue"]);
+                } else {
+                    command.args(["--server", &server.origin, "--graph", "og_catalog"]);
+                }
+                command.args(["query", "-e", &source, "--json"]);
+                if let Some((flag, value)) = selector {
+                    command.args([flag, value]);
+                }
+                let output = if selector.is_some() {
+                    output_failure(&mut command)
+                } else {
+                    output_success(&mut command)
+                };
+                let output = parse_stdout_json(&output);
+                if selector.is_some() {
+                    assert_eq!(output["code"], "bad_request");
+                    assert!(
+                        output["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("no branches or snapshots")
+                    );
+                } else {
+                    assert_eq!(output["rows"][0]["e.version"], "catalogue-reply");
+                    assert!(output["target"]["branch"].is_null());
+                    assert!(output["target"]["snapshot"].is_null());
+                }
+                server.assert_complete();
+                let requests = server.workflow_requests();
+                assert_eq!(requests.len(), 1);
+                let request = &requests[0];
+                assert_eq!(request.method, "POST");
+                assert_eq!(request.path, "/graphs/og_catalog/query");
+                assert_eq!(request.body["query"], source);
+                assert_eq!(
+                    request.body["branch"],
+                    if selector == Some(("--branch", "main")) {
+                        json!("main")
+                    } else {
+                        Value::Null
+                    }
+                );
+                assert_eq!(
+                    request.body["snapshot"],
+                    if selector == Some(("--snapshot", "saved")) {
+                        json!("saved")
+                    } else {
+                        Value::Null
+                    }
+                );
+            }
+        }
+    }
+}

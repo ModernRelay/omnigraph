@@ -42,6 +42,9 @@ puts each changed path in one class:
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
 
+The catalogue reference, `docs/user/queries/catalogue.md`, is engine input
+because `Test Workspace` checks its inventories against the built CLI.
+
 A class exists only when the set of jobs reading its paths is closed; a path
 outside every class is engine input and runs every job. The `.gqt` corpus is
 read by the `omnigraph-gqt` crate (its `include_str!` cases and its harness,

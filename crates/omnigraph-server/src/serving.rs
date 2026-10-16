@@ -354,6 +354,7 @@ impl GraphTransition {
         unavailable: Vec<Arc<BlockedGraph>>,
         deleted: Vec<(GraphKey, SchemaContractDigest)>,
         server_policy: Option<Arc<crate::PolicyEngine>>,
+        catalogue_policy: Option<Arc<crate::PolicyEngine>>,
         deployment: Option<crate::deployment::ActiveDeployment>,
     ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
         let views = self
@@ -365,7 +366,10 @@ impl GraphTransition {
                 views,
                 unavailable,
                 deleted,
-                server_policy,
+                crate::registry::DeploymentPolicies {
+                    server: server_policy,
+                    catalogue: catalogue_policy,
+                },
                 deployment,
             )
         })

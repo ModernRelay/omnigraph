@@ -1063,7 +1063,7 @@ fn load_desired_captured(config_dir: &Path, capture: &mut SourceCapture) -> Load
                             from: policy_address.clone(),
                             to: graph_address(&graph_id),
                         });
-                    } else {
+                    } else if graph_id != omnigraph_compiler::CATALOGUE_SCOPE {
                         diagnostics.push(Diagnostic::error(
                             "dangling_graph_reference",
                             format!("policies.{policy_name}.applies_to[{idx}]"),

@@ -15,7 +15,7 @@ Most graph commands accept one of these scopes:
 | Scope | Use |
 |---|---|
 | positional URI | Direct access for commands whose positional slot is not used by another value |
-| `--store <URI>` | Direct access to one `file://`, `s3://`, or `az://` graph |
+| `--store <URI>` | Direct access to one `file://`, `s3://`, or `az://` graph; the exact token `og_catalog` (also as `--graph og_catalog` on a server) is the [engine catalogue](../queries/catalogue.md), serving `query` and `schema show` with no store opened |
 | `--server <NAME\|URL> --graph <ID>` | A graph served by a multi-graph server at an `http://`, `https://` or [`unix://`](index.md#use-a-server-through-a-unix-socket) URL |
 | `--cluster <DIR\|URI> --graph <ID>` | Direct maintenance of a cluster-managed graph |
 | `--profile <NAME>` | A named scope from operator config |

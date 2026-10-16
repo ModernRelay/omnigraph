@@ -36,6 +36,7 @@ pub mod mirror;
 pub mod operation;
 pub mod optimizer;
 pub mod output;
+pub mod passes;
 pub mod physical;
 pub mod registry;
 pub mod route;
@@ -68,15 +69,16 @@ pub use lower::{
     AggregateFields, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, RankFuseFields,
     SortMergeJoinFields,
 };
-pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef};
+pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef, TableSource};
 pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use output::{NodeObjectType, validate_output_schemas};
+pub use passes::{PassId, PassRow, PassStage, pass_rows};
 pub use physical::{
     Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, GatePolicy, Hop,
-    HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OrderKey, OverfetchRung, PhysicalNode,
-    PhysicalPlan, PipelineSink, PipelineSource, PipelineSpec, Prefilter, PrefilterMode, Properties,
-    ROW_ADDRESS_PREFIX, RankArm, RankKind, RankScope, RankedAccess, ScanInput, SideChain,
-    StatisticSource,
+    HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OperatorRow, OrderKey, OverfetchRung,
+    PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineSink, PipelineSource, PipelineSpec,
+    Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind, RankScope,
+    RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
 };
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
