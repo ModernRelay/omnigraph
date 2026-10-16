@@ -37,10 +37,10 @@ use omnigraph_api_types::{
     ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, DiffOutput,
     EntityKindOutput, ExportRequest, GraphBatchLoadOutput, GraphDiscoveryResponse,
     GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryRequest, ReadOutput,
-    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
-    branch_read_output, change_baseline_output, change_feed_output, change_scope,
-    commit_changes_output, commit_output, diff_output, merge_base_output, read_output,
-    schema_apply_output, show_read_output, snapshot_payload,
+    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_output,
+    branch_list_read_output, branch_read_output, change_baseline_output, change_feed_output,
+    change_scope, commit_changes_output, commit_output, diff_output, merge_base_output,
+    read_output, schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchRead, BranchWrite, CommitWrite};
@@ -628,7 +628,37 @@ impl GraphClient {
                 let session = Self::open_read_session(uri, &[]).await?;
                 let mut branches = session.branch_list().await?;
                 branches.sort();
-                Ok(BranchListOutput { branches })
+                Ok(BranchListOutput {
+                    branches,
+                    details: None,
+                })
+            }
+        }
+    }
+
+    /// [`Self::branch_list`] with each readable branch's details
+    /// (`GET /branches?detail=true`).
+    pub(crate) async fn branch_list_detailed(&self) -> Result<BranchListOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                ..
+            } => {
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["branches"], &[("detail", "true")])?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let session = Self::open_read_session(uri, &[]).await?;
+                let listing = session.branch_list_detailed(&mut |_| true).await?;
+                Ok(branch_list_output(&listing))
             }
         }
     }

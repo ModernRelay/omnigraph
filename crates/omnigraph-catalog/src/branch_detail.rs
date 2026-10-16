@@ -1,0 +1,178 @@
+//! What a detailed branch listing reports about each live graph branch: its
+//! head, the branch and commit its current lifetime was created from, and when
+//! and by whom that lifetime was created. Every fact is read from the branch
+//! refs and each branch's own `__manifest`; nothing is stored for the listing.
+
+use std::sync::Arc;
+
+use futures::StreamExt;
+use lance::Dataset;
+use lance::dataset::refs::BranchContents;
+
+use crate::branch_control::list_live_manifest_branch_contents;
+use crate::error::{OmniError, Result};
+use crate::history::ExtentCache;
+use crate::layout::open_manifest_dataset_with_session;
+use crate::state::{GraphLineageRow, read_manifest_rows_projected};
+
+/// How many branches a listing reads at once.
+const BRANCH_DETAIL_READ_CONCURRENCY: usize = 8;
+
+/// One listing of the live graph branches.
+#[derive(Debug, Clone)]
+pub struct GraphBranchListing {
+    /// Every live branch, `main` first and the rest by name.
+    pub branches: Vec<String>,
+    /// One entry per branch the caller admitted, in the order of `branches`.
+    pub details: Vec<GraphBranchDetail>,
+}
+
+/// One live graph branch as a detailed listing reports it.
+#[derive(Debug, Clone)]
+pub struct GraphBranchDetail {
+    pub name: String,
+    /// The head record of the branch's latest `__manifest` version: its newest
+    /// commit, or the commit it was created at while it has written none.
+    pub head: GraphLineageRow,
+    /// Whether the branch's current lifetime wrote `head`.
+    pub head_is_own: bool,
+    /// The logical name of the branch the current lifetime was created from,
+    /// as that branch was named then; it may since have been deleted or
+    /// recreated. `None` on main.
+    pub from: Option<String>,
+    /// The head of `from` at the `__manifest` version the lifetime was
+    /// created from; `None` on main.
+    pub fork: Option<GraphLineageRow>,
+    /// The actor recorded on the lifetime's native ref as its creator; `None`
+    /// on main and when no actor was recorded.
+    pub actor_id: Option<String>,
+    /// `BranchContents::create_at` of the lifetime's native ref, in Unix
+    /// seconds; `None` on main.
+    pub created_at_seconds: Option<u64>,
+}
+
+/// Every live graph branch, with details of those `can_read` admits. One open
+/// of main's `__manifest` and one listing of its refs; then, for each admitted
+/// branch, a checkout of its latest version and one scan of its rows, and when
+/// the branch has written a commit, the checkout and scan of the version it was
+/// created from. A branch whose ref is gone before its own reads keeps its name
+/// and has no details: it was deleted after the listing.
+pub async fn list_graph_branches_detailed(
+    root_uri: &str,
+    control_session: &Arc<lance::session::Session>,
+    can_read: &mut (dyn FnMut(&str) -> bool + Send + '_),
+) -> Result<GraphBranchListing> {
+    let root = root_uri.trim_end_matches('/');
+    let main = open_manifest_dataset_with_session(root, None, control_session).await?;
+    let mut named = Vec::new();
+    for (native, contents) in list_live_manifest_branch_contents(&main).await? {
+        if native == "main" {
+            continue;
+        }
+        let logical = crate::branch_names::logical_branch_name(&native).to_string();
+        named.push((logical, native, contents));
+    }
+    named.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some(pair) = named.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(OmniError::manifest_conflict(format!(
+            "branch '{}' has more than one live native incarnation; run cleanup before using it",
+            pair[0].0
+        )));
+    }
+
+    let branches = std::iter::once("main".to_string())
+        .chain(named.iter().map(|(logical, _, _)| logical.clone()))
+        .collect();
+    let mut details = Vec::with_capacity(named.len() + 1);
+    if can_read("main") {
+        details.push(GraphBranchDetail {
+            name: "main".to_string(),
+            head: read_manifest_rows_projected(&main).await?.head,
+            head_is_own: true,
+            from: None,
+            fork: None,
+            actor_id: None,
+            created_at_seconds: None,
+        });
+    }
+    let admitted: Vec<_> = named
+        .into_iter()
+        .filter(|(logical, _, _)| can_read(logical))
+        .collect();
+    let legacy = ExtentCache::default();
+    let mut reads = futures::stream::iter(admitted)
+        .map(|(logical, native, contents)| {
+            let (main, legacy) = (&main, &legacy);
+            async move { branch_detail(root, main, legacy, logical, native, contents).await }
+        })
+        .buffered(BRANCH_DETAIL_READ_CONCURRENCY);
+    while let Some(detail) = reads.next().await {
+        details.extend(detail?);
+    }
+    Ok(GraphBranchListing { branches, details })
+}
+
+async fn branch_detail(
+    root: &str,
+    main: &Dataset,
+    legacy: &ExtentCache,
+    logical: String,
+    native: String,
+    contents: BranchContents,
+) -> Result<Option<GraphBranchDetail>> {
+    match read_branch(root, main, legacy, &native, &contents).await {
+        Ok((head, fork_commit)) => {
+            let head_is_own = head.native_branch.as_deref() == Some(native.as_str());
+            let from = contents
+                .parent_branch
+                .as_deref()
+                .map(crate::branch_names::logical_branch_name)
+                .unwrap_or("main")
+                .to_string();
+            Ok(Some(GraphBranchDetail {
+                name: logical,
+                from: Some(from),
+                fork: Some(fork_commit.unwrap_or_else(|| head.clone())),
+                head,
+                head_is_own,
+                actor_id: crate::branch_control::branch_creator(&contents).map(str::to_string),
+                created_at_seconds: Some(contents.create_at),
+            }))
+        }
+        // The listing saw this lifetime live, and a native name is never
+        // reused. A read that fails once its ref is gone reports a branch
+        // deleted since; any other failure is the read's own.
+        Err(error) => match crate::branch_control::get_branch_identifier(main, &native).await {
+            Err(lance::Error::RefNotFound { .. }) => Ok(None),
+            _ => Err(error),
+        },
+    }
+}
+
+/// The latest head of the lifetime `native` and, when the lifetime wrote it,
+/// the head at the version the lifetime was created from.
+async fn read_branch(
+    root: &str,
+    main: &Dataset,
+    legacy: &ExtentCache,
+    native: &str,
+    contents: &BranchContents,
+) -> Result<(GraphLineageRow, Option<GraphLineageRow>)> {
+    let branch = main
+        .checkout_branch(native)
+        .await
+        .map_err(OmniError::storage)?;
+    let head = read_manifest_rows_projected(&branch).await?.head;
+    if head.native_branch.as_deref() != Some(native) {
+        return Ok((head, None));
+    }
+    let created = branch
+        .checkout_version(contents.parent_version)
+        .await
+        .map_err(OmniError::storage)?;
+    let fork = match crate::legacy::at_version(root, &created.session(), legacy, &created).await? {
+        None => read_manifest_rows_projected(&created).await?.head,
+        Some(at) => at.served(Some(native), contents.parent_version)?.commit,
+    };
+    Ok((head, Some(fork)))
+}

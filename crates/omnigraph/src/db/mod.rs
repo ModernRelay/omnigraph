@@ -16,17 +16,17 @@ pub use commit_graph::{GraphCommit, GraphCommitKind};
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{DatasetEntry, DatasetUpdate};
 pub use omnigraph::{
-    CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot, CollectorReport,
-    CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
-    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, GraphCreateReconciliation,
-    InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedGraphCreate,
-    PreparedSchemaApply, PreparedSchemaSettlement, ReadCheck, RebuiltFullTextIndex, RepairAction,
-    RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
-    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
-    SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
-    SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
-    SystemColumnUpgradeReport, TableCollectionPlan, UnattachedTagRecord, UnpublishedManifest,
-    unattached_release_order,
+    BranchDetail, BranchListing, CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot,
+    CollectorReport, CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats,
+    DatasetRepairStats, EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult,
+    GraphCreateReconciliation, InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode,
+    PendingIndex, PreparedGraphCreate, PreparedSchemaApply, PreparedSchemaSettlement, ReadCheck,
+    RebuiltFullTextIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
+    RetainedManifestVersions, SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation,
+    SchemaApplyResult, SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof,
+    SkipReason, StagingVerdict, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
+    SystemColumnUpgradeOutcome, SystemColumnUpgradeReport, TableCollectionPlan,
+    UnattachedTagRecord, UnpublishedManifest, unattached_release_order,
 };
 pub(crate) use omnigraph::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,

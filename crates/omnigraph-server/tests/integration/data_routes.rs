@@ -5349,6 +5349,29 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(change_body["branch"], "feature");
     assert_eq!(change_body["affected_nodes"], 1);
 
+    // `detail=true` adds what `GET /commits?branch=` would otherwise be read
+    // for, per branch; the plain listing stays names only.
+    assert!(list_body.get("details").is_none(), "{list_body}");
+    let (status, detailed) = get_json(&app, g("/branches?detail=true")).await;
+    assert_eq!(status, StatusCode::OK, "{detailed}");
+    assert_eq!(detailed["branches"], json!(["feature", "main"]));
+    let (_, main_commits) = get_json(&app, g("/commits?branch=main")).await;
+    let main_head = &main_commits["commits"][0];
+    let main = &detailed["details"][1];
+    assert_eq!(main["name"], "main");
+    assert_eq!(&main["head"], main_head);
+    assert_eq!((&main["from"], &main["fork"]), (&Value::Null, &Value::Null));
+    assert_eq!(main["created_at"], Value::Null);
+    assert_eq!(main["updated_at"], main_head["created_at"]);
+    let feature = &detailed["details"][0];
+    assert_eq!(feature["name"], "feature");
+    assert_eq!(feature["head"], change_body["commit"]);
+    assert_eq!(feature["updated_at"], change_body["commit"]["created_at"]);
+    assert_eq!(feature["from"], create_body["from"]);
+    assert_eq!(&feature["fork"], main_head);
+    assert!(feature["created_at"].as_i64().unwrap() > 0, "{feature}");
+    assert_eq!(feature["actor_id"], create_body["actor_id"]);
+
     let read_main_before = QueryRequest {
         query: fs::read_to_string(fixture("test.gq")).unwrap(),
         name: Some("get_person".to_string()),

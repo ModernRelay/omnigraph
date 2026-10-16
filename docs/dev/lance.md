@@ -243,6 +243,9 @@ Stock `Branches::get` and `list` include every physical ref. OmniGraph's logical
 manifest helpers validate and filter `omnigraph.retired_manifest_branch`, a
 version-1 JSON value binding the exact native name and identifier. An absent
 marker means live; malformed, unsupported, or mismatched metadata fails closed.
+Creation records the creating actor under `omnigraph.created_by_actor_id` with
+`replace_metadata` after the native create; it is provenance a detailed branch
+listing reports, never authority, and retirement preserves it.
 The metadata update publishes retirement and preserves unrelated metadata.
 Before unlinking the active ref, retirement archives the exact `BranchContents`
 inside its native tree; retries validate the same identity in the ref or archive.

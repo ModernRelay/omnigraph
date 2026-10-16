@@ -876,8 +876,12 @@ impl GraphTools {
             "branches_list" => {
                 let args: GraphArguments = arguments_as(arguments)?;
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output =
-                    handlers::server_branch_list(Extension(handle), Some(Extension(actor))).await?;
+                let output = handlers::server_branch_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    Query(Default::default()),
+                )
+                .await?;
                 bounded_result(&output.0)
             }
             "commits_list" => {
@@ -1078,8 +1082,12 @@ impl GraphTools {
             }
             GraphResource::Branches(name) => {
                 let (handle, actor) = self.graph(&name, actor, &graph)?;
-                let output =
-                    handlers::server_branch_list(Extension(handle), Some(Extension(actor))).await?;
+                let output = handlers::server_branch_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    Query(Default::default()),
+                )
+                .await?;
                 Ok(("application/json", pretty(&output.0)?))
             }
         }

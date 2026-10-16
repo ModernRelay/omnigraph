@@ -14,6 +14,7 @@ pub(crate) use omnigraph_core::{
     branch_control, branch_names, dataset_index, error, handle_cache, instrumentation,
     lance_access, lance_clone, metadata, seams, staging, storage,
 };
+pub mod branch_detail;
 pub mod commit_graph;
 
 mod commit;
@@ -63,6 +64,7 @@ pub mod retention;
 pub mod state;
 pub mod unattached;
 pub mod unpublished;
+pub use branch_detail::{GraphBranchDetail, GraphBranchListing, list_graph_branches_detailed};
 pub use branch_names::is_merge_input_tag;
 pub use migrations::{
     UNATTACHED_BRANCHES_STAMP, UNPUBLISHED_COMMITS_STAMP, require_unattached_branches,
@@ -2335,6 +2337,15 @@ impl ManifestCoordinator {
     /// legacy ref named exactly `name` also counts as existing.
     #[doc(hidden)]
     pub async fn create_branch(&mut self, name: &str) -> Result<()> {
+        self.create_branch_as(name, None).await
+    }
+
+    /// [`Self::create_branch`], recording `actor` on the new ref as the actor
+    /// that created it. The branch exists once the native create succeeds; a
+    /// failure to record the actor afterwards reports uncertain completion,
+    /// and the branch lists with no actor.
+    #[doc(hidden)]
+    pub async fn create_branch_as(&mut self, name: &str, actor: Option<&str>) -> Result<()> {
         crate::branch_names::ensure_logical_branch_name(name)?;
         let mut ds = self.dataset.clone();
         crate::branch_control::ensure_manifest_branch_create_namespace(&ds, name)
@@ -2345,11 +2356,26 @@ impl ManifestCoordinator {
         match crate::branch_control::create_branch_recoverably(&mut ds, &native, self.version())
             .await?
         {
-            crate::branch_control::BranchCreateOutcome::Created => Ok(()),
-            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => Err(
-                OmniError::manifest_conflict(format!("branch '{}' already exists", name)),
-            ),
+            crate::branch_control::BranchCreateOutcome::Created => {}
+            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => {
+                return Err(OmniError::manifest_conflict(format!(
+                    "branch '{}' already exists",
+                    name
+                )));
+            }
         }
+        let Some(actor) = actor else {
+            return Ok(());
+        };
+        crate::branch_control::record_branch_creator(&ds, &native, actor)
+            .await
+            .map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "branch '{name}' was created, but recording the actor that created it \
+                     failed ({error}); it lists with no actor"
+                ))
+                .with_completion_evidence(crate::error::CompletionEvidence::Uncertain)
+            })
     }
 
     async fn open_branch_control_dataset(&self) -> Result<Dataset> {

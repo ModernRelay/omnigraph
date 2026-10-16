@@ -821,6 +821,37 @@ pub(crate) fn print_change_human(output: &ChangeOutput) {
     }
 }
 
+/// One line per branch: its name, then with details its head, the branch and
+/// commit it was created from, the actor that created it, and its creation and
+/// last-move times. A branch
+/// without details (one the caller may not read) prints its name alone.
+pub(crate) fn print_branch_list_human(payload: &BranchListOutput) {
+    let details = payload.details.as_deref().unwrap_or_default();
+    for branch in &payload.branches {
+        let Some(detail) = details.iter().find(|detail| &detail.name == branch) else {
+            println!("{branch}");
+            continue;
+        };
+        let fork = match (&detail.from, &detail.fork) {
+            (Some(from), Some(fork)) => format!(" from={from} fork={}", fork.graph_commit_id),
+            _ => String::new(),
+        };
+        let actor = detail
+            .actor_id
+            .as_deref()
+            .map(|actor| format!(" actor={actor}"))
+            .unwrap_or_default();
+        let created_at = detail
+            .created_at
+            .map(|created_at| format!(" created_at={created_at}"))
+            .unwrap_or_default();
+        println!(
+            "{branch} head={}{fork}{actor}{created_at} updated_at={}",
+            detail.head.graph_commit_id, detail.updated_at
+        );
+    }
+}
+
 pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
     for commit in commits {
         let branch = commit.graph_branch.as_deref().unwrap_or("main");

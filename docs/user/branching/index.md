@@ -28,6 +28,36 @@ omnigraph branch list --store graph.omni
 omnigraph branch delete review/abandoned --store graph.omni
 ```
 
+`branch list --detail` (served: `GET /branches?detail=true`, which adds a
+`details` array beside `branches`) also reports, for each branch:
+
+| Field | Meaning |
+|---|---|
+| `head` | The commit a read of the branch sees: its newest commit, or the commit it was created at while it has written none. |
+| `from` | The branch this one was created from, as the create receipt named it; that branch may since have been deleted or recreated. |
+| `fork` | The head of `from` when this branch was created. It is fixed for the branch's lifetime, so a later merge moves the merge base (`branch merge-base`) but not the fork. |
+| `actor_id` | The actor that created this branch, as the create receipt named it; `null` when the create named no actor, and for branches created before OmniGraph recorded creators. |
+| `created_at` | When this branch was created, as Unix microseconds recorded to the second. |
+| `updated_at` | When the head last moved: the newest commit's time, or `created_at` while the branch has written none. |
+
+`main` has no `from`, `fork`, `actor_id` or `created_at`. A branch deleted and created
+again under the same name is a new lifetime, so the listing reports the second
+creation, its actor and its fork. A create that cannot record its actor
+after creating the branch fails with an uncertain outcome; the branch exists
+and lists with `actor_id: null`. The details are read from each branch's own manifest,
+never from its commit history: a listing reads the latest version of each
+branch and, once the branch has written a commit, the version it was created
+from, whatever the history depth. The text output prints one line per branch:
+
+```text
+feature head=<commit> from=main fork=<commit> actor=<actor> created_at=<micros> updated_at=<micros>
+main head=<commit> updated_at=<micros>
+```
+
+The served listing needs the same `read` as `GET /branches`, and reports
+details only for the branches the caller may `read`; another branch appears in
+`branches` alone.
+
 Creating a branch defaults to `main` when `--from` is omitted. A load can create
 a missing target branch by combining `--branch <name>` with `--from <base>`.
 

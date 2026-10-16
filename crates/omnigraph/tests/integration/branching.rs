@@ -1,5 +1,6 @@
 use crate::helpers;
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 
@@ -9,7 +10,7 @@ use lance::Dataset;
 use lance_index::is_system_index;
 
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::db::{BranchDetail, GraphCommit, MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::error::{CompletionEvidence, ManifestErrorKind, MergeConflictKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
@@ -278,6 +279,196 @@ async fn branch_create_open_list_and_lazy_branching_work() {
 
     let main = Omnigraph::open(uri).await.unwrap();
     assert_eq!(count_rows(&main, "node:Person").await, 4);
+}
+
+/// The newest commit `list_commits` reports for `branch`.
+async fn newest_commit(db: &Omnigraph, branch: &str) -> GraphCommit {
+    db.list_commits(Some(branch)).await.unwrap().remove(0)
+}
+
+/// Every branch's detail, keyed by name, from a listing that may read all.
+async fn detailed_branches(db: &Omnigraph) -> BTreeMap<String, BranchDetail> {
+    let listing = db.branch_list_detailed(&mut |_| true).await.unwrap();
+    let names: Vec<_> = listing.details.iter().map(|d| d.name.clone()).collect();
+    assert_eq!(names, listing.branches, "every readable branch has details");
+    listing
+        .details
+        .into_iter()
+        .map(|detail| (detail.name.clone(), detail))
+        .collect()
+}
+
+fn unix_micros_now() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    i64::try_from(elapsed.as_micros()).unwrap()
+}
+
+/// A branch's details answer what a client would otherwise derive from its
+/// whole commit list: its head, the branch and commit its current lifetime was
+/// created from, who created it and when, and when it last moved. The fork is
+/// fixed for the lifetime, so a merge moves the merge base but not the fork;
+/// deleting and recreating the name starts a new lifetime with its own fork,
+/// creator and creation time; cleanup leaves every fork readable.
+#[tokio::test]
+async fn branch_list_detailed_reports_head_fork_creator_and_lifetime() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let insert = |name: &str| mixed_params(&[("$name", name)], &[("$age", 30)]);
+    let loaded = newest_commit(&db, "main").await;
+
+    let before_create = unix_micros_now() / 1_000_000 * 1_000_000;
+    db.branch_create_as("feature", Some("act-alice"))
+        .await
+        .unwrap();
+    let after_create = unix_micros_now();
+    let details = detailed_branches(&db).await;
+    let main = &details["main"];
+    assert_eq!(main.head, loaded);
+    assert_eq!((main.from.as_deref(), main.fork.as_ref()), (None, None));
+    assert_eq!((main.actor_id.as_deref(), main.created_at), (None, None));
+    assert_eq!(main.updated_at, loaded.created_at);
+    let unwritten = &details["feature"];
+    assert_eq!(unwritten.head, loaded, "an unwritten branch reads its fork");
+    assert_eq!(
+        (unwritten.from.as_deref(), unwritten.fork.as_ref()),
+        (Some("main"), Some(&loaded))
+    );
+    assert_eq!(unwritten.actor_id.as_deref(), Some("act-alice"));
+    let created_at = unwritten.created_at.unwrap();
+    assert!(
+        (before_create..=after_create).contains(&created_at),
+        "{before_create} <= {created_at} <= {after_create}"
+    );
+    assert_eq!(unwritten.updated_at, created_at);
+
+    mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Mia"))
+        .await
+        .unwrap();
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Eve"),
+    )
+    .await
+    .unwrap();
+    let written = newest_commit(&db, "feature").await;
+    assert_eq!(
+        written.parent_commit_id.as_deref(),
+        Some(loaded.graph_commit_id.as_str())
+    );
+    db.branch_create_from_as(ReadTarget::branch("feature"), "child", Some("act-bob"))
+        .await
+        .unwrap();
+    mutate_branch(
+        &db,
+        "child",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Kid"),
+    )
+    .await
+    .unwrap();
+    let details = detailed_branches(&db).await;
+    let feature = &details["feature"];
+    assert_eq!(feature.head, written);
+    assert_eq!(feature.updated_at, written.created_at);
+    assert_eq!(
+        feature.fork.as_ref(),
+        Some(&loaded),
+        "a written branch keeps the commit it was created at"
+    );
+    let child = &details["child"];
+    assert_eq!(child.head, newest_commit(&db, "child").await);
+    assert_eq!(child.actor_id.as_deref(), Some("act-bob"));
+    assert_eq!(
+        (child.from.as_deref(), child.fork.as_ref()),
+        (Some("feature"), Some(&written))
+    );
+
+    let main_head = newest_commit(&db, "main").await;
+    db.branch_merge("main", "feature").await.unwrap();
+    let merged = newest_commit(&db, "feature").await;
+    assert_eq!(
+        merged.merged_parent_commit_id.as_deref(),
+        Some(main_head.graph_commit_id.as_str())
+    );
+    let base = db.merge_base("feature", "main").await.unwrap().merge_base;
+    assert_eq!(base, main_head, "the merge moved the merge base");
+    let details = detailed_branches(&db).await;
+    assert_eq!(details["feature"].head, merged);
+    assert_eq!(
+        details["feature"].fork.as_ref(),
+        Some(&loaded),
+        "a merge does not move the fork"
+    );
+
+    db.branch_delete("feature").await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    let details = detailed_branches(&db).await;
+    assert_eq!(
+        details.keys().collect::<Vec<_>>(),
+        ["child", "feature", "main"]
+    );
+    let recreated = &details["feature"];
+    assert_eq!(
+        (recreated.from.as_deref(), recreated.fork.as_ref()),
+        (Some("main"), Some(&main_head))
+    );
+    assert_eq!(recreated.head, main_head);
+    assert!(recreated.created_at.unwrap() >= created_at);
+    assert_eq!(
+        recreated.actor_id, None,
+        "a new lifetime does not inherit its predecessor's creator"
+    );
+    let child = &details["child"];
+    assert_eq!(
+        (child.from.as_deref(), child.fork.as_ref()),
+        (Some("feature"), Some(&written)),
+        "`from` names the source as it was named then"
+    );
+
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Ann"),
+    )
+    .await
+    .unwrap();
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    let details = detailed_branches(&db).await;
+    assert_eq!(details["feature"].fork.as_ref(), Some(&main_head));
+    assert_eq!(details["child"].fork.as_ref(), Some(&written));
+
+    let mut asked = Vec::new();
+    let listing = db
+        .branch_list_detailed(&mut |name: &str| {
+            asked.push(name.to_string());
+            name != "child"
+        })
+        .await
+        .unwrap();
+    assert_eq!(asked, ["main", "child", "feature"], "asked once per branch");
+    assert_eq!(listing.branches, ["main", "child", "feature"]);
+    assert_eq!(
+        listing
+            .details
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["main", "feature"],
+        "a branch the caller may not read lists by name alone"
+    );
 }
 
 #[tokio::test]

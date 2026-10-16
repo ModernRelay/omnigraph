@@ -9,6 +9,7 @@ omnigraph_seams::catalog! {
     crate::blob::BLOB_READ_POST_CAPTURE,
     crate::branch_control::BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE,
     crate::branch_control::BRANCH_CREATE_POST_NATIVE,
+    crate::branch_control::BRANCH_CREATE_PRE_CREATOR,
     crate::branch_control::BRANCH_DELETE_POST_NATIVE,
     crate::branch_control::BRANCH_DELETE_POST_ARCHIVE,
     crate::changes::enumerate::CHANGE_FEED_POST_HEAD_WITNESS,

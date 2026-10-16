@@ -471,6 +471,20 @@ Cached write admission checks the ref's identifier and retirement metadata
 through the existing lookup, with no additional storage request. Cold branch
 enumeration reads active refs; creation does not scan retired histories.
 
+A detailed listing (`list_graph_branches_detailed` in `omnigraph-catalog`)
+derives every field from the same authority: each live ref's `BranchContents`
+(`parent_branch`, `parent_version`, `create_at`, and the creating actor under
+the metadata key `omnigraph.created_by_actor_id`), the head row of the
+branch's latest `__manifest` version and, once the branch has written a
+commit, the head row of its clone at `parent_version`. Creation records the
+actor with a second write of the new ref after the native create
+(`record_branch_creator`); retirement preserves the key. When that write
+fails, read back, the branch exists without an actor and the create reports
+uncertain completion. It reads no lineage, so its cost per
+branch is flat in history (`branch_control_cost.rs`). No path prunes a live
+branch's `__manifest` versions; a reclamation that did would have to keep each
+live branch's `parent_version`.
+
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, or pointer belongs to the same lifetime.
 

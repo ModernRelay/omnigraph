@@ -2713,7 +2713,7 @@
           "branches"
         ],
         "summary": "List all branches.",
-        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.",
+        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.\n\n`detail=true` adds `details`: for each branch the caller may `read`, its\nhead commit, the branch and commit it was created from, who created it and\nwhen, and when it last moved. Each listed branch costs a read of its latest\nversion, and of the version it was created from once it has written a\ncommit; no commit history is read.",
         "operationId": "cluster_listBranches",
         "parameters": [
           {
@@ -2723,6 +2723,15 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "detail",
+            "in": "query",
+            "description": "`true` adds `details`: each branch's head, the branch and commit it\nwas created from, who created it and when, and when it last moved.\nReads each listed branch's latest version, and the version it was\ncreated from once it has written a commit, never its commit history;\nthe names alone read neither.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           },
           {
@@ -9548,6 +9557,64 @@
           }
         }
       },
+      "BranchDetailOutput": {
+        "type": "object",
+        "description": "One live branch as `GET /branches?detail=true` reports it. `from`,\n`actor_id` and `created_at` describe the branch's creation as its\n`POST /branches` receipt did. A branch deleted and created again under the\nsame name is a new lifetime: its creation and fork are the later creation's.",
+        "required": [
+          "name",
+          "head",
+          "updated_at"
+        ],
+        "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The actor that created the branch; `null` on `main` and when the\ncreation recorded no actor."
+          },
+          "created_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the branch was created, as Unix epoch microseconds recorded to\nthe second; `null` on `main`.",
+            "example": 1714000000000000
+          },
+          "fork": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CommitOutput",
+                "description": "The head of `from` when this branch was created. A later merge does\nnot move it; `GET /branches/merge-base` answers where two branches\nlast met. `null` on `main`."
+              }
+            ]
+          },
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch this one was created from, as that branch was named then;\nit may since have been deleted or recreated. `null` on `main`."
+          },
+          "head": {
+            "$ref": "#/components/schemas/CommitOutput",
+            "description": "The commit a read of the branch sees: its newest commit, or `fork`\nwhile it has written none."
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the head last moved, as Unix epoch microseconds: the time of the\nbranch's newest commit, or `created_at` while it has written none.",
+            "example": 1714000000000000
+          }
+        }
+      },
       "BranchListOutput": {
         "type": "object",
         "required": [
@@ -9558,7 +9625,18 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Every live branch, sorted by name in byte order."
+          },
+          "details": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/BranchDetailOutput"
+            },
+            "description": "Present only with `detail=true`: one entry per branch the caller may\n`read`, in the order of `branches`. A branch the caller may not read is\nlisted in `branches` alone."
           }
         }
       },

@@ -3142,6 +3142,38 @@ fn branch_list_outputs_sorted_branches() {
         .collect::<Vec<_>>();
 
     assert_eq!(lines, vec!["alpha", "main", "zeta"]);
+
+    // `--detail` keeps one line per branch, in the same order, and adds the
+    // head, the fork and the times.
+    let detailed = output_success(
+        cli()
+            .arg("branch")
+            .arg("list")
+            .arg("--detail")
+            .arg("--uri")
+            .arg(&graph),
+    );
+    let stdout = stdout_string(&detailed);
+    let lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    let head = lines[1]
+        .strip_prefix("main head=")
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("{stdout}"));
+    for (line, name) in [(lines[0], "alpha"), (lines[2], "zeta")] {
+        assert!(
+            line.starts_with(&format!("{name} head={head} from=main fork={head} ")),
+            "{stdout}"
+        );
+        assert!(
+            line.contains(" created_at=") && line.contains(" updated_at="),
+            "{stdout}"
+        );
+    }
 }
 
 #[test]
