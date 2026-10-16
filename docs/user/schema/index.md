@@ -86,7 +86,7 @@ also have a single-property shorthand.
 | `@key(p, ...)` | node or edge | The property tuple identifies the entity; its id is derived from it. Key properties must be non-null scalar values. An edge key must include both `@src` and `@dst`, and a key may be declared only when the type is created. |
 | `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `@src` and `@dst`. |
 | `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness. |
-| `@range(p, min..max)` | node | Restricts a numeric property; either bound may be omitted. |
+| `@range(p, min..max)` | node | Restricts a numeric property, or each element of a numeric list, to an inclusive range; either bound may be omitted. Values compare with the bounds exactly at any magnitude, and a decimal bound on an integer property admits the integers on its side: `@range(n, -2.5..2.5)` admits -2 through 2. |
 | `@check(p, "regex")` | node | Requires a String property to match the expression. |
 | `@card(min..max)` | edge | Restricts the number of edges; omit `max` for an unbounded range, as in `@card(1..)`. The default is unbounded from zero. |
 
