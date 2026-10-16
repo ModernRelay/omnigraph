@@ -791,8 +791,12 @@ pub(crate) fn print_read_output(output: &ReadOutput, format: ReadOutputFormat) -
 /// prints; a mutation's prints the affected counts.
 pub(crate) fn print_change_human(output: &ChangeOutput) {
     match &output.outcome {
-        Some(BranchOutcomeOutput::Created { from, name }) => {
-            println!("created branch {name} from {from}");
+        Some(BranchOutcomeOutput::Created {
+            from,
+            name,
+            from_commit_id,
+        }) => {
+            println!("created branch {name} from {from} at {from_commit_id}");
         }
         Some(BranchOutcomeOutput::Deleted { name }) => println!("deleted branch {name}"),
         Some(BranchOutcomeOutput::Merged {

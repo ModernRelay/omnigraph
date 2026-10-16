@@ -120,8 +120,9 @@ expected to succeed, binds the receipt's commit id to `$name`
 `--- query snapshot: $name` header reads at that commit instead of a branch,
 and a commit statement whose whole quoted operand is the name,
 `commit publish "${name}"` or `commit drop "${name}"`, is dispatched with the
-bound id; this is the one place `${` may appear in a statement body, and the
-engine receives an ordinary literal. A mutation declaration
+bound id, as is a `branch create <branch> from commit "${name}"` whose
+commit is the whole quoted operand; these are the places `${` may appear in a statement
+body, and the engine receives an ordinary literal. A mutation declaration
 `as unattached branch on "${name}"` (RFC "Unattached graph branches") is
 substituted the same way, and a `--- params` body may spell a bound name,
 `{"base": "${name}"}`, beside the loop variable; a `--- mutate` header without

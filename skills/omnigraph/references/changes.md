@@ -24,7 +24,8 @@ delete`, or `branch merge` statement without `name`, `params`, or a request
 outcome carries `merge` (`already_up_to_date`, `fast_forward`, or `merged`).
 Affected entity counts are zero because these are branch controls.
 
-Creation and deletion return `commit: null` despite changing branch state. A
+Creation and deletion return `commit: null` despite changing branch state; a
+created outcome's `from_commit_id` names the commit the new branch starts at. A
 `fast_forward` or `merged` result returns `commit`, the exact commit that merge
 published, even when another writer has since advanced the target; an
 `already_up_to_date` merge publishes nothing and returns `commit: null`.

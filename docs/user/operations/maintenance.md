@@ -208,7 +208,10 @@ At least one retention option is required:
 A graph commit survives when either option retains it. The current HEAD of
 every live branch is always retained, and a named branch also keeps its
 oldest commit, the copy of the parent's commit it was created from, while
-the branch lives. Cleanup also retains the selected merge bases between
+the branch lives; for a branch started at a past commit, that is the commit
+it names. A commit cleanup no longer retains starts no branch
+([start a branch at a commit](../branching/index.md#start-a-branch-at-a-commit)).
+Cleanup also retains the selected merge bases between
 current branch heads and accepted merge inputs. Native tags protect the exact
 snapshots they name. A tagged graph snapshot retains all its table versions; a
 tagged table snapshot retains that version, including a detached version or a
@@ -238,7 +241,10 @@ Before cleanup:
 Cleanup fails closed per table: a trace that does not finish (a pinned
 version missing from the table's version listing, or a read that failed)
 deletes nothing for that table and reports why in its result row; fix the
-cause and rerun cleanup to converge. The run derives each branch's history
+cause and rerun cleanup to converge. A run that stops while deleting removes
+a table version's unused files before the version itself, so the next run
+finds that version again and counts the files already gone as removed.
+The run derives each branch's history
 and pins from one captured version, then validates that the live inventory,
 versions, incarnations and tags still match after all table inventories.
 A changed observation refuses the whole plan before deletion; rerun with the

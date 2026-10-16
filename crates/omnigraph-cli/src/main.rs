@@ -715,6 +715,7 @@ async fn run(cli: Cli) -> Result<()> {
             BranchCommand::Create {
                 uri,
                 from,
+                from_commit,
                 name,
                 json,
             } => {
@@ -728,13 +729,19 @@ async fn run(cli: Cli) -> Result<()> {
                     cli.store.as_deref(),
                 )
                 .await?;
-                let from = resolve_branch(from, None, "main");
+                let start = match from_commit {
+                    Some(commit) => ReadTarget::snapshot(SnapshotId::new(commit)),
+                    None => ReadTarget::branch(resolve_branch(from, None, "main")),
+                };
                 echo_write_target(cli.quiet, "branch create", client.uri(), client.is_remote());
-                let payload = client.branch_create_from(&from, &name).await?;
+                let payload = client.branch_create(start, &name).await?;
                 if json {
                     print_json(&payload)?;
                 } else {
-                    println!("created branch {} from {}", payload.name, payload.from);
+                    println!(
+                        "created branch {} from {} at {}",
+                        payload.name, payload.from, payload.from_commit_id
+                    );
                 }
             }
             BranchCommand::List { uri, json } => {

@@ -432,6 +432,150 @@ async fn native_branch_controls_reclassify_lost_acknowledgements() {
         before_commits,
         "native branch controls must not manufacture graph lineage"
     );
+
+    // A start at a past commit clones the version that published it through
+    // the same native create: a failure between the inventory and the create
+    // leaves nothing, and a lost acknowledgement classifies as success.
+    let loaded = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    let before_version = version_main(&db).await.unwrap();
+    let before_commits = db.list_commits(Some("main")).await.unwrap();
+    let at_load = ReadTarget::snapshot(SnapshotId::new(loaded.clone()));
+    {
+        let _fp = catalog::BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE.fire_always();
+        db.branch_create_from(at_load.clone(), "at-load")
+            .await
+            .expect_err("a failure before the native create creates nothing");
+    }
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+    {
+        let _fp = catalog::BRANCH_CREATE_POST_NATIVE.fire_always();
+        let created = db
+            .branch_create_from(at_load, "at-load")
+            .await
+            .expect("matching BranchContents must classify a lost create acknowledgement");
+        assert_eq!(created.from_commit_id, loaded);
+    }
+    assert_eq!(
+        helpers::count_rows_branch(&db, "at-load", "node:Person").await,
+        4,
+        "the branch holds the commit's rows, not main's head"
+    );
+    assert_eq!(version_main(&db).await.unwrap(), before_version);
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), before_commits);
+}
+
+/// Cleanup deletes a swept table version's files before its manifest, so a
+/// run stopped between the two leaves a manifest that still opens over
+/// objects that are gone. A branch cannot start at a commit pinning such a
+/// version: a start probes every object of each pin its source head does not
+/// hold, and refuses the commit as not retained before any effect. The
+/// cleanup retry removes that manifest, and the start stays refused, now
+/// because the version no longer opens; a start at the retained head works
+/// throughout.
+#[tokio::test]
+#[serial]
+async fn branch_start_refuses_a_commit_an_interrupted_cleanup_emptied() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    for name in ["Eve", "Frank"] {
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", 40)]),
+        )
+        .await
+        .unwrap();
+    }
+    let commits = db.list_commits(Some("main")).await.unwrap();
+    let eve = commits[1].graph_commit_id.clone();
+    let frank = commits[0].graph_commit_id.clone();
+    let at_eve = ReadTarget::snapshot(SnapshotId::new(eve.clone()));
+    let eve_person = db
+        .snapshot_of(at_eve.clone())
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .version_metadata
+        .staged_version()
+        .expect("Eve's insert pins a detached Person version");
+    let person_uri = node_table_uri(&db, "Person").await;
+
+    {
+        let _fp = catalog::CLEANUP_SWEEP_PRE_MANIFEST_DELETE.fire_always();
+        let _ = db.cleanup(keep_one()).await;
+    }
+    assert!(
+        detached_versions(&person_uri).await.contains(&eve_person),
+        "precondition: the interrupted sweep left Eve's Person manifest"
+    );
+    let main_version = version_main(&db).await.unwrap();
+    let assert_not_retained = |refused: OmniError| {
+        assert_eq!(
+            refused.completion_evidence(),
+            Some(CompletionEvidence::BeforeEffect),
+            "{refused}"
+        );
+        assert!(
+            matches!(
+                refused.into_completion_evidence().0,
+                OmniError::BranchStartRefused {
+                    reason: omnigraph::error::BranchStartRefusal::NotRetained { table_key, .. },
+                    ..
+                } if table_key == "node:Person"
+            ),
+            "the refusal names the emptied table"
+        );
+    };
+    assert_not_retained(
+        db.branch_create_from(at_eve.clone(), "at-eve")
+            .await
+            .expect_err("a manifest whose objects are gone proves nothing"),
+    );
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+    assert_eq!(version_main(&db).await.unwrap(), main_version);
+
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    let person = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(person.error.is_none(), "the retry converges: {person:?}");
+    assert!(
+        !detached_versions(&person_uri).await.contains(&eve_person),
+        "the retry removes the half-swept manifest"
+    );
+    assert_not_retained(
+        db.branch_create_from(at_eve, "at-eve")
+            .await
+            .expect_err("a reclaimed version starts no branch"),
+    );
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+
+    let created = db
+        .branch_create_from(
+            ReadTarget::snapshot(SnapshotId::new(frank.clone())),
+            "at-frank",
+        )
+        .await
+        .expect("the retained head starts a branch");
+    assert_eq!(created.from_commit_id, frank);
+    assert_eq!(
+        helpers::count_rows_branch(&db, "at-frank", "node:Person").await,
+        helpers::count_rows_branch(&db, "main", "node:Person").await,
+    );
 }
 
 /// Branch delete leaves the deleted branch's detached staging for `cleanup`:
@@ -9702,6 +9846,84 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
     assert!(plan.errors.is_empty(), "{:?}", plan.errors);
     assert!(plan.would_remove().is_empty(), "{:?}", plan.would_remove());
     assert_eq!(plan.roots, std::collections::BTreeSet::from([chain[2]]));
+}
+
+/// A pass stopped after its file deletions and before the manifest that names
+/// them leaves that manifest with an index directory already gone. The next
+/// pass plans the same manifest again; deleting a directory an earlier pass
+/// removed is already done, so it removes the manifest and converges.
+#[tokio::test]
+#[serial]
+async fn collector_retry_treats_an_index_directory_an_interrupted_pass_removed_as_swept() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let before = detached_versions(&person_uri).await;
+    insert_person(&db, "main", "swept-first").await;
+    let first = staged_since(&person_uri, &before).await;
+    insert_person(&db, "main", "swept-second").await;
+    let rows = count_rows(&db, "node:Person").await;
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.sweep.contains(&first), "{:?}", plan.sweep);
+    let swept_indices: Vec<_> = plan
+        .sweep_paths
+        .iter()
+        .filter(|path| path.starts_with("_indices/"))
+        .cloned()
+        .collect();
+    assert!(
+        !swept_indices.is_empty(),
+        "the fixture must sweep an index directory only the pruned pin names: {:?}",
+        plan.sweep_paths
+    );
+
+    let stats = {
+        let _fp = catalog::CLEANUP_SWEEP_PRE_MANIFEST_DELETE.fire_always();
+        db.cleanup(keep_one()).await.unwrap()
+    };
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|error| error.contains("cleanup.sweep_pre_manifest_delete")),
+        "the interrupted pass reports the window: {row:?}"
+    );
+    assert_eq!(row.manifests_removed, 0, "{row:?}");
+    assert!(detached_versions(&person_uri).await.contains(&first));
+    for path in &swept_indices {
+        assert!(
+            !std::path::Path::new(&person_uri).join(path).exists(),
+            "the interrupted pass deleted the files before stopping: {path}"
+        );
+    }
+
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(row.error.is_none(), "{row:?}");
+    assert!(row.manifests_removed >= 1, "{row:?}");
+    assert!(
+        !detached_versions(&person_uri).await.contains(&first),
+        "the retry removes the half-swept manifest"
+    );
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert!(plan.would_remove().is_empty(), "{:?}", plan.would_remove());
+    assert_eq!(
+        db.cleanup_plan_missing_paths(&report).await.unwrap(),
+        Vec::<(String, String)>::new(),
+        "every retained root's paths still exist"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, rows);
 }
 
 /// A failed publish acknowledgement and unavailable readback leave publication

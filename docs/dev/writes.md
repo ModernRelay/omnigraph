@@ -76,6 +76,30 @@ native branch lifetime; a stale or missing view takes the existing refresh/open
 path. Captures share immutable lineage and the Lance session, copy current
 table state, and leave the handle's active branch unchanged.
 
+A start at a graph commit (`from_commit`, `branch create … from commit "<id>"`) captures the
+branch whose incarnation wrote the commit and clones that branch's
+`__manifest` at the version that published it: Lance `create_branch` takes any
+retained version, so the new branch's first manifest holds the commit's table
+pins, head, buffer and schema contract, exactly as a create while the commit
+was the head. No second publication follows. Under the gates the engine reads
+the commit's record from the capture and refuses, before any effect, a record
+another incarnation wrote, a version above the captured head, a schema
+contract other than the accepted one, a version only the legacy history
+serves, a version whose head row is another commit, and any pinned table
+version that no longer opens (cleanup reclaimed it) or misses an object its
+manifest references. The collector's sweep deletes a version's files before
+its manifest, so a manifest that opens proves nothing after an interrupted
+run: every pin the captured head does not also hold (the head's pins are
+roots, whose files the collector never deletes) is probed object by object,
+as the collector oracle probes retained roots. The probe stands in for a
+property the collector does not yet give every reader: a manifest that is
+present names only objects that are present. A sweep that deleted a version's
+manifest before its files would give it, and the probe would then reduce to
+opening each pin. Collection keeps the new branch's base version, and with
+it the commit's pins, while the branch lives.
+An unpublished commit and an unattached snapshot are detached `__manifest`
+versions that no branch history holds, and are refused.
+
 Create admission lists native ref names and reads bodies only for the source,
 the target's incarnations and logical ancestors or descendants. Physical path
 checks include retired ref names. The

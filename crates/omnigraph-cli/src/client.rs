@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::settings::{SessionSettings, SettingId, SettingValue, Source};
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent, Session};
 use omnigraph_api_types::{
@@ -43,7 +43,7 @@ use omnigraph_api_types::{
     schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::{BranchRead, BranchWrite, CommitWrite};
+use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
 use omnigraph_compiler::query::parser::parse_query;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
@@ -1389,12 +1389,22 @@ impl GraphClient {
                 let query_name = write.statement_name().to_string();
                 let (branch, commit, outcome) = match write {
                     BranchWrite::Create { name, from } => {
-                        let from = from.unwrap_or_else(|| "main".to_string());
-                        self.branch_create_from(&from, &name).await?;
+                        let start = match from {
+                            Some(BranchCreateFrom::Commit(commit)) => {
+                                ReadTarget::snapshot(SnapshotId::new(commit))
+                            }
+                            Some(BranchCreateFrom::Branch(branch)) => ReadTarget::branch(branch),
+                            None => ReadTarget::branch("main"),
+                        };
+                        let created = self.branch_create(start, &name).await?;
                         (
                             name.clone(),
                             None,
-                            BranchOutcomeOutput::Created { from, name },
+                            BranchOutcomeOutput::Created {
+                                from: created.from,
+                                name,
+                                from_commit_id: created.from_commit_id,
+                            },
                         )
                     }
                     BranchWrite::Delete { name } => {
@@ -1918,9 +1928,10 @@ impl GraphClient {
         }
     }
 
-    pub(crate) async fn branch_create_from(
+    /// Create `name` at `start`: a branch's head, or a published graph commit.
+    pub(crate) async fn branch_create(
         &self,
-        from: &str,
+        start: ReadTarget,
         name: &str,
     ) -> Result<BranchCreateOutput> {
         match self {
@@ -1934,9 +1945,17 @@ impl GraphClient {
                     http,
                     Method::POST,
                     remote_url(base_url, &["branches"], &[])?,
-                    Some(serde_json::to_value(BranchCreateRequest {
-                        from: Some(from.to_string()),
-                        name: name.to_string(),
+                    Some(serde_json::to_value(match start {
+                        ReadTarget::Branch(branch) => BranchCreateRequest {
+                            from: Some(branch),
+                            from_commit: None,
+                            name: name.to_string(),
+                        },
+                        ReadTarget::Snapshot(commit) => BranchCreateRequest {
+                            from: None,
+                            from_commit: Some(commit.as_str().to_string()),
+                            name: name.to_string(),
+                        },
                     })?),
                     token.as_deref(),
                 )
@@ -1945,13 +1964,13 @@ impl GraphClient {
             GraphClient::Embedded { uri, actor } => {
                 let db = Self::open_write(uri).await?;
                 let actor = actor.as_deref();
-                db.branch_create_from_as(ReadTarget::branch(from), name, actor)
-                    .await?;
+                let created = db.branch_create_from_as(start, name, actor).await?;
                 Ok(BranchCreateOutput {
                     uri: uri.clone(),
-                    from: from.to_string(),
+                    from: created.from,
                     name: name.to_string(),
                     actor_id: actor.map(String::from),
+                    from_commit_id: created.from_commit_id,
                 })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("branch create from")),

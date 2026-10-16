@@ -137,6 +137,11 @@ the target the base snapshot recorded, whatever branch the request names.
 snapshot need `read` on that recorded target; `commit show <id>` keeps its
 scope-free `read`; `commit drop` takes `commit_drop` on the recorded target as
 for an unpublished commit (see [Unattached graph branches](../../rfcs/2026-10-11-unattached-graph-branches.md)).
+`branch_create` from a branch checks that branch as the source and the new
+branch as the target. A start at a commit (`from_commit`) checks the branch
+that wrote the commit as the source; a denial answers `404`, as an id no
+commit has does, so the id discloses nothing (see
+[start a branch at a commit](../branching/index.md#start-a-branch-at-a-commit)).
 
 ## Validate and test
 
