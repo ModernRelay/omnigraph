@@ -3047,6 +3047,105 @@ fn as_on_a_served_write_is_rejected() {
     server.assert_complete();
 }
 
+/// `commit publish` and `commit drop` are writes, so a direct graph takes
+/// `--as` for them as it does for `mutate -e 'commit publish "<id>"'`. A
+/// publication records no publisher: the published commit keeps the actor
+/// of the write that created it. The `commit` reads refuse `--as`, and a
+/// served publish or drop refuses it before any request.
+#[test]
+fn commit_publish_and_drop_take_as_on_a_direct_graph_issue_1023() {
+    use crate::support::managed_http::IntentApiFixture;
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let propose = |name: &str| {
+        let output = output_success(
+            cli()
+                .arg("mutate")
+                .arg("--store")
+                .arg(&graph)
+                .args(["--as", "act-author", "-e"])
+                .arg(format!(
+                    "query propose() as commit {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+                ))
+                .arg("--json"),
+        );
+        let commit = parse_stdout_json(&output)["commit"].clone();
+        assert_eq!(commit["published"], false, "{commit}");
+        assert_eq!(commit["actor_id"], "act-author", "{commit}");
+        commit["graph_commit_id"].as_str().unwrap().to_string()
+    };
+    let commit = |args: &[&str]| {
+        let mut command = cli();
+        command.arg("commit").args(args).arg("--store").arg(&graph);
+        command
+    };
+
+    let pia = propose("Pia");
+    let published = parse_stdout_json(&output_success(&mut commit(&[
+        "publish",
+        &pia,
+        "--as",
+        "act-reviewer",
+        "--json",
+    ])));
+    assert_eq!(published["graph_commit_id"], pia.as_str(), "{published}");
+    assert_eq!(published["published"], true, "{published}");
+    assert_eq!(published["actor_id"], "act-author", "{published}");
+    assert_eq!(resolved_snapshot_id(&graph, "main"), pia);
+
+    let quin = propose("Quin");
+    let dropped = parse_stdout_json(&output_success(&mut commit(&[
+        "drop",
+        &quin,
+        "--as",
+        "act-reviewer",
+        "--json",
+    ])));
+    assert_eq!(dropped["graph_commit_id"], quin.as_str(), "{dropped}");
+    output_failure(&mut commit(&["show", &quin]));
+    let listed = parse_stdout_json(&output_success(&mut commit(&[
+        "list",
+        "--unpublished",
+        "--json",
+    ])));
+    assert_eq!(listed["commits"], json!([]), "{listed}");
+    assert_eq!(resolved_snapshot_id(&graph, "main"), pia);
+
+    for (label, args) in [
+        ("commit list", vec!["list"]),
+        ("commit show", vec!["show", pia.as_str()]),
+        ("commit changes", vec!["changes", pia.as_str()]),
+    ] {
+        let output = output_failure(commit(&args).args(["--as", "act-reader"]));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("`{label}` is a data command"))
+                && stderr.contains("--as sets the actor")
+                && stderr.contains("does not apply"),
+            "{label} must refuse an actor it cannot consume: {stderr}"
+        );
+    }
+
+    let server = IntentApiFixture::new(vec![]);
+    for verb in ["publish", "drop"] {
+        let output = output_failure(
+            cli()
+                .args(["commit", verb, &pia, "--server"])
+                .arg(&server.origin)
+                .args(["--as", "act-nope"]),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("`--as` is not allowed on a served write"),
+            "served commit {verb} must refuse --as: {stderr}"
+        );
+    }
+    assert!(server.requests().is_empty());
+    server.assert_complete();
+}
+
 #[test]
 fn change_supports_inline_query_string() {
     let temp = tempdir().unwrap();
