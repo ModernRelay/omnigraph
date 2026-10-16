@@ -255,6 +255,11 @@ impl OperationRuntime {
                         uncertain: true,
                     },
                 };
+                crate::telemetry::operation_finished(
+                    "write",
+                    result.result.is_ok(),
+                    result.uncertain,
+                );
                 // A known result carries its reservation through pending delivery.
                 // Consumption releases admission before the handler can respond;
                 // abandonment destroys the output before releasing its ownership.
@@ -270,7 +275,7 @@ impl OperationRuntime {
                     owner,
                 });
             }
-            .in_current_span(),
+            .instrument(crate::telemetry::operation_span("write")),
         );
         Ok(OwnedResponse(receiver))
     }
@@ -428,10 +433,11 @@ impl ReadObserver {
                     .catch_unwind()
                     .await
                     .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
+                crate::telemetry::operation_finished("read", result.is_ok(), false);
                 // No result history: an absent waiter drops the result here.
                 let _ = sender.send(result);
             }
-            .in_current_span(),
+            .instrument(crate::telemetry::operation_span("read")),
         );
         OwnedReadResponse {
             receiver,
@@ -737,6 +743,18 @@ mod tests {
 
     #[test]
     fn disconnected_owned_operation_keeps_its_request_span() {
+        fn request_parent() -> Option<tracing::Id> {
+            use tracing_subscriber::registry::LookupSpan;
+            tracing::Span::current()
+                .with_subscriber(|(id, dispatch)| {
+                    let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
+                    let operation = registry.span(id)?;
+                    assert_eq!(operation.name(), "native.operation");
+                    operation.parent().map(|parent| parent.id())
+                })
+                .flatten()
+        }
+
         let subscriber =
             tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::DEBUG);
         use tracing_subscriber::prelude::*;
@@ -753,7 +771,7 @@ mod tests {
                         let _entered = span.enter();
                         runtime
                             .submit((), async move {
-                                sent.send(tracing::Span::current().id()).unwrap();
+                                sent.send(request_parent()).unwrap();
                                 Ok::<_, ApiError>(()).into()
                             })
                             .unwrap()
@@ -764,7 +782,7 @@ mod tests {
                     let response = {
                         let _entered = span.enter();
                         runtime.try_observe().unwrap().spawn_read((), async move {
-                            sent.send(tracing::Span::current().id()).unwrap();
+                            sent.send(request_parent()).unwrap();
                             Ok::<_, ApiError>(())
                         })
                     };

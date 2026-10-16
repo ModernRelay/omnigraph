@@ -413,6 +413,7 @@ pub(crate) async fn apply(
             "a canonical deployment_id is required",
         ));
     }
+    crate::telemetry::deployment_id(&request.deployment_id);
     let gate = state
         .deployments
         .gate
