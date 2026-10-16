@@ -14,6 +14,7 @@
 - Operator config & credentials
 - Addressing a graph
 - Output formats and positions · health check
+- Organization administration (members and invitations)
 - Cluster control plane (direct and managed)
 
 Commands you'll reach for but don't need best-practice rules around. Quick syntax reference.
@@ -47,6 +48,7 @@ prints the exact flags of the installed binary.
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check or list a cluster's stored queries |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; `--managed` selects the managed service |
+| `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires `--managed`; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
 | `login` | — | Store a server's bearer token, or open a managed session |
@@ -344,7 +346,7 @@ omnigraph login --api <origin>             # managed Intent API session (OS keyc
 omnigraph logout --api <origin>            # revoke that session and remove its keychain entry
 ```
 
-The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. `--config` selects source/context folders for `cluster` and `use`.
+The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. `--config` selects source/context folders for `cluster`, `organization` and `use`.
 
 ## Addressing a Graph
 
@@ -418,6 +420,56 @@ while a graph is still loading, when a nonempty inventory has no ready graph,
 and once draining starts. Readiness is not proof that every configured graph
 is healthy; authorized `graphs list --server <name|url> --json` returns one
 `graphs` list with each graph's `state` and `action`, blocked graphs included.
+
+## Organization Administration
+
+`organization` (alias `org`) requires explicit `--managed` and the selected
+organization's control grant `{cluster: null, verb: members_manage}`. Sign in
+with `login --api <origin> --organization <id>`. Supply those same selectors to
+organization commands, or use a bound folder (`--config <dir>` selects another
+folder). Explicit selectors must agree with that binding; outside a bound
+folder, omitting `--organization` requires exactly one cached organization for
+the API. These commands do not change the binding. They reject `--server`,
+`--profile`, `--store`, `--cluster`, `--graph`, `--as` and `--direct`.
+`--json` prints the validated API envelope.
+
+In a bound folder:
+
+```bash
+omnigraph organization members list --managed --json
+omnigraph organization members apply member.yaml --managed --idempotency-key <key> --json
+omnigraph organization members offboard <USER_ID> --managed --expected-version <N> --idempotency-key <key> --json
+omnigraph organization invitations list --managed [--after <cursor>] --json
+omnigraph organization invitations send <email> --managed --idempotency-key <key>
+omnigraph organization invitations resend <INVITATION_ID> --managed --idempotency-key <key>
+omnigraph organization invitations revoke <INVITATION_ID> --managed --idempotency-key <key>
+```
+
+`members list` returns the complete directory, including provider membership
+status and current local grant versions; more than 1,000 members refuses.
+`members apply` takes a versioned YAML add/update/remove patch. Use exact IDs and
+the current grant version. Add/update patches preserve unrelated grants and
+admissions; a remove patch clears local access while retaining provider membership.
+Invitation lists are pages of up to 100; pass the returned `data.after` as
+`--after` until it is null. Wait for acceptance before enrollment. Invitation
+acceptance and cluster admission do not grant graph or configuration permissions:
+applied Cedar policy owns those permissions.
+
+Before `members offboard`, remove the person's principal from applicable Cedar
+policies, deploy them and verify denial with a previously issued graph credential.
+Offboarding clears local access, removes that organization's membership and
+revokes its explicitly scoped sessions; it preserves the shared user and other
+organizations' sessions. Existing graph credentials may last 86,400 seconds, so
+membership removal alone does not immediately revoke graph access. Use grant
+version zero only for someone not enrolled locally. A partial cleanup exits 3;
+inspect its separate local, provider and session outcomes.
+
+Every write requires `--idempotency-key`. Keep the exact arguments, YAML and key
+after a timeout; it does not cancel provider work. Replay the identical request
+with the same key to retrieve its retained outcome. A new key starts a new action,
+and a partial offboard result remains partial on replay. See the
+[team administration guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/managed-team.md)
+for the patch schema and the full onboarding workflow.
 
 ## Cluster Control Plane
 
