@@ -17,7 +17,7 @@ belong to review; a keyword inside a code span, a fence, or an HTML comment
 is read, and a PR against a non-default base is examined although GitHub
 closes nothing there.
 
-A fix outside the code paths, `crates/` and `tools/` (Markdown files under
+A fix outside the code paths, `crates/`, `tools/` and `skills/` (Markdown files under
 them aside) and the root `Cargo.toml` and `Cargo.lock`, where every
 workspace member lives, has no logic or Rust test that could witness it (a
 workflow, a script, a document, a deployment file), so a PR whose diff
@@ -34,9 +34,9 @@ A closed issue N is satisfied by a regression that is added or
 strengthened. Corpus shape: a regular `.gqt` case named `issue_N_*` anywhere
 under the logic-test corpus, with no hidden path components. It must be new
 or modified with at least one added body line (a line that is neither a `#` header line nor a `//` comment).
-Rust shapes, in a top-level test target `<crates|tools>/*/tests/<name>.rs`,
+Rust shapes, in a top-level test target `tests/<name>.rs`,
 `tests/integration/main.rs` or its directly declared modules, or an
-in-source module under `<crates|tools>/*/src/`: an added test
+in-source `src/` module under `<crates|tools>/*/` or `skills/`: an added test
 definition, a function whose name carries `issue_N`, with an added
 `#[test]` or `#[<path>::test]` attribute line (`#[tokio::test(...)]`
 included) directly above it in the same hunk, other `#[...]` attribute
@@ -116,14 +116,14 @@ def closing_keyword(repo: str | None) -> re.Pattern[str]:
 
 # The workspace members' homes plus the root manifests, Markdown excluded;
 # the self-test pins it to `[workspace] members`.
-CODE_PATH = re.compile(r"^(?:(?:crates|tools)/(?!.*\.md$)|Cargo\.toml$|Cargo\.lock$)")
+CODE_PATH = re.compile(r"^(?:(?:crates|tools|skills)/(?!.*\.md$)|Cargo\.toml$|Cargo\.lock$)")
 WORKSPACE_MEMBERS = re.compile(r"^members\s*=\s*\[(.*?)\]", re.MULTILINE | re.DOTALL)
 # A corpus case's `# issue: N` header line, spelled exactly as the harness
 # accepts it (`crates/omnigraph-gqt-core/src/lib.rs`, `parse_header`).
 CASE_ISSUE_HEADER = re.compile(r"^# issue: ([1-9]\d*)$")
 CASE_ISSUE_STEM = re.compile(r"^issue[_-]?0*(\d+)[_-]?", re.IGNORECASE)
 # Nested Rust test paths need owner discovery before crediting a regression.
-RUST_NESTED_TEST_PATH = re.compile(r"^(?:crates|tools)/[^/]+/tests/[^/]+/.+\.rs$")
+RUST_NESTED_TEST_PATH = re.compile(r"^(?:(?:crates|tools)/[^/]+|skills)/tests/[^/]+/.+\.rs$")
 CORPUS_PATH_SENTENCE = "crates/omnigraph-gqt/cases/"
 WAIVER_LABEL = "no-repro"
 PATHSPECS = (
@@ -132,6 +132,8 @@ PATHSPECS = (
     ":(glob)crates/*/src/**",
     ":(glob)tools/*/tests/**",
     ":(glob)tools/*/src/**",
+    ":(glob)skills/tests/**",
+    ":(glob)skills/src/**",
 )
 
 
@@ -146,10 +148,10 @@ def issue_token(n: str) -> re.Pattern[str]:
 
 CORPUS_DIR_PREFIX = "crates/omnigraph-gqt/cases/"
 # One path segment after `tests/` (a top-level target) or any `.rs` under
-# `src/`, in a `crates/` or `tools/` workspace member.
-RUST_FN_PATH = re.compile(r"^(?:crates|tools)/[^/]+/(?:tests/[^/]+\.rs|src/.+\.rs)$")
+# `src/`, in a `crates/`, `tools/` or `skills/` workspace member.
+RUST_FN_PATH = re.compile(r"^(?:(?:crates|tools)/[^/]+|skills)/(?:tests/[^/]+\.rs|src/.+\.rs)$")
 RUST_INTEGRATION_PATH = re.compile(
-    r"^((?:crates|tools)/[^/]+/tests/integration)/([A-Za-z_][A-Za-z0-9_]*)\.rs$"
+    r"^((?:(?:crates|tools)/[^/]+|skills)/tests/integration)/([A-Za-z_][A-Za-z0-9_]*)\.rs$"
 )
 RUST_FN_DEF = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
@@ -695,7 +697,7 @@ def run_gate(body: str, labels: list[str], range_: str, repo: str | None) -> int
 
 def self_test_integration_owners() -> None:
     test = ["#[test]", "fn check_issue_563() {", "    assert_eq!(1, 1);", "}"]
-    for home in ("crates/engine", "tools/checker"):
+    for home in ("crates/engine", "tools/checker", "skills"):
         root = f"{home}/tests/integration/main.rs"
         owner = f"{home}/tests/integration/search.rs"
         sources = {root: ["mod search;"], owner: test}
@@ -792,9 +794,9 @@ def self_test() -> int:
     assert closed_issues("fixes ModernRelay/omnigraph#4", None) == []
     assert closed_issues("Closes https://github.com/ModernRelay/omnigraph/issues/4") == []
     assert closed_issues("fixes #4", None) == ["4"]
-    for path in ("crates/omnigraph/src/lib.rs", "tools/x/tests/a.rs", "Cargo.toml", "Cargo.lock", "crates/omnigraph-bench/Cargo.toml", "crates/x/tests/fixtures/a.md.json"):
+    for path in ("crates/omnigraph/src/lib.rs", "tools/x/tests/a.rs", "Cargo.toml", "Cargo.lock", "crates/omnigraph-bench/Cargo.toml", "crates/x/tests/fixtures/a.md.json", "skills/Cargo.toml", "skills/build.rs", "skills/src/lib.rs"):
         assert CODE_PATH.match(path), path
-    for path in (".github/workflows/ci.yml", "docs/dev/ci.md", "scripts/check-docs.py", "deploy/x.yaml", "benchmarks/Cargo.toml", "rust-toolchain.toml", "crates2/x.rs", "Cargo.toml.bak", "crates/omnigraph-dst/README.md", "crates/omnigraph/tests/fixtures/lance10-fts.md", "tools/x/README.md"):
+    for path in (".github/workflows/ci.yml", "docs/dev/ci.md", "scripts/check-docs.py", "deploy/x.yaml", "benchmarks/Cargo.toml", "rust-toolchain.toml", "crates2/x.rs", "Cargo.toml.bak", "crates/omnigraph-dst/README.md", "crates/omnigraph/tests/fixtures/lance10-fts.md", "tools/x/README.md", "skills/omnigraph/SKILL.md", "skills/omnigraph/references/commands.md", "skills2/src/lib.rs"):
         assert not CODE_PATH.match(path), path
     # The code paths are pinned to the workspace: every member must sit
     # under one, or a fix there would pass unexamined.
@@ -956,6 +958,13 @@ def self_test() -> int:
     assert not RUST_FN_PATH.match("crates/omnigraph/src/lib.md")
     assert RUST_FN_PATH.match("crates/omnigraph/src/bin/omnigraph.rs")
     assert not RUST_FN_PATH.match("crates/omnigraph/tests/search/main.rs")
+    assert RUST_FN_PATH.match("skills/src/lib.rs")
+    assert RUST_FN_PATH.match("skills/tests/embedding.rs")
+    assert not RUST_FN_PATH.match("skills/omnigraph/example.rs")
+    assert not RUST_FN_PATH.match("skills/tests/helpers/mod.rs")
+    assert issue_satisfied(
+        "563", [], [("skills/src/lib.rs", "#[test]"), ("skills/src/lib.rs", "fn embedding_issue_563() {")]
+    )
 
     spoof_diff = "\n".join(
         [
