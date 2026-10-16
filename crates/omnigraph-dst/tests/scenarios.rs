@@ -2449,6 +2449,15 @@ fn labeled_cost_rows<S>(root: String, scenario: &S, label: &str) -> String
 where
     S: omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage, Output = ()>,
 {
+    labeled_cost_rows_of(root, scenario, &[label])
+}
+
+/// The cost rows of each of `labels`, in that order, from one run of
+/// `scenario`; every label must reach the physical read meter.
+fn labeled_cost_rows_of<S>(root: String, scenario: &S, labels: &[&str]) -> String
+where
+    S: omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage, Output = ()>,
+{
     omnigraph_dst::lance_faults::install();
     let environment = omnigraph_dst::memory::MemoryEnvironment::new(
         root,
@@ -2462,26 +2471,28 @@ where
     run.cleanup.unwrap().unwrap();
     run.result.unwrap().unwrap();
     let mut rows = String::new();
-    let mut physical_reads = 0;
-    for line in table.lines() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields[0] != label {
-            continue;
+    for label in labels {
+        let mut physical_reads = 0;
+        for line in table.lines() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields[0] != *label {
+                continue;
+            }
+            if fields[1] == "l.get" {
+                physical_reads = fields[2]
+                    .strip_prefix("calls=")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+            }
+            rows.push_str(line);
+            rows.push('\n');
         }
-        if fields[1] == "l.get" {
-            physical_reads = fields[2]
-                .strip_prefix("calls=")
-                .unwrap()
-                .parse::<u64>()
-                .unwrap();
-        }
-        rows.push_str(line);
-        rows.push('\n');
+        assert!(
+            physical_reads > 0,
+            "{label} must reach the physical read meter: {table}"
+        );
     }
-    assert!(
-        physical_reads > 0,
-        "{label} must reach the physical read meter: {table}"
-    );
     rows
 }
 
@@ -2541,6 +2552,125 @@ fn branch_write_cost_rows(replay: &str) -> String {
         &BranchWriteCost,
         "BranchWrite",
     )
+}
+
+/// A graph diff's first page and its continuation on a reopened handle, for
+/// the two-point and the branch form, beside one and nine idle branches. A
+/// continuation resolves its sides again and opens each token commit through
+/// what reached it, so its rows equal at both sizes and read no more than its
+/// first page.
+fn diff_cost_rows(replay: &str) -> String {
+    use omnigraph::changes::{ChangeFeedScope, GraphDiffRequest, GraphDiffSides};
+
+    struct DiffCost {
+        branch_form: bool,
+        idle: u64,
+        first: &'static str,
+        next: &'static str,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for DiffCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_diff_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("feature").await.unwrap();
+            for (name, age) in [("Alice", 31), ("Bob", 26)] {
+                db.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", name)], &[("$age", age)]),
+                )
+                .await
+                .unwrap();
+            }
+            for i in 0..self.idle {
+                db.branch_create(&format!("idle{i}")).await.unwrap();
+            }
+            let detached = db.detach();
+            let db = detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ));
+            let sides = if self.branch_form {
+                GraphDiffSides::Branch {
+                    source: "feature".to_string(),
+                    target: "main".to_string(),
+                }
+            } else {
+                GraphDiffSides::Between {
+                    from: "main".to_string(),
+                    to: "feature".to_string(),
+                }
+            };
+            let request = |page_token: Option<String>| GraphDiffRequest {
+                sides: sides.clone(),
+                scope: ChangeFeedScope::default(),
+                page_token,
+                max_changes: Some(1),
+                max_bytes: None,
+            };
+            omnigraph_dst::cost::set_label(self.first);
+            let first = db.diff_page(&request(None)).await.unwrap();
+            omnigraph_dst::cost::set_label(self.next);
+            let next = db
+                .diff_page(&request(first.next_page_token.clone()))
+                .await
+                .unwrap();
+            omnigraph_dst::cost::set_label("_diff_verify");
+            assert_eq!(first.changes.len(), 1);
+            assert_eq!(next.changes.len(), 1);
+            assert_eq!(next.to_commit_id, first.to_commit_id);
+            assert!(next.next_page_token.is_none());
+        }
+    }
+
+    let mut rows = String::new();
+    for (branch_form, idle, first, next) in [
+        (false, 1, "DiffPageIdle1", "DiffContinuationIdle1"),
+        (false, 9, "DiffPageIdle9", "DiffContinuationIdle9"),
+        (
+            true,
+            1,
+            "BranchDiffPageIdle1",
+            "BranchDiffContinuationIdle1",
+        ),
+        (
+            true,
+            9,
+            "BranchDiffPageIdle9",
+            "BranchDiffContinuationIdle9",
+        ),
+    ] {
+        rows.push_str(&labeled_cost_rows_of(
+            format!("shared-memory://dst-diff-cost-{replay}-{first}"),
+            &DiffCost {
+                branch_form,
+                idle,
+                first,
+                next,
+            },
+            &[first, next],
+        ));
+    }
+    rows
 }
 
 /// One page of `main`'s commit list on a reopened handle, after `publishes`
@@ -2657,8 +2787,8 @@ fn commit_list_cost_rows(replay: &str) -> String {
     rows
 }
 
-/// Storage calls per op kind plus reopened merge-history, branch-write and
-/// commit-list scenarios, replayed identically and compared with
+/// Storage calls per op kind plus reopened merge-history, branch-write, diff
+/// and commit-list scenarios, replayed identically and compared with
 /// `cost_table.txt` (DST_REGEN_COSTS=1 to regen).
 #[test]
 #[serial]
@@ -2676,6 +2806,7 @@ fn dst_bench_cost_count_golden() {
     omnigraph_dst::cost::disarm();
     table.push_str(&merge_history_cost_rows("a"));
     table.push_str(&branch_write_cost_rows("a"));
+    table.push_str(&diff_cost_rows("a"));
     table.push_str(&commit_list_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
@@ -2683,6 +2814,7 @@ fn dst_bench_cost_count_golden() {
     omnigraph_dst::cost::disarm();
     table2.push_str(&merge_history_cost_rows("b"));
     table2.push_str(&branch_write_cost_rows("b"));
+    table2.push_str(&diff_cost_rows("b"));
     table2.push_str(&commit_list_cost_rows("b"));
     assert_eq!(
         table, table2,
