@@ -2733,9 +2733,12 @@ impl Omnigraph {
     /// its snapshot opens, and a side `can_read` refuses is
     /// [`OmniError::ReadTargetNotFound`] naming it, exactly as a side that
     /// names nothing: the answer is not an existence oracle. A continuation
-    /// classifies and authorizes its sides again before it reopens the
-    /// token's commits. The branch form names its branches outright, so its
-    /// caller authorizes them before the call.
+    /// classifies and authorizes its sides again, then reopens only the
+    /// token's commits its sides reach: what a side resolves to now, or a
+    /// commit `can_read` allows as a side of its own; any other is
+    /// [`OmniError::ChangeCursorRejected`]. The branch form names its branches
+    /// outright, so its caller authorizes them before the call, and
+    /// `can_read` decides only a continuation's commits.
     pub async fn diff_page_readable(
         &self,
         request: &crate::changes::GraphDiffRequest,
@@ -2785,13 +2788,9 @@ impl Omnigraph {
                         "diff page token was minted for a different filter scope",
                     ));
                 }
-                if let Some(can_read) = can_read
-                    && let crate::changes::GraphDiffSides::Between { from, to } = &request.sides
-                {
-                    for side in [from, to] {
-                        self.authorized_diff_side(side, Some(&mut *can_read))
-                            .await?;
-                    }
+                if let Some(can_read) = can_read {
+                    self.authorize_diff_continuation(&request.sides, &decoded, can_read)
+                        .await?;
                 }
                 let endpoints = self
                     .reopen_diff_endpoints(
@@ -3008,6 +3007,74 @@ impl Omnigraph {
                 })
             }
         }
+    }
+
+    /// Authorize a diff continuation for a caller who may read only some
+    /// branches: its sides as the first page did, then each commit the token
+    /// names. A token is checksummed, not signed, so its commits are the
+    /// caller's claim. A commit is reached when its side resolves to it now,
+    /// or, for a side that moves (a branch head, a merge base), when the
+    /// caller could name the commit as a side itself, so a branch that moved
+    /// since the first page still reaches its old head. A side spelled as a
+    /// commit reaches only that commit. A commit the sides do not reach,
+    /// unknown or unreadable alike, refuses the page before any snapshot
+    /// opens.
+    async fn authorize_diff_continuation(
+        &self,
+        sides: &crate::changes::GraphDiffSides,
+        decoded: &crate::changes::token::DiffPageTokenV1,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<()> {
+        use crate::changes::GraphDiffSides;
+        // Each named commit, what its side resolves to now, and whether the
+        // side can move: a branch head or a merge base can, a commit cannot.
+        let reached = match sides {
+            GraphDiffSides::Between { from, to } => {
+                if decoded.base_commit_id.is_some() {
+                    return Err(diff_token_unreached());
+                }
+                let from_now = self
+                    .authorized_diff_side(from, Some(&mut *can_read))
+                    .await?;
+                let to_now = self.authorized_diff_side(to, Some(&mut *can_read)).await?;
+                [
+                    (
+                        &decoded.from_commit_id,
+                        from_now.moves(),
+                        from_now.commit_id(),
+                    ),
+                    (&decoded.to_commit_id, to_now.moves(), to_now.commit_id()),
+                ]
+            }
+            GraphDiffSides::Branch { source, target } => {
+                if decoded.base_commit_id.as_ref() != Some(&decoded.from_commit_id) {
+                    return Err(diff_token_unreached());
+                }
+                let (source_head, _, base, _, _) = self.capture_merge_base(source, target).await?;
+                [
+                    (&decoded.from_commit_id, true, Some(base.graph_commit_id)),
+                    (&decoded.to_commit_id, true, Some(source_head)),
+                ]
+            }
+        };
+        for (named, moves, current) in reached {
+            if current.as_ref() == Some(named) {
+                continue;
+            }
+            if !moves {
+                return Err(diff_token_unreached());
+            }
+            match self.authorized_diff_side(named, Some(&mut *can_read)).await {
+                Ok(DiffReadTarget::Commit(commit)) if &commit.graph_commit_id == named => {}
+                Ok(_)
+                | Err(OmniError::ReadTargetNotFound { .. })
+                | Err(OmniError::AmbiguousReadTarget { .. }) => {
+                    return Err(diff_token_unreached());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Reopen the exact commits a diff page token names.
@@ -4589,8 +4656,15 @@ pub(crate) fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result
 }
 
 /// A caller's answer to "may it read this branch?", asked once per two-point
-/// graph diff side; see [`Omnigraph::diff_page_readable`].
+/// graph diff side and, on a continuation, per commit the page token names
+/// that its side no longer resolves to; see [`Omnigraph::diff_page_readable`].
 pub type ReadCheck<'a> = dyn FnMut(&str) -> bool + Send + 'a;
+
+/// The one refusal of a diff page token naming a commit its sides do not
+/// reach, whether the commit is unknown or the caller may not read it.
+fn diff_token_unreached() -> OmniError {
+    crate::changes::token::cursor_rejected("diff page token names a commit its sides do not reach")
+}
 
 /// What one graph diff endpoint names.
 enum DiffReadTarget {
@@ -4599,6 +4673,20 @@ enum DiffReadTarget {
 }
 
 impl DiffReadTarget {
+    /// Whether a later resolution of the same spelling may name another
+    /// commit: a branch's head moves, a commit stays itself.
+    fn moves(&self) -> bool {
+        matches!(self, Self::Branch(_))
+    }
+
+    /// The commit this side resolves to now: the branch's head, or the commit.
+    fn commit_id(self) -> Option<String> {
+        match self {
+            Self::Branch(resolved) => resolved.graph_commit_id,
+            Self::Commit(commit) => Some(commit.graph_commit_id),
+        }
+    }
+
     /// The branch a caller authorizes `read` on: the branch itself, or the
     /// authored branch of the commit (an unpublished proposal's or unattached
     /// snapshot's recorded target).

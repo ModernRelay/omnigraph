@@ -4156,9 +4156,31 @@ pub(crate) async fn two_point_diff_page(
     page_token: Option<String>,
     max_changes: Option<usize>,
 ) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
+    readable_diff_page(
+        handle,
+        actor,
+        omnigraph::changes::GraphDiffRequest {
+            sides: omnigraph::changes::GraphDiffSides::Between { from, to },
+            scope,
+            page_token,
+            max_changes,
+            max_bytes: None,
+        },
+    )
+    .await
+}
+
+/// One diff page read under `actor`'s `read` decisions, which the engine asks
+/// for each branch a two-point side reads and for each commit a continuation
+/// names that its side no longer resolves to. A policy failure (a missing
+/// bearer, an evaluation error) is not a denial: it stops the read, and its
+/// own error answers.
+async fn readable_diff_page(
+    handle: &GraphRequest,
+    actor: Option<&AuthenticatedActor>,
+    request: omnigraph::changes::GraphDiffRequest,
+) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
     let policy = handle.policy.as_deref();
-    // A policy failure (a missing bearer, an evaluation error) is not a
-    // denial: it stops the read, and its own error answers.
     let mut failure = None;
     let mut can_read = |branch: &str| {
         let request = PolicyRequest {
@@ -4177,16 +4199,7 @@ pub(crate) async fn two_point_diff_page(
     };
     let page = handle
         .engine
-        .diff_page_readable(
-            &omnigraph::changes::GraphDiffRequest {
-                sides: omnigraph::changes::GraphDiffSides::Between { from, to },
-                scope,
-                page_token,
-                max_changes,
-                max_bytes: None,
-            },
-            &mut can_read,
-        )
+        .diff_page_readable(&request, &mut can_read)
         .await;
     if let Some(error) = failure {
         return Err(error);
@@ -4262,7 +4275,9 @@ pub(crate) async fn server_branch_diff(
 
 /// One page of what `source` changed since its merge base with `target`
 /// (`main` when absent), for `GET /branches/diff` and the `branch diff`
-/// statement: `read` on both named branches before any lineage is read.
+/// statement: `read` on both named branches before any lineage is read, and on
+/// the branch of each commit a continuation names that the branches no longer
+/// resolve to.
 pub(crate) async fn branch_diff_page(
     handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
@@ -4275,17 +4290,18 @@ pub(crate) async fn branch_diff_page(
     let source = requested_branch(Some(source))?;
     let target = requested_branch(target)?;
     authorize_branch_reads(actor, handle.policy.as_deref(), [&source, &target])?;
-    handle
-        .engine
-        .diff_page(&omnigraph::changes::GraphDiffRequest {
+    readable_diff_page(
+        handle,
+        actor,
+        omnigraph::changes::GraphDiffRequest {
             sides: omnigraph::changes::GraphDiffSides::Branch { source, target },
             scope,
             page_token,
             max_changes,
             max_bytes: None,
-        })
-        .await
-        .map_err(change_route_error)
+        },
+    )
+    .await
 }
 
 #[utoipa::path(
