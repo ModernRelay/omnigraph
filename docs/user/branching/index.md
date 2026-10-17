@@ -139,7 +139,9 @@ token back with the same `--branch` for the next page, of 100 commits unless
 `--limit` sets the size. Later pages answer for that head even after the
 branch moves, so a page never repeats or skips a commit. A page reads only the
 history it returns; without `--limit` or `--page-token` the whole history is
-read and listed at once. Served, the same listing is
+read and listed at once. Served under a policy, a continuation by a caller
+whose `read` does not cover every branch is checked against the branch's
+history, so it costs what the whole listing costs. Served, the same listing is
 `GET /commits?branch=<name>&limit=<n>` continued with `page_token=<token>`.
 Paging applies to a branch's history, not to `--unpublished` or
 `--unattached`.

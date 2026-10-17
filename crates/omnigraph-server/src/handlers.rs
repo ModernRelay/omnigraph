@@ -3224,14 +3224,32 @@ pub(crate) async fn server_commit_list(
     )?;
     let db = &handle.engine;
     if paged {
-        let page = db
-            .list_commits_page(
-                Some(branch.as_str()),
-                query.page_token.as_deref(),
-                query.limit,
-            )
-            .await
-            .map_err(ApiError::from_omni)?;
+        // A page token is checksummed, not signed, so the commit it continues
+        // from is the caller's claim. A caller allowed graph-wide `read` (the
+        // gate of `GET /commits/{commit_id}`) may read any commit by id and
+        // follow its parents, so its claim needs no proof; any other caller's
+        // continuation is proven on the branch's history.
+        let any_commit = query.page_token.is_none()
+            || matches!(
+                authorize(
+                    actor.as_ref().map(|Extension(actor)| actor),
+                    handle.policy.as_deref(),
+                    PolicyRequest {
+                        action: PolicyAction::Read,
+                        branch: None,
+                        target_branch: None,
+                    },
+                )?,
+                Authz::Allowed
+            );
+        let (branch, page_token) = (Some(branch.as_str()), query.page_token.as_deref());
+        let page = if any_commit {
+            db.list_commits_page(branch, page_token, query.limit).await
+        } else {
+            db.list_commits_page_on_branch(branch, page_token, query.limit)
+                .await
+        }
+        .map_err(ApiError::from_omni)?;
         return Ok(Json(CommitListOutput {
             commits: page.commits.iter().map(api::commit_output).collect(),
             head_commit_id: Some(page.head_commit_id),

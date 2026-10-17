@@ -3934,15 +3934,50 @@ impl Omnigraph {
     ///
     /// The first page resolves the branch's head and names it; a continuation
     /// (`page_token`) answers for that head's first-parent chain, whatever
-    /// the branch did since, and is refused for another graph or branch. The
-    /// token carries a digest of the branch, never its name. A page reads the
-    /// branch's `__manifest` and the `__history` extents its own commits
-    /// occupy, so its cost follows the page, not the history below it.
+    /// the branch did since. The token carries a digest of the branch, never
+    /// its name. A page reads the branch's `__manifest` and the `__history`
+    /// extents its own commits occupy, so its cost follows the page, not the
+    /// history below it.
+    ///
+    /// The token is checksummed, not signed. A continuation is refused for
+    /// another graph or branch digest, but the commit it continues from is
+    /// the caller's claim: the walk starts at any commit this handle can find,
+    /// on any branch. That is no authority for a caller who may read every
+    /// commit by id; a caller who may read only `branch` uses
+    /// [`Self::list_commits_page_on_branch`].
     pub async fn list_commits_page(
         &self,
         branch: Option<&str>,
         page_token: Option<&str>,
         limit: Option<usize>,
+    ) -> Result<CommitListPage> {
+        self.commit_list_page(branch, page_token, limit, false)
+            .await
+    }
+
+    /// [`Self::list_commits_page`] for a caller who may read only `branch`: a
+    /// continuation's commit must be on the branch's first-parent chain from
+    /// its head now, the first commit there below the generation the token
+    /// carries, or the page is [`OmniError::ChangeCursorRejected`]. The proof
+    /// walks the chain from the head down to that commit, so a continuation
+    /// costs what [`Self::list_commits`] costs; a first page costs the page.
+    pub async fn list_commits_page_on_branch(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<CommitListPage> {
+        self.commit_list_page(branch, page_token, limit, true).await
+    }
+
+    /// One commit list page; `prove` holds a continuation's commit to the
+    /// branch's history.
+    async fn commit_list_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        prove: bool,
     ) -> Result<CommitListPage> {
         use crate::changes::token;
 
@@ -3978,6 +4013,17 @@ impl Omnigraph {
             ));
         }
         let coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        if prove
+            && let Some(resume) = &resume
+            && coordinator
+                .first_parent_below(resume.below_generation)
+                .await?
+                .is_none_or(|commit| commit.graph_commit_id != resume.next_commit_id)
+        {
+            return Err(token::cursor_rejected(
+                "commit list page token names a commit off this branch's history",
+            ));
+        }
         let start = resume.as_ref().map(|resume| resume.next_commit_id.as_str());
         let (head, page) = coordinator.first_parent_page(start, limit).await?;
         let Some(page) = page else {

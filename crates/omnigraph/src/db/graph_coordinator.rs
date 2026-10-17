@@ -440,6 +440,33 @@ impl GraphCoordinator {
         Ok((head, page))
     }
 
+    /// The first commit of the first-parent chain from the head this
+    /// coordinator holds whose generation is below `generation`; `None` when
+    /// the chain ends first. Generation falls along the chain, so this walks
+    /// every commit above it, a page of [`FIRST_PARENT_WALK_COMMITS`] at a
+    /// time.
+    pub(crate) async fn first_parent_below(&self, generation: u64) -> Result<Option<GraphCommit>> {
+        let graph = self.manifest.commit_graph();
+        let mut start = graph.head().graph_commit_id.clone();
+        loop {
+            let page = graph
+                .first_parent_page(&start, FIRST_PARENT_WALK_COMMITS)
+                .await?
+                .ok_or_else(|| commit_not_found(&SnapshotId::new(start.clone())))?;
+            if let Some(below) = page
+                .commits
+                .into_iter()
+                .find(|commit| commit.generation < generation)
+            {
+                return Ok(Some(below));
+            }
+            match page.next {
+                Some(next) => start = next,
+                None => return Ok(None),
+            }
+        }
+    }
+
     pub async fn branch_list(&self) -> Result<Vec<String>> {
         self.manifest.list_graph_branches().await
     }
@@ -995,6 +1022,9 @@ impl GraphCoordinator {
         self.load_commits().await
     }
 }
+
+/// Commits one step of a whole-chain walk reads before the next.
+const FIRST_PARENT_WALK_COMMITS: usize = 1024;
 
 /// The state of a settled commit, from the `table` rows of its record.
 async fn settled_commit_state(

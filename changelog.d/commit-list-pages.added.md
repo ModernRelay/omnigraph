@@ -4,7 +4,9 @@
   page returns `head_commit_id`, the head its listing resolved, and a
   `next_page_token` while older commits remain; later pages answer for that
   head even after the branch moves. A page reads only the history it returns,
-  so its cost no longer grows with the branch's history. Without either
+  so its cost no longer grows with the branch's history; under a policy, a
+  continuation by a caller whose `read` does not cover every branch is checked
+  against the branch's history and costs what the whole listing costs. Without either
   parameter the whole history is listed as before. See
   [commits][commit-list-pages-guide].
 
