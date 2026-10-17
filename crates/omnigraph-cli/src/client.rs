@@ -353,7 +353,7 @@ impl GraphClient {
     /// one, and the registry is server-scoped either way). An explicit
     /// `--graph` never reaches here — the addressing guard rejects it.
     pub(crate) fn resolve_registry(server: Option<&str>, profile: Option<&str>) -> Result<Self> {
-        let scope = crate::scope::resolve_scope(
+        let scope = crate::scope::resolve_scope_from_env(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Served,
             crate::scope::ScopeFlags {
@@ -396,7 +396,7 @@ impl GraphClient {
         // so scope resolution and the addressing guard share one
         // classification; every current caller is a data-plane (`Any`) verb —
         // registry-scoped `graphs list` uses `resolve_registry` instead.
-        let scope = crate::scope::resolve_scope(
+        let scope = crate::scope::resolve_scope_from_env(
             &crate::operator::load_operator_config()?,
             capability,
             crate::scope::ScopeFlags {
@@ -450,7 +450,7 @@ impl GraphClient {
         // RFC-011 scope translation (see `resolve`); explicit addressing passes
         // through unchanged, and the caller threads its verb's declared
         // capability.
-        let scope = crate::scope::resolve_scope(
+        let scope = crate::scope::resolve_scope_from_env(
             &crate::operator::load_operator_config()?,
             capability,
             crate::scope::ScopeFlags {

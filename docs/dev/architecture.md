@@ -54,6 +54,12 @@ embedded caller may use the engine directly; the CLI may use an embedded store
 or the HTTP API; the server hosts multiple graphs from one applied cluster
 revision.
 
+The CLI's [scope resolver](../../crates/omnigraph-cli/src/scope.rs) selects an
+ordinary scope from supplied flags, operator configuration and an ambient profile
+value. Its `resolve_scope_from_env` boundary captures `OMNIGRAPH_PROFILE`;
+configuration loading, credential acquisition and server discovery remain with
+their existing callers.
+
 ## Authority model
 
 Three kinds of state must not be conflated:
