@@ -34,8 +34,8 @@ pub struct IntentReply {
     pub body: Vec<u8>,
 }
 
-/// Delivery faults applied only after a real server's successful merge or
-/// Blob write reply has been fully read. They cannot stand in for cancelling a
+/// Delivery faults applied only after a real server's successful merge, Blob
+/// write or commit control reply has been fully read. They cannot stand in for cancelling a
 /// server request.
 #[derive(Debug, Clone, Copy)]
 pub enum MergeDeliveryFault {
@@ -120,8 +120,8 @@ impl IntentApiFixture {
         Self::start(replies, None, delay, true)
     }
 
-    /// Forward discovery and one merge to an actual server, then break only
-    /// delivery of the successful merge response. Unexpected calls stay counted.
+    /// Forward discovery and one graph write to an actual server, then break
+    /// only delivery of its successful response. Unexpected calls stay counted.
     pub fn graph_merge_proxy(upstream: &str, fault: MergeDeliveryFault) -> Self {
         Self::start_with_origin(
             |_| Vec::new(),
@@ -386,17 +386,32 @@ impl IntentApiFixture {
                             .split('?')
                             .next()
                             .is_some_and(|path| path.ends_with("/blob"));
+                    let segments: Vec<_> = request.path.split('/').collect();
+                    let commit_publish = request.method == "POST"
+                        && matches!(
+                            segments.as_slice(),
+                            ["", "graphs", _, "commits", _, "publish"]
+                        );
+                    let commit_drop = request.method == "DELETE"
+                        && matches!(segments.as_slice(), ["", "graphs", _, "commits", _]);
                     if let Forwarding::Merge(_, fault) = forwarding
                         && ((request.method == "POST"
                             && (request.path.ends_with("/branches/merge")
                                 || request.path.ends_with("/mutate")))
-                            || blob_write)
+                            || blob_write
+                            || commit_publish
+                            || commit_drop)
                     {
-                        assert_eq!(reply.status, 200, "upstream write must succeed");
+                        assert_eq!(
+                            reply.status,
+                            if commit_drop { 204 } else { 200 },
+                            "upstream write must succeed"
+                        );
                         captured_responses.lock().unwrap().push(reply.clone());
                         match fault {
                             MergeDeliveryFault::Disconnect => continue,
                             MergeDeliveryFault::Truncate => {
+                                assert!(!commit_drop, "a 204 response has no body to truncate");
                                 reply
                                     .headers
                                     .push(("content-length".into(), reply.body.len().to_string()));

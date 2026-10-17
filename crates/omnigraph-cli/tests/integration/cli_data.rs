@@ -2460,6 +2460,10 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         vec!["branch", "create", "review"],
         vec!["branch", "delete", "review", "--yes"],
         vec!["branch", "merge", "review"],
+        vec!["mutate", "-e", "commit publish \"proposal\""],
+        vec!["mutate", "-e", "commit drop \"proposal\"", "--yes"],
+        vec!["commit", "publish", "proposal"],
+        vec!["commit", "drop", "proposal", "--yes"],
         vec!["load", "--data", data, "--mode", "append"],
         vec![
             "load", "--data", data, "--mode", "merge", "--branch", "review", "--from", "main",
@@ -3436,6 +3440,8 @@ fn quiet_suppresses_the_write_target_echo() {
 
 #[test]
 fn branch_delete_against_non_local_scope_refuses_without_yes() {
+    use crate::support::managed_http::IntentApiFixture;
+
     // No bucket needed: the confirm gate fires before the graph is opened.
     let output = output_failure(
         cli()
@@ -3450,6 +3456,40 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
     let error = output["error"].as_str().unwrap();
     assert!(error.contains("refusing destructive `branch delete`") && error.contains("--yes"));
     assert_eq!(output["command_outcome"]["effects"], "none");
+
+    // Both commit-drop spellings use the same consent gate before submission.
+    for arguments in [
+        vec!["commit", "drop", "proposal"],
+        vec!["mutate", "-e", "commit drop \"proposal\""],
+    ] {
+        let server = IntentApiFixture::graph(vec![]);
+        let output = output_failure(cli().args(&arguments).args([
+            "--server",
+            &server.origin,
+            "--graph",
+            "knowledge",
+            "--json",
+        ]));
+        let error = parse_stdout_json(&output);
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("refusing destructive `commit drop`"),
+            "{arguments:?}: {error}"
+        );
+        assert_eq!(
+            error["command_outcome"],
+            serde_json::json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
+            "{arguments:?}"
+        );
+        let requests = server.requests();
+        assert!(
+            requests.is_empty(),
+            "consent precedes discovery and submission: {arguments:?}"
+        );
+        server.assert_complete();
+    }
 }
 
 #[test]
