@@ -95,6 +95,11 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-gqt-core` | GQT format, ordinary session execution and expectation checks, shared by the GQT runner and benchmark harness. It has no build script or test-only engine dependency. |
 | `omnigraph-reference-engine` | Engine v1, frozen (`publish = false`, hash-pinned by its `tests/frozen.rs`): the reference executor a GQT step's `--- expect same as v1` compares engine v2 against. Its input is the pinned `omnigraph_compiler::ir::untyped` read IR, produced by one-way erasure only at the test reference door. It depends only on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and third-party crates; `omnigraph-gqt` is the only crate that may depend on it (`forbidden_apis.rs` guards both), and no production door reaches it. |
 
+The CLI's [invocation parser](../../crates/omnigraph-cli/src/invocation.rs) owns
+command construction, explicit argument provenance and cross-level argument
+validation. It reads no operator configuration or command inputs. Execution keeps
+its existing routing, credential acquisition and output owners.
+
 ## Principal flows
 
 - A read resolves one branch or snapshot and keeps that immutable view for the

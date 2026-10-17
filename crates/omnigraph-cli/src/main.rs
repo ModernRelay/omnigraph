@@ -1,9 +1,8 @@
 #![recursion_limit = "256"]
 
-use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::ValueEnum;
 use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
-use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
     CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput,
@@ -26,9 +25,7 @@ use omnigraph_compiler::{
     json_params_to_param_map, lint_query_file,
 };
 use omnigraph_server::queries::{QueryRegistry, check};
-use omnigraph_server::{
-    PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig,
-};
+use omnigraph_server::{PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig};
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
@@ -42,7 +39,7 @@ mod embed;
 mod operator;
 mod read_format;
 
-use embed::{EmbedArgs, EmbedOutput, execute_embed};
+use embed::{EmbedOutput, execute_embed};
 use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 
 mod admission;
@@ -53,6 +50,7 @@ mod cluster_remote;
 mod command_outcome;
 mod graph_http;
 mod helpers;
+mod invocation;
 mod managed;
 #[cfg(test)]
 #[path = "../tests/support/managed_http.rs"]
@@ -68,6 +66,7 @@ mod unix_gateway_fixture;
 mod upgrade;
 use cli::*;
 use helpers::*;
+use invocation::{MachineErrors, ParsedInvocation};
 use output::*;
 
 /// Exit code for a verified remote `--if-commit` refusal (HTTP 412) with
@@ -151,45 +150,8 @@ async fn main() -> Result<()> {
         .display_env_section(false)
         .display_location_section(false)
         .install()?;
-    let (cli, machine) = {
-        let matches = Cli::command()
-            .arg(
-                Arg::new("version")
-                    .short('v')
-                    .long("version")
-                    .action(ArgAction::Version)
-                    .help("Print version"),
-            )
-            .get_matches();
-        let mut command_matches = &matches;
-        while let Some((_, child)) = command_matches.subcommand() {
-            command_matches = child;
-        }
-        let format = command_matches
-            .try_get_one::<ReadOutputFormat>("format")
-            .ok()
-            .flatten()
-            .copied();
-        let json = command_matches
-            .try_get_one::<bool>("json")
-            .ok()
-            .flatten()
-            .copied()
-            .unwrap_or(false)
-            || format == Some(ReadOutputFormat::Json);
-        let machine = if json {
-            Some(MachineErrors::Json)
-        } else if format == Some(ReadOutputFormat::Jsonl) {
-            Some(MachineErrors::Jsonl)
-        } else {
-            None
-        };
-        let cli = Cli::from_arg_matches(&matches)?;
-        if let Err(error) = validate_cluster_arguments(&cli, command_matches) {
-            error.exit();
-        }
-        (cli, machine)
-    };
+    let ParsedInvocation { cli, machine, .. } =
+        invocation::parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     let (result, evidence) = if command_outcome::applies(&cli) {
         let (result, evidence) = admission::scope(command_outcome::observe(run(cli))).await;
         (result, Some(evidence))
@@ -256,163 +218,6 @@ async fn main() -> Result<()> {
         }
         result => result,
     }
-}
-
-/// Cross-level argument relations must be checked after Clap propagates global
-/// values: subcommand validation cannot see `--cluster` given before `cluster`.
-fn validate_cluster_arguments(
-    cli: &Cli,
-    command_matches: &clap::ArgMatches,
-) -> std::result::Result<(), clap::Error> {
-    if matches!(&cli.command, Command::Organization { managed: false, .. }) {
-        return Err(Cli::command().error(
-            clap::error::ErrorKind::ArgumentConflict,
-            "organization commands require --managed",
-        ));
-    }
-    let Command::Cluster { managed, command } = &cli.command else {
-        return Ok(());
-    };
-    let conflict =
-        |message| Cli::command().error(clap::error::ErrorKind::ArgumentConflict, message);
-    if *managed {
-        match command {
-            ClusterCommand::Validate { .. }
-            | ClusterCommand::Observe { .. }
-            | ClusterCommand::ForceUnlock { .. }
-            | ClusterCommand::UpgradeLedger { .. } => {
-                return Err(conflict("this command cannot be used with --managed"));
-            }
-            ClusterCommand::Apply {
-                deployment_id,
-                writers_stopped,
-                plan,
-                ..
-            } => {
-                if deployment_id.is_some() || *writers_stopped {
-                    return Err(conflict(
-                        "--deployment-id and --writers-stopped cannot be used with --managed",
-                    ));
-                }
-                if plan.is_none() {
-                    return Err(Cli::command().error(
-                        clap::error::ErrorKind::MissingRequiredArgument,
-                        "cluster apply --managed requires --plan <PREVIEW_ID>",
-                    ));
-                }
-            }
-            ClusterCommand::Status { deployment_id, .. } if deployment_id.is_some() => {
-                return Err(conflict(
-                    "--managed status accepts a positional DEPLOYMENT_ID; --deployment-id selects a server or storage deployment",
-                ));
-            }
-            _ => {}
-        }
-        // The managed dispatcher rejects competing target selectors before
-        // reading context, preserving its structured scope diagnostics.
-        return Ok(());
-    }
-    match command {
-        ClusterCommand::Create { .. }
-        | ClusterCommand::List { .. }
-        | ClusterCommand::Members { .. }
-        | ClusterCommand::Pull { .. }
-        | ClusterCommand::Push { .. }
-        | ClusterCommand::Delete { .. }
-        | ClusterCommand::UndoDelete { .. }
-        | ClusterCommand::Token { .. }
-        | ClusterCommand::Operation { .. }
-        | ClusterCommand::History { .. }
-        | ClusterCommand::Cancel { .. } => {
-            return Err(conflict("this command requires --managed"));
-        }
-        ClusterCommand::Plan { revision, run, .. }
-            if revision.is_some()
-                || run.no_wait
-                || run.timeout.is_some()
-                || run.idempotency_key.is_some() =>
-        {
-            return Err(conflict(
-                "plan options --rev, --no-wait, --timeout and --idempotency-key require --managed",
-            ));
-        }
-        ClusterCommand::Apply { plan, run, .. }
-            if plan.is_some() || run.idempotency_key.is_some() =>
-        {
-            return Err(conflict("--plan and --idempotency-key require --managed"));
-        }
-        ClusterCommand::Status {
-            run_id: Some(_), ..
-        } => {
-            return Err(conflict(
-                "a positional delivery ID requires --managed; use --deployment-id for a server or storage deployment",
-            ));
-        }
-        _ => {}
-    }
-    if cli.server.is_none()
-        && matches!(
-            command,
-            ClusterCommand::Apply {
-                run: ClusterRunArgs { no_wait: true, .. },
-                ..
-            } | ClusterCommand::Apply {
-                run: ClusterRunArgs {
-                    timeout: Some(_),
-                    ..
-                },
-                ..
-            } | ClusterCommand::Status { wait: true, .. }
-        )
-    {
-        return Err(Cli::command().error(
-            clap::error::ErrorKind::ArgumentConflict,
-            "deployment wait options require --server <SERVER>",
-        ));
-    }
-    if cli.cluster.is_some()
-        && command_matches
-            .try_get_one::<PathBuf>("config")
-            .ok()
-            .flatten()
-            .is_some()
-        && command_matches.value_source("config") == Some(clap::parser::ValueSource::CommandLine)
-    {
-        return Err(Cli::command().error(
-            clap::error::ErrorKind::ArgumentConflict,
-            "--cluster and explicit --config cannot be used together",
-        ));
-    }
-    if cli.cluster.is_none()
-        && cli.server.is_none()
-        && matches!(
-            command,
-            ClusterCommand::UpgradeLedger { .. }
-                | ClusterCommand::Apply {
-                    writers_stopped: true,
-                    ..
-                }
-                | ClusterCommand::Status {
-                    deployment_id: Some(_),
-                    ..
-                }
-        )
-    {
-        return Err(Cli::command().error(
-            clap::error::ErrorKind::MissingRequiredArgument,
-            "this deployment operation requires --cluster <ROOT>",
-        ));
-    }
-    Ok(())
-}
-
-/// The machine error format a run's output format asks for: `--json` (and
-/// `--format json`) print the error body pretty, `--format jsonl` prints it
-/// as one line, like the rows it would have carried.
-#[derive(Clone, Copy)]
-enum MachineErrors {
-    Json,
-    Jsonl,
 }
 
 /// The error body a failed run would carry on the wire: a served refusal's
