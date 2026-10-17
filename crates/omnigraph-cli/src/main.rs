@@ -1910,9 +1910,14 @@ async fn run(cli: Cli) -> Result<()> {
                     defined.join(", ")
                 );
             };
-            let output =
-                execute_operator_alias(&name, operator_alias, &args, load_params_json(&params)?)
-                    .await?;
+            let output = execute_operator_alias(
+                &operator_config,
+                &name,
+                operator_alias,
+                &args,
+                load_params_json(&params)?,
+            )
+            .await?;
             let format = resolve_read_format(format, json, operator_alias.format);
             print_read_output(&output, format)?;
         }

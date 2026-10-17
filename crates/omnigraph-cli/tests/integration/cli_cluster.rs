@@ -69,6 +69,115 @@ fn lifecycle_fixture(replies: Vec<IntentReply>) -> IntentApiFixture {
     IntentApiFixture::with_session(replies, lifecycle_session("principal-one", "account-one"))
 }
 
+#[test]
+fn core_remote_status_uses_one_operator_config_for_server_and_token() {
+    let status = serde_json::json!({
+        "status": {
+            "canonical_root": "file:///server-only-storage",
+            "ledger_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "state_revision": 1,
+            "result_revision": 0,
+            "next_sequence": 1,
+            "lock_id": "server-owner",
+            "outstanding_id": null,
+            "lookup": null
+        },
+        "active": false,
+        "in_progress": false
+    });
+    for named in [true, false] {
+        let home = tempdir().unwrap();
+        let api = IntentApiFixture::graph(vec![IntentReply::json(200, status.clone())]);
+        fs::write(
+            home.path().join("config.yaml"),
+            format!(
+                "servers:\n  status-server:\n    url: '{}'\ncaptured_only: true\n",
+                api.origin
+            ),
+        )
+        .unwrap();
+        let server = if named { "status-server" } else { &api.origin };
+        let output = output_success(
+            cli()
+                .current_dir(home.path())
+                .env("OMNIGRAPH_HOME", home.path())
+                .env("OMNIGRAPH_TOKEN_STATUS_SERVER", "keyed-status-token")
+                .env("OMNIGRAPH_BEARER_TOKEN", "fallback-status-token")
+                .args(["cluster", "status", "--server", server, "--json"]),
+        );
+        assert_eq!(parse_stdout_json(&output), status);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches("unknown key `captured_only`").count(),
+            1,
+            "one setup must read and warn about its config once: named={named}: {stderr}"
+        );
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/cluster/deployments");
+        assert_eq!(
+            requests[0].headers["authorization"],
+            "Bearer keyed-status-token"
+        );
+        for request in api
+            .requests()
+            .iter()
+            .filter(|request| request.method == "HEAD")
+        {
+            assert!(!request.headers.contains_key("authorization"));
+        }
+        assert_no_core_effects(home.path());
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn core_remote_server_validation_preserves_config_error_precedence() {
+    let home = tempdir().unwrap();
+    fs::write(home.path().join("config.yaml"), "servers: [\n").unwrap();
+    let api = IntentApiFixture::graph(vec![]);
+    for server in [
+        "ftp://host/root",
+        "file:///must-not-open",
+        "s3://bucket/must-not-open",
+        "unix://host/tmp/og.sock",
+    ] {
+        let output = output_failure(
+            cli()
+                .current_dir(home.path())
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["cluster", "status", "--server", server, "--json"]),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("invalid server address"),
+            "{server}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("could not parse operator config"),
+            "literal validation must precede config loading: {server}: {stderr}"
+        );
+    }
+    for server in ["status-server", api.origin.as_str()] {
+        let output = output_failure(
+            cli()
+                .current_dir(home.path())
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["cluster", "status", "--server", server, "--json"]),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("could not parse operator config"),
+            "{server}: {stderr}"
+        );
+        assert!(!stderr.contains("unknown server"), "{server}: {stderr}");
+    }
+    assert!(api.requests().is_empty());
+    assert_no_core_effects(home.path());
+    api.assert_complete();
+}
+
 /// The source directory belongs to the caller; the file storage root belongs
 /// to the server. An absent client-side mount must not prevent HTTP submission.
 #[test]
