@@ -10,11 +10,16 @@ pub struct Completion {
 }
 
 impl Completion {
-    pub(crate) const fn success() -> Self { Self::exit(0) }
-    pub(crate) const fn exit(code: i32) -> Self { Self { code } }
-    pub const fn code(self) -> i32 { self.code }
+    pub(crate) const fn success() -> Self {
+        Self::exit(0)
+    }
+    pub(crate) const fn exit(code: i32) -> Self {
+        Self { code }
+    }
+    pub const fn code(self) -> i32 {
+        self.code
+    }
 }
-
 
 /// fsync the directory holding a just-atomically-persisted file so the rename
 /// itself is durable before a resume cursor is printed. On Unix this opens the
@@ -92,80 +97,155 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let ParsedInvocation { cli, machine, .. } = match invocation::parse_from(args) {
+    let parsed = match invocation::parse_from(args) {
         Ok(parsed) => parsed,
         Err(error) => {
             error.print()?;
             return Ok(Completion::exit(error.exit_code()));
         }
     };
-    let (result, evidence) = if command_outcome::applies(&cli) {
-        let (result, evidence) = admission::scope(command_outcome::observe(run(cli))).await;
+    execute(parsed, &mut io::stdout(), &mut io::stderr()).await
+}
+
+async fn execute(
+    parsed: ParsedInvocation,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Completion> {
+    let ParsedInvocation {
+        cli, mut machine, ..
+    } = parsed;
+    let observe = command_outcome::applies(&cli);
+    // Rendering runs inside observation. The completion path retains that
+    // same evidence when flushing, including after a dispatched write.
+    // The legacy dispatch future contains every command variant. Keep that
+    // large state off reusable callers' stacks (including libtest threads).
+    let invocation = Box::pin(run(cli, &mut machine, stdout));
+    let (result, evidence) = if observe {
+        let (result, evidence) = admission::scope(command_outcome::observe(invocation)).await;
         (result, Some(evidence))
     } else {
-        (admission::scope(run(cli)).await, None)
+        (admission::scope(invocation).await, None)
     };
-    match result {
-        Err(error) => {
-            if error
-                .downcast_ref::<cluster_remote::WaitTimeout>()
-                .is_some()
-            {
-                std::io::stdout().flush()?;
-                return Ok(Completion::exit(5));
-            }
-            if let Some(evidence) = evidence {
-                let failure = command_outcome::Failure::classify(error, evidence);
-                match machine {
-                    Some(MachineErrors::Json) => print_json(&failure)?,
-                    Some(MachineErrors::Jsonl) => println!("{}", serde_json::to_string(&failure)?),
-                    None => {
-                        let message = match &failure.output.diagnostic {
-                            Some(diagnostic) => render_diagnostic(&failure.output, diagnostic),
-                            None => failure.output.error.clone(),
-                        };
-                        eprintln!("{message}");
-                        if let Some(status) = failure.http_status {
-                            eprintln!("HTTP {status}");
-                        }
-                        if let Some(backoff) = &failure.retry_after {
-                            eprintln!("Retry-After: {backoff}");
-                        }
-                        eprintln!(
-                            "command_outcome: {}",
-                            serde_json::to_string(&failure.command_outcome)?
-                        );
+    finish(result, evidence, machine, stdout, stderr)
+}
+
+fn finish(
+    result: Result<Completion>,
+    evidence: Option<command_outcome::Evidence>,
+    machine: Option<MachineErrors>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Completion> {
+    let result = result.and_then(|completion| {
+        stdout.flush()?;
+        Ok(completion)
+    });
+    let error = match result {
+        Ok(completion) => return Ok(completion),
+        Err(error) => error,
+    };
+    if error
+        .downcast_ref::<cluster_remote::WaitTimeout>()
+        .is_some()
+    {
+        stdout.flush()?;
+        return Ok(Completion::exit(5));
+    }
+    if let Some(evidence) = evidence {
+        let failure = command_outcome::Failure::classify(error, evidence);
+        let delivered = (|| -> Result<()> {
+            match machine {
+                Some(format) => write_machine(&failure, format, stdout)?,
+                None => {
+                    let message = match &failure.output.diagnostic {
+                        Some(diagnostic) => render_diagnostic(&failure.output, diagnostic),
+                        None => failure.output.error.clone(),
+                    };
+                    writeln!(stderr, "{message}")?;
+                    if let Some(status) = failure.http_status {
+                        writeln!(stderr, "HTTP {status}")?;
                     }
+                    if let Some(backoff) = &failure.retry_after {
+                        writeln!(stderr, "Retry-After: {backoff}")?;
+                    }
+                    writeln!(
+                        stderr,
+                        "command_outcome: {}",
+                        serde_json::to_string(&failure.command_outcome)?
+                    )?;
+                    stderr.flush()?;
                 }
-                std::io::stdout().flush()?;
-                return Ok(Completion::exit(failure.exit));
             }
-            if let Some(output) = error_output_of(&error) {
-                match machine {
-                    Some(MachineErrors::Json) => print_json(&output)?,
-                    Some(MachineErrors::Jsonl) => println!("{}", serde_json::to_string(&output)?),
-                    None => match &output.diagnostic {
-                        Some(diagnostic) => eprintln!("{}", render_diagnostic(&output, diagnostic)),
-                        None => return Err(error),
-                    },
-                }
-                std::io::stdout().flush()?;
-                return Ok(Completion::exit(1));
-            }
-            if let Some(contract) = error.downcast_ref::<graph_http::ApiContractError>() {
-                match machine {
-                    Some(MachineErrors::Json) => print_json(contract)?,
-                    Some(MachineErrors::Jsonl) => println!("{}", serde_json::to_string(contract)?),
-                    None => return Err(error),
-                }
-                std::io::stdout().flush()?;
-                return Ok(Completion::exit(1));
-            }
-            Err(error)
+            stdout.flush()?;
+            Ok(())
+        })();
+        if let Err(delivery) = delivered {
+            // stdout may be closed or contain a partial result. Retain the
+            // complete outcome in the returned error, which main reports on
+            // stderr, rather than losing it to the output error.
+            return Err(UndeliveredFailure { failure, delivery }.into());
         }
-        result => result,
+        return Ok(Completion::exit(failure.exit));
+    }
+    if let Some(output) = error_output_of(&error) {
+        match machine {
+            Some(format) => write_machine(&output, format, stdout)?,
+            None => match &output.diagnostic {
+                Some(diagnostic) => {
+                    writeln!(stderr, "{}", render_diagnostic(&output, diagnostic))?;
+                    stderr.flush()?;
+                }
+                None => return Err(error),
+            },
+        }
+        stdout.flush()?;
+        return Ok(Completion::exit(1));
+    }
+    if let Some(contract) = error.downcast_ref::<graph_http::ApiContractError>() {
+        match machine {
+            Some(format) => write_machine(contract, format, stdout)?,
+            None => return Err(error),
+        }
+        stdout.flush()?;
+        return Ok(Completion::exit(1));
+    }
+    // Unstructured transport errors keep their stderr-only diagnostic path.
+    Err(error)
+}
+
+fn write_machine<T: Serialize>(
+    value: &T,
+    format: MachineErrors,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    match format {
+        MachineErrors::Json => output::write_json(value, writer),
+        MachineErrors::Jsonl => {
+            writeln!(writer, "{}", serde_json::to_string(value)?)?;
+            Ok(())
+        }
     }
 }
+
+#[derive(Debug)]
+struct UndeliveredFailure {
+    failure: command_outcome::Failure,
+    delivery: color_eyre::Report,
+}
+
+impl std::fmt::Display for UndeliveredFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not deliver CLI diagnostic: {}; {}",
+            self.delivery,
+            serde_json::to_string(&self.failure).map_err(|_| std::fmt::Error)?
+        )
+    }
+}
+
+impl std::error::Error for UndeliveredFailure {}
 
 /// The error body a failed run would carry on the wire: a served refusal's
 /// own body, or an embedded compile refusal rendered the way the server
@@ -198,7 +278,11 @@ fn render_diagnostic(
     lines.join("\n")
 }
 
-async fn run(cli: Cli) -> Result<Completion> {
+async fn run(
+    cli: Cli,
+    machine: &mut Option<MachineErrors>,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if cluster_remote::dispatch(&cli).await? {
         return Ok(Completion::success());
     }
@@ -1139,7 +1223,8 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
             }
             SchemaCommand::UpgradeSystemColumns { uri, check, json } => {
-                return schema_upgrade::run(&cli.profile, &cli.store, uri, check, json, cli.quiet).await;
+                return schema_upgrade::run(&cli.profile, &cli.store, uri, check, json, cli.quiet)
+                    .await;
             }
             SchemaCommand::Show { uri, json } => {
                 let client = client::GraphClient::resolve(
@@ -1392,6 +1477,8 @@ async fn run(cli: Cli) -> Result<Completion> {
                     yes: cli.yes,
                 },
                 managed_data,
+                machine,
+                stdout,
             )
             .await?;
         }
@@ -1408,10 +1495,11 @@ async fn run(cli: Cli) -> Result<Completion> {
                     yes: cli.yes,
                 },
                 managed_data,
+                stdout,
             )
             .await?;
         }
-        Command::Alias(args) => commands::query::run_alias(args).await?,
+        Command::Alias(args) => commands::query::run_alias(args, machine, stdout).await?,
         Command::Policy { command } => {
             // Policy tooling sources the Cedar bundle(s) from the cluster's
             // applied policies (RFC-011): --cluster <dir>, + the global --graph
@@ -2048,3 +2136,7 @@ async fn run_diff(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

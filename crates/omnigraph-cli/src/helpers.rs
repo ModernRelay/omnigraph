@@ -824,26 +824,6 @@ pub(crate) fn resolve_query_path(
         })
 }
 
-/// The format cascade (RFC-011): `--json` > `--format` > alias format >
-/// operator `defaults.output` > table.
-pub(crate) fn resolve_read_format(
-    cli_format: Option<ReadOutputFormat>,
-    json: bool,
-    alias_format: Option<ReadOutputFormat>,
-) -> ReadOutputFormat {
-    if json {
-        return ReadOutputFormat::Json;
-    }
-    cli_format
-        .or(alias_format)
-        .or_else(|| {
-            operator::load_operator_config()
-                .ok()
-                .and_then(|operator| operator.output())
-        })
-        .unwrap_or_default()
-}
-
 /// Pick the query the caller named out of an already-parsed source. An
 /// `explain` statement offers its one declaration (the engine answers the
 /// plan); the `Branch` arm stays as the guard: a branch statement never
@@ -1179,8 +1159,8 @@ pub(crate) async fn execute_queries_list(
 
 #[cfg(test)]
 mod tests {
-    use omnigraph_compiler::query::parser::parse_query;
     use super::*;
+    use omnigraph_compiler::query::parser::parse_query;
 
     #[test]
     fn stored_query_parse_failures_keep_diagnostics_in_validation_output() {

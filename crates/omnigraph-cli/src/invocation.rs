@@ -17,8 +17,8 @@ pub(crate) struct ParsedInvocation {
     pub(crate) explicit_config: bool,
 }
 
-/// The machine error format requested by argv alone. Alias/operator defaults
-/// remain with the existing execution path.
+/// The initial machine error format requested by argv alone. Read execution
+/// can replace it after capturing valid operator and alias preferences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MachineErrors {
     Json,

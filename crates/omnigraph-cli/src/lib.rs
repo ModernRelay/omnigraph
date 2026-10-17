@@ -5,7 +5,7 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::Omnigraph;
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
-    CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput,
+    CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput,
     SchemaApplyOutput, SnapshotDatasetOutput,
 };
 use omnigraph_cluster::{
@@ -35,7 +35,6 @@ mod operator;
 mod read_format;
 
 use embed::{EmbedOutput, execute_embed};
-use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 
 mod admission;
 mod blob_cli;
@@ -53,6 +52,7 @@ mod managed;
 mod managed_http_fixture;
 mod output;
 mod planes;
+mod presentation;
 mod schema_upgrade;
 mod scope;
 mod skill;
@@ -67,7 +67,6 @@ use invocation::{MachineErrors, ParsedInvocation};
 pub mod app;
 use app::{core_deployment_result, error_output_of, sync_dir};
 use output::*;
-
 
 #[cfg(test)]
 #[path = "main_tests.rs"]

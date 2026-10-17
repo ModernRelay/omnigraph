@@ -395,6 +395,20 @@ impl GraphClient {
         profile: Option<&str>,
         store: Option<&str>,
     ) -> Result<Self> {
+        let operator = operator::load_operator_config()?;
+        Self::resolve_with_config(&operator, capability, server, graph, uri, profile, store).await
+    }
+
+    /// Reuse the caller's validated configuration for routing and presentation.
+    pub(crate) async fn resolve_with_config(
+        operator: &OperatorConfig,
+        capability: crate::planes::Capability,
+        server: Option<&str>,
+        graph: Option<&str>,
+        uri: Option<String>,
+        profile: Option<&str>,
+        store: Option<&str>,
+    ) -> Result<Self> {
         // RFC-011: a scope (profile / --store / operator defaults) may stand in
         // for omitted addressing. The explicit branch passes server/graph/uri
         // straight through, so existing invocations are unchanged. The caller
@@ -402,9 +416,8 @@ impl GraphClient {
         // so scope resolution and the addressing guard share one
         // classification; every current caller is a data-plane (`Any`) verb —
         // registry-scoped `graphs list` uses `resolve_registry` instead.
-        let operator = operator::load_operator_config()?;
         let scope = crate::scope::resolve_scope_from_env(
-            &operator,
+            operator,
             capability,
             crate::scope::ScopeFlags {
                 profile,
@@ -415,15 +428,15 @@ impl GraphClient {
                 uri,
             },
         )?;
-        require_graph_for_multi_graph_server(&operator, &scope).await?;
+        require_graph_for_multi_graph_server(operator, &scope).await?;
         let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         if server.is_none() && is_catalogue_scope(uri.as_deref()) {
             return Ok(GraphClient::Catalogue);
         }
         let via_server = server.is_some();
-        let server_root = resolve_server_flag_with_config(&operator, server, None)?;
-        let uri = apply_server_flag(&operator, server_root.as_deref(), graph, uri)?;
-        let token = resolve_remote_bearer_token_with_config(&operator, uri.as_deref())?;
+        let server_root = resolve_server_flag_with_config(operator, server, None)?;
+        let uri = apply_server_flag(operator, server_root.as_deref(), graph, uri)?;
+        let token = resolve_remote_bearer_token_with_config(operator, uri.as_deref())?;
         let uri = crate::helpers::resolve_uri(uri)?;
         reject_positional_remote(via_server, &uri)?;
         if is_remote_uri(&uri) {

@@ -1,5 +1,4 @@
-//! In-source test suite for the CLI binary (moved verbatim from
-//! main.rs; `use super::*` resolves through the #[path] declaration).
+//! Shared CLI contract tests, compiled once in the application library.
 
 use super::{
     DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, branch_statement_change_request,

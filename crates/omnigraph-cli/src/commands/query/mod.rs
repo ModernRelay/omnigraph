@@ -7,6 +7,7 @@ mod args;
 mod prepare;
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use color_eyre::eyre::{Result, bail};
@@ -19,12 +20,14 @@ use serde_json::Value;
 use crate::client::{GraphClient, parse_set_flags};
 use crate::graph_http::GraphHttpClient;
 use crate::helpers::{
-    confirm_destructive, remote_json, remote_url, resolve_query_path, resolve_read_format,
+    confirm_destructive, remote_json, remote_url, resolve_query_path,
     resolve_remote_bearer_token_with_config, resolve_server_flag_with_config,
 };
+use crate::invocation::MachineErrors;
 use crate::operator::{self, OperatorAlias, OperatorConfig};
-use crate::output::{print_change_human, print_json, print_read_output};
+use crate::output::{write_change_human, write_json};
 use crate::planes::Capability;
+use crate::presentation::ReadPresentation;
 
 use args::ParamsArgs;
 pub(crate) use args::{AliasArgs, MutateArgs, QueryArgs};
@@ -45,6 +48,8 @@ pub(crate) async fn run_query(
     args: QueryArgs,
     scope: GraphScope<'_>,
     managed_client: Option<GraphClient>,
+    machine: &mut Option<MachineErrors>,
+    stdout: &mut dyn Write,
 ) -> Result<()> {
     let QueryArgs {
         name,
@@ -58,10 +63,21 @@ pub(crate) async fn run_query(
         json,
     } = args;
     let settings = parse_set_flags(&settings)?;
+    // Ordinary query routing and rendering share this snapshot. A managed
+    // client has already resolved its own context; preserve its existing
+    // tolerance of an invalid optional operator presentation file.
+    let operator = if managed_client.is_some() {
+        operator::load_operator_config().unwrap_or_default()
+    } else {
+        operator::load_operator_config()?
+    };
+    let presentation = ReadPresentation::capture(&operator, format, json, None);
+    *machine = presentation.machine_errors();
     let client = if let Some(client) = managed_client {
         client
     } else {
-        GraphClient::resolve(
+        GraphClient::resolve_with_config(
+            &operator,
             scope.capability,
             scope.server,
             scope.graph,
@@ -125,8 +141,7 @@ pub(crate) async fn run_query(
         }
         ReadOperation::Show(source, id) => client.show_statement(source, id, &settings).await?,
     };
-    let format = resolve_read_format(format, json, None);
-    print_read_output(&output, format)?;
+    presentation.write_read(&output, stdout)?;
     Ok(())
 }
 
@@ -134,6 +149,7 @@ pub(crate) async fn run_mutate(
     args: MutateArgs,
     scope: GraphScope<'_>,
     managed_client: Option<GraphClient>,
+    stdout: &mut dyn Write,
 ) -> Result<()> {
     let MutateArgs {
         name,
@@ -233,14 +249,18 @@ pub(crate) async fn run_mutate(
         }
     };
     if json {
-        print_json(&output)?;
+        write_json(&output, stdout)?;
     } else {
-        print_change_human(&output);
+        write_change_human(&output, stdout)?;
     }
     Ok(())
 }
 
-pub(crate) async fn run_alias(args: AliasArgs) -> Result<()> {
+pub(crate) async fn run_alias(
+    args: AliasArgs,
+    machine: &mut Option<MachineErrors>,
+    stdout: &mut dyn Write,
+) -> Result<()> {
     let AliasArgs {
         name,
         args,
@@ -257,6 +277,9 @@ pub(crate) async fn run_alias(args: AliasArgs) -> Result<()> {
             defined.join(", ")
         );
     };
+    let presentation =
+        ReadPresentation::capture(&operator_config, format, json, operator_alias.format);
+    *machine = presentation.machine_errors();
     let output = execute_operator_alias(
         &operator_config,
         &name,
@@ -265,8 +288,7 @@ pub(crate) async fn run_alias(args: AliasArgs) -> Result<()> {
         load_params_json(&params)?,
     )
     .await?;
-    let format = resolve_read_format(format, json, operator_alias.format);
-    print_read_output(&output, format)?;
+    presentation.write_read(&output, stdout)?;
     Ok(())
 }
 
