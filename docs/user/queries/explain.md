@@ -276,7 +276,8 @@ takes the same `--branch`/`--snapshot` target and `--params` as the query
 itself and needs the same `read` policy decision. `mutate` refuses it, as does a
 mutation declaration under `explain`. A load statement under `explain` takes
 the same doors with a `--branch` target only: a historical `--snapshot` is
-refused, since a load targets a branch head.
+refused, since a load targets a branch head. Served load explain requests
+require the load's `change` permission on that branch before source access.
 
 Every read executes on engine v2, the one value of the session setting
 `engine`, so explain describes the route the query runs. See
@@ -291,11 +292,10 @@ instead of running the load:
 explain load csv "s3://imports/knows.csv" into edge:Knows mode overwrite delimiter "|" header
 ```
 
-The statement takes the load's own form and every option the load takes.
-It reads no payload byte: only the external Blob policy check and the
-source's metadata probe run.
-A source over `load_source_max_bytes` refuses as `csv_source_bytes`, exactly
-as the load would.
+The statement accepts every load option. It reads metadata, but no payload,
+and publishes nothing. HTTP and MCP require `change` on the target branch
+before the external Blob policy check or metadata probe. A source over
+`load_source_max_bytes` refuses as `csv_source_bytes`, as a load would.
 
 The answer is the planner's document, in the same rows a query's explain
 uses: trees `logical_initial`, `logical` and `physical` in pre-order, then the `plan` rows.
@@ -324,12 +324,13 @@ committed table it reads, or `null`) and, on the physical node, `access`:
 | `probe` | a filtered key lookup; uniqueness uses chunks of 8,192 keys |
 | `scan` | one projected scan of the key columns, matched in memory |
 
-Endpoint and uniqueness checks take `probe` when the estimated rows fit one
-chunk and `scan` otherwise. `cardinality` and `retained_edges` always take
-`probe`. A node overwrite separately scans its old node IDs to find removals;
-the retained-edge access describes the filtered lookup in the incident edge
-table.
-Append and merge take `probe` everywhere.
+Overwrite endpoint checks cost probes and scans using estimated input rows,
+the consulted table's row count, and usable BTREE coverage at the accepted
+version. Partial or missing coverage gets no index discount. Unknown counts
+and equal costs keep `probe`; statistics record the inputs and both costs.
+`cardinality` and `retained_edges` always use `probe`. Node overwrite scans
+old node IDs to find removals; retained-edge access describes the filtered
+lookup in the incident edge table. Append and merge always use `probe`.
 
 The `FragmentWrite` row's `mode` pairs with its `adapter`: an overwrite writes
 `fragments`, an append uses `strict_insert`, and a merge uses `upsert`.

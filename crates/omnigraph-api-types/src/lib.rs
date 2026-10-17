@@ -1145,8 +1145,10 @@ pub struct QueryRequest {
     /// `detail`: the logical, physical and available DataFusion trees, then `plan` entries for
     /// the passes and the document's other fields), under the same `params`,
     /// `branch`, or `snapshot` as the query itself. `explain load csv …` answers the accepted
-    /// load plan as the same results (tree `load`, then `plan` entries) without reading the source,
-    /// under `branch` alone: `snapshot`, `name` and `params` are refused.
+    /// load plan as the same results (`logical_initial`, `logical`, `physical`, then `plan`
+    /// entries), under `branch` alone: `snapshot`, `name` and `params` are refused.
+    /// It requires the load's `change` permission before probing source metadata,
+    /// reads no payload byte, and publishes nothing.
     #[schema(
         example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
     )]

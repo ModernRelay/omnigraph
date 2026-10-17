@@ -322,7 +322,24 @@ pub(super) fn classify_failure(
 /// the statement's pool, held until the statement's reuse caches drop (RFC
 /// 2026-10-15 bulk load as a query plan).
 pub(crate) struct LoadReuseReservation {
-    _reservation: MemoryReservation,
+    reservation: MemoryReservation,
+}
+
+impl LoadReuseReservation {
+    pub(in crate::engine) fn admit(pool: Arc<dyn MemoryPool>, limit: u64) -> Option<Self> {
+        let available = limit.saturating_sub(pool.reserved() as u64);
+        let want = (available / 4).min(64 * 1024 * 1024);
+        if want < 1024 * 1024 {
+            return None;
+        }
+        let reservation = MemoryConsumer::new("load read reuse").register(&pool);
+        reservation.try_grow(usize::try_from(want).ok()?).ok()?;
+        Some(Self { reservation })
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.reservation.size()
+    }
 }
 
 /// One load statement's tracked memory: the engine's pool sized by
@@ -349,18 +366,12 @@ impl LoadMemory {
         &self.context
     }
 
-    /// Admit `want` bytes of read-reuse buffers, reserving before anything is
-    /// retained; `None` means the allowance cannot admit them and the caller
-    /// runs uncached.
-    pub(crate) fn admit_read_reuse(&self, want: u64) -> Option<LoadReuseReservation> {
-        let pool = Arc::clone(&self.context.pool) as Arc<dyn MemoryPool>;
-        let reservation = MemoryConsumer::new("load read reuse").register(&pool);
-        reservation
-            .try_grow(usize::try_from(want).unwrap_or(usize::MAX))
-            .ok()?;
-        Some(LoadReuseReservation {
-            _reservation: reservation,
-        })
+    /// Admit optional caches from the pool's currently unreserved bytes.
+    pub(crate) fn admit_read_reuse(&self) -> Option<LoadReuseReservation> {
+        LoadReuseReservation::admit(
+            Arc::clone(&self.context.pool) as Arc<dyn MemoryPool>,
+            self.limit(),
+        )
     }
 
     /// A named charge on the statement's pool, freed when dropped.
@@ -551,6 +562,26 @@ impl MemoryPool for SpillHeadroomPool {
 mod tests {
     use super::*;
     use futures::FutureExt;
+
+    #[test]
+    fn load_reuse_uses_only_headroom_after_mandatory_admission() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        const MIB: usize = 1024 * 1024;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16 * MIB));
+        let mandatory = MemoryConsumer::new("validation facts").register(&pool);
+        mandatory.try_grow(12 * MIB).unwrap();
+        let reuse = LoadReuseReservation::admit(Arc::clone(&pool), (16 * MIB) as u64).unwrap();
+        assert_eq!(reuse.bytes(), MIB);
+        assert_eq!(pool.reserved(), 13 * MIB);
+        drop(reuse);
+        assert_eq!(pool.reserved(), 12 * MIB);
+        mandatory.try_grow(3 * MIB).unwrap();
+        assert!(LoadReuseReservation::admit(Arc::clone(&pool), (16 * MIB) as u64).is_none());
+        assert_eq!(pool.reserved(), 15 * MIB);
+        drop(mandatory);
+        assert_eq!(pool.reserved(), 0);
+    }
 
     /// Child registration and closure race inside the executor, not in GQ.
     #[tokio::test]

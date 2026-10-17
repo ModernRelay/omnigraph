@@ -133,7 +133,7 @@ impl TableHandleCache {
         last_linear_version: Option<u64>,
         location: &str,
         session: Option<&Arc<Session>>,
-        statement_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        statement_wrapper: Option<Arc<crate::read_memo::RangeMemoWrapper>>,
     ) -> Result<Dataset> {
         let key = TableHandleKey {
             table_path: dataset_path.to_string(),
@@ -148,12 +148,13 @@ impl TableHandleCache {
                 return Ok(ds);
             }
         }
+        let memo = statement_wrapper.clone();
         let wrapper = match (statement_wrapper, crate::instrumentation::table_wrapper()) {
             (Some(statement), Some(probe)) => {
                 Some(crate::read_memo::StackedWrapper::new(statement, probe)
                     as Arc<dyn WrappingObjectStore>)
             }
-            (Some(statement), None) => Some(statement),
+            (Some(statement), None) => Some(statement as Arc<dyn WrappingObjectStore>),
             (None, probe) => probe,
         };
         // Miss: open without holding the lock (the open is async IO). A concurrent
@@ -169,6 +170,9 @@ impl TableHandleCache {
             wrapper,
         )
         .await?;
+        if let (Some(memo), Some(session)) = (memo, session) {
+            memo.register_dataset(&ds, session).await;
+        }
         let mut inner = self.inner.lock().await;
         if let Some(existing) = inner.entries.get(&key).cloned() {
             return Ok(existing);

@@ -16,8 +16,8 @@ use omnigraph_compiler::types::Direction;
 
 use crate::cost::{
     AccessPath, AntiJoinStrategy, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
-    HASH_JOIN_POOL_DIVISOR, HYDRATE_ROW_RATIO, IndexCoverage, PROBE_CHUNK_KEYS,
-    SOURCE_PARTITION_BYTES, ValidateAccess, chain_rows, choose_access_path,
+    HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
+    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, chain_rows, choose_access_path,
     choose_anti_join_strategy, choose_expand_mode, choose_validate_access, direction_probe_factor,
     estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
 };
@@ -3599,33 +3599,75 @@ impl Lowering<'_> {
         }
     }
 
-    /// Pass 9 on one check of the validation: delta without a consulted image,
-    /// else the check's access, where only an overwrite scans past one probe
-    /// chunk (append and merge keep the executor's probe path until the sink takes them).
+    /// Pass 9 costs the committed lookup from the accepted node count and
+    /// index metadata. Append and merge retain their executor's Probe path.
     fn validate_access(
         &mut self,
         spec: &ValidateSpec,
         estimated_rows: Option<u64>,
     ) -> ValidateAccess {
-        if spec.consults.is_none() {
+        let Some(image) = &spec.consults else {
             return ValidateAccess::Delta;
-        }
-        let estimated_rows = estimated_rows.unwrap_or(u64::MAX);
+        };
         let overwrite = self
             .logical
             .live()
             .any(|(_, node)| matches!(node, LogicalNode::FragmentWrite { spec, .. } if spec.mode == LoadStmtMode::Overwrite));
-        let access = match choose_validate_access(&spec.check, estimated_rows) {
-            ValidateAccess::Scan if !overwrite => ValidateAccess::Probe,
-            access => access,
+        let node = image
+            .table
+            .strip_prefix("node:")
+            .and_then(|name| self.source.node_type(name).ok());
+        let columns: Vec<&str> = match &spec.check {
+            omnigraph_compiler::ir::ValidateCheck::Unique { columns, .. } => {
+                columns.iter().map(String::as_str).collect()
+            }
+            omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. } => node
+                .as_ref()
+                .map(|node| node.columns.id)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
         };
+        let facts = self.source.index_facts(&image.table);
+        let indexed = !columns.is_empty()
+            && columns.iter().all(|column| {
+                let mut candidates = facts
+                    .iter()
+                    .filter(|fact| fact.column == *column)
+                    .peekable();
+                candidates.peek().is_some()
+                    && candidates.all(|fact| fact.fully_covers_btree(column))
+            });
+        let inputs = ValidateCostInputs {
+            input_rows: estimated_rows,
+            consulted_rows: node.as_ref().and_then(|node| node.row_count),
+            indexed,
+        };
+        let access = if overwrite {
+            choose_validate_access(&spec.check, inputs)
+        } else {
+            ValidateAccess::Probe
+        };
+        let costs = inputs.costs(&spec.check);
         self.access_path = true;
         self.decisions.push(StatisticSource {
             statistic: format!("validate_access({})", spec.check.name()),
             value: access.as_str().to_string(),
-            origin: format!(
-                "estimated_rows {estimated_rows} against probe_chunk_keys {PROBE_CHUNK_KEYS}"
-            ),
+            origin: serde_json::json!({
+                "check": spec.check,
+                "consulted_table": image.table,
+                "consulted_version": image.version,
+                "estimated_rows": estimated_rows,
+                "consulted_rows": inputs.consulted_rows,
+                "index_full_coverage": indexed,
+                "index_facts": facts,
+                "indexed_row_factor": HASH_JOIN_RATIO,
+                "probe_calls": costs.map(|(_, _, calls)| calls),
+                "probe_cost": costs.map(|(probe, _, _)| probe),
+                "scan_cost": costs.map(|(_, scan, _)| scan),
+                "overwrite": overwrite,
+            })
+            .to_string(),
         });
         access
     }

@@ -24,9 +24,20 @@ use super::{
 };
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
+use crate::loader::read_reuse::LoadReadReuse;
 use crate::loader::{LoadMode, validate_enum_constraints, validate_value_constraints};
 
+pub(crate) enum LoadPhase {
+    RemovedInput,
+    Extracted,
+}
+
+type PhaseAdmission<'a> = dyn FnMut(LoadPhase) -> Result<Box<dyn Send>> + Send + 'a;
+type ReadReuseAdmission<'a> = dyn FnMut() -> Option<LoadReadReuse> + Send + 'a;
+
 pub(crate) struct LoadAdmission<'a> {
+    pub(crate) phase: Option<&'a mut PhaseAdmission<'a>>,
+    pub(crate) reuse: Option<&'a mut ReadReuseAdmission<'a>>,
     pub(crate) removed: &'a mut (dyn FnMut(&str) -> Result<()> + Send),
     pub(crate) retained: &'a mut (dyn FnMut(&RecordBatch) -> Result<()> + Send),
 }
@@ -47,6 +58,11 @@ pub(crate) async fn judge_load(
     let system_columns = catalog.system_columns;
     let overwrite = mode == LoadMode::Overwrite;
     let removed = if overwrite {
+        let _phase = admission
+            .phase
+            .as_mut()
+            .map(|admit| admit(LoadPhase::RemovedInput))
+            .transpose()?;
         let change = TableChange {
             added: batches.to_vec(),
             ..TableChange::default()
@@ -58,16 +74,32 @@ pub(crate) async fn judge_load(
     } else {
         Vec::new()
     };
-    let mut extracted = Extracted::sweep(table, checks, catalog, batches, system_columns)?;
-    let committed = CommittedState {
-        committed: Some(base),
-        overwritten: overwrite.then(|| table.to_string()).into_iter().collect(),
-        live: None,
-    };
+    let _phase = admission
+        .phase
+        .as_mut()
+        .map(|admit| admit(LoadPhase::Extracted))
+        .transpose()?;
+    let mut extracted =
+        Extracted::sweep(table, checks, catalog, batches, system_columns, overwrite)?;
+    let mut reuse = admission.reuse.as_mut().and_then(|admit| admit());
+    let mut cached_base = reuse.as_ref().map(|reuse| {
+        let mut snapshot = base.clone();
+        snapshot.set_read_caches(reuse.snapshot_caches());
+        snapshot
+    });
     let mut first = FirstViolation::default();
     let mut edge_ri_judged = false;
     let mut retained_judged: HashSet<&str> = HashSet::new();
     for (index, spec) in checks.iter().enumerate() {
+        if matches!(spec.check, ValidateCheck::RetainedEdges { .. }) {
+            drop(cached_base.take());
+            drop(reuse.take());
+        }
+        let committed = CommittedState {
+            committed: Some(cached_base.as_ref().unwrap_or(base)),
+            overwritten: overwrite.then(|| table.to_string()).into_iter().collect(),
+            live: None,
+        };
         match &spec.check {
             ValidateCheck::Value { .. } => first.refuse(extracted.value.take())?,
             ValidateCheck::Unique { columns, .. } => {
@@ -246,6 +278,7 @@ impl Extracted {
         catalog: &Catalog,
         batches: &[RecordBatch],
         system_columns: SystemColumns,
+        overwrite: bool,
     ) -> Result<Self> {
         let mut extracted = Self::default();
         let needs_value = checks
@@ -254,6 +287,9 @@ impl Extracted {
         let needs_edges = checks
             .iter()
             .any(|spec| matches!(spec.check, ValidateCheck::EdgeRi { .. }));
+        let needs_ids = checks.iter().any(|spec| {
+            matches!(spec.check, ValidateCheck::Unique { .. }) && spec.consults.is_some()
+        });
         let needs_card = checks
             .iter()
             .any(|spec| matches!(spec.check, ValidateCheck::Cardinality { .. }));
@@ -266,9 +302,17 @@ impl Extracted {
             })
             .collect();
         for &(index, _) in &unique_checks {
-            extracted
-                .unique
-                .insert(index, (UniqueImageBuilder::for_input(), None));
+            extracted.unique.insert(
+                index,
+                (
+                    if overwrite {
+                        UniqueImageBuilder::for_replacement()
+                    } else {
+                        UniqueImageBuilder::for_input()
+                    },
+                    None,
+                ),
+            );
         }
         let type_name = table.split_once(':').map(|(_, name)| name).unwrap_or(table);
         for batch in batches {
@@ -276,10 +320,12 @@ impl Extracted {
                 extracted.value = value_check(table, type_name, catalog, batch)
                     .map(|err| value_violation(table, err));
             }
-            let ids = string_col(batch, system_columns.id)?;
-            for row in 0..ids.len() {
-                if !ids.is_null(row) {
-                    extracted.ids.insert(ids.value(row).to_string());
+            if needs_ids {
+                let ids = string_col(batch, system_columns.id)?;
+                for row in 0..ids.len() {
+                    if !ids.is_null(row) {
+                        extracted.ids.insert(ids.value(row).to_string());
+                    }
                 }
             }
             for &(index, columns) in &unique_checks {
@@ -515,6 +561,8 @@ mod tests {
             load_mode(mode),
             batches,
             &mut LoadAdmission {
+                phase: None,
+                reuse: None,
                 removed: &mut |_| Ok(()),
                 retained: &mut |_| Ok(()),
             },
@@ -663,6 +711,8 @@ mod tests {
             LoadMode::Overwrite,
             &[person_batch(sc, &[("Alice", "alice@x"), ("Bob", "bob@x")])],
             &mut LoadAdmission {
+                phase: None,
+                reuse: None,
                 removed: &mut |id| {
                     admitted.push(id.to_string());
                     Ok(())
@@ -689,6 +739,8 @@ mod tests {
                 &[("Alice", "alice@x"), ("Bob", "bob@x"), ("Carol", "carol@x")],
             )],
             &mut LoadAdmission {
+                phase: None,
+                reuse: None,
                 removed: &mut |_| Ok(()),
                 retained: &mut |_| Ok(()),
             },

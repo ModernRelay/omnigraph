@@ -503,9 +503,8 @@ fn estimate_rows_over(
     }
 }
 
-/// Keys per committed-image probe chunk: one chunk is one filtered scan of
-/// the consulted table; past one chunk a projected scan matched in memory
-/// costs less, so a validation with more estimated rows scans.
+/// Keys per uniqueness probe chunk. Endpoint probes use one filtered scan
+/// carrying the whole endpoint set, without this chunking.
 pub const PROBE_CHUNK_KEYS: u64 = 8_192;
 
 /// Source bytes per parser partition: a smaller file stays one partition,
@@ -533,29 +532,97 @@ impl ValidateAccess {
     }
 }
 
-/// The access of a validation that reads a committed image: retained-edge
-/// and cardinality checks probe, and a uniqueness
-/// or endpoint check scans past one probe chunk of estimated rows.
-pub fn choose_validate_access(check: &ValidateCheck, estimated_rows: u64) -> ValidateAccess {
-    match check {
-        ValidateCheck::RetainedEdges { .. } | ValidateCheck::Cardinality { .. } => {
-            ValidateAccess::Probe
-        }
-        ValidateCheck::Unique { .. }
-        | ValidateCheck::EdgeRi { .. }
-        | ValidateCheck::Value { .. } => {
-            if estimated_rows > PROBE_CHUNK_KEYS {
-                ValidateAccess::Scan
-            } else {
-                ValidateAccess::Probe
-            }
-        }
+/// Accepted row counts and complete usable BTREE coverage for a validation's
+/// filter columns. Partial or unknown coverage earns no index discount.
+#[derive(Debug, Clone, Copy)]
+pub struct ValidateCostInputs {
+    pub input_rows: Option<u64>,
+    pub consulted_rows: Option<u64>,
+    pub indexed: bool,
+}
+
+impl ValidateCostInputs {
+    /// Estimated row work: probe, scan and filtered-scan calls. Indexed
+    /// lookup uses the same per-row factor as dependent-scan selection.
+    pub fn costs(self, check: &ValidateCheck) -> Option<(u64, u64, u64)> {
+        let (input, table) = (self.input_rows?, self.consulted_rows?);
+        let calls = if matches!(check, ValidateCheck::Unique { .. }) {
+            input.div_ceil(PROBE_CHUNK_KEYS)
+        } else {
+            u64::from(input > 0)
+        };
+        let probe = if self.indexed {
+            input.saturating_mul(HASH_JOIN_RATIO)
+        } else {
+            table.saturating_mul(calls).saturating_add(input)
+        };
+        let scan = table.saturating_add(input);
+        Some((probe, scan, calls))
+    }
+}
+
+/// Pick the cheaper supported access. Ties and unknown statistics retain
+/// Probe; cardinality and retained-edge checks only implement Probe.
+pub fn choose_validate_access(check: &ValidateCheck, inputs: ValidateCostInputs) -> ValidateAccess {
+    if matches!(
+        check,
+        ValidateCheck::RetainedEdges { .. } | ValidateCheck::Cardinality { .. }
+    ) {
+        return ValidateAccess::Probe;
+    }
+    match inputs.costs(check) {
+        Some((probe, scan, _)) if scan < probe => ValidateAccess::Scan,
+        _ => ValidateAccess::Probe,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_costs_distinguish_endpoint_and_unique_probe_calls() {
+        use omnigraph_compiler::ir::{Endpoint, UniqueRole};
+        let endpoint = ValidateCheck::EdgeRi {
+            endpoint: Endpoint::From,
+            node_type: "Person".into(),
+        };
+        let unique = ValidateCheck::Unique {
+            role: UniqueRole::Unique,
+            columns: vec!["email".into()],
+        };
+        let inputs = ValidateCostInputs {
+            input_rows: Some(8193),
+            consulted_rows: Some(1_000_000),
+            indexed: false,
+        };
+        assert_eq!(inputs.costs(&endpoint), Some((1_008_193, 1_008_193, 1)));
+        assert_eq!(inputs.costs(&unique), Some((2_008_193, 1_008_193, 2)));
+        assert_eq!(
+            choose_validate_access(&endpoint, inputs),
+            ValidateAccess::Probe
+        );
+        assert_eq!(
+            choose_validate_access(&unique, inputs),
+            ValidateAccess::Scan
+        );
+        let unknown = ValidateCostInputs {
+            input_rows: None,
+            ..inputs
+        };
+        assert_eq!(
+            choose_validate_access(&endpoint, unknown),
+            ValidateAccess::Probe
+        );
+        let empty = ValidateCostInputs {
+            input_rows: Some(0),
+            ..inputs
+        };
+        assert_eq!(
+            choose_validate_access(&unique, empty),
+            ValidateAccess::Probe
+        );
+    }
 
     /// Cost inputs with generous hard caps, so the cost comparison (not a
     /// ceiling) is what an assertion exercises unless it sets one on purpose.

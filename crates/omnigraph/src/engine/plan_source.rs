@@ -731,6 +731,15 @@ pub(crate) async fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQ
     Ok(ExplainedQuery { explain, accepted })
 }
 
+/// Index metadata from the accepted table version; no table payload is read.
+pub(crate) async fn load_index_facts(
+    snapshot: &Snapshot,
+    type_key: &str,
+) -> Result<Vec<IndexFact>> {
+    let dataset = snapshot.open_lance_dataset(type_key).await?;
+    indexes::gather(&dataset).await
+}
+
 async fn query_table_statistics(
     ir: &QueryIR,
     snapshot: &Snapshot,

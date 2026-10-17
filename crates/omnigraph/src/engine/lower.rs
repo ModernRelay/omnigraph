@@ -1267,6 +1267,7 @@ impl Lower for Walk<'_, '_> {
             ))
         })?;
         let judge = LoadJudge {
+            db: Arc::clone(&write.db),
             table,
             checks: fields.checks.to_vec(),
             mode: load.request.mode,

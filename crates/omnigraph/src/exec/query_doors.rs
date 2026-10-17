@@ -200,7 +200,8 @@ impl Session {
             source_bytes,
             self.settings().query_memory_bytes(),
             WriteBudget::from_settings(self.settings()).bytes(),
-        )?;
+        )
+        .await?;
         let explain = decision.explain().ok_or_else(|| {
             OmniError::manifest_internal("explain load csv: the planner answered no document")
         })?;

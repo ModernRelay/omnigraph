@@ -401,7 +401,8 @@ impl CsvTyping<'_> {
             .iter()
             .map(|batch| batch.num_rows() as u64)
             .sum::<u64>();
-        let mut bytes = rows.saturating_mul(128).saturating_add(
+        let batch_rows = read.iter().map(RecordBatch::num_rows).max().unwrap_or(0) as u64;
+        let mut bytes = batch_rows.saturating_mul(128).saturating_add(
             (read.len() as u64)
                 .saturating_mul(self.arrow_schema.fields().len() as u64)
                 .saturating_mul(2048),
@@ -420,7 +421,12 @@ impl CsvTyping<'_> {
             LoadTarget::Node(name) => self.catalog.node_types[name].key.as_ref(),
             LoadTarget::Edge(name) => self.catalog.edge_types[name].key.as_ref(),
         };
+        if keys.is_none() {
+            bytes = bytes.saturating_add(rows.saturating_mul(64));
+        }
+        let mut key_scratch = 0_u64;
         for batch in read {
+            let mut batch_key_scratch = 0_u64;
             for (role, column) in self.roles.iter().zip(batch.columns()) {
                 let role_name = match role {
                     ColumnRole::Src => self.catalog.system_columns.src,
@@ -453,15 +459,16 @@ impl CsvTyping<'_> {
                     } else {
                         (batch.num_rows() as u64).saturating_mul(384)
                     };
-                    bytes = bytes.saturating_add(
-                        key_bytes
-                            .saturating_add((batch.num_rows() as u64).saturating_mul(32))
-                            .saturating_mul(4),
-                    );
+                    let key_bytes =
+                        key_bytes.saturating_add((batch.num_rows() as u64).saturating_mul(32));
+                    bytes = bytes.saturating_add(key_bytes.saturating_mul(2));
+                    batch_key_scratch =
+                        batch_key_scratch.saturating_add(key_bytes.saturating_mul(2));
                 }
             }
+            key_scratch = key_scratch.max(batch_key_scratch);
         }
-        Ok(bytes)
+        Ok(bytes.saturating_add(key_scratch))
     }
 
     fn normalize_batches(&self, read: &[RecordBatch]) -> Result<Vec<RecordBatch>> {

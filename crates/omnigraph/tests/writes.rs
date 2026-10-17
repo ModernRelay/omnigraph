@@ -1349,6 +1349,68 @@ async fn load_csv_statement_probes_and_reads_its_source_once() {
     }
 }
 
+/// Generated scale belongs here: GQT fixtures cannot cover the default pool's
+/// row-capacity regression without checking in a large CSV payload.
+#[tokio::test]
+async fn load_csv_overwrite_admits_compact_keys_under_default_memory() {
+    use omnigraph::loader::CsvLoadRequest;
+    use omnigraph_compiler::query::ast::LoadTarget;
+    use std::io::Write;
+
+    const ROWS: usize = 400_000;
+    let source_dir = tempfile::tempdir().unwrap();
+    let csv_path = source_dir.path().join("people.csv");
+    let mut csv = std::io::BufWriter::new(std::fs::File::create(&csv_path).unwrap());
+    writeln!(csv, "id").unwrap();
+    for row in 0..ROWS {
+        writeln!(csv, "p{row:07}").unwrap();
+    }
+    csv.flush().unwrap();
+    drop(csv);
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(source_dir.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            graph_dir.path().to_str().unwrap(),
+            "node Person { id: String @key }",
+        )
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"id":"old"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let request = CsvLoadRequest {
+        source: format!("file://{}", csv_path.display()),
+        target: LoadTarget::Node("Person".to_string()),
+        mode: LoadMode::Overwrite,
+        delimiter: b',',
+        header: true,
+        columns: None,
+    };
+    let receipt = db
+        .load_csv_as_with_receipt("main", &request, None)
+        .await
+        .unwrap();
+    assert_eq!(receipt.result.nodes_loaded.values().sum::<usize>(), ROWS);
+    assert_eq!(
+        helpers::count_rows_branch(&db, "main", "node:Person").await,
+        ROWS
+    );
+}
+
 /// Update predicate matching is itself a bounded allocation. The committed
 /// side must stream and charge rows before it is retained/concatenated, rather
 /// than first collecting an arbitrarily wide match set and relying on the

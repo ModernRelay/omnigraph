@@ -62,6 +62,7 @@ fn group_columns(
 pub(super) struct UniqueImageBuilder {
     final_by_id: HashMap<String, (Vec<String>, Vec<ScalarValue>)>,
     input_keys: Option<HashMap<Vec<String>, String>>,
+    input_only: bool,
     within_batch_violation: bool,
 }
 
@@ -70,6 +71,13 @@ impl UniqueImageBuilder {
         Self {
             input_keys: Some(HashMap::new()),
             ..Self::default()
+        }
+    }
+
+    pub(super) fn for_replacement() -> Self {
+        Self {
+            input_only: true,
+            ..Self::for_input()
         }
     }
 
@@ -94,6 +102,14 @@ impl UniqueImageBuilder {
                 self.final_by_id.remove(&id);
                 continue;
             };
+            if self.input_only {
+                if let Some(prior) = seen.get(&key) {
+                    sink(unique_violation(table_key, columns, &key, &id, prior))?;
+                    self.within_batch_violation = true;
+                }
+                seen.insert(key, id);
+                continue;
+            }
             if let Some(prior) = seen.insert(key.clone(), id.clone()) {
                 sink(unique_violation(table_key, columns, &key, &id, &prior))?;
                 self.within_batch_violation = true;

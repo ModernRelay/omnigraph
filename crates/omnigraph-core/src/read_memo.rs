@@ -24,7 +24,7 @@ const ENTRY_OVERHEAD_BYTES: u64 = 128;
 
 /// Path components whose objects are immutable once written (uuid-named data,
 /// index and deletion files); only reads under them are memoized.
-const IMMUTABLE_COMPONENTS: [&str; 3] = ["/data/", "/_indices/", "/_deletions/"];
+const IMMUTABLE_COMPONENTS: [&str; 3] = ["data", "_indices", "_deletions"];
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum KeyRange {
@@ -49,6 +49,17 @@ struct MemoEntry {
     bytes: Bytes,
 }
 
+struct LeasedBytes {
+    bytes: Bytes,
+    _lease: Arc<dyn fmt::Debug + Send + Sync>,
+}
+
+impl AsRef<[u8]> for LeasedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
 impl MemoEntry {
     fn into_result(self) -> GetResult {
         GetResult {
@@ -62,7 +73,14 @@ impl MemoEntry {
     }
 }
 
+struct MemoRoot {
+    store_prefix: String,
+    path: Path,
+    dataset_root: bool,
+}
+
 struct MemoState {
+    roots: Vec<MemoRoot>,
     entries: HashMap<MemoKey, MemoEntry>,
     remaining_bytes: u64,
 }
@@ -85,10 +103,58 @@ impl RangeReadMemo {
     pub fn with_lease(budget_bytes: u64, lease: Arc<dyn fmt::Debug + Send + Sync>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(MemoState {
+                roots: Vec::new(),
                 entries: HashMap::new(),
                 remaining_bytes: budget_bytes,
             }),
             _lease: lease,
+        })
+    }
+
+    fn register_root(&self, store_prefix: &str, path: &Path, dataset_root: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.roots.iter().any(|root| {
+            root.store_prefix == store_prefix
+                && root.path == *path
+                && root.dataset_root == dataset_root
+        }) {
+            return;
+        }
+        let cost = std::mem::size_of::<MemoRoot>()
+            .saturating_add(1)
+            .saturating_mul(4)
+            .saturating_add(store_prefix.len().saturating_mul(2))
+            .saturating_add(path.as_ref().len().saturating_mul(2))
+            .saturating_add(64) as u64;
+        if cost > state.remaining_bytes {
+            return;
+        }
+        state.remaining_bytes -= cost;
+        state.roots.push(MemoRoot {
+            store_prefix: store_prefix.to_owned(),
+            path: path.clone(),
+            dataset_root,
+        });
+    }
+
+    fn immutable_path(&self, store_prefix: &str, path: &Path) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.roots.iter().any(|root| {
+            root.store_prefix == store_prefix
+                && path.prefix_match(&root.path).is_some_and(|mut relative| {
+                    let Some(first) = relative.next() else {
+                        return false;
+                    };
+                    !root.dataset_root
+                        || (IMMUTABLE_COMPONENTS.contains(&first.as_ref())
+                            && relative.next().is_some())
+                })
         })
     }
 
@@ -148,6 +214,33 @@ pub struct RangeMemoWrapper {
 }
 
 impl RangeMemoWrapper {
+    pub async fn register_dataset(
+        &self,
+        dataset: &lance::Dataset,
+        session: &Arc<lance::session::Session>,
+    ) {
+        let Some(memo) = self.memo.upgrade() else {
+            return;
+        };
+        let registry = session.store_registry();
+        let prefix = |uri: &str| {
+            registry
+                .calculate_object_store_prefix(uri, dataset.initial_storage_options())
+                .ok()
+        };
+        if let Some(store_prefix) = prefix(dataset.uri()) {
+            memo.register_root(&store_prefix, dataset.refs.base(), true);
+        }
+        for base in dataset.manifest().base_paths.values() {
+            let Ok(path) = base.extract_path(Arc::clone(&registry)) else {
+                continue;
+            };
+            if let Some(store_prefix) = prefix(&base.path) {
+                memo.register_root(&store_prefix, &path, base.is_dataset_root);
+            }
+        }
+    }
+
     pub fn new(memo: &Arc<RangeReadMemo>) -> Arc<Self> {
         Arc::new(Self {
             memo: Arc::downgrade(memo),
@@ -213,10 +306,7 @@ impl RangeMemoStore {
             return None;
         }
         let path = location.as_ref();
-        if !IMMUTABLE_COMPONENTS
-            .iter()
-            .any(|component| path.contains(component))
-        {
+        if !self.memo.immutable_path(&self.store_prefix, location) {
             return None;
         }
         let range = match &options.range {
@@ -293,7 +383,10 @@ impl ObjectStore for RangeMemoStore {
                     meta,
                     range,
                     attributes,
-                    bytes,
+                    bytes: Bytes::from_owner(LeasedBytes {
+                        bytes,
+                        _lease: Arc::clone(&self.memo._lease),
+                    }),
                 };
                 self.memo.insert(key, entry.clone(), cost);
                 Ok(entry.into_result())
@@ -465,6 +558,7 @@ mod tests {
 
     fn wrapped(counting: &Arc<CountingStore>, budget: u64) -> Arc<dyn ObjectStore> {
         let memo = RangeReadMemo::new(budget);
+        memo.register_root("test", &Path::from("tables/x"), true);
         RangeMemoWrapper::new(&memo).wrap("test", Arc::clone(counting) as Arc<dyn ObjectStore>)
     }
 
@@ -509,6 +603,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutable_paths_below_data_named_ancestors_are_not_memoized() {
+        let counting = CountingStore::new();
+        let memo = RangeReadMemo::new(1024 * 1024);
+        let store = RangeMemoWrapper::new(&memo)
+            .wrap("test", Arc::clone(&counting) as Arc<dyn ObjectStore>);
+        for (root, control) in [
+            ("data/graph/tables/x", "_versions/1.manifest"),
+            ("srv/data/graph/tables/x", "_transactions/txn.txn"),
+            ("srv/_indices/graph/tables/x", "_latest.manifest"),
+            ("srv/_deletions/graph/tables/x", "_refs/main"),
+        ] {
+            memo.register_root("test", &Path::from(root), true);
+            let path = format!("{root}/{control}");
+            seed(&counting, &path).await;
+            let path = Path::from(path);
+            let first = store
+                .get_opts(&path, bounded(0, 8))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            counting
+                .inner
+                .put(&path, PutPayload::from_static(&[9_u8; 256]))
+                .await
+                .unwrap();
+            let second = store
+                .get_opts(&path, bounded(0, 8))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_ne!(first, second, "mutable object {path} must be reread");
+            let data = format!("{root}/data/77777777-7777-7777-7777-777777777777.lance");
+            seed(&counting, &data).await;
+            let data = Path::from(data);
+            for _ in 0..2 {
+                store
+                    .get_opts(&data, bounded(0, 8))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(counting.gets.load(Ordering::Relaxed), 12);
+    }
+
+    #[tokio::test]
     async fn an_exhausted_budget_skips_caching() {
         let counting = CountingStore::new();
         seed(&counting, DATA_PATH).await;
@@ -530,6 +676,168 @@ mod tests {
             .unwrap();
         assert_eq!(counting.gets.load(Ordering::Relaxed), 2);
     }
+    /// Pinned native branches can read both their own fragments and fragments
+    /// inherited from main and an earlier native branch. Resolve real Lance
+    /// paths, then count reads independently of Lance's own metadata caches.
+    #[tokio::test]
+    async fn native_and_inherited_branch_data_are_memoized() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance::dataset::{WriteMode, WriteParams};
+        use lance::session::Session;
+        use lance_file::version::LanceFileVersion;
+
+        fn row(value: i32) -> impl arrow_array::RecordBatchReader + Send + 'static {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("value", DataType::Int32, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![format!("branch-{value}")])),
+                    Arc::new(Int32Array::from(vec![value])),
+                ],
+            )
+            .unwrap();
+            RecordBatchIterator::new(vec![Ok(batch)], schema)
+        }
+
+        fn params(mode: WriteMode) -> WriteParams {
+            WriteParams {
+                mode,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("data/graph/table.lance");
+        let mut main = crate::lance_clone::fresh_dataset(uri.to_str().unwrap()).await;
+        let main_data = main.data_dir();
+        let main_version = main.version().version;
+        let mut parent =
+            crate::lance_clone::create_branch(&mut main, "parent/data/topic", main_version)
+                .await
+                .unwrap();
+        parent
+            .append(row(2), Some(params(WriteMode::Append)))
+            .await
+            .unwrap();
+        let parent_data = parent.data_dir();
+        let parent_version = parent.version().version;
+        let mut child =
+            crate::lance_clone::create_branch(&mut parent, "child/_indices/topic", parent_version)
+                .await
+                .unwrap();
+        child
+            .append(row(3), Some(params(WriteMode::Append)))
+            .await
+            .unwrap();
+        let child_data = child.data_dir();
+
+        let access = crate::lance_access::LanceAccessContext::with_io_scope(Some(
+            omnigraph_storage::StorageIoScope::new(),
+        ));
+        let registry = access.data_session().store_registry();
+        let session = Arc::new(Session::new(1024 * 1024, 1024 * 1024, registry.clone()));
+        let pinned = crate::instrumentation::open_dataset(
+            child.uri(),
+            crate::instrumentation::VersionResolution::At(child.version().version),
+            Some(&session),
+            None,
+        )
+        .await
+        .unwrap();
+        let memo = RangeReadMemo::new(1024 * 1024);
+        let wrapper = RangeMemoWrapper::new(&memo);
+        wrapper.register_dataset(&pinned, &session).await;
+
+        let counting = CountingStore::new();
+        let mut seen_roots = std::collections::HashSet::new();
+        let mut read_count = 0;
+        for fragment in pinned.manifest().fragments.iter() {
+            for file in &fragment.files {
+                let data_root = match file.base_id {
+                    Some(base_id) => {
+                        let base = &pinned.manifest().base_paths[&base_id];
+                        assert!(base.is_dataset_root);
+                        base.extract_path(registry.clone()).unwrap().join("data")
+                    }
+                    None => pinned.data_dir(),
+                };
+                seen_roots.insert(data_root.clone());
+                let path = data_root.join(file.path.as_str());
+                let base_uri = file.base_id.map_or_else(
+                    || pinned.uri(),
+                    |base_id| pinned.manifest().base_paths[&base_id].path.as_str(),
+                );
+                let prefix = registry
+                    .calculate_object_store_prefix(base_uri, pinned.initial_storage_options())
+                    .unwrap();
+                let store = wrapper.wrap(&prefix, counting.clone() as Arc<dyn ObjectStore>);
+                seed(&counting, path.as_ref()).await;
+                for _ in 0..2 {
+                    assert_eq!(
+                        store
+                            .get_opts(&path, bounded(0, 8))
+                            .await
+                            .unwrap()
+                            .bytes()
+                            .await
+                            .unwrap()
+                            .as_ref(),
+                        &[7_u8; 8],
+                    );
+                }
+                read_count += 1;
+                assert_eq!(counting.gets.load(Ordering::Relaxed), read_count);
+            }
+        }
+        assert_eq!(
+            seen_roots,
+            [main_data, parent_data, child_data].into_iter().collect()
+        );
+        assert_eq!(
+            read_count, 3,
+            "fixture must exercise three independently written files"
+        );
+
+        let prefix = registry
+            .calculate_object_store_prefix(pinned.uri(), pinned.initial_storage_options())
+            .unwrap();
+        let store = wrapper.wrap(&prefix, counting.clone() as Arc<dyn ObjectStore>);
+        let manifest = pinned
+            .refs
+            .base()
+            .clone()
+            .join("_versions")
+            .join("1.manifest");
+        seed(&counting, manifest.as_ref()).await;
+        let first = store
+            .get_opts(&manifest, bounded(0, 8))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        counting
+            .inner
+            .put(&manifest, PutPayload::from_static(&[9_u8; 256]))
+            .await
+            .unwrap();
+        let second = store
+            .get_opts(&manifest, bounded(0, 8))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(counting.gets.load(Ordering::Relaxed), read_count + 2);
+    }
+
     /// Observes registry owners and lease destruction, which GQT cannot inspect.
     #[tokio::test]
     async fn registry_keys_do_not_retain_memo_and_live_stores_keep_the_lease() {
@@ -556,6 +864,15 @@ mod tests {
         let weak_lease = Arc::downgrade(&lease);
         let memo = RangeReadMemo::with_lease(4096, lease.clone());
         let weak_memo = Arc::downgrade(&memo);
+        let root = lance::io::ObjectStore::extract_path_from_uri(
+            Arc::clone(&registry),
+            "memory://memo-lifetime/table",
+        )
+        .unwrap();
+        let prefix = registry
+            .calculate_object_store_prefix("memory://memo-lifetime/table", None)
+            .unwrap();
+        memo.register_root(&prefix, &root, true);
         let wrapper = RangeMemoWrapper::new(&memo);
         let weak_wrapper = Arc::downgrade(&wrapper);
         let params = ObjectStoreParams {
@@ -569,7 +886,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let data = Path::from("table/data/probe.lance");
+        let data = root.join("data").join("probe.lance");
         store
             .inner
             .put(&data, PutPayload::from_static(&[7_u8; 256]))
@@ -588,6 +905,7 @@ mod tests {
             256
         );
         assert_eq!(memo.state.lock().unwrap().entries.len(), 1);
+        let bytes = store.inner.get(&data).await.unwrap().bytes().await.unwrap();
 
         drop(params);
         drop(wrapper);
@@ -599,6 +917,9 @@ mod tests {
 
         drop(store);
         assert!(weak_memo.upgrade().is_none());
+        assert!(weak_lease.upgrade().is_some());
+        assert_eq!(bytes.len(), 256);
+        drop(bytes);
         assert!(weak_lease.upgrade().is_none());
         assert!(weak_wrapper.upgrade().is_none());
         assert_eq!(registry.stats().active_stores, 0);

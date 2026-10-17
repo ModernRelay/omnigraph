@@ -53,10 +53,10 @@ pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
 pub use cost::{
     AccessPath, AntiJoinStrategy, CSR_BUILD_FACTOR, CoverageProvenance, ExpandCostInputs,
     ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO,
-    IndexCoverage, PROBE_CHUNK_KEYS, SOURCE_PARTITION_BYTES, ValidateAccess, chain_rows,
-    choose_access_path, choose_anti_join_strategy, choose_expand_mode, choose_validate_access,
-    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
-    should_switch_to_csr,
+    IndexCoverage, PROBE_CHUNK_KEYS, SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs,
+    chain_rows, choose_access_path, choose_anti_join_strategy, choose_expand_mode,
+    choose_validate_access, direction_probe_factor, estimate_rows, executed_hops,
+    hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
 };
 pub use error::PlanError;
 pub use explain::Explain;

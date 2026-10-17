@@ -1678,7 +1678,7 @@ fn error_code_schema_has_expected_variants() {
 }
 
 #[test]
-fn external_blob_source_error_is_structured_and_declared_on_write_routes() {
+fn external_blob_source_error_is_structured_and_declared_on_source_probe_routes() {
     let doc = openapi_json();
     let detail = &doc["components"]["schemas"]["ExternalBlobSourceOutput"];
     let required: HashSet<&str> = detail["required"]
@@ -1697,6 +1697,7 @@ fn external_blob_source_error_is_structured_and_declared_on_write_routes() {
     assert_eq!(output_ref, "#/components/schemas/ExternalBlobSourceOutput");
 
     for path in [
+        "/graphs/{graph_id}/query",
         "/graphs/{graph_id}/mutate",
         "/graphs/{graph_id}/mutate/if-graph-commit",
         "/graphs/{graph_id}/queries/{name}",

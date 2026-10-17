@@ -1,8 +1,8 @@
 //! A `load csv` statement resolves to `CsvSource → Validate → FragmentWrite`,
 //! the one validation carrying every check in refusal order, and routes to
 //! the engine under overwrite. Rust and not `.gqt`: the claims are the node
-//! chain, the access rule at both sides of one probe chunk and the route
-//! decision, which the engine's explain rows render later.
+//! chain, accepted statistics and route decisions. GQT owns the rendered
+//! access choices on stored tables.
 
 use std::sync::Arc;
 
@@ -198,14 +198,14 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
 }
 
 #[test]
-fn edge_endpoint_checks_probe_within_one_chunk_and_scan_past_it_under_overwrite() {
+fn endpoint_checks_keep_probe_without_consulted_statistics() {
     let mapped_columns = ["from", "to", "w"].len() as u64;
     let narrowest_row = 2 * mapped_columns;
     let within = PROBE_CHUNK_KEYS * narrowest_row;
     let past = within + narrowest_row;
     for (mode, source_bytes, expected) in [
         (LoadStmtMode::Overwrite, within, ValidateAccess::Probe),
-        (LoadStmtMode::Overwrite, past, ValidateAccess::Scan),
+        (LoadStmtMode::Overwrite, past, ValidateAccess::Probe),
         (LoadStmtMode::Append, past, ValidateAccess::Probe),
         (LoadStmtMode::Merge, past, ValidateAccess::Probe),
     ] {
@@ -303,4 +303,80 @@ fn load_nodes_survive_the_bound_plan_mirror() {
     let _ = ValidateCheck::Value {
         columns: Vec::new(),
     };
+}
+
+/// Synthetic snapshot counts make the table-size and unknown-statistics
+/// boundaries deterministic without loading a 100-million-row fixture.
+#[test]
+fn endpoint_access_costs_the_consulted_table_and_index_coverage() {
+    use omnigraph_planner::{FragmentCoverage, IndexFact, IndexKind, NodeTypeSpec};
+
+    let input_rows = 10_000;
+    let op = operation(
+        LoadTarget::Edge("Knows".into()),
+        LoadStmtMode::Overwrite,
+        input_rows * 6,
+    );
+    for (rows, coverage, usable, expected) in [
+        (Some(100_000_000), Some((1, 1)), true, ValidateAccess::Probe),
+        (Some(1_000), Some((1, 1)), true, ValidateAccess::Scan),
+        (Some(1_000), Some((0, 1)), true, ValidateAccess::Probe),
+        (Some(1_000), Some((1, 2)), true, ValidateAccess::Probe),
+        (Some(1_000), None, true, ValidateAccess::Probe),
+        (Some(1_000), Some((1, 1)), false, ValidateAccess::Probe),
+        (None, Some((1, 1)), true, ValidateAccess::Probe),
+    ] {
+        let schema = parse_schema("node Person { id: String @key }").unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let node = catalog.node_types.get("Person").unwrap();
+        let source = source()
+            .with_node_type(
+                "Person",
+                NodeTypeSpec {
+                    table: side("node:Person", 7).table,
+                    version: Some(7),
+                    columns: SYSTEM_COLUMNS_V3,
+                    schema: node.arrow_schema.clone(),
+                    key: node.key.clone().unwrap_or_default(),
+                    object_columns: node
+                        .node_object_fields()
+                        .map(|f| f.name().clone())
+                        .collect(),
+                    object_fields: node
+                        .node_object_members()
+                        .map(|(member, field)| {
+                            Field::new(member, field.data_type().clone(), field.is_nullable())
+                        })
+                        .collect(),
+                    row_count: rows,
+                },
+            )
+            .with_index_facts(
+                "node:Person",
+                vec![IndexFact {
+                    name: "id_index".into(),
+                    column: SYSTEM_COLUMNS_V3.id.into(),
+                    kind: IndexKind::Btree { usable },
+                    coverage: coverage.map(|(covered, total)| FragmentCoverage { covered, total }),
+                }],
+            );
+        let Decision::Engine { plan, explain, .. } =
+            route(&op, &source, RouteOverride::Registry, &BOUNDS)
+        else {
+            panic!("overwrite routes to the engine")
+        };
+        assert_eq!(
+            accesses(&plan)
+                .into_iter()
+                .filter(|(kind, _)| kind == "edge_ri")
+                .map(|(_, access)| access)
+                .collect::<Vec<_>>(),
+            [expected, expected],
+            "rows={rows:?}, coverage={coverage:?}, usable={usable}",
+        );
+        let document = explain.to_value().to_string();
+        assert!(document.contains("consulted_rows"), "{document}");
+        assert!(document.contains("index_full_coverage"), "{document}");
+        assert!(document.contains("probe_calls"), "{document}");
+    }
 }

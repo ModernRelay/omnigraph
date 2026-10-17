@@ -1,6 +1,6 @@
 # issue: none
 # notes: A load whose session `query_memory_bytes` cannot admit the statement's read-reuse
-# notes: buffers (a quarter of the allowance under the 1 MiB floor) runs its committed reads
+# notes: buffers after mandatory validation admission runs its committed reads
 # notes: uncached and still loads: over the same fragmented committed table, the small-allowance
 # notes: load and the default-allowance load land the same rows with the same outcomes.
 
@@ -69,6 +69,31 @@ query loaded() {
 {"a.id": "person-0002", "b.id": "person-0003"}
 {"a.id": "person-0003", "b.id": "person-0004"}
 
+--- expect shape
+a.id: String
+b.id: String
+
+--- mutate
+set query_memory_bytes = 3145728;
+load csv "knows_uncached.csv" into edge:Knows mode overwrite delimiter "|" header
+--- expect ok
+
+--- query
+query replaced_uncached() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n":2}
+--- expect shape
+n: I64
+
+--- mutate
+load csv "knows_admitted.csv" into edge:Knows mode overwrite delimiter "|" header
+--- expect ok
+
+--- query
+query replaced_admitted() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": "person-0002", "b.id": "person-0003"}
+{"a.id": "person-0003", "b.id": "person-0004"}
 --- expect shape
 a.id: String
 b.id: String

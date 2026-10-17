@@ -2591,7 +2591,8 @@ async fn show_takes_the_scope_free_read_decision_as_branch_list_does() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn signed_identity_with_change_only_policy_cannot_show_settings() {
+async fn signed_identity_uses_statement_action_for_show_and_explain_load() {
+    use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
     let tokens = data_tokens::DataTokens::new();
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
@@ -2602,13 +2603,32 @@ async fn signed_identity_with_change_only_policy_cannot_show_settings() {
         tokens.actor
     );
     fs::write(&policy_path, policy).unwrap();
-    let state = AppState::open_with_bearer_tokens_and_policy(
+    let external_dir = tempfile::tempdir().unwrap();
+    let csv_path = external_dir.path().join("people.csv");
+    let csv = "name,age\nzed,41\n";
+    fs::write(&csv_path, csv).unwrap();
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            format!("file://{}/", external_dir.path().display()),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .with_external_blob_policy(external_policy)
+        .unwrap();
+    let policy_engine =
+        omnigraph_server::PolicyEngine::load_graph(&policy_path, graph.to_string_lossy().as_ref())
+            .unwrap();
+    let state = AppState::new_with_bearer_tokens_and_policy(
         graph.to_string_lossy().to_string(),
+        db,
         vec![("breakglass".into(), "explicit.static.credential".into())],
-        Some(&policy_path),
+        Some(policy_engine),
     )
-    .await
-    .unwrap()
     .with_data_token_trust(tokens.trust.clone());
     let app = build_app(state);
     let change_only = tokens.identity_token();
@@ -2621,6 +2641,51 @@ async fn signed_identity_with_change_only_policy_cannot_show_settings() {
         let (status, body) = json_response(&app, statement_request("/query", &read, source)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_show_rows(&body, "show by a read credential");
+    }
+
+    let before = manifest_dataset_version(&graph).await;
+    for (path, expected) in [
+        (csv_path, StatusCode::OK),
+        (
+            external_dir.path().join("absent.csv"),
+            StatusCode::FAILED_DEPENDENCY,
+        ),
+    ] {
+        let load = format!(
+            "load csv \"file://{}\" into node:Person mode overwrite header",
+            path.display()
+        );
+        let explain = format!("explain {load}");
+        for (route, source) in [("/mutate", load.as_str()), ("/query", explain.as_str())] {
+            let (status, body) = json_response(&app, statement_request(route, &read, source)).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("action 'change'"),
+                "{route}: {body}"
+            );
+            assert_forbidden(status, body, "source access by a read-only credential");
+        }
+
+        let (status, body) =
+            json_response(&app, statement_request("/query", &change_only, &explain)).await;
+        assert_eq!(status, expected, "{body}");
+        if status == StatusCode::OK {
+            let source = body["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["node"] == "CsvSource")
+                .unwrap();
+            let detail: Value = serde_json::from_str(source["detail"].as_str().unwrap()).unwrap();
+            assert_eq!(detail["source_bytes"], csv.len());
+        }
+        assert_eq!(
+            manifest_dataset_version(&graph).await,
+            before,
+            "explain publishes nothing"
+        );
     }
 }
 

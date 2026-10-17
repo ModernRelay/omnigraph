@@ -25,15 +25,15 @@ use serde_json::Value as JsonValue;
 use omnigraph_compiler::ir::{LoadCheck, lower_load};
 use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
 use omnigraph_planner::{
-    BoundPlan, Decision, MemorySource, Operation, RouteOverride, Side, SideId, TableRef,
-    ValueTable, route,
+    BoundPlan, Decision, MemorySource, NodeTypeSpec, Operation, RouteOverride, Side, SideId,
+    TableRef, ValueTable, route,
 };
 
 use crate::db::manifest::HistoryReleaseBytes;
 use crate::db::{Omnigraph, Snapshot, WriteTxn};
 use crate::engine::{EngineContext, GraphIndexHandle, LoadFacts, LoadWrite};
 use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
-use crate::exec::staging::{MutationStaging, PendingMode};
+use crate::exec::staging::{MutationStaging, PendingMode, StagedMutation};
 use crate::seams::{catalog, decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::{
@@ -101,7 +101,7 @@ pub enum LoadMode {
 }
 
 pub mod csv;
-mod read_reuse;
+pub(crate) mod read_reuse;
 pub use csv::{CSV_SOURCE_BYTES_RESOURCE, CSV_SOURCE_READ_DEADLINE, CsvLoadRequest};
 
 /// How the load input is read: lenient JSON, strict NDJSON envelopes, or
@@ -691,24 +691,14 @@ async fn load_jsonl_data(
     unreachable!("bounded load retry loop always returns")
 }
 
-/// Admit a CSV load's batches under the mode's input bound, returning the
-/// keyed bytes retained so far: a keyed mode retains them against the shared
-/// keyed ceiling, an overwrite bounds each staged-write input by `write_max_bytes`.
+/// Retain CSV append/merge input against the shared keyed-write ceiling.
 fn admit_csv_batches(
     prepared: &csv::PreparedCsvBatch,
-    bounded_keyed_input: bool,
     mut prepared_keyed_bytes: u64,
     write_budget: WriteBudget,
 ) -> Result<u64> {
     for batch in &prepared.batches {
-        if bounded_keyed_input {
-            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, batch, write_budget)?;
-        } else {
-            write_budget.check(
-                STAGED_WRITE_INPUT_BYTES_RESOURCE,
-                crate::table_store::write_batch_bytes(batch)?.rows,
-            )?;
-        }
+        prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, batch, write_budget)?;
     }
     Ok(prepared_keyed_bytes)
 }
@@ -726,7 +716,6 @@ async fn load_jsonl_reader_once<R: BufRead>(
     write_budget: WriteBudget,
     memory: &crate::engine::LoadMemory,
 ) -> Result<LoadReceipt> {
-    let read_reuse = read_reuse::LoadReadReuse::admit(db, memory);
     // Capture the manifest/schema authority before interpreting any input. The
     // catalog rides the WriteTxn and was built from the exact accepted IR named
     // by its schema token; a long-lived handle's global catalog may legitimately
@@ -739,10 +728,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         }
     })?;
     let catalog = Arc::clone(&txn.catalog);
-    let mut snapshot = txn.base.clone();
-    if let Some(reuse) = &read_reuse {
-        snapshot.set_read_caches(reuse.snapshot_caches());
-    }
+    let snapshot = txn.base.clone();
 
     // Phase 1: Parse all lines, spool into per-type collections
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
@@ -772,7 +758,8 @@ async fn load_jsonl_reader_once<R: BufRead>(
             capture.size,
             memory.limit(),
             write_budget.bytes(),
-        )?;
+        )
+        .await?;
         if mode == LoadMode::Overwrite {
             return Box::pin(load_csv_overwrite_plan(
                 handle,
@@ -1004,12 +991,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let _entry = snapshot.dataset(&prepared.table_key).ok_or_else(|| {
             OmniError::manifest(missing_graph_type_at_snapshot(&prepared.table_key))
         })?;
-        prepared_keyed_bytes = admit_csv_batches(
-            &prepared,
-            bounded_keyed_input,
-            prepared_keyed_bytes,
-            write_budget,
-        )?;
+        prepared_keyed_bytes = admit_csv_batches(&prepared, prepared_keyed_bytes, write_budget)?;
         prepared_nodes.push((
             prepared.type_name,
             prepared.table_key,
@@ -1099,12 +1081,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let _entry = snapshot.dataset(&prepared.table_key).ok_or_else(|| {
             OmniError::manifest(missing_graph_type_at_snapshot(&prepared.table_key))
         })?;
-        admit_csv_batches(
-            &prepared,
-            bounded_keyed_input,
-            prepared_keyed_bytes,
-            write_budget,
-        )?;
+        admit_csv_batches(&prepared, prepared_keyed_bytes, write_budget)?;
         prepared_edges.push((
             prepared.type_name,
             prepared.table_key,
@@ -1177,7 +1154,6 @@ async fn load_jsonl_reader_once<R: BufRead>(
             }
         }
     }
-    let committed = crate::validate::CommittedState::load(&snapshot, mode, &changeset);
     let loaded_rows: usize = result
         .nodes_loaded
         .values()
@@ -1190,9 +1166,24 @@ async fn load_jsonl_reader_once<R: BufRead>(
     if let Some(validation) = &validation {
         validation.entries::<String>(loaded_rows.saturating_mul(VALIDATION_ENTRIES_PER_ROW))?;
     }
-    let access = crate::validate::AccessPaths::probe_everywhere();
-    crate::validate::validate_changeset_with_access(&changeset, &committed, &catalog, &access)
-        .await?;
+    {
+        let reuse = memory
+            .admit_read_reuse()
+            .and_then(|admitted| read_reuse::LoadReadReuse::new(db, &snapshot, admitted));
+        let validation_snapshot = reuse.as_ref().map(|reuse| {
+            let mut cached = snapshot.clone();
+            cached.set_read_caches(reuse.snapshot_caches());
+            cached
+        });
+        let committed = crate::validate::CommittedState::load(
+            validation_snapshot.as_ref().unwrap_or(&snapshot),
+            mode,
+            &changeset,
+        );
+        let access = crate::validate::AccessPaths::probe_everywhere();
+        crate::validate::validate_changeset_with_access(&changeset, &committed, &catalog, &access)
+            .await?;
+    }
     drop(validation);
     executed.rows = loaded_rows as u64;
 
@@ -1206,39 +1197,8 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let staged = staging
         .stage_all_with_concurrency(db, branch, stage_write_concurrency)
         .await?;
-    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
-    let lineage_intent = db
-        .new_lineage_intent_for_branch(branch, actor_id, history_release_bytes)
-        .await?;
-    // `held_gates` holds the root-shared schema permit → branch →
-    // sorted-table gates across manifest publication. This closes
-    // same-process interleaving across the effect lifetime. The exact
-    // publisher token remains the persistent correctness authority; these
-    // local gates do not expand the documented single-writer-process
-    // boundary.
-    let crate::exec::staging::CommittedMutation {
-        updates,
-        expected_versions,
-        detached: _,
-        gates: _held_gates,
-    } = staged.commit_all(db, branch, &txn).await?;
-    // Same detached-effects → publisher boundary as mutations: every table
-    // effect is committed detached, but the graph manifest has not published
-    // the result. Reuse the mutation failpoint name so one failpoint pins the
-    // shared boundary.
-    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
-    let publish_result = db
-        .commit_updates_on_branch_with_expected(
-            branch,
-            &updates,
-            &expected_versions,
-            actor_id,
-            &txn,
-            lineage_intent,
-            crate::db::omnigraph::Publication::Publish,
-        )
-        .await;
-    let commit = publish_result?;
+    let commit =
+        publish_staged_load(db, staged, &txn, branch, actor_id, history_release_bytes).await?;
 
     Ok(LoadReceipt {
         result,
@@ -1305,7 +1265,6 @@ async fn load_csv_overwrite_plan(
         load: Some(&facts),
     };
     let rows = crate::engine::execute_load(&bound, &context, memory).await?;
-    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
     let staged = staged
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1315,27 +1274,8 @@ async fn load_csv_overwrite_plan(
                 "load csv overwrite into {table_key}: the plan ran without staging a write"
             ))
         })?;
-    let lineage_intent = db
-        .new_lineage_intent_for_branch(branch, actor_id, history_release_bytes)
-        .await?;
-    let crate::exec::staging::CommittedMutation {
-        updates,
-        expected_versions,
-        detached: _,
-        gates: _held_gates,
-    } = staged.commit_all(db, branch, &txn).await?;
-    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
-    let commit = db
-        .commit_updates_on_branch_with_expected(
-            branch,
-            &updates,
-            &expected_versions,
-            actor_id,
-            &txn,
-            lineage_intent,
-            crate::db::omnigraph::Publication::Publish,
-        )
-        .await?;
+    let commit =
+        publish_staged_load(db, staged, &txn, branch, actor_id, history_release_bytes).await?;
     executed.rows = rows;
     let loaded = usize::try_from(rows)
         .map_err(|_| OmniError::manifest("load csv: row count exceeds usize".to_string()))?;
@@ -1356,10 +1296,41 @@ async fn load_csv_overwrite_plan(
     })
 }
 
+async fn publish_staged_load(
+    db: &Omnigraph,
+    staged: StagedMutation,
+    txn: &WriteTxn,
+    branch: Option<&str>,
+    actor_id: Option<&str>,
+    history_release_bytes: HistoryReleaseBytes,
+) -> Result<crate::db::GraphCommit> {
+    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+    let lineage_intent = db
+        .new_lineage_intent_for_branch(branch, actor_id, history_release_bytes)
+        .await?;
+    let crate::exec::staging::CommittedMutation {
+        updates,
+        expected_versions,
+        detached: _,
+        gates: _held_gates,
+    } = staged.commit_all(db, branch, txn).await?;
+    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+    db.commit_updates_on_branch_with_expected(
+        branch,
+        &updates,
+        &expected_versions,
+        actor_id,
+        txn,
+        lineage_intent,
+        crate::db::omnigraph::Publication::Publish,
+    )
+    .await
+}
+
 /// The planner's decision for one `load csv` statement under `catalog` at
 /// `snapshot`: the statement, the pinned tables and the source's size are
 /// all it reads, so an explain and an attempt plan alike.
-pub(crate) fn plan_load(
+pub(crate) async fn plan_load(
     catalog: &Catalog,
     snapshot: &Snapshot,
     request: &CsvLoadRequest,
@@ -1382,15 +1353,68 @@ pub(crate) fn plan_load(
     let ir = lower_load(catalog, &stmt);
     let table_key = request.target.table_key();
     let tables = load_sides(snapshot, catalog.system_columns, &table_key, &ir.checks);
+    let mut source = MemorySource::default().with_schema(
+        SideId::Child,
+        csv::target_arrow_schema(catalog, &request.target)?,
+    );
+    if request.mode == LoadMode::Overwrite {
+        for side in &tables {
+            let key = &side.table.type_key;
+            let endpoint = ir.checks.iter().any(|check| {
+                matches!(
+                    check.check,
+                    omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. }
+                ) && check.consults.as_ref() == Some(key)
+            });
+            if !endpoint {
+                continue;
+            }
+            let Some(name) = key.strip_prefix("node:") else {
+                continue;
+            };
+            let Some(node) = catalog.node_types.get(name) else {
+                continue;
+            };
+            let Some(entry) = snapshot.dataset(key) else {
+                continue;
+            };
+            source = source
+                .with_node_type(
+                    name,
+                    NodeTypeSpec {
+                        table: side.table.clone(),
+                        version: Some(side.version),
+                        columns: catalog.system_columns,
+                        schema: node.arrow_schema.clone(),
+                        key: node.key.clone().unwrap_or_default(),
+                        object_columns: node
+                            .node_object_fields()
+                            .map(|field| field.name().clone())
+                            .collect(),
+                        object_fields: node
+                            .node_object_members()
+                            .map(|(member, field)| {
+                                arrow_schema::Field::new(
+                                    member,
+                                    field.data_type().clone(),
+                                    field.is_nullable(),
+                                )
+                            })
+                            .collect(),
+                        row_count: Some(entry.entity_count),
+                    },
+                )
+                .with_index_facts(
+                    key,
+                    crate::engine::plan_source::load_index_facts(snapshot, key).await?,
+                );
+        }
+    }
     let operation = Operation::Load {
         ir: Box::new(ir),
         tables,
         source_bytes,
     };
-    let source = MemorySource::default().with_schema(
-        SideId::Child,
-        csv::target_arrow_schema(catalog, &request.target)?,
-    );
     let bounds = crate::engine::engine_bounds(memory_limit, write_max_bytes);
     Ok(route(&operation, &source, RouteOverride::Registry, &bounds))
 }
