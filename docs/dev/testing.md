@@ -141,8 +141,14 @@ workspace gate; its required-cell checks reject removed or ignored cases. The
 lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
 timeout without replaying a committed merge or commit publication/drop (a drop's
 empty response has no body to truncate). Output unit tests inject write and flush
-failures; application tests check baseline file-lock custody through cursor flush.
-Its deployment matrix holds a real
+failures; application tests check baseline file-lock custody through cursor flush,
+transfer receipt failures after a single dispatched write, and raw stream failures
+without mixed diagnostics. `blob_cli` unit tests own bounded stdin capture and
+interrupted reads. Extend `cli_data` for load consent and source-read ordering,
+Blob preconditions and output-file lifecycle; reuse its HTTP fixture and the
+existing parity matrix. Query semantics remain in GQT, not duplicated in these
+CLI boundary tests.
+The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server

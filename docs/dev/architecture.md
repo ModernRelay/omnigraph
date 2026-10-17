@@ -130,6 +130,15 @@ output-file lock through durable installation and resume-cursor delivery, includ
 the cursor flush. Dedicated commit publication and drop share the application's
 write-outcome observation with their `mutate` statement forms.
 
+`commands/transfer` owns `load`, `export` and Blob commands. Blob input capture
+validates ranges and write preconditions before resolving a graph. Stdin comes
+from a supplied reader; file and stdin payloads retain the existing byte bound.
+Load retains its source path: `GraphClient` owns backend-specific input reads and managed limits,
+including the embedded writable open before the source read. Transfer handlers
+use supplied output writers; stream and receipt delivery failures return through
+application completion with any write evidence retained. Blob output files keep
+their existing deferred open and partial-transfer behavior.
+
 CLI unit tests own invocation preparation and presentation; CLI process tests
 own argument, environment, configuration, transport, output and exit behavior.
 GQT owns query semantics across its execution adapters. Keep those boundaries

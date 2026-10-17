@@ -28,7 +28,7 @@ tokio::task_local! {
 pub(crate) fn applies(cli: &Cli) -> bool {
     matches!(
         &cli.command,
-        Command::Load { .. }
+        Command::Load(_)
             | Command::Mutate(_)
             | Command::Branch {
                 command: BranchCommand::Create { .. }

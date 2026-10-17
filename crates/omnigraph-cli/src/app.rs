@@ -1,6 +1,7 @@
 //! CLI application dispatch. Process startup and termination belong to the binary.
 
 use crate::*;
+use std::io::{IsTerminal, Read};
 
 /// An already handled invocation, including nonzero report statuses.
 /// This is distinct from an unrendered command error.
@@ -53,11 +54,22 @@ where
             return Ok(Completion::exit(error.exit_code()));
         }
     };
-    execute(parsed, &mut io::stdout(), &mut io::stderr()).await
+    let mut stdin = io::stdin();
+    let stdin_is_terminal = stdin.is_terminal();
+    execute(
+        parsed,
+        &mut stdin,
+        stdin_is_terminal,
+        &mut io::stdout(),
+        &mut io::stderr(),
+    )
+    .await
 }
 
 async fn execute(
     parsed: ParsedInvocation,
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
@@ -69,7 +81,14 @@ async fn execute(
     // same evidence when flushing, including after a dispatched write.
     // The legacy dispatch future contains every command variant. Keep that
     // large state off reusable callers' stacks (including libtest threads).
-    let invocation = Box::pin(run(cli, &mut machine, stdout, stderr));
+    let invocation = Box::pin(run(
+        cli,
+        &mut machine,
+        stdin,
+        stdin_is_terminal,
+        stdout,
+        stderr,
+    ));
     let (result, evidence) = if observe {
         let (result, evidence) = admission::scope(command_outcome::observe(invocation)).await;
         (result, Some(evidence))
@@ -231,6 +250,8 @@ fn render_diagnostic(
 async fn run(
     cli: Cli,
     machine: &mut Option<MachineErrors>,
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
@@ -451,49 +472,24 @@ async fn run(
             .await?;
             println!("initialized {}", uri);
         }
-        Command::Load {
-            uri,
-            data,
-            branch,
-            from,
-            mode,
-            settings,
-            json,
-        } => {
-            let settings = client::parse_set_flags(&settings)?;
-            let client = if let Some(client) = managed_data {
-                client
-            } else {
-                client::GraphClient::resolve_with_policy(
+        Command::Load(args) => {
+            commands::transfer::run_load(
+                args,
+                commands::transfer::TransferScope {
                     capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.as_actor.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?
-            };
-            let branch = resolve_branch(branch, None, "main");
-            if matches!(mode, CliLoadMode::Overwrite) {
-                confirm_destructive("load --mode overwrite", client.uri(), cli.yes, json)?;
-            }
-            echo_write_target(cli.quiet, "load", client.uri(), client.is_remote());
-            let payload = client
-                .load(
-                    &branch,
-                    from.as_deref(),
-                    &data.to_string_lossy(),
-                    mode,
-                    &settings,
-                )
-                .await?;
-            if json {
-                print_json(&payload)?;
-            } else {
-                print_load_human(&payload);
-            }
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    store: cli.store.as_deref(),
+                    yes: cli.yes,
+                    quiet: cli.quiet,
+                },
+                managed_data,
+                stdout,
+                stderr,
+            )
+            .await?;
         }
         Command::Branch { command } => {
             commands::history::run_branch(
@@ -725,158 +721,42 @@ async fn run(
             )
             .await?;
         }
-        Command::Export {
-            uri,
-            branch,
-            type_names,
-        } => {
-            let client = client::GraphClient::resolve(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
+        Command::Export(args) => {
+            commands::transfer::run_export(
+                args,
+                commands::transfer::TransferScope {
+                    capability,
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    store: cli.store.as_deref(),
+                    yes: cli.yes,
+                    quiet: cli.quiet,
+                },
+                stdout,
             )
             .await?;
-            let branch = resolve_branch(branch, None, "main");
-
-            let stdout = io::stdout();
-            let mut stdout = stdout.lock();
-            client.export(&branch, &type_names, &mut stdout).await?;
         }
-        Command::Blob { command } => match command {
-            BlobCommand::Get {
-                entity,
-                type_name,
-                id,
-                property,
-                branch,
-                snapshot,
-                offset,
-                length,
-                out,
-            } => {
-                // Invalid range arithmetic is rejected before scope resolution
-                // can probe a server or open a graph.
-                let range = blob_cli::BlobRangeRequest::new(offset, length)?;
-                let query =
-                    blob_cli::blob_query(entity.into(), type_name, id, property, branch, snapshot);
-                let client = client::GraphClient::resolve(
+        Command::Blob { command } => {
+            commands::transfer::run_blob(
+                command,
+                commands::transfer::TransferScope {
                     capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    None,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                match out {
-                    Some(path) => {
-                        let mut file = blob_cli::DeferredOutputFile::new(path);
-                        client.blob_get(&query, range, &mut file).await?;
-                    }
-                    None => {
-                        let stdout = io::stdout();
-                        let mut stdout = stdout.lock();
-                        client.blob_get(&query, range, &mut stdout).await?;
-                    }
-                }
-            }
-            BlobCommand::Stat {
-                entity,
-                type_name,
-                id,
-                property,
-                branch,
-                snapshot,
-                json,
-            } => {
-                let query =
-                    blob_cli::blob_query(entity.into(), type_name, id, property, branch, snapshot);
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    None,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let output = client.blob_stat(&query).await?;
-                if json {
-                    print_json(&output)?;
-                } else {
-                    print_blob_stat_human(&output);
-                }
-            }
-            BlobCommand::Put {
-                entity,
-                type_name,
-                id,
-                property,
-                branch,
-                file,
-                if_match,
-                json,
-            } => {
-                // A malformed precondition and input over the limit are
-                // refused before scope resolution, so neither arm starts.
-                let precondition = blob_cli::parse_if_match(if_match.as_deref())?;
-                let bytes = blob_cli::read_put_input(file.as_deref())?;
-                let query =
-                    blob_cli::blob_write_query(entity.into(), type_name, id, property, branch);
-                let client = client::GraphClient::resolve_with_policy(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    None,
-                    cli.as_actor.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let output = client
-                    .blob_write(&query, Some(bytes), if_match.as_deref(), precondition)
-                    .await?;
-                if json {
-                    print_json(&output)?;
-                } else {
-                    print_blob_write_human(&output);
-                }
-            }
-            BlobCommand::Clear {
-                entity,
-                type_name,
-                id,
-                property,
-                branch,
-                if_match,
-                json,
-            } => {
-                let precondition = blob_cli::parse_if_match(if_match.as_deref())?;
-                let query =
-                    blob_cli::blob_write_query(entity.into(), type_name, id, property, branch);
-                let client = client::GraphClient::resolve_with_policy(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    None,
-                    cli.as_actor.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let output = client
-                    .blob_write(&query, None, if_match.as_deref(), precondition)
-                    .await?;
-                if json {
-                    print_json(&output)?;
-                } else {
-                    print_blob_write_human(&output);
-                }
-            }
-        },
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    store: cli.store.as_deref(),
+                    yes: cli.yes,
+                    quiet: cli.quiet,
+                },
+                stdin,
+                stdin_is_terminal,
+                stdout,
+            )
+            .await?;
+        }
         Command::Query(args) => {
             commands::query::run_query(
                 args,

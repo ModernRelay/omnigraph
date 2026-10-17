@@ -269,10 +269,10 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
     match cmd {
         Command::Query(_)
         | Command::Mutate(_)
-        | Command::Load { .. }
+        | Command::Load(_)
         | Command::Branch { .. }
         | Command::Snapshot(_)
-        | Command::Export { .. }
+        | Command::Export(_)
         | Command::Blob { .. }
         | Command::Commit { .. }
         | Command::Diff(_)
@@ -326,7 +326,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         },
         Command::Embed(_) => "embed",
         Command::Init { .. } => "init",
-        Command::Load { .. } => "load",
+        Command::Load(_) => "load",
         Command::Branch { .. } => "branch",
         Command::Schema { command } => match command {
             SchemaCommand::Plan { .. } => "schema plan",
@@ -340,7 +340,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             QueriesCommand::List { .. } => "queries list",
         },
         Command::Snapshot(_) => "snapshot",
-        Command::Export { .. } => "export",
+        Command::Export(_) => "export",
         Command::Blob { command } => match command {
             BlobCommand::Get { .. } => "blob get",
             BlobCommand::Stat { .. } => "blob stat",

@@ -471,8 +471,9 @@ pub(crate) fn finish_cluster_force_unlock(
     Ok(Completion::success())
 }
 
-pub(crate) fn print_load_human(payload: &LoadOutput) {
-    println!(
+pub(crate) fn write_load_human(payload: &LoadOutput, writer: &mut dyn Write) -> Result<()> {
+    writeln!(
+        writer,
         "loaded {} on branch {} with {}: {} entities across {} node types and {} edge types",
         payload.uri,
         payload.branch,
@@ -480,15 +481,16 @@ pub(crate) fn print_load_human(payload: &LoadOutput) {
         payload.total_entities,
         payload.nodes.len(),
         payload.edges.len()
-    );
+    )?;
     if payload.branch_created {
         if let Some(base) = &payload.base_branch {
-            println!("branch {} created from {}", payload.branch, base);
+            writeln!(writer, "branch {} created from {}", payload.branch, base)?;
         }
     }
     if let Some(diagnostic) = payload.embedding_generation {
-        println!("{}", diagnostic.message());
+        writeln!(writer, "{}", diagnostic.message())?;
     }
+    Ok(())
 }
 
 pub(crate) fn print_schema_plan_human(uri: &str, plan: &SchemaMigrationPlan) {
@@ -732,70 +734,79 @@ pub(crate) fn write_snapshot_human(
 
 /// A Blob write receipt: the cell, the state it was left in and the commit
 /// that published it, or that nothing was published.
-pub(crate) fn print_blob_write_human(output: &omnigraph_api_types::BlobWriteOutput) {
+pub(crate) fn write_blob_write_human(
+    output: &omnigraph_api_types::BlobWriteOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
     let entity = match output.selector.entity {
         omnigraph_api_types::BlobEntityKind::Node => "node",
         omnigraph_api_types::BlobEntityKind::Edge => "edge",
     };
-    println!("entity: {entity}");
-    println!("type: {}", output.selector.r#type);
-    println!("id: {}", output.selector.id);
-    println!("property: {}", output.selector.property);
-    println!("branch: {}", output.branch);
+    writeln!(writer, "entity: {entity}")?;
+    writeln!(writer, "type: {}", output.selector.r#type)?;
+    writeln!(writer, "id: {}", output.selector.id)?;
+    writeln!(writer, "property: {}", output.selector.property)?;
+    writeln!(writer, "branch: {}", output.branch)?;
     match output.kind {
         omnigraph_api_types::BlobWriteStateOutput::Managed => {
-            println!("kind: managed");
+            writeln!(writer, "kind: managed")?;
             if let Some(size) = output.size {
-                println!("size: {size}");
+                writeln!(writer, "size: {size}")?;
             }
             if let Some(etag) = output.etag.as_deref() {
-                println!("etag: {etag}");
+                writeln!(writer, "etag: {etag}")?;
             }
         }
-        omnigraph_api_types::BlobWriteStateOutput::Null => println!("kind: null"),
+        omnigraph_api_types::BlobWriteStateOutput::Null => writeln!(writer, "kind: null")?,
     }
     if let Some(actor) = output.actor_id.as_deref() {
-        println!("actor: {actor}");
+        writeln!(writer, "actor: {actor}")?;
     }
     match &output.commit {
-        Some(commit) => println!("commit: {}", commit.graph_commit_id),
-        None => println!("commit: none (the cell was already null)"),
+        Some(commit) => writeln!(writer, "commit: {}", commit.graph_commit_id)?,
+        None => writeln!(writer, "commit: none (the cell was already null)")?,
     }
+    Ok(())
 }
 
-pub(crate) fn print_blob_stat_human(output: &BlobStatOutput) {
+pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Write) -> Result<()> {
     let entity = match output.selector.entity {
         omnigraph_api_types::BlobEntityKind::Node => "node",
         omnigraph_api_types::BlobEntityKind::Edge => "edge",
     };
-    println!("entity: {entity}");
-    println!("type: {}", output.selector.r#type);
-    println!("id: {}", output.selector.id);
-    println!("property: {}", output.selector.property);
+    writeln!(writer, "entity: {entity}")?;
+    writeln!(writer, "type: {}", output.selector.r#type)?;
+    writeln!(writer, "id: {}", output.selector.id)?;
+    writeln!(writer, "property: {}", output.selector.property)?;
     match output.kind {
         BlobContentKindOutput::Managed => {
-            println!("kind: managed");
+            writeln!(writer, "kind: managed")?;
             if let Some(size) = output.size {
-                println!("size: {size}");
+                writeln!(writer, "size: {size}")?;
             }
             if let Some(etag) = output.etag.as_deref() {
-                println!("etag: {etag}");
+                writeln!(writer, "etag: {etag}")?;
             }
         }
         BlobContentKindOutput::External => {
-            println!("kind: external");
+            writeln!(writer, "kind: external")?;
             if let Some(uri) = output.uri.as_deref() {
-                println!("uri: {uri}");
+                writeln!(writer, "uri: {uri}")?;
             }
         }
     }
     if let Some(branch) = output.target.branch.as_deref() {
-        println!("branch: {branch}");
+        writeln!(writer, "branch: {branch}")?;
     }
     if let Some(snapshot) = output.target.snapshot.as_deref() {
-        println!("snapshot: {snapshot}");
+        writeln!(writer, "snapshot: {snapshot}")?;
     }
-    println!("resolved_snapshot: {}", output.target.resolved_snapshot);
+    writeln!(
+        writer,
+        "resolved_snapshot: {}",
+        output.target.resolved_snapshot
+    )?;
+    Ok(())
 }
 
 /// A branch statement's `ChangeOutput` prints the line its `branch` verb
@@ -1952,6 +1963,123 @@ mod tests {
         assert_ne!(
             super::render_change_value(&serde_json::json!("")),
             super::ABSENT_PROPERTY
+        );
+    }
+
+    fn assert_transfer_format(
+        expected: &str,
+        write: impl Fn(&mut dyn Write) -> color_eyre::Result<()>,
+    ) {
+        let mut bytes = Vec::new();
+        write(&mut bytes).unwrap();
+        assert_eq!(bytes, expected.as_bytes());
+        assert_writer_failure("transfer formatter", WriterFault::AfterPrefix, write);
+    }
+
+    #[test]
+    fn load_human_preserves_branch_and_embedding_diagnostics() {
+        let mut output = super::LoadOutput {
+            uri: "graph".to_string(),
+            branch: "work".to_string(),
+            mode: "append",
+            base_branch: Some("main".to_string()),
+            branch_created: true,
+            nodes: vec![omnigraph_api_types::GraphBatchDeclarationOutput {
+                name: "Doc".to_string(),
+                entities_loaded: 2,
+            }],
+            edges: Vec::new(),
+            total_entities: 2,
+            embedding_generation: Some(omnigraph_api_types::LoadEmbeddingGeneration::Unsupported),
+            commit: None,
+        };
+        assert_transfer_format(
+            "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n\
+             branch work created from main\n\
+             Loads do not generate embeddings. Supplied vectors are preserved; omitted vectors follow schema nullability. Supply vectors in the input or prepare them with omnigraph embed.\n",
+            |writer| super::write_load_human(&output, writer),
+        );
+        output.branch_created = false;
+        output.embedding_generation = None;
+        assert_transfer_format(
+            "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n",
+            |writer| super::write_load_human(&output, writer),
+        );
+    }
+
+    #[test]
+    fn blob_stat_human_preserves_managed_external_and_read_target_fields() {
+        let mut query = omnigraph_api_types::BlobReadQuery {
+            entity: omnigraph_api_types::BlobEntityKind::Node,
+            r#type: "Doc".to_string(),
+            id: "one".to_string(),
+            property: "body".to_string(),
+            branch: Some("work".to_string()),
+            snapshot: None,
+        };
+        let output =
+            omnigraph_api_types::BlobStatOutput::managed(&query, "resolved", 0, "\"etag\"");
+        assert_transfer_format(
+            "entity: node\ntype: Doc\nid: one\nproperty: body\nkind: managed\n\
+             size: 0\netag: \"etag\"\nbranch: work\nresolved_snapshot: resolved\n",
+            |writer| super::write_blob_stat_human(&output, writer),
+        );
+
+        query.entity = omnigraph_api_types::BlobEntityKind::Edge;
+        query.branch = None;
+        query.snapshot = Some("requested".to_string());
+        let output =
+            omnigraph_api_types::BlobStatOutput::external(&query, "resolved", "s3://bucket/body");
+        assert_transfer_format(
+            "entity: edge\ntype: Doc\nid: one\nproperty: body\nkind: external\n\
+             uri: s3://bucket/body\nsnapshot: requested\nresolved_snapshot: resolved\n",
+            |writer| super::write_blob_stat_human(&output, writer),
+        );
+    }
+
+    #[test]
+    fn blob_write_human_preserves_receipt_and_already_null_text() {
+        let mut output = omnigraph_api_types::BlobWriteOutput {
+            selector: omnigraph_api_types::BlobSelectorOutput {
+                entity: omnigraph_api_types::BlobEntityKind::Node,
+                r#type: "Doc".to_string(),
+                id: "one".to_string(),
+                property: "body".to_string(),
+            },
+            branch: "work".to_string(),
+            kind: omnigraph_api_types::BlobWriteStateOutput::Managed,
+            size: Some(0),
+            etag: Some("\"etag\"".to_string()),
+            actor_id: Some("actor".to_string()),
+            commit: Some(omnigraph_api_types::CommitOutput {
+                graph_commit_id: "published".to_string(),
+                graph_branch: Some("work".to_string()),
+                graph_manifest_version: 2,
+                parent_commit_id: None,
+                merged_parent_commit_id: None,
+                actor_id: Some("actor".to_string()),
+                created_at: 42,
+                published: true,
+                kind: omnigraph_api_types::CommitKindOutput::Published,
+                root_commit_id: None,
+            }),
+        };
+        assert_transfer_format(
+            "entity: node\ntype: Doc\nid: one\nproperty: body\nbranch: work\n\
+             kind: managed\nsize: 0\netag: \"etag\"\nactor: actor\ncommit: published\n",
+            |writer| super::write_blob_write_human(&output, writer),
+        );
+
+        output.selector.entity = omnigraph_api_types::BlobEntityKind::Edge;
+        output.kind = omnigraph_api_types::BlobWriteStateOutput::Null;
+        output.size = None;
+        output.etag = None;
+        output.actor_id = None;
+        output.commit = None;
+        assert_transfer_format(
+            "entity: edge\ntype: Doc\nid: one\nproperty: body\nbranch: work\n\
+             kind: null\ncommit: none (the cell was already null)\n",
+            |writer| super::write_blob_write_human(&output, writer),
         );
     }
 

@@ -207,9 +207,13 @@ fn blob_get_streams_exact_node_edge_empty_range_and_file_bytes() {
 
 #[test]
 fn blob_get_rejects_zero_overflow_and_out_of_bounds_ranges() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_blob_graph(&graph);
+    let destination = temp.path().join("existing.bin");
+    fs::write(&destination, b"preserve me").unwrap();
 
     for (case, range_args) in [
         ("zero length", vec!["--length", "0"]),
@@ -225,6 +229,8 @@ fn blob_get_rejects_zero_overflow_and_out_of_bounds_ranges() {
                 .arg("get")
                 .args(["node", "Document", "readme", "content"])
                 .args(range_args)
+                .arg("--out")
+                .arg(&destination)
                 .arg("--store")
                 .arg(&graph),
         );
@@ -232,10 +238,9 @@ fn blob_get_rejects_zero_overflow_and_out_of_bounds_ranges() {
             output.stdout.is_empty(),
             "{case}: a rejected range must emit no payload bytes"
         );
+        assert_eq!(fs::read(&destination).unwrap(), b"preserve me", "{case}");
     }
 
-    let destination = temp.path().join("existing.bin");
-    fs::write(&destination, b"preserve me").unwrap();
     let missing = output_failure(
         cli()
             .arg("blob")
@@ -252,6 +257,85 @@ fn blob_get_rejects_zero_overflow_and_out_of_bounds_ranges() {
         b"preserve me",
         "a pre-transfer failure must not truncate an existing --out destination"
     );
+
+    // Served output has the same lifecycle. A large truncated body makes
+    // transfer begin before EOF, without relying on a socket timing race.
+    let prefix: Vec<u8> = (0..256 * 1024).map(|index| (index % 256) as u8).collect();
+    for (case, status, bytes, length) in [
+        ("refused", 403, b"not Blob bytes".to_vec(), 14),
+        ("empty", 200, Vec::new(), 0),
+        ("truncated", 200, prefix.clone(), prefix.len() + 1),
+    ] {
+        fs::write(&destination, b"preserve me").unwrap();
+        let server = IntentApiFixture::graph(vec![IntentReply {
+            status,
+            headers: vec![
+                ("Content-Length".into(), length.to_string()),
+                ("Content-Type".into(), "application/octet-stream".into()),
+                ("ETag".into(), "\"blob-version\"".into()),
+                ("Omnigraph-Snapshot-Id".into(), "snapshot".into()),
+            ],
+            body: bytes,
+        }]);
+        let output = cli()
+            .args([
+                "blob",
+                "get",
+                "node",
+                "Document",
+                "readme",
+                "content",
+                "--server",
+                &server.origin,
+                "--graph",
+                "knowledge",
+                "--out",
+            ])
+            .arg(&destination)
+            .timeout(std::time::Duration::from_secs(15))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            case == "empty",
+            "{case}: {output:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "--out never mixes payload with stdout: {case}"
+        );
+        let stored = fs::read(&destination).unwrap();
+        match case {
+            "refused" => assert_eq!(stored, b"preserve me"),
+            "empty" => assert!(
+                stored.is_empty(),
+                "successful empty delivery truncates --out"
+            ),
+            _ => {
+                assert!(
+                    !stored.is_empty(),
+                    "truncated delivery must exercise an actual transferred prefix"
+                );
+                assert!(
+                    prefix.starts_with(&stored),
+                    "only delivered binary bytes may remain"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("Blob delivery stream"),
+                    "{output:?}"
+                );
+            }
+        }
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one discovery and one read, without replay: {case}"
+        );
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[1].method, "GET");
+        server.assert_complete();
+    }
 }
 
 #[test]
@@ -630,13 +714,14 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
     assert_eq!(get(readme), b"from a file\0\xff");
 
     let edge = ["edge", "Attachment", "attachment-1", "payload"];
-    let human = output_success(blob("put", edge).write_stdin(b"from stdin".to_vec()));
+    let stdin_bytes = b"from stdin\0\xff";
+    let human = output_success(blob("put", edge).write_stdin(stdin_bytes.to_vec()));
     let human = stdout_string(&human);
     assert!(
-        human.contains("kind: managed") && human.contains("size: 10"),
+        human.contains("kind: managed") && human.contains("size: 12"),
         "{human}"
     );
-    assert_eq!(get(edge), b"from stdin");
+    assert_eq!(get(edge), stdin_bytes);
 
     let stale = output_failure(
         blob("put", readme)
@@ -685,7 +770,7 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
         parse_stdout_json(&lowered)["resource_limit"],
         json!({"resource": "Blob write payload bytes", "limit": 4093, "actual": 4094})
     );
-    assert_eq!(get(edge), b"from stdin");
+    assert_eq!(get(edge), stdin_bytes);
 
     // Refused before the graph is addressed: the store does not exist.
     let absent = temp.path().join("absent.omni");
@@ -726,6 +811,39 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
     );
     assert_eq!(refused["command_outcome"]["execution"], "not_started");
     assert!(!absent.exists(), "neither arm opened the store");
+
+    // If-Match precedes reading the input; a missing input in turn precedes
+    // scope discovery. Neither refusal can contact the selected server.
+    for (validator, expected) in [("unquoted", "If-Match"), ("*", "cannot read --file")] {
+        let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
+        let output = output_failure(
+            cli()
+                .args([
+                    "blob",
+                    "put",
+                    "node",
+                    "Document",
+                    "readme",
+                    "content",
+                    "--if-match",
+                    validator,
+                    "--file",
+                ])
+                .arg(temp.path().join("missing.bin"))
+                .args(["--server", &server.origin, "--graph", "knowledge", "--json"]),
+        );
+        let refused = parse_stdout_json(&output);
+        assert!(
+            refused["error"].as_str().unwrap().contains(expected),
+            "{validator}: {refused}"
+        );
+        assert_eq!(
+            refused["command_outcome"],
+            json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+        );
+        assert!(server.requests().is_empty());
+        server.assert_complete();
+    }
 }
 
 #[test]
@@ -3572,6 +3690,32 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
             .contains("refusing destructive `load --mode overwrite`")
     );
     assert_eq!(output["command_outcome"]["effects"], "none");
+
+    let temp = tempdir().unwrap();
+    let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
+    let output = output_failure(
+        cli()
+            .args(["load", "--mode", "overwrite", "--data"])
+            .arg(temp.path().join("missing.jsonl"))
+            .args(["--server", &server.origin, "--graph", "knowledge", "--json"]),
+    );
+    let refused = parse_stdout_json(&output);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("refusing destructive `load --mode overwrite`"),
+        "consent must precede reading --data: {refused}"
+    );
+    assert_eq!(
+        refused["command_outcome"],
+        json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+    );
+    assert!(
+        server.requests().is_empty(),
+        "consent must precede discovery and submission"
+    );
+    server.assert_complete();
 }
 
 #[test]
@@ -4277,6 +4421,9 @@ fn cli_fails_for_missing_schema_or_data_file() {
     );
 
     init_graph(&graph);
+    let before = parse_stdout_json(&output_success(
+        cli().args(["commit", "list"]).arg(&graph).arg("--json"),
+    ));
     let load_output = output_failure(
         cli()
             .arg("load")
@@ -4284,13 +4431,53 @@ fn cli_fails_for_missing_schema_or_data_file() {
             .arg("overwrite")
             .arg("--data")
             .arg(&missing_data)
+            .arg("--json")
             .arg(&graph),
     );
+    let refused = parse_stdout_json(&load_output);
     assert!(
-        String::from_utf8(load_output.stderr)
-            .unwrap()
-            .contains("No such file")
+        refused["error"].as_str().unwrap().contains("No such file"),
+        "{refused}"
     );
+    assert_eq!(
+        refused["command_outcome"],
+        json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"}),
+        "embedded load opens writable storage before reading --data"
+    );
+    let after = parse_stdout_json(&output_success(
+        cli().args(["commit", "list"]).arg(&graph).arg("--json"),
+    ));
+    assert_eq!(after, before, "missing input must not publish a load");
+
+    for (settings, expected) in [
+        (None, "No such file"),
+        (
+            Some("merge_lineage=off"),
+            "load takes --set only on an embedded store",
+        ),
+    ] {
+        let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
+        let mut command = cli();
+        command
+            .args(["load", "--mode", "append", "--data"])
+            .arg(&missing_data)
+            .args(["--server", &server.origin, "--graph", "knowledge", "--json"]);
+        if let Some(settings) = settings {
+            command.args(["--set", settings]);
+        }
+        let refused = parse_stdout_json(&output_failure(&mut command));
+        assert!(
+            refused["error"].as_str().unwrap().contains(expected),
+            "{settings:?}: {refused}"
+        );
+        assert_eq!(
+            refused["command_outcome"],
+            json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
+            "served load validates settings and reads --data before HTTP"
+        );
+        assert!(server.requests().is_empty());
+        server.assert_complete();
+    }
 }
 
 #[test]
