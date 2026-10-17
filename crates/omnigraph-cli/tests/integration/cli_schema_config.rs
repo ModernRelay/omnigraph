@@ -21,17 +21,34 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
     };
     use omnigraph_api_types::HTTP_API_CONTRACT;
 
+    // The release workflows stamp both at compile time; the test binary is
+    // built with whatever this build was given, normally neither.
+    let channel = option_env!("OMNIGRAPH_RELEASE_CHANNEL");
+    let commit = option_env!("OMNIGRAPH_SOURCE_VERSION");
+    let version = match (channel, commit) {
+        (Some("edge"), Some(commit)) => {
+            format!("{}-edge+{}", env!("CARGO_PKG_VERSION"), &commit[..7])
+        }
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    };
+
     // The first two lines keep their earlier text and position; the contract
-    // line follows them.
+    // line follows them, then the commit of a packaged build.
     let output = output_success(cli().arg("version"));
     let stdout = stdout_string(&output);
+    let mut expected = vec![
+        format!("omnigraph {version}"),
+        format!("internal-schema {WRITES} (serves v{LOWEST} to v{WRITES})"),
+        format!("http-contract {HTTP_API_CONTRACT}"),
+    ];
+    expected.extend(commit.map(|commit| format!("commit {commit}")));
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), expected);
+
+    // `--version` prints the first line alone.
+    let output = output_success(cli().arg("--version"));
     assert_eq!(
-        stdout.lines().collect::<Vec<_>>(),
-        [
-            format!("omnigraph {}", env!("CARGO_PKG_VERSION")),
-            format!("internal-schema {WRITES} (serves v{LOWEST} to v{WRITES})"),
-            format!("http-contract {HTTP_API_CONTRACT}"),
-        ],
+        stdout_string(&output).trim_end(),
+        format!("omnigraph {version}")
     );
 
     // Equality with the whole object pins the field set: a field added or
@@ -41,7 +58,9 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
     assert_eq!(
         json,
         serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": version,
+            "channel": channel,
+            "commit": commit,
             "http_contract": HTTP_API_CONTRACT,
             "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
         }),

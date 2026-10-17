@@ -8,4 +8,6 @@ pub const BOUNDS: Bounds = Bounds {
     build_key_cap_rows: 1 << 22,
     query_memory_pool_bytes: 150 * 1024 * 1024,
     late_materialization_only: false,
+    load_workers_max: 4,
+    load_write_max_bytes: 256 * 1024 * 1024,
 };

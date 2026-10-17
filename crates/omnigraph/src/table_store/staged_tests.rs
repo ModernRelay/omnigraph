@@ -2397,6 +2397,106 @@ async fn stage_overwrite_empty_batch_replaces_all_rows() {
     );
 }
 
+/// Several batches stage as one `Operation::Overwrite` whose fragments hold
+/// every batch's rows; the batches are never concatenated into one Arrow
+/// allocation, and a zero-row batch between them contributes nothing.
+#[tokio::test]
+async fn stage_overwrite_batches_keeps_every_batch_in_one_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let committed_fragment_ids: std::collections::HashSet<u64> =
+        ds.manifest.fragments.iter().map(|f| f.id).collect();
+    let pre_version = ds.version().version;
+
+    let staged = store
+        .stage_overwrite_batches(
+            &ds,
+            vec![
+                person_batch(&[("zoe", Some(99)), ("yan", Some(1))]),
+                person_batch(&[]),
+                person_batch(&[("xia", None)]),
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        staged.transaction.operation,
+        Operation::Overwrite { .. }
+    ));
+    assert_eq!(
+        staged
+            .new_fragments()
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or(0))
+            .sum::<usize>(),
+        3,
+        "the staged fragments hold every row of every batch"
+    );
+    let removed: std::collections::HashSet<u64> =
+        staged.removed_fragment_ids().iter().copied().collect();
+    assert_eq!(removed, committed_fragment_ids);
+    assert_eq!(ds.version().version, pre_version);
+
+    let batches = store
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
+        .await
+        .unwrap();
+    assert_eq!(collect_ids(&batches), vec!["xia", "yan", "zoe"]);
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.version().version, pre_version + 1);
+    let after = store.scan_batches(&new_ds).await.unwrap();
+    assert_eq!(collect_ids(&after), vec!["xia", "yan", "zoe"]);
+}
+
+/// With no batch at all the overwrite carries no fragment and keeps the
+/// dataset's own schema: the table image becomes empty, nothing else moves.
+#[tokio::test]
+async fn stage_overwrite_batches_with_no_batch_empties_the_table_keeping_its_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    let ds = TableStore::write_dataset(
+        &uri,
+        person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+    let pre_version = ds.version().version;
+
+    let staged = store
+        .stage_overwrite_batches(&ds, Vec::new())
+        .await
+        .unwrap();
+    assert!(staged.new_fragments().is_empty());
+    assert_eq!(
+        staged.removed_fragment_ids().len(),
+        ds.manifest.fragments.len()
+    );
+    assert_eq!(ds.version().version, pre_version);
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.version().version, pre_version + 1);
+    assert_eq!(new_ds.count_rows(None).await.unwrap(), 0);
+    assert_eq!(
+        arrow_schema::Schema::from(new_ds.schema()),
+        arrow_schema::Schema::from(ds.schema()),
+        "an overwrite without a batch keeps the committed schema"
+    );
+}
+
 /// A mixed BTREE + FTS + full-table vector batch writes immutable index files
 /// without moving HEAD, then lands every index in one exact transaction and
 /// exactly one table-version advance.

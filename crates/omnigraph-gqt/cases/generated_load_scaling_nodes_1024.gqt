@@ -1,0 +1,41 @@
+# issue: none
+# notes: family B: one-call append of 1024 Knows rows over 1024 seeded Person rows (4 fragments); step reads scaling with n means a batched node-table scan.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    id: String @key
+    v: I64
+}
+edge Knows: Person -> Person {
+    w: I64
+}
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 1024
+    commits: 4
+    columns:
+      id: {kind: key, prefix: person-, width: 4}
+      v: {kind: ordinal, start: 0, step: 1}
+
+--- load generate: v1 seed: 7 mode: append
+tables:
+  - kind: edge
+    name: Knows
+    rows: 1024
+    commits: 1
+    from: {kind: endpoint, prefix: person-, width: 4, population: 1024, distribution: {kind: ordinal}}
+    to: {kind: endpoint, prefix: person-, width: 4, population: 1024, distribution: {kind: ordinal}}
+    columns:
+      w: {kind: ordinal, start: 0, step: 1}
+
+--- expect ok

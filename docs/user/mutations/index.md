@@ -183,8 +183,8 @@ with the kind named; an unmapped one stores null when nullable.
 
 Float values must be finite and representable by their declared `F32` or
 `F64` type; NaN, infinity and overflow refuse the load. Each decoded batch
-is admitted against the same projected Arrow-byte budget as JSONL before
-it is retained, including the cost of omitted nullable columns.
+is held against the statement's `query_memory_bytes` allowance before it
+is retained, and each staged-write input against `write_max_bytes`.
 
 Node ids derive from the `@key` as in a JSONL load; an edge's `from` and `to`
 are the canonical ids of its endpoints, so a single-property integer key is
@@ -204,6 +204,13 @@ larger object. A direct `omnigraph mutate`
 run installs an embedded-only base over a `file://` source's directory for
 that statement, so the file is admitted by the same rule; a served run
 refuses a `file://` source, since the server reads only what it may reach.
+
+`explain` before a `load csv` statement prints the load's plan, the same
+document a query's explain prints: the source, the one validation with each
+check and its access path, and the write.
+An overwrite runs that plan; append and merge run the keyed adapters.
+It reads the source's metadata and no payload byte.
+See [Explaining a load statement](../queries/explain.md#explaining-a-load-statement).
 
 #### CLI and HTTP requests
 
@@ -242,14 +249,33 @@ touched types. Blob payloads have a separate allowance of the same size,
 including inline bytes, copied external bytes and carried update values.
 Every version of a key written in one mutation counts, so an insert and an
 update of the same row charge its Blob twice.
-Keyed loads also bound their parser estimate independently. Every strict
-load retains its projected input check, a CSV load included: its typed batch
-is charged against `write_max_bytes` in every mode, so an overwrite over the
-cap refuses with `strict_input_arrow_bytes` as a JSONL overwrite does, and
-its source object is bounded by `load_source_max_bytes` before it is read
-(refused as `csv_source_bytes`). Raising `write_max_bytes` lifts
-`strict_input_arrow_bytes`; raising `load_source_max_bytes` lifts
-`csv_source_bytes`. See [Blob limits](../blobs.md#limits).
+Keyed loads also bound their parser estimate independently. A strict JSONL
+load retains its projected input check, `strict_input_arrow_bytes`.
+A CSV load has no whole-statement input check.
+It applies `write_max_bytes` to each staged-write input instead.
+An overwrite stages the reader's 8,192-row batches, and a batch over the
+allowance refuses as `staged_write_input_bytes`.
+An append or merge keeps the keyed adapter's ceilings
+(`retained keyed batch bytes per operation`, `keyed entities for <table>`,
+`keyed entity bytes for <table>`).
+The [`query_memory_bytes`](../queries/settings.md) setting bounds one
+`load csv` statement's tracked memory as a whole: the retained source, every
+decoded batch, validation state and the staging working set.
+A statement the allowance cannot hold refuses with the `query_memory_bytes`
+resource error before any fragment write.
+A CSV load needs roughly the source plus twice its typed input under that
+allowance.
+The source object is bounded by `load_source_max_bytes` before it is read
+(refused as `csv_source_bytes`).
+The loader reads the object once per statement, under the size, etag and
+version its metadata probe captured, and every reprepare attempt reuses those
+bytes.
+An object replaced between the probe and the read refuses as an
+external-source error, and nothing is staged.
+Raising `write_max_bytes` lifts `strict_input_arrow_bytes` and
+`staged_write_input_bytes`; raising `query_memory_bytes` admits a larger
+statement; raising `load_source_max_bytes` lifts `csv_source_bytes`. See
+[Blob limits](../blobs.md#limits).
 
 Deletes, including cascades, and overwrite loads collecting replaced IDs have
 a separate `write_max_bytes` allowance per operation for those IDs, summed over all
@@ -261,12 +287,12 @@ committed ID of that type, because those IDs are generated again on each load.
 
 Oversized work returns a resource-limit error before its data is staged or
 published. These checks do not bound total engine memory. The setting can
-change each allowance from its 32 MiB default; a value raised above the
-default is held in memory as one typed batch at an overwrite load's commit.
-Split larger inserts, updates, keyed loads and deletes into
-explicit commits. An overwrite replaces each represented type as one image and
-cannot be split: it keeps its bulk-input behavior and remains subject to its
-separate input and removed-ID checks.
+change each allowance from its 32 MiB default; a CSV overwrite stages its
+input as a vector of reader batches, each bounded by the allowance, under
+the statement's `query_memory_bytes`. Split larger inserts, updates, keyed
+loads and deletes into explicit commits. An overwrite replaces each
+represented type as one image and cannot be split: it keeps its bulk-input
+behavior and remains subject to its removed-ID check.
 
 Independent existing constructive datasets stage concurrently. The
 `stage_write_concurrency` [session setting](../queries/index.md#session-settings)
