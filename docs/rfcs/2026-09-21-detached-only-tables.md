@@ -859,8 +859,9 @@ New evidence, each an entry in `blocked_on`:
   `cleanup.sweep_between_manifests` and `cleanup.sweep_pre_file_delete`
   added, each reached by the `cleanup` milestone recipe, and
   `cleanup.sweep_pre_dead_manifest_delete` between the dead stagings' files
-  and their manifests, reached by its own recipe after the reach census's
-  setup crash strands an index build before its manifest commit
+  and their manifests, reached by its own recipe after its setup crash
+  strands an index build before its manifest commit; the reach census, the
+  hunt and the fleet schedule both
   (`dst_dead_staging_sweep_window_is_reached_and_retried`). A window inside
   the sweep defers its table rather than failing `cleanup`; the DST judges
   that table's retry like a crashed cleanup's, a rerun that must finish it

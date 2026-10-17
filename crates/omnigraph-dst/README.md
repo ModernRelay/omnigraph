@@ -124,7 +124,10 @@ and `tests/integration/lane_b.rs`.
   `dst_hunt_crash_window_sweep` test sweeps the whole catalog. A window
   inside `cleanup`'s per-table pass defers that table instead of failing the
   op; the universe records `deferred:<window>@op<i>` and runs the obligation
-  pass a crashed cleanup gets.
+  pass a crashed cleanup gets. A window whose precondition is an earlier
+  crash's aftermath names that crash in `harness::setup_crash_for`;
+  `Scenario::setup_crash` schedules it before the window, and the reach
+  census, the hunt and the fleet all use it.
 - **Injected storage faults**: `Scenario::faults` installs a seeded `FaultPlan`
   on the adapter and optionally Lance. Latency uses virtual time. Lance supports
   errors, latency and lost acknowledgements; adapter text corruption and

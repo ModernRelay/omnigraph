@@ -650,6 +650,13 @@ pub struct Scenario {
     /// `crash_at`, and just as deterministic: the trigger is a pure function
     /// of the seeded op stream.
     pub crash_on_match: Option<(&'static str, usize)>,
+    /// SETUP CRASH: a real crash at failpoint `.0` on the `.1`-th sampled op
+    /// whose kind matches it, scheduled before `crash_on_match`. A window
+    /// whose precondition is an earlier crash's aftermath takes its setup
+    /// from [`setup_crash_for`]. `crash_on_match` starts matching only on the
+    /// op after the setup crash, so its skip counts ops that can see the
+    /// aftermath; `probe_only` leaves the setup a real crash.
+    pub setup_crash: Option<(&'static str, usize)>,
     /// CROSSING PROBE: with `crash_on_match` set, install a
     /// RECORD-ONLY callback instead of an injected failure — the op executes
     /// normally and `UniverseReport.crossed` says whether execution actually
@@ -863,6 +870,20 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "cleanup" => vec![MutateMain, CleanupMain],
         "optimize" => vec![MutateMain],
         _ => Vec::new(),
+    }
+}
+
+/// The setup crash a window needs (`Scenario::setup_crash`), shared by the
+/// reach census, the hunt and the fleet.
+/// - the window before the dead stagings' manifests: an index build crashed
+///   before its manifest commit leaves the unpublished staging that the
+///   window's recipe then makes dead and reclaims.
+pub fn setup_crash_for(window: &str) -> Option<(&'static str, usize)> {
+    match window {
+        "cleanup.sweep_pre_dead_manifest_delete" => {
+            Some(("ensure_indices.post_phase_b_pre_manifest_commit", 0))
+        }
+        _ => None,
     }
 }
 
@@ -1993,6 +2014,7 @@ fn window_matches(window: &str, wop: &WorldOp) -> bool {
 /// to the windows only its ops can reach.
 pub fn window_needs_wide(window: &str) -> bool {
     matches!(window.split('.').next().unwrap_or(window), "load")
+        || setup_crash_for(window).is_some_and(|(setup, _)| window_needs_wide(setup))
 }
 
 /// Does scheduling this window require the schema-op face
@@ -2002,7 +2024,7 @@ pub fn window_needs_schema_ops(window: &str) -> bool {
     matches!(
         window.split('.').next().unwrap_or(window),
         "schema_apply" | "schema_reload"
-    )
+    ) || setup_crash_for(window).is_some_and(|(setup, _)| window_needs_schema_ops(setup))
 }
 
 /// Can the CURRENT workload produce any op reaching this window's family?
@@ -5346,15 +5368,17 @@ pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<Uni
         !(sc.keep_handle
             && (sc.crash_at.is_some()
                 || sc.crash_on_match.is_some()
+                || sc.setup_crash.is_some()
                 || sc.die_at_write.is_some()
                 || sc.recovery_crash.is_some())),
         "keep_handle is a live-handle liveness mode; a crash universe has no handle to keep"
     );
     println!(
-        "dst universe [root={root} seed={} ops={} crash={:?} crash_on_match={:?} faults={} kill={:?}]",
+        "dst universe [root={root} seed={} ops={} crash={:?} setup_crash={:?} crash_on_match={:?} faults={} kill={:?}]",
         sc.seed,
         sc.ops,
         sc.crash_at,
+        sc.setup_crash,
         sc.crash_on_match,
         sc.faults
             .as_ref()
@@ -5502,6 +5526,10 @@ impl UniverseScenario<RustResources> for Scenario {
         // Targeted-scheduling state: pending until the (skip+1)-th
         // family-matching op has been crash-executed (or probe-executed).
         let (mut match_pending, mut match_skip) = match sc.crash_on_match {
+            Some((_, skip)) => (true, skip),
+            None => (false, 0),
+        };
+        let (mut setup_pending, mut setup_skip) = match sc.setup_crash {
             Some((_, skip)) => (true, skip),
             None => (false, 0),
         };
@@ -5656,13 +5684,26 @@ impl UniverseScenario<RustResources> for Scenario {
             // this op kind (no-op when the cost ledger is disarmed).
             crate::cost::set_label(&crate::cost::debug_head(&wop));
 
-            // Unified crash trigger: blind index (`crash_at`) or targeted
-            // family match (`crash_on_match`) — at most one crash either way.
+            // Unified crash trigger: blind index (`crash_at`), the setup
+            // crash, or targeted family match (`crash_on_match`, which waits
+            // for the setup) — at most one crash per op.
             let mut crash_now: Option<&'static str> = None;
             if let Some((crash_idx, failpoint)) = sc.crash_at {
                 crash_now = (i == crash_idx).then_some(failpoint);
             }
-            if crash_now.is_none() && match_pending {
+            let mut setup_now: Option<&'static str> = None;
+            if crash_now.is_none() && setup_pending {
+                let (failpoint, _) = sc.setup_crash.expect("pending implies present");
+                if window_matches(failpoint, &wop) {
+                    if setup_skip == 0 {
+                        setup_pending = false;
+                        setup_now = Some(failpoint);
+                    } else {
+                        setup_skip -= 1;
+                    }
+                }
+            }
+            if crash_now.is_none() && setup_now.is_none() && !setup_pending && match_pending {
                 let (failpoint, _) = sc.crash_on_match.expect("pending implies present");
                 if window_matches(failpoint, &wop) {
                     if match_skip == 0 {
@@ -5673,12 +5714,16 @@ impl UniverseScenario<RustResources> for Scenario {
                     }
                 }
             }
-            let heads_before = if failing.is_some() || (crash_now.is_some() && !sc.probe_only) {
+            // `probe_only` probes a scheduled window instead of crashing it;
+            // the setup is always a real crash.
+            let probe_now = crash_now.filter(|_| sc.probe_only);
+            let crash_now = setup_now.or(crash_now.filter(|_| !sc.probe_only));
+            let heads_before = if failing.is_some() || crash_now.is_some() {
                 branch_heads(&db, &world, i, &wop, failing.as_deref()).await
             } else {
                 Vec::new()
             };
-            if let Some(failpoint) = crash_now.filter(|_| !sc.probe_only) {
+            if let Some(failpoint) = crash_now {
                 let (new_db, outcome) = Box::pin(crash_op(
                     db,
                     storage.clone(),
@@ -5810,8 +5855,8 @@ impl UniverseScenario<RustResources> for Scenario {
             // attribution.
             #[cfg(feature = "failpoints")]
             let exec_result = {
-                let _probe_guard = match crash_now {
-                    Some(failpoint) if sc.probe_only => {
+                let _probe_guard = match probe_now {
+                    Some(failpoint) => {
                         let flag = crossed_flag.clone();
                         Some(
                             omnigraph::seams::catalog::decide(failpoint)
@@ -5828,7 +5873,7 @@ impl UniverseScenario<RustResources> for Scenario {
                 let effect_window = sc.faults.as_ref().and_then(|plan| {
                     if plan.engine_effect_error_pct == 0
                         || sc.probe_window.is_some()
-                        || (sc.probe_only && crash_now.is_some())
+                        || probe_now.is_some()
                         || !matches!(&wop, WorldOp::Data { op, .. } if is_mutation_op(op) || is_load_op(op))
                         || effect_rng.below(100) >= plan.engine_effect_error_pct
                     {
@@ -5870,7 +5915,10 @@ impl UniverseScenario<RustResources> for Scenario {
                 }
             };
             #[cfg(not(feature = "failpoints"))]
-            let exec_result = exec_world_op(&db, &wop).await;
+            let exec_result = {
+                let _ = probe_now;
+                exec_world_op(&db, &wop).await
+            };
 
             // the dead flag — not the error text, not even the
             // op's verdict — is the authority. The dying op may surface a
