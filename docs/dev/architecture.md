@@ -139,6 +139,14 @@ use supplied output writers; stream and receipt delivery failures return through
 application completion with any write evidence retained. Blob output files keep
 their existing deferred open and partial-transfer behavior.
 
+`commands/schema` owns initialization, schema commands and lint. The handlers
+preserve each command's source-read and target-resolution order, including cluster
+ownership refusals before init/apply source reads and offline lint without target
+resolution. They render through supplied writers. Schema apply keeps the existing
+client's write evidence; initialization and system-column upgrade retain their
+own execution paths and do not claim the data-write outcome envelope. The upgrade
+adapter keeps its separate read-only check and execution modes.
+
 CLI unit tests own invocation preparation and presentation; CLI process tests
 own argument, environment, configuration, transport, output and exit behavior.
 GQT owns query semantics across its execution adapters. Keep those boundaries

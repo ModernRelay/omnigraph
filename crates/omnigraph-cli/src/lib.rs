@@ -13,11 +13,9 @@ use omnigraph_cluster::{
     ValidateOutput, force_unlock_config_dir, observe_config_dir, status_config_dir,
     validate_config_dir,
 };
-use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
-    JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSchemaSource,
-    QueryLintSeverity, QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, build_catalog,
-    json_params_to_param_map, lint_query_file,
+    JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSeverity,
+    QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, json_params_to_param_map,
 };
 use omnigraph_server::queries::{QueryRegistry, check};
 use omnigraph_server::{PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig};

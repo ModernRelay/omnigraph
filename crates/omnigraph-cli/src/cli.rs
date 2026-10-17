@@ -9,6 +9,8 @@ use omnigraph_server::PolicyAction;
 pub(crate) use crate::commands::history::{BranchCommand, ChangesCommand, CommitCommand};
 use crate::commands::history::{DiffArgs, SnapshotArgs};
 use crate::commands::query::{AliasArgs, MutateArgs, QueryArgs};
+pub(crate) use crate::commands::schema::SchemaCommand;
+use crate::commands::schema::{InitArgs, LintArgs};
 pub(crate) use crate::commands::transfer::{BlobCommand, CliLoadMode};
 use crate::commands::transfer::{ExportArgs, LoadArgs};
 use crate::embed::EmbedArgs;
@@ -183,20 +185,7 @@ pub(crate) enum Command {
 
     // ── Storage / local graph ops ── direct storage or local files; reject --server.
     /// Initialize a new graph from a schema
-    Init {
-        #[arg(long)]
-        schema: PathBuf,
-        /// Graph URI (local path, s3://, or az://). Azure is a qualification
-        /// preview pending adversarial live qualification; initialization is
-        /// a write and requires the root-scoped external admission wrapper.
-        uri: String,
-        /// Replace orphan schema artifacts only after proving that the URI
-        /// has no `__manifest`. Without this flag, init refuses a URI that
-        /// already holds a graph manifest or any schema artifact. This flag never
-        /// overwrites an initialized graph or purges its Lance datasets.
-        #[arg(long)]
-        force: bool,
-    },
+    Init(InitArgs),
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
     /// the current format this binary serves (v16); other formats are rebuilt by export and load
     Upgrade {
@@ -256,16 +245,7 @@ pub(crate) enum Command {
         json: bool,
     },
     /// Validate queries against a schema (offline) or repo (repo-backed).
-    Lint {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        query: PathBuf,
-        #[arg(long)]
-        schema: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
+    Lint(LintArgs),
     /// Operate on the server-side stored-query registry (`queries:`).
     Queries {
         #[command(subcommand)]
@@ -784,54 +764,6 @@ pub(crate) enum GraphsCommand {
         /// Minimal authenticated graph existence; requires an identity credential.
         #[arg(long)]
         discovery: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum SchemaCommand {
-    /// Plan a schema migration against the accepted persisted schema
-    Plan {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        schema: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Apply a supported schema migration to a standalone graph.
-    /// Deploy served schemas with `cluster apply --server URL --config DIR`.
-    ///
-    /// A drop removes the property or type from the current graph-manifest
-    /// version and reclaims nothing at apply: older commits still read the
-    /// dropped data until `omnigraph cleanup` stops retaining them, after
-    /// which it cannot be recovered.
-    Apply {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        schema: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show the current accepted schema source
-    #[command(alias = "get")]
-    Show {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
-    /// `__id`/`__src`/`__dst`); the storage layout is unchanged (RFC 0040)
-    #[command(name = "upgrade-system-columns")]
-    UpgradeSystemColumns {
-        /// Standalone graph storage URI; alternatively use --store
-        uri: Option<String>,
-        /// Run the preflight only; write nothing
-        #[arg(long)]
-        check: bool,
-        #[arg(long)]
-        json: bool,
     },
 }
 

@@ -148,6 +148,13 @@ interrupted reads. Extend `cli_data` for load consent and source-read ordering,
 Blob preconditions and output-file lifecycle; reuse its HTTP fixture and the
 existing parity matrix. Query semantics remain in GQT, not duplicated in these
 CLI boundary tests.
+Schema-family application tests verify that failed result delivery preserves an
+applied schema and its actor with one publication, and that an undeliverable
+target line precedes writable open. Init output failure leaves a readable graph;
+lint report failures and subsequent invocations remain reusable. Extend the
+existing `cli_schema_config`, `cli_cluster` and `cli_data` owners for addressing,
+cluster ownership and offline source-read ordering.
+
 The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation

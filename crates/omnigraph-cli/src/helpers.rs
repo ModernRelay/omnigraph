@@ -908,46 +908,6 @@ pub(crate) fn branch_statement_change_request(query_source: &str) -> ChangeReque
     }
 }
 
-pub(crate) async fn execute_query_lint(
-    cli_uri: Option<String>,
-    schema_path: Option<&PathBuf>,
-    query_path: &PathBuf,
-) -> Result<QueryLintOutput> {
-    let resolved_query_path = resolve_query_path(Some(query_path), None)?;
-    let query_source = fs::read_to_string(&resolved_query_path)?;
-    let query_path = resolved_query_path.to_string_lossy().into_owned();
-
-    if let Some(schema_path) = schema_path {
-        let schema_source = fs::read_to_string(schema_path)?;
-        let schema =
-            parse_schema(&schema_source).map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
-        let catalog =
-            build_catalog(&schema).map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
-        return Ok(lint_query_file(
-            &catalog,
-            &query_source,
-            query_path,
-            QueryLintSchemaSource::file(schema_path.to_string_lossy().into_owned()),
-        ));
-    }
-
-    if cli_uri.is_none() {
-        bail!(
-            "lint requires --schema <schema.pg> (offline) or a graph target \
-             (--store <uri> / --cluster <dir> --graph <id>)"
-        );
-    }
-
-    let uri = resolve_local_uri(cli_uri, "lint")?;
-    let db = crate::admission::open_read_only(&uri, None).await?;
-    Ok(lint_query_file(
-        &db.catalog(),
-        &query_source,
-        query_path,
-        QueryLintSchemaSource::graph(uri),
-    ))
-}
-
 /// Build a `QueryRegistry` from a cluster serving snapshot's stored queries,
 /// optionally scoped to one graph. The `ServingQuery.source` is the
 /// digest-verified `.gq` content, so no file I/O or omnigraph.yaml is involved.

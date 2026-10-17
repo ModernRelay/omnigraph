@@ -110,22 +110,38 @@ pub(crate) struct SchemaPlanOutput<'a> {
     pub(crate) steps: &'a [SchemaMigrationStep],
 }
 
-pub(crate) fn print_schema_apply_human(output: &SchemaApplyOutput) {
-    println!("schema apply for {}", output.uri);
-    println!("supported: {}", if output.supported { "yes" } else { "no" });
-    println!("applied: {}", if output.applied { "yes" } else { "no" });
-    println!("graph_manifest_version: {}", output.graph_manifest_version);
+pub(crate) fn write_schema_apply_human(
+    output: &SchemaApplyOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "schema apply for {}", output.uri)?;
+    writeln!(
+        writer,
+        "supported: {}",
+        if output.supported { "yes" } else { "no" }
+    )?;
+    writeln!(
+        writer,
+        "applied: {}",
+        if output.applied { "yes" } else { "no" }
+    )?;
+    writeln!(
+        writer,
+        "graph_manifest_version: {}",
+        output.graph_manifest_version
+    )?;
     if output.steps.is_empty() {
         if output.applied {
-            println!("schema source updated; no table migration steps");
+            writeln!(writer, "schema source updated; no table migration steps")?;
         } else {
-            println!("no schema changes");
+            writeln!(writer, "no schema changes")?;
         }
-        return;
+        return Ok(());
     }
     for step in &output.steps {
-        println!("- {}", render_schema_plan_step(step));
+        writeln!(writer, "- {}", render_schema_plan_step(step))?;
     }
+    Ok(())
 }
 
 pub(crate) fn query_kind_label(kind: QueryLintQueryKind) -> &'static str {
@@ -143,49 +159,65 @@ pub(crate) fn severity_label(severity: QueryLintSeverity) -> &'static str {
     }
 }
 
-pub(crate) fn print_query_lint_human(output: &QueryLintOutput) {
+pub(crate) fn write_query_lint_human(
+    output: &QueryLintOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
     for result in &output.results {
         match result.status {
             QueryLintStatus::Ok => {
-                println!(
+                writeln!(
+                    writer,
                     "OK    query `{}` ({})",
                     result.name,
                     query_kind_label(result.kind)
-                );
+                )?;
             }
             QueryLintStatus::Error => {
-                println!(
+                writeln!(
+                    writer,
                     "ERROR query `{}`: {}",
                     result.name,
                     result.error.as_deref().unwrap_or("unknown error")
-                );
+                )?;
             }
         }
 
         for warning in &result.warnings {
-            println!("WARN  query `{}`: {}", result.name, warning);
+            writeln!(writer, "WARN  query `{}`: {}", result.name, warning)?;
         }
     }
 
     for finding in &output.findings {
-        println!("{} {}", severity_label(finding.severity), finding.message);
+        writeln!(
+            writer,
+            "{} {}",
+            severity_label(finding.severity),
+            finding.message
+        )?;
     }
 
-    println!(
+    writeln!(
+        writer,
         "INFO  Lint complete: {} queries processed ({} error(s), {} warning(s), {} info item(s))",
         output.queries_processed, output.errors, output.warnings, output.infos
-    );
+    )?;
+    Ok(())
 }
 
-pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<Completion> {
+pub(crate) fn finish_query_lint(
+    output: &QueryLintOutput,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_query_lint_human(output);
+        write_query_lint_human(output, stdout)?;
     }
 
     if output.status == QueryLintStatus::Error {
-        io::stdout().flush()?;
+        stdout.flush()?;
         return Ok(Completion::exit(1));
     }
 
@@ -493,16 +525,25 @@ pub(crate) fn write_load_human(payload: &LoadOutput, writer: &mut dyn Write) -> 
     Ok(())
 }
 
-pub(crate) fn print_schema_plan_human(uri: &str, plan: &SchemaMigrationPlan) {
-    println!("schema plan for {}", uri);
-    println!("supported: {}", if plan.supported { "yes" } else { "no" });
+pub(crate) fn write_schema_plan_human(
+    uri: &str,
+    plan: &SchemaMigrationPlan,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "schema plan for {}", uri)?;
+    writeln!(
+        writer,
+        "supported: {}",
+        if plan.supported { "yes" } else { "no" }
+    )?;
     if plan.steps.is_empty() {
-        println!("no table migration steps");
-        return;
+        writeln!(writer, "no table migration steps")?;
+        return Ok(());
     }
     for step in &plan.steps {
-        println!("- {}", render_schema_plan_step(step));
+        writeln!(writer, "- {}", render_schema_plan_step(step))?;
     }
+    Ok(())
 }
 
 pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
@@ -1966,14 +2007,193 @@ mod tests {
         );
     }
 
-    fn assert_transfer_format(
+    fn assert_human_format(
         expected: &str,
         write: impl Fn(&mut dyn Write) -> color_eyre::Result<()>,
     ) {
         let mut bytes = Vec::new();
         write(&mut bytes).unwrap();
         assert_eq!(bytes, expected.as_bytes());
-        assert_writer_failure("transfer formatter", WriterFault::AfterPrefix, write);
+        assert_writer_failure("human formatter", WriterFault::AfterPrefix, write);
+    }
+
+    #[test]
+    fn schema_human_reports_preserve_empty_unsupported_and_applied_shapes() {
+        use omnigraph_compiler::{SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind};
+
+        let added = SchemaMigrationStep::AddType {
+            type_kind: SchemaTypeKind::Node,
+            name: "Doc".to_string(),
+        };
+        for (plan, expected) in [
+            (
+                SchemaMigrationPlan {
+                    supported: true,
+                    steps: Vec::new(),
+                },
+                "schema plan for graph\nsupported: yes\nno table migration steps\n",
+            ),
+            (
+                SchemaMigrationPlan {
+                    supported: true,
+                    steps: vec![added.clone()],
+                },
+                "schema plan for graph\nsupported: yes\n- add node type 'Doc'\n",
+            ),
+            (
+                SchemaMigrationPlan {
+                    supported: false,
+                    steps: vec![SchemaMigrationStep::UnsupportedChange {
+                        entity: "Doc.body".to_string(),
+                        reason: "type changed".to_string(),
+                        code: None,
+                    }],
+                },
+                "schema plan for graph\nsupported: no\n- unsupported change on Doc.body: type changed\n",
+            ),
+        ] {
+            assert_human_format(expected, |writer| {
+                super::write_schema_plan_human("graph", &plan, writer)
+            });
+        }
+
+        for (applied, steps, expected) in [
+            (
+                false,
+                Vec::new(),
+                "schema apply for graph\nsupported: yes\napplied: no\ngraph_manifest_version: 7\nno schema changes\n",
+            ),
+            (
+                true,
+                Vec::new(),
+                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\nschema source updated; no table migration steps\n",
+            ),
+            (
+                true,
+                vec![added],
+                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\n- add node type 'Doc'\n",
+            ),
+        ] {
+            let output = omnigraph_api_types::SchemaApplyOutput {
+                uri: "graph".to_string(),
+                supported: true,
+                applied,
+                step_count: steps.len(),
+                graph_manifest_version: 7,
+                steps,
+            };
+            assert_human_format(expected, |writer| {
+                super::write_schema_apply_human(&output, writer)
+            });
+        }
+    }
+
+    #[test]
+    fn lint_report_preserves_text_status_and_report_flush_failures() {
+        use omnigraph_compiler::{
+            QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,
+            QueryLintSchemaSource, QueryLintSeverity, QueryLintStatus,
+        };
+
+        let output = QueryLintOutput {
+            status: QueryLintStatus::Error,
+            schema_source: QueryLintSchemaSource::file("schema.pg"),
+            query_path: "queries.gq".to_string(),
+            queries_processed: 3,
+            errors: 2,
+            warnings: 2,
+            infos: 1,
+            results: vec![
+                QueryLintQueryResult {
+                    name: "read_docs".to_string(),
+                    kind: QueryLintQueryKind::Read,
+                    status: QueryLintStatus::Ok,
+                    warnings: vec!["unused parameter".to_string()],
+                    error: None,
+                    operation: None,
+                },
+                QueryLintQueryResult {
+                    name: "update_docs".to_string(),
+                    kind: QueryLintQueryKind::Mutation,
+                    status: QueryLintStatus::Ok,
+                    warnings: Vec::new(),
+                    error: None,
+                    operation: None,
+                },
+                QueryLintQueryResult {
+                    name: "broken".to_string(),
+                    kind: QueryLintQueryKind::Read,
+                    status: QueryLintStatus::Error,
+                    warnings: Vec::new(),
+                    error: None,
+                    operation: None,
+                },
+            ],
+            findings: [
+                (QueryLintSeverity::Error, "invalid read"),
+                (QueryLintSeverity::Warning, "missing coverage"),
+                (QueryLintSeverity::Info, "index available"),
+            ]
+            .into_iter()
+            .map(|(severity, message)| QueryLintFinding {
+                severity,
+                code: "L000".to_string(),
+                message: message.to_string(),
+                type_name: None,
+                property: None,
+                query_names: Vec::new(),
+            })
+            .collect(),
+        };
+        let human = "OK    query `read_docs` (read)\nWARN  query `read_docs`: unused parameter\n\
+            OK    query `update_docs` (mutation)\nERROR query `broken`: unknown error\n\
+            ERROR invalid read\nWARN  missing coverage\nINFO  index available\n\
+            INFO  Lint complete: 3 queries processed (2 error(s), 2 warning(s), 1 info item(s))\n";
+        assert_human_format(human, |writer| {
+            super::write_query_lint_human(&output, writer)
+        });
+        for json in [false, true] {
+            let mut bytes = Vec::new();
+            let completion = super::finish_query_lint(&output, json, &mut bytes).unwrap();
+            assert_eq!(completion.code(), 1);
+            let expected = if json {
+                format!("{}\n", serde_json::to_string_pretty(&output).unwrap())
+            } else {
+                human.to_string()
+            };
+            assert_eq!(bytes, expected.as_bytes());
+            for fault in [WriterFault::AfterPrefix, WriterFault::Flush] {
+                assert_writer_failure("lint report", fault, |writer| {
+                    super::finish_query_lint(&output, json, writer).map(|_| ())
+                });
+            }
+        }
+
+        let clean = QueryLintOutput {
+            status: QueryLintStatus::Ok,
+            queries_processed: 0,
+            errors: 0,
+            warnings: 0,
+            infos: 0,
+            results: Vec::new(),
+            findings: Vec::new(),
+            ..output
+        };
+        let mut writer = FailingWriter {
+            fault: WriterFault::Flush,
+            bytes: Vec::new(),
+            flushes: 0,
+        };
+        assert_eq!(
+            super::finish_query_lint(&clean, false, &mut writer)
+                .unwrap()
+                .code(),
+            0
+        );
+        assert_eq!(
+            writer.flushes, 0,
+            "successful report flush stays with application completion"
+        );
     }
 
     #[test]
@@ -1993,7 +2213,7 @@ mod tests {
             embedding_generation: Some(omnigraph_api_types::LoadEmbeddingGeneration::Unsupported),
             commit: None,
         };
-        assert_transfer_format(
+        assert_human_format(
             "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n\
              branch work created from main\n\
              Loads do not generate embeddings. Supplied vectors are preserved; omitted vectors follow schema nullability. Supply vectors in the input or prepare them with omnigraph embed.\n",
@@ -2001,7 +2221,7 @@ mod tests {
         );
         output.branch_created = false;
         output.embedding_generation = None;
-        assert_transfer_format(
+        assert_human_format(
             "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n",
             |writer| super::write_load_human(&output, writer),
         );
@@ -2019,7 +2239,7 @@ mod tests {
         };
         let output =
             omnigraph_api_types::BlobStatOutput::managed(&query, "resolved", 0, "\"etag\"");
-        assert_transfer_format(
+        assert_human_format(
             "entity: node\ntype: Doc\nid: one\nproperty: body\nkind: managed\n\
              size: 0\netag: \"etag\"\nbranch: work\nresolved_snapshot: resolved\n",
             |writer| super::write_blob_stat_human(&output, writer),
@@ -2030,7 +2250,7 @@ mod tests {
         query.snapshot = Some("requested".to_string());
         let output =
             omnigraph_api_types::BlobStatOutput::external(&query, "resolved", "s3://bucket/body");
-        assert_transfer_format(
+        assert_human_format(
             "entity: edge\ntype: Doc\nid: one\nproperty: body\nkind: external\n\
              uri: s3://bucket/body\nsnapshot: requested\nresolved_snapshot: resolved\n",
             |writer| super::write_blob_stat_human(&output, writer),
@@ -2064,7 +2284,7 @@ mod tests {
                 root_commit_id: None,
             }),
         };
-        assert_transfer_format(
+        assert_human_format(
             "entity: node\ntype: Doc\nid: one\nproperty: body\nbranch: work\n\
              kind: managed\nsize: 0\netag: \"etag\"\nactor: actor\ncommit: published\n",
             |writer| super::write_blob_write_human(&output, writer),
@@ -2076,7 +2296,7 @@ mod tests {
         output.etag = None;
         output.actor_id = None;
         output.commit = None;
-        assert_transfer_format(
+        assert_human_format(
             "entity: edge\ntype: Doc\nid: one\nproperty: body\nbranch: work\n\
              kind: null\ncommit: none (the cell was already null)\n",
             |writer| super::write_blob_write_human(&output, writer),

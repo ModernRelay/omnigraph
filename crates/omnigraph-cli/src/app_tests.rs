@@ -37,7 +37,7 @@ async fn handled_lint_failure_allows_a_following_successful_invocation() {
     ] {
         let query = temp.path().join("query.gq");
         std::fs::write(&query, source).unwrap();
-        let completion = run_from([
+        let args = [
             "omnigraph".into(),
             "lint".into(),
             "--query".into(),
@@ -45,10 +45,41 @@ async fn handled_lint_failure_allows_a_following_successful_invocation() {
             "--schema".into(),
             schema.clone().into_os_string(),
             "--json".into(),
-        ])
-        .await
-        .unwrap();
-        assert_eq!(completion.code(), expected, "{source}");
+        ];
+        for fault in [
+            Some(OutputFault::AfterPrefix),
+            Some(OutputFault::Flush),
+            None,
+        ] {
+            let parsed = crate::invocation::parse_from(args.clone()).unwrap();
+            let mut delivered = Vec::new();
+            let mut failing = FailingOutput {
+                fault: fault.unwrap_or(OutputFault::Flush),
+                bytes: Vec::new(),
+            };
+            let stdout: &mut dyn Write = if fault.is_some() {
+                &mut failing
+            } else {
+                &mut delivered
+            };
+            let mut stderr = Vec::new();
+            let result = super::execute(parsed, &mut io::empty(), false, stdout, &mut stderr).await;
+            if fault.is_some() {
+                assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<io::Error>()
+                        .unwrap()
+                        .kind(),
+                    io::ErrorKind::BrokenPipe
+                );
+            } else {
+                assert_eq!(result.unwrap().code(), expected, "{source}");
+                let report: Value = serde_json::from_slice(&delivered).unwrap();
+                assert_eq!(report["status"], if expected == 0 { "ok" } else { "error" });
+            }
+            assert!(stderr.is_empty());
+        }
     }
 }
 
@@ -702,4 +733,232 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
     assert!(stderr.is_empty());
     assert!(server.requests().is_empty());
     server.assert_complete();
+}
+
+#[tokio::test]
+async fn schema_apply_delivery_failure_retains_publication_and_actor() {
+    use crate::client::GraphClient;
+    use crate::commands::schema::apply_schema;
+    const BEFORE: &str = "node Person {\n    slug: String @key\n}\n";
+    const AFTER: &str = "node Person {\n    slug: String @key\n    age: I32?\n}\n";
+
+    for json in [false, true] {
+        for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
+            let temp = tempfile::tempdir().unwrap();
+            let uri = temp
+                .path()
+                .join("graph.omni")
+                .to_string_lossy()
+                .into_owned();
+            omnigraph::db::Omnigraph::init(&uri, BEFORE).await.unwrap();
+            let source = temp.path().join("next.pg");
+            std::fs::write(&source, AFTER).unwrap();
+            let client = GraphClient::Embedded {
+                uri,
+                actor: Some("schema-operator".into()),
+            };
+            let before = client
+                .snapshot("main")
+                .await
+                .unwrap()
+                .graph_manifest_version;
+            let before_count = client.list_commits(None).await.unwrap().commits.len();
+            let mut stdout = FailingOutput {
+                fault,
+                bytes: Vec::new(),
+            };
+            let mut stderr = Vec::new();
+            let (result, evidence) = command_outcome::observe(async {
+                apply_schema(&client, &source, json, true, &mut stdout, &mut stderr).await?;
+                Ok::<_, color_eyre::Report>(Completion::success())
+            })
+            .await;
+            assert_eq!(result.is_ok(), matches!(fault, OutputFault::Flush));
+            let completed = finish(
+                result,
+                Some(evidence),
+                json.then_some(MachineErrors::Json),
+                &mut stdout,
+                &mut stderr,
+            );
+            if json || matches!(fault, OutputFault::Flush) {
+                let error = completed.unwrap_err();
+                let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
+                let failure = serde_json::to_value(&undelivered.failure).unwrap();
+                assert_eq!(
+                    failure["command_outcome"],
+                    json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"})
+                );
+                assert_eq!(
+                    undelivered
+                        .delivery
+                        .downcast_ref::<io::Error>()
+                        .unwrap()
+                        .kind(),
+                    io::ErrorKind::BrokenPipe
+                );
+            } else {
+                assert_eq!(completed.unwrap().code(), 1);
+            }
+            if json {
+                assert!(stderr.is_empty());
+            } else {
+                let text = String::from_utf8(stderr).unwrap();
+                assert!(
+                    text.contains("unknown") && text.contains("reconcile"),
+                    "{text}"
+                );
+            }
+            // Delivery failed after exactly one publication; its actor and
+            // accepted source survive when read through a fresh client session.
+            assert_eq!(client.schema_source().await.unwrap().schema_source, AFTER);
+            assert_eq!(
+                client
+                    .snapshot("main")
+                    .await
+                    .unwrap()
+                    .graph_manifest_version,
+                before + 1
+            );
+            let commits = client.list_commits(None).await.unwrap().commits;
+            assert_eq!(commits.len(), before_count + 1);
+            assert!(
+                commits
+                    .iter()
+                    .any(|commit| commit.graph_manifest_version == before + 1
+                        && commit.actor_id.as_deref() == Some("schema-operator"))
+            );
+        }
+    }
+
+    // An undeliverable target line precedes writable open and schema effects.
+    let temp = tempfile::tempdir().unwrap();
+    let uri = temp
+        .path()
+        .join("graph.omni")
+        .to_string_lossy()
+        .into_owned();
+    omnigraph::db::Omnigraph::init(&uri, BEFORE).await.unwrap();
+    let source = temp.path().join("next.pg");
+    std::fs::write(&source, AFTER).unwrap();
+    let client = GraphClient::Embedded { uri, actor: None };
+    let before = client
+        .snapshot("main")
+        .await
+        .unwrap()
+        .graph_manifest_version;
+    let mut stdout = Vec::new();
+    let mut stderr = FailingOutput {
+        fault: OutputFault::AfterPrefix,
+        bytes: Vec::new(),
+    };
+    let (result, evidence) = command_outcome::observe(async {
+        apply_schema(&client, &source, true, false, &mut stdout, &mut stderr).await?;
+        Ok::<_, color_eyre::Report>(Completion::success())
+    })
+    .await;
+    assert_eq!(
+        finish(
+            result,
+            Some(evidence),
+            Some(MachineErrors::Json),
+            &mut stdout,
+            &mut stderr
+        )
+        .unwrap()
+        .code(),
+        1
+    );
+    let failure: Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(
+        failure["command_outcome"],
+        json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+    );
+    assert_eq!(
+        client
+            .snapshot("main")
+            .await
+            .unwrap()
+            .graph_manifest_version,
+        before
+    );
+    assert_eq!(client.schema_source().await.unwrap().schema_source, BEFORE);
+}
+
+#[tokio::test]
+async fn init_output_failure_preserves_the_initialized_graph() {
+    use crate::client::GraphClient;
+    use crate::commands::schema::{args::InitArgs, run_init};
+    const SOURCE: &str = "node Person {\n    slug: String @key\n}\n";
+    for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
+        let temp = tempfile::tempdir().unwrap();
+        let uri = temp
+            .path()
+            .join("nested/graph.omni")
+            .to_string_lossy()
+            .into_owned();
+        let schema = temp.path().join("schema.pg");
+        std::fs::write(&schema, SOURCE).unwrap();
+        let mut stdout = FailingOutput {
+            fault,
+            bytes: Vec::new(),
+        };
+        let mut stderr = Vec::new();
+        let result = run_init(
+            InitArgs {
+                uri: uri.clone(),
+                schema: schema.clone(),
+                force: false,
+            },
+            &mut stdout,
+        )
+        .await;
+        let error = finish(
+            result.map(|()| Completion::success()),
+            None,
+            None,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(
+            stderr.is_empty(),
+            "init must not invent data-write evidence"
+        );
+        let client = GraphClient::Embedded {
+            uri: uri.clone(),
+            actor: None,
+        };
+        assert_eq!(client.schema_source().await.unwrap().schema_source, SOURCE);
+        let version = client
+            .snapshot("main")
+            .await
+            .unwrap()
+            .graph_manifest_version;
+        // A caller retry still refuses the existing graph, even with --force.
+        assert!(
+            run_init(
+                InitArgs {
+                    uri,
+                    schema,
+                    force: true
+                },
+                &mut Vec::new()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            client
+                .snapshot("main")
+                .await
+                .unwrap()
+                .graph_manifest_version,
+            version
+        );
+    }
 }

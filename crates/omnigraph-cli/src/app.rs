@@ -442,35 +442,8 @@ async fn run(
                 print_embed_human(&output);
             }
         }
-        Command::Init { schema, uri, force } => {
-            // RFC-010 Slice 3: graphs inside an established cluster are created
-            // by `cluster apply` (which records deployment ledger), not
-            // by hand-running `init` into the cluster's storage layout.
-            if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri)
-                .await
-                .map_err(|diagnostic| {
-                    color_eyre::eyre::eyre!(
-                        "could not check cluster ownership for `{}`: {}",
-                        diagnostic.path,
-                        diagnostic.message
-                    )
-                })?
-            {
-                bail!(
-                    "`{uri}` is inside cluster `{root}`. Graphs in a cluster are created by \
-                     `cluster apply` (which records the deployment ledger), not `init`. \
-                     Declare the graph in cluster.yaml and run `cluster apply`."
-                );
-            }
-            let schema_source = fs::read_to_string(&schema)?;
-            ensure_local_graph_parent(&uri)?;
-            Omnigraph::init_with_options(
-                &uri,
-                &schema_source,
-                omnigraph::db::InitOptions { force },
-            )
-            .await?;
-            println!("initialized {}", uri);
+        Command::Init(args) => {
+            commands::schema::run_init(args, stdout).await?;
         }
         Command::Load(args) => {
             commands::transfer::run_load(
@@ -562,135 +535,40 @@ async fn run(
             )
             .await?;
         }
-        Command::Schema { command } => match command {
-            SchemaCommand::Plan { uri, schema, json } => {
-                let uri = resolve_maintenance_uri(
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                    cli.cluster.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    "schema plan",
-                )
-                .await?;
-                let schema_source = fs::read_to_string(&schema)?;
-                let db = crate::admission::open_read_only(&uri, None).await?;
-                let plan = db.plan_schema(&schema_source).await?;
-                let output = SchemaPlanOutput {
-                    uri: &uri,
-                    supported: plan.supported,
-                    step_count: plan.steps.len(),
-                    steps: &plan.steps,
-                };
-                if json {
-                    print_json(&output)?;
-                } else {
-                    print_schema_plan_human(&uri, &plan);
-                }
-            }
-            SchemaCommand::Apply { uri, schema, json } => {
-                let client = client::GraphClient::resolve_with_policy(
+        Command::Schema { command } => {
+            return commands::schema::run_schema(
+                command,
+                commands::schema::SchemaScope {
                     capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.as_actor.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                // RFC-011 Decision 10: a graph managed by a cluster evolves via
-                // `cluster apply` (deployment ledger), not a direct
-                // `schema apply` against its storage root — that would bypass the
-                // ledger. Mirrors `init`'s refusal. This command addresses
-                // standalone storage only.
-                if !client.is_remote() {
-                    if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(client.uri())
-                        .await
-                        .map_err(|diagnostic| {
-                            color_eyre::eyre::eyre!(
-                                "could not check cluster ownership for `{}`: {}",
-                                diagnostic.path,
-                                diagnostic.message
-                            )
-                        })?
-                    {
-                        bail!(
-                            "`{}` is inside cluster `{root}`. A graph in a cluster evolves via \
-                             `cluster apply` (which records the deployment ledger), not \
-                             `schema apply`. Update the schema in cluster.yaml and run `cluster apply`.",
-                            client.uri()
-                        );
-                    }
-                }
-                let schema_source = fs::read_to_string(&schema)?;
-                // The embedded (direct-store) arm carries no stored-query
-                // registry — the registry is cluster-owned (RFC-011), so a
-                // standalone apply has nothing to validate against.
-                echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
-                let output = client
-                    .apply_schema(&schema_source, |_catalog| Ok(()))
-                    .await?;
-                if json {
-                    print_json(&output)?;
-                } else {
-                    print_schema_apply_human(&output);
-                }
-            }
-            SchemaCommand::UpgradeSystemColumns { uri, check, json } => {
-                return schema_upgrade::run(&cli.profile, &cli.store, uri, check, json, cli.quiet)
-                    .await;
-            }
-            SchemaCommand::Show { uri, json } => {
-                let client = client::GraphClient::resolve(
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: &cli.profile,
+                    store: &cli.store,
+                    cluster: cli.cluster.as_deref(),
+                    quiet: cli.quiet,
+                },
+                stdout,
+                stderr,
+            )
+            .await;
+        }
+        Command::Lint(args) => {
+            return commands::schema::run_lint(
+                args,
+                commands::schema::SchemaScope {
                     capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let output = client.schema_source().await?;
-                if json {
-                    print_json(&output)?;
-                } else if client.is_catalogue() {
-                    if let Some(catalogue) = &output.catalogue_source {
-                        println!("// engine catalogue (read-only, derived from this binary)");
-                        println!("{catalogue}");
-                    }
-                } else {
-                    println!("{}", output.schema_source);
-                }
-            }
-        },
-        Command::Lint {
-            uri,
-            query,
-            schema,
-            json,
-        } => {
-            // A graph target (when `--schema` is absent) resolves through the
-            // direct scope path (positional URI / --store / --profile /
-            // defaults.store). Offline (`--schema`) needs no graph, so leave
-            // the uri unresolved in that case.
-            let graph_uri = if schema.is_some() {
-                uri
-            } else {
-                Some(
-                    resolve_maintenance_uri(
-                        cli.profile.as_deref(),
-                        cli.store.as_deref(),
-                        cli.cluster.as_deref(),
-                        cli.graph.as_deref(),
-                        uri,
-                        "lint",
-                    )
-                    .await?,
-                )
-            };
-            let output = execute_query_lint(graph_uri, schema.as_ref(), &query).await?;
-            return finish_query_lint(&output, json);
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: &cli.profile,
+                    store: &cli.store,
+                    cluster: cli.cluster.as_deref(),
+                    quiet: cli.quiet,
+                },
+                stdout,
+            )
+            .await;
         }
         Command::Queries { command } => {
             let cluster =

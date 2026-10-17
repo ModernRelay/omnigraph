@@ -3997,20 +3997,22 @@ fn optimize_on_multi_graph_cluster_without_graph_lists_candidates() {
 fn init_refuses_a_cluster_managed_path_and_signposts_cluster_apply() {
     let temp = applied_knowledge_cluster();
     // Hand-init a NEW graph into the established cluster's storage layout.
-    let out = output_failure(
-        cli()
-            .arg("init")
-            .arg("--schema")
-            .arg(temp.path().join("people.pg"))
-            .arg(temp.path().join("graphs").join("sneaky.omni")),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("cluster apply"),
-        "init into a cluster-managed path should signpost `cluster apply`; got: {stderr}"
-    );
-    // And it did not create the graph.
-    assert!(!temp.path().join("graphs").join("sneaky.omni").exists());
+    for schema in ["people.pg", "missing.pg"] {
+        let out = output_failure(
+            cli()
+                .arg("init")
+                .arg("--schema")
+                .arg(temp.path().join(schema))
+                .arg(temp.path().join("graphs").join("sneaky.omni")),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cluster apply"),
+            "cluster ownership must be checked before reading {schema}; got: {stderr}"
+        );
+        assert!(out.stdout.is_empty());
+        assert!(!temp.path().join("graphs").join("sneaky.omni").exists());
+    }
 }
 
 #[test]
@@ -4026,32 +4028,37 @@ fn schema_apply_refuses_a_cluster_managed_graph_and_signposts_cluster_apply() {
         "node Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
     )
     .unwrap();
-    let out = output_failure(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg("--schema")
-            .arg(temp.path().join("people_v2.pg"))
-            .arg("--store")
-            .arg(temp.path().join("graphs").join("knowledge.omni")),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("cluster apply"),
-        "schema apply against a cluster-managed graph should signpost `cluster apply`; got: {stderr}"
-    );
-    // And it bailed BEFORE mutating: the live schema still lacks `bio`.
-    let show = output_success(
-        cli()
-            .arg("schema")
-            .arg("show")
-            .arg(temp.path().join("graphs").join("knowledge.omni")),
-    );
-    assert!(
-        !stdout_string(&show).contains("bio"),
-        "the refused apply must not have changed the live schema; got: {}",
-        stdout_string(&show)
-    );
+    let graph = temp.path().join("graphs").join("knowledge.omni");
+    let before = parse_stdout_json(&output_success(
+        cli().arg("snapshot").arg(&graph).arg("--json"),
+    ));
+    for schema in ["people_v2.pg", "missing.pg"] {
+        let out = output_failure(
+            cli()
+                .arg("schema")
+                .arg("apply")
+                .arg("--schema")
+                .arg(temp.path().join(schema))
+                .arg("--store")
+                .arg(&graph),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cluster apply"),
+            "cluster ownership must be checked before reading {schema}; got: {stderr}"
+        );
+        assert!(out.stdout.is_empty());
+        let show = output_success(cli().args(["schema", "show"]).arg(&graph));
+        assert!(
+            !stdout_string(&show).contains("bio"),
+            "the refused apply must not have changed the live schema; got: {}",
+            stdout_string(&show)
+        );
+        let after = parse_stdout_json(&output_success(
+            cli().arg("snapshot").arg(&graph).arg("--json"),
+        ));
+        assert_eq!(after, before, "refusal must not publish a graph change");
+    }
 }
 
 #[test]

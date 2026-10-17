@@ -178,7 +178,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // its target with a required positional URI and never reads it.
         ScopeFlag::Store => match capability {
             Any => true,
-            Direct => !matches!(cmd, Command::Init { .. }),
+            Direct => !matches!(cmd, Command::Init(_)),
             Served | Control | Local => false,
         },
         // The actor rides direct-engine writes (`any` via --store) and cluster
@@ -236,7 +236,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // the registry path).
         ScopeFlag::Profile => match capability {
             Any | Served => true,
-            Direct => !matches!(cmd, Command::Init { .. }),
+            Direct => !matches!(cmd, Command::Init(_)),
             Control => !matches!(cmd, Command::Cluster { .. }),
             Local => false,
         },
@@ -292,13 +292,13 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         // plane (RFC 0011 — omnigraph.yaml excised from the CLI).
         Command::Queries { .. } => Plane::Control,
         Command::Policy { .. } => Plane::Control,
-        Command::Init { .. }
+        Command::Init(_)
         | Command::Upgrade { .. }
         | Command::Optimize { .. }
         | Command::RebuildFullTextIndexes { .. }
         | Command::Repair { .. }
         | Command::Cleanup { .. }
-        | Command::Lint { .. } => Plane::Storage,
+        | Command::Lint(_) => Plane::Storage,
         Command::Cluster { .. } | Command::Organization { .. } => Plane::Control,
         Command::Alias(_)
         | Command::Embed(_)
@@ -325,7 +325,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             SkillCommand::Show { .. } => "skill show",
         },
         Command::Embed(_) => "embed",
-        Command::Init { .. } => "init",
+        Command::Init(_) => "init",
         Command::Load(_) => "load",
         Command::Branch { .. } => "branch",
         Command::Schema { command } => match command {
@@ -334,7 +334,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             SchemaCommand::Show { .. } => "schema show",
             SchemaCommand::UpgradeSystemColumns { .. } => "schema upgrade-system-columns",
         },
-        Command::Lint { .. } => "lint",
+        Command::Lint(_) => "lint",
         Command::Queries { command } => match command {
             QueriesCommand::Validate { .. } => "queries validate",
             QueriesCommand::List { .. } => "queries list",
@@ -386,7 +386,7 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
             | Command::Cleanup { .. }
             // `lint` can type-check a `.gq` against a cluster graph's schema
             // (RFC 0011): `--cluster <dir> --graph <id>`.
-            | Command::Lint { .. }
+            | Command::Lint(_)
             // The policy/queries tooling addresses a cluster's applied state
             // (RFC 0011): `--cluster <dir>` selects the cluster, `--graph <id>`
             // picks a graph's bundle/registry within it.
@@ -461,7 +461,7 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 fn remediation(capability: Capability, cmd: &Command) -> &'static str {
     match capability {
         Capability::Direct => match cmd {
-            Command::Init { .. } => " Pass a storage URI.",
+            Command::Init(_) => " Pass a storage URI.",
             Command::Schema {
                 command: SchemaCommand::Apply { .. },
             } => {

@@ -424,30 +424,34 @@ fn schema_plan_json_reports_supported_additive_change() {
 
 #[test]
 fn schema_plan_with_server_flag_errors_wrong_plane() {
+    let temp = tempdir().unwrap();
     let server = support::managed_http::IntentApiFixture::graph(Vec::new());
     for command in ["plan", "apply"] {
-        let output = output_failure(
-            cli()
-                .args(["schema", command, "--schema"])
-                .arg(fixture("test.pg"))
-                .args(["--server", &server.origin]),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!(
-                "`schema {command}` is a direct (storage-native) command"
-            )),
-            "schema {command} wrong-capability message not found; got: {stderr}"
-        );
-        if command == "apply" {
-            assert!(stderr.contains("cluster apply --server"), "{stderr}");
-        } else {
-            assert!(stderr.contains("Pass a storage URI."), "{stderr}");
+        for schema in [fixture("test.pg"), temp.path().join("missing.pg")] {
+            let output = output_failure(
+                cli()
+                    .args(["schema", command, "--schema"])
+                    .arg(&schema)
+                    .args(["--server", &server.origin]),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(&format!(
+                    "`schema {command}` is a direct (storage-native) command"
+                )),
+                "schema {command} must reject its plane before reading {schema:?}; got: {stderr}"
+            );
+            if command == "apply" {
+                assert!(stderr.contains("cluster apply --server"), "{stderr}");
+            } else {
+                assert!(stderr.contains("Pass a storage URI."), "{stderr}");
+            }
+            assert!(output.stdout.is_empty());
+            assert!(
+                server.requests().is_empty(),
+                "refuse before discovery or dispatch"
+            );
         }
-        assert!(
-            server.requests().is_empty(),
-            "refuse before discovery or dispatch"
-        );
     }
     server.assert_complete();
 }

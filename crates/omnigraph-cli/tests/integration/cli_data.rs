@@ -1313,6 +1313,13 @@ fn lint_json_with_schema_reports_warnings() {
     let temp = tempdir().unwrap();
     let schema_path = temp.path().join("schema.pg");
     let query_path = temp.path().join("queries.gq");
+    // Offline lint reads cwd-relative source files without loading operator
+    // configuration, an ambient profile, or managed folder context.
+    let home = temp.path().join("operator");
+    fs::create_dir(&home).unwrap();
+    write_file(&home.join("config.yaml"), "not: [valid yaml");
+    fs::create_dir(temp.path().join(".omnigraph")).unwrap();
+    write_file(&temp.path().join(".omnigraph/context"), "invalid");
     write_file(
         &schema_path,
         r#"
@@ -1339,11 +1346,14 @@ query list_policies() {
 
     let output = output_success(
         cli()
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_HOME", &home)
+            .env("OMNIGRAPH_PROFILE", "missing-profile")
             .arg("lint")
             .arg("--query")
-            .arg(&query_path)
+            .arg("queries.gq")
             .arg("--schema")
-            .arg(&schema_path)
+            .arg("schema.pg")
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -1586,6 +1596,24 @@ query list_people() {
         stderr.contains("lint requires --schema <schema.pg>")
             || stderr.contains("no graph addressed"),
         "expected a schema-or-graph-target requirement; got: {stderr}"
+    );
+
+    // Query bytes are captured before the offline schema is read. If the
+    // schema were read first, this would instead fail for its missing path.
+    fs::write(&query_path, b"\xff").unwrap();
+    let output = output_failure(
+        cli()
+            .args(["lint", "--query"])
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(temp.path().join("missing.pg"))
+            .arg("--json"),
+    );
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("UTF-8"),
+        "query read must come first: {stderr}"
     );
 }
 
