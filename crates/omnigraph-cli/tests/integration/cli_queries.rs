@@ -881,6 +881,147 @@ fn alias_unknown_name_errors_listing_defined() {
 }
 
 #[test]
+#[cfg(unix)]
+fn alias_setup_keeps_one_operator_config_across_params_file() {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    use serde_json::json;
+
+    let home = tempdir().unwrap();
+    let config = home.path().join("config.yaml");
+    let replacement = home.path().join("replacement.yaml");
+    let params_file = home.path().join("params.json");
+    let trap = IntentApiFixture::graph(vec![]);
+    let server = IntentApiFixture::graph(vec![IntentReply::json(
+        200,
+        json!({
+            "query_name": "find_person",
+            "target": {"branch": "main"},
+            "row_count": 1,
+            "rows": [{"p.name": "original-server"}]
+        }),
+    )]);
+    fs::write(
+        &config,
+        format!(
+            "servers:\n  prod:\n    url: '{}'\n  graph-owner:\n    url: '{}/graphs/knowledge'\naliases:\n  who:\n    server: prod\n    graph: knowledge\n    query: find_person\n    args: [name, limit]\n    params: {{name: fixed, limit: 1, source: original-alias}}\ncaptured_only: true\n",
+            server.origin, server.origin
+        ),
+    )
+    .unwrap();
+    let replacement_config = format!(
+        "servers:\n  prod:\n    url: '{}'\n  replacement:\n    url: '{}/graphs/knowledge'\naliases:\n  who:\n    server: prod\n    graph: replacement\n    query: replacement_query\n    params: {{source: replacement-alias}}\nreplacement_only: true\n",
+        trap.origin, server.origin
+    );
+    fs::write(&replacement, &replacement_config).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&params_file)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let mut command = assert_cmd::Command::from(cli_process());
+    command
+        .current_dir(home.path())
+        .env("OMNIGRAPH_HOME", home.path())
+        .env("OMNIGRAPH_TOKEN_PROD", "captured-root-token")
+        .env("OMNIGRAPH_TOKEN_GRAPH_OWNER", "captured-graph-token")
+        .env("OMNIGRAPH_TOKEN_REPLACEMENT", "replacement-token")
+        .env_remove("OMNIGRAPH_BEARER_TOKEN")
+        .env_remove("OMNIGRAPH_PROFILE")
+        .args([
+            "alias",
+            "who",
+            "positional-name",
+            "2",
+            "--json",
+            "--params-file",
+        ])
+        .arg(&params_file)
+        .timeout(Duration::from_secs(15));
+    let output = std::thread::scope(|scope| {
+        // assert_cmd kills and reaps the child on timeout, including if the
+        // barrier fails before a writer can release its parameter-file read.
+        let child = scope.spawn(move || command.output().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut params = loop {
+            match OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&params_file)
+            {
+                Ok(params) => break params,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("CLI did not open its parameter file: {error}"),
+            }
+        };
+        // Opening the FIFO writer succeeds only once the CLI has opened its
+        // reader, after loading the alias. Readiness, not the polling delay,
+        // orders replacement before execute_operator_alias can start.
+        fs::rename(&replacement, &config).unwrap();
+        params
+            .write_all(br#"{"name":"explicit-name","extra":"file"}"#)
+            .unwrap();
+        drop(params);
+        child.join().unwrap()
+    });
+
+    assert_eq!(fs::read_to_string(&config).unwrap(), replacement_config);
+    assert!(
+        trap.requests().is_empty(),
+        "alias setup changed destination"
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        parse_stdout_json(&output)["rows"][0]["p.name"],
+        "original-server"
+    );
+    trap.assert_complete();
+    server.assert_complete();
+    let requests = server.workflow_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/graphs/knowledge/queries/find_person");
+    assert_eq!(
+        requests[0].headers["authorization"],
+        "Bearer captured-graph-token"
+    );
+    assert_eq!(
+        requests[0].body,
+        json!({
+            "expect_mutation": false,
+            "params": {
+                "name": "explicit-name", "limit": 2,
+                "source": "original-alias", "extra": "file"
+            }
+        })
+    );
+    let stderr = stderr_string(&output);
+    assert_eq!(
+        stderr.matches("unknown key `captured_only`").count(),
+        1,
+        "{stderr}"
+    );
+    // Rendering still loads its own preferences after setup, including for
+    // JSON output. Only that existing read may see the replacement config.
+    assert_eq!(
+        stderr.matches("unknown key `replacement_only`").count(),
+        1,
+        "{stderr}"
+    );
+}
+
+#[test]
 fn alias_rejects_global_scope_flags_that_the_binding_owns() {
     for (flag, value) in [
         ("--server", "dev"),

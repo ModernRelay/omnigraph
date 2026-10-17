@@ -3,7 +3,8 @@
 
 use super::{
     DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, branch_statement_change_request,
-    branch_statement_query_request, normalize_bearer_token, resolve_remote_bearer_token, sync_dir,
+    branch_statement_query_request, normalize_bearer_token,
+    resolve_remote_bearer_token_with_config, sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -118,19 +119,20 @@ fn normalize_bearer_token_trims_and_filters_blank_values() {
 fn resolve_remote_bearer_token_falls_back_to_default_env() {
     // RFC-011: with no operator server matching the URL, the only chain
     // left is the default `OMNIGRAPH_BEARER_TOKEN` env (no omnigraph.yaml
-    // scoped chain). Hermetic: no operator config is read for a literal URL
-    // that matches no `servers:` entry.
+    // scoped chain). Supply an empty config so this test reads no operator
+    // file and the URL matches no `servers:` entry.
     let previous = std::env::var_os(DEFAULT_BEARER_TOKEN_ENV);
-    let previous_home = std::env::var_os("OMNIGRAPH_HOME");
     unsafe {
         std::env::set_var(DEFAULT_BEARER_TOKEN_ENV, "global-token");
-        std::env::set_var("OMNIGRAPH_HOME", "/nonexistent/omnigraph-test-home");
     }
 
     assert_eq!(
-        resolve_remote_bearer_token(Some("https://override.example.com"))
-            .unwrap()
-            .as_deref(),
+        resolve_remote_bearer_token_with_config(
+            &crate::operator::OperatorConfig::default(),
+            Some("https://override.example.com"),
+        )
+        .unwrap()
+        .as_deref(),
         Some("global-token")
     );
 
@@ -139,11 +141,6 @@ fn resolve_remote_bearer_token_falls_back_to_default_env() {
             std::env::set_var(DEFAULT_BEARER_TOKEN_ENV, value);
         } else {
             std::env::remove_var(DEFAULT_BEARER_TOKEN_ENV);
-        }
-        if let Some(value) = previous_home {
-            std::env::set_var("OMNIGRAPH_HOME", value);
-        } else {
-            std::env::remove_var("OMNIGRAPH_HOME");
         }
     }
 }

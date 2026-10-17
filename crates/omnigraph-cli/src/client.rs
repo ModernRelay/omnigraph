@@ -2698,9 +2698,7 @@ fn parse_change_feed_start(start: &str) -> Result<omnigraph::changes::ChangeFeed
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::{
-        RemoteErrorCli, remote_json_with_graph_commit_precondition, resolve_server_flag,
-    };
+    use crate::helpers::{RemoteErrorCli, remote_json_with_graph_commit_precondition};
     use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
     use serde_json::json;
 
@@ -2914,9 +2912,13 @@ mod tests {
         let gateway = crate::unix_gateway_fixture::UnixGateway::new(&server.origin);
         let root = gateway.url();
         let http = GraphHttpClient::new(&root).unwrap();
-        let base = resolve_server_flag(Some(&root), Some("knowledge"))
-            .unwrap()
-            .unwrap();
+        let base = resolve_server_flag_with_config(
+            &OperatorConfig::default(),
+            Some(&root),
+            Some("knowledge"),
+        )
+        .unwrap()
+        .unwrap();
         let value: Value = remote_json(
             &http,
             Method::GET,
@@ -2945,9 +2947,10 @@ mod tests {
         assert_eq!(gateway.connections(), 2, "both requests used the socket");
         server.assert_complete();
 
-        let escaped = resolve_server_flag(Some(&root), Some("../.."))
-            .unwrap()
-            .unwrap();
+        let escaped =
+            resolve_server_flag_with_config(&OperatorConfig::default(), Some(&root), Some("../.."))
+                .unwrap()
+                .unwrap();
         for outside in [
             format!("{root}2/graphs"),
             remote_url(&escaped, &["snapshot"], &[]).unwrap(),

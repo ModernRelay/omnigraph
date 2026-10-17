@@ -194,6 +194,8 @@ Ordinary graph commands and `graphs list` use one copy of the operator configura
 during client setup. Editing that file during discovery does not change the
 client's destination or which configured server supplies its credentials.
 Token values still use the usual environment and credentials-file lookup.
+Operator aliases and served `cluster plan`, `cluster apply`, and `cluster status`
+follow the same rule.
 
 ## Use a server through a Unix socket
 
