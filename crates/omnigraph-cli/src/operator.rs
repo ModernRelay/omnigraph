@@ -15,12 +15,15 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use serde::Deserialize;
 
+use crate::graph_http::RequestTarget;
 use crate::read_format::{ReadOutputFormat, TableCellLayout};
 
 pub(crate) const OPERATOR_HOME_ENV: &str = "OMNIGRAPH_HOME";
@@ -171,21 +174,21 @@ impl OperatorConfig {
         self.defaults.output
     }
 
-    /// The gh-host model: which operator server (if any) does this request
-    /// URL belong to? Longest-prefix match after trailing-slash
-    /// normalization, so `url: http://h:8080` matches
-    /// `http://h:8080/graphs/spike` but never `http://h:8080-evil`.
-    pub(crate) fn find_server_for_url(&self, request_url: &str) -> Option<&str> {
-        let request = request_url.trim_end_matches('/');
+    /// The gh-host model: which operator server (if any) does a request
+    /// sent to `target` belong to? The server whose own target has the same
+    /// endpoint and whose path segments lead the request's, deepest first, so
+    /// `url: http://h:8080` covers `http://h:8080/graphs/spike` but never
+    /// `http://h:8080-evil`, a `..` that climbs out of a path-prefixed `url`,
+    /// or another socket. An entry the transport cannot address matches
+    /// nothing.
+    pub(crate) fn find_server_for_target(&self, target: &RequestTarget) -> Option<&str> {
         let mut best: Option<(&str, usize)> = None;
         for (name, server) in &self.servers {
-            let base = server.url.trim_end_matches('/');
-            let matches = request == base
-                || request
-                    .strip_prefix(base)
-                    .is_some_and(|rest| rest.starts_with('/'));
-            if matches && best.is_none_or(|(_, len)| base.len() > len) {
-                best = Some((name, base.len()));
+            let Ok(base) = RequestTarget::of(&server.url, &server.url) else {
+                continue;
+            };
+            if target.is_under(&base) && best.is_none_or(|(_, depth)| base.depth() > depth) {
+                best = Some((name, base.depth()));
             }
         }
         best.map(|(name, _)| name)
@@ -236,6 +239,23 @@ impl OperatorConfig {
         }
         Ok(())
     }
+
+    /// Each server's token variable is its own: `a-b` and `a_b`, or `prod`
+    /// and `PROD`, spell one `OMNIGRAPH_TOKEN_<NAME>`, which would bind one
+    /// token to both servers. Such names are refused loudly, naming both.
+    fn validate_server_token_names(&self) -> Result<()> {
+        let mut owners: BTreeMap<String, &str> = BTreeMap::new();
+        for name in self.servers.keys() {
+            if let Some(other) = owners.insert(token_env_name(name), name) {
+                bail!(
+                    "operator config `servers` entries `{other}` and `{name}` share the token \
+                     variable {}; rename one so each server has its own credential",
+                    token_env_name(name)
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl OperatorProfile {
@@ -280,17 +300,126 @@ pub(crate) fn operator_dir() -> Option<PathBuf> {
     env::home_dir().map(|home| home.join(OPERATOR_DIR))
 }
 
+/// Configuration inputs selected once for this invocation. Reading the file is
+/// lazy so wrong-mode and argument refusals still precede configuration access.
+/// Only routing/configuration is retained; managed token renewal stays with its
+/// existing credential owner.
+#[derive(Debug)]
+pub(crate) struct InvocationConfig {
+    directory: Option<PathBuf>,
+    profile: Option<String>,
+    profile_present: bool,
+    captured: OnceLock<CapturedOperator>,
+    warnings: OnceLock<std::result::Result<(), (io::ErrorKind, String)>>,
+}
+
+#[derive(Debug)]
+struct CapturedOperator {
+    config: std::result::Result<OperatorConfig, String>,
+    warnings: Vec<u8>,
+}
+
+impl InvocationConfig {
+    pub(crate) fn capture() -> Self {
+        let profile = env::var_os(crate::scope::PROFILE_ENV);
+        let mut input = Self::at(
+            operator_dir(),
+            profile
+                .as_ref()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        );
+        // Managed ambiguity detection also rejects a non-Unicode ambient
+        // profile, while the ordinary profile resolver cannot select that name.
+        input.profile_present = profile.is_some_and(|value| !value.is_empty());
+        input
+    }
+
+    pub(crate) fn at(directory: Option<PathBuf>, profile: Option<String>) -> Self {
+        Self {
+            directory,
+            profile_present: profile.as_ref().is_some_and(|value| !value.is_empty()),
+            profile,
+            captured: OnceLock::new(),
+            warnings: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn has_profile(&self) -> bool {
+        self.profile_present
+    }
+
+    pub(crate) fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+
+    pub(crate) fn config_path(&self) -> Option<PathBuf> {
+        self.directory
+            .as_ref()
+            .map(|dir| dir.join(OPERATOR_CONFIG_FILE))
+    }
+
+    pub(crate) fn credentials_path(&self) -> Option<PathBuf> {
+        self.directory
+            .as_ref()
+            .map(|dir| dir.join(CREDENTIALS_FILE))
+    }
+
+    fn captured(&self, stderr: &mut dyn Write) -> Result<&CapturedOperator> {
+        let captured = self.captured.get_or_init(|| {
+            let mut warnings = Vec::new();
+            let config = match &self.directory {
+                Some(dir) => load_operator_config_at_with_writer(
+                    &dir.join(OPERATOR_CONFIG_FILE),
+                    &mut warnings,
+                ),
+                None => Ok(OperatorConfig::default()),
+            }
+            .map_err(|error| error.to_string());
+            CapturedOperator { config, warnings }
+        });
+        let warnings = self.warnings.get_or_init(|| {
+            if captured.warnings.is_empty() {
+                return Ok(());
+            }
+            stderr
+                .write_all(&captured.warnings)
+                .and_then(|()| stderr.flush())
+                .map_err(|error| (error.kind(), error.to_string()))
+        });
+        if let Err((kind, message)) = warnings {
+            return Err(io::Error::new(*kind, message.clone()).into());
+        }
+        Ok(captured)
+    }
+
+    pub(crate) fn get(&self, stderr: &mut dyn Write) -> Result<&OperatorConfig> {
+        self.captured(stderr)?
+            .config
+            .as_ref()
+            .map_err(|message| eyre!(message.clone()))
+    }
+
+    /// Existing managed query presentation tolerates an invalid optional config.
+    /// Diagnostic delivery failures still propagate; they are not config absence.
+    pub(crate) fn optional_get(&self, stderr: &mut dyn Write) -> Result<Option<&OperatorConfig>> {
+        Ok(self.captured(stderr)?.config.as_ref().ok())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
+    load_operator_config_at_with_writer(path, &mut io::sink())
+}
+
 /// Load the operator layer. Absent file (or unresolvable home) is an empty
 /// layer, never an error; a present-but-malformed file is a loud error (the
 /// operator owns it and can fix it); unknown keys warn to stderr once.
-pub(crate) fn load_operator_config() -> Result<OperatorConfig> {
-    let Some(dir) = operator_dir() else {
-        return Ok(OperatorConfig::default());
-    };
-    load_operator_config_at(&dir.join(OPERATOR_CONFIG_FILE))
-}
-
-pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
+fn load_operator_config_at_with_writer(
+    path: &Path,
+    stderr: &mut dyn Write,
+) -> Result<OperatorConfig> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -310,9 +439,14 @@ pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
         )
     })?;
     for warning in config.unknown_key_warnings() {
-        eprintln!("warning: {warning} in operator config '{}'", path.display());
+        writeln!(
+            stderr,
+            "warning: {warning} in operator config '{}'",
+            path.display()
+        )?;
     }
     config.validate_defaults()?;
+    config.validate_server_token_names()?;
     Ok(config)
 }
 
@@ -352,10 +486,6 @@ impl OperatorConfig {
 pub(crate) const CREDENTIALS_FILE: &str = "credentials";
 const TOKEN_ENV_PREFIX: &str = "OMNIGRAPH_TOKEN_";
 
-pub(crate) fn credentials_path() -> Option<PathBuf> {
-    operator_dir().map(|dir| dir.join(CREDENTIALS_FILE))
-}
-
 /// `intel-dev` → `OMNIGRAPH_TOKEN_INTEL_DEV`.
 pub(crate) fn token_env_name(server: &str) -> String {
     let mut name = String::from(TOKEN_ENV_PREFIX);
@@ -370,20 +500,20 @@ pub(crate) fn token_env_name(server: &str) -> String {
 
 /// The keyed token chain for a named server (§D4 steps 1–2):
 /// `OMNIGRAPH_TOKEN_<NAME>` env → `[<name>]` in the credentials file.
-/// `Ok(None)` means "no keyed token" — callers fall through to the legacy
-/// chain; a present-but-unreadable/over-permissive credentials file is a
-/// loud error, never a silent skip.
-pub(crate) fn resolve_keyed_token(server: &str) -> Result<Option<String>> {
+/// `Ok(None)` means "no keyed token": the request carries no credential. A
+/// present-but-unreadable/over-permissive credentials file is a loud error,
+/// never a silent skip.
+pub(crate) fn resolve_keyed_token_at(server: &str, path: Option<&Path>) -> Result<Option<String>> {
     if let Ok(token) = env::var(token_env_name(server)) {
         let token = token.trim();
         if !token.is_empty() {
             return Ok(Some(token.to_string()));
         }
     }
-    let Some(path) = credentials_path() else {
+    let Some(path) = path else {
         return Ok(None);
     };
-    read_credential_at(&path, server)
+    read_credential_at(path, server)
 }
 
 pub(crate) fn read_credential_at(path: &Path, server: &str) -> Result<Option<String>> {
@@ -421,23 +551,6 @@ pub(crate) fn read_credential_at(path: &Path, server: &str) -> Result<Option<Str
         }
     }
     Ok(None)
-}
-
-/// Write (or rotate) one server's token, preserving every other section.
-/// Temp file + rename (#139 finding 7), created 0600.
-pub(crate) fn write_credential(server: &str, token: &str) -> Result<PathBuf> {
-    let path = credentials_path()
-        .ok_or_else(|| eyre!("no home directory resolvable for the credentials file"))?;
-    rewrite_credentials_at(&path, server, Some(token))?;
-    Ok(path)
-}
-
-/// Remove one server's section. Idempotent: absent file or section is fine.
-pub(crate) fn remove_credential(server: &str) -> Result<PathBuf> {
-    let path = credentials_path()
-        .ok_or_else(|| eyre!("no home directory resolvable for the credentials file"))?;
-    rewrite_credentials_at(&path, server, None)?;
-    Ok(path)
 }
 
 pub(crate) fn rewrite_credentials_at(path: &Path, server: &str, token: Option<&str>) -> Result<()> {
@@ -624,6 +737,83 @@ mod tests {
     }
 
     #[test]
+    fn invocation_config_is_lazy_and_retains_a_failed_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(OPERATOR_CONFIG_FILE);
+        fs::write(&path, "servers: [\n").unwrap();
+        let input = InvocationConfig::at(Some(home.path().to_owned()), Some("selected".into()));
+        assert!(input.captured.get().is_none());
+        assert_eq!(
+            input.credentials_path(),
+            Some(home.path().join(CREDENTIALS_FILE))
+        );
+        assert_eq!(input.profile(), Some("selected"));
+        assert!(input.has_profile());
+        let error = input.get(&mut Vec::new()).unwrap_err().to_string();
+        fs::write(&path, "defaults: { store: graph.omni }\n").unwrap();
+        assert_eq!(input.get(&mut Vec::new()).unwrap_err().to_string(), error);
+        assert!(input.optional_get(&mut Vec::new()).unwrap().is_none());
+        let fresh = InvocationConfig::at(Some(home.path().to_owned()), None);
+        assert_eq!(
+            fresh.get(&mut Vec::new()).unwrap().default_store(),
+            Some("graph.omni")
+        );
+    }
+
+    #[test]
+    fn invocation_warning_failure_is_not_config_absence_or_retried_delivery() {
+        struct FailedWarning {
+            flush: bool,
+            writes: usize,
+        }
+        impl Write for FailedWarning {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                if self.flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(OPERATOR_CONFIG_FILE);
+        for flush in [false, true] {
+            fs::write(&path, "future: true\ndefaults: { store: original.omni }\n").unwrap();
+            let input = InvocationConfig::at(Some(home.path().to_owned()), None);
+            let mut stderr = FailedWarning { flush, writes: 0 };
+            let error = input.get(&mut stderr).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(stderr.writes, 1);
+            fs::write(&path, "defaults: { store: replacement.omni }\n").unwrap();
+            let mut retry = Vec::new();
+            let error = input.optional_get(&mut retry).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert!(retry.is_empty());
+            assert_eq!(
+                input
+                    .captured
+                    .get()
+                    .unwrap()
+                    .config
+                    .as_ref()
+                    .unwrap()
+                    .default_store(),
+                Some("original.omni")
+            );
+        }
+    }
+
+    #[test]
     fn unknown_keys_warn_but_load() {
         // A file written for a later slice (servers/aliases) must load
         // cleanly today — warn-only forward compatibility.
@@ -740,28 +930,87 @@ profiles:
     }
 
     #[test]
-    fn find_server_for_url_longest_prefix_no_substring_traps() {
+    fn servers_sharing_a_token_variable_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        for (first, second) in [("a-b", "a_b"), ("prod", "PROD")] {
+            fs::write(
+                &path,
+                format!(
+                    "servers:\n  {first}:\n    url: http://h:1\n  {second}:\n    url: http://h:2\n"
+                ),
+            )
+            .unwrap();
+            let err = load_operator_config_at(&path).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "share the token variable {}",
+                    token_env_name(first)
+                )),
+                "{err}"
+            );
+            assert!(err.contains(first) && err.contains(second), "{err}");
+        }
+        fs::write(
+            &path,
+            "servers:\n  a-b:\n    url: http://h:1\n  ab:\n    url: http://h:2\n",
+        )
+        .unwrap();
+        load_operator_config_at(&path).unwrap();
+    }
+
+    #[test]
+    fn find_server_for_target_matches_where_the_request_is_sent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         fs::write(
             &path,
-            "servers:\n  dev:\n    url: http://h:8080\n  dev-spike:\n    url: http://h:8080/graphs/spike\n",
+            "servers:\n  dev:\n    url: http://h:8080\n  dev-spike:\n    url: http://h:8080/graphs/spike\n  \
+               tenant:\n    url: https://t.example/tenant-a/\n  og:\n    url: unix:///tmp/og/og.sock\n",
         )
         .unwrap();
         let config = load_operator_config_at(&path).unwrap();
-        assert_eq!(config.find_server_for_url("http://h:8080"), Some("dev"));
+        let server = |url: &str| {
+            let target = RequestTarget::of(url, url).unwrap();
+            config.find_server_for_target(&target)
+        };
+        assert_eq!(server("http://h:8080"), Some("dev"));
+        assert_eq!(server("http://H:8080/graphs/other"), Some("dev"));
+        // The deepest base wins.
         assert_eq!(
-            config.find_server_for_url("http://h:8080/graphs/other"),
-            Some("dev")
-        );
-        // longest prefix wins
-        assert_eq!(
-            config.find_server_for_url("http://h:8080/graphs/spike/queries/q"),
+            server("http://h:8080/graphs/spike/queries/q"),
             Some("dev-spike")
         );
-        // no substring trap: a different port/host must not match
-        assert_eq!(config.find_server_for_url("http://h:8080-evil/x"), None);
-        assert_eq!(config.find_server_for_url("http://other:9999"), None);
+        assert_eq!(server("http://h:8080/graphs/spike/../other"), Some("dev"));
+        assert_eq!(
+            server("http://h:8080/graphs/x/../spike/queries/q"),
+            Some("dev-spike")
+        );
+        // A different host, port or scheme is a different server; a port
+        // that does not parse addresses nothing.
+        assert!(RequestTarget::of("http://h:8080-evil/x", "http://h:8080-evil/x").is_err());
+        assert_eq!(server("http://h-evil:8080/x"), None);
+        assert_eq!(server("http://other:9999"), None);
+        assert_eq!(server("https://h:8080"), None);
+        // The default port is the same endpoint; a sibling prefix is not.
+        assert_eq!(
+            server("https://t.example:443/tenant-a/graphs/g"),
+            Some("tenant")
+        );
+        assert_eq!(server("https://t.example/tenant-ab/graphs/g"), None);
+        assert_eq!(server("https://t.example/tenant-a/../tenant-b"), None);
+        assert_eq!(server("https://t.example/tenant-a/%2e%2e/tenant-b"), None);
+        // A socket is matched by the path the transport connects to.
+        #[cfg(unix)]
+        {
+            let socket = |root: &str| {
+                let target = RequestTarget::of(root, &format!("{root}/graphs/g")).unwrap();
+                config.find_server_for_target(&target)
+            };
+            assert_eq!(socket("unix:///tmp/og/og.sock"), Some("og"));
+            assert_eq!(socket("unix:///tmp/og/./og.sock"), Some("og"));
+            assert_eq!(socket("unix:///tmp/og/og.sock/../evil.sock"), None);
+        }
     }
 
     #[test]

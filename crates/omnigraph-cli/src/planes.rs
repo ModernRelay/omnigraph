@@ -178,7 +178,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // its target with a required positional URI and never reads it.
         ScopeFlag::Store => match capability {
             Any => true,
-            Direct => !matches!(cmd, Command::Init { .. }),
+            Direct => !matches!(cmd, Command::Init(_)),
             Served | Control | Local => false,
         },
         // The actor rides direct-engine writes (`any` via --store) and cluster
@@ -211,11 +211,11 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     Command::Blob {
                         command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
                     } | Command::Changes { .. }
-                        | Command::Diff { .. }
+                        | Command::Diff(_)
                         | Command::Branch {
                             command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
                         }
-                        | Command::Query { .. }
+                        | Command::Query(_)
                 ),
             },
             Control => matches!(
@@ -229,7 +229,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             ),
             Direct => matches!(
                 cmd,
-                Command::RebuildFullTextIndexes { .. }
+                Command::RebuildFullTextIndexes(_)
                     | Command::Schema {
                         command: SchemaCommand::Apply { .. }
                     }
@@ -247,7 +247,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // the registry path).
         ScopeFlag::Profile => match capability {
             Any | Served => true,
-            Direct => !matches!(cmd, Command::Init { .. }),
+            Direct => !matches!(cmd, Command::Init(_)),
             Control => !matches!(cmd, Command::Cluster { .. }),
             Local => false,
         },
@@ -278,15 +278,15 @@ pub(crate) fn command_capability(cmd: &Command) -> Capability {
 /// `schema show` is data; `queries`/`policy` read cluster applied state).
 pub(crate) fn command_plane(cmd: &Command) -> Plane {
     match cmd {
-        Command::Query { .. }
-        | Command::Mutate { .. }
-        | Command::Load { .. }
+        Command::Query(_)
+        | Command::Mutate(_)
+        | Command::Load(_)
         | Command::Branch { .. }
-        | Command::Snapshot { .. }
-        | Command::Export { .. }
+        | Command::Snapshot(_)
+        | Command::Export(_)
         | Command::Blob { .. }
         | Command::Commit { .. }
-        | Command::Diff { .. }
+        | Command::Diff(_)
         | Command::Changes { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
@@ -303,15 +303,15 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         // plane (RFC 0011 — omnigraph.yaml excised from the CLI).
         Command::Queries { .. } => Plane::Control,
         Command::Policy { .. } => Plane::Control,
-        Command::Init { .. }
-        | Command::Upgrade { .. }
-        | Command::Optimize { .. }
-        | Command::RebuildFullTextIndexes { .. }
-        | Command::Repair { .. }
-        | Command::Cleanup { .. }
-        | Command::Lint { .. } => Plane::Storage,
+        Command::Init(_)
+        | Command::Upgrade(_)
+        | Command::Optimize(_)
+        | Command::RebuildFullTextIndexes(_)
+        | Command::Repair(_)
+        | Command::Cleanup(_)
+        | Command::Lint(_) => Plane::Storage,
         Command::Cluster { .. } | Command::Organization { .. } => Plane::Control,
-        Command::Alias { .. }
+        Command::Alias(_)
         | Command::Embed(_)
         | Command::Login { .. }
         | Command::Logout { .. }
@@ -336,8 +336,8 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             SkillCommand::Show { .. } => "skill show",
         },
         Command::Embed(_) => "embed",
-        Command::Init { .. } => "init",
-        Command::Load { .. } => "load",
+        Command::Init(_) => "init",
+        Command::Load(_) => "load",
         Command::Branch { .. } => "branch",
         Command::Schema { command } => match command {
             SchemaCommand::Plan { .. } => "schema plan",
@@ -345,13 +345,13 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             SchemaCommand::Show { .. } => "schema show",
             SchemaCommand::UpgradeSystemColumns { .. } => "schema upgrade-system-columns",
         },
-        Command::Lint { .. } => "lint",
+        Command::Lint(_) => "lint",
         Command::Queries { command } => match command {
             QueriesCommand::Validate { .. } => "queries validate",
             QueriesCommand::List { .. } => "queries list",
         },
-        Command::Snapshot { .. } => "snapshot",
-        Command::Export { .. } => "export",
+        Command::Snapshot(_) => "snapshot",
+        Command::Export(_) => "export",
         Command::Blob { command } => match command {
             BlobCommand::Get { .. } => "blob get",
             BlobCommand::Stat { .. } => "blob stat",
@@ -365,20 +365,20 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             CommitCommand::Show { .. } => "commit show",
             CommitCommand::Changes { .. } => "commit changes",
         },
-        Command::Diff { .. } => "diff",
+        Command::Diff(_) => "diff",
         Command::Changes { command } => match command {
             ChangesCommand::Poll { .. } => "changes poll",
             ChangesCommand::Baseline { .. } => "changes baseline",
         },
-        Command::Query { .. } => "query",
-        Command::Mutate { .. } => "mutate",
-        Command::Alias { .. } => "alias",
+        Command::Query(_) => "query",
+        Command::Mutate(_) => "mutate",
+        Command::Alias(_) => "alias",
         Command::Policy { .. } => "policy",
-        Command::Upgrade { .. } => "upgrade",
-        Command::Optimize { .. } => "optimize",
-        Command::RebuildFullTextIndexes { .. } => "rebuild-full-text-indexes",
-        Command::Repair { .. } => "repair",
-        Command::Cleanup { .. } => "cleanup",
+        Command::Upgrade(_) => "upgrade",
+        Command::Optimize(_) => "optimize",
+        Command::RebuildFullTextIndexes(_) => "rebuild-full-text-indexes",
+        Command::Repair(_) => "repair",
+        Command::Cleanup(_) => "cleanup",
         Command::Cluster { .. } => "cluster",
         Command::Organization { .. } => "organization",
         Command::Graphs { command } => match command {
@@ -397,13 +397,13 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
 pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Optimize { .. }
-            | Command::RebuildFullTextIndexes { .. }
-            | Command::Repair { .. }
-            | Command::Cleanup { .. }
+        Command::Optimize(_)
+            | Command::RebuildFullTextIndexes(_)
+            | Command::Repair(_)
+            | Command::Cleanup(_)
             // `lint` can type-check a `.gq` against a cluster graph's schema
             // (RFC 0011): `--cluster <dir> --graph <id>`.
-            | Command::Lint { .. }
+            | Command::Lint(_)
             // The policy/queries tooling addresses a cluster's applied state
             // (RFC 0011): `--cluster <dir>` selects the cluster, `--graph <id>`
             // picks a graph's bundle/registry within it.
@@ -432,7 +432,7 @@ fn accepts_graph_selector(cmd: &Command) -> bool {
 ///
 /// RFC 0010 Slice 1, generalized for RFC 0011 cluster addressing.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
-    if let Command::Alias { .. } = &cli.command {
+    if let Command::Alias(_) = &cli.command {
         // The binding owns all addressing. The listing keeps its historical
         // flag order (error text is observable contract).
         let flags: Vec<&str> = [
@@ -478,16 +478,16 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 fn remediation(capability: Capability, cmd: &Command) -> &'static str {
     match capability {
         Capability::Direct => match cmd {
-            Command::Init { .. } => " Pass a storage URI.",
+            Command::Init(_) => " Pass a storage URI.",
             Command::Schema {
                 command: SchemaCommand::Apply { .. },
             } => {
                 " Pass a standalone storage URI, or deploy the schema with `cluster apply --server <SERVER> --config <CONFIG>`."
             }
-            Command::Optimize { .. }
-            | Command::RebuildFullTextIndexes { .. }
-            | Command::Repair { .. }
-            | Command::Cleanup { .. } => " Pass a storage URI, or --cluster <dir> --graph <id>.",
+            Command::Optimize(_)
+            | Command::RebuildFullTextIndexes(_)
+            | Command::Repair(_)
+            | Command::Cleanup(_) => " Pass a storage URI, or --cluster <dir> --graph <id>.",
             _ => " Pass a storage URI.",
         },
         Capability::Control => match cmd {
@@ -693,10 +693,15 @@ mod tests {
             ];
             args.extend_from_slice(extra);
             let cli = Cli::try_parse_from(args).unwrap();
-            let error = crate::cluster_remote::dispatch(&cli)
-                .await
-                .unwrap_err()
-                .to_string();
+            let error = crate::cluster_remote::dispatch(
+                &crate::operator::InvocationConfig::at(None, None),
+                &cli,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
             assert!(error.contains(expected), "{error}");
         }
     }

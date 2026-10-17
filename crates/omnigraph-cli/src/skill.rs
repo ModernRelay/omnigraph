@@ -221,8 +221,9 @@ pub(crate) fn export(dir: &Path, force: bool) -> Result<SkillExportOutput> {
     })
 }
 
-pub(crate) fn print_export_human(output: &SkillExportOutput) {
-    println!(
+pub(crate) fn write_export_human(output: &SkillExportOutput, stdout: &mut dyn Write) -> Result<()> {
+    writeln!(
+        stdout,
         "exported the {} skill {} to {}: {} files (CLI {}, HTTP contract {})",
         output.skill,
         output.skill_version,
@@ -230,21 +231,25 @@ pub(crate) fn print_export_human(output: &SkillExportOutput) {
         output.files.len(),
         output.cli_version,
         output.http_contract
-    );
+    )?;
     for path in &output.removed {
-        println!("removed {path}: an earlier export wrote it and this skill no longer has it");
+        writeln!(
+            stdout,
+            "removed {path}: an earlier export wrote it and this skill no longer has it"
+        )?;
     }
     for file in &output.kept {
         let reason = match file.reason {
             KeptReason::Modified => "changed since an earlier export wrote it",
             KeptReason::NotAFile => "no longer a regular file",
         };
-        println!("kept {}: {reason}", file.path);
+        writeln!(stdout, "kept {}: {reason}", file.path)?;
     }
+    Ok(())
 }
 
 /// Prints one built-in skill file to stdout.
-pub(crate) fn show(path: &str) -> Result<()> {
+pub(crate) fn show(path: &str, stdout: &mut dyn Write) -> Result<()> {
     let Some(file) = omnigraph_skill::file(path) else {
         let paths: Vec<&str> = omnigraph_skill::FILES
             .iter()
@@ -252,7 +257,6 @@ pub(crate) fn show(path: &str) -> Result<()> {
             .collect();
         bail!("the skill has no {path}; its files: {}", paths.join(", "));
     };
-    let mut stdout = io::stdout().lock();
     match stdout
         .write_all(file.contents)
         .and_then(|()| stdout.flush())
@@ -388,6 +392,61 @@ mod tests {
 
     use super::{is_skill_path, names_current_file};
 
+    #[test]
+    fn show_uses_the_supplied_sink_and_only_suppresses_broken_pipe() {
+        use std::io::{self, Write};
+        struct Fault {
+            kind: io::ErrorKind,
+            on_flush: bool,
+            accepted: Vec<u8>,
+        }
+        impl Write for Fault {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.on_flush {
+                    return Err(io::Error::new(self.kind, "sink refused write"));
+                }
+                self.accepted.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(self.kind, "sink refused flush"))
+            }
+        }
+        for on_flush in [false, true] {
+            for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::PermissionDenied] {
+                let mut writer = Fault {
+                    kind,
+                    on_flush,
+                    accepted: Vec::new(),
+                };
+                let result = super::show("SKILL.md", &mut writer);
+                if kind == io::ErrorKind::BrokenPipe {
+                    result.unwrap();
+                } else {
+                    assert_eq!(
+                        result
+                            .unwrap_err()
+                            .downcast_ref::<io::Error>()
+                            .unwrap()
+                            .kind(),
+                        kind
+                    );
+                }
+                assert_eq!(
+                    writer.accepted.as_slice(),
+                    if on_flush {
+                        omnigraph_skill::file("SKILL.md").unwrap().contents
+                    } else {
+                        &[]
+                    }
+                );
+            }
+        }
+        let mut bytes = Vec::new();
+        super::show("SKILL.md", &mut bytes).unwrap();
+        assert_eq!(bytes, omnigraph_skill::file("SKILL.md").unwrap().contents);
+    }
+
     /// Every public command path of the CLI, from the clap tree: a command
     /// without subcommands is one path, and a command with subcommands
     /// contributes one path per public subcommand.
@@ -509,7 +568,7 @@ mod tests {
     /// change fails here until the skill says what `omnigraph version` says.
     #[test]
     fn skill_states_the_storage_formats_this_binary_reports() {
-        let line = crate::output::VersionOutput::current()
+        let line = crate::commands::local::output::VersionOutput::current()
             .internal_schema
             .line();
         assert!(
