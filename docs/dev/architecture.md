@@ -122,6 +122,14 @@ effective format and table options once; rendering does not reload configuration
 The captured read format also selects structured execution-error output, while
 mutation error formatting remains tied to explicit `--json`.
 
+`commands/history` owns branch, commit, diff, change-feed and snapshot commands.
+Its preparation types distinguish a requested page from automatic pagination and
+preserve optional branch selection. Human and JSON renderers use fallible writers;
+streams flush each page before requesting another. Baseline capture holds its
+output-file lock through durable installation and resume-cursor delivery, including
+the cursor flush. Dedicated commit publication and drop share the application's
+write-outcome observation with their `mutate` statement forms.
+
 CLI unit tests own invocation preparation and presentation; CLI process tests
 own argument, environment, configuration, transport, output and exit behavior.
 GQT owns query semantics across its execution adapters. Keep those boundaries

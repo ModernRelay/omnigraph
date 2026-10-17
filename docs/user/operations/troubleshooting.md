@@ -72,6 +72,10 @@ CLI data-write failures preserve structured details and add `command_outcome`:
 fields to stdout; human mode prints the action on stderr. HTTP failures also
 retain `http_status` and, when present, the original `retry_after` string.
 
+This includes `commit publish` and `commit drop`, as well as their `mutate`
+statement forms. If a response or result output is lost, inspect the commit's
+current state before another attempt; an output failure does not undo the write.
+
 | CLI exit | What to do |
 |---:|---|
 | 0 | The operation succeeded or was a no-op. A merge can separately report a source-deletion failure without losing its successful result. |

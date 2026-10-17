@@ -211,4 +211,6 @@ same `400`.
 The CLI's durable `--out` installation is available on POSIX platforms. The
 file contains only snapshot entity records, not the terminal handshake. The CLI
 syncs and atomically replaces it before printing
-`{"snapshot_commit_id":"...","resume_cursor":"..."}` to JSON stdout.
+`{"snapshot_commit_id":"...","resume_cursor":"..."}` to JSON stdout. Concurrent
+captures to the same path stay serialized until the cursor output is flushed.
+A cursor-output failure returns an error; the installed snapshot remains in place.
