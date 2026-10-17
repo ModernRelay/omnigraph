@@ -191,29 +191,29 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         assert!(stderr.is_empty());
     }
 
-    // A successful write can still lose a buffered stderr warning. Completion
-    // must flush both sinks while retaining the same dispatched-write evidence.
-    let (result, evidence) = command_outcome::observe(async {
-        command_outcome::dispatched(&Method::POST);
-        Ok::<_, color_eyre::Report>(Completion::success())
-    })
-    .await;
-    let mut stdout = Vec::new();
-    let mut stderr = FailingOutput {
-        fault: OutputFault::Flush,
-        bytes: Vec::new(),
-    };
-    stderr
-        .write_all(b"warning after committed write\n")
-        .unwrap();
-    let error = finish(result, Some(evidence), None, &mut stdout, &mut stderr).unwrap_err();
-    let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
-    let failure = serde_json::to_value(&undelivered.failure).unwrap();
-    assert_eq!(
-        failure["command_outcome"],
-        json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"})
-    );
-    assert!(stdout.is_empty());
+    // A failed stderr flush must retain write evidence without appending a
+    // failure document to a receipt already delivered on healthy stdout.
+    for machine in [None, Some(MachineErrors::Json)] {
+        let (result, evidence) = command_outcome::observe(async {
+            command_outcome::dispatched(&Method::POST);
+            Ok::<_, color_eyre::Report>(Completion::success())
+        })
+        .await;
+        let receipt = b"{\"receipt\":\"committed\"}\n";
+        let mut stdout = receipt.to_vec();
+        let mut stderr = FailingOutput {
+            fault: OutputFault::Flush,
+            bytes: b"warning after committed write\n".to_vec(),
+        };
+        let error = finish(result, Some(evidence), machine, &mut stdout, &mut stderr).unwrap_err();
+        let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
+        let failure = serde_json::to_value(&undelivered.failure).unwrap();
+        assert_eq!(
+            failure["command_outcome"],
+            json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"})
+        );
+        assert_eq!(stdout, receipt);
+    }
 
     let (result, evidence) = command_outcome::observe(async {
         command_outcome::dispatched(&Method::POST);
@@ -243,6 +243,82 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
     );
     assert!(stdout.is_empty());
     assert!(String::from_utf8_lossy(&stderr.bytes).contains("command_outcome:"));
+}
+
+#[tokio::test]
+async fn delivered_refusals_keep_their_exit_status_when_unused_stdout_cannot_flush() {
+    use crate::helpers::{PreconditionFailedCli, RemoteErrorCli};
+    use omnigraph_api_types::{ErrorCode, ErrorOutput};
+    use reqwest::StatusCode;
+
+    let mut busy = ErrorOutput::message("writer busy");
+    busy.code = Some(ErrorCode::TooManyRequests);
+    let refusals = [
+        (
+            PreconditionFailedCli {
+                output: ErrorOutput::message("commit changed"),
+                http_status: Some(412),
+                retry_after: None,
+            }
+            .into(),
+            4,
+            "commit changed",
+        ),
+        (
+            RemoteErrorCli {
+                output: busy,
+                status: StatusCode::TOO_MANY_REQUESTS,
+                retry_after: Some("3".into()),
+            }
+            .into(),
+            75,
+            "writer busy",
+        ),
+    ];
+    for (error, expected, message) in refusals {
+        let (result, evidence) = command_outcome::observe(async {
+            command_outcome::dispatched(&Method::POST);
+            Err::<Completion, color_eyre::Report>(error)
+        })
+        .await;
+        let mut stdout = FailingOutput {
+            fault: OutputFault::Flush,
+            bytes: Vec::new(),
+        };
+        let mut stderr = Vec::new();
+        let completion = finish(result, Some(evidence), None, &mut stdout, &mut stderr).unwrap();
+        assert_eq!(completion.code(), expected);
+        assert!(stdout.bytes.is_empty());
+        let diagnostic = String::from_utf8(stderr).unwrap();
+        assert_eq!(diagnostic.matches(message).count(), 1);
+        assert_eq!(diagnostic.matches("command_outcome:").count(), 1);
+        if expected == 75 {
+            assert!(diagnostic.contains("Retry-After: 3"));
+        }
+    }
+}
+
+#[test]
+fn handled_nonzero_completions_do_not_flush_an_unrelated_or_failed_stream() {
+    for code in [1, 2, 3, 4, 5, 6, 75] {
+        for delivered_on_stdout in [false, true] {
+            let mut delivered = b"already delivered and flushed\n".to_vec();
+            let mut unused = FailingOutput {
+                fault: OutputFault::Flush,
+                bytes: Vec::new(),
+            };
+            let (stdout, stderr): (&mut dyn Write, &mut dyn Write) = if delivered_on_stdout {
+                (&mut delivered, &mut unused)
+            } else {
+                (&mut unused, &mut delivered)
+            };
+            let completion =
+                finish(Ok(Completion::exit(code)), None, None, stdout, stderr).unwrap();
+            assert_eq!(completion.code(), code);
+            assert_eq!(delivered, b"already delivered and flushed\n");
+            assert!(unused.bytes.is_empty());
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -528,7 +604,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                 } else {
                     assert_eq!(completed.unwrap().code(), 1);
                 }
-                if json {
+                if json || matches!(fault, OutputFault::Flush) {
                     assert!(stderr.is_empty());
                 } else {
                     let diagnostic = String::from_utf8(stderr).unwrap();
@@ -809,7 +885,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
             } else {
                 assert_eq!(completed.unwrap().code(), 1);
             }
-            if json {
+            if json || matches!(fault, OutputFault::Flush) {
                 assert!(stderr.is_empty());
             } else {
                 let text = String::from_utf8(stderr).unwrap();

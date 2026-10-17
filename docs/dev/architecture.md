@@ -56,9 +56,8 @@ revision.
 
 The CLI's [scope resolver](../../crates/omnigraph-cli/src/scope.rs) selects an
 ordinary scope from supplied flags, operator configuration and an ambient profile
-value. Its `resolve_scope_from_env` boundary captures `OMNIGRAPH_PROFILE`;
-configuration loading, credential acquisition and server discovery remain with
-their existing callers.
+value. `InvocationConfig` captures `OMNIGRAPH_PROFILE` once; configuration loading,
+credential acquisition and server discovery remain outside the pure resolver.
 
 ## Authority model
 
@@ -110,7 +109,15 @@ dispatch, invocation-scoped admission and outcome evidence, and completion
 reporting. A completion carries the exit status of an already handled invocation;
 an unrendered error remains a `Result` error. The
 [binary](../../crates/omnigraph-cli/src/main.rs) owns runtime startup, diagnostic
-hooks, process arguments and the final process exit status.
+hooks, process arguments and the final process exit status. After an already
+reported nonzero completion, runtime shutdown does not wait for lingering blocking
+tasks such as DNS lookups; successful completion keeps normal shutdown. Clap's
+help, version and argument-refusal statuses survive closed output streams.
+Completion flushes a returned result without appending a second machine response
+if flushing fails. Handlers flush nonzero reports before returning completion;
+completion does not touch their streams again. Failure rendering flushes only
+the stream carrying that failure, so an unused stream cannot invalidate a
+delivered refusal.
 
 Command handlers consume supplied input, terminal status and fallible output
 writers; the process-facing application wrapper supplies the actual standard

@@ -67,6 +67,37 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn clap_exit_status_survives_closed_output() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    for (args, expected, uses_stderr) in [
+        (vec!["--help"], 0, false),
+        (vec!["--version"], 0, false),
+        (vec!["query", "--help"], 0, false),
+        (vec!["--unknown-option"], 2, true),
+    ] {
+        // Close the reader before spawning, avoiding the race in `| head -n0`.
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let mut command = cli_process();
+        command.args(&args).stdin(Stdio::null());
+        if uses_stderr {
+            command.stderr(Stdio::from(writer));
+        } else {
+            command.stdout(Stdio::from(writer));
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+    }
+}
+
 /// `skills/omnigraph`, the one copy of the skill the binary embeds.
 fn source_skill_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/omnigraph")

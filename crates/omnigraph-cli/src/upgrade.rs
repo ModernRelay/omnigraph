@@ -69,12 +69,21 @@ pub(crate) async fn run(
     let report =
         omnigraph::db::upgrade_storage(&uri, omnigraph::db::UpgradeOptions { check, to_format })
             .await?;
+    finish_report(&report, json, stdout)
+}
+
+fn finish_report(
+    report: &omnigraph::db::UpgradeReport,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        write_json(&report, stdout)?;
+        write_json(report, stdout)?;
     } else {
-        write_human(&report, stdout)?;
+        write_human(report, stdout)?;
     }
     if !report.success() {
+        stdout.flush()?;
         return Ok(Completion::exit(1));
     }
     Ok(Completion::success())
@@ -192,6 +201,30 @@ mod tests {
             UpgradeFinding, UpgradeMode, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
             UpgradeWork,
         };
+        use std::io;
+
+        #[derive(Default)]
+        struct ReportWriter {
+            bytes: Vec<u8>,
+            flushes: usize,
+            fail_flush: bool,
+        }
+
+        impl Write for ReportWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.fail_flush {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "output closed"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
 
         let mut report = UpgradeReport {
             mode: UpgradeMode::Check,
@@ -261,6 +294,51 @@ mod tests {
             std::io::ErrorKind::WriteZero
         );
         assert_eq!(&prefix, b"upgrade");
+
+        for outcome in [UpgradeOutcome::RecoveryRequired, UpgradeOutcome::Completed] {
+            report.outcome = outcome;
+            if report.success() {
+                report.recovery = None;
+            }
+            for json in [false, true] {
+                let mut expected = Vec::new();
+                if json {
+                    write_json(&report, &mut expected).unwrap();
+                } else {
+                    write_human(&report, &mut expected).unwrap();
+                }
+
+                for fail_flush in [false, true] {
+                    let mut writer = ReportWriter {
+                        fail_flush,
+                        ..ReportWriter::default()
+                    };
+                    let result = finish_report(&report, json, &mut writer);
+                    if fail_flush && !report.success() {
+                        assert_eq!(
+                            result
+                                .unwrap_err()
+                                .downcast_ref::<io::Error>()
+                                .unwrap()
+                                .kind(),
+                            io::ErrorKind::BrokenPipe
+                        );
+                    } else {
+                        assert_eq!(result.unwrap().code(), i32::from(!report.success()));
+                    }
+                    assert_eq!(writer.bytes, expected);
+                    assert_eq!(writer.flushes, usize::from(!report.success()));
+                }
+
+                let mut prefix = [0_u8; 7];
+                let error = finish_report(&report, json, &mut prefix.as_mut_slice()).unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().kind(),
+                    io::ErrorKind::WriteZero
+                );
+                assert_eq!(prefix.as_slice(), &expected[..7]);
+            }
+        }
     }
 
     #[test]

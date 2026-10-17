@@ -297,15 +297,17 @@ impl RemoteCluster {
                 Err(error) => {
                     // Preserve the caller's recovery identity even if access
                     // or the protocol changes while observing the operation.
-                    writeln!(
+                    let delivery = writeln!(
                         stderr,
                         "Deployment-ID: {id}; observation failed; never resubmit unknown work"
                     )
-                    .and_then(|()| stderr.flush())
-                    .wrap_err_with(|| format!(
-                        "could not deliver observation failure; Deployment-ID: {id}; never resubmit unknown work"
-                    ))?;
-                    return Err(error);
+                    .and_then(|()| stderr.flush());
+                    return Err(match delivery {
+                        Ok(()) => error,
+                        Err(delivery_error) => error.wrap_err(format!(
+                            "could not deliver observation failure to stderr: {delivery_error}; Deployment-ID: {id}; never resubmit unknown work"
+                        )),
+                    });
                 }
             }
         }
@@ -397,15 +399,17 @@ impl RemoteCluster {
                 .await
             }
             Err(error) => {
-                writeln!(
+                let delivery = writeln!(
                     stderr,
                     "Inspect cluster status --server <SERVER> --deployment-id {id}; a lost response does not authorize replay."
                 )
-                .and_then(|()| stderr.flush())
-                .wrap_err_with(|| format!(
-                    "could not deliver submission failure; Deployment-ID: {id}; a lost response does not authorize replay"
-                ))?;
-                Err(error)
+                .and_then(|()| stderr.flush());
+                Err(match delivery {
+                    Ok(()) => error,
+                    Err(delivery_error) => error.wrap_err(format!(
+                        "could not deliver submission failure to stderr: {delivery_error}; Deployment-ID: {id}; a lost response does not authorize replay"
+                    )),
+                })
             }
         }
     }
@@ -583,6 +587,8 @@ mod tests {
         fault: Option<OutputFault>,
         bytes: Vec<u8>,
         flushes: usize,
+        fault_after_flushes: usize,
+        fault_start: Option<usize>,
     }
 
     impl Output {
@@ -591,14 +597,26 @@ mod tests {
                 fault,
                 bytes: Vec::new(),
                 flushes: 0,
+                fault_after_flushes: 0,
+                fault_start: None,
+            }
+        }
+
+        fn after_flushes(fault: Option<OutputFault>, successful_flushes: usize) -> Self {
+            Self {
+                fault_after_flushes: successful_flushes,
+                ..Self::new(fault)
             }
         }
     }
 
     impl Write for Output {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            let count = if matches!(self.fault, Some(OutputFault::AfterPrefix)) {
-                let remaining = 5 - self.bytes.len();
+            let count = if matches!(self.fault, Some(OutputFault::AfterPrefix))
+                && self.flushes >= self.fault_after_flushes
+            {
+                let start = *self.fault_start.get_or_insert(self.bytes.len());
+                let remaining = 5 - (self.bytes.len() - start);
                 if remaining == 0 {
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "output closed"));
                 }
@@ -612,7 +630,9 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             self.flushes += 1;
-            if matches!(self.fault, Some(OutputFault::Flush)) {
+            if matches!(self.fault, Some(OutputFault::Flush))
+                && self.flushes > self.fault_after_flushes
+            {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "output closed"))
             } else {
                 Ok(())
@@ -711,6 +731,102 @@ mod tests {
                 assert!(!source.path().join("__cluster").exists());
                 assert!(!source.path().join("graphs").exists());
                 api.assert_complete();
+            }
+        }
+
+        // A definitive refusal remains the command error even if its recovery
+        // hint cannot be delivered. The identity line must first reach stderr
+        // so these faults occur after the single submission, not before it.
+        let outstanding_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV:2:01ARZ3NDEKTSV4RRFFQ69G5FAX";
+        for during_observation in [false, true] {
+            for refusal_status in [StatusCode::FORBIDDEN, StatusCode::CONFLICT] {
+                let refusal = json!({
+                    "error": format!("deployment {outstanding_id} is outstanding; access refused"),
+                    "code": if refusal_status == StatusCode::FORBIDDEN { "forbidden" } else { "conflict" },
+                });
+                for fault in [
+                    None,
+                    Some(OutputFault::AfterPrefix),
+                    Some(OutputFault::Flush),
+                ] {
+                    let mut replies = vec![IntentReply::json(200, status.clone())];
+                    if during_observation {
+                        replies.push(IntentReply::json(202, accepted.clone()));
+                    }
+                    replies.push(IntentReply::json(refusal_status.as_u16(), refusal.clone()));
+                    let api = IntentApiFixture::graph(replies);
+                    let remote = RemoteCluster {
+                        root: api.origin.clone(),
+                        token: Some("fixture-secret".into()),
+                        client: GraphHttpClient::new(&api.origin).unwrap(),
+                    };
+                    let mut stdout = Output::new(None);
+                    let mut stderr = Output::after_flushes(fault, 1);
+                    let error = remote
+                        .apply(
+                            source.path(),
+                            Some(id),
+                            true,
+                            !during_observation,
+                            Some(10),
+                            &mut stdout,
+                            &mut stderr,
+                        )
+                        .await
+                        .unwrap_err();
+                    let remote_error = error
+                        .downcast_ref::<RemoteErrorCli>()
+                        .expect("hint failure must preserve the typed server refusal");
+                    assert_eq!(remote_error.status, refusal_status);
+                    assert_eq!(serde_json::to_value(&remote_error.output).unwrap(), refusal);
+                    assert_eq!(
+                        serde_json::to_value(crate::app::error_output_of(&error).unwrap()).unwrap(),
+                        refusal,
+                        "application JSON rendering must retain the server body"
+                    );
+                    assert!(!retry_observation(&error));
+                    assert!(!error.is::<WaitTimeout>());
+                    assert!(stdout.bytes.is_empty());
+                    if fault.is_some() {
+                        let context = error.to_string();
+                        assert!(context.contains("stderr"), "{error:?}");
+                        assert!(context.contains("output closed"), "{error:?}");
+                        assert!(context.contains(id), "{error:?}");
+                        assert!(context.contains(if during_observation {
+                            "observation failure"
+                        } else {
+                            "submission failure"
+                        }));
+                    } else {
+                        assert_eq!(error.to_string(), refusal["error"].as_str().unwrap());
+                    }
+                    assert_eq!(
+                        stderr.flushes,
+                        if matches!(fault, Some(OutputFault::AfterPrefix)) {
+                            1
+                        } else {
+                            2
+                        }
+                    );
+                    let requests = api.workflow_requests();
+                    assert_eq!(requests.len(), if during_observation { 3 } else { 2 });
+                    assert_eq!(
+                        requests
+                            .iter()
+                            .filter(|request| request.method == "POST")
+                            .count(),
+                        1,
+                        "a failed refusal hint never authorizes resubmission"
+                    );
+                    assert_eq!(requests[1].body["deployment_id"], id);
+                    if during_observation {
+                        assert_eq!(requests[2].method, "GET");
+                        assert_eq!(requests[2].path, format!("/cluster/deployments/{id}"));
+                    }
+                    assert!(!source.path().join("__cluster").exists());
+                    assert!(!source.path().join("graphs").exists());
+                    api.assert_complete();
+                }
             }
         }
     }

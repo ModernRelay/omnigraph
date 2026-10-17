@@ -116,11 +116,22 @@ fn managed_output_preserves_bytes_and_recovery_details_on_delivery_failure() {
             let mut failed = FailedOutput::new(fault, 0);
             let mut other = Vec::new();
             let error = if expected_err.is_empty() {
-                output().emit(&mut failed, &mut other)
+                output().emit(&mut failed, &mut other).unwrap_err()
             } else {
-                output().emit(&mut other, &mut failed)
-            }
-            .unwrap_err();
+                assert_eq!(output().emit(&mut other, &mut failed).unwrap(), 1);
+                let recovery: Value = serde_json::from_slice(&other).unwrap();
+                assert_eq!(recovery["type"], "output_delivery_failed");
+                assert_eq!(recovery["accepted_deployment"], accepted);
+                assert_eq!(recovery["idempotency_key"], "original-key");
+                assert!(recovery.get("submission").is_none());
+                assert!(recovery.get("original_error").is_none());
+                output()
+                    .emit(
+                        &mut FailedOutput::new(fault, 0),
+                        &mut FailedOutput::new(fault, 0),
+                    )
+                    .unwrap_err()
+            };
             assert_eq!(
                 error.downcast_ref::<std::io::Error>().unwrap().kind(),
                 std::io::ErrorKind::BrokenPipe
@@ -136,8 +147,45 @@ fn managed_output_preserves_bytes_and_recovery_details_on_delivery_failure() {
                 assert!(message.contains("original-key"));
                 assert!(message.contains("retain original IDs"));
             }
-            assert!(other.is_empty());
+            if expected_err.is_empty() {
+                assert!(other.is_empty());
+            } else {
+                assert!(message.contains("stdout recovery delivery also failed"));
+            }
         }
+    }
+
+    // A lifecycle identity receives the same narrow fallback. Extra fields and
+    // reflected error text must never turn recovery into source/secret export.
+    let identity = json!({"cluster_id":"cluster-original","incarnation":"incarnation-original","operation_id":"operation-original","kind":"create"});
+    for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+        let mut body = json!({"type":"output_delivery_failed","detail":"private-error-content","accepted_operation":identity,"submission":{"idempotency_key":"original-key","request":{"source":"private-request-content"}},"access_token":"private-token-extra","data":{"files":{"secret.pg":"private-source-content"}}});
+        body["accepted_operation"]["token"] = json!("private-identity-extra");
+        let mut stdout = Vec::new();
+        assert_eq!(
+            Output::from_result(Err(Failure { body, exit: 1 }), false, 1)
+                .emit(&mut stdout, &mut FailedOutput::new(fault, 0))
+                .unwrap(),
+            1
+        );
+        let recovery: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(recovery["accepted_operation"], identity);
+        assert_eq!(recovery["idempotency_key"], "original-key");
+        assert!(!String::from_utf8(stdout).unwrap().contains("private-"));
+
+        let mut stdout = Vec::new();
+        let error = Output::from_result(
+            Err(Failure::refused(
+                "invalid_input",
+                "no operation was accepted",
+            )),
+            false,
+            2,
+        )
+        .emit(&mut stdout, &mut FailedOutput::new(fault, 0))
+        .unwrap_err();
+        assert!(stdout.is_empty());
+        assert!(format!("{error:#}").contains("invalid_input"));
     }
 }
 
@@ -197,6 +245,55 @@ async fn managed_deployment_delivery_failures_never_submit_or_poll_again() {
                 assert_eq!(request.body, json!({"preview_id":"preview-original"}));
             }
             assert!(!error.body.to_string().contains("automation-secret"));
+            let output = || {
+                Output::from_result(
+                    Err(Failure {
+                        body: error.body.clone(),
+                        exit: error.exit,
+                    }),
+                    false,
+                    1,
+                )
+            };
+            let mut stdout = Vec::new();
+            let delivered = output().emit(&mut stdout, &mut stderr);
+            if fail_after_key {
+                assert_eq!(delivered.unwrap(), 1);
+                let recovery: Value = serde_json::from_slice(&stdout).unwrap();
+                assert_eq!(recovery["type"], "output_delivery_failed");
+                assert_eq!(
+                    recovery["accepted_deployment"],
+                    error.body["accepted_deployment"]
+                );
+                assert!(
+                    !String::from_utf8(stdout)
+                        .unwrap()
+                        .contains("automation-secret")
+                );
+            } else {
+                assert!(delivered.is_err());
+                assert!(
+                    stdout.is_empty(),
+                    "pre-dispatch failures do not use recovery fallback"
+                );
+            }
+            let undelivered = output()
+                .emit(
+                    &mut FailedOutput::new(fault, 0),
+                    &mut FailedOutput::new(fault, 0),
+                )
+                .unwrap_err();
+            let message = format!("{undelivered:#}");
+            assert!(!message.contains("automation-secret"));
+            if fail_after_key {
+                for identity in ["delivery-original", "native-original", "preview-original"] {
+                    assert!(message.contains(identity), "{message}");
+                }
+                assert!(message.contains("stdout recovery delivery also failed"));
+            } else {
+                assert!(message.contains("original-key"));
+            }
+            assert_eq!(server.requests().len(), usize::from(fail_after_key));
             server.assert_complete();
         }
     }

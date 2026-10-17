@@ -3062,13 +3062,20 @@ fn read_supports_inline_query_string() {
 fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
 
-    let cases: &[(Option<&str>, &[&str], &str)] = &[
-        (None, &["--json"], "json"),
-        (Some("knowledge"), &["--json"], "json"),
-        (Some("knowledge"), &[], "csv"),
-        (Some("knowledge"), &["--format", "table"], "table"),
+    let cases: &[(&str, Option<&str>, &[&str], &str)] = &[
+        ("query", None, &["--json"], "json"),
+        ("query", Some("knowledge"), &["--json"], "json"),
+        ("query", Some("knowledge"), &[], "csv"),
+        ("query", Some("knowledge"), &["--format", "table"], "table"),
+        ("mutate", None, &["--json"], "json"),
+        ("mutate", Some("knowledge"), &["--json"], "json"),
     ];
-    for &(graph, flags, expected_format) in cases {
+    for &(verb, graph, flags, expected_format) in cases {
+        let source = if verb == "mutate" {
+            r#"query q() { insert Person { name: "original-server" } }"#
+        } else {
+            "query q() { match { $p: Person } return { $p.name } }"
+        };
         let home = tempdir().unwrap();
         let config = home.path().join("config.yaml");
         let replacement = home.path().join("replacement.yaml");
@@ -3093,15 +3100,35 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         if graph.is_none() {
             replies.push(IntentReply::json(200, json!({"graphs": []})));
         }
-        replies.push(IntentReply::json(
-            200,
+        let response = if verb == "mutate" {
+            json!({
+                "query_name": "q",
+                "branch": "main",
+                "affected_nodes": 1,
+                "affected_edges": 0,
+                "actor_id": null,
+                "commit": {
+                    "graph_commit_id": "original-server",
+                    "graph_manifest_version": 1,
+                    "graph_branch": "main",
+                    "parent_commit_id": null,
+                    "merged_parent_commit_id": null,
+                    "actor_id": null,
+                    "created_at": 1234567,
+                    "published": true,
+                    "kind": "published",
+                    "root_commit_id": null
+                }
+            })
+        } else {
             json!({
                 "query_name": "q",
                 "target": {"branch": "main"},
                 "row_count": 1,
                 "rows": [{"p.name": "original-server"}]
-            }),
-        ));
+            })
+        };
+        replies.push(IntentReply::json(200, response));
         let server = IntentApiFixture::graph_with_discovery_hook(replies, {
             let config = config.clone();
             let replacement = replacement.clone();
@@ -3135,13 +3162,7 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
             .env_remove("OMNIGRAPH_TOKEN_REPLACEMENT")
             .env_remove("OMNIGRAPH_BEARER_TOKEN")
             .env_remove("OMNIGRAPH_PROFILE")
-            .args([
-                "query",
-                "--server",
-                "prod",
-                "-e",
-                "query q() { match { $p: Person } return { $p.name } }",
-            ])
+            .args([verb, "--server", "prod", "-e", source])
             .args(flags);
         if let Some(graph) = graph {
             command.args(["--graph", graph]);
@@ -3158,9 +3179,17 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
             "discovery must replace the credentials"
         );
         assert!(trap.requests().is_empty(), "setup changed destination");
-        assert!(output.status.success(), "{graph:?} {flags:?}: {output:?}");
+        assert!(
+            output.status.success(),
+            "{verb} {graph:?} {flags:?}: {output:?}"
+        );
         let stdout = stdout_string(&output);
         match expected_format {
+            "json" if verb == "mutate" => {
+                let receipt = parse_stdout_json(&output);
+                assert_eq!(receipt["affected_nodes"], 1);
+                assert_eq!(receipt["commit"]["graph_commit_id"], "original-server");
+            }
             "json" => assert_eq!(
                 parse_stdout_json(&output)["rows"][0]["p.name"],
                 "original-server"
@@ -3180,8 +3209,9 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         server.assert_complete();
 
         let requests = server.workflow_requests();
+        assert_eq!(requests.len(), if graph.is_some() { 1 } else { 2 });
         let (data_path, token) = if graph.is_some() {
-            ("/graphs/knowledge/query", "captured-graph-token")
+            (format!("/graphs/knowledge/{verb}"), "captured-graph-token")
         } else {
             assert_eq!(requests[0].method, "GET");
             assert_eq!(requests[0].path, "/graphs");
@@ -3189,11 +3219,12 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
                 requests[0].headers["authorization"],
                 "Bearer captured-root-token"
             );
-            ("/query", "captured-root-token")
+            (format!("/{verb}"), "captured-root-token")
         };
         let data = requests.last().unwrap();
         assert_eq!(data.method, "POST");
         assert_eq!(data.path, data_path);
+        assert_eq!(data.body["query"], source);
         assert_eq!(data.headers["authorization"], format!("Bearer {token}"));
         for request in server
             .requests()

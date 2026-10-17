@@ -36,7 +36,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
-| `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
+| `omnigraph-cli` | In-source application, runtime, parsing, output and transport tests plus `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-skill` | In-source `src/lib.rs`: the embedded table is sorted and `file` finds every path. The CLI owns the rest. In-source `src/skill.rs` holds the skill's command index (`references/commands.md`) and condensed reference (`SKILL.md`) to the clap tree and its storage-format line to `omnigraph version`; `integration/cli_schema_config.rs` owns `skill export` and `skill show`, including byte identity with `skills/omnigraph`; `scripts/check-docs.py` holds `metadata.version` and the declared HTTP contract to the CLI | None |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `integration/lane_b.rs`, `integration/torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
@@ -178,8 +178,13 @@ process behavior and `cli_data` for profile/embedding output. Its existing
 discovery-swap fixture also replaces the credential file, requiring registry
 probing and the subsequent command to retain the original token. Application and
 managed-output tests own completion, partial-write and flush failures; managed
-authentication/lifecycle fixtures own the pre-dispatch diagnostic gates. These
-are CLI boundary contracts; query-semantic GQT cases remain unchanged.
+authentication/lifecycle fixtures own the pre-dispatch diagnostic gates and
+accepted-identity recovery output when stderr fails. Application tests keep
+single-result stdout intact and preserve delivered refusal statuses; served
+cluster tests retain typed refusals through failed hints. The binary's channel
+barrier test proves reported failures do not wait for blocked runtime work;
+`cli_schema_config` owns help/version/refusal statuses with closed streams.
+These are CLI boundary contracts; query-semantic GQT cases remain unchanged.
 
 The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before

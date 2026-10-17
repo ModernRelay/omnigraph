@@ -146,7 +146,10 @@ convergence and activation by polling the original ID. `--no-wait` instead retur
 after durable acceptance; drain and preparation may precede that acknowledgment.
 `--timeout SECONDS` bounds caller waiting, including acceptance (default 300,
 maximum 3600). Expiry exits 5 with the original ID and last observation; it does
-not cancel execution or prove failure. Resume observation with:
+not cancel execution or prove failure. After reporting expiry, the CLI does not
+wait for an unfinished background DNS lookup before exiting. A failed recovery
+hint also preserves the server's original refusal, including an outstanding
+deployment ID. Resume observation with:
 
 ```bash
 omnigraph cluster status --server production --deployment-id ID --wait --timeout 1800 --json

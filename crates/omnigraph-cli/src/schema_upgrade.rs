@@ -54,12 +54,21 @@ pub(crate) async fn run(
     let report = db
         .upgrade_system_columns(omnigraph::db::SystemColumnUpgradeOptions { check })
         .await?;
+    finish_report(&report, json, stdout)
+}
+
+fn finish_report(
+    report: &omnigraph::db::SystemColumnUpgradeReport,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        write_json(&report, stdout)?;
+        write_json(report, stdout)?;
     } else {
-        write_human(&report, stdout)?;
+        write_human(report, stdout)?;
     }
     if !report.success() {
+        stdout.flush()?;
         return Ok(Completion::exit(1));
     }
     Ok(Completion::success())
@@ -125,7 +134,30 @@ mod tests {
             }
 
             fn flush(&mut self) -> io::Result<()> {
-                panic!("report formatting leaves flush to application completion");
+                panic!("a failed report write must not reach flush");
+            }
+        }
+
+        #[derive(Default)]
+        struct ReportWriter {
+            bytes: Vec<u8>,
+            flushes: usize,
+            fail_flush: bool,
+        }
+
+        impl Write for ReportWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.fail_flush {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "output closed"))
+                } else {
+                    Ok(())
+                }
             }
         }
 
@@ -174,6 +206,45 @@ mod tests {
                 io::ErrorKind::BrokenPipe
             );
             assert_eq!(writer.0, b"system-");
+
+            for json in [false, true] {
+                let expected = if json {
+                    let mut bytes = Vec::new();
+                    write_json(&report, &mut bytes).unwrap();
+                    bytes
+                } else {
+                    expected.as_bytes().to_vec()
+                };
+                for fail_flush in [false, true] {
+                    let mut writer = ReportWriter {
+                        fail_flush,
+                        ..ReportWriter::default()
+                    };
+                    let result = finish_report(&report, json, &mut writer);
+                    if fail_flush && !report.success() {
+                        assert_eq!(
+                            result
+                                .unwrap_err()
+                                .downcast_ref::<io::Error>()
+                                .unwrap()
+                                .kind(),
+                            io::ErrorKind::BrokenPipe
+                        );
+                    } else {
+                        assert_eq!(result.unwrap().code(), i32::from(!report.success()));
+                    }
+                    assert_eq!(writer.bytes, expected);
+                    assert_eq!(writer.flushes, usize::from(!report.success()));
+                }
+
+                let mut writer = PrefixWriter(Vec::new());
+                let error = finish_report(&report, json, &mut writer).unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().kind(),
+                    io::ErrorKind::BrokenPipe
+                );
+                assert_eq!(writer.0, &expected[..7]);
+            }
         }
     }
 

@@ -140,18 +140,95 @@ impl Output {
             }
             Ok(())
         })();
-        delivered.map_err(|error| {
+        if let Err(mut error) = delivered {
+            // Only this branch has left stdout untouched. An accepted operation
+            // still needs a recoverable identity when its diagnostic sink fails.
+            if !self.json && self.human.is_none() && self.body["detail"].is_string() {
+                if let Some(recovery) = accepted_recovery_output(&self.body, self.recovery.as_ref())
+                {
+                    let delivered = (|| -> color_eyre::Result<()> {
+                        writeln!(stdout, "{}", serde_json::to_string(&recovery)?)?;
+                        stdout.flush()?;
+                        Ok(())
+                    })();
+                    match delivered {
+                        Ok(()) => return Ok(1),
+                        Err(failure) => {
+                            error = error.wrap_err(format!(
+                                "stdout recovery delivery also failed: {failure}"
+                            ));
+                        }
+                    }
+                }
+            }
             let mut evidence = recovery_evidence(&self.body);
             if let Some(recovery) = &self.recovery {
                 evidence["request"] = recovery.clone();
             }
-            error.wrap_err(format!(
+            return Err(error.wrap_err(format!(
                 "managed output delivery failed (result exit {}): {}",
                 self.exit, evidence
-            ))
-        })?;
+            )));
+        }
         Ok(self.exit)
     }
+}
+
+/// A fallback record contains only accepted identities and an existing key:
+/// never reflected error text, request bodies, source exports or token fields.
+fn accepted_recovery_output(body: &Value, recovery: Option<&Value>) -> Option<Value> {
+    let mut output = Failure::output_delivery().body;
+    let mut accepted = false;
+    for (name, fields) in [
+        (
+            "accepted_deployment",
+            &["deployment_id", "native_deployment_id", "preview_id"][..],
+        ),
+        (
+            "accepted_operation",
+            &["cluster_id", "incarnation", "operation_id", "kind"][..],
+        ),
+    ] {
+        let identity: Option<serde_json::Map<String, Value>> = fields
+            .iter()
+            .map(|field| {
+                body.get(name)?
+                    .get(*field)?
+                    .as_str()
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value.len() <= 256
+                            && !value.chars().any(char::is_control)
+                    })
+                    .map(|value| ((*field).to_owned(), json!(value)))
+            })
+            .collect();
+        if let Some(identity) = identity {
+            output[name] = Value::Object(identity);
+            accepted = true;
+        }
+    }
+    if !accepted {
+        return None;
+    }
+    for source in [Some(body), body.get("submission"), recovery]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(key) = source
+            .get("idempotency_key")
+            .and_then(Value::as_str)
+            .filter(|key| {
+                !key.is_empty()
+                    && key.len() <= 256
+                    && key.bytes().all(|byte| byte.is_ascii_graphic())
+            })
+        {
+            output["idempotency_key"] = json!(key);
+            break;
+        }
+    }
+    Some(output)
 }
 
 /// Keep recovery facts if the selected stream cannot deliver the result. Do

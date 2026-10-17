@@ -5,6 +5,7 @@ use std::io::{IsTerminal, Read};
 
 /// An already handled invocation, including nonzero report statuses.
 /// This is distinct from an unrendered command error.
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Completion {
     code: i32,
@@ -14,6 +15,7 @@ impl Completion {
     pub(crate) const fn success() -> Self {
         Self::exit(0)
     }
+    /// Nonzero statuses require the owner to render and flush its report first.
     pub(crate) const fn exit(code: i32) -> Self {
         Self { code }
     }
@@ -50,7 +52,8 @@ where
     let parsed = match invocation::parse_from(args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            error.print()?;
+            // Match Clap's exit contract even when its selected stream is closed.
+            let _ = error.print();
             return Ok(Completion::exit(error.exit_code()));
         }
     };
@@ -105,13 +108,29 @@ fn finish(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let result = result.and_then(|completion| {
-        stdout.flush()?;
-        stderr.flush()?;
-        Ok(completion)
-    });
     let error = match result {
-        Ok(completion) => return Ok(completion),
+        // Nonzero reports were already flushed by their owner. Touching either
+        // stream again can invalidate a delivered refusal or recovery record.
+        Ok(completion) if completion.code() != 0 => return Ok(completion),
+        Ok(completion) => {
+            if let Err(delivery) = stdout.flush().and_then(|()| stderr.flush()) {
+                // A result may already be delivered. Never append a second
+                // machine response while reporting a final output failure.
+                if let Some(evidence) = evidence {
+                    let failure = command_outcome::Failure::classify(
+                        color_eyre::eyre::eyre!("could not flush CLI output: {delivery}"),
+                        evidence,
+                    );
+                    return Err(UndeliveredFailure {
+                        failure,
+                        delivery: delivery.into(),
+                    }
+                    .into());
+                }
+                return Err(delivery.into());
+            }
+            return Ok(completion);
+        }
         Err(error) => error,
     };
     if error
@@ -125,7 +144,10 @@ fn finish(
         let failure = command_outcome::Failure::classify(error, evidence);
         let delivered = (|| -> Result<()> {
             match machine {
-                Some(format) => write_machine(&failure, format, stdout)?,
+                Some(format) => {
+                    write_machine(&failure, format, stdout)?;
+                    stdout.flush()?;
+                }
                 None => {
                     let message = match &failure.output.diagnostic {
                         Some(diagnostic) => render_diagnostic(&failure.output, diagnostic),
@@ -146,7 +168,6 @@ fn finish(
                     stderr.flush()?;
                 }
             }
-            stdout.flush()?;
             Ok(())
         })();
         if let Err(delivery) = delivered {
@@ -159,7 +180,10 @@ fn finish(
     }
     if let Some(output) = error_output_of(&error) {
         match machine {
-            Some(format) => write_machine(&output, format, stdout)?,
+            Some(format) => {
+                write_machine(&output, format, stdout)?;
+                stdout.flush()?;
+            }
             None => match &output.diagnostic {
                 Some(diagnostic) => {
                     writeln!(stderr, "{}", render_diagnostic(&output, diagnostic))?;
@@ -168,7 +192,6 @@ fn finish(
                 None => return Err(error),
             },
         }
-        stdout.flush()?;
         return Ok(Completion::exit(1));
     }
     if let Some(contract) = error.downcast_ref::<graph_http::ApiContractError>() {

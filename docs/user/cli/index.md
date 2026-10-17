@@ -222,7 +222,15 @@ Output delivery failures return nonzero without undoing completed work. A failed
 login/logout report may follow a completed credential change; skill export or
 embedding generation may have already written its files. The CLI does not repeat
 those operations to recover output. `skill show` keeps its existing exception:
-a reader closing the pipe early is accepted.
+a reader closing the pipe early is accepted. Help and version also retain their
+normal exit status when their output pipe closes.
+
+A final flush failure does not append another JSON document after a returned
+result. A human data-write refusal delivered on stderr keeps its documented exit
+code even when stdout is unavailable. If a managed command has accepted a
+deployment or lifecycle operation but cannot report it on stderr, it attempts
+one recovery-only JSON record on stdout with the accepted identity and any
+retained idempotency key. This still exits nonzero and does not resubmit work.
 
 See [output formats](reference.md#query-inputs-and-output)
 and [diagnostics](../queries/diagnostics.md).
