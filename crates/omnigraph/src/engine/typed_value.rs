@@ -780,7 +780,10 @@ pub(super) fn validate_plan_values(
                 | PhysicalNode::Limit { .. }
                 | PhysicalNode::Page { .. }
                 | PhysicalNode::Expand { .. }
-                | PhysicalNode::OuterReference { .. } => {}
+                | PhysicalNode::OuterReference { .. }
+                | PhysicalNode::CsvSource { .. }
+                | PhysicalNode::Validate { .. }
+                | PhysicalNode::FragmentWrite { .. } => {}
             }
         }
         for expr in &pending {

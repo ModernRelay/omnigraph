@@ -8,7 +8,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]
-#[command(version = env!("CARGO_PKG_VERSION"), disable_version_flag = true)]
+#[command(version = crate::output::PACKAGE_VERSION.as_str(), disable_version_flag = true)]
 // Subcommands render in declaration order (clap can't print labeled headings
 // between groups), so this legend names the capability each command needs —
 // the user-facing vocabulary (RFC-011). `Plane` stays the internal classifier.
@@ -120,16 +120,14 @@ pub(crate) enum Command {
         /// the catalog (served — addressed via --server/--profile). With
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
-        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one
-        /// branch read statement (`branch list`, `branch diff`,
-        /// `branch merge-base`, `branch merge … dry run`), or one
-        /// `explain query …` statement, which answers the plan the query
-        /// would run under as results.
+        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one branch read statement
+        /// (`branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`), or one `explain query …`
+        /// or `explain load csv …` statement, answering the plan as results (a load plan reads no source byte).
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
-        /// a branch read statement, which takes no name, params, --branch or
-        /// --snapshot, or an `explain query …` statement.
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be a branch read statement,
+        /// which takes no name, params, --branch or --snapshot, or an `explain query …` or
+        /// `explain load csv …` statement.
         #[arg(
             short = 'e',
             long = "query-string",

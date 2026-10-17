@@ -574,6 +574,9 @@ over a string query, whose embedding needs the embedding client, gets a
 `plan` row `datafusion` naming the reason in place of that tree.
 `Session::explain_query` returns the same document itself. A `.gqt` case's
 `--- expect plan` compares it; case settings and query prefixes apply.
+A load statement's explain (`explain load csv …`) answers the same document
+under the same `explain_version`, its `datafusion` row saying the operators
+are lowered only at execution ([explain.md](../user/queries/explain.md#explaining-a-load-statement)).
 Destination hydration uses the planned projection; edge-property attach
 retains its complete property projection.
 
@@ -968,6 +971,18 @@ All load modes share the mutation publisher and recovery protocol:
 | `Overwrite` | One staged replacement per touched table. |
 | `Append` | Strict insert by exact physical `id`; an existing ID is a typed conflict. The public mode name does not mean a bare Lance Append transaction. |
 | `Merge` | Upsert by exact physical `id`; the last input occurrence wins. |
+
+A `load csv` overwrite is the first write plan: the planner routes
+`Operation::Load` to the engine, which lowers `CsvSource → Validate →
+FragmentWrite` to `CsvSourceExec` (one reader over the captured source),
+`ValidateExec` (a pipeline breaker: one pass over the held delta extracts what
+every check needs, then the checks are judged in refusal order against the
+committed image under each check's access) and DataFusion's `DataSinkExec`
+over `LanceFragmentSink`, which stages the fragments through the mutation
+staging and never commits. The attempt then commits the staged transaction
+detached and publishes once, the epilogue every write shares. Append, merge
+and JSONL loads keep the keyed path below; every load operator runs one
+worker until the parallel source lands.
 
 Mutation insert/update and keyed Load retain the per-table limit of 8,192 rows.
 An immutable `WriteBudget` captures the session's `write_max_bytes` (default

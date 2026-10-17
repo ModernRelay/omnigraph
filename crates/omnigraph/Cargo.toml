@@ -76,6 +76,7 @@ time = { workspace = true }
 async-trait = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
+csv-core = "0.1.13"
 arc-swap = { workspace = true }
 
 [dev-dependencies]

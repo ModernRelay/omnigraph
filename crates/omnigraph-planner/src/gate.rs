@@ -8,6 +8,7 @@ use std::io::Write;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::ir::{IRExpr, QueryIR};
+use omnigraph_compiler::query::ast::LoadStmtMode;
 use omnigraph_compiler::settings::{SettingId, Traversal};
 use omnigraph_compiler::types::Direction;
 use serde_json::{Value, json};
@@ -305,6 +306,9 @@ pub enum Unrouted {
     /// The plan source failed while answering a lookup
     /// (`PlanError::Source`); the engine returns the source's own error.
     SourceError { message: String },
+    /// A load mode the executor's keyed adapters still own: the plan is
+    /// built and explained, the executor runs the statement.
+    ModeOnExecutor { mode: &'static str },
 }
 
 impl Unrouted {
@@ -331,6 +335,7 @@ impl Unrouted {
             Self::UnsupportedQuery { .. } => "unsupported_query",
             Self::ValidationExhausted { .. } => "validation_exhausted",
             Self::SourceError { .. } => "source_error",
+            Self::ModeOnExecutor { .. } => "mode_on_executor",
         }
     }
 
@@ -354,6 +359,7 @@ impl Unrouted {
             Self::ValidationExhausted { limit, value } => {
                 json!({ "kind": self.kind(), "limit": limit, "value": value })
             }
+            Self::ModeOnExecutor { mode } => json!({ "kind": self.kind(), "mode": mode }),
         }
     }
 }
@@ -368,8 +374,9 @@ pub enum Decision {
         entry: &'static Entry,
         explain: Explain,
     },
-    /// A GQ query: the engine's `engine/lower.rs` executes `plan`, lowered
-    /// one-to-one from `logical`. Never consults the registry.
+    /// A GQ query or an overwrite load: the engine's `engine/lower.rs`
+    /// executes `plan`, lowered one-to-one from `logical`. Never consults
+    /// the registry.
     Engine {
         plan: PhysicalPlan,
         logical: LogicalPlan,
@@ -677,6 +684,45 @@ fn route_decision(
                     &fired,
                     Some(&initial),
                 ),
+                plan,
+            ),
+        };
+    }
+    if let Operation::Load { ir, .. } = op {
+        let lowered = physical_plan(&mut plan, source, bounds, fired.clone());
+        let logical = LogicalView::of(&plan);
+        return match lowered {
+            Ok(mut optimized) => {
+                optimized
+                    .physical
+                    .set_assumptions(recorded.assumptions(bounds));
+                let mut explain = logical.explain(
+                    operation,
+                    override_,
+                    None,
+                    Some(&optimized),
+                    &fired,
+                    Some(&initial),
+                );
+                explain.pipelines = None;
+                match ir.mode {
+                    LoadStmtMode::Overwrite => Decision::Engine {
+                        plan: optimized.physical,
+                        logical: plan,
+                        explain: explain.engine(),
+                    },
+                    LoadStmtMode::Append | LoadStmtMode::Merge => executor(
+                        Unrouted::ModeOnExecutor {
+                            mode: ir.mode.as_str(),
+                        },
+                        explain,
+                        plan,
+                    ),
+                }
+            }
+            Err(error) => executor(
+                Unrouted::of(error),
+                logical.explain(operation, override_, None, None, &fired, Some(&initial)),
                 plan,
             ),
         };

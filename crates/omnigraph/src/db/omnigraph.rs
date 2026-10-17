@@ -2323,6 +2323,7 @@ impl Omnigraph {
                 .set_read_caches(crate::db::manifest::SnapshotReadCaches {
                     session: self.read_caches.session.clone(),
                     handles: self.read_caches.handles.clone(),
+                    table_wrapper: None,
                 });
         }
         Ok(resolved)

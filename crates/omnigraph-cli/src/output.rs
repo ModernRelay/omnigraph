@@ -1077,12 +1077,22 @@ pub(crate) fn print_profile_detail(detail: &ProfileDetail, json: bool) -> Result
     Ok(())
 }
 
+/// The version this binary reports, `omnigraph --version` included
+/// ([`omnigraph_api_types::build`]).
+pub(crate) static PACKAGE_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    omnigraph_api_types::build::reported_version(env!("CARGO_PKG_VERSION"))
+});
+
 /// What this binary speaks, learned without contacting a server: the
 /// `omnigraph-http-api` value a server must match exactly, and the storage
 /// formats it writes and serves.
 #[derive(Debug, Serialize)]
 pub(crate) struct VersionOutput {
-    pub(crate) version: &'static str,
+    pub(crate) version: String,
+    /// `stable` or `edge` for a release archive; null for any other build.
+    pub(crate) channel: Option<&'static str>,
+    /// The full commit a packaged build was compiled from; null otherwise.
+    pub(crate) commit: Option<&'static str>,
     pub(crate) http_contract: &'static str,
     pub(crate) internal_schema: InternalSchemaOutput,
 }
@@ -1112,7 +1122,9 @@ impl VersionOutput {
             INTERNAL_MANIFEST_SCHEMA_VERSION, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
         };
         Self {
-            version: env!("CARGO_PKG_VERSION"),
+            version: PACKAGE_VERSION.clone(),
+            channel: omnigraph_api_types::build::RELEASE_CHANNEL,
+            commit: omnigraph_api_types::build::SOURCE_COMMIT,
             http_contract: omnigraph_api_types::HTTP_API_CONTRACT,
             internal_schema: InternalSchemaOutput {
                 writes: INTERNAL_MANIFEST_SCHEMA_VERSION,
@@ -1132,6 +1144,9 @@ pub(crate) fn print_version(output: &VersionOutput, json: bool) -> Result<()> {
     println!("omnigraph {}", output.version);
     println!("{}", output.internal_schema.line());
     println!("http-contract {}", output.http_contract);
+    if let Some(commit) = output.commit {
+        println!("commit {commit}");
+    }
     Ok(())
 }
 

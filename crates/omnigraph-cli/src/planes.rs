@@ -13,8 +13,8 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use crate::cli::{
-    BlobCommand, BranchCommand, ChangesCommand, Cli, ClusterCommand, Command, GraphsCommand,
-    QueriesCommand, SchemaCommand, SkillCommand,
+    BlobCommand, BranchCommand, ChangesCommand, Cli, ClusterCommand, Command, CommitCommand,
+    GraphsCommand, QueriesCommand, SchemaCommand, SkillCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +183,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         },
         // The actor rides direct-engine writes (`any` via --store) and cluster
         // writes; Blob get/stat are reads and never consume it, while Blob
-        // put/clear are writes and do. Served writes
+        // put/clear are writes and do; commit list/show/changes and commit
+        // publish/drop split the same way. Served writes
         // resolve the actor from the bearer token
         // (rejected downstream with its own message). On `direct`, full-text
         // rebuild attributes its graph publication; other maintenance verbs
@@ -193,20 +194,30 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         ScopeFlag::As => match capability {
             // `--as` names an actor for a direct/`--store` WRITE; a served write
             // resolves the actor from its token. The read commands (`query`,
-            // `changes`, `commit`, `blob`) attribute no actor on either surface,
+            // `diff`, `changes`, `commit list/show/changes`, `blob get/stat`,
+            // `branch diff/merge-base`) attribute no actor on either surface,
             // so accepting `--as` there is a silent no-op — reject it instead.
-            Any => !matches!(
-                cmd,
-                Command::Blob {
-                    command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
-                } | Command::Changes { .. }
-                    | Command::Commit { .. }
-                    | Command::Diff { .. }
-                    | Command::Branch {
-                        command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
-                    }
-                    | Command::Query { .. }
-            ),
+            // `commit` mixes reads and writes; its match is exhaustive so a
+            // new subcommand is classified before it compiles.
+            Any => match cmd {
+                Command::Commit { command } => match command {
+                    CommitCommand::Publish { .. } | CommitCommand::Drop { .. } => true,
+                    CommitCommand::List { .. }
+                    | CommitCommand::Show { .. }
+                    | CommitCommand::Changes { .. } => false,
+                },
+                _ => !matches!(
+                    cmd,
+                    Command::Blob {
+                        command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
+                    } | Command::Changes { .. }
+                        | Command::Diff { .. }
+                        | Command::Branch {
+                            command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
+                        }
+                        | Command::Query { .. }
+                ),
+            },
             Control => matches!(
                 cmd,
                 Command::Cluster {
@@ -347,7 +358,13 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             BlobCommand::Put { .. } => "blob put",
             BlobCommand::Clear { .. } => "blob clear",
         },
-        Command::Commit { .. } => "commit",
+        Command::Commit { command } => match command {
+            CommitCommand::List { .. } => "commit list",
+            CommitCommand::Publish { .. } => "commit publish",
+            CommitCommand::Drop { .. } => "commit drop",
+            CommitCommand::Show { .. } => "commit show",
+            CommitCommand::Changes { .. } => "commit changes",
+        },
         Command::Diff { .. } => "diff",
         Command::Changes { command } => match command {
             ChangesCommand::Poll { .. } => "changes poll",
@@ -495,7 +512,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scope_flag_matrix_matches_capabilities() {
+    fn scope_flag_matrix_matches_capabilities_issue_1023() {
         // The full flag × capability contract in one place. Rows cover every
         // capability, and both cluster_ok refinements of `direct` (optimize vs
         // init) and of `control` (queries vs cluster). `graphs` is
@@ -530,6 +547,24 @@ mod tests {
             (
                 parse(&["omnigraph", "commit", "changes", "some-commit"]),
                 [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "commit", "list"]),
+                [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "commit", "show", "some-commit"]),
+                [true, false, true, true, false, true],
+            ),
+            // `commit publish` and `commit drop` write, so a direct target
+            // takes `--as` as every other direct write does.
+            (
+                parse(&["omnigraph", "commit", "publish", "some-commit"]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&["omnigraph", "commit", "drop", "some-commit"]),
+                [true, false, true, true, true, true],
             ),
             (
                 parse(&["omnigraph", "changes", "poll"]),

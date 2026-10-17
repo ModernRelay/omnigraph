@@ -268,8 +268,10 @@ disconnect; no polling worker or second storage-writing CLI is involved.
 POST returns 202 after the outstanding ledger CAS confirms acceptance. The CLI
 then polls exact-ID GET; its wait deadline does not cancel the owned operation.
 Exact GET returns the receipt, `active`, and `in_progress` derived from the
-current process owner. A complete receipt can precede activation. A missing
-receipt during preparation is not proof of refusal, and an outstanding receipt
+current process owner. That owner retains the deployment gate through pending
+result delivery; its observation clears when the gate releases. A complete
+receipt can precede activation. A missing receipt during preparation is not proof
+of refusal, and an outstanding receipt
 without a live owner requires recovery.
 
 Exact receipt reads also permit the authenticated initiating actor recorded in

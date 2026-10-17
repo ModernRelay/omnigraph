@@ -24,6 +24,7 @@ pub mod instrumentation;
 pub mod lance_access;
 pub mod lance_clone;
 pub mod metadata;
+pub mod read_memo;
 pub mod seams;
 pub mod staging;
 pub mod storage;

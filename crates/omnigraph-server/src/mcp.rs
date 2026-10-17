@@ -581,7 +581,7 @@ impl ServerHandler for GraphTools {
         )
         .with_server_info(Implementation::new(
             "omnigraph-server",
-            env!("CARGO_PKG_VERSION"),
+            crate::api::build::reported_version(env!("CARGO_PKG_VERSION")),
         ))
         .with_instructions(instructions(self.state.mcp_settings()))
     }
@@ -1406,7 +1406,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "read",
         title: "Run a GQ read",
-        description: "Run a GQ read query you write. Call `schema` first. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; pick one declared query with `name` when the source declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Also answers `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` and `explain query …`, sent without `branch`, `snapshot`, `name` or `params`. Mutations and branch writes are refused. Returns `rows`, `row_count` and `graph_commit_id`.",
+        description: "Run a GQ read query you write. Call `schema` first. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; pick one declared query with `name` when the source declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Also answers `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` and `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; and `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations and branch writes are refused. Returns `rows`, `row_count` and `graph_commit_id`.",
         input: read_schema,
         output: None,
         effect: Effect::Read,
@@ -1652,7 +1652,7 @@ fn query_schema() -> Value {
 fn read_schema() -> Value {
     arguments(
         json!({
-            "query": text_schema("GQ source declaring one or more read queries, or one branch read or `explain` statement."),
+            "query": text_schema("GQ source declaring one or more read queries, or one branch read or `explain` statement (`explain query …` or `explain load csv …`)."),
             "name": text_schema("Which declared query to run when `query` declares several."),
             "params": {"type": "object", "description": "Values keyed by the query's declared parameter names, without `$`."},
             "branch": text_schema("Branch to read. Defaults to `main`. Not with `snapshot`."),

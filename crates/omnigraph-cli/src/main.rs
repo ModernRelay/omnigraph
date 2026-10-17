@@ -1701,6 +1701,22 @@ async fn run(cli: Cli) -> Result<()> {
                         ..
                     }) => bail!("{}", helpers::load_at_read_door(&stmt)),
                     Ok(QueryFile {
+                        body: FileBody::ExplainLoad(stmt),
+                        settings: prefix,
+                        ..
+                    }) => {
+                        refuse_process_prefix_when_remote(&client, &prefix)?;
+                        run_explain_load_cli(
+                            &client,
+                            &query_source,
+                            stmt,
+                            target,
+                            name.is_some() || params_json.is_some(),
+                            &settings,
+                        )
+                        .await?
+                    }
+                    Ok(QueryFile {
                         body: FileBody::Show(id),
                         settings: prefix,
                         ..
@@ -1849,7 +1865,7 @@ async fn run(cli: Cli) -> Result<()> {
                         ..
                     }) => Err(color_eyre::eyre::eyre!("{}", show_at_write_door(id))),
                     Ok(QueryFile {
-                        body: FileBody::Explain(_),
+                        body: FileBody::Explain(_) | FileBody::ExplainLoad(_),
                         ..
                     }) => Err(color_eyre::eyre::eyre!("{}", explain_at_write_door())),
                     parsed => {
@@ -2583,6 +2599,35 @@ async fn run_load_statement_cli(
     };
     client
         .load_statement(branch, query_source, stmt, policy, settings)
+        .await
+}
+
+/// The `query` door's `explain load csv` path: the plan the load would be
+/// accepted under, as explain rows, against `--branch` (never `--snapshot`),
+/// with the source probed under the same base install a direct load gets.
+async fn run_explain_load_cli(
+    client: &client::GraphClient,
+    query_source: &str,
+    stmt: omnigraph_compiler::query::ast::LoadStmt,
+    target: ReadTarget,
+    has_name_or_params: bool,
+    settings: &[(SettingId, SettingValue)],
+) -> Result<ReadOutput> {
+    if client.is_catalogue() {
+        return Err(client::catalogue_scope_refusal("explain load"));
+    }
+    refuse_statement_envelope(
+        matches!(target, ReadTarget::Snapshot(_)),
+        has_name_or_params,
+        false,
+    )?;
+    let policy = if client.is_remote() {
+        None
+    } else {
+        embedded_file_source_policy(&stmt.source)?
+    };
+    client
+        .explain_load(target, query_source, stmt, policy, settings)
         .await
 }
 
