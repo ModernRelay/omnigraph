@@ -312,7 +312,9 @@ impl GraphHttpClient {
             && bearer.is_none()
             && let Some(missing) = &self.missing_credential
         {
-            response.extensions_mut().insert(MissingCredential::clone(missing));
+            response
+                .extensions_mut()
+                .insert(MissingCredential::clone(missing));
         }
         Ok(response)
     }
