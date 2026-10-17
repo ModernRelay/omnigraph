@@ -2,6 +2,7 @@
 //! main.rs in the modularization).
 
 use super::*;
+use crate::app::Completion;
 
 pub(crate) fn graph_type_subject(type_key: &str) -> String {
     if let Some(type_name) = type_key.strip_prefix("node:") {
@@ -176,7 +177,7 @@ pub(crate) fn print_query_lint_human(output: &QueryLintOutput) {
     );
 }
 
-pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -185,14 +186,19 @@ pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<
 
     if output.status == QueryLintStatus::Error {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
 
-    Ok(())
+    Ok(Completion::success())
 }
 
 pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+pub(crate) fn write_json<T: Serialize>(value: &T, writer: &mut dyn Write) -> Result<()> {
+    writeln!(writer, "{}", serde_json::to_string_pretty(value)?)?;
     Ok(())
 }
 
@@ -394,7 +400,7 @@ pub(crate) fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagno
     }
 }
 
-pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -402,12 +408,12 @@ pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Re
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -415,12 +421,12 @@ pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()>
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -428,12 +434,15 @@ pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_state_sync(output: &StateSyncOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_state_sync(
+    output: &StateSyncOutput,
+    json: bool,
+) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -441,12 +450,15 @@ pub(crate) fn finish_cluster_state_sync(output: &StateSyncOutput, json: bool) ->
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_force_unlock(output: &ForceUnlockOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_force_unlock(
+    output: &ForceUnlockOutput,
+    json: bool,
+) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -454,13 +466,14 @@ pub(crate) fn finish_cluster_force_unlock(output: &ForceUnlockOutput, json: bool
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn print_load_human(payload: &LoadOutput) {
-    println!(
+pub(crate) fn write_load_human(payload: &LoadOutput, writer: &mut dyn Write) -> Result<()> {
+    writeln!(
+        writer,
         "loaded {} on branch {} with {}: {} entities across {} node types and {} edge types",
         payload.uri,
         payload.branch,
@@ -468,15 +481,16 @@ pub(crate) fn print_load_human(payload: &LoadOutput) {
         payload.total_entities,
         payload.nodes.len(),
         payload.edges.len()
-    );
+    )?;
     if payload.branch_created {
         if let Some(base) = &payload.base_branch {
-            println!("branch {} created from {}", payload.branch, base);
+            writeln!(writer, "branch {} created from {}", payload.branch, base)?;
         }
     }
     if let Some(diagnostic) = payload.embedding_generation {
-        println!("{}", diagnostic.message());
+        writeln!(writer, "{}", diagnostic.message())?;
     }
+    Ok(())
 }
 
 pub(crate) fn print_schema_plan_human(uri: &str, plan: &SchemaMigrationPlan) {
@@ -690,141 +704,158 @@ pub(crate) fn print_embed_human(output: &EmbedOutput) {
     );
 }
 
-pub(crate) fn print_snapshot_human(
+pub(crate) fn write_snapshot_human(
     graph_branch: &str,
     graph_manifest_version: u64,
     internal_schema_version: u32,
     entries: &[SnapshotDatasetOutput],
-) {
-    println!("graph_branch: {}", graph_branch);
-    println!("graph_manifest_version: {}", graph_manifest_version);
-    println!("internal_schema_version: {}", internal_schema_version);
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "graph_branch: {}", graph_branch)?;
+    writeln!(writer, "graph_manifest_version: {}", graph_manifest_version)?;
+    writeln!(
+        writer,
+        "internal_schema_version: {}",
+        internal_schema_version
+    )?;
     for entry in entries {
-        println!(
+        writeln!(
+            writer,
             "{} type '{}' published_dataset_version={} native_dataset_branch={} entities={}",
             entry.entity_kind.as_str(),
             entry.type_name,
             entry.published_dataset_version,
             entry.native_dataset_branch.as_deref().unwrap_or("main"),
             entry.entity_count
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// A Blob write receipt: the cell, the state it was left in and the commit
 /// that published it, or that nothing was published.
-pub(crate) fn print_blob_write_human(output: &omnigraph_api_types::BlobWriteOutput) {
+pub(crate) fn write_blob_write_human(
+    output: &omnigraph_api_types::BlobWriteOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
     let entity = match output.selector.entity {
         omnigraph_api_types::BlobEntityKind::Node => "node",
         omnigraph_api_types::BlobEntityKind::Edge => "edge",
     };
-    println!("entity: {entity}");
-    println!("type: {}", output.selector.r#type);
-    println!("id: {}", output.selector.id);
-    println!("property: {}", output.selector.property);
-    println!("branch: {}", output.branch);
+    writeln!(writer, "entity: {entity}")?;
+    writeln!(writer, "type: {}", output.selector.r#type)?;
+    writeln!(writer, "id: {}", output.selector.id)?;
+    writeln!(writer, "property: {}", output.selector.property)?;
+    writeln!(writer, "branch: {}", output.branch)?;
     match output.kind {
         omnigraph_api_types::BlobWriteStateOutput::Managed => {
-            println!("kind: managed");
+            writeln!(writer, "kind: managed")?;
             if let Some(size) = output.size {
-                println!("size: {size}");
+                writeln!(writer, "size: {size}")?;
             }
             if let Some(etag) = output.etag.as_deref() {
-                println!("etag: {etag}");
+                writeln!(writer, "etag: {etag}")?;
             }
         }
-        omnigraph_api_types::BlobWriteStateOutput::Null => println!("kind: null"),
+        omnigraph_api_types::BlobWriteStateOutput::Null => writeln!(writer, "kind: null")?,
     }
     if let Some(actor) = output.actor_id.as_deref() {
-        println!("actor: {actor}");
+        writeln!(writer, "actor: {actor}")?;
     }
     match &output.commit {
-        Some(commit) => println!("commit: {}", commit.graph_commit_id),
-        None => println!("commit: none (the cell was already null)"),
+        Some(commit) => writeln!(writer, "commit: {}", commit.graph_commit_id)?,
+        None => writeln!(writer, "commit: none (the cell was already null)")?,
     }
+    Ok(())
 }
 
-pub(crate) fn print_blob_stat_human(output: &BlobStatOutput) {
+pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Write) -> Result<()> {
     let entity = match output.selector.entity {
         omnigraph_api_types::BlobEntityKind::Node => "node",
         omnigraph_api_types::BlobEntityKind::Edge => "edge",
     };
-    println!("entity: {entity}");
-    println!("type: {}", output.selector.r#type);
-    println!("id: {}", output.selector.id);
-    println!("property: {}", output.selector.property);
+    writeln!(writer, "entity: {entity}")?;
+    writeln!(writer, "type: {}", output.selector.r#type)?;
+    writeln!(writer, "id: {}", output.selector.id)?;
+    writeln!(writer, "property: {}", output.selector.property)?;
     match output.kind {
         BlobContentKindOutput::Managed => {
-            println!("kind: managed");
+            writeln!(writer, "kind: managed")?;
             if let Some(size) = output.size {
-                println!("size: {size}");
+                writeln!(writer, "size: {size}")?;
             }
             if let Some(etag) = output.etag.as_deref() {
-                println!("etag: {etag}");
+                writeln!(writer, "etag: {etag}")?;
             }
         }
         BlobContentKindOutput::External => {
-            println!("kind: external");
+            writeln!(writer, "kind: external")?;
             if let Some(uri) = output.uri.as_deref() {
-                println!("uri: {uri}");
+                writeln!(writer, "uri: {uri}")?;
             }
         }
     }
     if let Some(branch) = output.target.branch.as_deref() {
-        println!("branch: {branch}");
+        writeln!(writer, "branch: {branch}")?;
     }
     if let Some(snapshot) = output.target.snapshot.as_deref() {
-        println!("snapshot: {snapshot}");
+        writeln!(writer, "snapshot: {snapshot}")?;
     }
-    println!("resolved_snapshot: {}", output.target.resolved_snapshot);
-}
-
-pub(crate) fn print_read_output(output: &ReadOutput, format: ReadOutputFormat) -> Result<()> {
-    println!(
-        "{}",
-        render_read(output, format, &resolve_table_render_options())?
-    );
+    writeln!(
+        writer,
+        "resolved_snapshot: {}",
+        output.target.resolved_snapshot
+    )?;
     Ok(())
 }
 
 /// A branch statement's `ChangeOutput` prints the line its `branch` verb
 /// prints; a mutation's prints the affected counts.
-pub(crate) fn print_change_human(output: &ChangeOutput) {
+pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) -> Result<()> {
     match &output.outcome {
         Some(BranchOutcomeOutput::Created { from, name }) => {
-            println!("created branch {name} from {from}");
+            writeln!(writer, "created branch {name} from {from}")?;
         }
-        Some(BranchOutcomeOutput::Deleted { name }) => println!("deleted branch {name}"),
+        Some(BranchOutcomeOutput::Deleted { name }) => writeln!(writer, "deleted branch {name}")?,
         Some(BranchOutcomeOutput::Merged {
             source,
             target,
             merge,
-        }) => println!("merged {source} into {target}: {}", merge.as_str()),
-        Some(BranchOutcomeOutput::Published) => println!(
+        }) => writeln!(writer, "merged {source} into {target}: {}", merge.as_str())?,
+        Some(BranchOutcomeOutput::Published) => writeln!(
+            writer,
             "published commit {} on {}",
             output
                 .commit
                 .as_ref()
                 .map_or("?", |commit| commit.graph_commit_id.as_str()),
             output.branch
-        ),
-        Some(BranchOutcomeOutput::Dropped { graph_commit_id }) => {
-            println!("dropped commit {graph_commit_id} on {}", output.branch)
-        }
-        None => println!(
+        )?,
+        Some(BranchOutcomeOutput::Dropped { graph_commit_id }) => writeln!(
+            writer,
+            "dropped commit {graph_commit_id} on {}",
+            output.branch
+        )?,
+        None => writeln!(
+            writer,
             "changed {} via {}: {} nodes, {} edges",
             output.branch, output.query_name, output.affected_nodes, output.affected_edges
-        ),
+        )?,
     }
     if let Some(actor_id) = &output.actor_id {
-        println!("actor_id: {}", actor_id);
+        writeln!(writer, "actor_id: {}", actor_id)?;
     }
+    Ok(())
 }
 
-pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
+pub(crate) fn write_commit_list_human(
+    commits: &[CommitOutput],
+    writer: &mut dyn Write,
+) -> Result<()> {
     for commit in commits {
         let branch = commit.graph_branch.as_deref().unwrap_or("main");
-        println!(
+        writeln!(
+            writer,
             "{} graph_branch={} graph_manifest_version={}{}{}",
             commit.graph_commit_id,
             branch,
@@ -835,8 +866,9 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
                 .map(|actor| format!(" actor={}", actor))
                 .unwrap_or_default(),
             commit_kind_suffix(commit),
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// ` kind=unattached root=<id>` for an unattached snapshot, empty otherwise:
@@ -851,37 +883,48 @@ fn commit_kind_suffix(commit: &CommitOutput) -> String {
     }
 }
 
-pub(crate) fn print_commit_human(commit: &CommitOutput) {
-    println!("graph_commit_id: {}", commit.graph_commit_id);
-    println!(
+pub(crate) fn write_commit_human(commit: &CommitOutput, writer: &mut dyn Write) -> Result<()> {
+    writeln!(writer, "graph_commit_id: {}", commit.graph_commit_id)?;
+    writeln!(
+        writer,
         "graph_branch: {}",
         commit.graph_branch.as_deref().unwrap_or("main")
-    );
-    println!("graph_manifest_version: {}", commit.graph_manifest_version);
+    )?;
+    writeln!(
+        writer,
+        "graph_manifest_version: {}",
+        commit.graph_manifest_version
+    )?;
     if !commit.published {
-        println!("published: false");
+        writeln!(writer, "published: false")?;
     }
-    println!(
+    writeln!(
+        writer,
         "kind: {}",
         match commit.kind {
             CommitKindOutput::Published => "published",
             CommitKindOutput::Unpublished => "unpublished",
             CommitKindOutput::Unattached => "unattached",
         }
-    );
+    )?;
     if let Some(root_commit_id) = &commit.root_commit_id {
-        println!("root_commit_id: {}", root_commit_id);
+        writeln!(writer, "root_commit_id: {}", root_commit_id)?;
     }
     if let Some(parent_commit_id) = &commit.parent_commit_id {
-        println!("parent_commit_id: {}", parent_commit_id);
+        writeln!(writer, "parent_commit_id: {}", parent_commit_id)?;
     }
     if let Some(merged_parent_commit_id) = &commit.merged_parent_commit_id {
-        println!("merged_parent_commit_id: {}", merged_parent_commit_id);
+        writeln!(
+            writer,
+            "merged_parent_commit_id: {}",
+            merged_parent_commit_id
+        )?;
     }
     if let Some(actor_id) = &commit.actor_id {
-        println!("actor_id: {}", actor_id);
+        writeln!(writer, "actor_id: {}", actor_id)?;
     }
-    println!("created_at: {}", commit.created_at);
+    writeln!(writer, "created_at: {}", commit.created_at)?;
+    Ok(())
 }
 
 pub(crate) fn print_policy_explain(
@@ -1144,38 +1187,37 @@ pub(crate) fn print_version(output: &VersionOutput, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Table prefs cascade (RFC-011): operator defaults.table_* > built-in.
-pub(crate) fn resolve_table_render_options() -> ReadRenderOptions {
-    let operator = crate::operator::load_operator_config().unwrap_or_default();
-    ReadRenderOptions {
-        max_column_width: operator.defaults.table_max_column_width.unwrap_or(80),
-        cell_layout: operator.defaults.table_cell_layout.unwrap_or_default(),
-    }
-}
-
-pub(crate) fn print_change_cause_human(cause: &omnigraph_api_types::ChangeCauseOutput) {
-    println!("commit: {}", cause.graph_commit_id);
-    println!("branch: {}", cause.authored_branch);
+pub(crate) fn write_change_cause_human(
+    cause: &omnigraph_api_types::ChangeCauseOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "commit: {}", cause.graph_commit_id)?;
+    writeln!(writer, "branch: {}", cause.authored_branch)?;
     if let Some(parent_commit_id) = &cause.parent_commit_id {
-        println!("parent: {}", parent_commit_id);
+        writeln!(writer, "parent: {}", parent_commit_id)?;
     }
     if let Some(merged_parent_commit_id) = &cause.merged_parent_commit_id {
-        println!("merged_parent: {}", merged_parent_commit_id);
+        writeln!(writer, "merged_parent: {}", merged_parent_commit_id)?;
     }
     if let Some(actor_id) = &cause.actor_id {
-        println!("actor: {}", actor_id);
+        writeln!(writer, "actor: {}", actor_id)?;
     }
-    println!("authored_at: {}", cause.authored_at);
+    writeln!(writer, "authored_at: {}", cause.authored_at)?;
+    Ok(())
 }
 
-fn print_entity_change_row(change: &omnigraph_api_types::EntityChangeOutput) {
-    println!(
+fn write_entity_change_row(
+    change: &omnigraph_api_types::EntityChangeOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(
+        writer,
         "{} {} {} {}",
         change.op.as_str(),
         change.kind.as_str(),
         change.r#type.name,
         change.id
-    );
+    )?;
     // Edge endpoints (present on edge images only). An endpoint-moving update
     // must show BOTH pairs; `after.or(before)` alone silently hid the old
     // endpoints of a move.
@@ -1188,17 +1230,18 @@ fn print_entity_change_row(change: &omnigraph_api_types::EntityChangeOutput) {
         .as_ref()
         .and_then(|image| image.endpoints.as_ref());
     if let Some(rendered) = format_endpoint_change(before_endpoints, after_endpoints) {
-        println!("  {rendered}");
+        writeln!(writer, "  {rendered}")?;
     }
     // The before/after property values are the point of a change feed; the
     // previous output dropped them. Show inserted/deleted values, or the
     // changed keys of an update as `before -> after`.
     match (&change.before, &change.after) {
-        (None, Some(after)) => print_change_properties("  +", &after.properties),
-        (Some(before), None) => print_change_properties("  -", &before.properties),
-        (Some(before), Some(after)) => print_change_property_diff(before, after),
+        (None, Some(after)) => write_change_properties("  +", &after.properties, writer)?,
+        (Some(before), None) => write_change_properties("  -", &before.properties, writer)?,
+        (Some(before), Some(after)) => write_change_property_diff(before, after, writer)?,
         (None, None) => {}
     }
+    Ok(())
 }
 
 /// Render an edge change's endpoints for human output. An endpoint-moving
@@ -1239,22 +1282,28 @@ fn render_change_value(value: &serde_json::Value) -> String {
 /// null or empty.
 const ABSENT_PROPERTY: &str = "<absent>";
 
-fn print_change_properties(marker: &str, properties: &serde_json::Value) {
+fn write_change_properties(
+    marker: &str,
+    properties: &serde_json::Value,
+    writer: &mut dyn Write,
+) -> Result<()> {
     if let Some(map) = properties.as_object() {
         for (key, value) in map {
-            println!("{marker} {key}: {}", render_change_value(value));
+            writeln!(writer, "{marker} {key}: {}", render_change_value(value))?;
         }
     }
+    Ok(())
 }
 
-fn print_change_property_diff(
+fn write_change_property_diff(
     before: &omnigraph_api_types::ChangeImageOutput,
     after: &omnigraph_api_types::ChangeImageOutput,
-) {
+    writer: &mut dyn Write,
+) -> Result<()> {
     let (Some(before_map), Some(after_map)) =
         (before.properties.as_object(), after.properties.as_object())
     else {
-        return;
+        return Ok(());
     };
     let mut keys: Vec<&String> = before_map.keys().chain(after_map.keys()).collect();
     keys.sort();
@@ -1269,19 +1318,24 @@ fn print_change_property_diff(
             let after_str = after_value
                 .map(render_change_value)
                 .unwrap_or_else(|| ABSENT_PROPERTY.to_string());
-            println!("  {key}: {before_str} -> {after_str}");
+            writeln!(writer, "  {key}: {before_str} -> {after_str}")?;
         }
     }
+    Ok(())
 }
 
-pub(crate) fn print_commit_changes_human(page: &omnigraph_api_types::CommitChangesOutput) {
-    print_change_cause_human(&page.cause);
+pub(crate) fn write_commit_changes_human(
+    page: &omnigraph_api_types::CommitChangesOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    write_change_cause_human(&page.cause, writer)?;
     for change in &page.changes {
-        print_entity_change_row(change);
+        write_entity_change_row(change, writer)?;
     }
     if let Some(next_page_token) = &page.next_page_token {
-        println!("next_page_token: {}", next_page_token);
+        writeln!(writer, "next_page_token: {}", next_page_token)?;
     }
+    Ok(())
 }
 
 /// Incremental JSON rendering for an auto-paginated finite commit diff.
@@ -1401,13 +1455,19 @@ impl<W: Write> CommitChangesJsonStream<W> {
 }
 
 /// Incremental human rendering for an auto-paginated finite commit diff.
-pub(crate) struct CommitChangesHumanStream {
+/// A successful page includes a writer flush; callers stop on failure before
+/// requesting a continuation, just as with the JSON stream.
+pub(crate) struct CommitChangesHumanStream<W: Write> {
+    writer: W,
     cause: Option<omnigraph_api_types::ChangeCauseOutput>,
 }
 
-impl CommitChangesHumanStream {
-    pub(crate) fn new() -> Self {
-        Self { cause: None }
+impl<W: Write> CommitChangesHumanStream<W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
+            writer,
+            cause: None,
+        }
     }
 
     pub(crate) fn write_page(
@@ -1416,16 +1476,16 @@ impl CommitChangesHumanStream {
     ) -> Result<()> {
         match &self.cause {
             None => {
-                print_change_cause_human(&page.cause);
+                write_change_cause_human(&page.cause, &mut self.writer)?;
                 self.cause = Some(page.cause.clone());
             }
             Some(cause) if cause == &page.cause => {}
             Some(_) => bail!("commit changes continuation changed its cause while auto-paginating"),
         }
         for change in &page.changes {
-            print_entity_change_row(change);
+            write_entity_change_row(change, &mut self.writer)?;
         }
-        io::stdout().flush()?;
+        self.writer.flush()?;
         Ok(())
     }
 }
@@ -1450,22 +1510,27 @@ impl DiffEndpointsHeader {
     }
 }
 
-fn print_diff_endpoints_human(header: &DiffEndpointsHeader) {
+fn write_diff_endpoints_human(header: &DiffEndpointsHeader, writer: &mut dyn Write) -> Result<()> {
     if let Some(base_commit_id) = &header.base_commit_id {
-        println!("merge_base: {base_commit_id}");
+        writeln!(writer, "merge_base: {base_commit_id}")?;
     }
-    println!("from: {}", header.from_commit_id);
-    println!("to: {}", header.to_commit_id);
+    writeln!(writer, "from: {}", header.from_commit_id)?;
+    writeln!(writer, "to: {}", header.to_commit_id)?;
+    Ok(())
 }
 
-pub(crate) fn print_diff_human(page: &omnigraph_api_types::DiffOutput) {
-    print_diff_endpoints_human(&DiffEndpointsHeader::of(page));
+pub(crate) fn write_diff_human(
+    page: &omnigraph_api_types::DiffOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    write_diff_endpoints_human(&DiffEndpointsHeader::of(page), writer)?;
     for change in &page.changes {
-        print_entity_change_row(change);
+        write_entity_change_row(change, writer)?;
     }
     if let Some(next_page_token) = &page.next_page_token {
-        println!("next_page_token: {}", next_page_token);
+        writeln!(writer, "next_page_token: {}", next_page_token)?;
     }
+    Ok(())
 }
 
 /// Incremental JSON rendering for an auto-paginated graph diff: the endpoint
@@ -1531,37 +1596,54 @@ impl<W: Write> DiffJsonStream<W> {
 }
 
 /// Incremental human rendering for an auto-paginated graph diff.
-pub(crate) struct DiffHumanStream {
+/// Each page is flushed before the caller requests its continuation.
+pub(crate) struct DiffHumanStream<W: Write> {
+    writer: W,
     header: Option<DiffEndpointsHeader>,
 }
 
-impl DiffHumanStream {
-    pub(crate) fn new() -> Self {
-        Self { header: None }
+impl<W: Write> DiffHumanStream<W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
+            writer,
+            header: None,
+        }
     }
 
     pub(crate) fn write_page(&mut self, page: &omnigraph_api_types::DiffOutput) -> Result<()> {
         let header = DiffEndpointsHeader::of(page);
         match &self.header {
             None => {
-                print_diff_endpoints_human(&header);
+                write_diff_endpoints_human(&header, &mut self.writer)?;
                 self.header = Some(header);
             }
             Some(seen) if seen == &header => {}
             Some(_) => bail!("diff continuation changed its endpoints while auto-paginating"),
         }
         for change in &page.changes {
-            print_entity_change_row(change);
+            write_entity_change_row(change, &mut self.writer)?;
         }
-        io::stdout().flush()?;
+        self.writer.flush()?;
         Ok(())
     }
 }
 
-pub(crate) fn print_merge_base_human(output: &omnigraph_api_types::MergeBaseOutput) {
-    println!("merge_base: {}", output.merge_base.graph_commit_id);
-    println!("source: {} at {}", output.source, output.source_commit_id);
-    println!("target: {} at {}", output.target, output.target_commit_id);
+pub(crate) fn write_merge_base_human(
+    output: &omnigraph_api_types::MergeBaseOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "merge_base: {}", output.merge_base.graph_commit_id)?;
+    writeln!(
+        writer,
+        "source: {} at {}",
+        output.source, output.source_commit_id
+    )?;
+    writeln!(
+        writer,
+        "target: {} at {}",
+        output.target, output.target_commit_id
+    )?;
+    Ok(())
 }
 
 /// Incremental JSON rendering for one auto-paginated feed poll.
@@ -1668,15 +1750,17 @@ impl<W: Write> ChangeFeedJsonStream<W> {
 
 /// Incremental human rendering for one auto-paginated feed poll. A repeated
 /// cause at the start of a continuation page is suppressed so a split commit
-/// still reads as one block.
-pub(crate) struct ChangeFeedHumanStream {
+/// still reads as one block. Each page is flushed before the next fetch.
+pub(crate) struct ChangeFeedHumanStream<W: Write> {
+    writer: W,
     current_cause: Option<omnigraph_api_types::ChangeCauseOutput>,
     wrote_block: bool,
 }
 
-impl ChangeFeedHumanStream {
-    pub(crate) fn new() -> Self {
+impl<W: Write> ChangeFeedHumanStream<W> {
+    pub(crate) fn new(writer: W) -> Self {
         Self {
+            writer,
             current_cause: None,
             wrote_block: false,
         }
@@ -1696,41 +1780,49 @@ impl ChangeFeedHumanStream {
             };
             if !same_block {
                 if self.wrote_block {
-                    println!();
+                    writeln!(self.writer)?;
                 }
-                print_change_cause_human(&block.cause);
+                write_change_cause_human(&block.cause, &mut self.writer)?;
                 self.current_cause = Some(block.cause.clone());
                 self.wrote_block = true;
             }
             for change in &block.changes {
-                print_entity_change_row(change);
+                write_entity_change_row(change, &mut self.writer)?;
             }
         }
-        io::stdout().flush()?;
+        self.writer.flush()?;
         Ok(())
     }
 
-    pub(crate) fn finish(self, cursor: Option<&str>, caught_up: Option<bool>) {
+    pub(crate) fn finish(mut self, cursor: Option<&str>, caught_up: Option<bool>) -> Result<W> {
         if !self.wrote_block {
-            println!("(no new commits)");
+            writeln!(self.writer, "(no new commits)")?;
         }
         if let Some(cursor) = cursor {
-            println!();
-            println!("cursor: {cursor}");
+            writeln!(self.writer)?;
+            writeln!(self.writer, "cursor: {cursor}")?;
             if let Some(caught_up) = caught_up {
-                println!("caught_up: {caught_up}");
+                writeln!(self.writer, "caught_up: {caught_up}")?;
             }
         }
+        self.writer.flush()?;
+        Ok(self.writer)
     }
 }
 
-pub(crate) fn print_change_baseline_human(
+pub(crate) fn write_change_baseline_human(
     baseline: &omnigraph_api_types::ChangeBaselineOutput,
     out_path: &std::path::Path,
-) {
-    println!("snapshot: {}", out_path.display());
-    println!("snapshot_commit_id: {}", baseline.snapshot_commit_id);
-    println!("resume_cursor: {}", baseline.resume_cursor);
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "snapshot: {}", out_path.display())?;
+    writeln!(
+        writer,
+        "snapshot_commit_id: {}",
+        baseline.snapshot_commit_id
+    )?;
+    writeln!(writer, "resume_cursor: {}", baseline.resume_cursor)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1738,9 +1830,12 @@ mod tests {
     use omnigraph_compiler::schema::ast::Annotation;
     use omnigraph_compiler::schema::parser::parse_schema;
     use std::collections::BTreeMap;
+    use std::io::{self, Write};
 
     use super::{
-        ChangeFeedJsonStream, CommitChangesJsonStream, graph_type_subject, render_annotations,
+        ChangeFeedHumanStream, ChangeFeedJsonStream, CommitChangesHumanStream,
+        CommitChangesJsonStream, DiffHumanStream, DiffJsonStream, graph_type_subject,
+        render_annotations,
     };
 
     #[test]
@@ -1871,6 +1966,123 @@ mod tests {
         );
     }
 
+    fn assert_transfer_format(
+        expected: &str,
+        write: impl Fn(&mut dyn Write) -> color_eyre::Result<()>,
+    ) {
+        let mut bytes = Vec::new();
+        write(&mut bytes).unwrap();
+        assert_eq!(bytes, expected.as_bytes());
+        assert_writer_failure("transfer formatter", WriterFault::AfterPrefix, write);
+    }
+
+    #[test]
+    fn load_human_preserves_branch_and_embedding_diagnostics() {
+        let mut output = super::LoadOutput {
+            uri: "graph".to_string(),
+            branch: "work".to_string(),
+            mode: "append",
+            base_branch: Some("main".to_string()),
+            branch_created: true,
+            nodes: vec![omnigraph_api_types::GraphBatchDeclarationOutput {
+                name: "Doc".to_string(),
+                entities_loaded: 2,
+            }],
+            edges: Vec::new(),
+            total_entities: 2,
+            embedding_generation: Some(omnigraph_api_types::LoadEmbeddingGeneration::Unsupported),
+            commit: None,
+        };
+        assert_transfer_format(
+            "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n\
+             branch work created from main\n\
+             Loads do not generate embeddings. Supplied vectors are preserved; omitted vectors follow schema nullability. Supply vectors in the input or prepare them with omnigraph embed.\n",
+            |writer| super::write_load_human(&output, writer),
+        );
+        output.branch_created = false;
+        output.embedding_generation = None;
+        assert_transfer_format(
+            "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n",
+            |writer| super::write_load_human(&output, writer),
+        );
+    }
+
+    #[test]
+    fn blob_stat_human_preserves_managed_external_and_read_target_fields() {
+        let mut query = omnigraph_api_types::BlobReadQuery {
+            entity: omnigraph_api_types::BlobEntityKind::Node,
+            r#type: "Doc".to_string(),
+            id: "one".to_string(),
+            property: "body".to_string(),
+            branch: Some("work".to_string()),
+            snapshot: None,
+        };
+        let output =
+            omnigraph_api_types::BlobStatOutput::managed(&query, "resolved", 0, "\"etag\"");
+        assert_transfer_format(
+            "entity: node\ntype: Doc\nid: one\nproperty: body\nkind: managed\n\
+             size: 0\netag: \"etag\"\nbranch: work\nresolved_snapshot: resolved\n",
+            |writer| super::write_blob_stat_human(&output, writer),
+        );
+
+        query.entity = omnigraph_api_types::BlobEntityKind::Edge;
+        query.branch = None;
+        query.snapshot = Some("requested".to_string());
+        let output =
+            omnigraph_api_types::BlobStatOutput::external(&query, "resolved", "s3://bucket/body");
+        assert_transfer_format(
+            "entity: edge\ntype: Doc\nid: one\nproperty: body\nkind: external\n\
+             uri: s3://bucket/body\nsnapshot: requested\nresolved_snapshot: resolved\n",
+            |writer| super::write_blob_stat_human(&output, writer),
+        );
+    }
+
+    #[test]
+    fn blob_write_human_preserves_receipt_and_already_null_text() {
+        let mut output = omnigraph_api_types::BlobWriteOutput {
+            selector: omnigraph_api_types::BlobSelectorOutput {
+                entity: omnigraph_api_types::BlobEntityKind::Node,
+                r#type: "Doc".to_string(),
+                id: "one".to_string(),
+                property: "body".to_string(),
+            },
+            branch: "work".to_string(),
+            kind: omnigraph_api_types::BlobWriteStateOutput::Managed,
+            size: Some(0),
+            etag: Some("\"etag\"".to_string()),
+            actor_id: Some("actor".to_string()),
+            commit: Some(omnigraph_api_types::CommitOutput {
+                graph_commit_id: "published".to_string(),
+                graph_branch: Some("work".to_string()),
+                graph_manifest_version: 2,
+                parent_commit_id: None,
+                merged_parent_commit_id: None,
+                actor_id: Some("actor".to_string()),
+                created_at: 42,
+                published: true,
+                kind: omnigraph_api_types::CommitKindOutput::Published,
+                root_commit_id: None,
+            }),
+        };
+        assert_transfer_format(
+            "entity: node\ntype: Doc\nid: one\nproperty: body\nbranch: work\n\
+             kind: managed\nsize: 0\netag: \"etag\"\nactor: actor\ncommit: published\n",
+            |writer| super::write_blob_write_human(&output, writer),
+        );
+
+        output.selector.entity = omnigraph_api_types::BlobEntityKind::Edge;
+        output.kind = omnigraph_api_types::BlobWriteStateOutput::Null;
+        output.size = None;
+        output.etag = None;
+        output.actor_id = None;
+        output.commit = None;
+        assert_transfer_format(
+            "entity: edge\ntype: Doc\nid: one\nproperty: body\nbranch: work\n\
+             kind: null\ncommit: none (the cell was already null)\n",
+            |writer| super::write_blob_write_human(&output, writer),
+        );
+    }
+
     #[test]
     fn commit_json_stream_preserves_aggregate_shape_without_page_aggregation() {
         let cause = cause("commit-1");
@@ -1910,6 +2122,23 @@ mod tests {
             ["a", "b"]
         );
         assert!(rendered.next_page_token.is_none());
+
+        let mut human = Vec::new();
+        let mut stream = CommitChangesHumanStream::new(&mut human);
+        stream.write_page(&first).unwrap();
+        stream.write_page(&second).unwrap();
+        assert_eq!(
+            String::from_utf8(human).unwrap(),
+            "commit: commit-1\nbranch: main\nparent: parent\nactor: act-test\nauthored_at: 42\n\
+             insert node Person a\n  + name: a\ninsert node Person b\n  + name: b\n"
+        );
+        let mut single_page = Vec::new();
+        super::write_commit_changes_human(&first, &mut single_page).unwrap();
+        assert_eq!(
+            String::from_utf8(single_page).unwrap(),
+            "commit: commit-1\nbranch: main\nparent: parent\nactor: act-test\nauthored_at: 42\n\
+             insert node Person a\n  + name: a\nnext_page_token: continue\n"
+        );
     }
 
     #[test]
@@ -1979,5 +2208,194 @@ mod tests {
         assert_eq!(rendered.blocks[1].changes[0].id, "c");
         assert_eq!(rendered.cursor.as_deref(), Some("durable"));
         assert_eq!(rendered.caught_up, Some(true));
+
+        let mut human = ChangeFeedHumanStream::new(Vec::new());
+        human.write_page(&first).unwrap();
+        human.write_page(&second).unwrap();
+        let bytes = human
+            .finish(second.cursor.as_deref(), second.caught_up)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "commit: commit-1\nbranch: main\nparent: parent\nactor: act-test\nauthored_at: 42\n\
+             insert node Person a\n  + name: a\ninsert node Person b\n  + name: b\n\n\
+             commit: commit-2\nbranch: main\nparent: parent\nactor: act-test\nauthored_at: 42\n\
+             insert node Person c\n  + name: c\n\ncursor: durable\ncaught_up: true\n"
+        );
+        let empty = ChangeFeedHumanStream::new(Vec::new())
+            .finish(Some("durable"), Some(true))
+            .unwrap();
+        assert_eq!(
+            empty,
+            b"(no new commits)\n\ncursor: durable\ncaught_up: true\n"
+        );
+    }
+
+    #[test]
+    fn diff_streams_keep_one_header_and_single_pages_keep_the_continuation() {
+        let first = omnigraph_api_types::DiffOutput {
+            from_commit_id: "from".to_string(),
+            to_commit_id: "to".to_string(),
+            base_commit_id: Some("base".to_string()),
+            changes: vec![change("a")],
+            next_page_token: Some("continue".to_string()),
+        };
+        let second = omnigraph_api_types::DiffOutput {
+            changes: vec![change("b")],
+            next_page_token: None,
+            ..first.clone()
+        };
+        let mut json = DiffJsonStream::new(Vec::new());
+        json.write_page(&first).unwrap();
+        json.write_page(&second).unwrap();
+        let aggregate = omnigraph_api_types::DiffOutput {
+            changes: vec![change("a"), change("b")],
+            next_page_token: None,
+            ..first.clone()
+        };
+        assert_eq!(
+            json.finish().unwrap(),
+            format!("{}\n", serde_json::to_string_pretty(&aggregate).unwrap()).into_bytes()
+        );
+
+        let mut human = Vec::new();
+        let mut stream = DiffHumanStream::new(&mut human);
+        stream.write_page(&first).unwrap();
+        stream.write_page(&second).unwrap();
+        assert_eq!(
+            String::from_utf8(human).unwrap(),
+            "merge_base: base\nfrom: from\nto: to\n\
+             insert node Person a\n  + name: a\ninsert node Person b\n  + name: b\n"
+        );
+        let mut single_page = Vec::new();
+        super::write_diff_human(&first, &mut single_page).unwrap();
+        assert_eq!(
+            String::from_utf8(single_page).unwrap(),
+            "merge_base: base\nfrom: from\nto: to\n\
+             insert node Person a\n  + name: a\nnext_page_token: continue\n"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum WriterFault {
+        AfterPrefix,
+        Flush,
+    }
+
+    struct FailingWriter {
+        fault: WriterFault,
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = match self.fault {
+                WriterFault::AfterPrefix => {
+                    let remaining = 5 - self.bytes.len();
+                    if remaining == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "history output closed",
+                        ));
+                    }
+                    remaining.min(bytes.len())
+                }
+                WriterFault::Flush => bytes.len(),
+            };
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "history output closed",
+            ))
+        }
+    }
+
+    fn assert_writer_failure(
+        label: &str,
+        fault: WriterFault,
+        write: impl FnOnce(&mut dyn Write) -> color_eyre::Result<()>,
+    ) {
+        let mut writer = FailingWriter {
+            fault,
+            bytes: Vec::new(),
+            flushes: 0,
+        };
+        let error = write(&mut writer).unwrap_err();
+        assert!(
+            error.to_string().contains("history output closed"),
+            "{label} {fault:?}: {error}"
+        );
+        match fault {
+            WriterFault::AfterPrefix => {
+                assert_eq!(writer.bytes.len(), 5, "{label}");
+                assert_eq!(
+                    writer.flushes, 0,
+                    "a failed write must stop immediately: {label}"
+                );
+            }
+            WriterFault::Flush => {
+                assert!(!writer.bytes.is_empty(), "{label}");
+                assert_eq!(
+                    writer.flushes, 1,
+                    "the page must flush before returning: {label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn history_stream_pages_propagate_partial_write_and_flush_failures() {
+        let commit = omnigraph_api_types::CommitChangesOutput {
+            cause: cause("commit-1"),
+            changes: vec![change("a")],
+            next_page_token: Some("continue".to_string()),
+        };
+        let diff = omnigraph_api_types::DiffOutput {
+            from_commit_id: "from".to_string(),
+            to_commit_id: "to".to_string(),
+            base_commit_id: None,
+            changes: commit.changes.clone(),
+            next_page_token: commit.next_page_token.clone(),
+        };
+        let feed = omnigraph_api_types::ChangeFeedOutput {
+            blocks: vec![omnigraph_api_types::ChangeBlockOutput {
+                cause: commit.cause.clone(),
+                changes: commit.changes.clone(),
+            }],
+            next_page_token: commit.next_page_token.clone(),
+            cursor: None,
+            caught_up: None,
+        };
+        for fault in [WriterFault::AfterPrefix, WriterFault::Flush] {
+            assert_writer_failure("commit JSON", fault, |writer| {
+                CommitChangesJsonStream::new(writer).write_page(&commit)
+            });
+            assert_writer_failure("commit human", fault, |writer| {
+                CommitChangesHumanStream::new(writer).write_page(&commit)
+            });
+            assert_writer_failure("diff JSON", fault, |writer| {
+                DiffJsonStream::new(writer).write_page(&diff)
+            });
+            assert_writer_failure("diff human", fault, |writer| {
+                DiffHumanStream::new(writer).write_page(&diff)
+            });
+            assert_writer_failure("feed JSON", fault, |writer| {
+                ChangeFeedJsonStream::new(writer).write_page(&feed)
+            });
+            assert_writer_failure("feed human", fault, |writer| {
+                ChangeFeedHumanStream::new(writer).write_page(&feed)
+            });
+            assert_writer_failure("feed human terminal cursor", fault, |writer| {
+                ChangeFeedHumanStream::new(writer)
+                    .finish(Some("durable"), Some(true))
+                    .map(|_| ())
+            });
+        }
     }
 }

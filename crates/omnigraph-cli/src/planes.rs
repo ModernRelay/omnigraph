@@ -201,11 +201,11 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
                 } | Command::Changes { .. }
                     | Command::Commit { .. }
-                    | Command::Diff { .. }
+                    | Command::Diff(_)
                     | Command::Branch {
                         command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
                     }
-                    | Command::Query { .. }
+                    | Command::Query(_)
             ),
             Control => matches!(
                 cmd,
@@ -267,15 +267,15 @@ pub(crate) fn command_capability(cmd: &Command) -> Capability {
 /// `schema show` is data; `queries`/`policy` read cluster applied state).
 pub(crate) fn command_plane(cmd: &Command) -> Plane {
     match cmd {
-        Command::Query { .. }
-        | Command::Mutate { .. }
-        | Command::Load { .. }
+        Command::Query(_)
+        | Command::Mutate(_)
+        | Command::Load(_)
         | Command::Branch { .. }
-        | Command::Snapshot { .. }
-        | Command::Export { .. }
+        | Command::Snapshot(_)
+        | Command::Export(_)
         | Command::Blob { .. }
         | Command::Commit { .. }
-        | Command::Diff { .. }
+        | Command::Diff(_)
         | Command::Changes { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
@@ -300,7 +300,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Cleanup { .. }
         | Command::Lint { .. } => Plane::Storage,
         Command::Cluster { .. } | Command::Organization { .. } => Plane::Control,
-        Command::Alias { .. }
+        Command::Alias(_)
         | Command::Embed(_)
         | Command::Login { .. }
         | Command::Logout { .. }
@@ -326,7 +326,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         },
         Command::Embed(_) => "embed",
         Command::Init { .. } => "init",
-        Command::Load { .. } => "load",
+        Command::Load(_) => "load",
         Command::Branch { .. } => "branch",
         Command::Schema { command } => match command {
             SchemaCommand::Plan { .. } => "schema plan",
@@ -339,8 +339,8 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             QueriesCommand::Validate { .. } => "queries validate",
             QueriesCommand::List { .. } => "queries list",
         },
-        Command::Snapshot { .. } => "snapshot",
-        Command::Export { .. } => "export",
+        Command::Snapshot(_) => "snapshot",
+        Command::Export(_) => "export",
         Command::Blob { command } => match command {
             BlobCommand::Get { .. } => "blob get",
             BlobCommand::Stat { .. } => "blob stat",
@@ -348,14 +348,14 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             BlobCommand::Clear { .. } => "blob clear",
         },
         Command::Commit { .. } => "commit",
-        Command::Diff { .. } => "diff",
+        Command::Diff(_) => "diff",
         Command::Changes { command } => match command {
             ChangesCommand::Poll { .. } => "changes poll",
             ChangesCommand::Baseline { .. } => "changes baseline",
         },
-        Command::Query { .. } => "query",
-        Command::Mutate { .. } => "mutate",
-        Command::Alias { .. } => "alias",
+        Command::Query(_) => "query",
+        Command::Mutate(_) => "mutate",
+        Command::Alias(_) => "alias",
         Command::Policy { .. } => "policy",
         Command::Upgrade { .. } => "upgrade",
         Command::Optimize { .. } => "optimize",
@@ -415,7 +415,7 @@ fn accepts_graph_selector(cmd: &Command) -> bool {
 ///
 /// RFC 0010 Slice 1, generalized for RFC 0011 cluster addressing.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
-    if let Command::Alias { .. } = &cli.command {
+    if let Command::Alias(_) = &cli.command {
         // The binding owns all addressing. The listing keeps its historical
         // flag order (error text is observable contract).
         let flags: Vec<&str> = [
