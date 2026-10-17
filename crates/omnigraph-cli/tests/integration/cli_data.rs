@@ -14,6 +14,7 @@ use crate::support::*;
 fn short_version_flag_prints_current_cli_version() {
     let output = output_success(cli().arg("-v"));
     let stdout = stdout_string(&output);
+    assert!(output.stderr.is_empty(), "{output:?}");
 
     assert_eq!(
         stdout.trim(),
@@ -25,6 +26,7 @@ fn short_version_flag_prints_current_cli_version() {
 fn long_version_flag_prints_current_cli_version() {
     let output = output_success(cli().arg("--version"));
     let stdout = stdout_string(&output);
+    assert!(output.stderr.is_empty(), "{output:?}");
 
     assert_eq!(
         stdout.trim(),

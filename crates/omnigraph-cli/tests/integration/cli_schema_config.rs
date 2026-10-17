@@ -265,6 +265,7 @@ fn help_groups_commands_by_capability() {
     // ordering — to avoid brittle full-text assertions on clap's help body.
     let output = output_success(cli().arg("--help"));
     let stdout = stdout_string(&output);
+    assert!(output.stderr.is_empty(), "{output:?}");
 
     assert!(
         stdout.contains("COMMANDS BY CAPABILITY"),
@@ -297,6 +298,14 @@ fn help_groups_commands_by_capability() {
         pos("optimize") < pos("cluster"),
         "direct commands should be listed before the control command"
     );
+
+    // Help must exit before cross-level validation requires a managed plan.
+    let output = output_success(cli().args(["cluster", "apply", "--managed", "--help"]));
+    assert!(
+        stdout_string(&output).contains("Usage: omnigraph cluster apply"),
+        "{output:?}"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]

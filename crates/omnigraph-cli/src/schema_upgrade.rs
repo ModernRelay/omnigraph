@@ -90,6 +90,7 @@ fn print_human(report: &omnigraph::db::SystemColumnUpgradeReport) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn system_column_upgrade_parses_check_and_json() {

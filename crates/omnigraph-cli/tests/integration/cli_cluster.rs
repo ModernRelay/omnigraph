@@ -2699,7 +2699,35 @@ fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
         arguments.extend(selector);
         rejected_arguments.push(arguments);
     }
-    for arguments in rejected_arguments {
+    // Global flags retain their provenance on either side of the command.
+    let config_conflicts = [
+        vec![
+            "--cluster",
+            "file:///must-not-open",
+            "cluster",
+            "status",
+            "--config",
+            ".",
+        ],
+        vec![
+            "cluster",
+            "status",
+            "--cluster",
+            "file:///must-not-open",
+            "--config",
+            ".",
+        ],
+    ];
+    let rejected_arguments = rejected_arguments
+        .into_iter()
+        .map(|arguments| (arguments, None))
+        .chain(config_conflicts.into_iter().map(|arguments| {
+            (
+                arguments,
+                Some("--cluster and explicit --config cannot be used together"),
+            )
+        }));
+    for (arguments, expected_clap_error) in rejected_arguments {
         let output = cli()
             .current_dir(&rejected_root)
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
@@ -2709,6 +2737,13 @@ fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        if let Some(expected) = expected_clap_error {
+            assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected),
+                "{arguments:?}: {output:?}"
+            );
+        }
         let diagnostics = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
