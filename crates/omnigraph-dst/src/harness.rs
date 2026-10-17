@@ -783,10 +783,8 @@ enum Milestone {
     /// Delete a base-fixture person on the milestone branch — puts a DELETE
     /// in the branch's merge delta (the rewrite-with-deletes merge route).
     DeleteFixtureOnBranch,
-    /// `ensure_indices` on main (the non-fork ensure_indices windows).
+    /// `ensure_indices` on main.
     EnsureIndicesMain,
-    /// `ensure_indices` on the milestone branch after a data op there.
-    EnsureIndicesBranch,
     /// `cleanup` on main (branch-snapshot resolution / fork reconciliation /
     /// table GC run against whatever state earlier milestones built).
     CleanupMain,
@@ -821,12 +819,11 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         }
         // Diverge main after the branch insert so this reaches the general
         // rewrite publisher, whose insert commit precedes the update phase.
-        // The hook also fires when that phase has no update payload.
-        "branch_merge.rewrite_after_insert_pre_update" => {
+        // The hook also fires when that phase has no update payload. A merge
+        // into an unchanged main only switches pins, so the rewrite is also
+        // the route that stages a table effect.
+        "branch_merge.rewrite_after_insert_pre_update" | "branch_merge.post_table_effect" => {
             return vec![EnsureBranch, DataOnBranch, MutateMain, MergeBranch];
-        }
-        "ensure_indices.post_table_effect" => {
-            return vec![EnsureBranch, DataOnBranch, EnsureIndicesBranch];
         }
         // cleanup with state to work on: a live branch fork.
         "cleanup.resolve_branch_snapshot" => {
@@ -1006,15 +1003,6 @@ fn milestone_op(
             branch: "main".to_string(),
             op: Op::EnsureIndices,
         },
-        Milestone::EnsureIndicesBranch => {
-            if !world.branches.contains_key(MILESTONE_BRANCH) {
-                return None; // wait for EnsureBranch
-            }
-            WorldOp::Data {
-                branch: MILESTONE_BRANCH.to_string(),
-                op: Op::EnsureIndices,
-            }
-        }
         Milestone::CleanupMain => WorldOp::Data {
             branch: "main".to_string(),
             op: Op::Cleanup,

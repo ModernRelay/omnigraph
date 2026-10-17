@@ -3414,7 +3414,7 @@ fn dst_predict_born_on_both_person_probe() {
 }
 
 /// MILESTONE REACH PROBE: the "one seeded universe per window,
-/// can we catch all 66?" experiment. For each catalog window, ONE universe
+/// can we catch them all?" experiment. For each catalog window, ONE universe
 /// with the window's milestone plan woven into the seeded stream +
 /// `crash_on_match` probe_only (record-only crossing). Reports per-window
 /// crossed/not and the tally. Success target: every milestone-reachable
@@ -3479,16 +3479,21 @@ fn dst_window_reach_probe() {
         "errored (milestone tripped an oracle — separate finding) ({}): {errored:?}",
         errored.len()
     );
-    // Non-regression floor: the census measured 50/66 on 2026-08-12; the
-    // then-16 non-crossing windows all carried NAMED reasons (schema
-    // quarantine — since requalified by the `schema_ops` face, whose
-    // windows now cross — birth-owned init, #473-blocked adopts, chunk
-    // thresholds, branch-from-branch first-touch shapes, kill-territory
-    // orphan discard). Floor 48 leaves margin for benign seed sensitivity;
-    // a bigger drop = a recipe-mechanism regression.
+    // Non-regression floor: the census measured 42/52 on 2026-10-16; the
+    // ten non-crossing windows all carry NAMED reasons: birth-owned init
+    // (`init.*`, owned by `dst_birth_contract_sweep`); no Blob property in
+    // the workload (`blob_read.post_capture`); no caller-supplied expected
+    // graph head on a no-effect mutation (`mutation.post_no_effect_pre_gate`);
+    // no merge deleting more than one chunk of rows
+    // (`branch_merge.between_delete_chunks`); and shapes only a table fork
+    // from before format v11 has, which no current writer creates
+    // (`classify.fresh_read`, `cleanup.resolve_branch_snapshot`, and the
+    // three `branch_merge.adopt_*` windows, since a merge adopts a delta
+    // only from a forked source table). Floor 40 leaves margin for benign
+    // seed sensitivity; a bigger drop = a recipe-mechanism regression.
     assert!(
-        crossed.len() >= 48,
-        "milestone reach regressed below the measured 50 ({} crossed)",
+        crossed.len() >= 40,
+        "milestone reach regressed below the measured 42 ({} crossed)",
         crossed.len()
     );
 }
