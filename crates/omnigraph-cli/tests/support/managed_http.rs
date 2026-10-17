@@ -99,6 +99,22 @@ impl IntentApiFixture {
         Self::start(replies, None, Duration::ZERO, true)
     }
 
+    /// Change fixture state before the first discovery response without races
+    /// between a test thread and the client receiving that response.
+    pub fn graph_with_discovery_hook(
+        replies: Vec<IntentReply>,
+        before_discovery: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self::start_with_origin(
+            |_| replies,
+            None,
+            Duration::ZERO,
+            true,
+            None,
+            Some(Box::new(before_discovery)),
+        )
+    }
+
     pub fn graph_with_response_delay(replies: Vec<IntentReply>, delay: Duration) -> Self {
         assert!(delay <= Duration::from_secs(32), "fixture delay bound");
         Self::start(replies, None, delay, true)
@@ -113,6 +129,7 @@ impl IntentApiFixture {
             Duration::ZERO,
             true,
             Some(Forwarding::Merge(upstream.to_owned(), fault)),
+            None,
         )
     }
 
@@ -129,6 +146,7 @@ impl IntentApiFixture {
             Duration::ZERO,
             true,
             Some(Forwarding::Deployment(upstream.to_owned(), fault)),
+            None,
         )
     }
 
@@ -138,12 +156,12 @@ impl IntentApiFixture {
         delay: Duration,
         graph: bool,
     ) -> Self {
-        Self::start_with_origin(|_| replies, session, delay, graph, None)
+        Self::start_with_origin(|_| replies, session, delay, graph, None, None)
     }
 
     /// Build replies after binding the exact origin, for origin-bound signed claims.
     pub fn with_origin(replies: impl FnOnce(&str) -> Vec<IntentReply>) -> Self {
-        Self::start_with_origin(replies, None, Duration::ZERO, false, None)
+        Self::start_with_origin(replies, None, Duration::ZERO, false, None, None)
     }
 
     fn start_with_origin(
@@ -152,6 +170,7 @@ impl IntentApiFixture {
         delay: Duration,
         graph: bool,
         forwarding: Option<Forwarding>,
+        mut before_discovery: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
         use std::io::Write;
         use std::sync::atomic::Ordering;
@@ -245,6 +264,9 @@ impl IntentApiFixture {
                 };
                 received.lock().unwrap().push(request.clone());
                 let discovery = graph && request_line[0] == "HEAD" && request_line[1] == "/healthz";
+                if discovery && let Some(before_discovery) = before_discovery.take() {
+                    before_discovery();
+                }
                 if !discovery {
                     sleep(delay);
                 }

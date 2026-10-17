@@ -13,7 +13,7 @@ use omnigraph_compiler::query::ast::{
 use omnigraph_compiler::settings::SettingId;
 
 use super::*;
-use crate::operator;
+use crate::operator::{self, OperatorConfig};
 
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
@@ -273,9 +273,19 @@ pub(crate) fn resolve_actor(cli_as: Option<&str>) -> Result<Option<String>> {
     if let Some(actor) = cli_as {
         return Ok(Some(actor.to_string()));
     }
-    Ok(operator::load_operator_config()?
-        .actor()
-        .map(str::to_string))
+    Ok(resolve_actor_with_config(
+        &operator::load_operator_config()?,
+        cli_as,
+    ))
+}
+
+pub(crate) fn resolve_actor_with_config(
+    operator_config: &OperatorConfig,
+    cli_as: Option<&str>,
+) -> Option<String> {
+    cli_as
+        .or_else(|| operator_config.actor())
+        .map(str::to_string)
 }
 
 pub(crate) fn resolve_cluster_actor(cli_as: Option<&str>) -> Result<Option<String>> {
@@ -291,13 +301,26 @@ pub(crate) fn resolve_cli_actor(cli_as: Option<&str>) -> Result<Option<String>> 
 /// file), then the default `OMNIGRAPH_BEARER_TOKEN` env. No omnigraph.yaml
 /// chain.
 pub(crate) fn resolve_remote_bearer_token(explicit_uri: Option<&str>) -> Result<Option<String>> {
+    if explicit_uri.is_some_and(is_remote_uri) {
+        return resolve_remote_bearer_token_with_config(
+            &operator::load_operator_config()?,
+            explicit_uri,
+        );
+    }
+    Ok(bearer_token_from_env(DEFAULT_BEARER_TOKEN_ENV))
+}
+
+/// Match against the captured server bindings, but read credentials live.
+pub(crate) fn resolve_remote_bearer_token_with_config(
+    operator_config: &OperatorConfig,
+    explicit_uri: Option<&str>,
+) -> Result<Option<String>> {
     // The keyed hop (RFC-007 §D4, gh-host model): when the effective remote
     // URL belongs to an operator-defined server, that server's keyed chain
     // applies first — OMNIGRAPH_TOKEN_<NAME> env, then the 0600 credentials
     // file. The keyed token is structurally scoped to its own server: a URL
     // matching no operator server never sees it.
     if let Some(remote_url) = explicit_uri.filter(|uri| is_remote_uri(uri)) {
-        let operator_config = operator::load_operator_config()?;
         if let Some(server) = operator_config.find_server_for_url(remote_url) {
             if let Some(token) = operator::resolve_keyed_token(server)? {
                 return Ok(Some(token));
@@ -318,6 +341,19 @@ pub(crate) fn resolve_server_flag(
     server: Option<&str>,
     graph: Option<&str>,
 ) -> Result<Option<String>> {
+    let operator_config = if server.is_some_and(|server| !server.contains("://")) {
+        operator::load_operator_config()?
+    } else {
+        OperatorConfig::default()
+    };
+    resolve_server_flag_with_config(&operator_config, server, graph)
+}
+
+pub(crate) fn resolve_server_flag_with_config(
+    operator_config: &OperatorConfig,
+    server: Option<&str>,
+    graph: Option<&str>,
+) -> Result<Option<String>> {
     let Some(server) = server else {
         return Ok(None);
     };
@@ -329,7 +365,6 @@ pub(crate) fn resolve_server_flag(
         crate::graph_http::ServerTransport::parse(server)?;
         server.to_string()
     } else {
-        let operator_config = operator::load_operator_config()?;
         let Some(entry) = operator_config.servers.get(server) else {
             let known = operator_config
                 .servers
@@ -411,6 +446,7 @@ pub(crate) async fn execute_operator_alias(
 /// Apply `--server`/`--graph` to a command's uri/target slots: exclusive
 /// with both (loud error, not silent precedence), no-op when absent.
 pub(crate) fn apply_server_flag(
+    operator_config: &OperatorConfig,
     server: Option<&str>,
     graph: Option<&str>,
     uri: Option<String>,
@@ -423,7 +459,7 @@ pub(crate) fn apply_server_flag(
             "--server is exclusive with a positional URI — pick one way to address the graph"
         );
     }
-    resolve_server_flag(server, graph)
+    resolve_server_flag_with_config(operator_config, server, graph)
 }
 
 pub(crate) fn apply_bearer_token(
@@ -1456,6 +1492,38 @@ mod tests {
         assert_eq!(
             resolve_server_flag(Some("https://graph.example.com/"), Some("knowledge")).unwrap(),
             Some("https://graph.example.com/graphs/knowledge".to_string())
+        );
+
+        let config: OperatorConfig = yaml_serde::from_str(
+            "servers:\n  captured:\n    url: https://captured.example.com/proxy/\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_server_flag_with_config(&config, Some("captured"), Some("knowledge")).unwrap(),
+            Some("https://captured.example.com/proxy/graphs/knowledge".to_string())
+        );
+        assert_eq!(
+            apply_server_flag(&config, Some("captured"), Some("knowledge"), None).unwrap(),
+            Some("https://captured.example.com/proxy/graphs/knowledge".to_string())
+        );
+        let error = resolve_server_flag_with_config(&config, Some("missing"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown server 'missing'"), "{error}");
+        assert!(error.contains("[captured]"), "{error}");
+    }
+
+    #[test]
+    fn actor_resolution_uses_supplied_config_and_explicit_override() {
+        let config: OperatorConfig =
+            yaml_serde::from_str("operator:\n  actor: configured-actor\n").unwrap();
+        assert_eq!(
+            resolve_actor_with_config(&config, None).as_deref(),
+            Some("configured-actor")
+        );
+        assert_eq!(
+            resolve_actor_with_config(&config, Some("explicit-actor")).as_deref(),
+            Some("explicit-actor")
         );
     }
 
