@@ -60,9 +60,10 @@ use crate::helpers::{
     PreconditionFailedCli, apply_bearer_token, apply_server_flag, branch_statement_change_request,
     branch_statement_query_request, is_remote_uri, precondition_failed_cli, query_params_from_json,
     remote_json, remote_json_bounded, remote_no_content, remote_response_json_bounded, remote_url,
-    resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag,
-    select_named_query,
+    resolve_actor_with_config, resolve_cli_graph, resolve_remote_bearer_token_with_config,
+    resolve_server_flag_with_config, select_named_query,
 };
+use crate::operator::{self, OperatorConfig};
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
 const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
@@ -259,11 +260,14 @@ pub(crate) fn is_catalogue_scope(uri: Option<&str>) -> bool {
 /// a policy-gated `/graphs` proceeds — the bare URL
 /// is then correct, or the real request surfaces the failure. Only fires on the
 /// no-graph path. Contract/discovery failures always stop without fallback.
-async fn require_graph_for_multi_graph_server(scope: &crate::scope::ResolvedScope) -> Result<()> {
+async fn require_graph_for_multi_graph_server(
+    operator: &OperatorConfig,
+    scope: &crate::scope::ResolvedScope,
+) -> Result<()> {
     let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
         return Ok(());
     };
-    let probe = GraphClient::registry_client(server)?;
+    let probe = GraphClient::registry_client(operator, server)?;
     let resp = match probe.list_graphs().await {
         Ok(resp) => resp,
         Err(error) if error.downcast_ref::<ApiContractError>().is_some() => return Err(error),
@@ -327,12 +331,13 @@ impl GraphClient {
 
     /// The single owner of registry (`GET /graphs`) addressing: the bare base
     /// URL of `server` (a config name or literal URL) — never `/graphs/<id>`
-    /// — with the keyed bearer-token chain. Synchronous: pure config
-    /// resolution, no I/O. Used by the RFC-011 D7 multi-graph probe and the
-    /// `graphs list` registry factory.
-    fn registry_client(server: &str) -> Result<Self> {
-        let base = resolve_server_flag(Some(server), None)?.expect("server name is present");
-        let token = resolve_remote_bearer_token(Some(&base))?;
+    /// — with the keyed bearer-token chain. Uses the caller's captured config;
+    /// credential lookup remains live. Used by the RFC-011 D7 multi-graph probe
+    /// and the `graphs list` registry factory.
+    fn registry_client(operator: &OperatorConfig, server: &str) -> Result<Self> {
+        let base = resolve_server_flag_with_config(operator, Some(server), None)?
+            .expect("server name is present");
+        let token = resolve_remote_bearer_token_with_config(operator, Some(&base))?;
         Ok(GraphClient::Remote {
             http: GraphHttpClient::new(&base)?,
             base_url: base,
@@ -353,8 +358,9 @@ impl GraphClient {
     /// one, and the registry is server-scoped either way). An explicit
     /// `--graph` never reaches here — the addressing guard rejects it.
     pub(crate) fn resolve_registry(server: Option<&str>, profile: Option<&str>) -> Result<Self> {
-        let scope = crate::scope::resolve_scope(
-            &crate::operator::load_operator_config()?,
+        let operator = operator::load_operator_config()?;
+        let scope = crate::scope::resolve_scope_from_env(
+            &operator,
             crate::planes::Capability::Served,
             crate::scope::ScopeFlags {
                 profile,
@@ -371,8 +377,8 @@ impl GraphClient {
                  --profile <name>, or set `defaults.server` in ~/.omnigraph/config.yaml"
             );
         };
-        // `resolve_server_flag` refuses any scope that is not a server address.
-        Self::registry_client(server)
+        // Server resolution refuses any scope that is not a server address.
+        Self::registry_client(&operator, server)
     }
 
     /// Resolve the addressing (positional URI / `--target` / `--server`)
@@ -389,6 +395,20 @@ impl GraphClient {
         profile: Option<&str>,
         store: Option<&str>,
     ) -> Result<Self> {
+        let operator = operator::load_operator_config()?;
+        Self::resolve_with_config(&operator, capability, server, graph, uri, profile, store).await
+    }
+
+    /// Reuse the caller's validated configuration for routing and presentation.
+    pub(crate) async fn resolve_with_config(
+        operator: &OperatorConfig,
+        capability: crate::planes::Capability,
+        server: Option<&str>,
+        graph: Option<&str>,
+        uri: Option<String>,
+        profile: Option<&str>,
+        store: Option<&str>,
+    ) -> Result<Self> {
         // RFC-011: a scope (profile / --store / operator defaults) may stand in
         // for omitted addressing. The explicit branch passes server/graph/uri
         // straight through, so existing invocations are unchanged. The caller
@@ -396,8 +416,8 @@ impl GraphClient {
         // so scope resolution and the addressing guard share one
         // classification; every current caller is a data-plane (`Any`) verb —
         // registry-scoped `graphs list` uses `resolve_registry` instead.
-        let scope = crate::scope::resolve_scope(
-            &crate::operator::load_operator_config()?,
+        let scope = crate::scope::resolve_scope_from_env(
+            operator,
             capability,
             crate::scope::ScopeFlags {
                 profile,
@@ -408,15 +428,15 @@ impl GraphClient {
                 uri,
             },
         )?;
-        require_graph_for_multi_graph_server(&scope).await?;
+        require_graph_for_multi_graph_server(operator, &scope).await?;
         let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         if server.is_none() && is_catalogue_scope(uri.as_deref()) {
             return Ok(GraphClient::Catalogue);
         }
         let via_server = server.is_some();
-        let server_root = resolve_server_flag(server, None)?;
-        let uri = apply_server_flag(server_root.as_deref(), graph, uri)?;
-        let token = resolve_remote_bearer_token(uri.as_deref())?;
+        let server_root = resolve_server_flag_with_config(operator, server, None)?;
+        let uri = apply_server_flag(operator, server_root.as_deref(), graph, uri)?;
+        let token = resolve_remote_bearer_token_with_config(operator, uri.as_deref())?;
         let uri = crate::helpers::resolve_uri(uri)?;
         reject_positional_remote(via_server, &uri)?;
         if is_remote_uri(&uri) {
@@ -450,8 +470,9 @@ impl GraphClient {
         // RFC-011 scope translation (see `resolve`); explicit addressing passes
         // through unchanged, and the caller threads its verb's declared
         // capability.
-        let scope = crate::scope::resolve_scope(
-            &crate::operator::load_operator_config()?,
+        let operator = operator::load_operator_config()?;
+        let scope = crate::scope::resolve_scope_from_env(
+            &operator,
             capability,
             crate::scope::ScopeFlags {
                 profile,
@@ -462,10 +483,11 @@ impl GraphClient {
                 uri,
             },
         )?;
-        Self::resolve_with_policy_scope(scope, cli_as).await
+        Self::resolve_with_policy_scope(&operator, scope, cli_as).await
     }
 
     async fn resolve_with_policy_scope(
+        operator: &OperatorConfig,
         scope: crate::scope::ResolvedScope,
         cli_as: Option<&str>,
     ) -> Result<Self> {
@@ -474,9 +496,9 @@ impl GraphClient {
             return Err(catalogue_scope_refusal("a write"));
         }
         let via_server = server.is_some();
-        let server_root = resolve_server_flag(server, None)?;
-        let uri = apply_server_flag(server_root.as_deref(), graph, scope.uri.clone())?;
-        let token = resolve_remote_bearer_token(uri.as_deref())?;
+        let server_root = resolve_server_flag_with_config(operator, server, None)?;
+        let uri = apply_server_flag(operator, server_root.as_deref(), graph, scope.uri.clone())?;
+        let token = resolve_remote_bearer_token_with_config(operator, uri.as_deref())?;
         let resolved = resolve_cli_graph(uri)?;
         reject_positional_remote(via_server, &resolved.uri)?;
         if resolved.is_remote {
@@ -490,7 +512,7 @@ impl GraphClient {
                 );
             }
             // Complete local addressing/identity validation before discovery.
-            require_graph_for_multi_graph_server(&scope).await?;
+            require_graph_for_multi_graph_server(operator, &scope).await?;
             Ok(GraphClient::Remote {
                 http: GraphHttpClient::new(server_root.as_deref().expect("remote server scope"))?,
                 base_url: resolved.uri,
@@ -499,7 +521,7 @@ impl GraphClient {
                 catalogue: is_catalogue_scope(graph),
             })
         } else {
-            let actor = resolve_cli_actor(cli_as)?;
+            let actor = resolve_actor_with_config(operator, cli_as);
             Ok(GraphClient::Embedded {
                 uri: resolved.uri,
                 actor,
@@ -2786,7 +2808,7 @@ mod tests {
             server: Some(server.origin.clone()),
             ..Default::default()
         };
-        let error = require_graph_for_multi_graph_server(&scope)
+        let error = require_graph_for_multi_graph_server(&OperatorConfig::default(), &scope)
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<ApiContractError>().is_some());
@@ -2903,9 +2925,13 @@ mod tests {
         let gateway = crate::unix_gateway_fixture::UnixGateway::new(&server.origin);
         let root = gateway.url();
         let http = GraphHttpClient::new(&root).unwrap();
-        let base = resolve_server_flag(Some(&root), Some("knowledge"))
-            .unwrap()
-            .unwrap();
+        let base = resolve_server_flag_with_config(
+            &OperatorConfig::default(),
+            Some(&root),
+            Some("knowledge"),
+        )
+        .unwrap()
+        .unwrap();
         let value: Value = remote_json(
             &http,
             Method::GET,
@@ -2934,9 +2960,10 @@ mod tests {
         assert_eq!(gateway.connections(), 2, "both requests used the socket");
         server.assert_complete();
 
-        let escaped = resolve_server_flag(Some(&root), Some("../.."))
-            .unwrap()
-            .unwrap();
+        let escaped =
+            resolve_server_flag_with_config(&OperatorConfig::default(), Some(&root), Some("../.."))
+                .unwrap()
+                .unwrap();
         for outside in [
             format!("{root}2/graphs"),
             remote_url(&escaped, &["snapshot"], &[]).unwrap(),

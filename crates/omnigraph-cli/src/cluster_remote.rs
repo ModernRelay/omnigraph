@@ -11,10 +11,10 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 
 use crate::cli::{Cli, ClusterCommand, Command};
-use crate::graph_http::{ApiContractError, GraphHttpClient};
+use crate::graph_http::{ApiContractError, GraphHttpClient, ServerTransport};
 use crate::helpers::{
     RemoteErrorCli, apply_bearer_token, remote_response_json_bounded, remote_url,
-    resolve_remote_bearer_token, resolve_server_flag,
+    resolve_remote_bearer_token_with_config, resolve_server_flag_with_config,
 };
 
 const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
@@ -138,8 +138,15 @@ struct RemoteCluster {
 
 impl RemoteCluster {
     fn new(server: &str) -> Result<Self> {
-        let root = resolve_server_flag(Some(server), None)?.expect("explicit server");
-        let token = resolve_remote_bearer_token(Some(&root))?;
+        // Preserve literal address errors before operator-config errors.
+        // Named addresses need configuration first.
+        if server.contains("://") {
+            ServerTransport::parse(server)?;
+        }
+        let operator_config = crate::operator::load_operator_config()?;
+        let root = resolve_server_flag_with_config(&operator_config, Some(server), None)?
+            .expect("explicit server");
+        let token = resolve_remote_bearer_token_with_config(&operator_config, Some(&root))?;
         let client = GraphHttpClient::new(&root)?;
         Ok(Self {
             root,

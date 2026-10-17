@@ -1,7 +1,22 @@
 //! The clap surface: every command, subcommand, and argument struct
 //! (moved verbatim from main.rs in the modularization).
 
-use super::*;
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
+use omnigraph_server::PolicyAction;
+
+pub(crate) use crate::commands::history::{BranchCommand, ChangesCommand, CommitCommand};
+use crate::commands::history::{DiffArgs, SnapshotArgs};
+use crate::commands::maintenance::{
+    CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
+};
+use crate::commands::query::{AliasArgs, MutateArgs, QueryArgs};
+pub(crate) use crate::commands::schema::SchemaCommand;
+use crate::commands::schema::{InitArgs, LintArgs};
+pub(crate) use crate::commands::transfer::{BlobCommand, CliLoadMode};
+use crate::commands::transfer::{ExportArgs, LoadArgs};
+use crate::embed::EmbedArgs;
 
 pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 
@@ -115,83 +130,11 @@ pub(crate) enum Command {
     /// Execute a read query, a branch read (`branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`), or an `explain` statement against a branch or snapshot.
     ///
     /// Run a read query.
-    Query {
-        /// Query name. With no `--query`/`-e`, the stored query to invoke from
-        /// the catalog (served — addressed via --server/--profile). With
-        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
-        name: Option<String>,
-        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one
-        /// branch read statement (`branch list`, `branch diff`,
-        /// `branch merge-base`, `branch merge … dry run`), or one
-        /// `explain query …` statement, which answers the plan the query
-        /// would run under as results.
-        #[arg(long, conflicts_with = "query_string")]
-        query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
-        /// a branch read statement, which takes no name, params, --branch or
-        /// --snapshot, or an `explain query …` statement.
-        #[arg(
-            short = 'e',
-            long = "query-string",
-            value_name = "GQ",
-            conflicts_with = "query"
-        )]
-        query_string: Option<String>,
-        #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long, conflicts_with = "snapshot")]
-        branch: Option<String>,
-        #[arg(long, conflicts_with = "branch")]
-        snapshot: Option<String>,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long, conflicts_with = "json")]
-        format: Option<ReadOutputFormat>,
-        #[arg(long, conflicts_with = "format")]
-        json: bool,
-    },
+    Query(QueryArgs),
     /// Execute a mutation, or one `branch create`/`delete`/`merge` statement.
     ///
     /// Run a mutation.
-    Mutate {
-        /// Query name. With no `--query`/`-e`, the stored mutation to invoke
-        /// from the catalog (served — addressed via --server/--profile). With
-        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
-        name: Option<String>,
-        /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass), or
-        /// one `branch create`/`branch delete`/`branch merge` statement.
-        #[arg(long, conflicts_with = "query_string")]
-        query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
-        /// one `branch create`/`branch delete`/`branch merge` statement, which
-        /// takes no name, params, --branch or --if-commit.
-        #[arg(
-            short = 'e',
-            long = "query-string",
-            value_name = "GQ",
-            conflicts_with = "query"
-        )]
-        query_string: Option<String>,
-        #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long)]
-        branch: Option<String>,
-        /// Compare-and-swap: run only while the branch head still equals this commit id
-        /// (from `omnigraph query --json` or `omnigraph commit list`). A lost race exits
-        /// 4 against a server, 1 embedded; --json prints `precondition_failure`.
-        #[arg(long = "if-commit", value_name = "COMMIT_ID")]
-        if_commit: Option<String>,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Mutate(MutateArgs),
     /// Invoke an operator alias.
     ///
     /// An alias is a personal binding under `aliases:` in
@@ -200,66 +143,18 @@ pub(crate) enum Command {
     /// stored query on its server. Living in its own namespace, an alias can
     /// never shadow or be shadowed by a built-in verb. Replaces the removed
     /// `--alias` flag on `query`/`mutate`.
-    Alias {
-        /// Alias name (a key under `aliases:` in ~/.omnigraph/config.yaml).
-        name: String,
-        /// Positional args bound to the alias's declared `args` params, in order.
-        args: Vec<String>,
-        #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long, conflicts_with = "json")]
-        format: Option<ReadOutputFormat>,
-        #[arg(long, conflicts_with = "format")]
-        json: bool,
-    },
+    Alias(AliasArgs),
     /// Load data into a graph (local, remote, or the selected managed cluster)
-    Load {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        data: PathBuf,
-        /// Target branch (defaults to main). Without --from it must exist.
-        #[arg(long)]
-        branch: Option<String>,
-        /// Base branch to fork --branch from when it doesn't exist yet.
-        /// Without this flag a missing branch is an error, never a fork.
-        #[arg(long)]
-        from: Option<String>,
-        /// How existing entities are handled: overwrite | append | merge.
-        /// Required — overwrite is destructive, so there is no default.
-        #[arg(long)]
-        mode: CliLoadMode,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
-        /// stores only: no served load route carries a `settings` field.
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Load(LoadArgs),
     /// Branch operations
     Branch {
         #[command(subcommand)]
         command: BranchCommand,
     },
     /// Show graph snapshot
-    Snapshot {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Snapshot(SnapshotArgs),
     /// Export a full graph snapshot as JSONL
-    Export {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long = "type")]
-        type_names: Vec<String>,
-    },
+    Export(ExportArgs),
     /// Read, replace or clear one logical node or edge Blob cell.
     Blob {
         #[command(subcommand)]
@@ -269,35 +164,7 @@ pub(crate) enum Command {
     /// or a graph commit id. Auto-paginates; `branch diff` reviews a branch
     /// against its merge base, `commit changes` reports one commit with its
     /// cause.
-    Diff {
-        /// Graph URI
-        uri: Option<String>,
-        /// Read target the diff starts from
-        #[arg(long)]
-        from: String,
-        /// Read target the diff ends at
-        #[arg(long)]
-        to: String,
-        /// Changes per page, at most 8192: 8192 when the CLI follows every
-        /// page, 1000 for one `--page-token` fetch
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Fetch exactly one page starting at this opaque token
-        /// (auto-paginates when omitted)
-        #[arg(long)]
-        page_token: Option<String>,
-        /// Filter by entity kind (repeatable): node | edge
-        #[arg(long = "kind", value_enum)]
-        kinds: Vec<ChangeKindArg>,
-        /// Filter by type name (repeatable)
-        #[arg(long = "type")]
-        types: Vec<String>,
-        /// Filter by operation (repeatable): insert | update | delete
-        #[arg(long = "op", value_enum)]
-        ops: Vec<ChangeOpArg>,
-        #[arg(long)]
-        json: bool,
-    },
+    Diff(DiffArgs),
     /// Commit history operations
     Commit {
         #[command(subcommand)]
@@ -321,89 +188,22 @@ pub(crate) enum Command {
 
     // ── Storage / local graph ops ── direct storage or local files; reject --server.
     /// Initialize a new graph from a schema
-    Init {
-        #[arg(long)]
-        schema: PathBuf,
-        /// Graph URI (local path, s3://, or az://). Azure is a qualification
-        /// preview pending adversarial live qualification; initialization is
-        /// a write and requires the root-scoped external admission wrapper.
-        uri: String,
-        /// Replace orphan schema artifacts only after proving that the URI
-        /// has no `__manifest`. Without this flag, init refuses a URI that
-        /// already holds a graph manifest or any schema artifact. This flag never
-        /// overwrites an initialized graph or purges its Lance datasets.
-        #[arg(long)]
-        force: bool,
-    },
+    Init(InitArgs),
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
     /// the current format this binary serves (v16); other formats are rebuilt by export and load
-    Upgrade {
-        /// Standalone graph storage URI; alternatively use --store
-        uri: Option<String>,
-        /// Report whether the conversion can run; writes nothing
-        #[arg(long)]
-        check: bool,
-        /// Requested storage format (defaults to the format this binary serves)
-        #[arg(long, value_name = "N")]
-        to_format: Option<u32>,
-        #[arg(long)]
-        json: bool,
-    },
+    Upgrade(UpgradeArgs),
     /// Compact small Lance fragments in every backing dataset of the graph
-    Optimize {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Optimize(OptimizeArgs),
     /// Rebuild all full-text indexes from one branch's current rows
     ///
     /// Uses the default English analyzer; replaces any custom tokenizer settings.
-    RebuildFullTextIndexes {
-        /// Graph storage URI; alternatively use --store or --cluster/--graph
-        uri: Option<String>,
-        /// Branch to rebuild; other branches and historical snapshots are unchanged
-        #[arg(long, default_value = "main")]
-        branch: String,
-        #[arg(long)]
-        json: bool,
-    },
+    RebuildFullTextIndexes(RebuildFullTextIndexesArgs),
     /// Diagnose foreign Lance HEAD movement without adopting it.
-    Repair {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Repair(RepairArgs),
     /// Remove old Lance versions from every backing dataset of the graph (destructive)
-    Cleanup {
-        /// Graph URI
-        uri: Option<String>,
-        /// Number of recent graph commits to keep on every live branch. Either
-        /// `--keep` or `--older-than` (or both) must be set.
-        #[arg(long)]
-        keep: Option<u32>,
-        /// Only remove versions older than this duration. Accepts Go-style
-        /// durations: `7d`, `24h`, `90m`. At least one of --keep / --older-than.
-        #[arg(long)]
-        older_than: Option<String>,
-        /// Required to actually run; without it, prints what would be removed
-        #[arg(long)]
-        confirm: bool,
-        #[arg(long)]
-        json: bool,
-    },
+    Cleanup(CleanupArgs),
     /// Validate queries against a schema (offline) or repo (repo-backed).
-    Lint {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        query: PathBuf,
-        #[arg(long)]
-        schema: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
+    Lint(LintArgs),
     /// Operate on the server-side stored-query registry (`queries:`).
     Queries {
         #[command(subcommand)]
@@ -534,134 +334,6 @@ pub(crate) enum ProfileCommand {
     Show {
         /// Profile name (optional).
         name: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum BlobEntityArg {
-    Node,
-    Edge,
-}
-
-impl From<BlobEntityArg> for omnigraph_api_types::BlobEntityKind {
-    fn from(entity: BlobEntityArg) -> Self {
-        match entity {
-            BlobEntityArg::Node => Self::Node,
-            BlobEntityArg::Edge => Self::Edge,
-        }
-    }
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum BlobCommand {
-    /// Stream one managed Blob to stdout or a file.
-    Get {
-        /// Logical entity namespace.
-        #[arg(value_name = "ENTITY")]
-        entity: BlobEntityArg,
-        /// Accepted-schema node or edge type.
-        #[arg(value_name = "TYPE")]
-        type_name: String,
-        /// Logical entity id.
-        #[arg(value_name = "ID")]
-        id: String,
-        /// Blob property name.
-        #[arg(value_name = "PROPERTY")]
-        property: String,
-        /// Read a named branch (defaults to main).
-        #[arg(long, conflicts_with = "snapshot")]
-        branch: Option<String>,
-        /// Read an immutable graph snapshot.
-        #[arg(long, conflicts_with = "branch")]
-        snapshot: Option<String>,
-        /// First byte to return.
-        #[arg(long)]
-        offset: Option<u64>,
-        /// Number of bytes to return; must be greater than zero.
-        #[arg(long)]
-        length: Option<u64>,
-        /// Write bytes to a file instead of stdout.
-        #[arg(long, value_name = "PATH")]
-        out: Option<PathBuf>,
-    },
-    /// Inspect one Blob descriptor without reading payload bytes.
-    Stat {
-        /// Logical entity namespace.
-        #[arg(value_name = "ENTITY")]
-        entity: BlobEntityArg,
-        /// Accepted-schema node or edge type.
-        #[arg(value_name = "TYPE")]
-        type_name: String,
-        /// Logical entity id.
-        #[arg(value_name = "ID")]
-        id: String,
-        /// Blob property name.
-        #[arg(value_name = "PROPERTY")]
-        property: String,
-        /// Read a named branch (defaults to main).
-        #[arg(long, conflicts_with = "snapshot")]
-        branch: Option<String>,
-        /// Read an immutable graph snapshot.
-        #[arg(long, conflicts_with = "branch")]
-        snapshot: Option<String>,
-        /// Emit stable JSON metadata.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Replace one Blob value of an existing node or edge with raw bytes from
-    /// a file or stdin, as one graph commit.
-    Put {
-        /// Logical entity namespace.
-        #[arg(value_name = "ENTITY")]
-        entity: BlobEntityArg,
-        /// Accepted-schema node or edge type.
-        #[arg(value_name = "TYPE")]
-        type_name: String,
-        /// Logical entity id; the entity must exist.
-        #[arg(value_name = "ID")]
-        id: String,
-        /// Blob property name.
-        #[arg(value_name = "PROPERTY")]
-        property: String,
-        /// Write a named branch (defaults to main).
-        #[arg(long)]
-        branch: Option<String>,
-        /// Read the bytes from this file instead of stdin.
-        #[arg(long, value_name = "PATH")]
-        file: Option<PathBuf>,
-        /// Write only while the cell's ETag is one of these entity tags, or,
-        /// as `*`, while the cell holds any value.
-        #[arg(long, value_name = "TAG")]
-        if_match: Option<String>,
-        /// Emit the receipt as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Set one nullable Blob value of an existing node or edge to null, as one
-    /// graph commit; a cell that is already null publishes nothing.
-    Clear {
-        /// Logical entity namespace.
-        #[arg(value_name = "ENTITY")]
-        entity: BlobEntityArg,
-        /// Accepted-schema node or edge type.
-        #[arg(value_name = "TYPE")]
-        type_name: String,
-        /// Logical entity id; the entity must exist.
-        #[arg(value_name = "ID")]
-        id: String,
-        /// Blob property name.
-        #[arg(value_name = "PROPERTY")]
-        property: String,
-        /// Write a named branch (defaults to main).
-        #[arg(long)]
-        branch: Option<String>,
-        /// Write only while the cell's ETag is one of these entity tags, or,
-        /// as `*`, while the cell holds any value.
-        #[arg(long, value_name = "TAG")]
-        if_match: Option<String>,
-        /// Emit the receipt as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -1054,336 +726,6 @@ pub(crate) enum GraphsCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum BranchCommand {
-    /// Create a new branch
-    Create {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        from: Option<String>,
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// List branches
-    List {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Delete a branch
-    Delete {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Merge a source branch into a target branch
-    Merge {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        source: String,
-        #[arg(long)]
-        into: Option<String>,
-        /// Delete the source branch after a successful merge. Runs under its
-        /// own branch_delete policy check; a refusal is reported as a warning
-        /// and never fails the already-landed merge.
-        #[arg(long)]
-        delete_branch: bool,
-        /// Merge into an unpublished commit (`branch merge … as commit`): the
-        /// target head is unchanged until `omnigraph commit publish <id>`.
-        /// Exclusive with --delete-branch, whose source the commit still holds.
-        #[arg(long, conflicts_with = "delete_branch")]
-        as_commit: bool,
-        /// Run the merge through classification and validation and stop:
-        /// report the outcome, or fail with the conflicts, and write nothing.
-        /// A read of both branches.
-        #[arg(long, conflicts_with_all = ["delete_branch", "as_commit"])]
-        dry_run: bool,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// What a branch changed since its merge base with a target branch: the
-    /// net entity changes from the base to the branch head. Auto-paginates.
-    Diff {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        source: String,
-        /// Branch the source is compared against (default main)
-        #[arg(long)]
-        into: Option<String>,
-        /// Changes per page, at most 8192: 8192 when the CLI follows every
-        /// page, 1000 for one `--page-token` fetch
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Fetch exactly one page starting at this opaque token
-        /// (auto-paginates when omitted)
-        #[arg(long)]
-        page_token: Option<String>,
-        /// Filter by entity kind (repeatable): node | edge
-        #[arg(long = "kind", value_enum)]
-        kinds: Vec<ChangeKindArg>,
-        /// Filter by type name (repeatable)
-        #[arg(long = "type")]
-        types: Vec<String>,
-        /// Filter by operation (repeatable): insert | update | delete
-        #[arg(long = "op", value_enum)]
-        ops: Vec<ChangeOpArg>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// The commit a merge of a source branch into a target branch would
-    /// classify against
-    MergeBase {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        source: String,
-        /// Branch the source would merge into (default main)
-        #[arg(long)]
-        into: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum SchemaCommand {
-    /// Plan a schema migration against the accepted persisted schema
-    Plan {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        schema: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Apply a supported schema migration to a standalone graph.
-    /// Deploy served schemas with `cluster apply --server URL --config DIR`.
-    ///
-    /// A drop removes the property or type from the current graph-manifest
-    /// version and reclaims nothing at apply: older commits still read the
-    /// dropped data until `omnigraph cleanup` stops retaining them, after
-    /// which it cannot be recovered.
-    Apply {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        schema: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show the current accepted schema source
-    #[command(alias = "get")]
-    Show {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
-    /// `__id`/`__src`/`__dst`); the storage layout is unchanged (RFC 0040)
-    #[command(name = "upgrade-system-columns")]
-    UpgradeSystemColumns {
-        /// Standalone graph storage URI; alternatively use --store
-        uri: Option<String>,
-        /// Run the preflight only; write nothing
-        #[arg(long)]
-        check: bool,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-
-pub(crate) enum CommitCommand {
-    /// List graph commits
-    List {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        /// List the unpublished commits whose recorded target is the branch
-        /// (`as commit` writes awaiting `commit publish`) instead of its history
-        #[arg(long)]
-        unpublished: bool,
-        /// List the live unattached snapshots whose recorded target is the
-        /// branch (`as unattached branch` writes) instead of its history
-        #[arg(long, conflicts_with = "unpublished")]
-        unattached: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Publish an unpublished commit onto its recorded target branch
-    Publish {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        commit_id: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Drop an unpublished commit or an unattached snapshot: the id and every
-    /// unattached descendant stop resolving and held merge inputs are released
-    Drop {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        commit_id: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show a graph commit
-    Show {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        commit_id: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the entity changes one commit made relative to its first parent
-    Changes {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        commit_id: String,
-        /// Changes per page, at most 8192: 8192 when the CLI follows every
-        /// page, 1000 for one `--page-token` fetch
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Fetch exactly one page starting at this opaque token
-        /// (auto-paginates when omitted)
-        #[arg(long)]
-        page_token: Option<String>,
-        /// Filter by entity kind (repeatable): node | edge
-        #[arg(long = "kind", value_enum)]
-        kinds: Vec<ChangeKindArg>,
-        /// Filter by type name (repeatable)
-        #[arg(long = "type")]
-        types: Vec<String>,
-        /// Filter by operation (repeatable): insert | update | delete
-        #[arg(long = "op", value_enum)]
-        ops: Vec<ChangeOpArg>,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum ChangeKindArg {
-    Node,
-    Edge,
-}
-
-impl From<ChangeKindArg> for omnigraph_api_types::EntityKindOutput {
-    fn from(kind: ChangeKindArg) -> Self {
-        match kind {
-            ChangeKindArg::Node => Self::Node,
-            ChangeKindArg::Edge => Self::Edge,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum ChangeOpArg {
-    Insert,
-    Update,
-    Delete,
-}
-
-impl From<ChangeOpArg> for omnigraph_api_types::ChangeOpOutput {
-    fn from(op: ChangeOpArg) -> Self {
-        match op {
-            ChangeOpArg::Insert => Self::Insert,
-            ChangeOpArg::Update => Self::Update,
-            ChangeOpArg::Delete => Self::Delete,
-        }
-    }
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ChangesCommand {
-    /// Poll the change feed of a branch. Auto-consumes page tokens and prints
-    /// the durable cursor from the terminal page.
-    Poll {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        /// Durable cursor from a previous poll or baseline
-        #[arg(long, conflicts_with = "start")]
-        cursor: Option<String>,
-        /// Start mode: now | beginning | after:<commit_id> (default now)
-        #[arg(long, conflicts_with = "cursor")]
-        start: Option<String>,
-        /// Changes per page, at most 8192 (default 8192; the CLI follows
-        /// every page)
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Filter by entity kind (repeatable): node | edge
-        #[arg(long = "kind", value_enum)]
-        kinds: Vec<ChangeKindArg>,
-        /// Filter by type name (repeatable)
-        #[arg(long = "type")]
-        types: Vec<String>,
-        /// Filter by operation (repeatable): insert | update | delete
-        #[arg(long = "op", value_enum)]
-        ops: Vec<ChangeOpArg>,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Capture an exact entity snapshot plus its resume cursor (POSIX only).
-    /// Non-POSIX platforms fail before capture until a durable write-through
-    /// namespace replacement is available.
-    Baseline {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        /// Snapshot scope by entity kind (repeatable): node | edge
-        #[arg(long = "kind", value_enum)]
-        kinds: Vec<ChangeKindArg>,
-        /// Snapshot scope by type name (repeatable)
-        #[arg(long = "type")]
-        types: Vec<String>,
-        /// Feed scope by operation (repeatable); binds the resume cursor only
-        #[arg(long = "op", value_enum)]
-        ops: Vec<ChangeOpArg>,
-        /// Write the NDJSON snapshot here; the handshake prints to stdout
-        #[arg(long, value_name = "PATH")]
-        out: std::path::PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 pub(crate) enum PolicyCommand {
     /// Compile and validate the Cedar policy bundle(s) applied in a cluster.
     ///
@@ -1432,39 +774,4 @@ pub(crate) enum QueriesCommand {
         #[arg(long)]
         json: bool,
     },
-}
-
-#[derive(Debug, Args, Clone)]
-pub(crate) struct ParamsArgs {
-    #[arg(long, conflicts_with = "params_file")]
-    pub(crate) params: Option<String>,
-    #[arg(long, conflicts_with = "params")]
-    pub(crate) params_file: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CliLoadMode {
-    Overwrite,
-    Append,
-    Merge,
-}
-
-impl From<CliLoadMode> for LoadMode {
-    fn from(value: CliLoadMode) -> Self {
-        match value {
-            CliLoadMode::Overwrite => LoadMode::Overwrite,
-            CliLoadMode::Append => LoadMode::Append,
-            CliLoadMode::Merge => LoadMode::Merge,
-        }
-    }
-}
-impl CliLoadMode {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            CliLoadMode::Overwrite => "overwrite",
-            CliLoadMode::Append => "append",
-            CliLoadMode::Merge => "merge",
-        }
-    }
 }

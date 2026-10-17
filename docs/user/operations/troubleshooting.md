@@ -72,6 +72,14 @@ CLI data-write failures preserve structured details and add `command_outcome`:
 fields to stdout; human mode prints the action on stderr. HTTP failures also
 retain `http_status` and, when present, the original `retry_after` string.
 
+This includes `commit publish` and `commit drop`, as well as their `mutate`
+statement forms. If a response or result output is lost, inspect the commit's
+current state before another attempt; an output failure does not undo the write.
+The same applies to `load`, `blob put`, `blob clear` and `schema apply`: a closed
+output pipe or failed result flush can follow a successful write. The CLI exits with a failure
+and does not repeat the operation. If stdout cannot carry a JSON failure, stderr
+reports the undelivered diagnostic and its outcome.
+
 | CLI exit | What to do |
 |---:|---|
 | 0 | The operation succeeded or was a no-op. A merge can separately report a source-deletion failure without losing its successful result. |
@@ -166,6 +174,12 @@ between graph roots.
 See [Operating a cluster](../clusters/index.md).
 
 ## Maintenance failures
+
+If `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes` or `upgrade` cannot
+write or flush its output, the CLI returns a failure without repeating the
+operation. An output failure does not undo completed work. Inspect the graph's
+state before another attempt; for an interrupted upgrade, follow the
+[upgrade recovery procedure](upgrade.md).
 
 - Recovery required: reopen the graph read-write or restart its server. A
   graph carrying a sidecar from a release before 0.12 must first be opened
