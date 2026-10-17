@@ -90,6 +90,68 @@ impl ServerTransport {
     }
 }
 
+/// Where a request composed under a server root goes, as the transport
+/// derives it: the endpoint it connects to and the HTTP path it sends, with
+/// `.` and `..` segments already resolved. A credential is matched against
+/// this, never against the address as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestTarget {
+    endpoint: Endpoint,
+    /// The sent path's segments, without the empty one a trailing slash
+    /// leaves.
+    segments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Endpoint {
+    /// Scheme, host and port, the scheme's default port filled in.
+    Tcp {
+        scheme: String,
+        host: String,
+        port: Option<u16>,
+    },
+    /// The socket path the transport connects to.
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
+}
+
+impl RequestTarget {
+    /// The target of `url`, a URL composed under `server_root`.
+    pub(crate) fn of(server_root: &str, url: &str) -> Result<Self> {
+        let transport = ServerTransport::parse(server_root)?;
+        let sent = transport.http_url(url)?;
+        let endpoint = match transport {
+            ServerTransport::Tcp => Endpoint::Tcp {
+                scheme: sent.scheme().to_owned(),
+                host: sent.host_str().unwrap_or_default().to_owned(),
+                port: sent.port_or_known_default(),
+            },
+            #[cfg(unix)]
+            ServerTransport::Unix { socket, .. } => Endpoint::Unix(socket),
+        };
+        let mut segments: Vec<String> = sent
+            .path_segments()
+            .map(|segments| segments.map(str::to_owned).collect())
+            .unwrap_or_default();
+        if segments.last().is_some_and(String::is_empty) {
+            segments.pop();
+        }
+        Ok(Self { endpoint, segments })
+    }
+
+    /// Whether this target is `base` or lies under it: the same endpoint, and
+    /// a path whose leading segments are all of `base`'s.
+    pub(crate) fn is_under(&self, base: &Self) -> bool {
+        self.endpoint == base.endpoint && self.segments.starts_with(&base.segments)
+    }
+
+    /// How many path segments the target names; a deeper base is a more
+    /// specific match.
+    pub(crate) fn depth(&self) -> usize {
+        self.segments.len()
+    }
+}
+
 /// `unix:///absolute/path.sock`: no host, port, user, query or fragment, and
 /// a path that names a socket, never a directory (a `.` or `..` segment that
 /// normalizes to one included). The path is percent-decoded, so a socket

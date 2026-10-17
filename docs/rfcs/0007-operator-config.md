@@ -282,10 +282,13 @@ future checkout-supplied surface:
    the operator layer** — first-set-wins, operator-before-checkout (the
    existing real-env-wins rule, extended one layer down). Finding #5's
    injection becomes a no-op against any var the operator actually uses.
-3. **A token is sent only to the server it is keyed to.** A request whose
-   URL belongs to an operator-defined server carries only that name's token
-   (§D4 steps 1–2); any other request carries none. The CLI reads no unkeyed
-   token (finding #6's broadcast).
+3. **A token is sent only to the server it is keyed to.** A request carries
+   only the token of the operator-defined server it is sent to (§D4 steps
+   1–2); any other request carries none. The CLI reads no unkeyed token
+   (finding #6's broadcast). "Sent to" is where the transport delivers the
+   request: the same scheme, host and port, or the same Unix socket, and a
+   path under the server's `url` once `.` and `..` segments resolve. The
+   address as written is never the match.
 
 ### D6. Compatibility rules (the #139 findings as law)
 
@@ -369,4 +372,7 @@ them. RFC 0002's header should gain a pointer here once this merges.
   D5 rule 3's "The legacy single `OMNIGRAPH_BEARER_TOKEN` fallback keeps
   working for the single-server shape, but when a request resolves through a
   *named* server, only that name's chain applies". The Background section's
-  description of the variable is history and is not rewritten.
+  description of the variable is history and is not rewritten. The same
+  change matches a credential on the request's transport target instead of
+  the address text, which a `..` segment could carry to a sibling path prefix
+  or another socket, and refuses a `--graph` with a `.` or `..` segment.

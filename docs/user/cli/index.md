@@ -194,10 +194,13 @@ from the token; clients cannot override it with `--as`.
 `OMNIGRAPH_TOKEN_<NAME>`, the server name uppercased with `-` written as `_`,
 supplies it instead and outranks the stored one: `OMNIGRAPH_TOKEN_PROD` here.
 
-The CLI sends the `prod` token only to URLs under its `url`. Any other request
-carries no credential, including a literal `--server https://…` URL that
-matches no declared server. If such a request gets HTTP 401, the error names
-the server to declare or the `omnigraph login` command to run.
+The CLI sends the `prod` token only to URLs under its `url`: the same scheme,
+host and port, and a path that starts with the `url`'s path once `.` and `..`
+segments are resolved. A `unix://` server's token goes only to that socket.
+Any other request carries no credential, including a literal
+`--server https://…` URL that matches no declared server. If such a request
+gets HTTP 401, the error names the server to declare or the `omnigraph login`
+command to run. A `--graph` value with a `.` or `..` path segment is refused.
 
 ## Use a server through a Unix socket
 

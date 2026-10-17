@@ -331,10 +331,12 @@ impl std::fmt::Display for MissingCredential {
     }
 }
 
-/// Resolve the credential for `url`, a URL under `server_root`.
+/// Resolve the credential for `url`, a URL under `server_root`, by where the
+/// transport sends it.
 pub(crate) fn resolve_remote_credential(server_root: &str, url: &str) -> Result<RemoteCredential> {
+    let target = crate::graph_http::RequestTarget::of(server_root, url)?;
     let operator_config = operator::load_operator_config()?;
-    let Some(server) = operator_config.find_server_for_url(url) else {
+    let Some(server) = operator_config.find_server_for_target(&target) else {
         return Ok(RemoteCredential::Missing(MissingCredential::Unbound {
             server_root: without_userinfo(server_root),
             config: operator::operator_dir().map(|dir| dir.join(operator::OPERATOR_CONFIG_FILE)),
@@ -429,9 +431,30 @@ pub(crate) fn resolve_server_flag(
     };
     let base = base_url.trim_end_matches('/');
     Ok(Some(match graph {
-        Some(graph) => format!("{base}/graphs/{graph}"),
+        Some(graph) => {
+            refuse_dot_segments(graph)?;
+            format!("{base}/graphs/{graph}")
+        }
         None => base.to_string(),
     }))
+}
+
+/// A graph name is written into a served URL's path, where a `.` or `..`
+/// segment would move the request off the graph's route. The URL parser also
+/// reads `%2e` as a dot and `\` as a separator, so those spellings count.
+fn refuse_dot_segments(graph: &str) -> Result<()> {
+    let dot = |segment: &str| {
+        matches!(
+            segment.to_ascii_lowercase().replace("%2e", ".").as_str(),
+            "." | ".."
+        )
+    };
+    if graph.split(['/', '\\']).any(dot) {
+        color_eyre::eyre::bail!(
+            "invalid graph `{graph}`: a graph name cannot contain a `.` or `..` path segment"
+        );
+    }
+    Ok(())
 }
 
 /// Execute an OPERATOR alias (RFC-007 PR 3): a pure binding invoking a

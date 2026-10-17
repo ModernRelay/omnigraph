@@ -2298,6 +2298,151 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
     }
 }
 
+/// A served request carries a server's token only when the URL the transport
+/// sends it to, with its `.` and `..` segments resolved, lies under that
+/// server's `url`. Matching the address as written let a path-prefixed
+/// server's token reach a sibling prefix, and a socket's token reach another
+/// socket. A `--graph` with a dot segment is refused before any request.
+#[test]
+fn served_credential_follows_the_sent_url_issue_1022() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
+    let rows = || {
+        IntentReply::json(
+            200,
+            json!({
+                "query_name":"q", "target":{"branch":"main"}, "row_count":0,
+                "columns":["value"], "rows":[], "graph_commit_id":"head"
+            }),
+        )
+    };
+    // A path-prefixed root's discovery is `/<prefix>/healthz`, which the
+    // fixture answers from its script.
+    let discovery = || IntentReply::json(200, json!({}));
+    let home = tempdir().unwrap();
+    let query = |token: (&str, &str), server: &str, graph: &str| {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_HOME", home.path())
+            .env(token.0, token.1)
+            .args(["query", "q", "--server", server, "--graph", graph, "--json"]);
+        command
+    };
+    let authorization = |fixture: &IntentApiFixture| {
+        let requests = fixture.workflow_requests();
+        let data = requests.last().expect("a data request");
+        (
+            data.path.clone(),
+            data.headers.get("authorization").cloned(),
+        )
+    };
+
+    // A server declared under a path prefix.
+    let fixture = IntentApiFixture::graph(vec![discovery(), rows(), discovery(), rows()]);
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "servers:\n  tenant-a:\n    url: '{}/tenant-a'\n",
+            fixture.origin
+        ),
+    )
+    .unwrap();
+    let tenant_a = ("OMNIGRAPH_TOKEN_TENANT_A", "tenant-a-token");
+    let prefixed = format!("{}/tenant-a", fixture.origin);
+    output_success(&mut query(tenant_a, &prefixed, "knowledge"));
+    assert_eq!(
+        authorization(&fixture),
+        (
+            "/tenant-a/graphs/knowledge/queries/q".to_string(),
+            Some("Bearer tenant-a-token".to_string())
+        )
+    );
+    // Its address followed by `..` is sent to a sibling prefix: no token.
+    let escaped = format!("{}/tenant-a/../tenant-b", fixture.origin);
+    output_success(&mut query(tenant_a, &escaped, "knowledge"));
+    assert_eq!(
+        authorization(&fixture),
+        ("/tenant-b/graphs/knowledge/queries/q".to_string(), None)
+    );
+    fixture.assert_complete();
+
+    // A `--graph` that would leave the graph's route is refused before any
+    // request, in every spelling the URL parser resolves.
+    let fixture = IntentApiFixture::graph(vec![]);
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "servers:\n  tenant-a:\n    url: '{}/tenant-a'\n",
+            fixture.origin
+        ),
+    )
+    .unwrap();
+    for graph in [
+        "../../tenant-b/graphs/knowledge",
+        "%2E%2E/%2e./tenant-b/graphs/knowledge",
+        r"..\..\tenant-b\graphs\knowledge",
+        ".",
+    ] {
+        let output = query(tenant_a, "tenant-a", graph).output().unwrap();
+        assert!(!output.status.success(), "{graph}: {output:?}");
+        let refusal = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            refusal.contains("cannot contain a `.` or `..` path segment"),
+            "{graph}: {refusal}"
+        );
+    }
+    assert!(fixture.requests().is_empty(), "{:?}", fixture.requests());
+
+    // A socket's token never reaches another socket its address resolves to.
+    #[cfg(unix)]
+    {
+        use crate::support::unix_gateway::UnixGateway;
+
+        let declared = IntentApiFixture::graph(vec![rows()]);
+        let other = IntentApiFixture::graph(vec![rows()]);
+        let declared_socket = UnixGateway::new(&declared.origin);
+        let other_socket = UnixGateway::new(&other.origin);
+        fs::write(
+            home.path().join("config.yaml"),
+            format!("servers:\n  og:\n    url: '{}'\n", declared_socket.url()),
+        )
+        .unwrap();
+        let og = ("OMNIGRAPH_TOKEN_OG", "og-token");
+        output_success(&mut query(og, "og", "knowledge"));
+        assert_eq!(
+            authorization(&declared),
+            (
+                "/graphs/knowledge/queries/q".to_string(),
+                Some("Bearer og-token".to_string())
+            )
+        );
+        // `<socket>/../../..` is the directory both gateways' directories share.
+        let other_dir = other_socket
+            .socket
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::file_name)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let escaped = format!(
+            "{}/../../../{other_dir}/gate way/s.sock",
+            declared_socket.url()
+        );
+        output_success(&mut query(og, &escaped, "knowledge"));
+        assert_eq!(
+            authorization(&other),
+            ("/graphs/knowledge/queries/q".to_string(), None)
+        );
+        declared.assert_complete();
+        other.assert_complete();
+    }
+}
+
 #[test]
 fn remote_json_errors_preserve_server_codes_and_details() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};

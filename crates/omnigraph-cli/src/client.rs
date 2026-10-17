@@ -2938,12 +2938,18 @@ mod tests {
         assert_eq!(gateway.connections(), 2, "both requests used the socket");
         server.assert_complete();
 
-        let escaped = resolve_server_flag(Some(&root), Some("../.."))
-            .unwrap()
-            .unwrap();
+        // `--graph` refuses a dot segment before any URL is composed; the
+        // transport still refuses a composed URL that climbs out of the root.
+        let refusal = resolve_server_flag(Some(&root), Some("../..")).unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("cannot contain a `.` or `..` path segment"),
+            "{refusal}"
+        );
         for outside in [
             format!("{root}2/graphs"),
-            remote_url(&escaped, &["snapshot"], &[]).unwrap(),
+            remote_url(&format!("{root}/graphs/../.."), &["snapshot"], &[]).unwrap(),
         ] {
             let error = http.request(Method::GET, outside.clone()).unwrap_err();
             assert!(
