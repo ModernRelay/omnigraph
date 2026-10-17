@@ -3021,27 +3021,35 @@ fn as_on_a_served_write_is_rejected() {
     // A served write resolves the actor from the bearer token. Refuse --as
     // before both discovery and the optional no-graph registry probe.
     let server = IntentApiFixture::new(vec![]);
-    for graph in [None, Some("knowledge")] {
-        let mut command = cli();
-        command
-            .arg("mutate")
-            .arg("--server")
-            .arg(&server.origin)
-            .arg("--as")
-            .arg("act-nope")
-            .arg("-e")
-            .arg("query add($name: String) { insert Person { name: $name } }")
-            .arg("--params")
-            .arg(r#"{"name":"X"}"#);
-        if let Some(graph) = graph {
-            command.args(["--graph", graph]);
+    let writes: [&[&str]; 3] = [
+        &[
+            "mutate",
+            "-e",
+            "query add($name: String) { insert Person { name: $name } }",
+            "--params",
+            r#"{"name":"X"}"#,
+        ],
+        &["commit", "publish", "some-commit"],
+        &["commit", "drop", "some-commit"],
+    ];
+    for write in writes {
+        for graph in [None, Some("knowledge")] {
+            let mut command = cli();
+            command
+                .args(write)
+                .arg("--server")
+                .arg(&server.origin)
+                .args(["--as", "act-nope"]);
+            if let Some(graph) = graph {
+                command.args(["--graph", graph]);
+            }
+            let output = output_failure(&mut command);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("`--as` is not allowed on a served write"),
+                "{write:?} {graph:?}: expected --as-served rejection; got: {stderr}"
+            );
         }
-        let output = output_failure(&mut command);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("`--as` is not allowed on a served write"),
-            "expected --as-served rejection; got: {stderr}"
-        );
     }
     assert!(server.requests().is_empty());
     server.assert_complete();
@@ -3050,12 +3058,10 @@ fn as_on_a_served_write_is_rejected() {
 /// `commit publish` and `commit drop` are writes, so a direct graph takes
 /// `--as` for them as it does for `mutate -e 'commit publish "<id>"'`. A
 /// publication records no publisher: the published commit keeps the actor
-/// of the write that created it. The `commit` reads refuse `--as`, and a
-/// served publish or drop refuses it before any request.
+/// and timestamp of the write that created it. The `commit` reads refuse
+/// `--as`; `as_on_a_served_write_is_rejected` owns the served refusal.
 #[test]
 fn commit_publish_and_drop_take_as_on_a_direct_graph_issue_1023() {
-    use crate::support::managed_http::IntentApiFixture;
-
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
@@ -3074,15 +3080,17 @@ fn commit_publish_and_drop_take_as_on_a_direct_graph_issue_1023() {
         let commit = parse_stdout_json(&output)["commit"].clone();
         assert_eq!(commit["published"], false, "{commit}");
         assert_eq!(commit["actor_id"], "act-author", "{commit}");
-        commit["graph_commit_id"].as_str().unwrap().to_string()
+        commit
     };
+    let commit_id = |commit: &Value| commit["graph_commit_id"].as_str().unwrap().to_string();
     let commit = |args: &[&str]| {
         let mut command = cli();
         command.arg("commit").args(args).arg("--store").arg(&graph);
         command
     };
 
-    let pia = propose("Pia");
+    let proposed = propose("Pia");
+    let pia = commit_id(&proposed);
     let published = parse_stdout_json(&output_success(&mut commit(&[
         "publish",
         &pia,
@@ -3093,9 +3101,13 @@ fn commit_publish_and_drop_take_as_on_a_direct_graph_issue_1023() {
     assert_eq!(published["graph_commit_id"], pia.as_str(), "{published}");
     assert_eq!(published["published"], true, "{published}");
     assert_eq!(published["actor_id"], "act-author", "{published}");
+    assert_eq!(
+        published["created_at"], proposed["created_at"],
+        "{published}"
+    );
     assert_eq!(resolved_snapshot_id(&graph, "main"), pia);
 
-    let quin = propose("Quin");
+    let quin = commit_id(&propose("Quin"));
     let dropped = parse_stdout_json(&output_success(&mut commit(&[
         "drop",
         &quin,
@@ -3127,23 +3139,6 @@ fn commit_publish_and_drop_take_as_on_a_direct_graph_issue_1023() {
             "{label} must refuse an actor it cannot consume: {stderr}"
         );
     }
-
-    let server = IntentApiFixture::new(vec![]);
-    for verb in ["publish", "drop"] {
-        let output = output_failure(
-            cli()
-                .args(["commit", verb, &pia, "--server"])
-                .arg(&server.origin)
-                .args(["--as", "act-nope"]),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("`--as` is not allowed on a served write"),
-            "served commit {verb} must refuse --as: {stderr}"
-        );
-    }
-    assert!(server.requests().is_empty());
-    server.assert_complete();
 }
 
 #[test]
