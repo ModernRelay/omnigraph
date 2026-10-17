@@ -78,6 +78,10 @@ impl Identity {
         error.body["accepted_deployment"] = serde_json::to_value(self).expect("string identity");
         error
     }
+
+    fn diagnostic(&self, stderr: &mut dyn Write, message: std::fmt::Arguments<'_>) -> Result<()> {
+        write_diagnostic(stderr, message).map_err(|error| self.retain(error))
+    }
 }
 
 /// No managed outcome is inferred from archive presence or a transport error.
@@ -174,8 +178,9 @@ async fn submit(
     body: &Value,
     run: &ClusterRunArgs,
     deadline: Instant,
+    stderr: &mut dyn Write,
 ) -> Result<(Value, String)> {
-    let key = idempotency_key(run.idempotency_key.as_deref())?;
+    let key = idempotency_key(run.idempotency_key.as_deref(), stderr)?;
     let request = api.request(Method::POST, path, Some(body), Some(&key));
     let result = if run.no_wait {
         request.await
@@ -218,6 +223,7 @@ async fn wait(
     mut body: Value,
     identity: &Identity,
     deadline: Instant,
+    stderr: &mut dyn Write,
 ) -> Result<(Value, i32)> {
     let path = format!(
         "/v1/clusters/{}/deployments/{}",
@@ -230,21 +236,24 @@ async fn wait(
         if let Some(exit) = completion(&body, identity).map_err(|error| identity.retain(error))? {
             return Ok((body, exit));
         }
-        eprintln!(
-            "deployment {} (native {}): delivery {}, archive {}, observation {}",
-            identity.deployment_id,
-            identity.native_deployment_id,
-            body["data"]["delivery"],
-            body["data"]["archive"],
-            body["data"]["observation"]["state"]
-        );
+        identity.diagnostic(
+            stderr,
+            format_args!(
+                "deployment {} (native {}): delivery {}, archive {}, observation {}\n",
+                identity.deployment_id,
+                identity.native_deployment_id,
+                body["data"]["delivery"],
+                body["data"]["archive"],
+                body["data"]["observation"]["state"]
+            ),
+        )?;
         let next = Instant::now() + POLL_INTERVAL;
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
-            eprintln!(
-                "wait deadline reached; inspect `cluster status --managed {}`; no work was cancelled or resubmitted",
+            identity.diagnostic(stderr, format_args!(
+                "wait deadline reached; inspect `cluster status --managed {}`; no work was cancelled or resubmitted\n",
                 identity.deployment_id
-            );
+            ))?;
             return Ok((body, 5));
         }
         tokio::time::sleep_until(next).await;
@@ -254,9 +263,9 @@ async fn wait(
                 if response.status.is_server_error()
                     || response.status == StatusCode::TOO_MANY_REQUESTS =>
             {
-                eprintln!(
-                    "deployment observation unavailable; retain original IDs and continue bounded read-only lookup"
-                );
+                identity.diagnostic(stderr, format_args!(
+                    "deployment observation unavailable; retain original IDs and continue bounded read-only lookup\n"
+                ))?;
             }
             Ok(Ok(response)) => {
                 return Err(identity.retain(Failure {
@@ -269,7 +278,12 @@ async fn wait(
                 }));
             }
             Ok(Err(error)) if error.body["type"] == "transport_failed" => {
-                eprintln!("deployment observation transport unavailable; retain original IDs");
+                identity.diagnostic(
+                    stderr,
+                    format_args!(
+                        "deployment observation transport unavailable; retain original IDs\n"
+                    ),
+                )?;
             }
             Ok(Err(error)) => return Err(identity.retain(error)),
             Err(_) => return Ok((body, 5)),
@@ -281,6 +295,7 @@ pub(super) async fn dispatch(
     api: &Api,
     context: &Context,
     command: &ClusterCommand,
+    stderr: &mut dyn Write,
 ) -> Result<(Value, i32)> {
     let base = format!("/v1/clusters/{}", context.cluster);
     match command {
@@ -321,8 +336,15 @@ pub(super) async fn dispatch(
                 ));
             }
             let request = json!({"revision":revision});
-            let (body, key) =
-                submit(api, &format!("{base}/plans"), &request, run, deadline).await?;
+            let (body, key) = submit(
+                api,
+                &format!("{base}/plans"),
+                &request,
+                run,
+                deadline,
+                stderr,
+            )
+            .await?;
             let exit = preview_exit(&body, context, &revision)
                 .map_err(|error| retain_submission(error, &key, &request))?;
             Ok((body, exit))
@@ -337,8 +359,15 @@ pub(super) async fn dispatch(
             identifier(plan)?;
             let deadline = Instant::now() + Duration::from_secs(run.timeout.unwrap_or(300));
             let request = json!({"preview_id":plan});
-            let (body, key) =
-                submit(api, &format!("{base}/deployments"), &request, run, deadline).await?;
+            let (body, key) = submit(
+                api,
+                &format!("{base}/deployments"),
+                &request,
+                run,
+                deadline,
+                stderr,
+            )
+            .await?;
             let identity = Identity::read(&body, &context.cluster, None)
                 .map_err(|error| retain_submission(error, &key, &request))?;
             if identity.preview_id != plan {
@@ -354,7 +383,7 @@ pub(super) async fn dispatch(
             if run.no_wait {
                 return Ok((body, 0));
             }
-            wait(api, context, body, &identity, deadline).await
+            wait(api, context, body, &identity, deadline, stderr).await
         }
         ClusterCommand::Status {
             run_id,
@@ -376,7 +405,7 @@ pub(super) async fn dispatch(
                 let identity = Identity::read(&body, &context.cluster, Some(id))
                     .map_err(|error| retain_requested(error, id))?;
                 if *should_wait {
-                    wait(api, context, body, &identity, deadline).await
+                    wait(api, context, body, &identity, deadline, stderr).await
                 } else {
                     Ok((body, 0))
                 }

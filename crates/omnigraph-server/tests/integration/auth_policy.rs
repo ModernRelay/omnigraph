@@ -3418,6 +3418,165 @@ rules:
     assert_eq!(main_head().await, before);
 }
 
+/// A commit-list page token is checksummed, not signed. A caller allowed to
+/// read `main` only, who may neither list `secret` nor read its commits by
+/// id, pages `main` through continuations checked against `main`'s history,
+/// and a token re-signed to continue from a `secret` commit, deep in
+/// `__history`, or from a commit no branch holds, reads nothing. A caller
+/// with graph-wide `read` is taken at its token's word.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_commit_list_continuation_stays_on_a_readable_branch() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = omnigraph::session::Session::from_defaults(
+        Arc::new(Omnigraph::open(graph.to_str().unwrap()).await.unwrap()),
+        omnigraph::settings::SessionSettings::default()
+            .with("history_release_bytes", "2048")
+            .unwrap(),
+    );
+    db.branch_create_from(ReadTarget::branch("main"), "secret")
+        .await
+        .unwrap();
+    let person = |name: String, age: usize| {
+        format!(r#"{{"type":"Person","data":{{"name":"{name}","age":{age}}}}}"#)
+    };
+    for i in 0..24 {
+        db.load_with_receipt("secret", &person(format!("secret-{i}"), i), LoadMode::Merge)
+            .await
+            .unwrap();
+    }
+    for i in 0..4 {
+        db.load_with_receipt("main", &person(format!("main-{i}"), i), LoadMode::Merge)
+            .await
+            .unwrap();
+    }
+    let oldest_secret = db
+        .list_commits(Some("secret"))
+        .await
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|commit| commit.graph_branch.as_deref() == Some("secret"))
+        .unwrap();
+    drop(db);
+    // act-bruno reads protected branches (main) only; act-ada reads every
+    // branch, and so every commit by id.
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        "version: 1\ngroups:\n  team: [act-bruno]\n  admins: [act-ada]\nprotected_branches: [main]\nrules:\n  - id: team-read\n    allow: {actors: {group: team}, actions: [read], branch_scope: protected}\n  - id: admin-read\n    allow: {actors: {group: admins}, actions: [read], branch_scope: any}\n",
+    )
+    .unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![
+                ("act-bruno".to_string(), "team-token".to_string()),
+                ("act-ada".to_string(), "admin-token".to_string()),
+            ],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+    let get_as = |uri: &str, token: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(uri))
+            .method(Method::GET)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let get = |uri: &str| get_as(uri, "team-token");
+
+    for uri in [
+        "/commits?branch=secret".to_string(),
+        format!("/commits/{}", oldest_secret.graph_commit_id),
+    ] {
+        let (status, body) = json_response(&app, get(&uri)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+
+    let (status, whole) = json_response(&app, get("/commits?branch=main")).await;
+    assert_eq!(status, StatusCode::OK, "{whole}");
+    let (status, first) = json_response(&app, get("/commits?branch=main&limit=2")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let token = first["next_page_token"].as_str().unwrap().to_string();
+    let mut paged = first["commits"].as_array().unwrap().clone();
+    let mut next = Some(token.clone());
+    while let Some(token) = next {
+        let (status, page) = json_response(
+            &app,
+            get(&format!("/commits?branch=main&limit=2&page_token={token}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "a proven continuation: {page}");
+        paged.extend(page["commits"].as_array().unwrap().iter().cloned());
+        next = page["next_page_token"].as_str().map(str::to_string);
+    }
+    assert_eq!(serde_json::Value::Array(paged), whole["commits"]);
+
+    // A commit `secret` published and a commit no branch holds are refused
+    // alike, so the refusal says nothing about what exists.
+    let unknown = "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    for (next, below) in [
+        (oldest_secret.graph_commit_id.as_str(), u64::MAX),
+        (
+            oldest_secret.graph_commit_id.as_str(),
+            oldest_secret.generation + 1,
+        ),
+        (unknown, u64::MAX),
+    ] {
+        let forged = resign_change_token(&token, |payload| {
+            payload["next_commit_id"] = json!(next);
+            payload["below_generation"] = json!(below);
+        });
+        let (status, body) = json_response(
+            &app,
+            get(&format!("/commits?branch=main&limit=5&page_token={forged}")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{next} below {below}: {body}"
+        );
+        assert!(body["commits"].is_null(), "{body}");
+        assert_eq!(
+            body["error"],
+            "change cursor rejected: commit list page token names a commit off this branch's history",
+            "{body}"
+        );
+    }
+
+    // A caller with graph-wide `read` may read any commit by id, so its
+    // continuation is taken as the token says, without a proof.
+    let (status, shown) = json_response(
+        &app,
+        get_as(
+            &format!("/commits/{}", oldest_secret.graph_commit_id),
+            "admin-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    let forged = resign_change_token(&token, |payload| {
+        payload["next_commit_id"] = json!(oldest_secret.graph_commit_id);
+        payload["below_generation"] = json!(u64::MAX);
+    });
+    let (status, page) = json_response(
+        &app,
+        get_as(
+            &format!("/commits?branch=main&limit=1&page_token={forged}"),
+            "admin-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["commits"][0], shown, "{page}");
+}
+
 /// `token` with its payload edited and its checksum recomputed, as any caller
 /// can: a continuation's envelope is `base64url(json ‖ sha256(json))`.
 fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {

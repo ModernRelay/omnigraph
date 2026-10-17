@@ -36,7 +36,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
-| `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
+| `omnigraph-cli` | In-source application, runtime, parsing, output and transport tests plus `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-skill` | In-source `src/lib.rs`: the embedded table is sorted and `file` finds every path. The CLI owns the rest. In-source `src/skill.rs` holds the skill's command index (`references/commands.md`) and condensed reference (`SKILL.md`) to the clap tree and its storage-format line to `omnigraph version`; `integration/cli_schema_config.rs` owns `skill export` and `skill show`, including byte identity with `skills/omnigraph`; `scripts/check-docs.py` holds `metadata.version` and the declared HTTP contract to the CLI | None |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `integration/lane_b.rs`, `integration/torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
@@ -139,7 +139,54 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
 workspace gate; its required-cell checks reject removed or ignored cases. The
 lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
-timeout without replaying a committed merge. Its deployment matrix holds a real
+timeout without replaying a committed merge or commit publication/drop (a drop's
+empty response has no body to truncate). Output unit tests inject write and flush
+failures; application tests check baseline file-lock custody through cursor flush,
+transfer receipt failures after a single dispatched write, and raw stream failures
+without mixed diagnostics. `blob_cli` unit tests own bounded stdin capture and
+interrupted reads. Extend `cli_data` for load consent and source-read ordering,
+Blob preconditions and output-file lifecycle; reuse its HTTP fixture and the
+existing parity matrix. Query semantics remain in GQT, not duplicated in these
+CLI boundary tests.
+Schema-family application tests verify that failed result delivery preserves an
+applied schema and its actor with one publication, and that an undeliverable
+target line precedes writable open. Init output failure leaves a readable graph;
+lint report failures and subsequent invocations remain reusable. Extend the
+existing `cli_schema_config`, `cli_cluster` and `cli_data` owners for addressing,
+cluster ownership and offline source-read ordering.
+
+Maintenance delivery tests use the existing output and application owners.
+They cover partial writes and flush failures, full-text rebuild publication and
+actor retention, and target-output failure before writable admission. Extend
+`cli_data` and `cli_cluster` for cleanup preview/consent and maintenance addressing;
+`crossversion_upgrade` retains ownership of storage-upgrade compatibility.
+
+Cluster delivery tests extend the application and output owners. Direct apply
+tests fail supplied stdout/stderr writes and flushes, then inspect the original
+receipt, retained lock, single deployment result and stable graph history. The
+served adapter's tests verify identity delivery before POST and receipt/timeout output failures without
+resubmission. `cli_cluster` and `cli_queries` own exact unlock refusals, graph
+filtering and wrong-plane refusal before configuration or HTTP access. The existing
+`system_remote` deployment matrix owns real server completion after delivery loss;
+these CLI changes require no additional query-semantic GQT cases.
+
+Local command tests in `commands/local` own supplied login input, credential
+changes after report failure, captured profile configuration, and completed skill
+or embedding files after output loss. `skill.rs` owns exact file delivery and its
+existing broken-pipe exception. Extend `cli_schema_config` for version and skill
+process behavior and `cli_data` for profile/embedding output. Its existing
+discovery-swap fixture also replaces the credential file, requiring registry
+probing and the subsequent command to retain the original token. Application and
+managed-output tests own completion, partial-write and flush failures; managed
+authentication/lifecycle fixtures own the pre-dispatch diagnostic gates and
+accepted-identity recovery output when stderr fails. Application tests keep
+single-result stdout intact and preserve delivered refusal statuses; served
+cluster tests retain typed refusals through failed hints. The binary's channel
+barrier test proves reported failures do not wait for blocked runtime work;
+`cli_schema_config` owns help/version/refusal statuses with closed streams.
+These are CLI boundary contracts; query-semantic GQT cases remain unchanged.
+
+The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server

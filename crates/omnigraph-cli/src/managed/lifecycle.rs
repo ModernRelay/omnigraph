@@ -53,7 +53,10 @@ fn context_required(config: &Path) -> Result<Context> {
     })
 }
 
-pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
+pub(super) async fn dispatch(
+    command: &ClusterCommand,
+    stderr: &mut dyn Write,
+) -> Result<(Value, i32)> {
     let (config, _) = config_and_json(command);
     match command {
         ClusterCommand::List {
@@ -96,6 +99,7 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
                     run,
                     tombstone: false,
                 },
+                stderr,
             )
             .await
         }
@@ -138,6 +142,7 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
                     run,
                     tombstone,
                 },
+                stderr,
             )
             .await
         }
@@ -198,7 +203,7 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
             };
             let identity = Identity::read(&body, None)?;
             identity.matches(context.as_ref(), None, Some(id))?;
-            wait_operation(&api, body, &identity, &options, deadline, false).await
+            wait_operation(&api, body, &identity, &options, deadline, false, stderr).await
         }
         ClusterCommand::Push {
             expected_revision,
@@ -254,6 +259,13 @@ struct Identity {
 }
 
 impl Identity {
+    fn diagnostic(&self, stderr: &mut dyn Write, message: std::fmt::Arguments<'_>) -> Result<()> {
+        write_diagnostic(stderr, message).map_err(|mut error| {
+            error.body["accepted_operation"] = serde_json::to_value(self).expect("string identity");
+            error
+        })
+    }
+
     fn read(body: &Value, expected_kind: Option<&str>) -> Result<Self> {
         let get = |field: &str| body["data"][field].as_str().ok_or_else(Failure::protocol);
         let cluster_id = get("cluster_id")?;
@@ -372,7 +384,11 @@ fn definitive_refusal(response: &Response) -> bool {
     )
 }
 
-async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
+async fn submit(
+    api: &Api,
+    mut intent: Submission<'_>,
+    stderr: &mut dyn Write,
+) -> Result<(Value, i32)> {
     let lock = pending::lock(intent.config)?;
     let current = read_context(intent.config)?;
     if intent.kind == "create" {
@@ -410,6 +426,7 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
         &principal,
         intent.run.idempotency_key.as_deref(),
         intent.kind == "create" && intent.context.is_some(),
+        stderr,
     )?;
     let response = tokio::time::timeout_at(
         deadline,
@@ -477,6 +494,7 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
         intent.run,
         deadline,
         intent.tombstone,
+        stderr,
     )
     .await
 }
@@ -488,6 +506,7 @@ async fn wait_operation(
     options: &ClusterRunArgs,
     deadline: Instant,
     tombstone: bool,
+    stderr: &mut dyn Write,
 ) -> Result<(Value, i32)> {
     if options.no_wait {
         return Ok((body, 0));
@@ -500,27 +519,33 @@ async fn wait_operation(
             .pointer("/data/lifecycle/phase")
             .and_then(Value::as_str)
             .unwrap_or("pending");
-        eprintln!(
-            "operation {}: {} ({phase})",
-            identity.operation_id,
-            body["data"]["state"].as_str().unwrap_or("pending")
-        );
+        identity.diagnostic(
+            stderr,
+            format_args!(
+                "operation {}: {} ({phase})\n",
+                identity.operation_id,
+                body["data"]["state"].as_str().unwrap_or("pending")
+            ),
+        )?;
         if tombstone && phase == "tombstoned" {
-            eprintln!(
-                "undo deadline: {}",
-                body.pointer("/data/lifecycle/purgeAfter")
-                    .and_then(Value::as_str)
-                    .ok_or_else(Failure::protocol)?
-            );
+            identity.diagnostic(
+                stderr,
+                format_args!(
+                    "undo deadline: {}\n",
+                    body.pointer("/data/lifecycle/purgeAfter")
+                        .and_then(Value::as_str)
+                        .ok_or_else(Failure::protocol)?
+                ),
+            )?;
             return Ok((body, 0));
         }
         let next = Instant::now() + POLL_INTERVAL;
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
-            eprintln!(
-                "wait deadline reached; operation {} continues; use cluster operation --managed {}",
+            identity.diagnostic(stderr, format_args!(
+                "wait deadline reached; operation {} continues; use cluster operation --managed {}\n",
                 identity.operation_id, identity.operation_id
-            );
+            ))?;
             return Ok((body, 5));
         }
         tokio::time::sleep_until(next).await;
@@ -551,5 +576,94 @@ async fn wait_operation(
             Some(&identity.operation_id),
         )?;
         body = next_body;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed::tests::{FailedOutput, OutputFault};
+    use crate::managed_http_fixture::IntentApiFixture;
+
+    #[tokio::test]
+    async fn undelivered_operation_progress_retains_identity_without_polling() {
+        for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+            let server = IntentApiFixture::new(vec![]);
+            let api =
+                Api::new(server.origin.clone(), Some("automation-secret".to_owned())).unwrap();
+            let identity = Identity {
+                cluster_id: "cluster-original".to_owned(),
+                incarnation: "incarnation-original".to_owned(),
+                operation_id: "operation-original".to_owned(),
+                kind: "create".to_owned(),
+            };
+            let options = ClusterRunArgs {
+                no_wait: false,
+                timeout: Some(30),
+                idempotency_key: None,
+            };
+            let error = wait_operation(
+                &api,
+                json!({"data":{"state":"running"}}),
+                &identity,
+                &options,
+                Instant::now() + Duration::from_secs(30),
+                false,
+                &mut FailedOutput::new(fault, 0),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.body["type"], "output_delivery_failed");
+            assert_eq!(error.exit, 1);
+            assert_eq!(
+                error.body["accepted_operation"],
+                serde_json::to_value(&identity).unwrap()
+            );
+            assert!(server.requests().is_empty());
+            server.assert_complete();
+        }
+    }
+
+    #[test]
+    fn undelivered_pending_key_does_not_replace_saved_recovery_state() {
+        for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+            let temp = tempfile::tempdir().unwrap();
+            let _lock = pending::lock(temp.path()).unwrap();
+            let principal = PrincipalIdentity {
+                principal_id: "principal-original".to_owned(),
+                account_id: "org_original".to_owned(),
+            };
+            let request = json!({"name":"original"});
+            let mut delivered = Vec::new();
+            let original = pending::prepare(
+                temp.path(),
+                "https://api.example",
+                "/v1/clusters",
+                &request,
+                &principal,
+                Some("original-key"),
+                false,
+                &mut delivered,
+            )
+            .unwrap();
+            assert_eq!(delivered, b"Idempotency-Key: original-key\n");
+            let path = temp.path().join(".omnigraph/pending-lifecycle.json");
+            let before = std::fs::read(&path).unwrap();
+            let error = pending::prepare(
+                temp.path(),
+                "https://api.example",
+                "/v1/clusters",
+                &request,
+                &principal,
+                None,
+                false,
+                &mut FailedOutput::new(fault, 0),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.body["type"], "output_delivery_failed");
+            assert_eq!(error.body["idempotency_key"], original.idempotency_key);
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
     }
 }

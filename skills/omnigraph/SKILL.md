@@ -327,7 +327,9 @@ The operator config and credentials are **auto-discovered — no flag points at 
 
 Credentials live outside config: `echo $TOKEN | omnigraph login intel-dev`
 writes `~/.omnigraph/credentials` (`0600`); the matching token resolves via
-`OMNIGRAPH_TOKEN_INTEL_DEV` or that file.
+`OMNIGRAPH_TOKEN_INTEL_DEV` or that file. A token goes only to URLs under its
+server's `url`: a literal `--server <url>` matching no `servers:` entry gets no
+credential, and `OMNIGRAPH_BEARER_TOKEN` is not read.
 
 **Addressing a graph**: `--store <file://|s3://|az:// uri>` or a positional URI for
 direct storage; `--server <name|url>` (+ `--graph <id>`) for a served remote;

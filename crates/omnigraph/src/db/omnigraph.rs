@@ -80,6 +80,23 @@ use super::schema_state::{
 use super::snapshot::Snapshot;
 use super::{ReadTarget, ResolvedTarget, SnapshotId};
 
+/// Commits one page of a commit list holds when the caller sets no limit.
+pub const COMMIT_LIST_DEFAULT_PAGE_COMMITS: usize = 100;
+/// The most commits one page of a commit list may hold.
+pub const COMMIT_LIST_MAX_PAGE_COMMITS: usize = 1000;
+
+/// One page of a branch's commit list ([`Omnigraph::list_commits_page`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitListPage {
+    /// The head the first page resolved; every page of the list answers for
+    /// its first-parent chain.
+    pub head_commit_id: String,
+    /// Newest first.
+    pub commits: Vec<GraphCommit>,
+    /// Continues the list below `commits`; absent on its last page.
+    pub next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeOutcome {
     AlreadyUpToDate,
@@ -3887,8 +3904,9 @@ impl Omnigraph {
     }
 
     /// List the branch's reachable graph lineage, **most recent first** (by
-    /// [`GraphCommit::lineage_key`] — the same total order head selection and
-    /// any future keyset pagination cursor derive from).
+    /// [`GraphCommit::lineage_key`], the order head selection derives from,
+    /// which along one first-parent chain is falling generation: the order
+    /// [`Self::list_commits_page`] walks).
     ///
     /// `branch: None` (or `"main"`) lists main's lineage projection. A named
     /// branch lists the history reachable from that branch's head: the main
@@ -3909,6 +3927,168 @@ impl Omnigraph {
         let mut commits = coordinator.list_commits().await?;
         commits.reverse();
         Ok(commits)
+    }
+
+    /// One page of [`Self::list_commits`]: up to `limit` commits
+    /// ([`COMMIT_LIST_DEFAULT_PAGE_COMMITS`] when `None`), newest first, and
+    /// a token that continues the list below them.
+    ///
+    /// The first page resolves the branch's head and names it; a continuation
+    /// (`page_token`) answers for that head's first-parent chain, whatever
+    /// the branch did since. The token carries a digest of the branch, never
+    /// its name. A page reads the branch's `__manifest` and the `__history`
+    /// extents its own commits occupy, so its cost follows the page, not the
+    /// history below it.
+    ///
+    /// The token is checksummed, not signed. A continuation is refused for
+    /// another graph or branch digest, but the commit it continues from, and
+    /// the head it names, are the caller's claim: the walk starts at any
+    /// commit this handle can find, on any branch. That is no authority for a
+    /// caller who may read every commit by id; a caller who may read only some
+    /// branches uses [`Self::list_commits_page_readable`].
+    pub async fn list_commits_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<CommitListPage> {
+        self.commit_list_page(branch, page_token, limit, None).await
+    }
+
+    /// [`Self::list_commits_page`] for a caller who may read only some
+    /// branches; `can_read` answers for a branch by name, as for
+    /// [`Self::diff_page_readable`]. A continuation lists from its commit only
+    /// when that commit is on `branch`'s history: held by the branch's
+    /// `__manifest` (its head or a buffered commit), published on a branch
+    /// `can_read` allows, or else the first commit below the token's
+    /// generation on the branch's first-parent chain from its head, a walk
+    /// that costs what [`Self::list_commits`] costs. Any other commit, unknown
+    /// or unreadable alike, is [`OmniError::ChangeCursorRejected`].
+    pub async fn list_commits_page_readable(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<CommitListPage> {
+        self.commit_list_page(branch, page_token, limit, Some(can_read))
+            .await
+    }
+
+    /// One commit list page; with `can_read`, a continuation's commit is held
+    /// to the branch's history.
+    async fn commit_list_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        can_read: Option<&mut ReadCheck<'_>>,
+    ) -> Result<CommitListPage> {
+        use crate::changes::token;
+
+        self.ensure_schema_state_valid().await?;
+        let limit = limit.unwrap_or(COMMIT_LIST_DEFAULT_PAGE_COMMITS);
+        if limit == 0 {
+            return Err(OmniError::manifest(
+                "commit list page limit must be greater than zero",
+            ));
+        }
+        if limit > COMMIT_LIST_MAX_PAGE_COMMITS {
+            return Err(OmniError::resource_limit(
+                "commit_list_page_commits",
+                COMMIT_LIST_MAX_PAGE_COMMITS as u64,
+                limit as u64,
+            ));
+        }
+        let branch = match branch {
+            Some(branch) => normalize_branch_name(branch)?,
+            None => None,
+        };
+        let graph_identity =
+            token::hashed_identity(&self.schema_view.load().schema_identity_domain);
+        let scope = token::BranchScopeV1::for_branch(branch.as_deref());
+        let resume = page_token
+            .map(token::decode_commit_list_page_token)
+            .transpose()?;
+        if let Some(resume) = &resume
+            && (resume.graph_identity != graph_identity || resume.branch != scope)
+        {
+            return Err(token::cursor_rejected(
+                "commit list page token does not match this graph and branch",
+            ));
+        }
+        let coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        let start = resume.as_ref().map(|resume| resume.next_commit_id.as_str());
+        let (head, page) = coordinator.first_parent_page(start, limit).await?;
+        // A commit the branch's history does not reach is refused as an
+        // unknown one is, so the refusal tells a caller nothing it may not read.
+        let unreached = || {
+            token::cursor_rejected(
+                "commit list page token names a commit off this branch's history",
+            )
+        };
+        let Some(page) = page else {
+            return Err(match (&resume, &can_read) {
+                (Some(_), Some(_)) => unreached(),
+                (Some(_), None) => token::cursor_rejected(
+                    "commit list page token names a commit this graph does not hold",
+                ),
+                (None, _) => OmniError::manifest_internal(format!(
+                    "the head '{}' of the branch is not held",
+                    head.graph_commit_id
+                )),
+            });
+        };
+        if let (Some(resume), Some(can_read)) = (&resume, can_read) {
+            // The cheap proofs first: a commit the branch's `__manifest` holds
+            // is on its first-parent run to the head, and one published on a
+            // branch the caller may read lists that branch's history. Only a
+            // commit neither covers, such as one an unreadable branch the
+            // branch forked from published, is looked for down the chain.
+            let first = &page.commits[0];
+            let reached = coordinator.holds_commit(&first.graph_commit_id)
+                || can_read(first.graph_branch.as_deref().unwrap_or("main"))
+                || coordinator
+                    .first_parent_below(resume.below_generation)
+                    .await?
+                    .is_some_and(|commit| commit.graph_commit_id == resume.next_commit_id);
+            if !reached {
+                return Err(unreached());
+            }
+        }
+        if let Some(resume) = &resume
+            && page
+                .commits
+                .first()
+                .is_some_and(|first| first.generation >= resume.below_generation)
+        {
+            return Err(token::cursor_rejected(
+                "commit list page token names a commit that is not below the page before it",
+            ));
+        }
+        let head_commit_id = match resume {
+            Some(resume) => resume.head_commit_id,
+            None => head.graph_commit_id,
+        };
+        let next_page_token = match (page.next, page.commits.last()) {
+            (Some(next_commit_id), Some(last)) => {
+                Some(token::encode_token(&token::CommitListPageTokenV1 {
+                    version: token::TOKEN_VERSION,
+                    kind: token::KIND_COMMIT_LIST_PAGE.to_string(),
+                    graph_identity,
+                    branch: scope,
+                    head_commit_id: head_commit_id.clone(),
+                    next_commit_id,
+                    below_generation: last.generation,
+                })?)
+            }
+            _ => None,
+        };
+        Ok(CommitListPage {
+            head_commit_id,
+            commits: page.commits,
+            next_page_token,
+        })
     }
 
     /// The unpublished commits whose target is `branch` (`None` = main) and

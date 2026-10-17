@@ -8,6 +8,8 @@ use omnigraph_api_types::{ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER
 use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 
+use crate::helpers::MissingCredential;
+
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schemes of a server address. `http` and `https` reach the server over
@@ -85,6 +87,68 @@ impl ServerTransport {
                 Ok(Url::parse(&format!("{UNIX_SOCKET_ORIGIN}{target}"))?)
             }
         }
+    }
+}
+
+/// Where a request composed under a server root goes, as the transport
+/// derives it: the endpoint it connects to and the HTTP path it sends, with
+/// `.` and `..` segments already resolved. A credential is matched against
+/// this, never against the address as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestTarget {
+    endpoint: Endpoint,
+    /// The sent path's segments, without the empty one a trailing slash
+    /// leaves.
+    segments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Endpoint {
+    /// Scheme, host and port, the scheme's default port filled in.
+    Tcp {
+        scheme: String,
+        host: String,
+        port: Option<u16>,
+    },
+    /// The socket path the transport connects to.
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
+}
+
+impl RequestTarget {
+    /// The target of `url`, a URL composed under `server_root`.
+    pub(crate) fn of(server_root: &str, url: &str) -> Result<Self> {
+        let transport = ServerTransport::parse(server_root)?;
+        let sent = transport.http_url(url)?;
+        let endpoint = match transport {
+            ServerTransport::Tcp => Endpoint::Tcp {
+                scheme: sent.scheme().to_owned(),
+                host: sent.host_str().unwrap_or_default().to_owned(),
+                port: sent.port_or_known_default(),
+            },
+            #[cfg(unix)]
+            ServerTransport::Unix { socket, .. } => Endpoint::Unix(socket),
+        };
+        let mut segments: Vec<String> = sent
+            .path_segments()
+            .map(|segments| segments.map(str::to_owned).collect())
+            .unwrap_or_default();
+        if segments.last().is_some_and(String::is_empty) {
+            segments.pop();
+        }
+        Ok(Self { endpoint, segments })
+    }
+
+    /// Whether this target is `base` or lies under it: the same endpoint, and
+    /// a path whose leading segments are all of `base`'s.
+    pub(crate) fn is_under(&self, base: &Self) -> bool {
+        self.endpoint == base.endpoint && self.segments.starts_with(&base.segments)
+    }
+
+    /// How many path segments the target names; a deeper base is a more
+    /// specific match.
+    pub(crate) fn depth(&self) -> usize {
+        self.segments.len()
     }
 }
 
@@ -204,6 +268,9 @@ pub(crate) struct GraphHttpClient {
     client: reqwest::Client,
     transport: ServerTransport,
     health_url: Url,
+    /// Why this client's requests carry no credential, attached to a 401
+    /// response so its refusal says how to bind one.
+    missing_credential: Option<Box<MissingCredential>>,
 }
 
 impl GraphHttpClient {
@@ -248,7 +315,13 @@ impl GraphHttpClient {
             client: Self::build(&transport, managed)?,
             transport,
             health_url,
+            missing_credential: None,
         })
+    }
+
+    pub(crate) fn with_missing_credential(mut self, missing: MissingCredential) -> Self {
+        self.missing_credential = Some(Box::new(missing));
+        self
     }
 
     /// Blob delivery retains its existing streaming deadline instead of
@@ -258,6 +331,7 @@ impl GraphHttpClient {
             client: Self::build(&self.transport, false)?,
             transport: self.transport.clone(),
             health_url: self.health_url.clone(),
+            missing_credential: self.missing_credential.clone(),
         })
     }
 
@@ -291,10 +365,18 @@ impl GraphHttpClient {
             .and_then(|value| value.strip_prefix("Bearer "))
             .map(str::to_owned);
         crate::command_outcome::dispatched(request.method());
-        let response = self.client.execute(request).await?;
+        let mut response = self.client.execute(request).await?;
         crate::command_outcome::response(response.status(), response.headers(), bearer.as_deref());
         if !has_contract(&response) {
             return Err(ApiContractError::response(response.status()).into());
+        }
+        if response.status() == StatusCode::UNAUTHORIZED
+            && bearer.is_none()
+            && let Some(missing) = &self.missing_credential
+        {
+            response
+                .extensions_mut()
+                .insert(MissingCredential::clone(missing));
         }
         Ok(response)
     }
