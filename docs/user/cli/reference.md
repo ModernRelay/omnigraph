@@ -28,7 +28,7 @@ Common global flags:
 
 | Flag | Meaning |
 |---|---|
-| `--as <ACTOR>` | Actor for direct writes and cluster operations |
+| `--as <ACTOR>` | Actor for direct writes and cluster operations; every read command refuses it |
 | `--yes` | Non-interactive consent for destructive writes to non-local storage |
 | `--quiet` | Suppress the resolved write target printed to stderr |
 

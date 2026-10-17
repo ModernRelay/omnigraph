@@ -181,61 +181,10 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Direct => !matches!(cmd, Command::Init { .. }),
             Served | Control | Local => false,
         },
-        // The actor rides direct-engine writes (`any` via --store) and cluster
-        // writes; Blob get/stat are reads and never consume it, while Blob
-        // put/clear are writes and do; commit list/show/changes and commit
-        // publish/drop split the same way. Served writes
-        // resolve the actor from the bearer token
-        // (rejected downstream with its own message). On `direct`, full-text
-        // rebuild attributes its graph publication; other maintenance verbs
-        // record no actor. `control` refines per command:
-        // Apply/upgrade attribute an actor; plan checks the intended actor
-        // against execution preflight. Other read-only control verbs do not.
-        ScopeFlag::As => match capability {
-            // `--as` names an actor for a direct/`--store` WRITE; a served write
-            // resolves the actor from its token. The read commands (`query`,
-            // `diff`, `changes`, `commit list/show/changes`, `blob get/stat`,
-            // `branch diff/merge-base`) attribute no actor on either surface,
-            // so accepting `--as` there is a silent no-op — reject it instead.
-            // `commit` mixes reads and writes; its match is exhaustive so a
-            // new subcommand is classified before it compiles.
-            Any => match cmd {
-                Command::Commit { command } => match command {
-                    CommitCommand::Publish { .. } | CommitCommand::Drop { .. } => true,
-                    CommitCommand::List { .. }
-                    | CommitCommand::Show { .. }
-                    | CommitCommand::Changes { .. } => false,
-                },
-                _ => !matches!(
-                    cmd,
-                    Command::Blob {
-                        command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
-                    } | Command::Changes { .. }
-                        | Command::Diff { .. }
-                        | Command::Branch {
-                            command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
-                        }
-                        | Command::Query { .. }
-                ),
-            },
-            Control => matches!(
-                cmd,
-                Command::Cluster {
-                    command: ClusterCommand::Plan { .. }
-                        | ClusterCommand::Apply { .. }
-                        | ClusterCommand::UpgradeLedger { .. },
-                    managed: false,
-                }
-            ),
-            Direct => matches!(
-                cmd,
-                Command::RebuildFullTextIndexes { .. }
-                    | Command::Schema {
-                        command: SchemaCommand::Apply { .. }
-                    }
-            ),
-            Served | Local => false,
-        },
+        // `--as` applies exactly where the command consumes an actor. A served
+        // write consumes one too, but resolves it from the bearer token: the
+        // write resolver refuses `--as` there with its own message.
+        ScopeFlag::As => consumes_actor(cmd),
         // A profile is consumed wherever scope resolution runs: the data/
         // served resolvers, the maintenance-URI resolver, and the policy/
         // queries cluster-scope resolver. `init` (positional target only),
@@ -322,6 +271,97 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
     }
 }
 
+/// Whether a command consumes an actor, the one thing `--as` names: an engine
+/// `_as` write (a data write, `schema apply`, a full-text rebuild) or an
+/// actor-bound cluster operation (`plan` checks the intended actor against
+/// execution preflight; `apply` and `upgrade-ledger` attribute it). Reads,
+/// the other maintenance verbs and local tooling record no actor, so the
+/// guard refuses `--as` there rather than dropping it. The match is
+/// exhaustive to the subcommand wherever a family holds both answers, so a
+/// new command or subcommand does not compile until it is classified; a
+/// family that only reads answers as a whole, which refuses `--as` on a
+/// subcommand added to it until that subcommand is classified here.
+fn consumes_actor(cmd: &Command) -> bool {
+    match cmd {
+        Command::Mutate { .. } | Command::Load { .. } | Command::RebuildFullTextIndexes { .. } => {
+            true
+        }
+        Command::Branch { command } => match command {
+            BranchCommand::Create { .. }
+            | BranchCommand::Delete { .. }
+            | BranchCommand::Merge { .. } => true,
+            BranchCommand::List { .. }
+            | BranchCommand::Diff { .. }
+            | BranchCommand::MergeBase { .. } => false,
+        },
+        Command::Blob { command } => match command {
+            BlobCommand::Put { .. } | BlobCommand::Clear { .. } => true,
+            BlobCommand::Get { .. } | BlobCommand::Stat { .. } => false,
+        },
+        Command::Commit { command } => match command {
+            CommitCommand::Publish { .. } | CommitCommand::Drop { .. } => true,
+            CommitCommand::List { .. }
+            | CommitCommand::Show { .. }
+            | CommitCommand::Changes { .. } => false,
+        },
+        Command::Schema { command } => match command {
+            SchemaCommand::Apply { .. } => true,
+            SchemaCommand::Plan { .. }
+            | SchemaCommand::Show { .. }
+            | SchemaCommand::UpgradeSystemColumns { .. } => false,
+        },
+        Command::Changes { command } => match command {
+            ChangesCommand::Poll { .. } | ChangesCommand::Baseline { .. } => false,
+        },
+        // A `--managed` operation acts as the authenticated identity.
+        Command::Cluster { command, managed } => {
+            !managed
+                && match command {
+                    ClusterCommand::Plan { .. }
+                    | ClusterCommand::Apply { .. }
+                    | ClusterCommand::UpgradeLedger { .. } => true,
+                    ClusterCommand::Validate { .. }
+                    | ClusterCommand::Status { .. }
+                    | ClusterCommand::Observe { .. }
+                    | ClusterCommand::ForceUnlock { .. }
+                    | ClusterCommand::Create { .. }
+                    | ClusterCommand::List { .. }
+                    | ClusterCommand::Members { .. }
+                    | ClusterCommand::Pull { .. }
+                    | ClusterCommand::Push { .. }
+                    | ClusterCommand::Delete { .. }
+                    | ClusterCommand::UndoDelete { .. }
+                    | ClusterCommand::Token { .. }
+                    | ClusterCommand::Operation { .. }
+                    | ClusterCommand::History { .. }
+                    | ClusterCommand::Cancel { .. } => false,
+                }
+        }
+        Command::Query { .. }
+        | Command::Snapshot { .. }
+        | Command::Export { .. }
+        | Command::Diff { .. }
+        | Command::Graphs { .. }
+        | Command::Queries { .. }
+        | Command::Policy { .. }
+        | Command::Organization { .. } => false,
+        Command::Init { .. }
+        | Command::Upgrade { .. }
+        | Command::Optimize { .. }
+        | Command::Repair { .. }
+        | Command::Cleanup { .. }
+        | Command::Lint { .. } => false,
+        Command::Alias { .. }
+        | Command::Embed(_)
+        | Command::Login { .. }
+        | Command::Logout { .. }
+        | Command::Use { .. }
+        | Command::Profile { .. }
+        | Command::Skill { .. }
+        | Command::Version { .. } => false,
+    }
+}
+
 /// User-facing label for a subcommand (descends one level for the nested
 /// families so messages read `schema plan`, `queries validate`, etc.).
 pub(crate) fn command_label(cmd: &Command) -> &'static str {
@@ -338,7 +378,14 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Embed(_) => "embed",
         Command::Init { .. } => "init",
         Command::Load { .. } => "load",
-        Command::Branch { .. } => "branch",
+        Command::Branch { command } => match command {
+            BranchCommand::Create { .. } => "branch create",
+            BranchCommand::List { .. } => "branch list",
+            BranchCommand::Delete { .. } => "branch delete",
+            BranchCommand::Merge { .. } => "branch merge",
+            BranchCommand::Diff { .. } => "branch diff",
+            BranchCommand::MergeBase { .. } => "branch merge-base",
+        },
         Command::Schema { command } => match command {
             SchemaCommand::Plan { .. } => "schema plan",
             SchemaCommand::Apply { .. } => "schema apply",
@@ -566,6 +613,68 @@ mod tests {
                 parse(&["omnigraph", "commit", "drop", "some-commit"]),
                 [true, false, true, true, true, true],
             ),
+            // Every data write takes `--as` on a direct target; every data
+            // read refuses it, whichever resolver it shares with the writes.
+            (
+                parse(&["omnigraph", "mutate", "-e", "q"]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&["omnigraph", "load", "--data", "d.jsonl", "--mode", "append"]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&["omnigraph", "branch", "create", "b"]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&["omnigraph", "branch", "delete", "b"]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&["omnigraph", "branch", "merge", "b"]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&[
+                    "omnigraph",
+                    "blob",
+                    "clear",
+                    "node",
+                    "Document",
+                    "readme",
+                    "content",
+                ]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&["omnigraph", "branch", "list"]),
+                [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "branch", "diff", "b"]),
+                [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "branch", "merge-base", "b"]),
+                [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "snapshot"]),
+                [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "export"]),
+                [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "schema", "show"]),
+                [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "diff", "--from", "a", "--to", "b"]),
+                [true, false, true, true, false, true],
+            ),
             (
                 parse(&["omnigraph", "changes", "poll"]),
                 [true, false, true, true, false, true],
@@ -666,6 +775,33 @@ mod tests {
                     command_label(cmd),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn as_refusal_names_the_subcommand() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["branch", "list"], "branch list"),
+            (&["branch", "diff", "b"], "branch diff"),
+            (&["commit", "show", "c"], "commit show"),
+            (&["snapshot"], "snapshot"),
+            (&["export"], "export"),
+            (&["schema", "show"], "schema show"),
+        ];
+        for (args, label) in cases {
+            let mut argv = vec!["omnigraph"];
+            argv.extend_from_slice(args);
+            argv.extend_from_slice(&["--as", "act-reader"]);
+            let error = guard_addressing(&Cli::try_parse_from(argv).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "`{label}` is a data command; --as sets the actor for a direct-engine or \
+                     actor-bound cluster operation and does not apply."
+                )
+            );
         }
     }
 

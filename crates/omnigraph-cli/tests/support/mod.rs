@@ -1405,8 +1405,22 @@ policies:
 /// `local_graph` and remotely against a server URL. Actor-bearing operations
 /// use `--as` locally and an equivalent bearer identity remotely; read-only
 /// Blob commands reject `--as`. Returns raw outputs for parity comparison.
+/// An operator home whose `config.yaml` names [`PARITY_ACTOR`] as
+/// `operator.actor`, for the direct arm of [`run_both`].
+pub fn parity_operator_home(root: &Path) -> PathBuf {
+    let home = root.join("parity-operator-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.yaml"),
+        format!("operator:\n  actor: {PARITY_ACTOR}\n"),
+    )
+    .unwrap();
+    home
+}
+
 pub fn run_both(
     local_graph: &Path,
+    local_operator_home: &Path,
     server_url: &str,
     args: &[&str],
 ) -> (std::process::Output, std::process::Output) {
@@ -1417,26 +1431,19 @@ pub fn run_both(
     // remote = served. RFC-011: a direct (`--store`) write carries no Cedar
     // policy — the parity policy is permissive for `act-parity` on the served
     // arm, so the two arms still agree.
+    //
+    // The direct arm takes the parity actor from `operator.actor` rather than
+    // `--as`: every write resolves it and every read ignores it, so the
+    // harness keeps no copy of the CLI's read/write split, and an explicit
+    // `--as` on a read stays the guard's error to report.
     let mut local = cli();
-    local.args(args).arg("--store").arg(local_graph);
+    local
+        .env("OMNIGRAPH_HOME", local_operator_home)
+        .args(args)
+        .arg("--store")
+        .arg(local_graph);
     if args.first() == Some(&"blob") {
         local.env("NO_COLOR", "1");
-    }
-    // The read commands (blob get/stat, branch diff/merge-base, commit
-    // list/show/changes, query, changes, diff) reject `--as`: a served read
-    // resolves the actor from its bearer token and a direct read attributes
-    // none, so passing `--as` there is an error. Only the write verbs,
-    // `blob put`/`clear` and `commit publish`/`drop` among them, carry the
-    // parity actor on the direct arm.
-    let read = match args {
-        ["blob", verb, ..] => matches!(*verb, "get" | "stat"),
-        ["branch", verb, ..] => matches!(*verb, "diff" | "merge-base"),
-        ["commit", verb, ..] => matches!(*verb, "list" | "show" | "changes"),
-        [verb, ..] => matches!(*verb, "query" | "changes" | "diff"),
-        [] => false,
-    };
-    if !read {
-        local.arg("--as").arg(PARITY_ACTOR);
     }
 
     let mut remote = cli();

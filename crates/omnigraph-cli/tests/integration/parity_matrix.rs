@@ -3,8 +3,9 @@
 //! For every CLI verb with an `is_remote` fork, run the identical
 //! invocation against (a) the local graph directly and (b) a spawned
 //! server on a twin copy of the same graph. Actor-bearing operations use the
-//! SAME actor on both arms (local `--as act-parity`; remote bearer token
-//! resolving to `act-parity`); read-only Blob commands reject `--as`.
+//! SAME actor on both arms (local `operator.actor: act-parity`, which every
+//! write resolves and every read ignores; remote bearer token resolving to
+//! `act-parity`).
 //! Scrub the declared-volatile allowlist
 //! (`support::scrub_volatile` — ids, wall-clock, transport locations);
 //! everything else must match exactly.
@@ -31,6 +32,7 @@ const KNOWN_DIVERGENCES: &[&str] = &[
 struct Parity {
     _temp: TempDir,
     local: std::path::PathBuf,
+    local_operator_home: std::path::PathBuf,
     server: TestServer,
     blob_external_uri: Option<String>,
 }
@@ -49,9 +51,11 @@ fn parity() -> Parity {
             r#"{"act-parity":"parity-tok"}"#,
         )],
     );
+    let local_operator_home = parity_operator_home(temp.path());
     Parity {
         _temp: temp,
         local,
+        local_operator_home,
         server,
         blob_external_uri: None,
     }
@@ -68,9 +72,11 @@ fn blob_parity() -> Parity {
             r#"{"act-parity":"parity-tok"}"#,
         )],
     );
+    let local_operator_home = parity_operator_home(temp.path());
     Parity {
         _temp: temp,
         local,
+        local_operator_home,
         server,
         blob_external_uri: Some(blob_external_uri),
     }
@@ -93,7 +99,12 @@ fn blob_write_parity() -> Parity {
 
 impl Parity {
     fn run(&self, args: &[&str]) -> (std::process::Output, std::process::Output) {
-        run_both(&self.local, &self.server.base_url, args)
+        run_both(
+            &self.local,
+            &self.local_operator_home,
+            &self.server.base_url,
+            args,
+        )
     }
 }
 
@@ -806,9 +817,11 @@ fn parity_load_embedding_diagnostics() {
             r#"{"act-parity":"parity-tok"}"#,
         )],
     );
+    let local_operator_home = parity_operator_home(temp.path());
     let p = Parity {
         _temp: temp,
         local,
+        local_operator_home,
         server,
         blob_external_uri: None,
     };
