@@ -190,6 +190,22 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
 The token is stored separately from `config.yaml`. A server resolves the actor
 from the token; clients cannot override it with `--as`.
 
+`login` writes the token to `~/.omnigraph/credentials` with mode `0600`.
+`OMNIGRAPH_TOKEN_<NAME>`, the server name uppercased with `-` written as `_`,
+supplies it instead and outranks the stored one: `OMNIGRAPH_TOKEN_PROD` here.
+Two server names that spell the same variable, such as `a-b` and `a_b`, are
+refused when the config loads.
+
+The CLI sends the `prod` token only to URLs under its `url`: the same scheme,
+host and port, and a path that starts with the `url`'s path once `.` and `..`
+segments are resolved. A `unix://` server's token goes only to that socket.
+Any other request carries no credential, including a literal
+`--server https://…` URL that matches no declared server. If such a request
+gets HTTP 401, the CLI names the server to declare or the `omnigraph login`
+command to run; `--json` output carries this as `missing_credential` beside the
+server's own error. A `--graph` value must be one path segment of ASCII letters,
+digits, `-` or `_`; any other value is refused before a request is sent.
+
 Each invocation keeps its selected operator home and ambient profile, then reads
 the operator configuration once when needed. Editing that file during a command
 does not change its destination, actor defaults or presentation settings; unknown

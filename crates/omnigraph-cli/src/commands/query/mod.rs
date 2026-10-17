@@ -18,10 +18,9 @@ use reqwest::Method;
 use serde_json::Value;
 
 use crate::client::{GraphClient, parse_set_flags};
-use crate::graph_http::GraphHttpClient;
 use crate::helpers::{
     confirm_destructive, remote_json, remote_url, resolve_query_path,
-    resolve_remote_bearer_token_with_input, resolve_server_flag_with_config,
+    resolve_server_flag_with_config, served_client_with_config,
 };
 use crate::input::Input;
 use crate::invocation::MachineErrors;
@@ -393,8 +392,7 @@ async fn execute_operator_alias(
     let uri =
         resolve_server_flag_with_config(operator_config, Some(&root), alias.graph.as_deref())?
             .expect("server name is present");
-    let client = GraphHttpClient::new(&root)?;
-    let bearer_token = resolve_remote_bearer_token_with_input(input, operator_config, Some(&uri))?;
+    let (client, bearer_token) = served_client_with_config(input, operator_config, &root, &uri)?;
     let params = prepare::alias_params(alias_name, alias, alias_args, explicit_params)?;
     let mut body = serde_json::Map::new();
     body.insert("expect_mutation".to_string(), Value::Bool(false));

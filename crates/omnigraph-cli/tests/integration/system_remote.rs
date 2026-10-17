@@ -1030,6 +1030,7 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
             }
             let before = commits();
             let proxy = IntentApiFixture::graph_blob_write_proxy(&server.base_url, fault);
+            let operator = KeyedServer::new(&proxy.origin);
             let mut args: Vec<std::ffi::OsString> = ["blob", if put { "put" } else { "clear" }]
                 .into_iter()
                 .chain(["node", "Document", "readme", "content"])
@@ -1053,7 +1054,7 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
             // and is abandoned.
             let output = if matches!(fault, MergeDeliveryFault::CallerWait) {
                 let mut caller = cli_process()
-                    .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+                    .envs(operator.env(PARITY_TOKEN))
                     .args(&args)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -1080,7 +1081,7 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
             } else {
                 output_failure(
                     cli()
-                        .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+                        .envs(operator.env(PARITY_TOKEN))
                         .args(&args)
                         .timeout(Duration::from_secs(15)),
                 )
@@ -1232,9 +1233,10 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
             socket
         });
         let proxy = IntentApiFixture::graph_deployment_proxy(&server.base_url, fault);
+        let operator = KeyedServer::new(&proxy.origin);
         let mut command = cli();
         command
-            .env("OMNIGRAPH_BEARER_TOKEN", TOKEN)
+            .envs(operator.env(TOKEN))
             .args(["cluster", "apply", "--config"])
             .arg(cluster.path())
             .args([
@@ -1332,7 +1334,7 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
         let receipt = if times_out {
             parse_stdout_json(&output_success(
                 cli()
-                    .env("OMNIGRAPH_BEARER_TOKEN", TOKEN)
+                    .envs(operator.env(TOKEN))
                     .args([
                         "cluster",
                         "status",
@@ -1866,7 +1868,7 @@ query insert_person($name: String, $age: I32) {
     let main_snapshot = || {
         parse_stdout_json(&output_success(
             cli()
-                .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+                .envs(server.credential("team-token"))
                 .arg("snapshot")
                 .arg("--server")
                 .arg(&server.base_url)
@@ -1895,7 +1897,7 @@ query insert_person($name: String, $age: I32) {
     // bruno cannot change protected main (team-write-unprotected only).
     let denied_main_change = output_failure(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
@@ -1926,7 +1928,7 @@ query insert_person($name: String, $age: I32) {
     .unwrap();
     let denied_load = output_failure(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("load")
             .arg("--server")
             .arg(&server.base_url)
@@ -1946,7 +1948,7 @@ query insert_person($name: String, $age: I32) {
     // An unrecognized bearer never reaches graph resolution.
     let unauthenticated = output_failure(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "unknown-token")
+            .envs(server.credential("unknown-token"))
             .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
@@ -1967,7 +1969,7 @@ query insert_person($name: String, $age: I32) {
     // bruno can create an unprotected branch.
     let created = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("branch")
             .arg("create")
             .arg("--server")
@@ -1984,7 +1986,7 @@ query insert_person($name: String, $age: I32) {
     // bruno can change the unprotected branch; actor resolves from the token.
     let changed = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
@@ -2005,7 +2007,7 @@ query insert_person($name: String, $age: I32) {
     // No rule grants branch_delete; the admin merge below still finds `feature`.
     let denied_delete = output_failure(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("branch")
             .arg("delete")
             .arg("--server")
@@ -2025,7 +2027,7 @@ query insert_person($name: String, $age: I32) {
     let before_merge = main_snapshot();
     let denied_merge = output_failure(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("branch")
             .arg("merge")
             .arg("--server")
@@ -2050,7 +2052,7 @@ query insert_person($name: String, $age: I32) {
     // The compound request still exits 0 and preserves the merge's receipt.
     let merged = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
+            .envs(server.credential("admin-token"))
             .arg("branch")
             .arg("merge")
             .arg("--server")
@@ -2099,7 +2101,7 @@ query insert_person($name: String, $age: I32) {
 
     let verify = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("query")
             .arg("--server")
             .arg(&server.base_url)
@@ -2158,7 +2160,7 @@ fn graphs_list_against_multi_graph_server() {
     // `graphs list` lists `alpha`.
     let payload = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
+            .envs(server.credential("admin-token"))
             .arg("graphs")
             .arg("list")
             .arg("--server")
@@ -2175,9 +2177,9 @@ fn graphs_list_against_multi_graph_server() {
 
     // RFC-011 D7: addressing the multi-graph server via `--server <url>` with no
     // `--graph` errors and lists the candidate graphs (the resolver probes
-    // GET /graphs; the default-env token authorizes it).
+    // GET /graphs; the server's keyed token authorizes it).
     let no_graph = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
+        .envs(server.credential("admin-token"))
         .arg("query")
         .arg("--server")
         .arg(&server.base_url)
@@ -2322,12 +2324,20 @@ fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
     );
     let gateway = UnixGateway::new(&server.base_url);
     let socket = gateway.url();
+    let socket_operator = KeyedServer::new(&socket);
     let served = |server_url: &str, args: &[&str]| {
+        let credential = if server_url == socket {
+            socket_operator.env(PARITY_TOKEN)
+        } else {
+            server.credential(PARITY_TOKEN)
+        };
         let mut command = cli();
-        command
-            .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
-            .args(args)
-            .args(["--server", server_url, "--graph", PARITY_GRAPH_ID]);
+        command.envs(credential).args(args).args([
+            "--server",
+            server_url,
+            "--graph",
+            PARITY_GRAPH_ID,
+        ]);
         command
     };
     let mut connections = 0;

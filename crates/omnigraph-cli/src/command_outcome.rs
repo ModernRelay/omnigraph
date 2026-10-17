@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::cli::{BlobCommand, BranchCommand, Cli, Command, CommitCommand, SchemaCommand};
 use crate::graph_http::ApiContractError;
-use crate::helpers::{PreconditionFailedCli, RemoteErrorCli};
+use crate::helpers::{MissingCredential, PreconditionFailedCli, RemoteErrorCli};
 
 #[derive(Default, Debug, Clone)]
 pub(crate) struct Evidence {
@@ -160,6 +160,9 @@ pub(crate) struct Failure {
     pub(crate) retry_after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) request_dispatched: Option<bool>,
+    /// The CLI's account of a refused request that carried no credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) missing_credential: Option<MissingCredential>,
     #[serde(skip)]
     pub(crate) exit: i32,
 }
@@ -192,6 +195,7 @@ impl Failure {
         } else {
             evidence.retry_after
         };
+        let missing_credential = remote.and_then(|remote| remote.missing_credential.clone());
         let output = if let Some(remote) = remote {
             remote.output.clone()
         } else if let Some(precondition) = precondition {
@@ -249,6 +253,7 @@ impl Failure {
             http_status,
             retry_after,
             request_dispatched,
+            missing_credential,
             exit: if retry {
                 75
             } else if conditional {

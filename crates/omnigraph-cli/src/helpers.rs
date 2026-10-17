@@ -129,10 +129,6 @@ pub(crate) fn normalize_bearer_token(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn bearer_token_from_env(var_name: &str) -> Option<String> {
-    normalize_bearer_token(std::env::var(var_name).ok())
-}
-
 /// The Cedar resource id for a graph selection: the explicit graph name when one
 /// is given, else the normalized URI (the anonymous fallback). Used by the
 /// `policy` tooling to address a graph's bundle.
@@ -188,28 +184,139 @@ pub(crate) fn resolve_cli_actor(
     resolve_actor(input, cli_as, stderr)
 }
 
-/// The bearer token for a remote request (RFC-011): the operator keyed chain
-/// for the matching server (`OMNIGRAPH_TOKEN_<NAME>` env → 0600 credentials
-/// file), then the default `OMNIGRAPH_BEARER_TOKEN` env. No omnigraph.yaml
-/// chain.
-///
-/// Match the captured bindings and credential-file location. Environment
-/// secrets are acquired only when this invocation selects a remote credential.
-pub(crate) fn resolve_remote_bearer_token_with_input(
-    input: &InvocationConfig,
-    operator_config: &OperatorConfig,
-    explicit_uri: Option<&str>,
-) -> Result<Option<String>> {
-    if let Some(remote_url) = explicit_uri.filter(|uri| is_remote_uri(uri)) {
-        if let Some(server) = operator_config.find_server_for_url(remote_url) {
-            if let Some(token) =
-                operator::resolve_keyed_token_at(server, input.credentials_path().as_deref())?
-            {
-                return Ok(Some(token));
-            }
+/// The credential a served request carries (RFC-007 §D4–§D5, gh-host
+/// model): the token keyed to the operator server whose `url` the request
+/// URL falls under, from `OMNIGRAPH_TOKEN_<NAME>` env, then the 0600
+/// credentials file. A token is sent only to the server it is keyed to, and
+/// no unkeyed token is read, so every other request carries none.
+pub(crate) enum RemoteCredential {
+    Keyed(String),
+    Missing(MissingCredential),
+}
+
+/// Why a served request carries no credential. A 401 to that request names
+/// it, so the refusal says how to bind one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MissingCredential {
+    /// The URL falls under this operator server, which has no keyed token.
+    Server(String),
+    /// The URL falls under no operator server. `server_root` is the address
+    /// as written, without URL userinfo; `config` is the operator config path.
+    Unbound {
+        server_root: String,
+        config: Option<std::path::PathBuf>,
+    },
+}
+
+/// `{"server": NAME, "hint": …}` for a declared server without a token,
+/// `{"unbound": ADDRESS, "hint": …}` for an address under no declared server.
+impl Serialize for MissingCredential {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("MissingCredential", 2)?;
+        match self {
+            Self::Server(name) => state.serialize_field("server", name)?,
+            Self::Unbound { server_root, .. } => state.serialize_field("unbound", server_root)?,
+        }
+        state.serialize_field("hint", &self.to_string())?;
+        state.end()
+    }
+}
+
+impl std::fmt::Display for MissingCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Server(name) => write!(
+                f,
+                "no credential is stored for server `{name}`: run `omnigraph login {name}` \
+                 or set {}",
+                operator::token_env_name(name)
+            ),
+            Self::Unbound {
+                server_root,
+                config,
+            } => write!(
+                f,
+                "no credential is bound to {server_root}: declare it under `servers:` in {}, \
+                 then run `omnigraph login <name>` or set OMNIGRAPH_TOKEN_<NAME>",
+                config.as_deref().map_or_else(
+                    || "~/.omnigraph/config.yaml".to_string(),
+                    |path| path.display().to_string()
+                )
+            ),
         }
     }
-    Ok(bearer_token_from_env(DEFAULT_BEARER_TOKEN_ENV))
+}
+
+/// Resolve the credential for `url`, a URL under `server_root`, by where the
+/// transport sends it. Routing and credential-file location come from the
+/// invocation's captured inputs; secrets are acquired only for the matched server.
+pub(crate) fn resolve_remote_credential_with_input(
+    input: &InvocationConfig,
+    operator_config: &OperatorConfig,
+    server_root: &str,
+    url: &str,
+) -> Result<RemoteCredential> {
+    let target = crate::graph_http::RequestTarget::of(server_root, url)?;
+    let Some(server) = operator_config.find_server_for_target(&target) else {
+        return Ok(RemoteCredential::Missing(MissingCredential::Unbound {
+            server_root: without_userinfo(server_root),
+            config: input.config_path(),
+        }));
+    };
+    Ok(
+        match operator::resolve_keyed_token_at(server, input.credentials_path().as_deref())? {
+            Some(token) => RemoteCredential::Keyed(token),
+            None => RemoteCredential::Missing(MissingCredential::Server(server.to_string())),
+        },
+    )
+}
+
+/// A server address for display: URL-embedded credentials never leave the
+/// request they were written for.
+fn without_userinfo(server_root: &str) -> String {
+    match reqwest::Url::parse(server_root) {
+        Ok(mut url) if !url.username().is_empty() || url.password().is_some() => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        _ => server_root.to_string(),
+    }
+}
+
+/// The HTTP client for `server_root` and the token its requests to `url`
+/// carry. A client without one keeps the reason, which a 401 reports.
+pub(crate) fn served_client_with_config(
+    input: &InvocationConfig,
+    operator_config: &OperatorConfig,
+    server_root: &str,
+    url: &str,
+) -> Result<(crate::graph_http::GraphHttpClient, Option<String>)> {
+    let http = crate::graph_http::GraphHttpClient::new(server_root)?;
+    Ok(
+        match resolve_remote_credential_with_input(input, operator_config, server_root, url)? {
+            RemoteCredential::Keyed(token) => (http, Some(token)),
+            RemoteCredential::Missing(missing) => (http.with_missing_credential(missing), None),
+        },
+    )
+}
+
+/// The reason a 401 response's request carried no credential.
+pub(crate) fn missing_credential(response: &reqwest::Response) -> Option<&MissingCredential> {
+    response.extensions().get::<MissingCredential>()
+}
+
+/// A refusal message followed by the reason its request carried no
+/// credential, when it had one.
+pub(crate) fn with_missing_credential(
+    message: String,
+    missing: Option<&MissingCredential>,
+) -> String {
+    match missing {
+        Some(missing) => format!("{message}\n{missing}"),
+        None => message,
+    }
 }
 
 /// `--server <name>` (RFC-007 PR 3): resolve an operator-defined server
@@ -252,16 +359,32 @@ pub(crate) fn resolve_server_flag_with_config(
     };
     let base = base_url.trim_end_matches('/');
     Ok(Some(match graph {
-        Some(graph) => format!("{base}/graphs/{graph}"),
+        Some(graph) => {
+            require_graph_segment(graph)?;
+            format!("{base}/graphs/{graph}")
+        }
         None => base.to_string(),
     }))
 }
 
-/// Execute an OPERATOR alias (RFC-007 PR 3): a pure binding invoking a
-/// stored query by name on a named server — POST {base}/queries/{name}.
-/// Param precedence: --params > positional args > the alias's fixed
-/// params. Server and credential-owner selection use the captured config;
-/// the keyed token applies via the ordinary URL match.
+/// A graph name is one path segment of the graph's served route, in the
+/// graph-id alphabet. Any other character could move the request off that
+/// route once the URL parser reads it: a dot segment in any spelling
+/// (`%2e`, a tab or newline it strips), `/`, `\` or `%2F`.
+fn require_graph_segment(graph: &str) -> Result<()> {
+    if graph.is_empty()
+        || !graph
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        color_eyre::eyre::bail!(
+            "invalid graph `{graph}`: a graph name is one path segment of ASCII letters, \
+             digits, `-` or `_`"
+        );
+    }
+    Ok(())
+}
+
 /// Apply `--server`/`--graph` to a command's uri/target slots: exclusive
 /// with both (loud error, not silent precedence), no-op when absent.
 pub(crate) fn apply_server_flag(
@@ -311,17 +434,33 @@ impl std::error::Error for PreconditionFailedCli {}
 
 /// Preserve a typed server refusal through the command dispatch so JSON
 /// callers retain its code and detail fields instead of parsing a message.
+/// `output` is the server's body as sent; `missing_credential` is the CLI's
+/// own account of a request that carried no credential.
 #[derive(Debug)]
 pub(crate) struct RemoteErrorCli {
     pub(crate) output: ErrorOutput,
     pub(crate) status: reqwest::StatusCode,
     pub(crate) retry_after: Option<String>,
+    pub(crate) missing_credential: Option<MissingCredential>,
 }
 
 impl std::fmt::Display for RemoteErrorCli {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.output.error)
+        f.write_str(&with_missing_credential(
+            self.output.error.clone(),
+            self.missing_credential.as_ref(),
+        ))
     }
+}
+
+/// A served refusal as `--json` prints it: the server's body unchanged,
+/// beside the CLI's account of a request that carried no credential.
+#[derive(Serialize)]
+pub(crate) struct RemoteRefusalOutput<'a> {
+    #[serde(flatten)]
+    pub(crate) output: &'a ErrorOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) missing_credential: Option<&'a MissingCredential>,
 }
 
 impl std::error::Error for RemoteErrorCli {}
@@ -430,6 +569,7 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
     let status = response.status();
     let retry_after = crate::command_outcome::retry_after(response.headers())
         .map(|value| crate::command_outcome::scrub_backoff(value, bearer_token));
+    let missing = missing_credential(&response).cloned();
     let text = if let Some(limit) = response_limit {
         if status.is_redirection() {
             bail!("managed data redirects are not followed");
@@ -455,7 +595,13 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
             }
             _ => text,
         };
-        return Err(remote_refusal(status, text, retry_after, expected_commit));
+        return Err(remote_refusal(
+            status,
+            text,
+            retry_after,
+            expected_commit,
+            missing.as_ref(),
+        ));
     }
     if response_limit.is_some() {
         // Serde errors can include rejected field values, including a reflected secret.
@@ -468,12 +614,15 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
 
 /// A non-success response as the typed refusal every remote call raises: a
 /// verified 412 as [`PreconditionFailedCli`], any other `ErrorOutput` body as
-/// [`RemoteErrorCli`], a body that is not one as the status and text.
+/// [`RemoteErrorCli`], a body that is not one as the status and text. A
+/// request that carried no credential keeps the reason: beside the typed
+/// body, or after the plain text.
 fn remote_refusal(
     status: reqwest::StatusCode,
     text: String,
     retry_after: Option<String>,
     expected_commit: Option<&str>,
+    missing: Option<&MissingCredential>,
 ) -> color_eyre::eyre::Report {
     if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
         let verified_precondition = status == reqwest::StatusCode::PRECONDITION_FAILED
@@ -500,10 +649,14 @@ fn remote_refusal(
             output: error,
             status,
             retry_after,
+            missing_credential: missing.cloned(),
         }
         .into();
     }
-    color_eyre::eyre::eyre!("server returned {}: {}", status, text)
+    color_eyre::eyre::eyre!(
+        "{}",
+        with_missing_credential(format!("server returned {status}: {text}"), missing)
+    )
 }
 
 /// [`remote_json`] for a route whose success carries no body
@@ -523,8 +676,15 @@ pub(crate) async fn remote_no_content(
     }
     let retry_after = crate::command_outcome::retry_after(response.headers())
         .map(|value| crate::command_outcome::scrub_backoff(value, bearer_token));
+    let missing = missing_credential(&response).cloned();
     let text = response.text().await?;
-    Err(remote_refusal(status, text, retry_after, None))
+    Err(remote_refusal(
+        status,
+        text,
+        retry_after,
+        None,
+        missing.as_ref(),
+    ))
 }
 
 /// The graph URI a command addresses (RFC-011): the scope-resolved URI string

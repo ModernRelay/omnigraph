@@ -105,7 +105,7 @@ fn served_policy_state(server: &TestServer) -> (Value, Value) {
     let read = |arguments: &[&str]| {
         parse_stdout_json(&output_success(
             cli()
-                .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+                .envs(server.credential("bruno-tok"))
                 .args(["--server", &server.base_url, "--graph", "knowledge"])
                 .args(arguments)
                 .arg("--json"),
@@ -1240,7 +1240,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
 
     // Case 2: bruno token against protected main → denied by the server.
     let denied = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .envs(server.credential("bruno-tok"))
         .arg("mutate")
         .arg("--server")
         .arg(&server.base_url)
@@ -1265,7 +1265,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
     // Case 3: ragnor token against main → permitted by admins-write.
     let allowed = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
+            .envs(server.credential("ragnor-tok"))
             .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
@@ -1287,7 +1287,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
     // group (bruno), while admins (ragnor) get write-only rules.
     let verify = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+            .envs(server.credential("bruno-tok"))
             .arg("query")
             .arg("--server")
             .arg(&server.base_url)
@@ -1376,7 +1376,7 @@ fn local_cli_load_enforces_engine_layer_policy() {
 
     // act-bruno: change-on-protected is denied (team-write-unprotected only).
     let denied = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .envs(server.credential("bruno-tok"))
         .arg("load")
         .arg("--mode")
         .arg("overwrite")
@@ -1404,7 +1404,7 @@ fn local_cli_load_enforces_engine_layer_policy() {
     // act-ragnor: admins-write rule permits change anywhere.
     let allowed = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
+            .envs(server.credential("ragnor-tok"))
             .arg("load")
             .arg("--mode")
             .arg("overwrite")
@@ -1445,7 +1445,7 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
     .unwrap();
 
     let denied = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .envs(server.credential("bruno-tok"))
         .arg("load")
         .arg("--mode")
         .arg("merge")
@@ -1473,7 +1473,7 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
 
     let allowed = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
+            .envs(server.credential("ragnor-tok"))
             .arg("load")
             .arg("--mode")
             .arg("merge")
@@ -1507,7 +1507,7 @@ fn local_cli_branch_create_enforces_engine_layer_policy() {
     );
 
     let denied = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .envs(server.credential("bruno-tok"))
         .arg("branch")
         .arg("create")
         .arg("--server")
@@ -1531,7 +1531,7 @@ fn local_cli_branch_create_enforces_engine_layer_policy() {
 
     output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
+            .envs(server.credential("ragnor-tok"))
             .arg("branch")
             .arg("create")
             .arg("--server")
@@ -1560,7 +1560,7 @@ fn local_cli_branch_delete_enforces_engine_layer_policy() {
     // Pre-create the branch as ragnor so there's something to delete.
     output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
+            .envs(server.credential("ragnor-tok"))
             .arg("branch")
             .arg("create")
             .arg("--server")
@@ -1575,7 +1575,7 @@ fn local_cli_branch_delete_enforces_engine_layer_policy() {
     // `--yes` clears the RFC-011 Decision 9 destructive-write confirmation so
     // the policy check (not the confirmation refusal) is what denies.
     let denied = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .envs(server.credential("bruno-tok"))
         .arg("branch")
         .arg("delete")
         .arg("--yes")
@@ -1598,7 +1598,7 @@ fn local_cli_branch_delete_enforces_engine_layer_policy() {
 
     output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
+            .envs(server.credential("ragnor-tok"))
             .arg("branch")
             .arg("delete")
             .arg("--yes")
@@ -1627,7 +1627,7 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
     // Pre-create a feature branch as ragnor (admins-branch-ops covers it).
     output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
+            .envs(server.credential("ragnor-tok"))
             .arg("branch")
             .arg("create")
             .arg("--server")
@@ -1640,7 +1640,7 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
     );
 
     let denied = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .envs(server.credential("bruno-tok"))
         .arg("branch")
         .arg("merge")
         .arg("--server")
@@ -1664,7 +1664,7 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
 
     output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
+            .envs(server.credential("ragnor-tok"))
             .arg("branch")
             .arg("merge")
             .arg("--server")
@@ -2388,9 +2388,11 @@ fn cluster_server_boot_ignores_local_config_in_cwd() {
 /// RFC-007 PR 2: keyed credentials end to end — `login` stores a 0600
 /// credential, the URL-matched server's token chain authenticates remote
 /// reads (env > file), a non-matching URL never sees the token (§D5 rule
-/// 3), and `logout` revokes.
+/// 3), and `logout` revokes. The unkeyed `OMNIGRAPH_BEARER_TOKEN` is never
+/// sent, even when it holds the server's own token: a 401 to a request that
+/// carried no credential says how to bind one.
 #[test]
-fn local_cli_keyed_credentials_authenticate_url_matched_server() {
+fn local_cli_keyed_credentials_authenticate_url_matched_server_issue_1022() {
     // RFC-011 cluster-only: the server boots from a converged cluster
     // serving the fixture graph under id `local`; tokens-only boot is
     // default-deny, which still permits `read`.
@@ -2434,6 +2436,32 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
     // No credential anywhere: the server refuses.
     let output = remote_read(&[]);
     assert!(!output.status.success(), "{output:?}");
+
+    // The unkeyed variable holds the server's real token, yet a declared
+    // server with no keyed token gets no credential.
+    let output = remote_read(&[("OMNIGRAPH_BEARER_TOKEN", "secret-tok")]);
+    assert!(
+        !output.status.success(),
+        "the unkeyed token must not reach a declared server: {output:?}"
+    );
+    let refusal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(refusal["code"], "unauthorized", "{refusal}");
+    // The server's own message is passed through unchanged.
+    assert!(
+        !refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("no credential is"),
+        "{refusal}"
+    );
+    assert_eq!(
+        refusal["missing_credential"],
+        serde_json::json!({
+            "server": "test-srv",
+            "hint": "no credential is stored for server `test-srv`: run \
+                     `omnigraph login test-srv` or set OMNIGRAPH_TOKEN_TEST_SRV"
+        })
+    );
 
     // login with a WRONG token (via stdin, the documented pipe flow).
     let output = cli()
@@ -2484,12 +2512,35 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
         "keyed env token must outrank the credentials file"
     );
 
-    // §D5 rule 3: a URL matching no operator server never sees the token.
+    // §D5 rule 3: a URL matching no operator server never sees the token,
+    // neither the keyed one nor the unkeyed variable.
     write_server_url("http://127.0.0.1:1");
-    let output = remote_read(&[]);
+    let output = remote_read(&[("OMNIGRAPH_BEARER_TOKEN", "secret-tok")]);
     assert!(
         !output.status.success(),
-        "token keyed to another url must not be sent here"
+        "token keyed to another url must not be sent here: {output:?}"
+    );
+    let refusal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(refusal["code"], "unauthorized", "{refusal}");
+    // The server's own message is passed through unchanged.
+    assert!(
+        !refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("no credential is"),
+        "{refusal}"
+    );
+    assert_eq!(
+        refusal["missing_credential"],
+        serde_json::json!({
+            "unbound": server.base_url,
+            "hint": format!(
+                "no credential is bound to {}: declare it under `servers:` in {}, then run \
+                 `omnigraph login <name>` or set OMNIGRAPH_TOKEN_<NAME>",
+                server.base_url,
+                operator_home.path().join("config.yaml").display()
+            )
+        })
     );
     write_server_url(&server.base_url);
 

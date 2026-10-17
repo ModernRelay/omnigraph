@@ -93,7 +93,7 @@ fn blob_write_parity() -> Parity {
 
 impl Parity {
     fn run(&self, args: &[&str]) -> (std::process::Output, std::process::Output) {
-        run_both(&self.local, &self.server.base_url, args)
+        run_both(&self.local, &self.server, args)
     }
 }
 
@@ -280,7 +280,7 @@ fn parity_schema_show() {
         let output = output_success(
             cli()
                 .env("OMNIGRAPH_HOME", &home)
-                .env("OMNIGRAPH_BEARER_TOKEN", "parity-tok")
+                .env("OMNIGRAPH_TOKEN_LOCAL", "parity-tok")
                 .args(&addressing)
                 .args(["schema", "show"]),
         );
@@ -381,7 +381,7 @@ fn parity_mutate() {
                     .arg(PARITY_ACTOR);
             } else {
                 command
-                    .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+                    .envs(p.server.credential(PARITY_TOKEN))
                     .arg("--server")
                     .arg(&p.server.base_url)
                     .arg("--graph")

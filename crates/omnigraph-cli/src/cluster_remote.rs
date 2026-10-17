@@ -16,7 +16,7 @@ use crate::commands::cluster::core_deployment_result;
 use crate::graph_http::{ApiContractError, GraphHttpClient, ServerTransport};
 use crate::helpers::{
     RemoteErrorCli, apply_bearer_token, remote_response_json_bounded, remote_url,
-    resolve_remote_bearer_token_with_input, resolve_server_flag_with_config,
+    resolve_server_flag_with_config, served_client_with_config,
 };
 use crate::output::write_json;
 
@@ -164,8 +164,7 @@ impl RemoteCluster {
         let operator_config = input.get(stderr)?;
         let root = resolve_server_flag_with_config(operator_config, Some(server), None)?
             .expect("explicit server");
-        let token = resolve_remote_bearer_token_with_input(input, operator_config, Some(&root))?;
-        let client = GraphHttpClient::new(&root)?;
+        let (client, token) = served_client_with_config(input, operator_config, &root, &root)?;
         Ok(Self {
             root,
             token,

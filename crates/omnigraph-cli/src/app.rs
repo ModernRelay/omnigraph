@@ -154,6 +154,9 @@ fn finish(
                         None => failure.output.error.clone(),
                     };
                     writeln!(stderr, "{message}")?;
+                    if let Some(missing) = &failure.missing_credential {
+                        writeln!(stderr, "{missing}")?;
+                    }
                     if let Some(status) = failure.http_status {
                         writeln!(stderr, "HTTP {status}")?;
                     }
@@ -179,9 +182,15 @@ fn finish(
         return Ok(Completion::exit(failure.exit));
     }
     if let Some(output) = error_output_of(&error) {
+        let refusal = RemoteRefusalOutput {
+            output: &output,
+            missing_credential: error
+                .downcast_ref::<RemoteErrorCli>()
+                .and_then(|remote| remote.missing_credential.as_ref()),
+        };
         match machine {
             Some(format) => {
-                write_machine(&output, format, stdout)?;
+                write_machine(&refusal, format, stdout)?;
                 stdout.flush()?;
             }
             None => match &output.diagnostic {

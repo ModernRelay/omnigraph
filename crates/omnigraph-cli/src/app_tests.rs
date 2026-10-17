@@ -269,6 +269,7 @@ async fn delivered_refusals_keep_their_exit_status_when_unused_stdout_cannot_flu
                 output: busy,
                 status: StatusCode::TOO_MANY_REQUESTS,
                 retry_after: Some("3".into()),
+                missing_credential: None,
             }
             .into(),
             75,

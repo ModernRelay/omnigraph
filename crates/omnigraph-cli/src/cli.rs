@@ -24,8 +24,6 @@ pub(crate) use crate::commands::transfer::{BlobCommand, CliLoadMode};
 use crate::commands::transfer::{ExportArgs, LoadArgs};
 use crate::embed::EmbedArgs;
 
-pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
-
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]

@@ -291,17 +291,24 @@ pub(crate) fn map_embedded_blob_error(error: OmniError) -> Report {
     }
 }
 
-pub(crate) fn remote_blob_error(status: StatusCode) -> Report {
-    match status {
-        StatusCode::BAD_REQUEST => eyre!("invalid Blob selector"),
-        StatusCode::UNAUTHORIZED => eyre!("Blob read requires authentication"),
-        StatusCode::FORBIDDEN => eyre!("Blob read is forbidden"),
-        StatusCode::NOT_FOUND => eyre!("Blob cell not found"),
-        StatusCode::CONFLICT => eyre!("Blob read target changed; retry the command"),
-        StatusCode::RANGE_NOT_SATISFIABLE => eyre!("Blob range is not satisfiable"),
-        StatusCode::INTERNAL_SERVER_ERROR => eyre!("Blob delivery failed"),
-        other => eyre!("Blob server request failed with status {other}"),
-    }
+pub(crate) fn remote_blob_error(
+    status: StatusCode,
+    missing: Option<&crate::helpers::MissingCredential>,
+) -> Report {
+    let message = match status {
+        StatusCode::BAD_REQUEST => "invalid Blob selector".to_string(),
+        StatusCode::UNAUTHORIZED => "Blob read requires authentication".to_string(),
+        StatusCode::FORBIDDEN => "Blob read is forbidden".to_string(),
+        StatusCode::NOT_FOUND => "Blob cell not found".to_string(),
+        StatusCode::CONFLICT => "Blob read target changed; retry the command".to_string(),
+        StatusCode::RANGE_NOT_SATISFIABLE => "Blob range is not satisfiable".to_string(),
+        StatusCode::INTERNAL_SERVER_ERROR => "Blob delivery failed".to_string(),
+        other => format!("Blob server request failed with status {other}"),
+    };
+    eyre!(
+        "{}",
+        crate::helpers::with_missing_credential(message, missing)
+    )
 }
 
 #[derive(Debug)]
@@ -517,8 +524,18 @@ mod tests {
     #[test]
     fn remote_conflict_matches_embedded_target_change_diagnostic() {
         assert_eq!(
-            remote_blob_error(StatusCode::CONFLICT).to_string(),
+            remote_blob_error(StatusCode::CONFLICT, None).to_string(),
             "Blob read target changed; retry the command"
+        );
+    }
+
+    #[test]
+    fn remote_unauthorized_names_the_missing_credential() {
+        let missing = crate::helpers::MissingCredential::Server("prod".to_string());
+        assert_eq!(
+            remote_blob_error(StatusCode::UNAUTHORIZED, Some(&missing)).to_string(),
+            "Blob read requires authentication\nno credential is stored for server `prod`: \
+             run `omnigraph login prod` or set OMNIGRAPH_TOKEN_PROD"
         );
     }
 }

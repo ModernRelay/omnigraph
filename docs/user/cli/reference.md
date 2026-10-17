@@ -224,9 +224,9 @@ aliases:
 Each profile binds exactly one of `server`, `cluster`, or `store`. Select it with
 `--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled by a profile.
 
-Bearer tokens never belong in `config.yaml`. Store a token with
-`omnigraph login <server>` or provide `OMNIGRAPH_BEARER_TOKEN` for the current
-invocation.
+Bearer tokens never belong in `config.yaml`. Bind one to a declared server with
+`omnigraph login <server>` or `OMNIGRAPH_TOKEN_<NAME>`; the CLI sends it only to
+URLs under that server's `url` (see [server credentials](index.md#use-a-server)).
 
 ## Managed cluster commands
 
@@ -323,7 +323,7 @@ omnigraph cluster apply --managed --plan PREVIEW_ID --idempotency-key DEPLOYMENT
 
 The canonical `OMNIGRAPH_CONTROL_API` must match the selected context. A
 missing or mismatched pair refuses before any request. These credentials are
-separate from `OMNIGRAPH_BEARER_TOKEN`, named servers, and operator profiles.
+separate from [server credentials](index.md#use-a-server) and operator profiles.
 
 `--managed` requires context except `create`, `list` and explicit-origin operation
 lookup; `--direct` is rejected. Managed API failures never trigger local deployment.
