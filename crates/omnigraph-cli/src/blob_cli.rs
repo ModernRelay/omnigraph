@@ -5,7 +5,7 @@
 //! range, and error vocabulary identical across the embedded and served arms.
 
 use std::fs::File;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -219,7 +219,11 @@ pub(crate) fn parse_if_match(raw: Option<&str>) -> Result<Option<BlobPreconditio
 /// graph is addressed. Input over the put limit is refused with the resource
 /// the engine and the server report, without reading past one more byte;
 /// an interactive stdin is refused rather than waited on.
-pub(crate) fn read_put_input(file: Option<&Path>) -> Result<bytes::Bytes> {
+pub(crate) fn read_put_input(
+    file: Option<&Path>,
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
+) -> Result<bytes::Bytes> {
     let limit = omnigraph::BLOB_WRITE_MAX_BYTES;
     let too_large = |actual: u64| -> Report {
         OmniError::resource_limit(omnigraph::BLOB_WRITE_PAYLOAD_RESOURCE, limit, actual).into()
@@ -242,14 +246,12 @@ pub(crate) fn read_put_input(file: Option<&Path>) -> Result<bytes::Bytes> {
                 .map_err(|error| eyre!("cannot read --file {}: {error}", path.display()))?;
         }
         None => {
-            let stdin = io::stdin();
-            if stdin.is_terminal() {
+            if stdin_is_terminal {
                 return Err(eyre!(
                     "blob put reads its bytes from stdin; pipe them in or pass --file PATH"
                 ));
             }
             stdin
-                .lock()
                 .take(limit + 1)
                 .read_to_end(&mut buffer)
                 .map_err(|error| eyre!("cannot read stdin: {error}"))?;
@@ -348,6 +350,123 @@ fn required_header<'a>(headers: &'a HeaderMap, name: &HeaderName, label: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct InterruptedInput<'a> {
+        remaining: &'a [u8],
+        interrupted: bool,
+    }
+
+    impl Read for InterruptedInput<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.remaining.read(buffer)
+        }
+    }
+
+    struct UnreadInput;
+
+    impl Read for UnreadInput {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("stdin must not be read");
+        }
+    }
+
+    #[test]
+    fn put_input_preserves_empty_and_binary_stdin_after_interruption() {
+        for input in [b"".as_slice(), b"\0\xff\nblob\r\n".as_slice()] {
+            let mut stdin = InterruptedInput {
+                remaining: input,
+                interrupted: false,
+            };
+            assert_eq!(read_put_input(None, &mut stdin, false).unwrap(), input);
+            assert!(stdin.interrupted);
+            assert!(stdin.remaining.is_empty());
+        }
+    }
+
+    #[test]
+    fn put_input_refuses_terminal_before_reading_and_file_ignores_stdin() {
+        assert_eq!(
+            read_put_input(None, &mut UnreadInput, true)
+                .unwrap_err()
+                .to_string(),
+            "blob put reads its bytes from stdin; pipe them in or pass --file PATH"
+        );
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"file\0bytes").unwrap();
+        assert_eq!(
+            read_put_input(Some(file.path()), &mut UnreadInput, true).unwrap(),
+            b"file\0bytes".as_slice()
+        );
+    }
+
+    #[test]
+    fn put_input_stops_at_the_existing_limit_plus_one_byte() {
+        struct CountingInput {
+            remaining: u64,
+            read: u64,
+        }
+
+        impl Read for CountingInput {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = self.remaining.min(buffer.len() as u64) as usize;
+                buffer[..count].fill(b'b');
+                self.remaining -= count as u64;
+                self.read += count as u64;
+                Ok(count)
+            }
+        }
+
+        let limit = omnigraph::BLOB_WRITE_MAX_BYTES;
+        for length in [limit, limit + 2] {
+            let mut stdin = CountingInput {
+                remaining: length,
+                read: 0,
+            };
+            let result = read_put_input(None, &mut stdin, false);
+            if length == limit {
+                assert_eq!(result.unwrap().len() as u64, limit);
+                assert_eq!(stdin.read, limit);
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<OmniError>(),
+                    Some(OmniError::ResourceLimitExceeded {
+                        resource,
+                        limit: reported_limit,
+                        actual,
+                    }) if resource == omnigraph::BLOB_WRITE_PAYLOAD_RESOURCE
+                        && *reported_limit == limit
+                        && *actual == limit + 1
+                ));
+                assert_eq!(stdin.read, limit + 1);
+                assert_eq!(stdin.remaining, 1, "the oversized suffix stays unread");
+            }
+        }
+    }
+
+    #[test]
+    fn put_input_read_failure_does_not_accept_a_delivered_prefix() {
+        struct FailedInput;
+
+        impl Read for FailedInput {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("input closed"))
+            }
+        }
+
+        let mut stdin = b"prefix".as_slice().chain(FailedInput);
+        assert_eq!(
+            read_put_input(None, &mut stdin, false)
+                .unwrap_err()
+                .to_string(),
+            "cannot read stdin: input closed"
+        );
+    }
 
     #[test]
     fn range_flags_reject_zero_and_overflow_before_resolution() {

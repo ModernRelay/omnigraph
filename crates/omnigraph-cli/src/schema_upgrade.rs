@@ -1,5 +1,7 @@
 use super::*;
+use crate::app::Completion;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     profile: &Option<String>,
     store: &Option<String>,
@@ -7,8 +9,10 @@ pub(crate) async fn run(
     check: bool,
     json: bool,
     quiet: bool,
-) -> Result<()> {
-    let target = scope::resolve_scope(
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Completion> {
+    let target = scope::resolve_scope_from_env(
         &operator::load_operator_config()?,
         planes::Capability::Direct,
         scope::ScopeFlags {
@@ -38,7 +42,7 @@ pub(crate) async fn run(
         );
     }
     if !check {
-        echo_write_target(quiet, "schema upgrade-system-columns", &uri, false);
+        write_target(quiet, "schema upgrade-system-columns", &uri, false, stderr)?;
     }
     let db = if check {
         omnigraph::db::Omnigraph::open_read_only(&uri).await?
@@ -49,40 +53,46 @@ pub(crate) async fn run(
         .upgrade_system_columns(omnigraph::db::SystemColumnUpgradeOptions { check })
         .await?;
     if json {
-        print_json(&report)?;
+        write_json(&report, stdout)?;
     } else {
-        print_human(&report)?;
+        write_human(&report, stdout)?;
     }
     if !report.success() {
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-fn print_human(report: &omnigraph::db::SystemColumnUpgradeReport) -> Result<()> {
+fn write_human(
+    report: &omnigraph::db::SystemColumnUpgradeReport,
+    writer: &mut dyn Write,
+) -> Result<()> {
     let mode = serde_json::to_value(report.mode)?;
     let outcome = serde_json::to_value(report.outcome)?;
-    println!(
+    writeln!(
+        writer,
         "system-column upgrade {}: {} ({})",
         report.location,
         outcome.as_str().unwrap_or("unknown"),
         mode.as_str().unwrap_or("unknown")
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "storage format: v{} -> v{}",
         report.stamp_before, report.stamp_after
-    );
-    println!("tables: {}", report.tables.join(", "));
+    )?;
+    writeln!(writer, "tables: {}", report.tables.join(", "))?;
     if let Some(version) = report.graph_manifest_version {
-        println!("graph manifest version: {version}");
+        writeln!(writer, "graph manifest version: {version}")?;
     }
     for finding in &report.findings {
-        println!("{}: {}", finding.code, finding.message);
+        writeln!(writer, "{}: {}", finding.code, finding.message)?;
     }
     if matches!(report.mode, omnigraph::db::UpgradeMode::Check) {
-        println!(
+        writeln!(
+            writer,
             "Check is advisory. Stop every server serving the graph and retain a verified backup before execution."
-        );
+        )?;
     }
     Ok(())
 }
@@ -90,6 +100,80 @@ fn print_human(report: &omnigraph::db::SystemColumnUpgradeReport) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn system_column_upgrade_report_preserves_bytes_and_propagates_write_failure() {
+        use omnigraph::db::{
+            SystemColumnUpgradeFinding, SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
+            UpgradeMode,
+        };
+
+        struct PrefixWriter(Vec<u8>);
+
+        impl Write for PrefixWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let remaining = 7 - self.0.len();
+                if remaining == 0 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "output closed"));
+                }
+                let count = remaining.min(bytes.len());
+                self.0.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("report formatting leaves flush to application completion");
+            }
+        }
+
+        let report = SystemColumnUpgradeReport {
+            location: "graph".to_string(),
+            mode: UpgradeMode::Check,
+            outcome: SystemColumnUpgradeOutcome::Refused,
+            stamp_before: 16,
+            stamp_after: 16,
+            tables: vec!["node:Doc".to_string(), "edge:Link".to_string()],
+            findings: vec![SystemColumnUpgradeFinding {
+                code: "system_columns_preflight",
+                message: "stop serving first".to_string(),
+            }],
+            graph_manifest_version: None,
+        };
+        let completed = SystemColumnUpgradeReport {
+            mode: UpgradeMode::Execute,
+            outcome: SystemColumnUpgradeOutcome::Completed,
+            findings: Vec::new(),
+            graph_manifest_version: Some(9),
+            ..report.clone()
+        };
+        for (report, expected) in [
+            (
+                report,
+                "system-column upgrade graph: refused (check)\n\
+                storage format: v16 -> v16\ntables: node:Doc, edge:Link\n\
+                system_columns_preflight: stop serving first\n\
+                Check is advisory. Stop every server serving the graph and retain a verified backup before execution.\n",
+            ),
+            (
+                completed,
+                "system-column upgrade graph: completed (execute)\n\
+                storage format: v16 -> v16\ntables: node:Doc, edge:Link\ngraph manifest version: 9\n",
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            write_human(&report, &mut bytes).unwrap();
+            assert_eq!(bytes, expected.as_bytes());
+
+            let mut writer = PrefixWriter(Vec::new());
+            let error = write_human(&report, &mut writer).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(writer.0, b"system-");
+        }
+    }
 
     #[test]
     fn system_column_upgrade_parses_check_and_json() {

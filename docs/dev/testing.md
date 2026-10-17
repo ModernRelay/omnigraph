@@ -139,7 +139,23 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
 workspace gate; its required-cell checks reject removed or ignored cases. The
 lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
-timeout without replaying a committed merge. Its deployment matrix holds a real
+timeout without replaying a committed merge or commit publication/drop (a drop's
+empty response has no body to truncate). Output unit tests inject write and flush
+failures; application tests check baseline file-lock custody through cursor flush,
+transfer receipt failures after a single dispatched write, and raw stream failures
+without mixed diagnostics. `blob_cli` unit tests own bounded stdin capture and
+interrupted reads. Extend `cli_data` for load consent and source-read ordering,
+Blob preconditions and output-file lifecycle; reuse its HTTP fixture and the
+existing parity matrix. Query semantics remain in GQT, not duplicated in these
+CLI boundary tests.
+Schema-family application tests verify that failed result delivery preserves an
+applied schema and its actor with one publication, and that an undeliverable
+target line precedes writable open. Init output failure leaves a readable graph;
+lint report failures and subsequent invocations remain reusable. Extend the
+existing `cli_schema_config`, `cli_cluster` and `cli_data` owners for addressing,
+cluster ownership and offline source-read ordering.
+
+The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server
