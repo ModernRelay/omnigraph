@@ -2,23 +2,18 @@
 
 use clap::ValueEnum;
 use color_eyre::eyre::{Result, bail};
-use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
+use omnigraph::db::Omnigraph;
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
     CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput,
-    SchemaApplyOutput, SnapshotDatasetOutput, query_file_refusals,
+    SchemaApplyOutput, SnapshotDatasetOutput,
 };
 use omnigraph_cluster::{
     DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
     ValidateOutput, force_unlock_config_dir, observe_config_dir, status_config_dir,
     validate_config_dir,
 };
-use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, CommitWrite, EmptyFile, FileBody, QueryFile, SettingStmt,
-};
-use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::settings::{SettingId, SettingValue};
 use omnigraph_compiler::{
     JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSchemaSource,
     QueryLintSeverity, QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, build_catalog,
@@ -48,6 +43,7 @@ mod cli;
 mod client;
 mod cluster_remote;
 mod command_outcome;
+mod commands;
 mod graph_http;
 mod helpers;
 mod invocation;

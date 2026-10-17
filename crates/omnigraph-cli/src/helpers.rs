@@ -4,13 +4,8 @@
 
 use std::io::IsTerminal;
 
-use omnigraph_api_types::{
-    ChangeRequest, QueryRequest, branch_statement_refusals, query_file_refusals,
-};
-use omnigraph_compiler::query::ast::{
-    BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
-};
-use omnigraph_compiler::settings::SettingId;
+use omnigraph_api_types::{ChangeRequest, QueryRequest, query_file_refusals};
+use omnigraph_compiler::query::ast::QueryFile;
 
 use super::*;
 use crate::app::Completion;
@@ -373,60 +368,6 @@ pub(crate) fn resolve_server_flag_with_config(
 /// Param precedence: --params > positional args > the alias's fixed
 /// params. Server and credential-owner selection use the captured config;
 /// the keyed token applies via the ordinary URL match.
-pub(crate) async fn execute_operator_alias(
-    operator_config: &OperatorConfig,
-    alias_name: &str,
-    alias: &crate::operator::OperatorAlias,
-    alias_args: &[String],
-    explicit_params: Option<Value>,
-) -> Result<ReadOutput> {
-    let root = resolve_server_flag_with_config(operator_config, Some(&alias.server), None)?
-        .expect("server name is present");
-    let uri =
-        resolve_server_flag_with_config(operator_config, Some(&root), alias.graph.as_deref())?
-            .expect("server name is present");
-    let client = crate::graph_http::GraphHttpClient::new(&root)?;
-    let bearer_token = resolve_remote_bearer_token_with_config(operator_config, Some(&uri))?;
-
-    let mut params = serde_json::Map::new();
-    for (key, value) in &alias.params {
-        let Some(key) = key.as_str() else {
-            bail!("alias '{alias_name}': params keys must be strings");
-        };
-        params.insert(key.to_string(), serde_json::to_value(value)?);
-    }
-    if alias_args.len() > alias.args.len() {
-        bail!(
-            "alias '{alias_name}' takes {} positional arg(s) ({}), got {}",
-            alias.args.len(),
-            alias.args.join(", "),
-            alias_args.len()
-        );
-    }
-    for (name, value) in alias.args.iter().zip(alias_args) {
-        params.insert(name.clone(), parse_alias_value(value));
-    }
-    if let Some(Value::Object(explicit)) = explicit_params {
-        for (key, value) in explicit {
-            params.insert(key, value);
-        }
-    }
-
-    let mut body = serde_json::Map::new();
-    body.insert("expect_mutation".to_string(), Value::Bool(false));
-    if !params.is_empty() {
-        body.insert("params".to_string(), Value::Object(params));
-    }
-    remote_json(
-        &client,
-        Method::POST,
-        remote_url(&uri, &["queries", &alias.query], &[])?,
-        Some(Value::Object(body)),
-        bearer_token.as_deref(),
-    )
-    .await
-}
-
 /// Apply `--server`/`--graph` to a command's uri/target slots: exclusive
 /// with both (loud error, not silent precedence), no-op when absent.
 pub(crate) fn apply_server_flag(
@@ -867,20 +808,6 @@ pub(crate) fn resolve_branch(
         .unwrap_or_else(|| default_branch.to_string())
 }
 
-pub(crate) fn resolve_read_target(
-    cli_branch: Option<String>,
-    cli_snapshot: Option<String>,
-    alias_branch: Option<String>,
-) -> Result<ReadTarget> {
-    if cli_branch.is_some() && cli_snapshot.is_some() {
-        bail!("read target may specify branch or snapshot, not both");
-    }
-    Ok(read_target_from_cli(
-        cli_branch.or(alias_branch),
-        cli_snapshot,
-    ))
-}
-
 pub(crate) fn resolve_query_path(
     explicit_query: Option<&PathBuf>,
     alias_query: Option<&str>,
@@ -895,27 +822,6 @@ pub(crate) fn resolve_query_path(
                 "exactly one of --query, --query-string, or --alias must be provided"
             )
         })
-}
-
-pub(crate) fn resolve_query_source(
-    explicit_query: Option<&PathBuf>,
-    inline_query: Option<&str>,
-    alias_query: Option<&str>,
-) -> Result<String> {
-    if let Some(inline) = inline_query {
-        if inline.trim().is_empty() {
-            bail!("--query-string must not be empty");
-        }
-        return Ok(inline.to_string());
-    }
-    Ok(fs::read_to_string(resolve_query_path(
-        explicit_query,
-        alias_query,
-    )?)?)
-}
-
-pub(crate) fn parse_alias_value(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
 }
 
 /// The format cascade (RFC-011): `--json` > `--format` > alias format >
@@ -936,23 +842,6 @@ pub(crate) fn resolve_read_format(
                 .and_then(|operator| operator.output())
         })
         .unwrap_or_default()
-}
-
-pub(crate) fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
-    if let Some(snapshot) = snapshot {
-        ReadTarget::snapshot(SnapshotId::new(snapshot))
-    } else {
-        ReadTarget::branch(branch.unwrap_or_else(|| "main".to_string()))
-    }
-}
-
-pub(crate) fn load_params_json(params: &ParamsArgs) -> Result<Option<Value>> {
-    match (&params.params, &params.params_file) {
-        (Some(inline), None) => Ok(Some(serde_json::from_str(inline)?)),
-        (None, Some(path)) => Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?)),
-        (None, None) => Ok(None),
-        (Some(_), Some(_)) => bail!("only one of --params or --params-file may be provided"),
-    }
 }
 
 /// Pick the query the caller named out of an already-parsed source. An
@@ -989,79 +878,6 @@ pub(crate) fn query_params_from_json(
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
-}
-
-/// The server's refusal for a control write sent through `query`. The door
-/// rule and its rationale live on `refuse_wrong_door` in
-/// `crates/omnigraph-server/src/handlers/dispatch.rs`; this side only restates it.
-pub(crate) fn control_write_at_read_door(write: &BranchWrite) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
-        write.statement_name(),
-    )
-}
-
-/// The server's refusal for `commit publish` or `commit drop` sent through
-/// `query`: a control write, under the statement's own name.
-pub(crate) fn commit_write_at_read_door(write: &CommitWrite) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
-        write.statement_name(),
-    )
-}
-
-/// The server's refusal for `load csv` sent through `query`: a control
-/// write, under the statement's own name.
-pub(crate) fn load_at_read_door(stmt: &omnigraph_compiler::query::ast::LoadStmt) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
-        stmt.statement_name(),
-    )
-}
-
-/// The server's refusal for a branch read (`branch list`, `branch diff`, …)
-/// sent through `mutate`.
-pub(crate) fn read_at_write_door(statement_name: &str) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::READ_AT_WRITE_DOOR,
-        statement_name,
-    )
-}
-
-/// `show` is a read: the same refusal `branch list` meets at the write door.
-pub(crate) fn show_at_write_door(id: Option<SettingId>) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::READ_AT_WRITE_DOOR,
-        &show_statement_name(id),
-    )
-}
-
-/// The server's refusal for an `explain` statement sent through `mutate`.
-pub(crate) fn explain_at_write_door() -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::READ_AT_WRITE_DOOR,
-        EXPLAIN_STATEMENT_NAME,
-    )
-}
-
-/// The server's envelope refusals for a branch statement, checked in its
-/// order: a request target, then a query name or parameters, then a commit
-/// precondition. Runs before any round trip or engine open.
-pub(crate) fn refuse_statement_envelope(
-    has_target: bool,
-    has_name_or_params: bool,
-    has_expected_head: bool,
-) -> Result<()> {
-    if has_target {
-        bail!(branch_statement_refusals::REQUEST_TARGET);
-    }
-    if has_name_or_params {
-        bail!(branch_statement_refusals::NAME_OR_PARAMS);
-    }
-    if has_expected_head {
-        bail!(branch_statement_refusals::COMMIT_PRECONDITION);
-    }
-    Ok(())
 }
 
 /// The `POST /query` body for `branch list` or `show`: the source alone; the
@@ -1363,6 +1179,7 @@ pub(crate) async fn execute_queries_list(
 
 #[cfg(test)]
 mod tests {
+    use omnigraph_compiler::query::parser::parse_query;
     use super::*;
 
     #[test]
