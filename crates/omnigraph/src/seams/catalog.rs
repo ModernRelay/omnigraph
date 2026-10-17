@@ -87,6 +87,7 @@ omnigraph_seams::catalog! {
     crate::db::omnigraph::collector::CLEANUP_SWEEP_PRE_MANIFEST_DELETE,
     crate::db::omnigraph::collector::CLEANUP_SWEEP_BETWEEN_MANIFESTS,
     crate::db::omnigraph::collector::CLEANUP_SWEEP_PRE_FILE_DELETE,
+    crate::db::omnigraph::collector::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE,
 }
 
 /// The one string-keyed lookup: a case file or the harness names a seam, the catalog answers.

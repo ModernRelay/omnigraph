@@ -857,7 +857,19 @@ New evidence, each an entry in `blocked_on`:
 - `detached_commit_matrix.rs` and `failpoints.rs`: promotion windows
   deleted; the windows `cleanup.sweep_pre_manifest_delete`,
   `cleanup.sweep_between_manifests` and `cleanup.sweep_pre_file_delete`
-  added, each reached by the `cleanup` milestone recipe.
+  added, each reached by the `cleanup` milestone recipe, and
+  `cleanup.sweep_pre_dead_manifest_delete` between the dead stagings' files
+  and their manifests, reached by its own recipe after the reach census's
+  setup crash strands an index build before its manifest commit
+  (`dst_dead_staging_sweep_window_is_reached_and_retried`). A window inside
+  the sweep defers its table rather than failing `cleanup`; the DST judges
+  that table's retry like a crashed cleanup's, a rerun that must finish it
+  under the collector oracle. On the file backend, where Lance reports an
+  absent index directory as `NotFound` and DST's shared-memory store lists
+  it empty, `failpoints.rs` stops a pass at `cleanup.sweep_pre_manifest_delete`,
+  `cleanup.sweep_between_manifests` and
+  `cleanup.sweep_pre_dead_manifest_delete` with an index directory already
+  deleted, and its retry converges.
 
 ### Acceptance thresholds
 

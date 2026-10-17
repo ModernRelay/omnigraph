@@ -1871,6 +1871,68 @@ fn dst_maintenance_obligations_bite_and_replay() {
     }
 }
 
+/// DEAD-STAGING MANIFEST WINDOW, the active pin. `census_setup` crashes the
+/// window recipe's index build before its manifest commit, stranding a
+/// detached staging; the recipe's next insert moves main's head past the
+/// head the staging recorded, so the recipe's cleanup judges it dead. The
+/// census cell must cross `cleanup.sweep_pre_dead_manifest_delete`. Stopped
+/// there, after the dead staging's files and before its manifest, that
+/// cleanup leaves the table owed: the obligation pass's clean rerun must
+/// finish it, with the collector oracle finding no dead staging left. Both
+/// universes replay strictly.
+#[cfg(feature = "failpoints")]
+#[test]
+#[serial]
+fn dst_dead_staging_sweep_window_is_reached_and_retried() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let window = omnigraph::seams::catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.name();
+    let probe = dead_staging_sweep_scenario(false);
+    let a = run_universe("shared-memory://dst-dead-staging-probe-a", &probe);
+    assert!(a.crossed, "the recipe's cleanup must cross {window}");
+    assert_eq!(a.crashes, 1, "only the setup crash dies");
+    let b = run_universe("shared-memory://dst-dead-staging-probe-b", &probe);
+    omnigraph_dst::harness::assert_strict_replay(&a, &b, "dead-staging probe: strict replay");
+
+    let stopped = dead_staging_sweep_scenario(true);
+    let a = run_universe("shared-memory://dst-dead-staging-stop-a", &stopped);
+    let context = format!("deferred:{window}@op{DEAD_STAGING_CLEANUP_OP}");
+    assert!(
+        a.reconcile_verdicts
+            .iter()
+            .any(|(tag, verdict, _)| *tag == context && verdict == "Deferred"),
+        "the stopped cleanup must leave the table owed: {:?}",
+        a.reconcile_verdicts
+    );
+    assert_eq!(a.crashes, 1, "the window defers a table; nothing dies");
+    assert_eq!(
+        a.maintenance_reruns, 2,
+        "the setup crash and the owed table each get their obligation pass"
+    );
+    let b = run_universe("shared-memory://dst-dead-staging-stop-b", &stopped);
+    omnigraph_dst::harness::assert_strict_replay(&a, &b, "dead-staging stop: strict replay");
+}
+
+/// The op the recipe's cleanup lands on in seed 40052.
+#[cfg(feature = "failpoints")]
+const DEAD_STAGING_CLEANUP_OP: usize = 8;
+
+/// The reach census's first cell for the window before the dead stagings'
+/// manifests (seed 40052), probing the window or, with `stop`, failing the
+/// recipe's cleanup at it.
+#[cfg(feature = "failpoints")]
+fn dead_staging_sweep_scenario(stop: bool) -> Scenario {
+    let window = omnigraph::seams::catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.name();
+    Scenario {
+        seed: 40_052,
+        ops: 30,
+        crash_on_match: census_setup(window),
+        crash_at: stop.then_some((DEAD_STAGING_CLEANUP_OP, window)),
+        probe_window: (!stop).then_some(window),
+        reach_target: Some(window),
+        ..Default::default()
+    }
+}
+
 #[cfg(feature = "failpoints")]
 fn returned_cleanup_error_scenario(keep_handle: bool) -> Scenario {
     Scenario {
@@ -1916,6 +1978,17 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
             returned_cleanup_error_scenario(keep_handle),
         )
     }));
+    // A cleanup the window left owing a table is judged like a crashed one.
+    cases.push((
+        "deferred-cleanup".to_string(),
+        Scenario {
+            seed: 7,
+            ops: 24,
+            crash_on_match: Some(("cleanup.sweep_pre_manifest_delete", 0)),
+            reach_target: Some("cleanup.sweep_pre_manifest_delete"),
+            ..Default::default()
+        },
+    ));
     for (case, mut sc) in cases {
         sc.fail_maintenance_rerun = true;
         let result = omnigraph_dst::harness::run_universe_caught(
@@ -1942,6 +2015,12 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
             msg.contains("detector=Store(Query)/MaintenanceObligations"),
             "s20 sensitivity: the rendered row must carry the detector field, got: {msg}"
         );
+        if case == "deferred-cleanup" {
+            assert!(
+                msg.contains("deferred:cleanup.sweep_pre_manifest_delete@op"),
+                "s20 sensitivity: the red must come from the owed table's pass, got: {msg}"
+            );
+        }
     }
 }
 
@@ -1957,9 +2036,15 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
 ///   (post_phase_b merge = roll-forward; post_table_commit mutation =
 ///   rollback+restore; post_fork_pre_commit = zero-effect orphan discard;
 ///   post_finalize = any recovery pass for the list/audit steps).
+/// - the window before the dead stagings' manifests: an index build crashed
+///   before its manifest commit leaves the unpublished staging that the
+///   window's recipe then makes dead and reclaims.
 fn census_setup(window: &'static str) -> Option<(&'static str, usize)> {
     match window {
         "classify.fresh_read" | "cleanup.reconcile_fork" => None,
+        "cleanup.sweep_pre_dead_manifest_delete" => {
+            Some(("ensure_indices.post_phase_b_pre_manifest_commit", 0))
+        }
         "recovery.before_roll_forward_publish" => {
             Some(("branch_merge.post_phase_b_pre_manifest_commit", 0))
         }
@@ -3424,7 +3509,7 @@ fn dst_predict_born_on_both_person_probe() {
 ///   cargo test -p omnigraph-dst dst_window_reach_probe -- --ignored --nocapture
 #[test]
 #[serial]
-#[ignore = "instrument: 66-window one-universe-each milestone reach census"]
+#[ignore = "instrument: one-universe-each milestone reach census over the crash-window catalog"]
 fn dst_window_reach_probe() {
     let _s = omnigraph::seams::FailScenario::setup();
     let mut crossed: Vec<&str> = Vec::new();
