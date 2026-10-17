@@ -376,4 +376,6 @@ them. RFC 0002's header should gain a pointer here once this merges.
   change matches a credential on the request's transport target instead of
   the address text, which a `..` segment could carry to a sibling path prefix
   or another socket, and accepts a served `--graph` only as one path segment
-  of ASCII letters, digits, `-` or `_`.
+  of ASCII letters, digits, `-` or `_`. Two `servers:` names that spell the
+  same `OMNIGRAPH_TOKEN_<NAME>` (D4 step 1) are refused at load, so one
+  variable never binds two servers.

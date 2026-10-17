@@ -306,6 +306,21 @@ pub(crate) enum MissingCredential {
     },
 }
 
+/// `{"server": NAME, "hint": …}` for a declared server without a token,
+/// `{"unbound": ADDRESS, "hint": …}` for an address under no declared server.
+impl Serialize for MissingCredential {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("MissingCredential", 2)?;
+        match self {
+            Self::Server(name) => state.serialize_field("server", name)?,
+            Self::Unbound { server_root, .. } => state.serialize_field("unbound", server_root)?,
+        }
+        state.serialize_field("hint", &self.to_string())?;
+        state.end()
+    }
+}
+
 impl std::fmt::Display for MissingCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -559,17 +574,33 @@ impl std::error::Error for PreconditionFailedCli {}
 
 /// Preserve a typed server refusal through the command dispatch so JSON
 /// callers retain its code and detail fields instead of parsing a message.
+/// `output` is the server's body as sent; `missing_credential` is the CLI's
+/// own account of a request that carried no credential.
 #[derive(Debug)]
 pub(crate) struct RemoteErrorCli {
     pub(crate) output: ErrorOutput,
     pub(crate) status: reqwest::StatusCode,
     pub(crate) retry_after: Option<String>,
+    pub(crate) missing_credential: Option<MissingCredential>,
 }
 
 impl std::fmt::Display for RemoteErrorCli {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.output.error)
+        f.write_str(&with_missing_credential(
+            self.output.error.clone(),
+            self.missing_credential.as_ref(),
+        ))
     }
+}
+
+/// A served refusal as `--json` prints it: the server's body unchanged,
+/// beside the CLI's account of a request that carried no credential.
+#[derive(Serialize)]
+pub(crate) struct RemoteRefusalOutput<'a> {
+    #[serde(flatten)]
+    pub(crate) output: &'a ErrorOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) missing_credential: Option<&'a MissingCredential>,
 }
 
 impl std::error::Error for RemoteErrorCli {}
@@ -724,7 +755,8 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
 /// A non-success response as the typed refusal every remote call raises: a
 /// verified 412 as [`PreconditionFailedCli`], any other `ErrorOutput` body as
 /// [`RemoteErrorCli`], a body that is not one as the status and text. A
-/// request that carried no credential adds the reason to the message.
+/// request that carried no credential keeps the reason: beside the typed
+/// body, or after the plain text.
 fn remote_refusal(
     status: reqwest::StatusCode,
     text: String,
@@ -732,7 +764,7 @@ fn remote_refusal(
     expected_commit: Option<&str>,
     missing: Option<&MissingCredential>,
 ) -> color_eyre::eyre::Report {
-    if let Ok(mut error) = serde_json::from_str::<ErrorOutput>(&text) {
+    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
         let verified_precondition = status == reqwest::StatusCode::PRECONDITION_FAILED
             && error
                 .precondition_failure
@@ -753,11 +785,11 @@ fn remote_refusal(
             }
             .into();
         }
-        error.error = with_missing_credential(error.error, missing);
         return RemoteErrorCli {
             output: error,
             status,
             retry_after,
+            missing_credential: missing.cloned(),
         }
         .into();
     }

@@ -237,6 +237,23 @@ impl OperatorConfig {
         }
         Ok(())
     }
+
+    /// Each server's token variable is its own: `a-b` and `a_b`, or `prod`
+    /// and `PROD`, spell one `OMNIGRAPH_TOKEN_<NAME>`, which would bind one
+    /// token to both servers. Such names are refused loudly, naming both.
+    fn validate_server_token_names(&self) -> Result<()> {
+        let mut owners: BTreeMap<String, &str> = BTreeMap::new();
+        for name in self.servers.keys() {
+            if let Some(other) = owners.insert(token_env_name(name), name) {
+                bail!(
+                    "operator config `servers` entries `{other}` and `{name}` share the token \
+                     variable {}; rename one so each server has its own credential",
+                    token_env_name(name)
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl OperatorProfile {
@@ -314,6 +331,7 @@ pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
         eprintln!("warning: {warning} in operator config '{}'", path.display());
     }
     config.validate_defaults()?;
+    config.validate_server_token_names()?;
     Ok(config)
 }
 
@@ -738,6 +756,36 @@ profiles:
         fs::write(&path, "operator: [not, a, mapping\n").unwrap();
         let err = load_operator_config_at(&path).unwrap_err();
         assert!(err.to_string().contains("could not parse operator config"));
+    }
+
+    #[test]
+    fn servers_sharing_a_token_variable_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        for (first, second) in [("a-b", "a_b"), ("prod", "PROD")] {
+            fs::write(
+                &path,
+                format!(
+                    "servers:\n  {first}:\n    url: http://h:1\n  {second}:\n    url: http://h:2\n"
+                ),
+            )
+            .unwrap();
+            let err = load_operator_config_at(&path).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "share the token variable {}",
+                    token_env_name(first)
+                )),
+                "{err}"
+            );
+            assert!(err.contains(first) && err.contains(second), "{err}");
+        }
+        fs::write(
+            &path,
+            "servers:\n  a-b:\n    url: http://h:1\n  ab:\n    url: http://h:2\n",
+        )
+        .unwrap();
+        load_operator_config_at(&path).unwrap();
     }
 
     #[test]

@@ -216,6 +216,9 @@ async fn main() -> Result<()> {
                             None => failure.output.error.clone(),
                         };
                         eprintln!("{message}");
+                        if let Some(missing) = &failure.missing_credential {
+                            eprintln!("{missing}");
+                        }
                         if let Some(status) = failure.http_status {
                             eprintln!("HTTP {status}");
                         }
@@ -232,9 +235,15 @@ async fn main() -> Result<()> {
                 std::process::exit(failure.exit);
             }
             if let Some(output) = error_output_of(&error) {
+                let refusal = RemoteRefusalOutput {
+                    output: &output,
+                    missing_credential: error
+                        .downcast_ref::<RemoteErrorCli>()
+                        .and_then(|remote| remote.missing_credential.as_ref()),
+                };
                 match machine {
-                    Some(MachineErrors::Json) => print_json(&output)?,
-                    Some(MachineErrors::Jsonl) => println!("{}", serde_json::to_string(&output)?),
+                    Some(MachineErrors::Json) => print_json(&refusal)?,
+                    Some(MachineErrors::Jsonl) => println!("{}", serde_json::to_string(&refusal)?),
                     None => match &output.diagnostic {
                         Some(diagnostic) => eprintln!("{}", render_diagnostic(&output, diagnostic)),
                         None => return Err(error),

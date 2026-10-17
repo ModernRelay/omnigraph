@@ -84,6 +84,10 @@ A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
 and `action: refresh`. The server answers these before it admits the write:
 bearer authentication, then the API contract header, then policy. Fix the
 credential, the policy grant or the client before running the command again.
+When the CLI sent no credential, the refusal also carries `missing_credential`:
+`server` names a declared server with no stored token, or `unbound` names an
+address under no declared server, and `hint` says how to bind one. The server's
+`error` text is unchanged.
 The status counts only with its matching `code` in a response that carries the
 server's API contract header: a bare `403` from a proxy stays `unknown` with
 `reconcile`, and a refusal that also reports recovery work stays `recover`.

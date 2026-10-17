@@ -2760,20 +2760,26 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             fields.remove("command_outcome");
             fields.remove("http_status");
             fields.remove("retry_after");
-            let mut expected = body.clone();
+            // No credential is bound to the fixture's URL, so a 401 also says
+            // how to bind one, beside the server's unchanged body.
+            let missing_credential = fields.remove("missing_credential");
             if *status == 401 {
-                // No credential is bound to the fixture's URL, so the refusal
-                // says how to bind one.
-                expected["error"] = format!(
-                    "{}\nno credential is bound to {}: declare it under `servers:` in \
-                     {HERMETIC_OPERATOR_HOME}/config.yaml, then run `omnigraph login <name>` \
-                     or set OMNIGRAPH_TOKEN_<NAME>",
-                    body["error"].as_str().unwrap(),
-                    server.origin
-                )
-                .into();
+                assert_eq!(
+                    missing_credential,
+                    Some(json!({
+                        "unbound": server.origin,
+                        "hint": format!(
+                            "no credential is bound to {}: declare it under `servers:` in \
+                             {HERMETIC_OPERATOR_HOME}/config.yaml, then run \
+                             `omnigraph login <name>` or set OMNIGRAPH_TOKEN_<NAME>",
+                            server.origin
+                        )
+                    }))
+                );
+            } else {
+                assert_eq!(missing_credential, None, "{arguments:?} HTTP {status}");
             }
-            assert_eq!(actual, expected, "preserve every typed detail");
+            assert_eq!(&actual, body, "preserve every typed detail");
             assert_eq!(
                 server.requests().len(),
                 2,

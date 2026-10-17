@@ -3,8 +3,10 @@
   `--server https://…` URL the operator does not control. A token now reaches
   only the server it is keyed to: a request to a URL under a server declared
   in `~/.omnigraph/config.yaml` carries that server's token, and any other
-  request carries none. When such a request gets HTTP 401, the error names
-  the server to declare or the `omnigraph login` command to run.
+  request carries none. When such a request gets HTTP 401, the CLI names the
+  server to declare or the `omnigraph login` command to run; `--json` output
+  carries this as `missing_credential` beside the server's unchanged error.
+  The server's own `OMNIGRAPH_SERVER_BEARER_TOKEN*` settings are unchanged.
 
   If you export `OMNIGRAPH_BEARER_TOKEN` for the CLI, declare the server under
   `servers:` and bind its token with `omnigraph login <name>`, or set

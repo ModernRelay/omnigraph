@@ -2446,13 +2446,21 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server_issue_1022() {
     );
     let refusal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(refusal["code"], "unauthorized", "{refusal}");
-    let message = refusal["error"].as_str().unwrap();
+    // The server's own message is passed through unchanged.
     assert!(
-        message.contains(
-            "no credential is stored for server `test-srv`: run `omnigraph login test-srv` \
-             or set OMNIGRAPH_TOKEN_TEST_SRV"
-        ),
-        "{message}"
+        !refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("no credential is"),
+        "{refusal}"
+    );
+    assert_eq!(
+        refusal["missing_credential"],
+        serde_json::json!({
+            "server": "test-srv",
+            "hint": "no credential is stored for server `test-srv`: run \
+                     `omnigraph login test-srv` or set OMNIGRAPH_TOKEN_TEST_SRV"
+        })
     );
 
     // login with a WRONG token (via stdin, the documented pipe flow).
@@ -2514,15 +2522,25 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server_issue_1022() {
     );
     let refusal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(refusal["code"], "unauthorized", "{refusal}");
-    let message = refusal["error"].as_str().unwrap();
+    // The server's own message is passed through unchanged.
     assert!(
-        message.contains(&format!(
-            "no credential is bound to {}: declare it under `servers:` in {}, then run \
-             `omnigraph login <name>` or set OMNIGRAPH_TOKEN_<NAME>",
-            server.base_url,
-            operator_home.path().join("config.yaml").display()
-        )),
-        "{message}"
+        !refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("no credential is"),
+        "{refusal}"
+    );
+    assert_eq!(
+        refusal["missing_credential"],
+        serde_json::json!({
+            "unbound": server.base_url,
+            "hint": format!(
+                "no credential is bound to {}: declare it under `servers:` in {}, then run \
+                 `omnigraph login <name>` or set OMNIGRAPH_TOKEN_<NAME>",
+                server.base_url,
+                operator_home.path().join("config.yaml").display()
+            )
+        })
     );
     write_server_url(&server.base_url);
 
