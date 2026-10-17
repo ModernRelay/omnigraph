@@ -94,7 +94,7 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-policy` | Cedar compilation and the engine-facing action/scope/actor gate. |
 | `omnigraph-cluster` | Desired configuration, deployment ledger, plan/apply, exact recovery, and immutable serving snapshots. |
 | `omnigraph-api-types` | Additive HTTP wire DTOs shared by server and CLI. |
-| `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. Client setup captures operator configuration for ordinary graph commands, aliases and served cluster commands; scope, endpoint, credential matching and direct-write actor selection use those captured values. |
+| `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. Client setup captures operator configuration for ordinary graph commands, aliases and served cluster commands; scope, endpoint, credential matching and direct-write actor selection use those captured values. Query and alias presentation uses the same captured configuration. |
 | `omnigraph-skill` | The `skills/omnigraph` agent skill, embedded byte for byte by its build script; the package root is `skills/`, so the skill tree stays its one copy. `omnigraph skill export` writes it. |
 | `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, multi-graph serving and live deployment activation. |
 | `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable server process through the root-derived Blob lease. It is not a storage backend. |
@@ -103,8 +103,29 @@ alias is reused. See [invariants.md](invariants.md) and
 
 The CLI's [invocation parser](../../crates/omnigraph-cli/src/invocation.rs) owns
 command construction, explicit argument provenance and cross-level argument
-validation. It reads no operator configuration or command inputs. Execution keeps
-its existing routing, credential acquisition and output owners.
+validation. It reads no operator configuration or command inputs. The
+[library](../../crates/omnigraph-cli/src/lib.rs) exposes the
+[application entry point](../../crates/omnigraph-cli/src/app.rs), which owns
+dispatch, invocation-scoped admission and outcome evidence, and completion
+reporting. A completion carries the exit status of an already handled invocation;
+an unrendered error remains a `Result` error. The
+[binary](../../crates/omnigraph-cli/src/main.rs) owns runtime startup, diagnostic
+hooks, process arguments and the final process exit status.
+
+`commands/query` owns `query`, `mutate` and alias execution. Its
+[pure preparation](../../crates/omnigraph-cli/src/commands/query/prepare.rs)
+classifies captured source and argument combinations without I/O. It enforces
+recognized statement restrictions while forwarding unrecognized source unchanged
+to its execution owner, preserving syntax supported by a newer server.
+[Read presentation](../../crates/omnigraph-cli/src/presentation.rs) captures the
+effective format and table options once; rendering does not reload configuration.
+The captured read format also selects structured execution-error output, while
+mutation error formatting remains tied to explicit `--json`.
+
+CLI unit tests own invocation preparation and presentation; CLI process tests
+own argument, environment, configuration, transport, output and exit behavior.
+GQT owns query semantics across its execution adapters. Keep those boundaries
+separate when extending the existing owners in [testing](testing.md#server-and-cli-ownership).
 
 ## Principal flows
 

@@ -2894,7 +2894,13 @@ fn read_supports_inline_query_string() {
 fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
 
-    for graph in [None, Some("knowledge")] {
+    let cases: &[(Option<&str>, &[&str], &str)] = &[
+        (None, &["--json"], "json"),
+        (Some("knowledge"), &["--json"], "json"),
+        (Some("knowledge"), &[], "csv"),
+        (Some("knowledge"), &["--format", "table"], "table"),
+    ];
+    for &(graph, flags, expected_format) in cases {
         let home = tempdir().unwrap();
         let config = home.path().join("config.yaml");
         let replacement = home.path().join("replacement.yaml");
@@ -2920,13 +2926,13 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         fs::write(
             &config,
             format!(
-                "servers:\n  prod:\n    url: '{}'\n  graph-owner:\n    url: '{}/graphs/knowledge'\ncaptured_only: true\n",
+                "servers:\n  prod:\n    url: '{}'\n  graph-owner:\n    url: '{}/graphs/knowledge'\ndefaults:\n  output: csv\n  table_max_column_width: 8\n  table_cell_layout: wrap\ncaptured_only: true\n",
                 server.origin, server.origin
             ),
         )
         .unwrap();
         let replacement_config = format!(
-            "servers:\n  prod:\n    url: '{}'\n  replacement:\n    url: '{}'\nreplacement_only: true\n",
+            "servers:\n  prod:\n    url: '{}'\n  replacement:\n    url: '{}'\ndefaults:\n  output: json\n  table_max_column_width: 80\n  table_cell_layout: truncate\nreplacement_only: true\n",
             trap.origin, server.origin
         );
         fs::write(&replacement, &replacement_config).unwrap();
@@ -2946,8 +2952,8 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
                 "prod",
                 "-e",
                 "query q() { match { $p: Person } return { $p.name } }",
-                "--json",
-            ]);
+            ])
+            .args(flags);
         if let Some(graph) = graph {
             command.args(["--graph", graph]);
         }
@@ -2955,11 +2961,24 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         assert_eq!(fs::read_to_string(&config).unwrap(), replacement_config);
         assert!(!replacement.exists(), "discovery must replace the config");
         assert!(trap.requests().is_empty(), "setup changed destination");
-        assert!(output.status.success(), "{graph:?}: {output:?}");
-        assert_eq!(
-            parse_stdout_json(&output)["rows"][0]["p.name"],
-            "original-server"
-        );
+        assert!(output.status.success(), "{graph:?} {flags:?}: {output:?}");
+        let stdout = stdout_string(&output);
+        match expected_format {
+            "json" => assert_eq!(
+                parse_stdout_json(&output)["rows"][0]["p.name"],
+                "original-server"
+            ),
+            "csv" => assert_eq!(stdout, "p.name\noriginal-server\n"),
+            "table" => {
+                assert!(stdout.lines().any(|line| line == "original"), "{stdout}");
+                assert!(
+                    stdout.lines().any(|line| line.trim_end() == "-server"),
+                    "{stdout}"
+                );
+                assert!(!stdout.contains("original-server"), "{stdout}");
+            }
+            _ => unreachable!(),
+        }
         trap.assert_complete();
         server.assert_complete();
 
@@ -2992,11 +3011,10 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
             1,
             "{stderr}"
         );
-        // Rendering reads its preferences separately after client setup, even
-        // for JSON output. That existing read sees the replacement config.
+        // Destination, credentials and presentation share the captured config.
         assert_eq!(
             stderr.matches("unknown key `replacement_only`").count(),
-            1,
+            0,
             "{stderr}"
         );
     }
