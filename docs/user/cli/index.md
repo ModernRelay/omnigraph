@@ -200,7 +200,8 @@ segments are resolved. A `unix://` server's token goes only to that socket.
 Any other request carries no credential, including a literal
 `--server https://…` URL that matches no declared server. If such a request
 gets HTTP 401, the error names the server to declare or the `omnigraph login`
-command to run. A `--graph` value with a `.` or `..` path segment is refused.
+command to run. A `--graph` value must be one path segment of ASCII letters,
+digits, `-` or `_`; any other value is refused before a request is sent.
 
 ## Use a server through a Unix socket
 

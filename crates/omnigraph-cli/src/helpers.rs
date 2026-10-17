@@ -432,26 +432,26 @@ pub(crate) fn resolve_server_flag(
     let base = base_url.trim_end_matches('/');
     Ok(Some(match graph {
         Some(graph) => {
-            refuse_dot_segments(graph)?;
+            require_graph_segment(graph)?;
             format!("{base}/graphs/{graph}")
         }
         None => base.to_string(),
     }))
 }
 
-/// A graph name is written into a served URL's path, where a `.` or `..`
-/// segment would move the request off the graph's route. The URL parser also
-/// reads `%2e` as a dot and `\` as a separator, so those spellings count.
-fn refuse_dot_segments(graph: &str) -> Result<()> {
-    let dot = |segment: &str| {
-        matches!(
-            segment.to_ascii_lowercase().replace("%2e", ".").as_str(),
-            "." | ".."
-        )
-    };
-    if graph.split(['/', '\\']).any(dot) {
+/// A graph name is one path segment of the graph's served route, in the
+/// graph-id alphabet. Any other character could move the request off that
+/// route once the URL parser reads it: a dot segment in any spelling
+/// (`%2e`, a tab or newline it strips), `/`, `\` or `%2F`.
+fn require_graph_segment(graph: &str) -> Result<()> {
+    if graph.is_empty()
+        || !graph
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
         color_eyre::eyre::bail!(
-            "invalid graph `{graph}`: a graph name cannot contain a `.` or `..` path segment"
+            "invalid graph `{graph}`: a graph name is one path segment of ASCII letters, \
+             digits, `-` or `_`"
         );
     }
     Ok(())

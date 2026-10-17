@@ -2302,7 +2302,8 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
 /// sends it to, with its `.` and `..` segments resolved, lies under that
 /// server's `url`. Matching the address as written let a path-prefixed
 /// server's token reach a sibling prefix, and a socket's token reach another
-/// socket. A `--graph` with a dot segment is refused before any request.
+/// socket. A `--graph` that is not one plain path segment is refused before
+/// any request.
 #[test]
 fn served_credential_follows_the_sent_url_issue_1022() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
@@ -2366,8 +2367,8 @@ fn served_credential_follows_the_sent_url_issue_1022() {
     );
     fixture.assert_complete();
 
-    // A `--graph` that would leave the graph's route is refused before any
-    // request, in every spelling the URL parser resolves.
+    // A `--graph` that is not one plain path segment is refused before any
+    // request, whatever the URL parser would make of it.
     let fixture = IntentApiFixture::graph(vec![]);
     fs::write(
         home.path().join("config.yaml"),
@@ -2381,7 +2382,10 @@ fn served_credential_follows_the_sent_url_issue_1022() {
         "../../tenant-b/graphs/knowledge",
         "%2E%2E/%2e./tenant-b/graphs/knowledge",
         r"..\..\tenant-b\graphs\knowledge",
+        ".\t./.\t./tenant-b/graphs/knowledge",
+        "..%2F..%2Ftenant-b",
         ".",
+        "",
     ] {
         let output = query(tenant_a, "tenant-a", graph).output().unwrap();
         assert!(!output.status.success(), "{graph}: {output:?}");
@@ -2391,7 +2395,7 @@ fn served_credential_follows_the_sent_url_issue_1022() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            refusal.contains("cannot contain a `.` or `..` path segment"),
+            refusal.contains("a graph name is one path segment"),
             "{graph}: {refusal}"
         );
     }

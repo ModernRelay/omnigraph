@@ -375,4 +375,5 @@ them. RFC 0002's header should gain a pointer here once this merges.
   description of the variable is history and is not rewritten. The same
   change matches a credential on the request's transport target instead of
   the address text, which a `..` segment could carry to a sibling path prefix
-  or another socket, and refuses a `--graph` with a `.` or `..` segment.
+  or another socket, and accepts a served `--graph` only as one path segment
+  of ASCII letters, digits, `-` or `_`.

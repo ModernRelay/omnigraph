@@ -4,7 +4,9 @@
   under that `url` after `.` and `..` segments resolve. Before, an address
   such as `https://host/tenant-a/../tenant-b`, or a socket path ending in
   `../other.sock`, could carry a declared server's token to a different
-  path prefix or socket. A `--graph` value with a `.` or `..` path segment
-  is now refused. See [server credentials][cli-credential-transport-target].
+  path prefix or socket. A `--graph` value for a served graph must now be
+  one path segment of ASCII letters, digits, `-` or `_`; any other value is
+  refused before a request is sent. See
+  [server credentials][cli-credential-transport-target].
 
 [cli-credential-transport-target]: ../docs/user/cli/index.md#use-a-server

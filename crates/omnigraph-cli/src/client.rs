@@ -2938,13 +2938,14 @@ mod tests {
         assert_eq!(gateway.connections(), 2, "both requests used the socket");
         server.assert_complete();
 
-        // `--graph` refuses a dot segment before any URL is composed; the
-        // transport still refuses a composed URL that climbs out of the root.
+        // `--graph` refuses anything but one plain segment before any URL is
+        // composed; the transport still refuses a composed URL that climbs
+        // out of the root.
         let refusal = resolve_server_flag(Some(&root), Some("../..")).unwrap_err();
         assert!(
             refusal
                 .to_string()
-                .contains("cannot contain a `.` or `..` path segment"),
+                .contains("a graph name is one path segment"),
             "{refusal}"
         );
         for outside in [
