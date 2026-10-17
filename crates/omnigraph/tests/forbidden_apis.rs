@@ -332,7 +332,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "commit_target_branch"),
     ("db/omnigraph.rs", "list_commits"),
     ("db/omnigraph.rs", "list_commits_page"),
-    ("db/omnigraph.rs", "list_commits_page_on_branch"),
+    ("db/omnigraph.rs", "list_commits_page_readable"),
     ("db/omnigraph.rs", "list_unpublished_commits"),
     ("db/omnigraph.rs", "list_unattached_commits"),
     ("exec/query_doors.rs", "query"),

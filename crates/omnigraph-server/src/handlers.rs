@@ -3180,6 +3180,11 @@ async fn delete_merged_source_branch(
 /// `page_token` with the same `branch`; later pages answer for that head's
 /// chain even after the branch moves. A page reads only the history it
 /// returns. Without `limit` and `page_token` the whole history is one answer.
+/// A caller whose `read` does not cover every branch continues only from a
+/// commit of `branch`'s history: one the branch still holds or a readable
+/// branch published costs nothing more; any other is looked for down the
+/// branch's history, which costs what the whole listing costs, and a commit
+/// the history does not reach is refused (400).
 ///
 /// `unpublished=true` lists instead the unpublished commits whose recorded
 /// target is `branch` (writes `as commit` awaiting `commit publish`), newest
@@ -3229,11 +3234,13 @@ pub(crate) async fn server_commit_list(
         // gate of `GET /commits/{commit_id}`) may read any commit by id and
         // follow its parents, so its claim needs no proof; any other caller's
         // continuation is proven on the branch's history.
+        let actor = actor.as_ref().map(|Extension(actor)| actor);
+        let policy = handle.policy.as_deref();
         let any_commit = query.page_token.is_none()
             || matches!(
                 authorize(
-                    actor.as_ref().map(|Extension(actor)| actor),
-                    handle.policy.as_deref(),
+                    actor,
+                    policy,
                     PolicyRequest {
                         action: PolicyAction::Read,
                         branch: None,
@@ -3246,8 +3253,16 @@ pub(crate) async fn server_commit_list(
         let page = if any_commit {
             db.list_commits_page(branch, page_token, query.limit).await
         } else {
-            db.list_commits_page_on_branch(branch, page_token, query.limit)
-                .await
+            let mut failure = None;
+            let page = db
+                .list_commits_page_readable(branch, page_token, query.limit, &mut |branch| {
+                    read_decision(actor, policy, &mut failure, branch)
+                })
+                .await;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            page
         }
         .map_err(ApiError::from_omni)?;
         return Ok(Json(CommitListOutput {
@@ -4238,29 +4253,40 @@ async fn readable_diff_page(
 ) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
     let policy = handle.policy.as_deref();
     let mut failure = None;
-    let mut can_read = |branch: &str| {
-        let request = PolicyRequest {
-            action: PolicyAction::Read,
-            branch: Some(branch.to_string()),
-            target_branch: None,
-        };
-        match authorize(actor, policy, request) {
-            Ok(Authz::Allowed) => true,
-            Ok(Authz::Denied(_)) => false,
-            Err(error) => {
-                failure.get_or_insert(error);
-                false
-            }
-        }
-    };
     let page = handle
         .engine
-        .diff_page_readable(&request, &mut can_read)
+        .diff_page_readable(&request, &mut |branch| {
+            read_decision(actor, policy, &mut failure, branch)
+        })
         .await;
     if let Some(error) = failure {
         return Err(error);
     }
     page.map_err(change_route_error)
+}
+
+/// `actor`'s `read` decision on `branch`, for the engine's read checks. A
+/// policy failure (a missing bearer, an evaluation error) is not a denial: it
+/// is kept in `failure`, and the caller answers with it.
+fn read_decision(
+    actor: Option<&AuthenticatedActor>,
+    policy: Option<&PolicyEngine>,
+    failure: &mut Option<ApiError>,
+    branch: &str,
+) -> bool {
+    let request = PolicyRequest {
+        action: PolicyAction::Read,
+        branch: Some(branch.to_string()),
+        target_branch: None,
+    };
+    match authorize(actor, policy, request) {
+        Ok(Authz::Allowed) => true,
+        Ok(Authz::Denied(_)) => false,
+        Err(error) => {
+            failure.get_or_insert(error);
+            false
+        }
+    }
 }
 
 /// Authorize `read` on each named branch of a branch diff or merge base.

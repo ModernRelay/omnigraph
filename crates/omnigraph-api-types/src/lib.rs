@@ -787,8 +787,9 @@ impl From<GraphCommitKind> for CommitKindOutput {
 pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
     /// The head a paged listing's first page resolved; every later page
-    /// answers for its first-parent chain. Present only when the request
-    /// set `limit` or `page_token`.
+    /// answers for its first-parent chain and repeats it as its page token
+    /// carries it, unchecked. Present only when the request set `limit` or
+    /// `page_token`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_commit_id: Option<String>,
     /// Continue THIS listing below the last commit of the page. Absent on the

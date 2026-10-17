@@ -449,10 +449,17 @@ impl GraphCoordinator {
         let graph = self.manifest.commit_graph();
         let mut start = graph.head().graph_commit_id.clone();
         loop {
+            // Each start is the head this coordinator holds or the first
+            // parent of a commit just read: a miss is a gap in the lineage.
             let page = graph
                 .first_parent_page(&start, FIRST_PARENT_WALK_COMMITS)
                 .await?
-                .ok_or_else(|| commit_not_found(&SnapshotId::new(start.clone())))?;
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "graph commit '{start}' is on this branch's first-parent chain and neither \
+                         its `__manifest` nor `__history` holds it"
+                    ))
+                })?;
             if let Some(below) = page
                 .commits
                 .into_iter()
@@ -465,6 +472,12 @@ impl GraphCoordinator {
                 None => return Ok(None),
             }
         }
+    }
+
+    /// Whether the head or a commit the buffer holds is `commit_id`: those
+    /// commits are the first-parent run that ends at the head.
+    pub(crate) fn holds_commit(&self, commit_id: &str) -> bool {
+        self.manifest.held_commit(commit_id).is_some()
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {

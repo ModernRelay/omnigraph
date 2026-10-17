@@ -3352,9 +3352,10 @@ rules:
 
 /// A commit-list page token is checksummed, not signed. A caller allowed to
 /// read `main` only, who may neither list `secret` nor read its commits by
-/// id, pages `main` through continuations proven on `main`'s history, and a
-/// token re-signed to continue from a `secret` commit, deep in `__history`,
-/// reads nothing.
+/// id, pages `main` through continuations checked against `main`'s history,
+/// and a token re-signed to continue from a `secret` commit, deep in
+/// `__history`, or from a commit no branch holds, reads nothing. A caller
+/// with graph-wide `read` is taken at its token's word.
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_commit_list_continuation_stays_on_a_readable_branch() {
     let temp = init_loaded_graph().await;
@@ -3390,26 +3391,36 @@ async fn policy_commit_list_continuation_stays_on_a_readable_branch() {
         .find(|commit| commit.graph_branch.as_deref() == Some("secret"))
         .unwrap();
     drop(db);
+    // act-bruno reads protected branches (main) only; act-ada reads every
+    // branch, and so every commit by id.
     let policy_path = temp.path().join("policy.yaml");
-    fs::write(&policy_path, POLICY_PROTECTED_READ_YAML).unwrap();
+    fs::write(
+        &policy_path,
+        "version: 1\ngroups:\n  team: [act-bruno]\n  admins: [act-ada]\nprotected_branches: [main]\nrules:\n  - id: team-read\n    allow: {actors: {group: team}, actions: [read], branch_scope: protected}\n  - id: admin-read\n    allow: {actors: {group: admins}, actions: [read], branch_scope: any}\n",
+    )
+    .unwrap();
     let app = build_app(
         AppState::open_with_bearer_tokens_and_policy(
             graph.to_string_lossy().to_string(),
-            vec![("act-bruno".to_string(), "team-token".to_string())],
+            vec![
+                ("act-bruno".to_string(), "team-token".to_string()),
+                ("act-ada".to_string(), "admin-token".to_string()),
+            ],
             Some(&policy_path),
         )
         .await
         .unwrap(),
     );
-    let get = |uri: &str| {
+    let get_as = |uri: &str, token: &str| {
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g(uri))
             .method(Method::GET)
-            .header("authorization", "Bearer team-token")
+            .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap()
     };
+    let get = |uri: &str| get_as(uri, "team-token");
 
     for uri in [
         "/commits?branch=secret".to_string(),
@@ -3438,9 +3449,19 @@ async fn policy_commit_list_continuation_stays_on_a_readable_branch() {
     }
     assert_eq!(serde_json::Value::Array(paged), whole["commits"]);
 
-    for below in [u64::MAX, oldest_secret.generation + 1] {
+    // A commit `secret` published and a commit no branch holds are refused
+    // alike, so the refusal says nothing about what exists.
+    let unknown = "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    for (next, below) in [
+        (oldest_secret.graph_commit_id.as_str(), u64::MAX),
+        (
+            oldest_secret.graph_commit_id.as_str(),
+            oldest_secret.generation + 1,
+        ),
+        (unknown, u64::MAX),
+    ] {
         let forged = resign_change_token(&token, |payload| {
-            payload["next_commit_id"] = json!(oldest_secret.graph_commit_id);
+            payload["next_commit_id"] = json!(next);
             payload["below_generation"] = json!(below);
         });
         let (status, body) = json_response(
@@ -3448,7 +3469,11 @@ async fn policy_commit_list_continuation_stays_on_a_readable_branch() {
             get(&format!("/commits?branch=main&limit=5&page_token={forged}")),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "below {below}: {body}");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{next} below {below}: {body}"
+        );
         assert!(body["commits"].is_null(), "{body}");
         assert_eq!(
             body["error"],
@@ -3456,6 +3481,32 @@ async fn policy_commit_list_continuation_stays_on_a_readable_branch() {
             "{body}"
         );
     }
+
+    // A caller with graph-wide `read` may read any commit by id, so its
+    // continuation is taken as the token says, without a proof.
+    let (status, shown) = json_response(
+        &app,
+        get_as(
+            &format!("/commits/{}", oldest_secret.graph_commit_id),
+            "admin-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    let forged = resign_change_token(&token, |payload| {
+        payload["next_commit_id"] = json!(oldest_secret.graph_commit_id);
+        payload["below_generation"] = json!(u64::MAX);
+    });
+    let (status, page) = json_response(
+        &app,
+        get_as(
+            &format!("/commits?branch=main&limit=1&page_token={forged}"),
+            "admin-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["commits"][0], shown, "{page}");
 }
 
 /// `token` with its payload edited and its checksum recomputed, as any caller

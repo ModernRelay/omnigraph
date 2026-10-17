@@ -273,8 +273,8 @@ async fn graph_lineage_lives_only_in_manifest() {
     // ── paged listing: the same order, one page at a time ────────────────────
     // Pages walk first parents by falling generation; across the fork and the
     // merge they must concatenate to the listing, whatever the page size.
-    // The branch-scoped door proves each continuation on the branch's history
-    // and answers the same pages.
+    // The readable door, for a caller who may read no branch by name, proves
+    // each continuation on the branch's history and answers the same pages.
     for (branch, listed) in [(None, &listed_main), (Some("feature"), &listed_feature)] {
         for limit in [1, 2, listed.len(), listed.len() + 1] {
             for on_branch in [false, true] {
@@ -322,7 +322,7 @@ async fn graph_lineage_lives_only_in_manifest() {
     }
     assert_eq!(rest, listed_main, "the continuation keeps the old head");
     let proven = main
-        .list_commits_page_on_branch(None, Some(&token), Some(2))
+        .list_commits_page_readable(None, Some(&token), Some(2), &mut |_| false)
         .await
         .unwrap();
     assert_eq!(
@@ -386,23 +386,44 @@ async fn graph_lineage_lives_only_in_manifest() {
         .await
         .unwrap();
     assert_eq!(trusted.commits[0].graph_commit_id, carol.graph_commit_id);
-    match main
-        .list_commits_page_on_branch(None, Some(&forged), Some(1))
+    // The readable door lists from Carol's commit for a caller who may read
+    // `feature`, which published it, and refuses it to one who may not,
+    // exactly as it refuses a commit no branch holds.
+    let mut asked = Vec::new();
+    let readable = main
+        .list_commits_page_readable(None, Some(&forged), Some(1), &mut |branch| {
+            asked.push(branch.to_string());
+            branch == "feature"
+        })
         .await
-        .unwrap_err()
-    {
-        omnigraph::error::OmniError::ChangeCursorRejected { reason } => {
-            assert_eq!(
-                reason,
-                "commit list page token names a commit off this branch's history"
-            )
+        .unwrap();
+    assert_eq!(readable.commits, trusted.commits);
+    assert_eq!(asked, ["feature"], "asked for the branch that published it");
+    let unknown = resign_change_token(&token, |payload| {
+        payload["next_commit_id"] =
+            serde_json::json!("hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        payload["below_generation"] = serde_json::json!(u64::MAX);
+    });
+    for forged in [&forged, &unknown] {
+        match main
+            .list_commits_page_readable(None, Some(forged), Some(1), &mut |branch| branch == "main")
+            .await
+            .unwrap_err()
+        {
+            omnigraph::error::OmniError::ChangeCursorRejected { reason } => {
+                assert_eq!(
+                    reason,
+                    "commit list page token names a commit off this branch's history"
+                )
+            }
+            other => panic!("expected ChangeCursorRejected, got {other:?}"),
         }
-        other => panic!("expected ChangeCursorRejected, got {other:?}"),
     }
 }
 
-/// One page of `branch`'s commit list, through the branch-scoped door when
-/// `on_branch`.
+/// One page of `branch`'s commit list; when `on_branch`, through the
+/// readable door for a caller who may read no branch by name, so every
+/// continuation is proven held or found down the chain.
 async fn commit_page(
     db: &omnigraph::session::Session,
     branch: Option<&str>,
@@ -412,7 +433,7 @@ async fn commit_page(
 ) -> omnigraph::db::CommitListPage {
     match on_branch {
         true => {
-            db.list_commits_page_on_branch(branch, token, Some(limit))
+            db.list_commits_page_readable(branch, token, Some(limit), &mut |_| false)
                 .await
         }
         false => db.list_commits_page(branch, token, Some(limit)).await,

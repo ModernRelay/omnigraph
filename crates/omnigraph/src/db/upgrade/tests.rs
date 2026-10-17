@@ -2817,7 +2817,12 @@ async fn commit_list_and_change_feed_cross_the_upgrade() {
                     let page = match on_branch {
                         true => {
                             graph
-                                .list_commits_page_on_branch(branch, token.as_deref(), Some(limit))
+                                .list_commits_page_readable(
+                                    branch,
+                                    token.as_deref(),
+                                    Some(limit),
+                                    &mut |_| false,
+                                )
                                 .await
                         }
                         false => {

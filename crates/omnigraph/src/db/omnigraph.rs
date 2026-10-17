@@ -3940,44 +3940,48 @@ impl Omnigraph {
     /// history below it.
     ///
     /// The token is checksummed, not signed. A continuation is refused for
-    /// another graph or branch digest, but the commit it continues from is
-    /// the caller's claim: the walk starts at any commit this handle can find,
-    /// on any branch. That is no authority for a caller who may read every
-    /// commit by id; a caller who may read only `branch` uses
-    /// [`Self::list_commits_page_on_branch`].
+    /// another graph or branch digest, but the commit it continues from, and
+    /// the head it names, are the caller's claim: the walk starts at any
+    /// commit this handle can find, on any branch. That is no authority for a
+    /// caller who may read every commit by id; a caller who may read only some
+    /// branches uses [`Self::list_commits_page_readable`].
     pub async fn list_commits_page(
         &self,
         branch: Option<&str>,
         page_token: Option<&str>,
         limit: Option<usize>,
     ) -> Result<CommitListPage> {
-        self.commit_list_page(branch, page_token, limit, false)
-            .await
+        self.commit_list_page(branch, page_token, limit, None).await
     }
 
-    /// [`Self::list_commits_page`] for a caller who may read only `branch`: a
-    /// continuation's commit must be on the branch's first-parent chain from
-    /// its head now, the first commit there below the generation the token
-    /// carries, or the page is [`OmniError::ChangeCursorRejected`]. The proof
-    /// walks the chain from the head down to that commit, so a continuation
-    /// costs what [`Self::list_commits`] costs; a first page costs the page.
-    pub async fn list_commits_page_on_branch(
+    /// [`Self::list_commits_page`] for a caller who may read only some
+    /// branches; `can_read` answers for a branch by name, as for
+    /// [`Self::diff_page_readable`]. A continuation lists from its commit only
+    /// when that commit is on `branch`'s history: held by the branch's
+    /// `__manifest` (its head or a buffered commit), published on a branch
+    /// `can_read` allows, or else the first commit below the token's
+    /// generation on the branch's first-parent chain from its head, a walk
+    /// that costs what [`Self::list_commits`] costs. Any other commit, unknown
+    /// or unreadable alike, is [`OmniError::ChangeCursorRejected`].
+    pub async fn list_commits_page_readable(
         &self,
         branch: Option<&str>,
         page_token: Option<&str>,
         limit: Option<usize>,
+        can_read: &mut ReadCheck<'_>,
     ) -> Result<CommitListPage> {
-        self.commit_list_page(branch, page_token, limit, true).await
+        self.commit_list_page(branch, page_token, limit, Some(can_read))
+            .await
     }
 
-    /// One commit list page; `prove` holds a continuation's commit to the
-    /// branch's history.
+    /// One commit list page; with `can_read`, a continuation's commit is held
+    /// to the branch's history.
     async fn commit_list_page(
         &self,
         branch: Option<&str>,
         page_token: Option<&str>,
         limit: Option<usize>,
-        prove: bool,
+        can_read: Option<&mut ReadCheck<'_>>,
     ) -> Result<CommitListPage> {
         use crate::changes::token;
 
@@ -4013,30 +4017,44 @@ impl Omnigraph {
             ));
         }
         let coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
-        if prove
-            && let Some(resume) = &resume
-            && coordinator
-                .first_parent_below(resume.below_generation)
-                .await?
-                .is_none_or(|commit| commit.graph_commit_id != resume.next_commit_id)
-        {
-            return Err(token::cursor_rejected(
-                "commit list page token names a commit off this branch's history",
-            ));
-        }
         let start = resume.as_ref().map(|resume| resume.next_commit_id.as_str());
         let (head, page) = coordinator.first_parent_page(start, limit).await?;
+        // A commit the branch's history does not reach is refused as an
+        // unknown one is, so the refusal tells a caller nothing it may not read.
+        let unreached = || {
+            token::cursor_rejected(
+                "commit list page token names a commit off this branch's history",
+            )
+        };
         let Some(page) = page else {
-            return Err(match resume {
-                Some(_) => token::cursor_rejected(
+            return Err(match (&resume, &can_read) {
+                (Some(_), Some(_)) => unreached(),
+                (Some(_), None) => token::cursor_rejected(
                     "commit list page token names a commit this graph does not hold",
                 ),
-                None => OmniError::manifest_internal(format!(
+                (None, _) => OmniError::manifest_internal(format!(
                     "the head '{}' of the branch is not held",
                     head.graph_commit_id
                 )),
             });
         };
+        if let (Some(resume), Some(can_read)) = (&resume, can_read) {
+            // The cheap proofs first: a commit the branch's `__manifest` holds
+            // is on its first-parent run to the head, and one published on a
+            // branch the caller may read lists that branch's history. Only a
+            // commit neither covers, such as one an unreadable branch the
+            // branch forked from published, is looked for down the chain.
+            let first = &page.commits[0];
+            let reached = coordinator.holds_commit(&first.graph_commit_id)
+                || can_read(first.graph_branch.as_deref().unwrap_or("main"))
+                || coordinator
+                    .first_parent_below(resume.below_generation)
+                    .await?
+                    .is_some_and(|commit| commit.graph_commit_id == resume.next_commit_id);
+            if !reached {
+                return Err(unreached());
+            }
+        }
         if let Some(resume) = &resume
             && page
                 .commits
