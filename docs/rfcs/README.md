@@ -247,5 +247,6 @@ then dated RFCs by date.
 | [2026-10-10](2026-10-10-unpublished-graph-commits.md) | Unpublished graph commits | maintainer | accepted | partial |
 | [2026-10-10](2026-10-10-merge-base-block-registry.md) | Block registry for merge base lookup | maintainer | draft | in-progress |
 | [2026-10-11](2026-10-11-unattached-graph-branches.md) | Unattached graph branches | maintainer | draft | not-started |
+| [2026-10-13](2026-10-13-request-aware-plan-cost.md) | Request-aware plan cost | maintainer | draft | not-started |
 | [2026-10-15](2026-10-15-bulk-load-as-a-query-plan.md) | Bulk load as a query plan | maintainer | draft | not-started |
 | [2026-10-16](2026-10-16-engine-catalogue.md) | Engine catalogue | maintainer | draft | in-progress |
