@@ -187,8 +187,7 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
   --server prod --graph knowledge
 ```
 
-The token is stored separately from `config.yaml`. A server resolves the actor
-from the token; clients cannot override it with `--as`.
+The server resolves the actor from its token; clients cannot override it with `--as`.
 
 `login` writes the token to `~/.omnigraph/credentials` with mode `0600`.
 `OMNIGRAPH_TOKEN_<NAME>`, the server name uppercased with `-` written as `_`,
@@ -206,18 +205,15 @@ command to run; `--json` output carries this as `missing_credential` beside the
 server's own error. A `--graph` value must be one path segment of ASCII letters,
 digits, `-` or `_`; any other value is refused before a request is sent.
 
-Each invocation keeps its selected operator home and ambient profile, then reads
-the operator configuration once when needed. Editing that file during a command
-does not change its destination, actor defaults or presentation settings; unknown
-keys warn once. Ordinary graph clients also keep the token selected during setup,
-so replacing the credentials file during discovery cannot change the token
-between registry probing and the command. Token selection still follows the usual
-environment and credentials-file precedence. Managed session renewal follows its
-existing authentication flow.
+Each invocation captures its operator home and ambient profile, then reads
+configuration once when needed. Editing it does not change the destination,
+actor defaults or presentation settings; unknown keys warn once. Ordinary graph
+clients retain the token selected during setup across registry discovery and
+execution, even if the credentials file changes. Managed session renewal follows
+its existing authentication flow.
 
-Named-server `login` without `--token` reads only the first line of stdin. Its
-credential writes and `logout` use the operator home selected when the invocation
-began.
+Named-server `login` without `--token` reads the first line of stdin. Credential
+writes by `login` and `logout` use the invocation's captured operator home.
 
 ## Output and errors
 
