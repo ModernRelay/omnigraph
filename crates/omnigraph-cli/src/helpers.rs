@@ -13,6 +13,7 @@ use omnigraph_compiler::query::ast::{
 use omnigraph_compiler::settings::SettingId;
 
 use super::*;
+use crate::app::Completion;
 use crate::operator::{self, OperatorConfig};
 
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
@@ -1170,7 +1171,7 @@ pub(crate) async fn execute_queries_validate(
     cluster: &str,
     graph: Option<&str>,
     json: bool,
-) -> Result<()> {
+) -> Result<Completion> {
     let snapshot = read_serving_snapshot_or_report(cluster).await?;
 
     // Type-check per graph: each graph's stored queries against its own schema
@@ -1256,9 +1257,9 @@ pub(crate) async fn execute_queries_validate(
 
     if has_breakages {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
 /// Print a stored-query annotation under its `queries list` entry. A

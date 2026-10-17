@@ -2,6 +2,7 @@
 //! main.rs in the modularization).
 
 use super::*;
+use crate::app::Completion;
 
 pub(crate) fn graph_type_subject(type_key: &str) -> String {
     if let Some(type_name) = type_key.strip_prefix("node:") {
@@ -176,7 +177,7 @@ pub(crate) fn print_query_lint_human(output: &QueryLintOutput) {
     );
 }
 
-pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -185,10 +186,10 @@ pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<
 
     if output.status == QueryLintStatus::Error {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
 
-    Ok(())
+    Ok(Completion::success())
 }
 
 pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -394,7 +395,7 @@ pub(crate) fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagno
     }
 }
 
-pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -402,12 +403,12 @@ pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Re
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -415,12 +416,12 @@ pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()>
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -428,12 +429,12 @@ pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_state_sync(output: &StateSyncOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_state_sync(output: &StateSyncOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -441,12 +442,12 @@ pub(crate) fn finish_cluster_state_sync(output: &StateSyncOutput, json: bool) ->
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_force_unlock(output: &ForceUnlockOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_force_unlock(output: &ForceUnlockOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -454,9 +455,9 @@ pub(crate) fn finish_cluster_force_unlock(output: &ForceUnlockOutput, json: bool
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
 pub(crate) fn print_load_human(payload: &LoadOutput) {

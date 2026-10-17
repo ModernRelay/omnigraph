@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::Completion;
 
 pub(crate) async fn run(
     profile: &Option<String>,
@@ -8,7 +9,7 @@ pub(crate) async fn run(
     to_format: Option<u32>,
     json: bool,
     quiet: bool,
-) -> Result<()> {
+) -> Result<Completion> {
     let target = scope::resolve_scope_from_env(
         &operator::load_operator_config()?,
         planes::Capability::Direct,
@@ -60,9 +61,9 @@ pub(crate) async fn run(
         print_human(&report)?;
     }
     if !report.success() {
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
 fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
