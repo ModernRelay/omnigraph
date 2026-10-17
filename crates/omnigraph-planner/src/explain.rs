@@ -23,7 +23,9 @@ use crate::validate::ValidationSummary;
 /// `depends_on`, with `source`, `operators` and `sink` as objects whose `id`
 /// joins the `physical_plan` nodes; the additive `logical_plan_initial`
 /// arrived with the same bump.
-pub const EXPLAIN_VERSION: u32 = 5;
+/// Version 6: the load node kinds `CsvSource`, `Validate` and
+/// `FragmentWrite` were added, and `operation` carries `mode` for a load.
+pub const EXPLAIN_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySummary {
@@ -60,6 +62,9 @@ pub struct OperationSummary {
     pub budget: Option<PageBudgetSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume: Option<String>,
+    /// A load's `mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
 }
 
 impl OperationSummary {
@@ -81,12 +86,17 @@ impl OperationSummary {
             } => (Some(*scope), Some(*budget), resume.clone()),
             _ => (None, None, None),
         };
+        let mode = match op {
+            Operation::Load { ir, .. } => Some(ir.mode.as_str()),
+            _ => None,
+        };
         Self {
             kind: op.kind(),
             tables,
             scope,
             budget,
             resume,
+            mode,
         }
     }
 
@@ -97,6 +107,7 @@ impl OperationSummary {
             scope: None,
             budget: None,
             resume: None,
+            mode: None,
         }
     }
 }

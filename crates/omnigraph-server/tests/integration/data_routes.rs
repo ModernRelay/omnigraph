@@ -4403,6 +4403,112 @@ fn explain_plan_rows<'a>(body: &'a Value, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// `explain load csv` through `POST /query`: the planner's document as explain rows (`logical`,
+/// `physical`, then `plan` rows), no head moved, `branch` honored; `snapshot`, `name`, `params` meet
+/// the envelope refusals; `/mutate` refuses the read; a source no base admits is denied unprobed.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_answers_an_explain_load_statement_as_rows() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let external_dir = tempfile::tempdir().unwrap();
+    let csv_path = external_dir.path().join("people.csv");
+    fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+    let external_base = format!("file://{}/", external_dir.path().display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(external_base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
+    let head = main_head_commit_id(&app).await;
+    let statement = format!(
+        "explain load csv \"file://{}\" into node:Person mode overwrite header",
+        csv_path.display()
+    );
+
+    for request in [
+        json!({"query": statement}),
+        json!({"query": statement, "branch": "main"}),
+    ] {
+        let (status, body) = json_response(&app, json_post("/query", &request)).await;
+        assert_eq!(status, StatusCode::OK, "{request}: {body}");
+        assert_eq!(body["query_name"], "load csv", "{body}");
+        assert_eq!(body["columns"], json!(["tree", "depth", "node", "detail"]));
+        assert_eq!(body["graph_commit_id"], head, "{body}");
+        let physical = explain_tree(&body, "physical");
+        assert_eq!(physical["node"], "FragmentWrite", "{physical}");
+        assert_eq!(physical["mode"], "overwrite", "{physical}");
+        assert_eq!(physical["table"], "node:Person", "{physical}");
+        let validate = &physical["inputs"][0];
+        assert_eq!(validate["node"], "Validate", "{physical}");
+        assert_eq!(validate["inputs"][0]["node"], "CsvSource", "{physical}");
+        assert_eq!(explain_tree(&body, "logical")["node"], "FragmentWrite");
+        assert_eq!(explain_plan_rows(&body, "route"), ["engine"], "{body}");
+        assert_eq!(explain_plan_rows(&body, "explain_version"), ["6"], "{body}");
+    }
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "an explain publishes nothing"
+    );
+    assert!(csv_path.exists(), "the source is only probed");
+
+    let cases = [
+        (
+            "/query",
+            json!({"query": statement, "snapshot": head}),
+            "a branch statement names its branches itself; drop the request target",
+        ),
+        (
+            "/query",
+            json!({"query": statement, "name": "load csv"}),
+            "a branch statement takes no name and no parameters",
+        ),
+        (
+            "/query",
+            json!({"query": statement, "params": {}}),
+            "a branch statement takes no name and no parameters",
+        ),
+        (
+            "/mutate",
+            json!({"query": statement}),
+            "statement 'explain' is a read; use POST /query",
+        ),
+        (
+            "/mutate",
+            json!({"query": statement, "branch": "main"}),
+            "statement 'explain' is a read; use POST /query",
+        ),
+    ];
+    for (path, request, expected) in cases {
+        let (status, body) = json_response(&app, json_post(path, &request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {request}: {body}");
+        assert_eq!(body["error"], expected, "{path} {request}: {body}");
+    }
+
+    let (_denied_temp, denied_app) = app_for_loaded_graph().await;
+    let (status, body) = json_response(
+        &denied_app,
+        json_post(
+            "/query",
+            &json!({"query": format!("explain {LOAD_CSV_PEOPLE}")}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ingress is denied for this graph"),
+        "{body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn query_endpoint_answers_an_explain_statement_as_rows() {
     let (_temp, app) = app_for_loaded_graph().await;

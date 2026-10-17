@@ -69,11 +69,14 @@ pub(crate) use typed_value::{fill_declared_params, validate_params};
 use bind::bind;
 pub(crate) use constant::evaluate_constant;
 use context::QueryContext;
-pub(crate) use explain::{explain_document, explain_rows};
+pub(crate) use context::{LoadCharge, LoadMemory, LoadReuseReservation};
+pub(crate) use explain::{explain_document, explain_load_rows, explain_rows};
 pub(crate) use graph::{EmbeddingResolver, GraphIndexHandle};
 use lower::Lowering;
 use plan_source::{ExplainedQuery, QuerySource, accept_query, explain_query};
-pub(crate) use plan_source::{accept_replay, replay_refused, replayed_coverage_holds};
+pub(crate) use plan_source::{
+    accept_replay, engine_bounds, replay_refused, replayed_coverage_holds,
+};
 pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
@@ -90,6 +93,29 @@ pub(crate) struct EngineContext<'a> {
     pub(crate) snapshot: Option<&'a Snapshot>,
     pub(crate) catalog: &'a Arc<Catalog>,
     pub(crate) graph_index: Arc<GraphIndexHandle>,
+    /// A load plan's facts; `None` under a read plan, whose lowering never
+    /// reaches a load node.
+    pub(crate) load: Option<&'a LoadFacts>,
+}
+
+/// What a load plan's operators need beside the snapshot: the statement as
+/// the loader resolved it, the one captured response its source parses, and
+/// the write verb's facts, `None` where no write runs (an explain).
+pub(crate) struct LoadFacts {
+    pub(crate) request: crate::loader::csv::CsvLoadRequest,
+    pub(crate) capture: Arc<crate::table_store::CapturedSource>,
+    pub(crate) write: Option<LoadWrite>,
+}
+
+/// The write verb's facts: the graph handle and the open transaction the
+/// sink stages under, the session's write allowance, and the slot the sink
+/// deposits its staged transaction in for the driver to commit.
+#[derive(Clone)]
+pub(crate) struct LoadWrite {
+    pub(crate) db: Arc<crate::db::Omnigraph>,
+    pub(crate) txn: Arc<crate::db::WriteTxn>,
+    pub(crate) write_budget: crate::storage_layer::WriteBudget,
+    pub(crate) staged: Arc<std::sync::Mutex<Option<crate::exec::staging::StagedMutation>>>,
 }
 
 /// The refusal every storage request of a catalogue-only query meets.
@@ -313,6 +339,7 @@ pub(crate) async fn execute_query(
         snapshot,
         catalog,
         graph_index: Arc::new(graph_index),
+        load: None,
     };
     let run = Box::pin(execute(bound, &context)).await?;
     #[cfg(test)]
@@ -338,6 +365,7 @@ pub(crate) async fn execute_query_inspected(
         snapshot,
         catalog,
         graph_index: Arc::new(graph_index),
+        load: None,
     };
     let PlanRun {
         result,
@@ -447,6 +475,30 @@ pub(crate) async fn execute(
         QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
     ctx.run_owned(execute_with_context(bound, evidence, context, &ctx))
         .await
+}
+
+/// A load plan run under the statement's own pool: the sink's one `count`
+/// row read back, every owned producer settled before return.
+pub(crate) async fn execute_load(
+    bound: &BoundPlan,
+    context: &EngineContext<'_>,
+    memory: &LoadMemory,
+) -> Result<u64> {
+    let ctx = memory.context();
+    ctx.run_owned(async {
+        let lowering = Lowering::new(bound, context);
+        let lowered = lowering.lower_query(&Pass::default())?;
+        let batch = run_plan(&lowered, &bound.plan, ctx).await?;
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| {
+                OmniError::manifest_internal("the load plan's root is not a u64 count")
+            })?;
+        Ok(counts.iter().flatten().sum())
+    })
+    .await
 }
 
 async fn execute_with_context(

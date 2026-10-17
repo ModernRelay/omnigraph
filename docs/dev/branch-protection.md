@@ -198,7 +198,7 @@ cold cache (`Test Workspace`, `Test omnigraph-server --features aws`,
 
 A group merges as one push of `main` carrying one squash commit per entry, so
 the post-merge runs (`Test Workspace`, the fence, the shards, Azurite, the
-vocabulary audit, the edge release) cover the whole group at once, and a
+vocabulary audit) cover the whole group at once, and a
 revert picks the entry's own squash commit out of that push.
 
 Changing one of the five required context names still needs the rule page:

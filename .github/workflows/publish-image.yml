@@ -13,7 +13,10 @@ name: Publish container image
 # The binaries are compiled inside a rust:1-bookworm container, NOT on the
 # runner host: the Dockerfile's runtime base is debian bookworm-slim
 # (glibc 2.36), and binaries built on ubuntu-latest (glibc 2.39) do not run
-# there. Builder and runtime must share the same distro release.
+# there. Builder and runtime must share the same distro release. They carry
+# the same commit and `stable` channel stamp as the release archives
+# (`build-release-archives.yml`), checked in the image before it is pushed,
+# and the pushed digest carries a build provenance attestation.
 
 on:
   workflow_call:
@@ -52,6 +55,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
@@ -60,6 +65,7 @@ jobs:
       # could pass a branch name or SHA and publish non-release code under a
       # release-looking image tag. Require an existing v* tag ref.
       - name: Validate release tag
+        id: tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -67,15 +73,47 @@ jobs:
             || { echo "tag must be a v* release tag, got: ${RELEASE_TAG}" >&2; exit 1; }
           gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null \
             || { echo "no such tag: ${RELEASE_TAG}" >&2; exit 1; }
+          # Releases before v0.14.0 predate the commit and channel stamp and
+          # release attestations, as in release.yml's `release_source`.
+          stamped=false
+          if [[ "$RELEASE_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            version=$(( 10#${BASH_REMATCH[1]} * 1000000 + 10#${BASH_REMATCH[2]} * 1000 + 10#${BASH_REMATCH[3]} ))
+            (( version >= 14000 )) && stamped=true
+          fi
+          echo "stamped=${stamped}" >> "$GITHUB_OUTPUT"
+
+      # The provenance predicate names the run's commit (its OIDC `sha`
+      # claim), not the checkout. A tag push runs at the tagged commit; a
+      # manual backfill attests only when dispatched at the tag itself.
+      # Decided before anything is pushed.
+      - name: Require the run's commit to be the built commit
+        id: provenance
+        env:
+          STAMPED: ${{ steps.tag.outputs.stamped }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]]; then
+            echo "attest=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$STAMPED" == true ]]; then
+            echo "::error::this run is for ${GITHUB_SHA}, not ${RELEASE_TAG} (${SOURCE_SHA}); dispatch the backfill at refs/tags/${RELEASE_TAG} so its provenance names the built commit"
+            exit 1
+          else
+            echo "::warning::${RELEASE_TAG} predates release attestations and this run is for ${GITHUB_SHA}; publishing without provenance"
+            echo "attest=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
 
+      # Read at compile time by `omnigraph version` and the server's
+      # `/healthz` `source_version`.
       - name: Build release binaries (bookworm builder)
         run: |
-          docker run --rm -v "$PWD:/work" -w /work rust:1-bookworm bash -euxc '
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e OMNIGRAPH_SOURCE_VERSION="$SOURCE_SHA" -e OMNIGRAPH_RELEASE_CHANNEL=stable \
+            rust:1-bookworm bash -euxc '
             apt-get update
             apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
             # A set RUSTFLAGS, empty included, replaces the workspace `[build]
@@ -110,17 +148,37 @@ jobs:
           }
 
       - name: Build and push image
+        id: push
+        env:
+          STAMPED: ${{ steps.tag.outputs.stamped }}
         run: |
+          set -euo pipefail
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           image="ghcr.io/${owner}/omnigraph-server"
           docker build -t "${image}:${RELEASE_TAG}" .
           docker run --rm --entrypoint /usr/local/bin/omnigraph \
             "${image}:${RELEASE_TAG}" version
+          if [[ "$STAMPED" == true ]]; then
+            docker run --rm --entrypoint /usr/local/bin/omnigraph \
+              "${image}:${RELEASE_TAG}" version --json > "$RUNNER_TEMP/version.json"
+            python3 - "$RUNNER_TEMP/version.json" <<'PY'
+          import json, os, sys
+          facts = json.load(open(sys.argv[1]))
+          expected = ("stable", os.environ["SOURCE_SHA"])
+          if (facts["channel"], facts["commit"]) != expected:
+              raise SystemExit(f"image reports {facts['channel']}/{facts['commit']}, expected {expected}")
+          PY
+          fi
           docker run --rm --entrypoint /usr/local/bin/omnigraph-server \
             "${image}:${RELEASE_TAG}" --help >/dev/null
           docker run --rm --entrypoint /usr/local/bin/omnigraph-azure-admission \
             "${image}:${RELEASE_TAG}" --help >/dev/null
           docker push "${image}:${RELEASE_TAG}"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${image}:${RELEASE_TAG}")"
+          digest="${digest#*@}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
           # Move `latest` only on real tag pushes — a dispatch backfill of an
           # old tag must not repoint `latest` at it.
@@ -128,6 +186,16 @@ jobs:
             docker tag "${image}:${RELEASE_TAG}" "${image}:latest"
             docker push "${image}:latest"
           fi
+
+      # The GHCR digest is attested and the attestation is stored beside the
+      # image; Docker Hub carries no attestation of its own.
+      - name: Attest image provenance
+        if: steps.provenance.outputs.attest == 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
       # Docker Hub is the primary public distribution channel (anonymous pulls
       # for deployments). Skipped when the DOCKERHUB_* secrets are not

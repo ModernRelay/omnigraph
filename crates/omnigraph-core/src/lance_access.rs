@@ -78,6 +78,21 @@ pub fn control_session() -> Arc<Session> {
     Arc::new(Session::new(0, 0, Arc::clone(&STORE_REGISTRY)))
 }
 
+/// Statement-scoped data session: caches sized to one statement's admitted
+/// read-reuse allowance, on the owner's registry so a storage IO scope is
+/// never bypassed. Dropped with the statement that admitted it.
+pub fn statement_session(
+    registry: Arc<ObjectStoreRegistry>,
+    index_cache_bytes: usize,
+    metadata_cache_bytes: usize,
+) -> Arc<Session> {
+    Arc::new(Session::new(
+        index_cache_bytes,
+        metadata_cache_bytes,
+        registry,
+    ))
+}
+
 /// DST seam (Lance-realm listing): the process-wide Lance object-store
 /// registry, exposed so the DST harness can list a realm's keys through the
 /// same provider Lance uses. Hidden: a test seam, not public API; production

@@ -1,10 +1,10 @@
-//! `load csv`: one CSV object, read under the graph's external Blob policy,
-//! typed by the `.pg` schema, normalized into the one per-type Arrow batch
-//! every strict load hands to the load transaction. The reader replaces only
-//! the JSON normalization step; admission, staging, validation and the
-//! branch-owned `__manifest` publication are the loader's, unchanged.
+//! `load csv`: one CSV object, captured once under the graph's external Blob
+//! policy, typed by the `.pg` schema, normalized into the per-type Arrow
+//! batches every strict load hands to the load transaction. The reader
+//! replaces only the JSON normalization step; admission, staging, validation
+//! and the branch-owned `__manifest` publication are the loader's, unchanged.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,11 +23,12 @@ use omnigraph_compiler::types::{PropType, ScalarType};
 
 use super::{
     LoadMode, canonical_key_id, edge_key_columns, generate_id, parse_date32_literal,
-    parse_date64_literal, projected_strict_field_bytes,
+    parse_date64_literal,
 };
 use crate::db::Omnigraph;
 use crate::error::{OmniError, Result};
-use crate::storage_layer::{KEYED_WRITE_MAX_ROWS, WriteBudget};
+use crate::storage_layer::KEYED_WRITE_MAX_ROWS;
+use crate::table_store::CapturedSource;
 
 /// The resource a source over the session's `load_source_max_bytes` is
 /// refused under, before any payload byte is read.
@@ -37,13 +38,9 @@ pub const CSV_SOURCE_BYTES_RESOURCE: &str = "csv_source_bytes";
 /// with the source named: a slow or stalled source cannot hold a write open.
 pub const CSV_SOURCE_READ_DEADLINE: Duration = Duration::from_secs(120);
 
-/// The resource the typed batch is admitted under, in every mode: the name
-/// the strict JSONL projection uses, so a CSV load over `write_max_bytes`
-/// refuses exactly as the equivalent JSONL load refuses.
-const CSV_INPUT_ARROW_BYTES_RESOURCE: &str = "strict_input_arrow_bytes";
-
-/// Records per reader batch; the batches are concatenated into one per load.
-const CSV_READ_BATCH_ROWS: usize = 8192;
+/// Records per reader batch in overwrite; each batch is one staged-write
+/// input.
+pub(crate) const CSV_READ_BATCH_ROWS: usize = 8192;
 
 /// One `load csv` statement, resolved to the loader's vocabulary.
 #[derive(Debug, Clone)]
@@ -71,15 +68,73 @@ impl CsvLoadRequest {
             columns: stmt.columns.clone(),
         }
     }
+
+    /// The statement as the grammar reads it back: `LoadStmt::render`'s text.
+    pub fn render(&self) -> String {
+        LoadStmt {
+            source: self.source.clone(),
+            target: self.target.clone(),
+            mode: match self.mode {
+                LoadMode::Overwrite => LoadStmtMode::Overwrite,
+                LoadMode::Append => LoadStmtMode::Append,
+                LoadMode::Merge => LoadStmtMode::Merge,
+            },
+            delimiter: self.delimiter,
+            header: self.header,
+            columns: self.columns.clone(),
+        }
+        .render()
+    }
+
+    /// The columns the statement maps, without reading the source: the
+    /// spelled `columns`, else every declared property of the target plus an
+    /// edge file's two endpoints. A target absent from `catalog` counts no
+    /// property.
+    pub fn mapped_column_count(&self, catalog: &Catalog) -> usize {
+        if let Some(columns) = &self.columns {
+            return columns.len();
+        }
+        match &self.target {
+            LoadTarget::Node(name) => catalog
+                .node_types
+                .get(name)
+                .map_or(0, |node_type| node_type.properties.len()),
+            LoadTarget::Edge(name) => catalog
+                .edge_types
+                .get(name)
+                .map_or(0, |edge_type| edge_type.properties.len())
+                .saturating_add(2),
+        }
+    }
 }
 
-/// The one typed batch a CSV load stages: its table key, the type name the
-/// receipt counts under, and whether it is a node or an edge batch.
-pub(super) struct PreparedCsvBatch {
-    pub(super) type_name: String,
-    pub(super) table_key: String,
-    pub(super) is_edge: bool,
-    pub(super) batch: RecordBatch,
+/// The typed batches a CSV load stages, in source order: their table key,
+/// the type name the receipt counts under, whether they are node or edge
+/// batches, and the record count across them.
+#[derive(Debug)]
+pub(crate) struct PreparedCsvBatch {
+    pub(crate) type_name: String,
+    pub(crate) table_key: String,
+    pub(crate) is_edge: bool,
+    pub(crate) batches: Vec<RecordBatch>,
+    pub(crate) rows: usize,
+}
+
+/// The strict batch shape the target's delta carries: the type's own Arrow
+/// schema, which every normalized batch and the plan's source node declare.
+pub(crate) fn target_arrow_schema(catalog: &Catalog, target: &LoadTarget) -> Result<SchemaRef> {
+    match target {
+        LoadTarget::Node(name) => catalog
+            .node_types
+            .get(name)
+            .map(|node_type| Arc::clone(&node_type.arrow_schema))
+            .ok_or_else(|| OmniError::manifest(format!("load csv: unknown node type '{name}'"))),
+        LoadTarget::Edge(name) => catalog
+            .edge_types
+            .get(name)
+            .map(|edge_type| Arc::clone(&edge_type.arrow_schema))
+            .ok_or_else(|| OmniError::manifest(format!("load csv: unknown edge type '{name}'"))),
+    }
 }
 
 /// What one CSV column feeds: an endpoint of an edge file or a declared
@@ -91,53 +146,24 @@ enum ColumnRole {
     Property { name: String, prop: PropType },
 }
 
-/// Resolve the target, the mapping and the supported kinds against the
-/// transaction's catalog, read the object under the policy, parse it typed,
-/// and normalize it into the strict batch shape. Every refusal before the
-/// read names what it refuses; nothing is staged on any error.
-pub(super) async fn prepare_csv_batch(
+/// Capture the source object once per statement: authorized by the graph's
+/// external Blob policy, bounded by `source_max_bytes` before any payload
+/// byte is read, read within `CSV_SOURCE_READ_DEADLINE` as one response
+/// bound to the version the probe reported. Every attempt of the statement
+/// parses this capture; none fetches again.
+pub(super) async fn capture_csv_source(
     db: &Omnigraph,
-    catalog: &Catalog,
     request: &CsvLoadRequest,
-    write_budget: WriteBudget,
     source_max_bytes: u64,
-) -> Result<PreparedCsvBatch> {
-    let table_key = request.target.table_key();
-    let (properties, blob_properties, arrow_schema, is_edge) = match &request.target {
-        LoadTarget::Node(name) => {
-            let node_type = catalog.node_types.get(name).ok_or_else(|| {
-                OmniError::manifest(format!("load csv: unknown node type '{name}'"))
-            })?;
-            (
-                &node_type.properties,
-                &node_type.blob_properties,
-                Arc::clone(&node_type.arrow_schema),
-                false,
-            )
-        }
-        LoadTarget::Edge(name) => {
-            let edge_type = catalog.edge_types.get(name).ok_or_else(|| {
-                OmniError::manifest(format!("load csv: unknown edge type '{name}'"))
-            })?;
-            (
-                &edge_type.properties,
-                &edge_type.blob_properties,
-                Arc::clone(&edge_type.arrow_schema),
-                true,
-            )
-        }
-    };
-    let system_columns = catalog.system_columns;
-    if let Some(columns) = &request.columns {
-        resolve_roles(columns, properties, is_edge, &table_key)?;
-    }
-
-    let bytes = tokio::time::timeout(
+    source_charge: Arc<crate::engine::LoadCharge>,
+) -> Result<CapturedSource> {
+    let mut capture = tokio::time::timeout(
         CSV_SOURCE_READ_DEADLINE,
         db.blob_materializer().read_external_object(
             &request.source,
             source_max_bytes,
             CSV_SOURCE_BYTES_RESOURCE,
+            |size| source_charge.grow(size.saturating_mul(2)),
         ),
     )
     .await
@@ -150,12 +176,91 @@ pub(super) async fn prepare_csv_batch(
             ),
         )
     })??;
+    source_charge.shrink_to(capture.size);
+    capture.admission = Some(source_charge);
+    tracing::debug!(
+        source = %request.source,
+        bytes = capture.size,
+        e_tag = ?capture.e_tag,
+        version = ?capture.version,
+        "load csv: captured the source"
+    );
+    Ok(capture)
+}
 
+/// The source's size from its metadata probe alone, for `explain load csv`:
+/// the policy authorization, `source_max_bytes` refusal and deadline of
+/// [`capture_csv_source`], and no payload byte read.
+pub(crate) async fn probe_csv_source_size(
+    db: &Omnigraph,
+    request: &CsvLoadRequest,
+    source_max_bytes: u64,
+) -> Result<u64> {
+    tokio::time::timeout(
+        CSV_SOURCE_READ_DEADLINE,
+        db.blob_materializer().external_object_size(
+            &request.source,
+            source_max_bytes,
+            CSV_SOURCE_BYTES_RESOURCE,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        OmniError::external_blob_source(
+            &request.source,
+            format!(
+                "explain load csv: probing the source exceeded {} seconds",
+                CSV_SOURCE_READ_DEADLINE.as_secs()
+            ),
+        )
+    })?
+}
+
+/// Resolve the target, the mapping and the supported kinds against the
+/// transaction's catalog, parse the capture typed, and normalize every
+/// reader batch into the strict batch shape. Every refusal names what it
+/// refuses; nothing is staged on any error.
+pub(crate) fn prepare_csv_batches(
+    catalog: &Catalog,
+    request: &CsvLoadRequest,
+    capture: &CapturedSource,
+    admit: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<PreparedCsvBatch> {
+    let table_key = request.target.table_key();
+    let (properties, arrow_schema, is_edge) = match &request.target {
+        LoadTarget::Node(name) => {
+            let node_type = catalog.node_types.get(name).ok_or_else(|| {
+                OmniError::manifest(format!("load csv: unknown node type '{name}'"))
+            })?;
+            (
+                &node_type.properties,
+                Arc::clone(&node_type.arrow_schema),
+                false,
+            )
+        }
+        LoadTarget::Edge(name) => {
+            let edge_type = catalog.edge_types.get(name).ok_or_else(|| {
+                OmniError::manifest(format!("load csv: unknown edge type '{name}'"))
+            })?;
+            (
+                &edge_type.properties,
+                Arc::clone(&edge_type.arrow_schema),
+                true,
+            )
+        }
+    };
+    if let Some(columns) = &request.columns {
+        resolve_roles(columns, properties, is_edge, &table_key)?;
+    }
+
+    let bytes = capture.bytes.as_ref();
+    let shape = CsvShape::count(bytes, request);
+    admit(shape.reader_bytes(bytes.len()))?;
     let format = Format::default()
         .with_header(request.header)
         .with_delimiter(request.delimiter);
     let (file_shape, _) = format
-        .infer_schema(Cursor::new(bytes.as_ref()), Some(0))
+        .infer_schema(Cursor::new(bytes), Some(0))
         .map_err(|error| csv_parse_error(&request.source, &table_key, error))?;
     if file_shape.fields().is_empty() {
         return Err(OmniError::manifest(format!(
@@ -187,125 +292,306 @@ pub(super) async fn prepare_csv_batch(
             .map(|(role, name)| Field::new(name, read_data_type(role), true))
             .collect::<Vec<_>>(),
     ));
-    let projections = project_columns(&arrow_schema, blob_properties, &roles, system_columns)?;
-    let read = parse_records(
-        bytes.as_ref(),
-        request,
-        Arc::clone(&read_schema),
-        &projections,
-        write_budget,
-        &table_key,
-    )?;
-    let rows = read.num_rows();
+    let read = parse_records(bytes, request, read_schema, &table_key)?;
+    let rows: usize = read.iter().map(RecordBatch::num_rows).sum();
     if rows == 0 {
         return Err(OmniError::manifest(format!(
             "load csv into {table_key}: the source holds no records"
         )));
     }
 
-    let mut by_role: HashMap<&ColumnRole, ArrayRef> = HashMap::with_capacity(roles.len());
-    for (index, role) in roles.iter().enumerate() {
-        by_role.insert(role, Arc::clone(read.column(index)));
-    }
-    let endpoint = |role: ColumnRole, label: &str| -> Result<ArrayRef> {
-        let column = by_role.get(&role).ok_or_else(|| {
-            OmniError::manifest_internal(format!("{label} column resolved twice"))
-        })?;
-        let strings = utf8_without_empty(column);
-        if let Some(record) = first_null(&strings) {
-            return Err(OmniError::manifest(format!(
-                "load csv into {table_key}: record {record} has an empty `{label}` endpoint"
-            )));
-        }
-        Ok(Arc::new(strings) as ArrayRef)
+    let typing = CsvTyping {
+        catalog,
+        target: &request.target,
+        table_key: &table_key,
+        properties,
+        arrow_schema: &arrow_schema,
+        roles: &roles,
+        is_edge,
     };
-    let (src_column, dst_column) = if is_edge {
-        (
-            Some(endpoint(ColumnRole::Src, FROM_COLUMN)?),
-            Some(endpoint(ColumnRole::Dst, TO_COLUMN)?),
-        )
-    } else {
-        (None, None)
-    };
-
-    let leading = if is_edge { 3 } else { 1 };
-    let mut property_columns: Vec<ArrayRef> =
-        Vec::with_capacity(arrow_schema.fields().len().saturating_sub(leading));
-    for field in arrow_schema.fields().iter().skip(leading) {
-        let prop = properties.get(field.name()).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "property '{}' of {table_key} is missing from its catalog entry",
-                field.name()
-            ))
-        })?;
-        let role = ColumnRole::Property {
-            name: field.name().to_string(),
-            prop: prop.clone(),
-        };
-        let column = match by_role.get(&role) {
-            Some(read_column) => convert_property(read_column, field.name(), prop, &table_key)?,
-            None => {
-                if !field.is_nullable() {
-                    return Err(OmniError::manifest(format!(
-                        "load csv into {table_key}: property '{}' is not nullable and the source has no column for it",
-                        field.name()
-                    )));
-                }
-                new_null_array(field.data_type(), rows)
-            }
-        };
-        if !field.is_nullable()
-            && let Some(record) = first_null(column.as_ref())
-        {
-            return Err(OmniError::manifest(format!(
-                "load csv into {table_key}: record {record} has an empty field for non-nullable property '{}'",
-                field.name()
-            )));
-        }
-        property_columns.push(column);
-    }
-
-    let ids = match &request.target {
-        LoadTarget::Node(name) => node_ids(
-            &catalog.node_types[name],
-            &arrow_schema,
-            &property_columns,
-            rows,
-        )?,
-        LoadTarget::Edge(name) => edge_ids(
-            &catalog.edge_types[name],
-            &arrow_schema,
-            src_column
-                .as_ref()
-                .expect("an edge batch resolved its endpoints"),
-            dst_column
-                .as_ref()
-                .expect("an edge batch resolved its endpoints"),
-            &property_columns,
-            system_columns,
-            rows,
-        )?,
-    };
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(arrow_schema.fields().len());
-    columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
-    if let (Some(src), Some(dst)) = (src_column, dst_column) {
-        columns.push(src);
-        columns.push(dst);
-    }
-    columns.extend(property_columns);
-    let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), columns)
-        .map_err(OmniError::arrow_internal)?;
-    write_budget.check(
-        CSV_INPUT_ARROW_BYTES_RESOURCE,
-        crate::table_store::write_batch_bytes(&batch)?.rows,
-    )?;
+    admit(typing.normalization_bytes(&read)?)?;
+    let batches = typing.normalize_batches(&read)?;
     Ok(PreparedCsvBatch {
         type_name: request.target.type_name().to_string(),
         table_key,
         is_edge,
-        batch,
+        batches,
+        rows,
     })
+}
+
+/// The resolved typing one CSV load applies to every reader batch.
+struct CsvTyping<'a> {
+    catalog: &'a Catalog,
+    target: &'a LoadTarget,
+    table_key: &'a str,
+    properties: &'a HashMap<String, PropType>,
+    arrow_schema: &'a SchemaRef,
+    roles: &'a [ColumnRole],
+    is_edge: bool,
+}
+
+struct CsvShape {
+    rows: usize,
+    columns: usize,
+}
+
+impl CsvShape {
+    fn count(mut bytes: &[u8], request: &CsvLoadRequest) -> Self {
+        let mut reader = csv_core::ReaderBuilder::new()
+            .delimiter(request.delimiter)
+            .build();
+        let mut output = [0; 4096];
+        let mut ends = [0; 128];
+        let mut records = 0_usize;
+        let mut columns = 0_usize;
+        let mut fields = 0_usize;
+        loop {
+            let (result, consumed, _, count) = reader.read_record(bytes, &mut output, &mut ends);
+            bytes = &bytes[consumed..];
+            fields = fields.saturating_add(count);
+            match result {
+                csv_core::ReadRecordResult::Record => {
+                    if records == 0 {
+                        columns = fields;
+                    }
+                    records = records.saturating_add(1);
+                    fields = 0;
+                }
+                csv_core::ReadRecordResult::End => break,
+                _ => {}
+            }
+        }
+        Self {
+            rows: records.saturating_sub(usize::from(request.header)),
+            columns,
+        }
+    }
+
+    /// Covers Arrow's record offsets, growing text buffer, parsed arrays,
+    /// header inference and batch metadata before any of them is allocated.
+    fn reader_bytes(&self, source_bytes: usize) -> u64 {
+        let rows = self.rows as u64;
+        let columns = self.columns as u64;
+        (source_bytes as u64)
+            .saturating_mul(4)
+            .saturating_add(rows.saturating_mul(columns).saturating_mul(32))
+            .saturating_add(
+                rows.div_ceil(CSV_READ_BATCH_ROWS as u64)
+                    .max(1)
+                    .saturating_mul(columns)
+                    .saturating_mul(2048),
+            )
+            .saturating_add(8192)
+    }
+}
+
+struct NormalizedCsvBatch {
+    first_record: usize,
+    rows: usize,
+    endpoints: Vec<ArrayRef>,
+    properties: Vec<ArrayRef>,
+}
+
+impl CsvTyping<'_> {
+    /// Admits typed null arrays, copied text and canonical IDs, including
+    /// temporary key strings and the final Arrow copies, before normalization.
+    fn normalization_bytes(&self, read: &[RecordBatch]) -> Result<u64> {
+        let rows = read
+            .iter()
+            .map(|batch| batch.num_rows() as u64)
+            .sum::<u64>();
+        let batch_rows = read.iter().map(RecordBatch::num_rows).max().unwrap_or(0) as u64;
+        let mut bytes = batch_rows.saturating_mul(128).saturating_add(
+            (read.len() as u64)
+                .saturating_mul(self.arrow_schema.fields().len() as u64)
+                .saturating_mul(2048),
+        );
+        for field in self.arrow_schema.fields() {
+            let width = super::projected_strict_field_bytes(
+                field,
+                &serde_json::Value::Null,
+                self.properties
+                    .get(field.name())
+                    .is_some_and(|prop| prop.scalar == ScalarType::Blob),
+            )?;
+            bytes = bytes.saturating_add(rows.saturating_mul(width).saturating_mul(2));
+        }
+        let keys = match self.target {
+            LoadTarget::Node(name) => self.catalog.node_types[name].key.as_ref(),
+            LoadTarget::Edge(name) => self.catalog.edge_types[name].key.as_ref(),
+        };
+        if keys.is_none() {
+            bytes = bytes.saturating_add(rows.saturating_mul(64));
+        }
+        let mut key_scratch = 0_u64;
+        for batch in read {
+            let mut batch_key_scratch = 0_u64;
+            for (role, column) in self.roles.iter().zip(batch.columns()) {
+                let role_name = match role {
+                    ColumnRole::Src => self.catalog.system_columns.src,
+                    ColumnRole::Dst => self.catalog.system_columns.dst,
+                    ColumnRole::Property { name, .. } => name.as_str(),
+                };
+                let keyed = keys.is_some_and(|keys| keys.iter().any(|key| key == role_name));
+                if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
+                    bytes = bytes.saturating_add(
+                        (strings.get_buffer_memory_size() as u64).saturating_mul(2),
+                    );
+                }
+                if keyed {
+                    let text_key = matches!(role, ColumnRole::Src | ColumnRole::Dst)
+                        || matches!(role, ColumnRole::Property { prop, .. } if prop.scalar == ScalarType::String);
+                    let key_bytes = if text_key {
+                        let strings = column
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .expect("a text key is read as Utf8");
+                        strings.iter().flatten().fold(0_u64, |sum, text| {
+                            text.bytes().fold(sum, |sum, byte| {
+                                sum.saturating_add(match byte {
+                                    0..=31 => 6,
+                                    b'"' | b'\\' => 2,
+                                    _ => 1,
+                                })
+                            })
+                        })
+                    } else {
+                        (batch.num_rows() as u64).saturating_mul(384)
+                    };
+                    let key_bytes =
+                        key_bytes.saturating_add((batch.num_rows() as u64).saturating_mul(32));
+                    bytes = bytes.saturating_add(key_bytes.saturating_mul(2));
+                    batch_key_scratch =
+                        batch_key_scratch.saturating_add(key_bytes.saturating_mul(2));
+                }
+            }
+            key_scratch = key_scratch.max(batch_key_scratch);
+        }
+        Ok(bytes.saturating_add(key_scratch))
+    }
+
+    fn normalize_batches(&self, read: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
+        let table_key = self.table_key;
+        let by_role: HashMap<&ColumnRole, usize> = self
+            .roles
+            .iter()
+            .enumerate()
+            .map(|(index, role)| (role, index))
+            .collect();
+        let leading = if self.is_edge { 3 } else { 1 };
+        let mut first_record = 1;
+        let mut normalized: Vec<NormalizedCsvBatch> = read
+            .iter()
+            .map(|batch| {
+                let normalized = NormalizedCsvBatch {
+                    first_record,
+                    rows: batch.num_rows(),
+                    endpoints: Vec::with_capacity(leading - 1),
+                    properties: Vec::with_capacity(
+                        self.arrow_schema.fields().len().saturating_sub(leading),
+                    ),
+                };
+                first_record += batch.num_rows();
+                normalized
+            })
+            .collect();
+        if self.is_edge {
+            for (role, label) in [(ColumnRole::Src, FROM_COLUMN), (ColumnRole::Dst, TO_COLUMN)] {
+                let index = *by_role.get(&role).ok_or_else(|| {
+                    OmniError::manifest_internal(format!("{label} column resolved twice"))
+                })?;
+                for (read, normalized) in read.iter().zip(&mut normalized) {
+                    let strings = utf8_without_empty(read.column(index));
+                    if let Some(row) = first_null(&strings) {
+                        return Err(OmniError::manifest(format!(
+                            "load csv into {table_key}: record {} has an empty `{label}` endpoint",
+                            normalized.first_record + row
+                        )));
+                    }
+                    normalized.endpoints.push(Arc::new(strings));
+                }
+            }
+        }
+        for field in self.arrow_schema.fields().iter().skip(leading) {
+            let prop = self.properties.get(field.name()).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "property '{}' of {table_key} is missing from its catalog entry",
+                    field.name()
+                ))
+            })?;
+            let role = ColumnRole::Property {
+                name: field.name().to_string(),
+                prop: prop.clone(),
+            };
+            let index = by_role.get(&role).copied();
+            if index.is_none() && !field.is_nullable() {
+                return Err(OmniError::manifest(format!(
+                    "load csv into {table_key}: property '{}' is not nullable and the source has no column for it",
+                    field.name()
+                )));
+            }
+            for (read, normalized) in read.iter().zip(&mut normalized) {
+                let column = match index {
+                    Some(index) => convert_property(
+                        read.column(index),
+                        field.name(),
+                        prop,
+                        table_key,
+                        normalized.first_record,
+                    )?,
+                    None => new_null_array(field.data_type(), normalized.rows),
+                };
+                normalized.properties.push(column);
+            }
+            if !field.is_nullable() {
+                for normalized in &normalized {
+                    let column = normalized
+                        .properties
+                        .last()
+                        .expect("every batch has the current property");
+                    if let Some(row) = first_null(column.as_ref()) {
+                        return Err(OmniError::manifest(format!(
+                            "load csv into {table_key}: record {} has an empty field for non-nullable property '{}'",
+                            normalized.first_record + row,
+                            field.name()
+                        )));
+                    }
+                }
+            }
+        }
+        normalized
+            .into_iter()
+            .map(|normalized| {
+                let ids = match self.target {
+                    LoadTarget::Node(name) => node_ids(
+                        &self.catalog.node_types[name],
+                        self.arrow_schema,
+                        &normalized.properties,
+                        normalized.rows,
+                        normalized.first_record,
+                    )?,
+                    LoadTarget::Edge(name) => edge_ids(
+                        &self.catalog.edge_types[name],
+                        self.arrow_schema,
+                        &normalized.endpoints[0],
+                        &normalized.endpoints[1],
+                        &normalized.properties,
+                        self.catalog.system_columns,
+                        normalized.rows,
+                        normalized.first_record,
+                    )?,
+                };
+                let mut columns: Vec<ArrayRef> =
+                    Vec::with_capacity(self.arrow_schema.fields().len());
+                columns.push(Arc::new(StringArray::from(ids)));
+                columns.extend(normalized.endpoints);
+                columns.extend(normalized.properties);
+                RecordBatch::try_new(Arc::clone(self.arrow_schema), columns)
+                    .map_err(OmniError::arrow_internal)
+            })
+            .collect()
+    }
 }
 
 /// The statement's names for an edge file's endpoint columns, fixed whatever
@@ -425,74 +711,30 @@ fn read_data_type(role: &ColumnRole) -> DataType {
     }
 }
 
-#[derive(Debug)]
-struct ColumnProjection {
-    base_bytes: u64,
-    text_column: Option<usize>,
-}
-
-fn project_columns(
-    schema: &Schema,
-    blob_properties: &HashSet<String>,
-    roles: &[ColumnRole],
-    system_columns: SystemColumns,
-) -> Result<Vec<ColumnProjection>> {
-    let source_columns: HashMap<&str, usize> = roles
-        .iter()
-        .enumerate()
-        .map(|(index, role)| {
-            let name = match role {
-                ColumnRole::Src => system_columns.src,
-                ColumnRole::Dst => system_columns.dst,
-                ColumnRole::Property { name, .. } => name.as_str(),
-            };
-            (name, index)
-        })
-        .collect();
-    schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let base_bytes = projected_strict_field_bytes(
-                field,
-                &serde_json::Value::Null,
-                blob_properties.contains(field.name()),
-            )?;
-            let text_column = if field.data_type() == &DataType::Utf8 {
-                source_columns.get(field.name().as_str()).copied()
-            } else {
-                None
-            };
-            Ok(ColumnProjection {
-                base_bytes,
-                text_column,
-            })
-        })
-        .collect()
-}
-
+/// The reader's batches of the read schema: `CSV_READ_BATCH_ROWS` records
+/// each in overwrite; a keyed mode reads up to its row cap plus one and
+/// refuses the record over the cap.
 fn parse_records(
     bytes: &[u8],
     request: &CsvLoadRequest,
     schema: SchemaRef,
-    projections: &[ColumnProjection],
-    write_budget: WriteBudget,
     table_key: &str,
-) -> Result<RecordBatch> {
+) -> Result<Vec<RecordBatch>> {
     let parse_error = |error| csv_parse_error(&request.source, table_key, error);
     let row_limit = match request.mode {
         LoadMode::Append | LoadMode::Merge => Some(KEYED_WRITE_MAX_ROWS),
         LoadMode::Overwrite => None,
     };
-    let batch_rows = row_limit.map_or(CSV_READ_BATCH_ROWS, |limit| limit + 1);
-    let reader = ReaderBuilder::new(Arc::clone(&schema))
+    let batch_rows = row_limit
+        .map_or(CSV_READ_BATCH_ROWS, |limit| limit + 1)
+        .min(CsvShape::count(bytes, request).rows.max(1));
+    let reader = ReaderBuilder::new(schema)
         .with_header(request.header)
         .with_delimiter(request.delimiter)
         .with_batch_size(batch_rows)
         .build(Cursor::new(bytes))
         .map_err(parse_error)?;
     let mut batches = Vec::new();
-    let mut projected = 0_u64;
     let mut rows = 0_usize;
     for batch in reader {
         let batch = batch.map_err(parse_error)?;
@@ -506,29 +748,9 @@ fn parse_records(
                 rows as u64,
             ));
         }
-        for row in 0..batch.num_rows() {
-            for projection in projections {
-                let text_bytes = projection.text_column.map_or(0, |index| {
-                    let strings = batch
-                        .column(index)
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .expect("invariant: a projected Utf8 field is read as StringArray");
-                    if strings.is_null(row) {
-                        0
-                    } else {
-                        u64::try_from(strings.value(row).len()).unwrap_or(u64::MAX)
-                    }
-                });
-                projected = projected
-                    .saturating_add(projection.base_bytes)
-                    .saturating_add(text_bytes);
-                write_budget.check(CSV_INPUT_ARROW_BYTES_RESOURCE, projected)?;
-            }
-        }
         batches.push(batch);
     }
-    arrow_select::concat::concat_batches(&schema, &batches).map_err(parse_error)
+    Ok(batches)
 }
 
 fn csv_parse_error(source: &str, table_key: &str, error: arrow_schema::ArrowError) -> OmniError {
@@ -550,25 +772,25 @@ fn utf8_without_empty(column: &ArrayRef) -> StringArray {
         .collect()
 }
 
-/// The 1-based record of the first null, `None` when the column is dense.
+/// The 0-based row of the first null, `None` when the column is dense.
 fn first_null(column: &dyn Array) -> Option<usize> {
-    (0..column.len())
-        .find(|row| column.is_null(*row))
-        .map(|row| row + 1)
+    (0..column.len()).find(|row| column.is_null(*row))
 }
 
 /// One read column to its declared Arrow type: numbers as read, text with
 /// empty fields as null, `Bool` from exactly `true` or `false`, `Date` and
-/// `DateTime` through the loader's literal checks and casts cell by cell.
+/// `DateTime` literal-checked cell by cell; `first_record` numbers row 0.
 fn convert_property(
     column: &ArrayRef,
     name: &str,
     prop: &PropType,
     table_key: &str,
+    first_record: usize,
 ) -> Result<ArrayRef> {
-    let cell_error = |record: usize, message: String| {
+    let cell_error = |row: usize, message: String| {
         OmniError::manifest(format!(
-            "load csv into {table_key}: record {record}, property '{name}': {message}"
+            "load csv into {table_key}: record {}, property '{name}': {message}",
+            first_record + row
         ))
     };
     Ok(match prop.scalar {
@@ -582,7 +804,7 @@ fn convert_property(
                 .iter()
                 .position(|value| value.is_some_and(|value| !value.is_finite()))
             {
-                return Err(cell_error(row + 1, "expected finite Float32".to_string()));
+                return Err(cell_error(row, "expected finite Float32".to_string()));
             }
             Arc::clone(column)
         }
@@ -595,7 +817,7 @@ fn convert_property(
                 .iter()
                 .position(|value| value.is_some_and(|value| !value.is_finite()))
             {
-                return Err(cell_error(row + 1, "expected finite Float64".to_string()));
+                return Err(cell_error(row, "expected finite Float64".to_string()));
             }
             Arc::clone(column)
         }
@@ -610,7 +832,7 @@ fn convert_property(
                     Some("false") => Some(false),
                     Some(other) => {
                         return Err(cell_error(
-                            row + 1,
+                            row,
                             format!("'{other}' is not `true` or `false`"),
                         ));
                     }
@@ -626,7 +848,7 @@ fn convert_property(
                     None => None,
                     Some(text) => Some(
                         parse_date32_literal(text)
-                            .map_err(|error| cell_error(row + 1, error.to_string()))?,
+                            .map_err(|error| cell_error(row, error.to_string()))?,
                     ),
                 });
             }
@@ -640,10 +862,10 @@ fn convert_property(
                     None => None,
                     Some(text) => {
                         omnigraph_compiler::check_datetime_literal(text)
-                            .map_err(|message| cell_error(row + 1, message))?;
+                            .map_err(|message| cell_error(row, message))?;
                         Some(
                             parse_date64_literal(text)
-                                .map_err(|error| cell_error(row + 1, error.to_string()))?,
+                                .map_err(|error| cell_error(row, error.to_string()))?,
                         )
                     }
                 });
@@ -665,6 +887,7 @@ fn node_ids(
     schema: &SchemaRef,
     property_columns: &[ArrayRef],
     rows: usize,
+    first_record: usize,
 ) -> Result<Vec<String>> {
     let key_columns = node_type
         .key
@@ -697,7 +920,7 @@ fn node_ids(
                 OmniError::manifest(format!(
                     "load csv into node:{}: record {} is missing a non-null @key value",
                     node_type.name,
-                    row + 1
+                    first_record + row
                 ))
             }),
             None => Ok(generate_id()),
@@ -715,6 +938,7 @@ fn edge_ids(
     property_columns: &[ArrayRef],
     system_columns: SystemColumns,
     rows: usize,
+    first_record: usize,
 ) -> Result<Vec<String>> {
     let key_columns = edge_key_columns(
         edge_type,
@@ -730,7 +954,7 @@ fn edge_ids(
                 OmniError::manifest(format!(
                     "load csv into edge:{}: record {} is missing a non-null @key value",
                     edge_type.name,
-                    row + 1
+                    first_record + row
                 ))
             }),
             None => Ok(generate_id()),
@@ -741,224 +965,264 @@ fn edge_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omnigraph_compiler::catalog::schema_ir::{SYSTEM_COLUMNS_META, SYSTEM_COLUMNS_V3};
-    use omnigraph_compiler::settings::SessionSettings;
+    use omnigraph_compiler::catalog::build_catalog;
+    use omnigraph_compiler::schema::parser::parse_schema;
     use std::fmt::Write;
 
-    fn request() -> CsvLoadRequest {
+    fn request(mode: LoadMode) -> CsvLoadRequest {
         CsvLoadRequest {
             source: "file:///input.csv".to_string(),
             target: LoadTarget::Node("Person".to_string()),
-            mode: LoadMode::Overwrite,
+            mode,
             delimiter: b',',
             header: true,
             columns: None,
         }
     }
 
-    fn budget(bytes: u64) -> WriteBudget {
-        WriteBudget::from_settings(
-            &SessionSettings::default()
-                .with("write_max_bytes", &bytes.to_string())
-                .unwrap(),
-        )
+    fn key_source(records: usize) -> String {
+        let mut source = String::from("key\n");
+        for row in 0..records {
+            writeln!(&mut source, "{row}").unwrap();
+        }
+        source
+    }
+
+    fn key_read_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]))
+    }
+
+    fn batch_rows(batches: &[RecordBatch]) -> Vec<usize> {
+        batches.iter().map(RecordBatch::num_rows).collect()
     }
 
     #[test]
-    fn projected_limit_refuses_first_batch_before_parsing_later_records() {
-        let target = Schema::new(vec![
-            Field::new("__id", DataType::Utf8, false),
-            Field::new("key", DataType::Int64, false),
-        ]);
-        let roles = [ColumnRole::Property {
-            name: "key".to_string(),
-            prop: PropType::scalar(ScalarType::I64, false),
-        }];
-        let projections =
-            project_columns(&target, &HashSet::new(), &roles, SYSTEM_COLUMNS_V3).unwrap();
-        let read_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
-        let mut source = String::from("key\n");
+    fn overwrite_keeps_every_reader_batch_separate() {
+        let source = key_source(CSV_READ_BATCH_ROWS + 1);
+        let batches = parse_records(
+            source.as_bytes(),
+            &request(LoadMode::Overwrite),
+            key_read_schema(),
+            "node:Person",
+        )
+        .unwrap();
+        assert_eq!(batch_rows(&batches), vec![CSV_READ_BATCH_ROWS, 1]);
+    }
+
+    #[test]
+    fn keyed_modes_read_the_row_cap_as_one_batch_and_refuse_one_more() {
+        for mode in [LoadMode::Append, LoadMode::Merge] {
+            let at_cap = key_source(KEYED_WRITE_MAX_ROWS);
+            let batches = parse_records(
+                at_cap.as_bytes(),
+                &request(mode),
+                key_read_schema(),
+                "node:Person",
+            )
+            .unwrap();
+            assert_eq!(batch_rows(&batches), vec![KEYED_WRITE_MAX_ROWS]);
+
+            let over_cap = key_source(KEYED_WRITE_MAX_ROWS + 1);
+            let error = parse_records(
+                over_cap.as_bytes(),
+                &request(mode),
+                key_read_schema(),
+                "node:Person",
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                OmniError::ResourceLimitExceeded { ref resource, limit, actual }
+                    if resource == "keyed entities for node:Person"
+                        && limit == KEYED_WRITE_MAX_ROWS as u64
+                        && actual == KEYED_WRITE_MAX_ROWS as u64 + 1
+            ));
+        }
+    }
+
+    #[test]
+    fn normalized_batches_number_records_across_reader_batches() {
+        let catalog = build_catalog(
+            &parse_schema("node Person {\n  key: I64 @key\n  score: F64\n}\n").unwrap(),
+        )
+        .unwrap();
+        let mut source = String::from("key,score\n");
         for row in 0..CSV_READ_BATCH_ROWS {
-            writeln!(&mut source, "{row}").unwrap();
+            writeln!(&mut source, "{row},1.5").unwrap();
         }
-        source.push_str("not-an-integer\n");
-        let limit = u64::try_from(CSV_READ_BATCH_ROWS).unwrap() * 40 - 1;
-        let error = parse_records(
-            source.as_bytes(),
-            &request(),
-            read_schema,
-            &projections,
-            budget(limit),
-            "node:Person",
+        source.push_str("8192,\n");
+        let capture = CapturedSource {
+            bytes: Arc::from(source.as_bytes()),
+            admission: None,
+            size: source.len() as u64,
+            e_tag: None,
+            version: None,
+        };
+        let error = prepare_csv_batches(
+            &catalog,
+            &request(LoadMode::Overwrite),
+            &capture,
+            &mut |_| Ok(()),
         )
         .unwrap_err();
-        assert!(matches!(
-            error,
-            OmniError::ResourceLimitExceeded { resource, limit: actual_limit, actual }
-                if resource == CSV_INPUT_ARROW_BYTES_RESOURCE
-                    && actual_limit == limit
-                    && actual == limit + 1
-        ));
-    }
+        assert_eq!(
+            error.to_string(),
+            "load csv into node:Person: record 8193 has an empty field for non-nullable property 'score'",
+            "the second reader batch keeps the source numbering"
+        );
 
-    #[test]
-    fn projected_limit_accumulates_across_reader_batches() {
-        let target = Schema::new(vec![
-            Field::new("__id", DataType::Utf8, false),
-            Field::new("key", DataType::Int64, false),
-        ]);
-        let roles = [ColumnRole::Property {
-            name: "key".to_string(),
-            prop: PropType::scalar(ScalarType::I64, false),
-        }];
-        let projections =
-            project_columns(&target, &HashSet::new(), &roles, SYSTEM_COLUMNS_V3).unwrap();
-        let read_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
-        let mut source = String::from("key\n");
-        for row in 0..=CSV_READ_BATCH_ROWS {
-            writeln!(&mut source, "{row}").unwrap();
-        }
-        let limit = u64::try_from(CSV_READ_BATCH_ROWS).unwrap() * 40;
-        let error = parse_records(
-            source.as_bytes(),
-            &request(),
-            read_schema,
-            &projections,
-            budget(limit),
-            "node:Person",
+        source.truncate(source.len() - "8192,\n".len());
+        source.push_str("8192,2.5\n");
+        let capture = CapturedSource {
+            bytes: Arc::from(source.as_bytes()),
+            admission: None,
+            size: source.len() as u64,
+            e_tag: None,
+            version: None,
+        };
+        let prepared = prepare_csv_batches(
+            &catalog,
+            &request(LoadMode::Overwrite),
+            &capture,
+            &mut |_| Ok(()),
         )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            OmniError::ResourceLimitExceeded { resource, limit: actual_limit, actual }
-                if resource == CSV_INPUT_ARROW_BYTES_RESOURCE
-                    && actual_limit == limit
-                    && actual == limit + 16
-        ));
+        .unwrap();
+        assert_eq!(prepared.rows, CSV_READ_BATCH_ROWS + 1);
+        assert_eq!(batch_rows(&prepared.batches), vec![CSV_READ_BATCH_ROWS, 1]);
+        assert_eq!(prepared.table_key, "node:Person");
+        assert!(!prepared.is_edge);
     }
 
+    /// Counts through fixed scratch-buffer boundaries and covers Arrow's
+    /// per-column buffer floors; GQT cannot inspect these allocations.
     #[test]
-    fn projection_matches_jsonl_for_reordered_text_dates_and_omitted_properties() {
-        let roles = [
-            ColumnRole::Property {
-                name: "day".to_string(),
-                prop: PropType::scalar(ScalarType::Date, false),
-            },
-            ColumnRole::Property {
-                name: "name".to_string(),
-                prop: PropType::scalar(ScalarType::String, true),
-            },
-            ColumnRole::Src,
-            ColumnRole::Property {
-                name: "key".to_string(),
-                prop: PropType::scalar(ScalarType::I64, false),
-            },
-            ColumnRole::Property {
-                name: "when".to_string(),
-                prop: PropType::scalar(ScalarType::DateTime, false),
-            },
-            ColumnRole::Dst,
-            ColumnRole::Property {
-                name: "flag".to_string(),
-                prop: PropType::scalar(ScalarType::Bool, false),
-            },
-        ];
-        let names = ["day", "name", "from", "key", "when", "to", "flag"];
-        let read_schema = Arc::new(Schema::new(
-            names
-                .iter()
-                .zip(&roles)
-                .map(|(name, role)| Field::new(*name, read_data_type(role), true))
+    fn reader_admission_covers_wide_quoted_records() {
+        let columns = 256;
+        let header = (0..columns)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut values = vec!["x".to_string(); columns];
+        values[0] = format!("\"{}\n{}\"", "a".repeat(5000), "b".repeat(5000));
+        let source = format!("{header}\r\n{}", values.join(","));
+        let request = request(LoadMode::Overwrite);
+        let shape = CsvShape::count(source.as_bytes(), &request);
+        assert_eq!((shape.rows, shape.columns), (1, columns));
+        let schema = Arc::new(Schema::new(
+            (0..columns)
+                .map(|i| Field::new(format!("c{i}"), DataType::Utf8, true))
                 .collect::<Vec<_>>(),
         ));
-        let source = concat!(
-            "day,name,from,key,when,to,flag\n",
-            "2024-01-01,\"é,x\",a,1,2024-01-01T00:00:00Z,bc,true\n",
-            "2024-02-02,,bb,2,2024-02-02T00:00:00Z,c,false\n",
-        );
-        for system_columns in [SYSTEM_COLUMNS_META, SYSTEM_COLUMNS_V3] {
-            for dimension in [4, i32::MAX] {
-                let target = Schema::new(vec![
-                    Field::new(system_columns.id, DataType::Utf8, false),
-                    Field::new(system_columns.src, DataType::Utf8, false),
-                    Field::new(system_columns.dst, DataType::Utf8, false),
-                    Field::new("key", DataType::Int64, false),
-                    Field::new("name", DataType::Utf8, true),
-                    Field::new("day", DataType::Date32, false),
-                    Field::new("when", DataType::Date64, false),
-                    Field::new("flag", DataType::Boolean, false),
-                    Field::new(
-                        "tags",
-                        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                        true,
-                    ),
-                    Field::new(
-                        "vector",
-                        DataType::FixedSizeList(
-                            Arc::new(Field::new("item", DataType::Float32, true)),
-                            dimension,
-                        ),
-                        true,
-                    ),
-                    Field::new("blob", DataType::Struct(Vec::<Field>::new().into()), true),
-                ]);
-                let blobs = HashSet::from(["blob".to_string()]);
-                let projections = project_columns(&target, &blobs, &roles, system_columns).unwrap();
-                let objects = [
-                    serde_json::json!({
-                        system_columns.src: "a", system_columns.dst: "bc", "key": 1,
-                        "name": "é,x", "day": "2024-01-01",
-                        "when": "2024-01-01T00:00:00Z", "flag": true,
-                    }),
-                    serde_json::json!({
-                        system_columns.src: "bb", system_columns.dst: "c", "key": 2,
-                        "name": null, "day": "2024-02-02",
-                        "when": "2024-02-02T00:00:00Z", "flag": false,
-                    }),
-                ];
-                let rows = objects
-                    .iter()
-                    .map(|object| object.as_object().unwrap())
-                    .collect::<Vec<_>>();
-                let projected = 404 + u64::try_from(dimension).unwrap() * 10;
-                let maximum = WriteBudget::default().bytes();
-                let limits = if projected > maximum {
-                    vec![maximum]
-                } else {
-                    vec![projected - 1, projected]
-                };
-                for limit in limits {
-                    let csv = parse_records(
-                        source.as_bytes(),
-                        &request(),
-                        Arc::clone(&read_schema),
-                        &projections,
-                        budget(limit),
-                        "edge:Knows",
-                    );
-                    let jsonl = super::super::preflight_strict_rows_arrow_bytes(
-                        &target, &rows, &blobs, limit,
-                    );
-                    if limit == projected {
-                        assert_eq!(csv.unwrap().num_rows(), 2);
-                        jsonl.unwrap();
+        let batches = parse_records(source.as_bytes(), &request, schema, "node:Person").unwrap();
+        let actual = batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum::<usize>();
+        assert!(shape.reader_bytes(source.len()) >= actual as u64);
+        assert!(actual > 262144);
+    }
+
+    /// GQT sees the refusal, but cannot observe whether admission preceded decoding.
+    #[test]
+    fn admission_precedes_reader_and_omitted_column_allocation() {
+        let catalog = build_catalog(
+            &parse_schema("node Person {\n key: I64 @key\n embedding: Vector(32768)?\n}\n")
+                .unwrap(),
+        )
+        .unwrap();
+        for (source, refuse_at) in [("key\nnot_an_integer\n", 1), ("key\n1\n", 2)] {
+            let capture = CapturedSource {
+                bytes: Arc::from(source.as_bytes()),
+                admission: None,
+                size: source.len() as u64,
+                e_tag: None,
+                version: None,
+            };
+            let mut calls = 0;
+            let error = prepare_csv_batches(
+                &catalog,
+                &request(LoadMode::Overwrite),
+                &capture,
+                &mut |bytes| {
+                    calls += 1;
+                    if calls == refuse_at {
+                        if refuse_at == 2 {
+                            assert!(bytes > 65536);
+                        }
+                        Err(OmniError::resource_limit("test admission", 1, bytes))
                     } else {
-                        let error = csv.unwrap_err();
-                        assert_eq!(error.to_string(), jsonl.unwrap_err().to_string());
-                        let expected = if projected > maximum {
-                            188 + u64::try_from(dimension).unwrap() * 5
-                        } else {
-                            projected
-                        };
-                        assert!(matches!(
-                            error,
-                            OmniError::ResourceLimitExceeded { resource, actual, .. }
-                                if resource == CSV_INPUT_ARROW_BYTES_RESOURCE
-                                    && actual == expected
-                        ));
+                        Ok(())
                     }
-                }
-            }
+                },
+            )
+            .unwrap_err();
+            assert_eq!(calls, refuse_at);
+            assert!(
+                matches!(error, OmniError::ResourceLimitExceeded { ref resource, .. }
+                if resource == "test admission")
+            );
         }
+    }
+
+    #[test]
+    fn render_reads_back_as_the_statement() {
+        let request = CsvLoadRequest {
+            source: "file:///input.csv".to_string(),
+            target: LoadTarget::Edge("Knows".to_string()),
+            mode: LoadMode::Merge,
+            delimiter: b'|',
+            header: true,
+            columns: Some(vec![
+                "from".to_string(),
+                "to".to_string(),
+                "since".to_string(),
+            ]),
+        };
+        assert_eq!(
+            request.render(),
+            "load csv \"file:///input.csv\" into edge:Knows mode merge delimiter \"|\" header columns (from, to, since)"
+        );
+        assert_eq!(
+            super::super::CsvLoadRequest::from_statement(&LoadStmt {
+                source: "s3://bucket/people.csv".to_string(),
+                target: LoadTarget::Node("Person".to_string()),
+                mode: LoadStmtMode::Overwrite,
+                delimiter: b',',
+                header: false,
+                columns: None,
+            })
+            .render(),
+            "load csv \"s3://bucket/people.csv\" into node:Person mode overwrite"
+        );
+    }
+
+    #[test]
+    fn mapped_column_count_is_the_spelling_or_the_declared_width() {
+        let catalog = build_catalog(
+            &parse_schema(
+                "node Person {\n  key: I64 @key\n  name: String?\n}\nedge Knows: Person -> Person {\n  since: I64\n}\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let spelled = CsvLoadRequest {
+            columns: Some(vec!["key".to_string()]),
+            ..request(LoadMode::Overwrite)
+        };
+        assert_eq!(spelled.mapped_column_count(&catalog), 1);
+        assert_eq!(
+            request(LoadMode::Overwrite).mapped_column_count(&catalog),
+            2
+        );
+        let edge = CsvLoadRequest {
+            target: LoadTarget::Edge("Knows".to_string()),
+            ..request(LoadMode::Overwrite)
+        };
+        assert_eq!(edge.mapped_column_count(&catalog), 3);
+        let unknown = CsvLoadRequest {
+            target: LoadTarget::Node("Ghost".to_string()),
+            ..request(LoadMode::Overwrite)
+        };
+        assert_eq!(unknown.mapped_column_count(&catalog), 0);
     }
 }

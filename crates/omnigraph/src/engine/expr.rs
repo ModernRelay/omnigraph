@@ -47,7 +47,10 @@ impl ProjectionContext {
                 | PhysicalNode::RankFuse { .. }
                 | PhysicalNode::Projection { .. }
                 | PhysicalNode::Aggregate { .. }
-                | PhysicalNode::Sort { .. } => {}
+                | PhysicalNode::Sort { .. }
+                | PhysicalNode::CsvSource { .. }
+                | PhysicalNode::Validate { .. }
+                | PhysicalNode::FragmentWrite { .. } => {}
             }
         }
         Self {

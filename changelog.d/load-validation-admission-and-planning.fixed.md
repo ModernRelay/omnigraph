@@ -1,0 +1,1 @@
+- **CSV loads:** Overwrite validation retains fewer duplicate key structures and releases phase-local memory before staging. Optional read caches use the remaining memory allowance and only memoize immutable objects beneath accepted dataset roots. Endpoint validation now costs probes and scans using the consulted table's row count and index coverage.

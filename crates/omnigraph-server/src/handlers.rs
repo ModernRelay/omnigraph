@@ -69,9 +69,9 @@ use dispatch::{
 pub(crate) async fn server_health() -> Json<HealthOutput> {
     Json(HealthOutput {
         status: "ok".to_string(),
-        version: SERVER_VERSION.to_string(),
+        version: crate::api::build::reported_version(SERVER_VERSION),
         internal_schema_version: SERVER_INTERNAL_SCHEMA_VERSION,
-        source_version: SERVER_SOURCE_VERSION.map(str::to_string),
+        source_version: crate::api::build::SOURCE_COMMIT.map(str::to_string),
     })
 }
 
@@ -801,6 +801,7 @@ pub(crate) async fn server_snapshot(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
+        (status = 424, description = "A load explain could not probe an allowed external source", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -810,7 +811,8 @@ pub(crate) async fn server_snapshot(
 /// names (`query`, `name`) match the CLI `-e` flag and the GQ `query`
 /// keyword. Mutations (`insert`/`update`/`delete`) are rejected with 400
 /// -- use `POST /mutate` for writes. Select a branch or snapshot and obtain
-/// the pinned graph-commit token with the response. Cedar authorizes Read.
+/// the pinned graph-commit token with the response. Cedar authorizes Read for
+/// read queries and Change for `explain load csv`.
 ///
 /// The GQ statement `branch list` is also served here, with no `branch`,
 /// `snapshot`, `name`, or `params`: it answers one result per branch (field
@@ -829,7 +831,11 @@ pub(crate) async fn server_snapshot(
 /// run, and the result describes its v2 logical, physical and available
 /// DataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by
 /// `plan` entries for the passes and the document's other fields, under the
-/// request's target and `params`.
+/// request's target and `params`. `explain load csv …` answers the accepted
+/// load plan the same way (`logical_initial`, `logical`, `physical`, then
+/// `plan` entries), under the request's `branch` alone. It requires the load's
+/// Change decision before probing the external source's metadata; it reads
+/// no payload byte and publishes nothing.
 pub(crate) async fn server_query(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
@@ -1637,7 +1643,7 @@ pub(crate) async fn run_mutate(
             .await;
         }
         FileBody::Show(id) => return Err(show_at_write_door(id)),
-        FileBody::Explain(_) => {
+        FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
             refuse_explain(door)?;
             return Err(explain_at_write_door());
         }
@@ -1843,6 +1849,36 @@ pub(crate) async fn run_query(
             refuse_explain(door)?;
             body.into_read_declarations()
                 .map_err(ApiError::bad_request)?
+        }
+        FileBody::ExplainLoad(stmt) => {
+            refuse_explain(door)?;
+            refuse_statement_envelope(
+                snapshot.is_some(),
+                name.is_some() || params_json.is_some(),
+                false,
+            )?;
+            let branch = branch.unwrap_or_else(|| "main".to_string());
+            authorize_request(
+                actor,
+                handle.policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::Change,
+                    branch: Some(branch.clone()),
+                    target_branch: None,
+                },
+            )?;
+            let target = ReadTarget::Branch(branch);
+            let session = session_with_prefix(&session, &file.settings)?;
+            let (result, graph_commit_id) = session
+                .explain_load(target.clone(), &stmt)
+                .await
+                .map_err(ApiError::from_omni)?;
+            return Ok(ReadDispatch::Rows {
+                query_name: stmt.statement_name().to_string(),
+                target,
+                result,
+                graph_commit_id,
+            });
         }
     };
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
@@ -4156,9 +4192,31 @@ pub(crate) async fn two_point_diff_page(
     page_token: Option<String>,
     max_changes: Option<usize>,
 ) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
+    readable_diff_page(
+        handle,
+        actor,
+        omnigraph::changes::GraphDiffRequest {
+            sides: omnigraph::changes::GraphDiffSides::Between { from, to },
+            scope,
+            page_token,
+            max_changes,
+            max_bytes: None,
+        },
+    )
+    .await
+}
+
+/// One diff page read under `actor`'s `read` decisions, which the engine asks
+/// for each branch a two-point side reads and for each commit a continuation
+/// names that its side no longer resolves to. A policy failure (a missing
+/// bearer, an evaluation error) is not a denial: it stops the read, and its
+/// own error answers.
+async fn readable_diff_page(
+    handle: &GraphRequest,
+    actor: Option<&AuthenticatedActor>,
+    request: omnigraph::changes::GraphDiffRequest,
+) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
     let policy = handle.policy.as_deref();
-    // A policy failure (a missing bearer, an evaluation error) is not a
-    // denial: it stops the read, and its own error answers.
     let mut failure = None;
     let mut can_read = |branch: &str| {
         let request = PolicyRequest {
@@ -4177,16 +4235,7 @@ pub(crate) async fn two_point_diff_page(
     };
     let page = handle
         .engine
-        .diff_page_readable(
-            &omnigraph::changes::GraphDiffRequest {
-                sides: omnigraph::changes::GraphDiffSides::Between { from, to },
-                scope,
-                page_token,
-                max_changes,
-                max_bytes: None,
-            },
-            &mut can_read,
-        )
+        .diff_page_readable(&request, &mut can_read)
         .await;
     if let Some(error) = failure {
         return Err(error);
@@ -4262,7 +4311,9 @@ pub(crate) async fn server_branch_diff(
 
 /// One page of what `source` changed since its merge base with `target`
 /// (`main` when absent), for `GET /branches/diff` and the `branch diff`
-/// statement: `read` on both named branches before any lineage is read.
+/// statement: `read` on both named branches before any lineage is read, and on
+/// the branch of each commit a continuation names that the branches no longer
+/// resolve to.
 pub(crate) async fn branch_diff_page(
     handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
@@ -4275,17 +4326,18 @@ pub(crate) async fn branch_diff_page(
     let source = requested_branch(Some(source))?;
     let target = requested_branch(target)?;
     authorize_branch_reads(actor, handle.policy.as_deref(), [&source, &target])?;
-    handle
-        .engine
-        .diff_page(&omnigraph::changes::GraphDiffRequest {
+    readable_diff_page(
+        handle,
+        actor,
+        omnigraph::changes::GraphDiffRequest {
             sides: omnigraph::changes::GraphDiffSides::Branch { source, target },
             scope,
             page_token,
             max_changes,
             max_bytes: None,
-        })
-        .await
-        .map_err(change_route_error)
+        },
+    )
+    .await
 }
 
 #[utoipa::path(
