@@ -962,3 +962,160 @@ async fn init_output_failure_preserves_the_initialized_graph() {
         );
     }
 }
+
+#[tokio::test]
+async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
+    use crate::client::GraphClient;
+    use crate::commands::maintenance::rebuild_full_text_indexes;
+
+    for json in [false, true] {
+        for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
+            let temp = tempfile::tempdir().unwrap();
+            let uri = temp
+                .path()
+                .join("graph.omni")
+                .to_string_lossy()
+                .into_owned();
+            omnigraph::db::Omnigraph::init(&uri, "node Person { slug: String @key }\n")
+                .await
+                .unwrap();
+            let client = GraphClient::Embedded {
+                uri: uri.clone(),
+                actor: None,
+            };
+            client
+                .mutate(
+                    None,
+                    "query add() { insert Person { slug: \"one\" } }",
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap();
+            client.branch_create_from("main", "search").await.unwrap();
+            let main_before = client
+                .snapshot("main")
+                .await
+                .unwrap()
+                .graph_manifest_version;
+            let before = client
+                .snapshot("search")
+                .await
+                .unwrap()
+                .graph_manifest_version;
+            let count_before = client
+                .list_commits(Some("search"))
+                .await
+                .unwrap()
+                .commits
+                .len();
+            let parsed = crate::invocation::parse_from([
+                "omnigraph",
+                "rebuild-full-text-indexes",
+                &uri,
+                "--branch",
+                "search",
+            ])
+            .unwrap();
+            assert!(!command_outcome::applies(&parsed.cli));
+
+            let mut stdout = FailingOutput {
+                fault,
+                bytes: Vec::new(),
+            };
+            let mut stderr = Vec::new();
+            let result = crate::admission::scope(rebuild_full_text_indexes(
+                &uri,
+                "search",
+                Some("maintenance-operator"),
+                json,
+                true,
+                &mut stdout,
+                &mut stderr,
+            ))
+            .await;
+            assert_eq!(result.is_ok(), matches!(fault, OutputFault::Flush));
+            let error = finish(
+                result.map(|()| Completion::success()),
+                None,
+                json.then_some(MachineErrors::Json),
+                &mut stdout,
+                &mut stderr,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert!(!String::from_utf8_lossy(&stderr).contains("command_outcome"));
+            assert_eq!(
+                client
+                    .snapshot("main")
+                    .await
+                    .unwrap()
+                    .graph_manifest_version,
+                main_before
+            );
+            assert_eq!(
+                client
+                    .snapshot("search")
+                    .await
+                    .unwrap()
+                    .graph_manifest_version,
+                before + 1
+            );
+            let commits = client.list_commits(Some("search")).await.unwrap().commits;
+            assert_eq!(commits.len(), count_before + 1);
+            assert!(
+                commits
+                    .iter()
+                    .any(|commit| commit.graph_manifest_version == before + 1
+                        && commit.actor_id.as_deref() == Some("maintenance-operator")
+                        && commit.graph_branch.as_deref() == Some("search"))
+            );
+
+            // The target line belongs before writable admission. If it cannot
+            // be delivered, a second rebuild must not publish anything.
+            let mut stdout = Vec::new();
+            let mut stderr = FailingOutput {
+                fault: OutputFault::AfterPrefix,
+                bytes: Vec::new(),
+            };
+            let error = crate::admission::scope(rebuild_full_text_indexes(
+                &uri,
+                "search",
+                Some("maintenance-operator"),
+                json,
+                false,
+                &mut stdout,
+                &mut stderr,
+            ))
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert!(stdout.is_empty());
+            assert_eq!(
+                client
+                    .snapshot("search")
+                    .await
+                    .unwrap()
+                    .graph_manifest_version,
+                before + 1
+            );
+            assert_eq!(
+                client
+                    .list_commits(Some("search"))
+                    .await
+                    .unwrap()
+                    .commits
+                    .len(),
+                count_before + 1
+            );
+        }
+    }
+}

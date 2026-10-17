@@ -38,11 +38,6 @@ pub(crate) fn uri_is_local(uri: &str) -> bool {
 /// unless `--quiet`. One line, e.g. `omnigraph load → file://g.omni (direct,
 /// local)`. stderr so `--json` consumers reading stdout are unaffected; the line
 /// legitimately differs embedded-vs-served (that visibility is the point).
-pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: bool) {
-    write_target(quiet, label, uri, served, &mut io::stderr())
-        .expect("failed printing resolved write target to stderr");
-}
-
 pub(crate) fn write_target(
     quiet: bool,
     label: &str,

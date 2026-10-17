@@ -8,6 +8,9 @@ use omnigraph_server::PolicyAction;
 
 pub(crate) use crate::commands::history::{BranchCommand, ChangesCommand, CommitCommand};
 use crate::commands::history::{DiffArgs, SnapshotArgs};
+use crate::commands::maintenance::{
+    CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
+};
 use crate::commands::query::{AliasArgs, MutateArgs, QueryArgs};
 pub(crate) use crate::commands::schema::SchemaCommand;
 use crate::commands::schema::{InitArgs, LintArgs};
@@ -188,62 +191,17 @@ pub(crate) enum Command {
     Init(InitArgs),
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
     /// the current format this binary serves (v16); other formats are rebuilt by export and load
-    Upgrade {
-        /// Standalone graph storage URI; alternatively use --store
-        uri: Option<String>,
-        /// Report whether the conversion can run; writes nothing
-        #[arg(long)]
-        check: bool,
-        /// Requested storage format (defaults to the format this binary serves)
-        #[arg(long, value_name = "N")]
-        to_format: Option<u32>,
-        #[arg(long)]
-        json: bool,
-    },
+    Upgrade(UpgradeArgs),
     /// Compact small Lance fragments in every backing dataset of the graph
-    Optimize {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Optimize(OptimizeArgs),
     /// Rebuild all full-text indexes from one branch's current rows
     ///
     /// Uses the default English analyzer; replaces any custom tokenizer settings.
-    RebuildFullTextIndexes {
-        /// Graph storage URI; alternatively use --store or --cluster/--graph
-        uri: Option<String>,
-        /// Branch to rebuild; other branches and historical snapshots are unchanged
-        #[arg(long, default_value = "main")]
-        branch: String,
-        #[arg(long)]
-        json: bool,
-    },
+    RebuildFullTextIndexes(RebuildFullTextIndexesArgs),
     /// Diagnose foreign Lance HEAD movement without adopting it.
-    Repair {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Repair(RepairArgs),
     /// Remove old Lance versions from every backing dataset of the graph (destructive)
-    Cleanup {
-        /// Graph URI
-        uri: Option<String>,
-        /// Number of recent graph commits to keep on every live branch. Either
-        /// `--keep` or `--older-than` (or both) must be set.
-        #[arg(long)]
-        keep: Option<u32>,
-        /// Only remove versions older than this duration. Accepts Go-style
-        /// durations: `7d`, `24h`, `90m`. At least one of --keep / --older-than.
-        #[arg(long)]
-        older_than: Option<String>,
-        /// Required to actually run; without it, prints what would be removed
-        #[arg(long)]
-        confirm: bool,
-        #[arg(long)]
-        json: bool,
-    },
+    Cleanup(CleanupArgs),
     /// Validate queries against a schema (offline) or repo (repo-backed).
     Lint(LintArgs),
     /// Operate on the server-side stored-query registry (`queries:`).

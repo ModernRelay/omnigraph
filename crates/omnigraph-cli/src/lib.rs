@@ -2,7 +2,6 @@
 
 use clap::ValueEnum;
 use color_eyre::eyre::{Result, bail};
-use omnigraph::db::Omnigraph;
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
     CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput,

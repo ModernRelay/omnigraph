@@ -155,6 +155,12 @@ lint report failures and subsequent invocations remain reusable. Extend the
 existing `cli_schema_config`, `cli_cluster` and `cli_data` owners for addressing,
 cluster ownership and offline source-read ordering.
 
+Maintenance delivery tests use the existing output and application owners.
+They cover partial writes and flush failures, full-text rebuild publication and
+actor retention, and target-output failure before writable admission. Extend
+`cli_data` and `cli_cluster` for cleanup preview/consent and maintenance addressing;
+`crossversion_upgrade` retains ownership of storage-upgrade compatibility.
+
 The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation

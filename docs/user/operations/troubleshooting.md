@@ -175,6 +175,12 @@ See [Operating a cluster](../clusters/index.md).
 
 ## Maintenance failures
 
+If `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes` or `upgrade` cannot
+write or flush its output, the CLI returns a failure without repeating the
+operation. An output failure does not undo completed work. Inspect the graph's
+state before another attempt; for an interrupted upgrade, follow the
+[upgrade recovery procedure](upgrade.md).
+
 - Recovery required: reopen the graph read-write or restart its server. A
   graph carrying a sidecar from a release before 0.12 must first be opened
   read-write with that release (`omnigraph snapshot <graph>` is such an open).

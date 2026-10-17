@@ -218,7 +218,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             ),
             Direct => matches!(
                 cmd,
-                Command::RebuildFullTextIndexes { .. }
+                Command::RebuildFullTextIndexes(_)
                     | Command::Schema {
                         command: SchemaCommand::Apply { .. }
                     }
@@ -293,11 +293,11 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         Command::Queries { .. } => Plane::Control,
         Command::Policy { .. } => Plane::Control,
         Command::Init(_)
-        | Command::Upgrade { .. }
-        | Command::Optimize { .. }
-        | Command::RebuildFullTextIndexes { .. }
-        | Command::Repair { .. }
-        | Command::Cleanup { .. }
+        | Command::Upgrade(_)
+        | Command::Optimize(_)
+        | Command::RebuildFullTextIndexes(_)
+        | Command::Repair(_)
+        | Command::Cleanup(_)
         | Command::Lint(_) => Plane::Storage,
         Command::Cluster { .. } | Command::Organization { .. } => Plane::Control,
         Command::Alias(_)
@@ -357,11 +357,11 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Mutate(_) => "mutate",
         Command::Alias(_) => "alias",
         Command::Policy { .. } => "policy",
-        Command::Upgrade { .. } => "upgrade",
-        Command::Optimize { .. } => "optimize",
-        Command::RebuildFullTextIndexes { .. } => "rebuild-full-text-indexes",
-        Command::Repair { .. } => "repair",
-        Command::Cleanup { .. } => "cleanup",
+        Command::Upgrade(_) => "upgrade",
+        Command::Optimize(_) => "optimize",
+        Command::RebuildFullTextIndexes(_) => "rebuild-full-text-indexes",
+        Command::Repair(_) => "repair",
+        Command::Cleanup(_) => "cleanup",
         Command::Cluster { .. } => "cluster",
         Command::Organization { .. } => "organization",
         Command::Graphs { command } => match command {
@@ -380,10 +380,10 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
 pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Optimize { .. }
-            | Command::RebuildFullTextIndexes { .. }
-            | Command::Repair { .. }
-            | Command::Cleanup { .. }
+        Command::Optimize(_)
+            | Command::RebuildFullTextIndexes(_)
+            | Command::Repair(_)
+            | Command::Cleanup(_)
             // `lint` can type-check a `.gq` against a cluster graph's schema
             // (RFC 0011): `--cluster <dir> --graph <id>`.
             | Command::Lint(_)
@@ -467,10 +467,10 @@ fn remediation(capability: Capability, cmd: &Command) -> &'static str {
             } => {
                 " Pass a standalone storage URI, or deploy the schema with `cluster apply --server <SERVER> --config <CONFIG>`."
             }
-            Command::Optimize { .. }
-            | Command::RebuildFullTextIndexes { .. }
-            | Command::Repair { .. }
-            | Command::Cleanup { .. } => " Pass a storage URI, or --cluster <dir> --graph <id>.",
+            Command::Optimize(_)
+            | Command::RebuildFullTextIndexes(_)
+            | Command::Repair(_)
+            | Command::Cleanup(_) => " Pass a storage URI, or --cluster <dir> --graph <id>.",
             _ => " Pass a storage URI.",
         },
         Capability::Control => match cmd {

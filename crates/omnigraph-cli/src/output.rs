@@ -14,6 +14,225 @@ pub(crate) fn graph_type_subject(type_key: &str) -> String {
     }
 }
 
+pub(crate) fn write_optimize(
+    uri: &str,
+    stats: &[omnigraph::db::DatasetOptimizeStats],
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    if json {
+        let value = serde_json::json!({
+            "uri": uri,
+            "datasets": stats.iter().map(|s| serde_json::json!({
+                "type_key": s.type_key,
+                "fragments_removed": s.fragments_removed,
+                "fragments_added": s.fragments_added,
+                "committed": s.committed,
+                "skipped": s.skipped.map(|r| r.as_str()),
+                "published_dataset_version": s.published_dataset_version,
+                "lance_head_version": s.lance_head_version,
+                "pending_indexes": s.pending_indexes.iter().map(|p| serde_json::json!({
+                    "property": p.property,
+                    "reason": p.reason,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        });
+        write_json(&value, stdout)?;
+    } else {
+        writeln!(stdout, "optimize {} — {} datasets", uri, stats.len())?;
+        for s in stats {
+            let subject = graph_type_subject(&s.type_key);
+            if let Some(reason) = s.skipped {
+                writeln!(stdout, "  {subject:<40} skipped ({reason})")?;
+            } else if s.committed {
+                writeln!(
+                    stdout,
+                    "  {:<40} frags {} → {} ✓",
+                    subject, s.fragments_removed, s.fragments_added
+                )?;
+            } else {
+                writeln!(stdout, "  {subject:<40} no-op")?;
+            }
+            for p in &s.pending_indexes {
+                writeln!(
+                    stdout,
+                    "    ↳ index pending on property '{}': {}",
+                    p.property, p.reason
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_full_text_rebuild(
+    uri: &str,
+    result: &omnigraph::db::FullTextIndexRebuildResult,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    let warnings = if result.rebuilt_indexes.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.",
+        ]
+    };
+    if json {
+        write_json(
+            &serde_json::json!({
+                "uri": uri,
+                "branch": result.branch,
+                "graph_commit_id": result.graph_commit_id,
+                "warnings": warnings,
+                "rebuilt_indexes": result.rebuilt_indexes.iter().map(|index| {
+                    serde_json::json!({
+                        "type_key": index.type_key,
+                        "property": index.property,
+                    })
+                }).collect::<Vec<_>>(),
+            }),
+            stdout,
+        )?;
+    } else {
+        for warning in &warnings {
+            writeln!(stderr, "warning: {warning}")?;
+        }
+        writeln!(
+            stdout,
+            "rebuild-full-text-indexes {} — branch {}, {} indexes rebuilt",
+            uri,
+            result.branch,
+            result.rebuilt_indexes.len(),
+        )?;
+        for index in &result.rebuilt_indexes {
+            writeln!(
+                stdout,
+                "  {}, property '{}'",
+                graph_type_subject(&index.type_key),
+                index.property,
+            )?;
+        }
+        if let Some(commit_id) = &result.graph_commit_id {
+            writeln!(stdout, "graph commit: {commit_id}")?;
+        } else {
+            writeln!(stdout, "no-op; no graph commit published")?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_repair(
+    uri: &str,
+    stats: &omnigraph::db::RepairStats,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    if json {
+        let value = serde_json::json!({
+            "uri": uri,
+            "graph_manifest_version": stats.graph_manifest_version,
+            "datasets": stats.datasets.iter().map(|s| serde_json::json!({
+                "type_key": s.type_key,
+                "published_dataset_version": s.published_dataset_version,
+                "lance_head_version": s.lance_head_version,
+                "classification": s.classification.as_str(),
+                "action": s.action.as_str(),
+                "operations": s.operations,
+                "error": s.error,
+            })).collect::<Vec<_>>(),
+        });
+        write_json(&value, stdout)?;
+    } else {
+        writeln!(stdout, "repair {} — {} datasets", uri, stats.datasets.len())?;
+        for s in &stats.datasets {
+            let drift = if s.published_dataset_version == s.lance_head_version {
+                format!("{}", s.published_dataset_version)
+            } else {
+                format!("{} → {}", s.published_dataset_version, s.lance_head_version)
+            };
+            let ops = if s.operations.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", s.operations.join(", "))
+            };
+            let err = s
+                .error
+                .as_ref()
+                .map(|err| format!(" ({err})"))
+                .unwrap_or_default();
+            writeln!(
+                stdout,
+                "  {:<40} {:<12} {:<22} {}{}{}",
+                graph_type_subject(&s.type_key),
+                s.action.as_str(),
+                s.classification.as_str(),
+                drift,
+                ops,
+                err
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_cleanup(
+    uri: &str,
+    policy: &omnigraph::db::CleanupPolicyOptions,
+    policy_desc: &str,
+    stats: &[omnigraph::db::DatasetCleanupStats],
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    let keep = policy.keep_versions;
+    let older_than_dur = policy.older_than;
+    if json {
+        let value = serde_json::json!({
+            "uri": uri,
+            "keep_versions": keep,
+            "older_than_secs": older_than_dur.map(|d| d.as_secs()),
+            "datasets": stats.iter().map(|s| serde_json::json!({
+                "type_key": s.type_key,
+                "bytes_removed": s.bytes_removed,
+                "old_versions_removed": s.old_versions_removed,
+                "error": s.error,
+                "manifests_removed": s.manifests_removed,
+                "unpublished_manifests": s.unpublished_manifests,
+                "unpublished_bytes": s.unpublished_bytes,
+                "foreign_versions": s.foreign_versions,
+            })).collect::<Vec<_>>(),
+        });
+        write_json(&value, stdout)?;
+    } else {
+        let total_bytes: u64 = stats.iter().map(|s| s.bytes_removed).sum();
+        let total_versions: u64 = stats.iter().map(|s| s.old_versions_removed).sum();
+        let failed: Vec<String> = stats
+            .iter()
+            .filter(|s| s.error.is_some())
+            .map(|s| graph_type_subject(&s.type_key))
+            .collect();
+        writeln!(
+            stdout,
+            "cleanup {} ({}) — removed {} versions ({} bytes) across {} datasets",
+            uri,
+            policy_desc,
+            total_versions,
+            total_bytes,
+            stats.len() - failed.len()
+        )?;
+        if !failed.is_empty() {
+            writeln!(
+                stdout,
+                "  {} dataset(s) failed and will be retried on the next cleanup: {}",
+                failed.len(),
+                failed.join(", ")
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct LoadOutput {
     pub(crate) uri: String,
@@ -2015,6 +2234,259 @@ mod tests {
         write(&mut bytes).unwrap();
         assert_eq!(bytes, expected.as_bytes());
         assert_writer_failure("human formatter", WriterFault::AfterPrefix, write);
+    }
+
+    fn assert_maintenance_report(
+        human: &str,
+        json: serde_json::Value,
+        render: impl Fn(bool, &mut dyn Write) -> color_eyre::Result<()>,
+    ) {
+        assert_human_format(human, |writer| render(false, writer));
+        let mut bytes = Vec::new();
+        render(true, &mut bytes).unwrap();
+        assert_eq!(
+            bytes,
+            format!("{}\n", serde_json::to_string_pretty(&json).unwrap()).as_bytes()
+        );
+        assert_writer_failure("maintenance JSON", WriterFault::AfterPrefix, |writer| {
+            render(true, writer)
+        });
+    }
+
+    #[tokio::test]
+    async fn maintenance_optimize_and_repair_reports_preserve_all_result_fields() {
+        use omnigraph::db::{
+            Omnigraph, PendingIndex, RepairAction, RepairClassification, RepairOptions, SkipReason,
+        };
+        // These engine result types are non_exhaustive. Obtain one valid value
+        // from a tiny graph, then set its public presentation fields; no engine
+        // outcome or storage behavior is asserted by this renderer test.
+        let temp = tempfile::tempdir().unwrap();
+        let uri = temp
+            .path()
+            .join("graph.omni")
+            .to_string_lossy()
+            .into_owned();
+        let db = Omnigraph::init(&uri, "node Person {\n    slug: String @key\n}\n")
+            .await
+            .unwrap();
+        let mut compacted = db.optimize().await.unwrap().pop().unwrap();
+        compacted.type_key = "node:Person".into();
+        compacted.fragments_removed = 3;
+        compacted.fragments_added = 1;
+        compacted.committed = true;
+        compacted.skipped = None;
+        compacted.published_dataset_version = None;
+        compacted.lance_head_version = None;
+        compacted.pending_indexes = vec![PendingIndex {
+            type_key: "node:Person".into(),
+            property: "embedding".into(),
+            reason: "no trainable vectors".into(),
+        }];
+        let mut skipped = compacted.clone();
+        skipped.type_key = "edge:Knows".into();
+        skipped.fragments_removed = 0;
+        skipped.fragments_added = 0;
+        skipped.committed = false;
+        skipped.skipped = Some(SkipReason::DriftNeedsRepair);
+        skipped.published_dataset_version = Some(4);
+        skipped.lance_head_version = Some(5);
+        skipped.pending_indexes.clear();
+        let mut noop = skipped.clone();
+        noop.type_key = "__manifest".into();
+        noop.skipped = None;
+        noop.published_dataset_version = None;
+        noop.lance_head_version = None;
+        let optimize = [compacted, skipped, noop];
+        assert_maintenance_report(
+            concat!(
+                "optimize graph — 3 datasets\n",
+                "  node type 'Person'                       frags 3 → 1 ✓\n",
+                "    ↳ index pending on property 'embedding': no trainable vectors\n",
+                "  edge type 'Knows'                        skipped (published dataset/Lance HEAD drift — run omnigraph repair)\n",
+                "  dataset '__manifest'                     no-op\n",
+            ),
+            serde_json::json!({
+                "uri":"graph",
+                "datasets":[
+                    {"type_key":"node:Person","fragments_removed":3,"fragments_added":1,"committed":true,"skipped":null,"published_dataset_version":null,"lance_head_version":null,"pending_indexes":[{"property":"embedding","reason":"no trainable vectors"}]},
+                    {"type_key":"edge:Knows","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":"drift_needs_repair","published_dataset_version":4,"lance_head_version":5,"pending_indexes":[]},
+                    {"type_key":"__manifest","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"published_dataset_version":null,"lance_head_version":null,"pending_indexes":[]},
+                ],
+            }),
+            |json, writer| super::write_optimize("graph", &optimize, json, writer),
+        );
+        assert_maintenance_report(
+            "optimize graph — 0 datasets\n",
+            serde_json::json!({"uri":"graph","datasets":[]}),
+            |json, writer| super::write_optimize("graph", &[], json, writer),
+        );
+
+        let mut repair = db.repair(RepairOptions::default()).await.unwrap();
+        let mut clean = repair.datasets.pop().unwrap();
+        clean.type_key = "node:Person".into();
+        clean.published_dataset_version = 4;
+        clean.lance_head_version = 4;
+        clean.classification = RepairClassification::NoDrift;
+        clean.action = RepairAction::NoOp;
+        clean.operations.clear();
+        clean.error = None;
+        let mut refused = clean.clone();
+        refused.type_key = "edge:Knows".into();
+        refused.lance_head_version = 6;
+        refused.classification = RepairClassification::ForeignDrift;
+        refused.action = RepairAction::Refused;
+        refused.operations = vec!["Append".into(), "Delete".into()];
+        refused.error = Some("foreign write".into());
+        repair.datasets = vec![clean, refused];
+        repair.graph_manifest_version = Some(9);
+        assert_maintenance_report(
+            concat!(
+                "repair graph — 2 datasets\n",
+                "  node type 'Person'                       no_op        no_drift               4\n",
+                "  edge type 'Knows'                        refused      foreign_drift          4 → 6 [Append, Delete] (foreign write)\n",
+            ),
+            serde_json::json!({
+                "uri":"graph", "graph_manifest_version":9,
+                "datasets":[
+                    {"type_key":"node:Person","published_dataset_version":4,"lance_head_version":4,"classification":"no_drift","action":"no_op","operations":[],"error":null},
+                    {"type_key":"edge:Knows","published_dataset_version":4,"lance_head_version":6,"classification":"foreign_drift","action":"refused","operations":["Append","Delete"],"error":"foreign write"},
+                ],
+            }),
+            |json, writer| super::write_repair("graph", &repair, json, writer),
+        );
+        repair.datasets.clear();
+        repair.graph_manifest_version = None;
+        assert_maintenance_report(
+            "repair graph — 0 datasets\n",
+            serde_json::json!({"uri":"graph","graph_manifest_version":null,"datasets":[]}),
+            |json, writer| super::write_repair("graph", &repair, json, writer),
+        );
+    }
+
+    #[test]
+    fn maintenance_cleanup_reports_preserve_partial_failure_and_policy() {
+        use omnigraph::db::{CleanupPolicyOptions, DatasetCleanupStats};
+        use std::time::Duration;
+        let policy = CleanupPolicyOptions {
+            keep_versions: Some(2),
+            older_than: Some(Duration::from_secs(60)),
+        };
+        let stats = [
+            DatasetCleanupStats {
+                type_key: "node:Person".into(),
+                bytes_removed: 12,
+                old_versions_removed: 3,
+                error: None,
+                manifests_removed: 4,
+                unpublished_manifests: 5,
+                unpublished_bytes: 6,
+                foreign_versions: vec![7, 8],
+            },
+            DatasetCleanupStats {
+                type_key: "edge:Knows".into(),
+                bytes_removed: 2,
+                old_versions_removed: 1,
+                error: Some("access denied".into()),
+                manifests_removed: 0,
+                unpublished_manifests: 0,
+                unpublished_bytes: 0,
+                foreign_versions: vec![],
+            },
+        ];
+        let description = "keep 2 versions, remove anything older than 60s";
+        assert_maintenance_report(
+            concat!(
+                "cleanup graph (keep 2 versions, remove anything older than 60s) — removed 4 versions (14 bytes) across 1 datasets\n",
+                "  1 dataset(s) failed and will be retried on the next cleanup: edge type 'Knows'\n",
+            ),
+            serde_json::json!({
+                "uri":"graph", "keep_versions":2,"older_than_secs":60,
+                "datasets":[
+                    {"type_key":"node:Person","bytes_removed":12,"old_versions_removed":3,"error":null,"manifests_removed":4,"unpublished_manifests":5,"unpublished_bytes":6,"foreign_versions":[7,8]},
+                    {"type_key":"edge:Knows","bytes_removed":2,"old_versions_removed":1,"error":"access denied","manifests_removed":0,"unpublished_manifests":0,"unpublished_bytes":0,"foreign_versions":[]},
+                ],
+            }),
+            |json, writer| {
+                super::write_cleanup("graph", &policy, description, &stats, json, writer)
+            },
+        );
+        let policy = CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::from_secs(60)),
+        };
+        assert_maintenance_report(
+            "cleanup graph (remove anything older than 60s) — removed 0 versions (0 bytes) across 0 datasets\n",
+            serde_json::json!({"uri":"graph","keep_versions":null,"older_than_secs":60,"datasets":[]}),
+            |json, writer| {
+                super::write_cleanup(
+                    "graph",
+                    &policy,
+                    "remove anything older than 60s",
+                    &[],
+                    json,
+                    writer,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn maintenance_full_text_reports_keep_warning_stream_and_noop_distinct() {
+        use omnigraph::db::{FullTextIndexRebuildResult, RebuiltFullTextIndex};
+        let warning = "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.";
+        let result = FullTextIndexRebuildResult {
+            branch: "dev".into(),
+            graph_commit_id: Some("commit-1".into()),
+            rebuilt_indexes: vec![RebuiltFullTextIndex {
+                type_key: "node:Doc".into(),
+                property: "body".into(),
+            }],
+        };
+        assert_maintenance_report(
+            "rebuild-full-text-indexes graph — branch dev, 1 indexes rebuilt\n  node type 'Doc', property 'body'\ngraph commit: commit-1\n",
+            serde_json::json!({"uri":"graph","branch":"dev","graph_commit_id":"commit-1","warnings":[warning],"rebuilt_indexes":[{"type_key":"node:Doc","property":"body"}]}),
+            |json, writer| {
+                let mut stderr = Vec::new();
+                let output =
+                    super::write_full_text_rebuild("graph", &result, json, writer, &mut stderr);
+                assert_eq!(
+                    stderr,
+                    if json {
+                        Vec::new()
+                    } else {
+                        format!("warning: {warning}\n").into_bytes()
+                    }
+                );
+                output
+            },
+        );
+        assert_writer_failure("full-text warning", WriterFault::AfterPrefix, |stderr| {
+            let mut stdout = Vec::new();
+            let error =
+                super::write_full_text_rebuild("graph", &result, false, &mut stdout, stderr);
+            assert!(
+                stdout.is_empty(),
+                "warning is delivered before the human report"
+            );
+            error
+        });
+        let noop = FullTextIndexRebuildResult {
+            branch: "main".into(),
+            graph_commit_id: None,
+            rebuilt_indexes: vec![],
+        };
+        assert_maintenance_report(
+            "rebuild-full-text-indexes graph — branch main, 0 indexes rebuilt\nno-op; no graph commit published\n",
+            serde_json::json!({"uri":"graph","branch":"main","graph_commit_id":null,"warnings":[],"rebuilt_indexes":[]}),
+            |json, writer| {
+                let mut stderr = Vec::new();
+                let output =
+                    super::write_full_text_rebuild("graph", &noop, json, writer, &mut stderr);
+                assert!(stderr.is_empty());
+                output
+            },
+        );
     }
 
     #[test]

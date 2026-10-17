@@ -276,6 +276,15 @@ async fn run(
     // The verb's declared capability, threaded into scope resolution so the
     // resolver and the guard share one classification (planes.rs).
     let capability = planes::command_capability(&cli.command);
+    let maintenance_scope = commands::maintenance::MaintenanceScope {
+        profile: cli.profile.as_deref(),
+        store: cli.store.as_deref(),
+        cluster: cli.cluster.as_deref(),
+        graph: cli.graph.as_deref(),
+        actor: cli.as_actor.as_deref(),
+        yes: cli.yes,
+        quiet: cli.quiet,
+    };
     match cli.command {
         Command::Login {
             name, token, json, ..
@@ -718,303 +727,30 @@ async fn run(
                 }
             }
         }
-        Command::Upgrade {
-            uri,
-            check,
-            to_format,
-            json,
-        } => {
-            return upgrade::run(
-                &cli.profile,
-                &cli.store,
-                uri,
-                check,
-                to_format,
-                json,
-                cli.quiet,
+        Command::Upgrade(args) => {
+            return commands::maintenance::run_upgrade(args, maintenance_scope, stdout, stderr)
+                .await;
+        }
+        Command::Optimize(args) => {
+            return commands::maintenance::run_optimize(args, maintenance_scope, stdout, stderr)
+                .await;
+        }
+        Command::RebuildFullTextIndexes(args) => {
+            return commands::maintenance::run_full_text_rebuild(
+                args,
+                maintenance_scope,
+                stdout,
+                stderr,
             )
             .await;
         }
-        Command::Optimize { uri, json } => {
-            let uri = resolve_maintenance_uri(
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-                cli.cluster.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                "optimize",
-            )
-            .await?;
-            echo_write_target(cli.quiet, "optimize", &uri, false);
-            crate::admission::ensure_graph(&uri).await?;
-            let db = Omnigraph::open(&uri).await?;
-            let stats = db.optimize().await?;
-            if json {
-                let value = serde_json::json!({
-                    "uri": uri,
-                    "datasets": stats.iter().map(|s| serde_json::json!({
-                        "type_key": s.type_key,
-                        "fragments_removed": s.fragments_removed,
-                        "fragments_added": s.fragments_added,
-                        "committed": s.committed,
-                        "skipped": s.skipped.map(|r| r.as_str()),
-                        "published_dataset_version": s.published_dataset_version,
-                        "lance_head_version": s.lance_head_version,
-                        "pending_indexes": s.pending_indexes.iter().map(|p| serde_json::json!({
-                            "property": p.property,
-                            "reason": p.reason,
-                        })).collect::<Vec<_>>(),
-                    })).collect::<Vec<_>>(),
-                });
-                print_json(&value)?;
-            } else {
-                println!("optimize {} — {} datasets", uri, stats.len());
-                for s in &stats {
-                    let subject = graph_type_subject(&s.type_key);
-                    if let Some(reason) = s.skipped {
-                        println!("  {subject:<40} skipped ({reason})");
-                    } else if s.committed {
-                        println!(
-                            "  {:<40} frags {} → {} ✓",
-                            subject, s.fragments_removed, s.fragments_added
-                        );
-                    } else {
-                        println!("  {subject:<40} no-op");
-                    }
-                    for p in &s.pending_indexes {
-                        println!(
-                            "    ↳ index pending on property '{}': {}",
-                            p.property, p.reason
-                        );
-                    }
-                }
-            }
+        Command::Repair(args) => {
+            return commands::maintenance::run_repair(args, maintenance_scope, stdout, stderr)
+                .await;
         }
-        Command::RebuildFullTextIndexes { uri, branch, json } => {
-            let uri = resolve_maintenance_uri(
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-                cli.cluster.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                "rebuild-full-text-indexes",
-            )
-            .await?;
-            let actor = resolve_cli_actor(cli.as_actor.as_deref())?;
-            echo_write_target(cli.quiet, "rebuild-full-text-indexes", &uri, false);
-            crate::admission::ensure_graph(&uri).await?;
-            let db = Omnigraph::open(&uri).await?;
-            let result = db
-                .rebuild_full_text_indices_on_as(&branch, actor.as_deref())
-                .await?;
-            let warnings = if result.rebuilt_indexes.is_empty() {
-                Vec::new()
-            } else {
-                vec![
-                    "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.",
-                ]
-            };
-            if json {
-                print_json(&serde_json::json!({
-                    "uri": uri,
-                    "branch": result.branch,
-                    "graph_commit_id": result.graph_commit_id,
-                    "warnings": warnings,
-                    "rebuilt_indexes": result.rebuilt_indexes.iter().map(|index| {
-                        serde_json::json!({
-                            "type_key": index.type_key,
-                            "property": index.property,
-                        })
-                    }).collect::<Vec<_>>(),
-                }))?;
-            } else {
-                for warning in &warnings {
-                    eprintln!("warning: {warning}");
-                }
-                println!(
-                    "rebuild-full-text-indexes {} — branch {}, {} indexes rebuilt",
-                    uri,
-                    result.branch,
-                    result.rebuilt_indexes.len(),
-                );
-                for index in &result.rebuilt_indexes {
-                    println!(
-                        "  {}, property '{}'",
-                        graph_type_subject(&index.type_key),
-                        index.property,
-                    );
-                }
-                if let Some(commit_id) = result.graph_commit_id {
-                    println!("graph commit: {commit_id}");
-                } else {
-                    println!("no-op; no graph commit published");
-                }
-            }
-        }
-        Command::Repair { uri, json } => {
-            let uri = resolve_maintenance_uri(
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-                cli.cluster.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                "repair",
-            )
-            .await?;
-            echo_write_target(cli.quiet, "repair", &uri, false);
-            crate::admission::ensure_graph(&uri).await?;
-            let db = Omnigraph::open(&uri).await?;
-            let stats = db.repair(omnigraph::db::RepairOptions::default()).await?;
-            let refused_count = stats
-                .datasets
-                .iter()
-                .filter(|s| matches!(s.action, omnigraph::db::RepairAction::Refused))
-                .count();
-            if json {
-                let value = serde_json::json!({
-                    "uri": uri,
-                    "graph_manifest_version": stats.graph_manifest_version,
-                    "datasets": stats.datasets.iter().map(|s| serde_json::json!({
-                        "type_key": s.type_key,
-                        "published_dataset_version": s.published_dataset_version,
-                        "lance_head_version": s.lance_head_version,
-                        "classification": s.classification.as_str(),
-                        "action": s.action.as_str(),
-                        "operations": s.operations,
-                        "error": s.error,
-                    })).collect::<Vec<_>>(),
-                });
-                print_json(&value)?;
-            } else {
-                println!("repair {} — {} datasets", uri, stats.datasets.len());
-                for s in &stats.datasets {
-                    let drift = if s.published_dataset_version == s.lance_head_version {
-                        format!("{}", s.published_dataset_version)
-                    } else {
-                        format!("{} → {}", s.published_dataset_version, s.lance_head_version)
-                    };
-                    let ops = if s.operations.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", s.operations.join(", "))
-                    };
-                    let err = s
-                        .error
-                        .as_ref()
-                        .map(|err| format!(" ({err})"))
-                        .unwrap_or_default();
-                    println!(
-                        "  {:<40} {:<12} {:<22} {}{}{}",
-                        graph_type_subject(&s.type_key),
-                        s.action.as_str(),
-                        s.classification.as_str(),
-                        drift,
-                        ops,
-                        err
-                    );
-                }
-            }
-            if refused_count > 0 {
-                bail!(
-                    "repair could not diagnose {} dataset(s); inspect the reported errors",
-                    refused_count
-                );
-            }
-        }
-        Command::Cleanup {
-            uri,
-            keep,
-            older_than,
-            confirm,
-            json,
-        } => {
-            let uri = resolve_maintenance_uri(
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-                cli.cluster.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                "cleanup",
-            )
-            .await?;
-
-            let older_than_dur = older_than.as_deref().map(parse_duration_arg).transpose()?;
-
-            if keep.is_none() && older_than_dur.is_none() {
-                bail!("cleanup requires at least one of --keep or --older-than");
-            }
-
-            let policy_desc = match (keep, older_than_dur) {
-                (Some(k), Some(d)) => {
-                    format!("keep {} versions, remove anything older than {:?}", k, d)
-                }
-                (Some(k), None) => format!("keep {} versions", k),
-                (None, Some(d)) => format!("remove anything older than {:?}", d),
-                _ => unreachable!(),
-            };
-
-            if !confirm {
-                eprintln!(
-                    "cleanup is destructive — rerun with --confirm. Policy for {}: {}",
-                    uri, policy_desc
-                );
-                return Ok(Completion::success());
-            }
-            // Past the preview gate: a real destructive run. Against a non-local
-            // scope this additionally requires --yes (or an interactive yes), so
-            // `cleanup --confirm s3://…` in CI refuses rather than destroying.
-            confirm_destructive("cleanup", &uri, cli.yes, json)?;
-            echo_write_target(cli.quiet, "cleanup", &uri, false);
-
-            let options = omnigraph::db::CleanupPolicyOptions {
-                keep_versions: keep,
-                older_than: older_than_dur,
-            };
-
-            crate::admission::ensure_graph(&uri).await?;
-            let db = Omnigraph::open(&uri).await?;
-            let stats = db.cleanup(options).await?;
-            if json {
-                let value = serde_json::json!({
-                    "uri": uri,
-                    "keep_versions": keep,
-                    "older_than_secs": older_than_dur.map(|d| d.as_secs()),
-                    "datasets": stats.iter().map(|s| serde_json::json!({
-                        "type_key": s.type_key,
-                        "bytes_removed": s.bytes_removed,
-                        "old_versions_removed": s.old_versions_removed,
-                        "error": s.error,
-                        "manifests_removed": s.manifests_removed,
-                        "unpublished_manifests": s.unpublished_manifests,
-                        "unpublished_bytes": s.unpublished_bytes,
-                        "foreign_versions": s.foreign_versions,
-                    })).collect::<Vec<_>>(),
-                });
-                print_json(&value)?;
-            } else {
-                let total_bytes: u64 = stats.iter().map(|s| s.bytes_removed).sum();
-                let total_versions: u64 = stats.iter().map(|s| s.old_versions_removed).sum();
-                let failed: Vec<String> = stats
-                    .iter()
-                    .filter(|s| s.error.is_some())
-                    .map(|s| graph_type_subject(&s.type_key))
-                    .collect();
-                println!(
-                    "cleanup {} ({}) — removed {} versions ({} bytes) across {} datasets",
-                    uri,
-                    policy_desc,
-                    total_versions,
-                    total_bytes,
-                    stats.len() - failed.len()
-                );
-                if !failed.is_empty() {
-                    println!(
-                        "  {} dataset(s) failed and will be retried on the next cleanup: {}",
-                        failed.len(),
-                        failed.join(", ")
-                    );
-                }
-            }
+        Command::Cleanup(args) => {
+            return commands::maintenance::run_cleanup(args, maintenance_scope, stdout, stderr)
+                .await;
         }
         Command::Use { .. } | Command::Organization { .. } => {
             unreachable!("managed dispatch handles organization commands and use")

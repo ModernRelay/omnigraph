@@ -1094,16 +1094,34 @@ fn optimize_json_succeeds_on_local_graph() {
 fn optimize_with_server_flag_errors_wrong_plane() {
     // RFC-010 Slice 1: --server is a data-plane addressing flag; on a
     // storage-plane verb the guard rejects it loudly (was: silently ignored).
-    for command in ["optimize", "rebuild-full-text-indexes"] {
-        let output = output_failure(cli().arg(command).arg("--server").arg("prod"));
+    let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
+    for command in [
+        "optimize",
+        "rebuild-full-text-indexes",
+        "repair",
+        "cleanup",
+        "upgrade",
+    ] {
+        let output = output_failure(cli().arg(command).arg("--server").arg(&server.origin));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains(&format!("`{command}` is a direct (storage-native) command"))
-                && stderr.contains("--server addresses a served graph and does not apply")
-                && stderr.contains("Pass a storage URI, or --cluster <dir> --graph <id>."),
+                && stderr.contains("--server addresses a served graph and does not apply"),
             "wrong-capability guard message not found; got: {stderr}"
         );
+        if command != "upgrade" {
+            assert!(
+                stderr.contains("Pass a storage URI, or --cluster <dir> --graph <id>."),
+                "{stderr}"
+            );
+        }
+        assert!(output.stdout.is_empty());
+        assert!(
+            server.requests().is_empty(),
+            "{command} must refuse before HTTP"
+        );
     }
+    server.assert_complete();
 }
 
 #[test]
@@ -3764,6 +3782,29 @@ fn cleanup_against_non_local_scope_refuses_without_yes() {
         stderr.contains("refusing destructive `cleanup`"),
         "expected a non-local cleanup refusal; stderr: {stderr}"
     );
+    let preview = output_success(cli().args([
+        "cleanup",
+        "--store",
+        "s3://fake-bucket/g.omni",
+        "--keep",
+        "5",
+        "--json",
+    ]));
+    assert!(preview.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&preview.stderr).contains("rerun with --confirm"));
+
+    // Invalid retention is diagnosed before either consent or cloud access.
+    let refused = output_failure(cli().args([
+        "cleanup",
+        "--store",
+        "s3://fake-bucket/g.omni",
+        "--older-than",
+        "invalid",
+        "--confirm",
+        "--json",
+    ]));
+    assert!(refused.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("invalid duration 'invalid'"));
 }
 
 #[test]
@@ -3773,6 +3814,45 @@ fn cleanup_against_local_scope_executes_with_confirm() {
     let graph = graph_path(temp.path());
     init_graph(&graph);
     load_fixture(&graph);
+    let before = parse_stdout_json(&output_success(
+        cli().args(["commit", "list"]).arg(&graph).arg("--json"),
+    ));
+    let version_before = manifest_dataset_version(&graph);
+    for (flags, success, message) in [
+        (vec!["--keep", "1"], true, "rerun with --confirm"),
+        (
+            vec!["--confirm"],
+            false,
+            "cleanup requires at least one of --keep or --older-than",
+        ),
+        (
+            vec!["--older-than", "invalid", "--confirm"],
+            false,
+            "invalid duration 'invalid'",
+        ),
+    ] {
+        let output = cli()
+            .arg("cleanup")
+            .arg(&graph)
+            .args(flags)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), success, "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "{output:?}"
+        );
+        assert_eq!(manifest_dataset_version(&graph), version_before);
+        let after = parse_stdout_json(&output_success(
+            cli().args(["commit", "list"]).arg(&graph).arg("--json"),
+        ));
+        assert_eq!(
+            after, before,
+            "preview or refusal must not remove retained history"
+        );
+    }
     let output = output_success(
         cli()
             .arg("cleanup")

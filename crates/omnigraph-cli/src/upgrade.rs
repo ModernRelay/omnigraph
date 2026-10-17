@@ -1,21 +1,33 @@
-use super::*;
+use std::io::Write;
+
+use color_eyre::eyre::{Result, bail};
+
 use crate::app::Completion;
+use crate::commands::maintenance::args::UpgradeArgs;
+use crate::helpers::{resolve_local_uri, write_target};
+use crate::output::write_json;
+use crate::{operator, planes, scope};
 
 pub(crate) async fn run(
-    profile: &Option<String>,
-    store: &Option<String>,
-    uri: Option<String>,
-    check: bool,
-    to_format: Option<u32>,
-    json: bool,
+    args: UpgradeArgs,
+    profile: Option<&str>,
+    store: Option<&str>,
     quiet: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<Completion> {
+    let UpgradeArgs {
+        uri,
+        check,
+        to_format,
+        json,
+    } = args;
     let target = scope::resolve_scope_from_env(
         &operator::load_operator_config()?,
         planes::Capability::Direct,
         scope::ScopeFlags {
-            profile: profile.as_deref(),
-            store: store.as_deref(),
+            profile,
+            store,
             server: None,
             cluster: None,
             graph: None,
@@ -50,15 +62,15 @@ pub(crate) async fn run(
         );
     }
     if !check {
-        echo_write_target(quiet, "upgrade", &uri, false);
+        write_target(quiet, "upgrade", &uri, false, stderr)?;
     }
     let report =
         omnigraph::db::upgrade_storage(&uri, omnigraph::db::UpgradeOptions { check, to_format })
             .await?;
     if json {
-        print_json(&report)?;
+        write_json(&report, stdout)?;
     } else {
-        print_human(&report)?;
+        write_human(&report, stdout)?;
     }
     if !report.success() {
         return Ok(Completion::exit(1));
@@ -66,20 +78,23 @@ pub(crate) async fn run(
     Ok(Completion::success())
 }
 
-fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
+fn write_human(report: &omnigraph::db::UpgradeReport, writer: &mut dyn Write) -> Result<()> {
     let mode = serde_json::to_value(report.mode)?;
     let outcome = serde_json::to_value(report.outcome)?;
-    println!(
+    writeln!(
+        writer,
         "upgrade {}: {} ({})",
         report.location,
         outcome.as_str().unwrap_or("unknown"),
         mode.as_str().unwrap_or("unknown")
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "graph identity: {}",
         report.graph_identity.as_deref().unwrap_or("unknown")
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "format: {} -> {}{}",
         report
             .observed_format
@@ -90,21 +105,24 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
         } else {
             ""
         }
-    );
-    println!("route: {}", joined(&report.route, " -> "));
-    println!(
+    )?;
+    writeln!(writer, "route: {}", joined(&report.route, " -> "))?;
+    writeln!(
+        writer,
         "completed handlers: {}",
         joined(&report.completed_handlers, ", ")
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "last durable completed boundary: {}",
         report
             .last_durable_completed_boundary
             .as_deref()
             .unwrap_or("none")
-    );
+    )?;
     let work = &report.work;
-    println!(
+    writeln!(
+        writer,
         "source: {} live refs, {} retired refs, {} orphan writers, {} legacy commits, \
          {} bookkeeping versions, {} absent parents",
         work.live_refs,
@@ -113,8 +131,9 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
         work.legacy_commits,
         work.bookkeeping_versions,
         work.absent_parents
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "legacy objects: {} data files, {} id shards, {} writer shards, {} schema contents, \
          {} bytes",
         work.data_files,
@@ -122,25 +141,31 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
         work.writer_shards,
         work.schema_contents,
         work.legacy_bytes
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "census: {} reads, {} cells",
         work.census_reads, work.census_cells
-    );
+    )?;
     for finding in &report.findings {
-        println!("{}: {}", finding.code, finding.message);
+        writeln!(writer, "{}: {}", finding.code, finding.message)?;
     }
     if let Some(recovery) = &report.recovery {
-        println!("failed handler: {}", recovery.failed_handler);
-        println!("recovery executable: {}", recovery.executable_compatibility);
-        println!("recovery action: {}", recovery.action);
+        writeln!(writer, "failed handler: {}", recovery.failed_handler)?;
+        writeln!(
+            writer,
+            "recovery executable: {}",
+            recovery.executable_compatibility
+        )?;
+        writeln!(writer, "recovery action: {}", recovery.action)?;
     }
     if matches!(report.mode, omnigraph::db::UpgradeMode::Check) {
-        println!(
+        writeln!(
+            writer,
             "Check is advisory. Keep the graph offline: stop all readers, writers and \
              maintenance, retain a verified backup of the whole root, then run `omnigraph \
              upgrade <graph>` without `--check`."
-        );
+        )?;
     }
     Ok(())
 }
@@ -156,7 +181,85 @@ fn joined(items: &[String], separator: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{Cli, Command};
     use clap::Parser;
+
+    #[test]
+    fn upgrade_report_preserves_recovery_details_and_propagates_output_failure() {
+        use omnigraph::db::{
+            UpgradeFinding, UpgradeMode, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
+            UpgradeWork,
+        };
+
+        let mut report = UpgradeReport {
+            mode: UpgradeMode::Check,
+            outcome: UpgradeOutcome::CheckFailed,
+            location: "graph".into(),
+            graph_identity: None,
+            observed_format: None,
+            target_format: 16,
+            target_defaulted: true,
+            route: Vec::new(),
+            completed_handlers: Vec::new(),
+            findings: vec![UpgradeFinding {
+                code: "unsupported_source".into(),
+                message: "inspect the source".into(),
+            }],
+            last_durable_completed_boundary: None,
+            recovery: None,
+            work: UpgradeWork::default(),
+        };
+        let mut bytes = Vec::new();
+        write_human(&report, &mut bytes).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            concat!(
+                "upgrade graph: check_failed (check)\n",
+                "graph identity: unknown\nformat: unknown -> 16 (default target)\n",
+                "route: none\ncompleted handlers: none\nlast durable completed boundary: none\n",
+                "source: 0 live refs, 0 retired refs, 0 orphan writers, 0 legacy commits, 0 bookkeeping versions, 0 absent parents\n",
+                "legacy objects: 0 data files, 0 id shards, 0 writer shards, 0 schema contents, 0 bytes\n",
+                "census: 0 reads, 0 cells\nunsupported_source: inspect the source\n",
+                "Check is advisory. Keep the graph offline: stop all readers, writers and maintenance, retain a verified backup of the whole root, then run `omnigraph upgrade <graph>` without `--check`.\n",
+            )
+        );
+
+        report.mode = UpgradeMode::Execute;
+        report.outcome = UpgradeOutcome::RecoveryRequired;
+        report.graph_identity = Some("original-identity".into());
+        report.observed_format = Some(13);
+        report.target_defaulted = false;
+        report.route = vec!["convert".into(), "activate".into()];
+        report.completed_handlers = vec!["convert".into()];
+        report.findings.clear();
+        report.last_durable_completed_boundary = Some("converted".into());
+        report.recovery = Some(UpgradeRecovery {
+            failed_handler: "activate".into(),
+            executable_compatibility: "the original executable".into(),
+            action: "keep offline and inspect".into(),
+        });
+        let mut bytes = Vec::new();
+        write_human(&report, &mut bytes).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            concat!(
+                "upgrade graph: recovery_required (execute)\n",
+                "graph identity: original-identity\nformat: 13 -> 16\n",
+                "route: convert -> activate\ncompleted handlers: convert\nlast durable completed boundary: converted\n",
+                "source: 0 live refs, 0 retired refs, 0 orphan writers, 0 legacy commits, 0 bookkeeping versions, 0 absent parents\n",
+                "legacy objects: 0 data files, 0 id shards, 0 writer shards, 0 schema contents, 0 bytes\n",
+                "census: 0 reads, 0 cells\nfailed handler: activate\n",
+                "recovery executable: the original executable\nrecovery action: keep offline and inspect\n",
+            )
+        );
+        let mut prefix = [0_u8; 7];
+        let error = write_human(&report, &mut prefix.as_mut_slice()).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WriteZero
+        );
+        assert_eq!(&prefix, b"upgrade");
+    }
 
     #[test]
     fn storage_upgrade_parses_explicit_route_and_check_options() {
@@ -171,7 +274,7 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            matches!(&cli.command, Command::Upgrade { uri: Some(uri), check: true, to_format: Some(15), json: true } if uri == "graph.omni")
+            matches!(&cli.command, Command::Upgrade(UpgradeArgs { uri: Some(uri), check: true, to_format: Some(15), json: true }) if uri == "graph.omni")
         );
         assert_eq!(
             planes::command_capability(&cli.command),
@@ -181,12 +284,12 @@ mod tests {
         let cli = Cli::try_parse_from(["omnigraph", "--store", "graph.omni", "upgrade"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Upgrade {
+            Command::Upgrade(UpgradeArgs {
                 uri: None,
                 check: false,
                 to_format: None,
                 json: false
-            }
+            })
         ));
     }
 
