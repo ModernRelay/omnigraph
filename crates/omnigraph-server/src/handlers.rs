@@ -801,6 +801,7 @@ pub(crate) async fn server_snapshot(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
+        (status = 424, description = "A load explain could not probe an allowed external source", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -810,7 +811,8 @@ pub(crate) async fn server_snapshot(
 /// names (`query`, `name`) match the CLI `-e` flag and the GQ `query`
 /// keyword. Mutations (`insert`/`update`/`delete`) are rejected with 400
 /// -- use `POST /mutate` for writes. Select a branch or snapshot and obtain
-/// the pinned graph-commit token with the response. Cedar authorizes Read.
+/// the pinned graph-commit token with the response. Cedar authorizes Read for
+/// read queries and Change for `explain load csv`.
 ///
 /// The GQ statement `branch list` is also served here, with no `branch`,
 /// `snapshot`, `name`, or `params`: it answers one result per branch (field
@@ -829,7 +831,11 @@ pub(crate) async fn server_snapshot(
 /// run, and the result describes its v2 logical, physical and available
 /// DataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by
 /// `plan` entries for the passes and the document's other fields, under the
-/// request's target and `params`.
+/// request's target and `params`. `explain load csv …` answers the accepted
+/// load plan the same way (`logical_initial`, `logical`, `physical`, then
+/// `plan` entries), under the request's `branch` alone. It requires the load's
+/// Change decision before probing the external source's metadata; it reads
+/// no payload byte and publishes nothing.
 pub(crate) async fn server_query(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
@@ -1637,7 +1643,7 @@ pub(crate) async fn run_mutate(
             .await;
         }
         FileBody::Show(id) => return Err(show_at_write_door(id)),
-        FileBody::Explain(_) => {
+        FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
             refuse_explain(door)?;
             return Err(explain_at_write_door());
         }
@@ -1843,6 +1849,36 @@ pub(crate) async fn run_query(
             refuse_explain(door)?;
             body.into_read_declarations()
                 .map_err(ApiError::bad_request)?
+        }
+        FileBody::ExplainLoad(stmt) => {
+            refuse_explain(door)?;
+            refuse_statement_envelope(
+                snapshot.is_some(),
+                name.is_some() || params_json.is_some(),
+                false,
+            )?;
+            let branch = branch.unwrap_or_else(|| "main".to_string());
+            authorize_request(
+                actor,
+                handle.policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::Change,
+                    branch: Some(branch.clone()),
+                    target_branch: None,
+                },
+            )?;
+            let target = ReadTarget::Branch(branch);
+            let session = session_with_prefix(&session, &file.settings)?;
+            let (result, graph_commit_id) = session
+                .explain_load(target.clone(), &stmt)
+                .await
+                .map_err(ApiError::from_omni)?;
+            return Ok(ReadDispatch::Rows {
+                query_name: stmt.statement_name().to_string(),
+                target,
+                result,
+                graph_commit_id,
+            });
         }
     };
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;

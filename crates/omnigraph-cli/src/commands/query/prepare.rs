@@ -23,6 +23,7 @@ pub(super) enum QueryInput<'a> {
 }
 
 /// Explicit envelope facts are retained separately from effective defaults.
+#[derive(Clone, Copy)]
 pub(super) struct Envelope<'a> {
     pub name: Option<&'a str>,
     pub has_params: bool,
@@ -36,6 +37,7 @@ pub(super) enum ReadOperation<'a> {
     Stored(&'a str),
     BranchList(&'a str),
     BranchRead(&'a str, BranchRead),
+    ExplainLoad(&'a str, LoadStmt),
     Show(&'a str, Option<SettingId>),
 }
 
@@ -105,6 +107,16 @@ pub(super) fn prepare_read<'a>(
                 statement.statement_name(),
             )
         ),
+        Ok(QueryFile {
+            body: FileBody::ExplainLoad(statement),
+            settings: prefix,
+            ..
+        }) => {
+            refuse_process_prefix_when_remote(remote, &prefix)?;
+            // Catalogue refusal precedes the envelope, and only snapshots are
+            // forbidden. The caller retains the resolved client and target.
+            Ok(ReadOperation::ExplainLoad(source, statement))
+        }
         Ok(QueryFile {
             body: FileBody::Show(id),
             settings: prefix,
@@ -176,7 +188,7 @@ pub(super) fn prepare_mutation<'a>(
             ..
         }) => bail!("{}", read_at_write_door(&show_statement_name(id))),
         Ok(QueryFile {
-            body: FileBody::Explain(_),
+            body: FileBody::Explain(_) | FileBody::ExplainLoad(_),
             ..
         }) => bail!("{}", read_at_write_door(EXPLAIN_STATEMENT_NAME)),
         parsed => {
@@ -222,7 +234,7 @@ fn read_at_write_door(statement_name: &str) -> String {
 }
 
 /// Keep the server's envelope refusal order: target, name/params, precondition.
-fn refuse_statement_envelope(envelope: &Envelope<'_>, has_target: bool) -> Result<()> {
+pub(super) fn refuse_statement_envelope(envelope: &Envelope<'_>, has_target: bool) -> Result<()> {
     if has_target {
         bail!(branch_statement_refusals::REQUEST_TARGET);
     }

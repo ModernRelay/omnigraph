@@ -1,5 +1,5 @@
 use omnigraph_compiler::SystemColumns;
-use omnigraph_compiler::ir::QueryIR;
+use omnigraph_compiler::ir::{LoadIR, QueryIR};
 use serde::{Deserialize, Serialize};
 
 /// Where a table's rows come from: a pinned dataset in the graph's store,
@@ -130,6 +130,14 @@ pub enum Operation {
     },
     /// A compiled GQ query, lowered directly without registry admission.
     Query(Box<QueryIR>),
+    /// A `load csv` statement, the first write plan: `tables` pins the
+    /// target and every consulted table present in the transaction's base;
+    /// `source_bytes` is the one source fact acceptance reads, its size.
+    Load {
+        ir: Box<LoadIR>,
+        tables: Vec<Side>,
+        source_bytes: u64,
+    },
 }
 
 impl Operation {
@@ -139,6 +147,7 @@ impl Operation {
             Self::SnapshotDiff { .. } => "snapshot_diff",
             Self::MergeClassify { .. } => "merge_classify",
             Self::Query(_) => "query",
+            Self::Load { .. } => "load",
         }
     }
 
@@ -152,6 +161,7 @@ impl Operation {
                 target,
             } => vec![base, source, target],
             Self::Query(_) => Vec::new(),
+            Self::Load { tables, .. } => tables.iter().collect(),
         }
     }
 }

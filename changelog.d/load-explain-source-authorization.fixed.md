@@ -1,0 +1,1 @@
+- **Authorization:** `explain load csv` over HTTP or MCP requires `change` permission on its target branch before probing source metadata. Read-only callers cannot inspect external source existence or size. Explaining a load still reads no payload bytes and publishes nothing.

@@ -4,7 +4,7 @@
 //! decision on `PhysicalNode::Expand`. Execution adjusts for the observed
 //! frontier and warm CSR; only legacy plans probe index coverage again.
 
-use omnigraph_compiler::ir::IRExpr;
+use omnigraph_compiler::ir::{IRExpr, ValidateCheck};
 use omnigraph_compiler::query::ast::{CompOp, Literal};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
@@ -497,12 +497,132 @@ fn estimate_rows_over(
         ),
         LogicalNode::OuterReference { .. } => outer_rows,
         LogicalNode::MergeClassify { .. } => None,
+        LogicalNode::CsvSource { spec } => Some(spec.estimated_rows),
+        LogicalNode::Validate { input, .. } => estimate_rows(plan, *input, source),
+        LogicalNode::FragmentWrite { .. } => Some(1),
+    }
+}
+
+/// Keys per uniqueness probe chunk. Endpoint probes use one filtered scan
+/// carrying the whole endpoint set, without this chunking.
+pub const PROBE_CHUNK_KEYS: u64 = 8_192;
+
+/// Source bytes per parser partition: a smaller file stays one partition,
+/// so the parallel source never splits what one reader finishes first.
+pub const SOURCE_PARTITION_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How a load validation reads the committed image it judges the delta
+/// against: nothing (the delta alone decides), a filtered probe per key
+/// chunk, or one projected scan matched in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidateAccess {
+    Delta,
+    Probe,
+    Scan,
+}
+
+impl ValidateAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delta => "delta",
+            Self::Probe => "probe",
+            Self::Scan => "scan",
+        }
+    }
+}
+
+/// Accepted row counts and complete usable BTREE coverage for a validation's
+/// filter columns. Partial or unknown coverage earns no index discount.
+#[derive(Debug, Clone, Copy)]
+pub struct ValidateCostInputs {
+    pub input_rows: Option<u64>,
+    pub consulted_rows: Option<u64>,
+    pub indexed: bool,
+}
+
+impl ValidateCostInputs {
+    /// Estimated row work: probe, scan and filtered-scan calls. Indexed
+    /// lookup uses the same per-row factor as dependent-scan selection.
+    pub fn costs(self, check: &ValidateCheck) -> Option<(u64, u64, u64)> {
+        let (input, table) = (self.input_rows?, self.consulted_rows?);
+        let calls = if matches!(check, ValidateCheck::Unique { .. }) {
+            input.div_ceil(PROBE_CHUNK_KEYS)
+        } else {
+            u64::from(input > 0)
+        };
+        let probe = if self.indexed {
+            input.saturating_mul(HASH_JOIN_RATIO)
+        } else {
+            table.saturating_mul(calls).saturating_add(input)
+        };
+        let scan = table.saturating_add(input);
+        Some((probe, scan, calls))
+    }
+}
+
+/// Pick the cheaper supported access. Ties and unknown statistics retain
+/// Probe; cardinality and retained-edge checks only implement Probe.
+pub fn choose_validate_access(check: &ValidateCheck, inputs: ValidateCostInputs) -> ValidateAccess {
+    if matches!(
+        check,
+        ValidateCheck::RetainedEdges { .. } | ValidateCheck::Cardinality { .. }
+    ) {
+        return ValidateAccess::Probe;
+    }
+    match inputs.costs(check) {
+        Some((probe, scan, _)) if scan < probe => ValidateAccess::Scan,
+        _ => ValidateAccess::Probe,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_costs_distinguish_endpoint_and_unique_probe_calls() {
+        use omnigraph_compiler::ir::{Endpoint, UniqueRole};
+        let endpoint = ValidateCheck::EdgeRi {
+            endpoint: Endpoint::From,
+            node_type: "Person".into(),
+        };
+        let unique = ValidateCheck::Unique {
+            role: UniqueRole::Unique,
+            columns: vec!["email".into()],
+        };
+        let inputs = ValidateCostInputs {
+            input_rows: Some(8193),
+            consulted_rows: Some(1_000_000),
+            indexed: false,
+        };
+        assert_eq!(inputs.costs(&endpoint), Some((1_008_193, 1_008_193, 1)));
+        assert_eq!(inputs.costs(&unique), Some((2_008_193, 1_008_193, 2)));
+        assert_eq!(
+            choose_validate_access(&endpoint, inputs),
+            ValidateAccess::Probe
+        );
+        assert_eq!(
+            choose_validate_access(&unique, inputs),
+            ValidateAccess::Scan
+        );
+        let unknown = ValidateCostInputs {
+            input_rows: None,
+            ..inputs
+        };
+        assert_eq!(
+            choose_validate_access(&endpoint, unknown),
+            ValidateAccess::Probe
+        );
+        let empty = ValidateCostInputs {
+            input_rows: Some(0),
+            ..inputs
+        };
+        assert_eq!(
+            choose_validate_access(&unique, empty),
+            ValidateAccess::Probe
+        );
+    }
 
     /// Cost inputs with generous hard caps, so the cost comparison (not a
     /// ceiling) is what an assertion exercises unless it sets one on purpose.

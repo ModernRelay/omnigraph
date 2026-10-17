@@ -155,8 +155,11 @@ deployment ID. Resume observation with:
 omnigraph cluster status --server production --deployment-id ID --wait --timeout 1800 --json
 ```
 
-The exact response contains `deployment`, `active` and `in_progress`. General
-cluster status retains its aggregate `status` object. An authenticated submitter
+The exact response contains `deployment`, `active` and `in_progress`. Default
+apply and status `--wait` return at activation, which can precede release of
+deployment admission. Repeat exact-ID status reads until `in_progress: false`
+before submitting another deployment; this confirms the observed deployment has
+released its admission. General cluster status retains its aggregate `status` object. An authenticated submitter
 can read its own durable receipt even after its deployment removes its management
 permission; general status and later deployments still require current permission.
 Lost submission responses are followed only by original-ID reads, never automatic

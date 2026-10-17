@@ -102,17 +102,18 @@ pub(crate) async fn run_query(
     }
     let target = resolve_read_target(branch, snapshot)?;
     let source = load_source(query.as_ref(), query_string.as_deref())?;
+    let envelope = Envelope {
+        name: name.as_deref(),
+        has_params: params_json.is_some(),
+        has_target,
+        has_expected_head: false,
+        has_settings: !settings.is_empty(),
+    };
     let operation = prepare::prepare_read(
         source
             .as_deref()
             .map_or(QueryInput::Stored, QueryInput::Supplied),
-        Envelope {
-            name: name.as_deref(),
-            has_params: params_json.is_some(),
-            has_target,
-            has_expected_head: false,
-            has_settings: !settings.is_empty(),
-        },
+        envelope,
         client.is_remote(),
     )?;
     let output: ReadOutput = match operation {
@@ -142,6 +143,23 @@ pub(crate) async fn run_query(
         ReadOperation::BranchRead(source, statement) => {
             client
                 .branch_read_statement(source, statement, &settings)
+                .await?
+        }
+        ReadOperation::ExplainLoad(source, statement) => {
+            if client.is_catalogue() {
+                return Err(crate::client::catalogue_scope_refusal("explain load"));
+            }
+            prepare::refuse_statement_envelope(
+                &envelope,
+                matches!(target, ReadTarget::Snapshot(_)),
+            )?;
+            let policy = if client.is_remote() {
+                None
+            } else {
+                embedded_file_source_policy(&statement.source)?
+            };
+            client
+                .explain_load(target, source, statement, policy, &settings)
                 .await?
         }
         ReadOperation::Show(source, id) => client.show_statement(source, id, &settings).await?,

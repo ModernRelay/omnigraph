@@ -619,8 +619,23 @@ impl GraphClient {
         uri: &str,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<Session> {
+        Self::open_read_session_with_external_blob_policy(uri, settings, None).await
+    }
+
+    /// An embedded read session, with `external_blob_policy` installed on
+    /// its fresh handle when given: `explain load csv "file://…"` probes its
+    /// source under the same base a direct load installs.
+    async fn open_read_session_with_external_blob_policy(
+        uri: &str,
+        settings: &[(SettingId, SettingValue)],
+        external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+    ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
         let db = crate::admission::open_read_only(uri, None).await?;
+        let db = match external_blob_policy {
+            Some(policy) => db.with_external_blob_policy(policy)?,
+            None => db,
+        };
         let mut session = Arc::new(db).session(defaults, sources);
         for (id, value) in settings {
             session.set(*id, value, Source::Request)?;
@@ -1938,6 +1953,42 @@ impl GraphClient {
                 };
                 Ok(output)
             }
+        }
+    }
+
+    /// `explain load csv …` against `target`: `POST /query` when served; the
+    /// embedded arm opens read-only with `external_blob_policy` installed so
+    /// the source's metadata probe is authorized as a direct load's would be.
+    pub(crate) async fn explain_load(
+        &self,
+        target: ReadTarget,
+        query_source: &str,
+        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<ReadOutput> {
+        match self {
+            GraphClient::Remote { .. } => {
+                self.query(Some(target), query_source, None, None, settings)
+                    .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let mut session = Self::open_read_session_with_external_blob_policy(
+                    uri,
+                    settings,
+                    external_blob_policy,
+                )
+                .await?;
+                Self::apply_prefix(&mut session, query_source)?;
+                let (result, graph_commit_id) = session.explain_load(target.clone(), &stmt).await?;
+                Ok(read_output(
+                    stmt.statement_name().to_string(),
+                    &target,
+                    result,
+                    graph_commit_id,
+                )?)
+            }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("explain load")),
         }
     }
 

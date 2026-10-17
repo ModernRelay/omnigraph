@@ -189,8 +189,9 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = load_source_max_bytes_schema)]
     pub load_source_max_bytes: Option<i64>,
-    /// `query_memory_bytes`: the memory pool one read query runs under, at
-    /// least `1`; an `i64` like `traversal_work_limit`.
+    /// `query_memory_bytes`: the memory pool one read query runs under, and
+    /// the allowance a load statement's read-reuse buffers are admitted
+    /// against, at least `1`; an `i64` like `traversal_work_limit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = query_memory_bytes_schema)]
     pub query_memory_bytes: Option<i64>,
@@ -1210,7 +1211,11 @@ pub struct QueryRequest {
     /// running it, as one result per plan node (fields `tree`, `depth`, `node`,
     /// `detail`: the logical, physical and available DataFusion trees, then `plan` entries for
     /// the passes and the document's other fields), under the same `params`,
-    /// `branch`, or `snapshot` as the query itself.
+    /// `branch`, or `snapshot` as the query itself. `explain load csv …` answers the accepted
+    /// load plan as the same results (`logical_initial`, `logical`, `physical`, then `plan`
+    /// entries), under `branch` alone: `snapshot`, `name` and `params` are refused.
+    /// It requires the load's `change` permission before probing source metadata,
+    /// reads no payload byte, and publishes nothing.
     #[schema(
         example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
     )]

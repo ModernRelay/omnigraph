@@ -4,9 +4,10 @@
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_planner::EmptyEligible;
 use omnigraph_planner::{
-    AggregateFields, ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, HydratedBinding,
-    Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields,
-    RankKind, RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
+    AggregateFields, ColumnRef, ContainsJoinFields, CsvSourceFields, ExpandFields,
+    FragmentWriteFields, HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode,
+    PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind, RankedAccess, ScanInput,
+    ScanSpec, SideId, SortMergeJoinFields, ValidateFields,
 };
 
 fn no_prefilter() -> Prefilter {
@@ -208,6 +209,28 @@ impl Lower for Trace {
         input: String,
     ) -> Result<String, PlanError> {
         self.call("sort", id, &[&input])
+    }
+
+    fn csv_source(&mut self, id: NodeId, _: CsvSourceFields<'_>) -> Result<String, PlanError> {
+        self.call("csv_source", id, &[])
+    }
+
+    fn validate(
+        &mut self,
+        id: NodeId,
+        _: ValidateFields<'_>,
+        input: String,
+    ) -> Result<String, PlanError> {
+        self.call("validate", id, &[&input])
+    }
+
+    fn fragment_write(
+        &mut self,
+        id: NodeId,
+        _: FragmentWriteFields<'_>,
+        input: String,
+    ) -> Result<String, PlanError> {
+        self.call("fragment_write", id, &[&input])
     }
 
     fn finish(&mut self, root: NodeId, op: String) -> Result<String, PlanError> {
