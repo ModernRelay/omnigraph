@@ -821,8 +821,11 @@ pub(crate) fn print_change_human(output: &ChangeOutput) {
     }
 }
 
-pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
-    for commit in commits {
+pub(crate) fn print_commit_list_human(list: &CommitListOutput) {
+    if let Some(head_commit_id) = &list.head_commit_id {
+        println!("head_commit_id: {head_commit_id}");
+    }
+    for commit in &list.commits {
         let branch = commit.graph_branch.as_deref().unwrap_or("main");
         println!(
             "{} graph_branch={} graph_manifest_version={}{}{}",
@@ -836,6 +839,9 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
                 .unwrap_or_default(),
             commit_kind_suffix(commit),
         );
+    }
+    if let Some(next_page_token) = &list.next_page_token {
+        println!("next_page_token: {next_page_token}");
     }
 }
 

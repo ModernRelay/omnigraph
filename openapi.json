@@ -4811,7 +4811,7 @@
           "commits"
         ],
         "summary": "List commits, most recent first.",
-        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract — newest first by (graph-manifest version, created-at, commit id) — and\na future `cursor`/`limit` pagination will be keyset-based on that same\norder. Read-only.\n\n`unpublished=true` lists instead the unpublished commits whose recorded\ntarget is `branch` (writes `as commit` awaiting `commit publish`), newest\nfirst; each carries `published: false`. `unattached=true` lists instead\nthe live unattached snapshots whose recorded target is `branch` (writes\n`as unattached branch`), newest first, each with `kind: \"unattached\"`;\nthe two filters together are refused (400).",
+        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract: newest first along the branch's first-parent chain, which is\nfalling generation and falling (graph-manifest version, created-at, commit\nid). Read-only.\n\n`limit` pages the history: each page names the head its listing resolved\n(`head_commit_id`) and continues with `next_page_token`, sent back as\n`page_token` with the same `branch`; later pages answer for that head's\nchain even after the branch moves. A page reads only the history it\nreturns. Without `limit` and `page_token` the whole history is one answer.\n\n`unpublished=true` lists instead the unpublished commits whose recorded\ntarget is `branch` (writes `as commit` awaiting `commit publish`), newest\nfirst; each carries `published: false`. `unattached=true` lists instead\nthe live unattached snapshots whose recorded target is `branch` (writes\n`as unattached branch`), newest first, each with `kind: \"unattached\"`;\nthe two filters together are refused (400), as is either with `limit` or\n`page_token`.",
         "operationId": "cluster_listCommits",
         "parameters": [
           {
@@ -4853,6 +4853,32 @@
             }
           },
           {
+            "name": "limit",
+            "in": "query",
+            "description": "Commits per page of the branch's history, 1 to 1000; the page names\nthe head it resolved and a `next_page_token`. Without `limit` and\n`page_token` the whole history is listed. Refused with `unpublished`\nor `unattached`; above 1000 the request fails with 413.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "maximum": 1000,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "page_token",
+            "in": "query",
+            "description": "Opaque continuation from the preceding page of this listing, sent with\nthe same `branch`; 100 commits per page unless `limit` is set. Later\npages answer for the head the first page resolved.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "name": "omnigraph-http-api",
             "in": "header",
             "description": "exactly one omnigraph-http-api header with value 0.13 is required",
@@ -4888,7 +4914,7 @@
             }
           },
           "400": {
-            "description": "Invalid request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "description": "Two listings selected, a page parameter with `unpublished` or `unattached`, a zero `limit`, or a rejected page token; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4931,6 +4957,48 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Branch not found",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Requested limit exceeds 1000 commits per page",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -10283,6 +10351,20 @@
             "items": {
               "$ref": "#/components/schemas/CommitOutput"
             }
+          },
+          "head_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The head a paged listing's first page resolved; every later page\nanswers for its first-parent chain. Present only when the request\nset `limit` or `page_token`."
+          },
+          "next_page_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Continue THIS listing below the last commit of the page. Absent on the\nlast page and on an unpaged listing."
           }
         }
       },

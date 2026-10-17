@@ -331,6 +331,8 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "commit_target_branch"),
     ("db/omnigraph.rs", "list_commits"),
+    ("db/omnigraph.rs", "list_commits_page"),
+    ("db/omnigraph.rs", "list_commits_page_on_branch"),
     ("db/omnigraph.rs", "list_unpublished_commits"),
     ("db/omnigraph.rs", "list_unattached_commits"),
     ("exec/query_doors.rs", "query"),
@@ -483,6 +485,16 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "list_commits",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "first_parent_page",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "first_parent_below",
     ),
     (
         "omnigraph-catalog/lib.rs",

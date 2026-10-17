@@ -807,7 +807,63 @@ impl GraphClient {
                     .iter()
                     .map(commit_output)
                     .collect::<Vec<_>>();
-                Ok(CommitListOutput { commits })
+                Ok(CommitListOutput {
+                    commits,
+                    head_commit_id: None,
+                    next_page_token: None,
+                })
+            }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("list commits")),
+        }
+    }
+
+    /// `commit list --limit`/`--page-token`: one page of the branch's history
+    /// (`None` = main), `GET /commits?limit=&page_token=` or the engine's
+    /// paged listing.
+    pub(crate) async fn list_commits_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<CommitListOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+                ..
+            } => {
+                let limit_value = limit.map(|limit| limit.to_string());
+                let mut query = Vec::new();
+                if let Some(branch) = branch {
+                    query.push(("branch", branch));
+                }
+                if let Some(page_token) = page_token {
+                    query.push(("page_token", page_token));
+                }
+                if let Some(limit) = limit_value.as_deref() {
+                    query.push(("limit", limit));
+                }
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["commits"], &query)?,
+                    None,
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Self::open_read_session(uri, &[]).await?;
+                let page = db.list_commits_page(branch, page_token, limit).await?;
+                Ok(CommitListOutput {
+                    commits: page.commits.iter().map(commit_output).collect(),
+                    head_commit_id: Some(page.head_commit_id),
+                    next_page_token: page.next_page_token,
+                })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("list commits")),
         }
@@ -855,7 +911,11 @@ impl GraphClient {
                     .iter()
                     .map(commit_output)
                     .collect::<Vec<_>>();
-                Ok(CommitListOutput { commits })
+                Ok(CommitListOutput {
+                    commits,
+                    head_commit_id: None,
+                    next_page_token: None,
+                })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("list unpublished commits")),
         }
@@ -903,7 +963,11 @@ impl GraphClient {
                     .iter()
                     .map(commit_output)
                     .collect::<Vec<_>>();
-                Ok(CommitListOutput { commits })
+                Ok(CommitListOutput {
+                    commits,
+                    head_commit_id: None,
+                    next_page_token: None,
+                })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("list unattached commits")),
         }

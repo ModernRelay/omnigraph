@@ -126,6 +126,26 @@ omnigraph commit show <commit-id> --uri graph.omni
 `main`; selecting a branch includes the history inherited at its fork plus its
 own commits.
 
+A long history can be read a page at a time:
+
+```bash
+omnigraph commit list graph.omni --branch main --limit 50 --json
+omnigraph commit list graph.omni --branch main --page-token <token> --json
+```
+
+`--limit` (1 to 1,000) returns one page with `head_commit_id`, the head the
+listing resolved, and `next_page_token` while older commits remain. Pass the
+token back with the same `--branch` for the next page, of 100 commits unless
+`--limit` sets the size. Later pages answer for that head even after the
+branch moves, so a page never repeats or skips a commit. A page reads only the
+history it returns; without `--limit` or `--page-token` the whole history is
+read and listed at once. Served under a policy, a continuation by a caller
+whose `read` does not cover every branch is checked against the branch's
+history, so it costs what the whole listing costs. Served, the same listing is
+`GET /commits?branch=<name>&limit=<n>` continued with `page_token=<token>`.
+Paging applies to a branch's history, not to `--unpublished` or
+`--unattached`.
+
 ### Unpublished commits
 
 A mutation or a merge written `as commit` records its result as an unpublished

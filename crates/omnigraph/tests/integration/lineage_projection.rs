@@ -269,4 +269,176 @@ async fn graph_lineage_lives_only_in_manifest() {
         authored >= 4,
         "expected the authored commits to surface their actor in the projection, saw {authored}"
     );
+
+    // ── paged listing: the same order, one page at a time ────────────────────
+    // Pages walk first parents by falling generation; across the fork and the
+    // merge they must concatenate to the listing, whatever the page size.
+    // The branch-scoped door proves each continuation on the branch's history
+    // and answers the same pages.
+    for (branch, listed) in [(None, &listed_main), (Some("feature"), &listed_feature)] {
+        for limit in [1, 2, listed.len(), listed.len() + 1] {
+            for on_branch in [false, true] {
+                let (head, paged) = all_pages(&main, branch, limit, on_branch).await;
+                assert_eq!(head, listed[0].graph_commit_id, "{branch:?} by {limit}");
+                assert_eq!(
+                    &paged, listed,
+                    "{branch:?} by {limit}, on branch {on_branch}"
+                );
+            }
+        }
+    }
+    assert!(
+        listed_main
+            .windows(2)
+            .all(|pair| pair[0].generation > pair[1].generation),
+        "the listing falls in generation, the page walk's keyset"
+    );
+
+    // A continuation answers for the head its first page resolved, after the
+    // branch moves; another branch's request refuses it.
+    let first = main.list_commits_page(None, None, Some(2)).await.unwrap();
+    assert_eq!(first.head_commit_id, merge_commit.graph_commit_id);
+    assert_eq!(first.commits, listed_main[..2]);
+    let token = first.next_page_token.clone().expect("more pages");
+    main.mutate_as(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 52)]),
+        Some("act-frank"),
+    )
+    .await
+    .unwrap();
+    let mut rest = first.commits.clone();
+    let mut next = Some(token.clone());
+    while let Some(token) = next {
+        let page = main
+            .list_commits_page(None, Some(&token), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(page.head_commit_id, merge_commit.graph_commit_id);
+        rest.extend(page.commits);
+        next = page.next_page_token;
+    }
+    assert_eq!(rest, listed_main, "the continuation keeps the old head");
+    let proven = main
+        .list_commits_page_on_branch(None, Some(&token), Some(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        proven.commits,
+        listed_main[2..4],
+        "the proof walks over the commit published since"
+    );
+    let moved = main.list_commits_page(None, None, Some(1)).await.unwrap();
+    assert_ne!(moved.head_commit_id, merge_commit.graph_commit_id);
+    assert_eq!(moved.commits[0].actor_id.as_deref(), Some("act-frank"));
+    for (branch, token) in [(Some("feature"), token.as_str()), (None, "not-a-token")] {
+        let error = main
+            .list_commits_page(branch, Some(token), Some(2))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                omnigraph::error::OmniError::ChangeCursorRejected { .. }
+            ),
+            "{error:?}"
+        );
+    }
+    let error = main
+        .list_commits_page(
+            None,
+            None,
+            Some(omnigraph::db::COMMIT_LIST_MAX_PAGE_COMMITS + 1),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            omnigraph::error::OmniError::ResourceLimitExceeded { .. }
+        ),
+        "{error:?}"
+    );
+    assert!(main.list_commits_page(None, None, Some(0)).await.is_err());
+
+    // A token is checksummed, not signed: re-signed to continue `main` from a
+    // commit only `feature`'s first-parent chain holds, the trusting door
+    // starts there and the branch-scoped door refuses it.
+    let carol = listed_feature
+        .iter()
+        .find(|commit| commit.actor_id.as_deref() == Some("act-carol"))
+        .unwrap();
+    assert!(!listed_main.contains(carol), "test setup: off main's chain");
+    let token = main
+        .list_commits_page(None, None, Some(1))
+        .await
+        .unwrap()
+        .next_page_token
+        .unwrap();
+    let forged = resign_change_token(&token, |payload| {
+        payload["next_commit_id"] = serde_json::json!(carol.graph_commit_id);
+        payload["below_generation"] = serde_json::json!(u64::MAX);
+    });
+    let trusted = main
+        .list_commits_page(None, Some(&forged), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(trusted.commits[0].graph_commit_id, carol.graph_commit_id);
+    match main
+        .list_commits_page_on_branch(None, Some(&forged), Some(1))
+        .await
+        .unwrap_err()
+    {
+        omnigraph::error::OmniError::ChangeCursorRejected { reason } => {
+            assert_eq!(
+                reason,
+                "commit list page token names a commit off this branch's history"
+            )
+        }
+        other => panic!("expected ChangeCursorRejected, got {other:?}"),
+    }
+}
+
+/// One page of `branch`'s commit list, through the branch-scoped door when
+/// `on_branch`.
+async fn commit_page(
+    db: &omnigraph::session::Session,
+    branch: Option<&str>,
+    token: Option<&str>,
+    limit: usize,
+    on_branch: bool,
+) -> omnigraph::db::CommitListPage {
+    match on_branch {
+        true => {
+            db.list_commits_page_on_branch(branch, token, Some(limit))
+                .await
+        }
+        false => db.list_commits_page(branch, token, Some(limit)).await,
+    }
+    .unwrap()
+}
+
+/// Every page of `branch`'s commit list at `limit` per page, concatenated,
+/// and the head the first page named, which every page repeats; through the
+/// branch-scoped door when `on_branch`.
+async fn all_pages(
+    db: &omnigraph::session::Session,
+    branch: Option<&str>,
+    limit: usize,
+    on_branch: bool,
+) -> (String, Vec<GraphCommit>) {
+    let first = commit_page(db, branch, None, limit, on_branch).await;
+    let head = first.head_commit_id.clone();
+    let mut commits = first.commits;
+    let mut next = first.next_page_token;
+    while let Some(token) = next {
+        let page = commit_page(db, branch, Some(&token), limit, on_branch).await;
+        assert_eq!(page.head_commit_id, head, "every page names the first head");
+        assert!(page.commits.len() <= limit && !page.commits.is_empty());
+        commits.extend(page.commits);
+        next = page.next_page_token;
+    }
+    (head, commits)
 }

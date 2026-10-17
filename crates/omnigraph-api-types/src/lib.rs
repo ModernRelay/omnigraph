@@ -854,6 +854,15 @@ impl From<GraphCommitKind> for CommitKindOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
+    /// The head a paged listing's first page resolved; every later page
+    /// answers for its first-parent chain. Present only when the request
+    /// set `limit` or `page_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_commit_id: Option<String>,
+    /// Continue THIS listing below the last commit of the page. Absent on the
+    /// last page and on an unpaged listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
 }
 
 /// Logical operation of one change. Ordering rank is frozen:
@@ -1828,6 +1837,16 @@ pub struct CommitListQuery {
     /// the branch's history. Refused together with `unpublished`.
     #[serde(default)]
     pub unattached: bool,
+    /// Commits per page of the branch's history, 1 to 1000; the page names
+    /// the head it resolved and a `next_page_token`. Without `limit` and
+    /// `page_token` the whole history is listed. Refused with `unpublished`
+    /// or `unattached`; above 1000 the request fails with 413.
+    #[param(minimum = 1, maximum = 1000)]
+    pub limit: Option<usize>,
+    /// Opaque continuation from the preceding page of this listing, sent with
+    /// the same `branch`; 100 commits per page unless `limit` is set. Later
+    /// pages answer for the head the first page resolved.
+    pub page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

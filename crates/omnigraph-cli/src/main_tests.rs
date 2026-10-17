@@ -81,6 +81,38 @@ fn commit_list_unattached_excludes_unpublished() {
 }
 
 #[test]
+fn commit_list_pages_only_a_branch_history() {
+    use clap::Parser;
+    for listing in ["--unattached", "--unpublished"] {
+        for page in [["--limit", "2"], ["--page-token", "token"]] {
+            let error = crate::cli::Cli::try_parse_from(
+                ["omnigraph", "commit", "list", listing]
+                    .into_iter()
+                    .chain(page),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{listing} {page:?}"
+            );
+        }
+    }
+    assert!(
+        crate::cli::Cli::try_parse_from([
+            "omnigraph",
+            "commit",
+            "list",
+            "--limit",
+            "2",
+            "--page-token",
+            "token",
+        ])
+        .is_ok()
+    );
+}
+
+#[test]
 fn apply_bearer_token_adds_header_when_configured() {
     let client = reqwest::Client::new();
     let request = apply_bearer_token(client.get("http://example.com"), Some("demo-token"))

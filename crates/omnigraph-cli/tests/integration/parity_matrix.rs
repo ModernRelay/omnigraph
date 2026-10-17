@@ -323,6 +323,40 @@ fn parity_commit_list_branch() {
 }
 
 #[test]
+fn parity_commit_list_pages() {
+    // The remote arm sends `?limit=&page_token=` while the embedded arm calls
+    // the engine's paged listing; the twins mint the same token.
+    let p = parity();
+    let (l, r) = p.run(&["commit", "list", "--limit", "1", "--json"]);
+    assert_parity("commit list --limit", &l, &r);
+    let first = parse_stdout_json(&l);
+    assert_eq!(first["commits"].as_array().unwrap().len(), 1, "{first}");
+    assert_eq!(
+        first["head_commit_id"],
+        first["commits"][0]["graph_commit_id"]
+    );
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("the fixture has more than one commit")
+        .to_string();
+    let (l, r) = p.run(&["commit", "list", "--page-token", &token, "--json"]);
+    assert_parity("commit list --page-token", &l, &r);
+    let (whole, _) = p.run(&["commit", "list", "--json"]);
+    let mut paged = first["commits"].as_array().unwrap().clone();
+    paged.extend(
+        parse_stdout_json(&l)["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
+    assert_eq!(
+        serde_json::Value::Array(paged),
+        parse_stdout_json(&whole)["commits"]
+    );
+}
+
+#[test]
 fn parity_mutate() {
     let p = parity();
     let (l, r) = p.run(&[

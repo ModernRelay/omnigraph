@@ -88,7 +88,7 @@ for a deployment whose policy was written with an LLM caller in mind.
 | `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph}/query` | `read`; `change` for `explain load csv` |
 | `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph}/snapshot` | `read` |
 | `branches_list` | `graph` | `GET /graphs/{graph}/branches` | `read` |
-| `commits_list` | `graph`, optional `branch` | `GET /graphs/{graph}/commits` | `read` |
+| `commits_list` | `graph`, optional `branch`, `limit`, `page_token` | `GET /graphs/{graph}/commits` | `read` |
 | `commits_get` | `graph`, `commit_id` | `GET /graphs/{graph}/commits/{commit_id}` | `read` |
 | `commits_changes` | `graph`, `commit_id`, optional `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph}/commits/{commit_id}/changes` | `read` |
 | `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph}/changes` | `read` |

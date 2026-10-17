@@ -1222,6 +1222,14 @@ pub(crate) enum CommitCommand {
         /// branch (`as unattached branch` writes) instead of its history
         #[arg(long, conflicts_with = "unpublished")]
         unattached: bool,
+        /// List one page of at most this many commits, 1 to 1000, and the
+        /// token that continues it (the whole history when omitted)
+        #[arg(long, conflicts_with_all = ["unpublished", "unattached"])]
+        limit: Option<usize>,
+        /// Continue a paged listing of the same branch with this opaque token,
+        /// 100 commits per page unless `--limit` is set
+        #[arg(long, conflicts_with_all = ["unpublished", "unattached"])]
+        page_token: Option<String>,
         #[arg(long)]
         json: bool,
     },
