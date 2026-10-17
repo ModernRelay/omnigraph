@@ -88,7 +88,7 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-policy` | Cedar compilation and the engine-facing action/scope/actor gate. |
 | `omnigraph-cluster` | Desired configuration, deployment ledger, plan/apply, exact recovery, and immutable serving snapshots. |
 | `omnigraph-api-types` | Additive HTTP wire DTOs shared by server and CLI. |
-| `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. |
+| `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. Ordinary graph-client setup shares one captured operator configuration across scope, endpoint, credential-owner and direct-write actor selection. |
 | `omnigraph-skill` | The `skills/omnigraph` agent skill, embedded byte for byte by its build script; the package root is `skills/`, so the skill tree stays its one copy. `omnigraph skill export` writes it. |
 | `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, multi-graph serving and live deployment activation. |
 | `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable server process through the root-derived Blob lease. It is not a storage backend. |

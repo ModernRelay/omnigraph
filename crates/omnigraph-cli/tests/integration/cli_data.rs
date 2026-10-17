@@ -2889,6 +2889,118 @@ fn read_supports_inline_query_string() {
 }
 
 #[test]
+fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
+    for graph in [None, Some("knowledge")] {
+        let home = tempdir().unwrap();
+        let config = home.path().join("config.yaml");
+        let replacement = home.path().join("replacement.yaml");
+        let trap = IntentApiFixture::graph(vec![]);
+        let mut replies = Vec::new();
+        if graph.is_none() {
+            replies.push(IntentReply::json(200, json!({"graphs": []})));
+        }
+        replies.push(IntentReply::json(
+            200,
+            json!({
+                "query_name": "q",
+                "target": {"branch": "main"},
+                "row_count": 1,
+                "rows": [{"p.name": "original-server"}]
+            }),
+        ));
+        let server = IntentApiFixture::graph_with_discovery_hook(replies, {
+            let config = config.clone();
+            let replacement = replacement.clone();
+            move || fs::rename(replacement, config).unwrap()
+        });
+        fs::write(
+            &config,
+            format!(
+                "servers:\n  prod:\n    url: '{}'\n  graph-owner:\n    url: '{}/graphs/knowledge'\ncaptured_only: true\n",
+                server.origin, server.origin
+            ),
+        )
+        .unwrap();
+        let replacement_config = format!(
+            "servers:\n  prod:\n    url: '{}'\n  replacement:\n    url: '{}'\nreplacement_only: true\n",
+            trap.origin, server.origin
+        );
+        fs::write(&replacement, &replacement_config).unwrap();
+
+        let mut command = cli();
+        command
+            .current_dir(home.path())
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_TOKEN_PROD", "captured-root-token")
+            .env("OMNIGRAPH_TOKEN_GRAPH_OWNER", "captured-graph-token")
+            .env("OMNIGRAPH_TOKEN_REPLACEMENT", "replacement-token")
+            .env_remove("OMNIGRAPH_BEARER_TOKEN")
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args([
+                "query",
+                "--server",
+                "prod",
+                "-e",
+                "query q() { match { $p: Person } return { $p.name } }",
+                "--json",
+            ]);
+        if let Some(graph) = graph {
+            command.args(["--graph", graph]);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), replacement_config);
+        assert!(!replacement.exists(), "discovery must replace the config");
+        assert!(trap.requests().is_empty(), "setup changed destination");
+        assert!(output.status.success(), "{graph:?}: {output:?}");
+        assert_eq!(
+            parse_stdout_json(&output)["rows"][0]["p.name"],
+            "original-server"
+        );
+        trap.assert_complete();
+        server.assert_complete();
+
+        let requests = server.workflow_requests();
+        let (data_path, token) = if graph.is_some() {
+            ("/graphs/knowledge/query", "captured-graph-token")
+        } else {
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[0].path, "/graphs");
+            assert_eq!(
+                requests[0].headers["authorization"],
+                "Bearer captured-root-token"
+            );
+            ("/query", "captured-root-token")
+        };
+        let data = requests.last().unwrap();
+        assert_eq!(data.method, "POST");
+        assert_eq!(data.path, data_path);
+        assert_eq!(data.headers["authorization"], format!("Bearer {token}"));
+        for request in server
+            .requests()
+            .iter()
+            .filter(|request| request.method == "HEAD")
+        {
+            assert!(!request.headers.contains_key("authorization"));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches("unknown key `captured_only`").count(),
+            1,
+            "{stderr}"
+        );
+        // Rendering reads its preferences separately after client setup, even
+        // for JSON output. That existing read sees the replacement config.
+        assert_eq!(
+            stderr.matches("unknown key `replacement_only`").count(),
+            1,
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
 fn ambiguous_or_positional_http_scopes_are_rejected_without_network_io() {
     use crate::support::managed_http::IntentApiFixture;
 

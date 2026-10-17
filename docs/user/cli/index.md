@@ -190,6 +190,11 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
 The token is stored separately from `config.yaml`. A server resolves the actor
 from the token; clients cannot override it with `--as`.
 
+Ordinary graph commands and `graphs list` use one copy of the operator configuration
+during client setup. Editing that file during discovery does not change the
+client's destination or which configured server supplies its credentials.
+Token values still use the usual environment and credentials-file lookup.
+
 ## Use a server through a Unix socket
 
 A server may also be reached through a Unix-domain socket, for example a local
