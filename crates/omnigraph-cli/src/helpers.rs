@@ -39,8 +39,19 @@ pub(crate) fn uri_is_local(uri: &str) -> bool {
 /// local)`. stderr so `--json` consumers reading stdout are unaffected; the line
 /// legitimately differs embedded-vs-served (that visibility is the point).
 pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: bool) {
+    write_target(quiet, label, uri, served, &mut io::stderr())
+        .expect("failed printing resolved write target to stderr");
+}
+
+pub(crate) fn write_target(
+    quiet: bool,
+    label: &str,
+    uri: &str,
+    served: bool,
+    stderr: &mut dyn Write,
+) -> Result<()> {
     if quiet {
-        return;
+        return Ok(());
     }
     let access = if served {
         "served"
@@ -49,7 +60,8 @@ pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: boo
     } else {
         "direct, remote"
     };
-    eprintln!("omnigraph {label} → {uri} ({access})");
+    writeln!(stderr, "omnigraph {label} → {uri} ({access})")?;
+    Ok(())
 }
 
 /// Gate a destructive write (`cleanup`, overwrite `load`, `branch delete`)
@@ -57,6 +69,16 @@ pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: boo
 /// confirmation; otherwise `--yes` consents, an interactive TTY is prompted, and
 /// a non-TTY / `--json` run refuses rather than silently proceeding.
 pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool) -> Result<()> {
+    confirm_destructive_with_writer(label, uri, yes, json, &mut io::stderr())
+}
+
+pub(crate) fn confirm_destructive_with_writer(
+    label: &str,
+    uri: &str,
+    yes: bool,
+    json: bool,
+    stderr: &mut dyn Write,
+) -> Result<()> {
     if uri_is_local(uri) || yes {
         return Ok(());
     }
@@ -66,10 +88,11 @@ pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool)
              pass --yes to confirm (an interactive TTY would be prompted instead)"
         );
     }
-    eprint!(
+    write!(
+        stderr,
         "About to run a destructive `{label}` against {uri} (not local). Type 'yes' to continue: "
-    );
-    io::stderr().flush()?;
+    )?;
+    stderr.flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     match answer.trim().to_ascii_lowercase().as_str() {

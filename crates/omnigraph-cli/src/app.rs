@@ -39,57 +39,6 @@ pub(crate) fn sync_dir(_dir: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Exclusive advisory lock on `<out>.lock`, serializing cooperating baseline
-/// captures of the same `--out` from before staging through cursor delivery.
-/// Two concurrent captures otherwise both replace `--out` and both print their
-/// own cursor, and the one that printed after being replaced pairs its cursor
-/// with the other's snapshot — a consumer restoring that pairing skips the
-/// changes between the two snapshot positions. The lock file is a stable
-/// sibling (never removed), so lockers cannot race a delete; blocking
-/// `LOCK_EX` makes the second capture wait rather than fail. Unix-only, like
-/// the rest of the baseline install barrier.
-#[cfg(unix)]
-struct BaselineOutLock {
-    _file: fs::File,
-}
-
-#[cfg(unix)]
-impl BaselineOutLock {
-    fn acquire(out: &std::path::Path) -> Result<Self> {
-        use std::os::unix::io::AsRawFd;
-        let lock_path = {
-            let mut os = out.as_os_str().to_os_string();
-            os.push(".lock");
-            std::path::PathBuf::from(os)
-        };
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)?;
-        // Blocking exclusive lock; released on drop (close).
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        Ok(Self { _file: file })
-    }
-}
-
-/// Whether the file NOW at `path` is the very file handle this capture
-/// installed (same device + inode). A concurrent or foreign writer that
-/// replaced `--out` after our atomic persist yields a different inode, so the
-/// caller can refuse to print a resume cursor that no longer pairs with the
-/// installed snapshot. Content-free: the baseline file deliberately carries
-/// only snapshot records (the handshake goes to stdout), so identity — not a
-/// terminal marker — is the correct witness.
-#[cfg(unix)]
-fn installed_file_is_current(installed: &fs::File, path: &std::path::Path) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let ours = installed.metadata()?;
-    let now = fs::metadata(path)?;
-    Ok(ours.dev() == now.dev() && ours.ino() == now.ino())
-}
-
 /// Invoke the CLI without installing process hooks or terminating the caller.
 /// Clap keeps its original output stream and exit status for help and refusals.
 pub async fn run_from<I, T>(args: I) -> Result<Completion>
@@ -120,7 +69,7 @@ async fn execute(
     // same evidence when flushing, including after a dispatched write.
     // The legacy dispatch future contains every command variant. Keep that
     // large state off reusable callers' stacks (including libtest threads).
-    let invocation = Box::pin(run(cli, &mut machine, stdout));
+    let invocation = Box::pin(run(cli, &mut machine, stdout, stderr));
     let (result, evidence) = if observe {
         let (result, evidence) = admission::scope(command_outcome::observe(invocation)).await;
         (result, Some(evidence))
@@ -139,6 +88,7 @@ fn finish(
 ) -> Result<Completion> {
     let result = result.and_then(|completion| {
         stdout.flush()?;
+        stderr.flush()?;
         Ok(completion)
     });
     let error = match result {
@@ -282,6 +232,7 @@ async fn run(
     cli: Cli,
     machine: &mut Option<MachineErrors>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<Completion> {
     if cluster_remote::dispatch(&cli).await? {
         return Ok(Completion::success());
@@ -544,609 +495,77 @@ async fn run(
                 print_load_human(&payload);
             }
         }
-        Command::Branch { command } => match command {
-            BranchCommand::Create {
-                uri,
-                from,
-                name,
-                json,
-            } => {
-                let client = client::GraphClient::resolve_with_policy(
+        Command::Branch { command } => {
+            commands::history::run_branch(
+                command,
+                commands::history::HistoryScope {
                     capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.as_actor.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let from = resolve_branch(from, None, "main");
-                echo_write_target(cli.quiet, "branch create", client.uri(), client.is_remote());
-                let payload = client.branch_create_from(&from, &name).await?;
-                if json {
-                    print_json(&payload)?;
-                } else {
-                    println!("created branch {} from {}", payload.name, payload.from);
-                }
-            }
-            BranchCommand::List { uri, json } => {
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let payload = client.branch_list().await?;
-                if json {
-                    print_json(&payload)?;
-                } else {
-                    for branch in payload.branches {
-                        println!("{}", branch);
-                    }
-                }
-            }
-            BranchCommand::Delete { uri, name, json } => {
-                let client = client::GraphClient::resolve_with_policy(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.as_actor.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                confirm_destructive("branch delete", client.uri(), cli.yes, json)?;
-                echo_write_target(cli.quiet, "branch delete", client.uri(), client.is_remote());
-                let payload = client.branch_delete(&name).await?;
-                if json {
-                    print_json(&payload)?;
-                } else {
-                    println!("deleted branch {}", payload.name);
-                }
-            }
-            BranchCommand::Merge {
-                uri,
-                source,
-                into,
-                delete_branch,
-                as_commit,
-                dry_run,
-                settings,
-                json,
-            } => {
-                let settings = client::parse_set_flags(&settings)?;
-                let client = client::GraphClient::resolve_with_policy(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.as_actor.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let into = resolve_branch(into, None, "main");
-                if !dry_run {
-                    echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
-                }
-                let payload = client
-                    .branch_merge(&source, &into, delete_branch, as_commit, dry_run, &settings)
-                    .await?;
-                // Keep the successful merge receipt on stdout; optional
-                // deletion has its own structured result and human warning.
-                if let Some(error) = &payload.branch_delete_error_details {
-                    eprintln!(
-                        "warning: merged, but could not delete branch '{}': {}",
-                        payload.source, error.error
-                    );
-                }
-                if json {
-                    print_json(&payload)?;
-                } else if payload.dry_run {
-                    println!(
-                        "dry run: merging {} into {} would be: {} (nothing was written)",
-                        payload.source,
-                        payload.target,
-                        payload.outcome.as_str()
-                    );
-                } else {
-                    match payload.commit.as_ref().filter(|commit| !commit.published) {
-                        Some(commit) => println!(
-                            "merged {} into {} as commit {}: {}",
-                            payload.source,
-                            payload.target,
-                            commit.graph_commit_id,
-                            payload.outcome.as_str()
-                        ),
-                        None => println!(
-                            "merged {} into {}: {}",
-                            payload.source,
-                            payload.target,
-                            payload.outcome.as_str()
-                        ),
-                    }
-                    if payload.branch_deleted == Some(true) {
-                        println!("deleted branch {}", payload.source);
-                    }
-                }
-            }
-            BranchCommand::Diff {
-                uri,
-                source,
-                into,
-                limit,
-                page_token,
-                kinds,
-                types,
-                ops,
-                json,
-            } => {
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let into = resolve_branch(into, None, "main");
-                let sides = client::DiffSidesArg::Branch {
-                    source: &source,
-                    target: &into,
-                };
-                run_diff(&client, sides, page_token, limit, kinds, types, ops, json).await?;
-            }
-            BranchCommand::MergeBase {
-                uri,
-                source,
-                into,
-                json,
-            } => {
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let into = resolve_branch(into, None, "main");
-                let output = client.merge_base(&source, &into).await?;
-                if json {
-                    print_json(&output)?;
-                } else {
-                    print_merge_base_human(&output);
-                }
-            }
-        },
-        Command::Diff {
-            uri,
-            from,
-            to,
-            limit,
-            page_token,
-            kinds,
-            types,
-            ops,
-            json,
-        } => {
-            let client = client::GraphClient::resolve(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    store: cli.store.as_deref(),
+                    yes: cli.yes,
+                    quiet: cli.quiet,
+                },
+                stdout,
+                stderr,
             )
             .await?;
-            let sides = client::DiffSidesArg::Between {
-                from: &from,
-                to: &to,
-            };
-            run_diff(&client, sides, page_token, limit, kinds, types, ops, json).await?;
         }
-        Command::Commit { command } => match command {
-            CommitCommand::List {
-                uri,
-                branch,
-                unpublished,
-                unattached,
-                json,
-            } => {
-                let client = match managed_data {
-                    Some(client) => client,
-                    None => {
-                        client::GraphClient::resolve(
-                            capability,
-                            cli.server.as_deref(),
-                            cli.graph.as_deref(),
-                            uri,
-                            cli.profile.as_deref(),
-                            cli.store.as_deref(),
-                        )
-                        .await?
-                    }
-                };
-                let payload = if unattached {
-                    client.list_unattached_commits(branch.as_deref()).await?
-                } else if unpublished {
-                    client.list_unpublished_commits(branch.as_deref()).await?
-                } else {
-                    client.list_commits(branch.as_deref()).await?
-                };
-                if json {
-                    print_json(&payload)?;
-                } else {
-                    print_commit_list_human(&payload.commits);
-                }
-            }
-            CommitCommand::Publish {
-                uri,
-                commit_id,
-                json,
-            } => {
-                let client = client::GraphClient::resolve_with_policy(
+        Command::Diff(args) => {
+            commands::history::run_diff_command(
+                args,
+                commands::history::HistoryScope {
                     capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.as_actor.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                echo_write_target(
-                    cli.quiet,
-                    "commit publish",
-                    client.uri(),
-                    client.is_remote(),
-                );
-                let commit = client.commit_publish(&commit_id).await?;
-                if json {
-                    print_json(&commit)?;
-                } else {
-                    println!(
-                        "published commit {} on {}",
-                        commit.graph_commit_id,
-                        commit.graph_branch.as_deref().unwrap_or("main")
-                    );
-                }
-            }
-            CommitCommand::Drop {
-                uri,
-                commit_id,
-                json,
-            } => {
-                let client = client::GraphClient::resolve_with_policy(
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    store: cli.store.as_deref(),
+                    yes: cli.yes,
+                    quiet: cli.quiet,
+                },
+                stdout,
+            )
+            .await?;
+        }
+        Command::Commit { command } => {
+            commands::history::run_commit(
+                command,
+                commands::history::HistoryScope {
                     capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.as_actor.as_deref(),
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                confirm_destructive("commit drop", client.uri(), cli.yes, json)?;
-                echo_write_target(cli.quiet, "commit drop", client.uri(), client.is_remote());
-                client.commit_drop(&commit_id).await?;
-                if json {
-                    print_json(&serde_json::json!({
-                        "uri": client.uri(),
-                        "graph_commit_id": commit_id,
-                    }))?;
-                } else {
-                    println!("dropped commit {commit_id}");
-                }
-            }
-            CommitCommand::Show {
-                uri,
-                commit_id,
-                json,
-            } => {
-                let client = match managed_data {
-                    Some(client) => client,
-                    None => {
-                        client::GraphClient::resolve(
-                            capability,
-                            cli.server.as_deref(),
-                            cli.graph.as_deref(),
-                            uri,
-                            cli.profile.as_deref(),
-                            cli.store.as_deref(),
-                        )
-                        .await?
-                    }
-                };
-                let commit = client.get_commit(&commit_id).await?;
-                if json {
-                    print_json(&commit)?;
-                } else {
-                    print_commit_human(&commit);
-                }
-            }
-            CommitCommand::Changes {
-                uri,
-                commit_id,
-                limit,
-                page_token,
-                kinds,
-                types,
-                ops,
-                settings,
-                json,
-            } => {
-                let settings = client::parse_set_flags(&settings)?;
-                let client = client::GraphClient::resolve(
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    store: cli.store.as_deref(),
+                    yes: cli.yes,
+                    quiet: cli.quiet,
+                },
+                managed_data,
+                stdout,
+                stderr,
+            )
+            .await?;
+        }
+        Command::Changes { command } => {
+            commands::history::run_changes(
+                command,
+                commands::history::HistoryScope {
                     capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let kinds: Vec<omnigraph_api_types::EntityKindOutput> =
-                    kinds.into_iter().map(Into::into).collect();
-                let ops: Vec<omnigraph_api_types::ChangeOpOutput> =
-                    ops.into_iter().map(Into::into).collect();
-                let filter = client::ChangeFilterArgs {
-                    kinds: &kinds,
-                    types: &types,
-                    ops: &ops,
-                };
-                if let Some(page_token) = page_token.as_deref() {
-                    // An explicit token is the raw one-page escape hatch.
-                    let page = client
-                        .commit_changes_page(
-                            &commit_id,
-                            Some(page_token),
-                            limit,
-                            &filter,
-                            &settings,
-                        )
-                        .await?;
-                    if json {
-                        print_json(&page)?;
-                    } else {
-                        print_commit_changes_human(&page);
-                    }
-                } else if json {
-                    let mut output = CommitChangesJsonStream::new(io::BufWriter::new(io::stdout()));
-                    let mut next_page_token: Option<String> = None;
-                    loop {
-                        let page = client
-                            .commit_changes_page(
-                                &commit_id,
-                                next_page_token.as_deref(),
-                                auto_page_limit(limit),
-                                &filter,
-                                &settings,
-                            )
-                            .await?;
-                        next_page_token = page.next_page_token.clone();
-                        output.write_page(&page)?;
-                        if next_page_token.is_none() {
-                            break;
-                        }
-                    }
-                    let _ = output.finish()?;
-                } else {
-                    let mut output = CommitChangesHumanStream::new();
-                    let mut next_page_token: Option<String> = None;
-                    loop {
-                        let page = client
-                            .commit_changes_page(
-                                &commit_id,
-                                next_page_token.as_deref(),
-                                auto_page_limit(limit),
-                                &filter,
-                                &settings,
-                            )
-                            .await?;
-                        next_page_token = page.next_page_token.clone();
-                        output.write_page(&page)?;
-                        if next_page_token.is_none() {
-                            break;
-                        }
-                    }
-                }
-            }
-        },
-        Command::Changes { command } => match command {
-            ChangesCommand::Poll {
-                uri,
-                branch,
-                cursor,
-                start,
-                limit,
-                kinds,
-                types,
-                ops,
-                settings,
-                json,
-            } => {
-                let settings = client::parse_set_flags(&settings)?;
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let kinds: Vec<omnigraph_api_types::EntityKindOutput> =
-                    kinds.into_iter().map(Into::into).collect();
-                let ops: Vec<omnigraph_api_types::ChangeOpOutput> =
-                    ops.into_iter().map(Into::into).collect();
-                let filter = client::ChangeFilterArgs {
-                    kinds: &kinds,
-                    types: &types,
-                    ops: &ops,
-                };
-                if json {
-                    let mut output = ChangeFeedJsonStream::new(io::BufWriter::new(io::stdout()));
-                    let mut next_page_token: Option<String> = None;
-                    loop {
-                        let page = client
-                            .poll_changes_page(
-                                branch.as_deref(),
-                                cursor.as_deref(),
-                                start.as_deref(),
-                                next_page_token.as_deref(),
-                                auto_page_limit(limit),
-                                &filter,
-                                &settings,
-                            )
-                            .await?;
-                        next_page_token = page.next_page_token.clone();
-                        output.write_page(&page)?;
-                        if next_page_token.is_none() {
-                            let _ = output.finish(page.cursor.as_deref(), page.caught_up)?;
-                            break;
-                        }
-                    }
-                } else {
-                    let mut output = ChangeFeedHumanStream::new();
-                    let mut next_page_token: Option<String> = None;
-                    loop {
-                        let page = client
-                            .poll_changes_page(
-                                branch.as_deref(),
-                                cursor.as_deref(),
-                                start.as_deref(),
-                                next_page_token.as_deref(),
-                                auto_page_limit(limit),
-                                &filter,
-                                &settings,
-                            )
-                            .await?;
-                        next_page_token = page.next_page_token.clone();
-                        output.write_page(&page)?;
-                        if next_page_token.is_none() {
-                            output.finish(page.cursor.as_deref(), page.caught_up);
-                            break;
-                        }
-                    }
-                }
-            }
-            ChangesCommand::Baseline {
-                uri,
-                branch,
-                kinds,
-                types,
-                ops,
-                out,
-                json,
-            } => {
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let kinds: Vec<omnigraph_api_types::EntityKindOutput> =
-                    kinds.into_iter().map(Into::into).collect();
-                let ops: Vec<omnigraph_api_types::ChangeOpOutput> =
-                    ops.into_iter().map(Into::into).collect();
-                let filter = client::ChangeFilterArgs {
-                    kinds: &kinds,
-                    types: &types,
-                    ops: &ops,
-                };
-                // The install contract below (file fsync + atomic replace +
-                // parent-directory fsync) is POSIX-shaped. Elsewhere (e.g.
-                // Windows, where std's rename is not write-through and a
-                // directory is not an fsync-able durability primitive) the
-                // namespace replacement cannot be proven durable before the
-                // resume cursor prints, so fail closed BEFORE any capture work
-                // rather than print a cursor for a snapshot the filesystem may
-                // lose. A durable/write-through replace is the sanctioned
-                // future lift for those platforms.
-                if cfg!(not(unix)) {
-                    bail!(
-                        "changes baseline is not supported on this platform: the \
-                         snapshot-install durability barrier (directory fsync after \
-                         an atomic replace) requires a POSIX filesystem"
-                    );
-                }
-                // Serialize cooperating captures of the same --out from before
-                // staging through cursor delivery; held until this arm returns.
-                #[cfg(unix)]
-                let _out_lock = BaselineOutLock::acquire(&out)?;
-                // Stream into a UNIQUE temp file in --out's directory and
-                // atomically replace --out only after the handshake completes
-                // AND the bytes are durable. NamedTempFile is created O_EXCL and
-                // removes itself on drop, so two concurrent captures cannot
-                // truncate each other's staging file, a failed capture never
-                // destroys the previous snapshot, and — with the fsync barrier
-                // below — a crash never exposes a resume cursor for a snapshot
-                // that is not durably on disk.
-                let out_dir = match out.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-                    _ => std::path::PathBuf::from("."),
-                };
-                let mut temp = tempfile::NamedTempFile::new_in(&out_dir)?;
-                let baseline = {
-                    let mut writer = io::BufWriter::new(temp.as_file_mut());
-                    match client
-                        .change_baseline(branch.as_deref(), &filter, &mut writer)
-                        .await
-                    {
-                        Ok(baseline) => {
-                            writer.flush()?;
-                            baseline
-                        }
-                        // `temp` auto-removes on drop; --out is left untouched.
-                        Err(error) => return Err(error),
-                    }
-                };
-                // Durability barrier BEFORE the resume cursor is printed: fsync
-                // the file, atomically persist it over --out, then fsync the
-                // parent directory so the rename itself survives a crash. Every
-                // step propagates its failure with `?`, so a durability error
-                // returns before any cursor is emitted — a printed cursor always
-                // implies the snapshot is durably on disk.
-                temp.as_file().sync_all()?;
-                let installed = temp.persist(&out).map_err(|error| error.error)?;
-                sync_dir(&out_dir)?;
-                // Concurrent-capture guard (belt to the lock's braces): if a
-                // NON-cooperating writer replaced --out after our atomic
-                // persist, the path no longer names the file we installed
-                // (different inode), and printing our cursor would pair it
-                // with someone else's snapshot — a consumer restoring that
-                // pairing skips the changes between the two snapshot
-                // positions. Refuse the print instead. Cooperating captures
-                // are already serialized by the .lock file, so they can never
-                // hit this between our persist and print.
-                #[cfg(unix)]
-                if !installed_file_is_current(&installed, &out)? {
-                    bail!(
-                        "the baseline at {} was replaced by another writer after \
-                         this capture installed its snapshot; no resume cursor \
-                         printed — re-run the capture",
-                        out.display()
-                    );
-                }
-                let _ = installed;
-                if json {
-                    print_json(&baseline)?;
-                } else {
-                    print_change_baseline_human(&baseline, &out);
-                }
-            }
-        },
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    store: cli.store.as_deref(),
+                    yes: cli.yes,
+                    quiet: cli.quiet,
+                },
+                stdout,
+            )
+            .await?;
+        }
         Command::Schema { command } => match command {
             SchemaCommand::Plan { uri, schema, json } => {
                 let uri = resolve_maintenance_uri(
@@ -1289,28 +708,22 @@ async fn run(
                 }
             }
         }
-        Command::Snapshot { uri, branch, json } => {
-            let client = client::GraphClient::resolve(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
+        Command::Snapshot(args) => {
+            commands::history::run_snapshot(
+                args,
+                commands::history::HistoryScope {
+                    capability,
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    store: cli.store.as_deref(),
+                    yes: cli.yes,
+                    quiet: cli.quiet,
+                },
+                stdout,
             )
             .await?;
-            let branch = resolve_branch(branch, None, "main");
-            let payload = client.snapshot(&branch).await?;
-            if json {
-                print_json(&payload)?;
-            } else {
-                print_snapshot_human(
-                    &payload.graph_branch,
-                    payload.graph_manifest_version,
-                    payload.internal_schema_version,
-                    &payload.datasets,
-                );
-            }
         }
         Command::Export {
             uri,
@@ -2054,87 +1467,6 @@ fn report_deployment_lock(status: &omnigraph_cluster::DeploymentStatus) {
             omnigraph::storage::redacted_storage_uri(&status.canonical_root)
         );
     }
-}
-
-/// The page size the CLI asks for when it follows every page itself: the
-/// public maximum unless `--limit` sets one. Every page resolves its commits
-/// again and restarts its ordered walk after the previous page's last change,
-/// so the same changes cost less in fewer, larger pages.
-fn auto_page_limit(limit: Option<usize>) -> Option<usize> {
-    Some(limit.unwrap_or(omnigraph::changes::COMMIT_CHANGES_MAX_CHANGES))
-}
-
-/// Print a graph diff: one page when `page_token` is given (the raw escape
-/// hatch), otherwise every page in turn, each emitted before the next is
-/// fetched.
-#[allow(clippy::too_many_arguments)]
-async fn run_diff(
-    client: &client::GraphClient,
-    sides: client::DiffSidesArg<'_>,
-    page_token: Option<String>,
-    limit: Option<usize>,
-    kinds: Vec<cli::ChangeKindArg>,
-    types: Vec<String>,
-    ops: Vec<cli::ChangeOpArg>,
-    json: bool,
-) -> Result<()> {
-    let kinds: Vec<omnigraph_api_types::EntityKindOutput> =
-        kinds.into_iter().map(Into::into).collect();
-    let ops: Vec<omnigraph_api_types::ChangeOpOutput> = ops.into_iter().map(Into::into).collect();
-    let filter = client::ChangeFilterArgs {
-        kinds: &kinds,
-        types: &types,
-        ops: &ops,
-    };
-    if let Some(page_token) = page_token.as_deref() {
-        let page = client
-            .diff_page(sides, Some(page_token), limit, &filter)
-            .await?;
-        if json {
-            print_json(&page)?;
-        } else {
-            print_diff_human(&page);
-        }
-        return Ok(());
-    }
-    let mut next_page_token: Option<String> = None;
-    if json {
-        let mut output = DiffJsonStream::new(io::BufWriter::new(io::stdout()));
-        loop {
-            let page = client
-                .diff_page(
-                    sides,
-                    next_page_token.as_deref(),
-                    auto_page_limit(limit),
-                    &filter,
-                )
-                .await?;
-            next_page_token = page.next_page_token.clone();
-            output.write_page(&page)?;
-            if next_page_token.is_none() {
-                break;
-            }
-        }
-        let _ = output.finish()?;
-    } else {
-        let mut output = DiffHumanStream::new();
-        loop {
-            let page = client
-                .diff_page(
-                    sides,
-                    next_page_token.as_deref(),
-                    auto_page_limit(limit),
-                    &filter,
-                )
-                .await?;
-            next_page_token = page.next_page_token.clone();
-            output.write_page(&page)?;
-            if next_page_token.is_none() {
-                break;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

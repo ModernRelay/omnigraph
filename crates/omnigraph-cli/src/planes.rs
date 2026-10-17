@@ -201,7 +201,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
                 } | Command::Changes { .. }
                     | Command::Commit { .. }
-                    | Command::Diff { .. }
+                    | Command::Diff(_)
                     | Command::Branch {
                         command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
                     }
@@ -271,11 +271,11 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Mutate(_)
         | Command::Load { .. }
         | Command::Branch { .. }
-        | Command::Snapshot { .. }
+        | Command::Snapshot(_)
         | Command::Export { .. }
         | Command::Blob { .. }
         | Command::Commit { .. }
-        | Command::Diff { .. }
+        | Command::Diff(_)
         | Command::Changes { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
@@ -339,7 +339,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             QueriesCommand::Validate { .. } => "queries validate",
             QueriesCommand::List { .. } => "queries list",
         },
-        Command::Snapshot { .. } => "snapshot",
+        Command::Snapshot(_) => "snapshot",
         Command::Export { .. } => "export",
         Command::Blob { command } => match command {
             BlobCommand::Get { .. } => "blob get",
@@ -348,7 +348,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             BlobCommand::Clear { .. } => "blob clear",
         },
         Command::Commit { .. } => "commit",
-        Command::Diff { .. } => "diff",
+        Command::Diff(_) => "diff",
         Command::Changes { command } => match command {
             ChangesCommand::Poll { .. } => "changes poll",
             ChangesCommand::Baseline { .. } => "changes baseline",
