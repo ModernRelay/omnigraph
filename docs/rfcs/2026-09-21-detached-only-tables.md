@@ -7,13 +7,13 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-21
-updated: 2026-09-25
+updated: 2026-10-16
 discussion: null
 supersedes: []
 superseded_by: []
 blocked_on:
   - "Inventory: the everything-blocked run. Under a `no-promotion` cargo feature on `omnigraph-engine`, where `promote_pin` returns the blocked outcome at every call site and `cleanup_all_datasets` sets `deferred` on every graph table, run `cargo test -p omnigraph-gqt`, `cargo test -p omnigraph-engine --features failpoints,no-promotion`, the DST scenarios, and the change-feed and merge cost owners. A red test is a dependency on the linear chain unless it asserts promotion itself; those are listed separately in this RFC as deleted with the promoters."
-  - "Storage: the tracing collector with its DST oracle, two predicates over a run's inputs. Safety: for every `__manifest` version the run's `--keep` and `--older-than` policy retains on every live branch, every `staged_version` it registers opens and every path its manifest lists exists. Progress: every manifest in the published set that no retained `__manifest` version names is absent after a run with `--older-than 0`. Fixtures: a pin published then pruned by `--keep 1`; an unpublished staging left by the mutation pre-publication failpoint window; a merge whose chain has three chunks with only the tip pinned; a fork branch created after a pin, with the pin pruned on main and retained on the branch; a publication that lands between the collector's scan of a branch and its sweep; a repeat run after a pass that already reclaimed a chain tip; a crash inside a pass followed by a retry of the same run. Crash windows inside the sweep, on file, S3 and Azure."
+  - "Storage: the tracing collector with its DST oracle, two predicates over a run's inputs. Safety: for every `__manifest` version the run's `--keep` and `--older-than` policy retains on every live branch, every `staged_version` it registers opens and every path its manifest lists exists. Progress: every manifest in the published set that no retained `__manifest` version names is absent after a run with `--older-than 0`. Fixtures: a pin published then pruned by `--keep 1`; an unpublished staging left by the mutation pre-publication failpoint window; a merge whose chain has three chunks with only the tip pinned; a fork branch created after a pin, with the pin pruned on main and retained on the branch; a publication that lands between the collector's scan of a branch and its sweep; a repeat run after a pass that already reclaimed a chain tip; a crash inside a pass followed by a retry of the same run."
   - "Change discovery: the replacement for the row-lineage stamp windows chosen from measured candidates, with the change-feed cost owner `tests/changes_cost.rs` and a merge cost owner still to be created, both flat against today's promoted path."
   - "Cost: `write_cost.rs` and `write_cost_s3` ceilings for a write without promotion, on a warm and on a cold handle, checked in with the thresholds under Evidence and tests."
   - "Compatibility: the format stamp, provisionally v11 until its order against RFC 0068 is decided, resolution of v10 rows under it, the refusal fence for older binaries, and the `cleanup` consumer fixture over the JSON result and `--keep` on a v10 and a v11 graph."
@@ -857,7 +857,20 @@ New evidence, each an entry in `blocked_on`:
 - `detached_commit_matrix.rs` and `failpoints.rs`: promotion windows
   deleted; the windows `cleanup.sweep_pre_manifest_delete`,
   `cleanup.sweep_between_manifests` and `cleanup.sweep_pre_file_delete`
-  added, each reached by the `cleanup` milestone recipe.
+  added, each reached by the `cleanup` milestone recipe, and
+  `cleanup.sweep_pre_dead_manifest_delete` between the dead stagings' files
+  and their manifests. `failpoints.rs` stops a pass at
+  `cleanup.sweep_pre_file_delete`, which deletes nothing, and at
+  `cleanup.sweep_pre_manifest_delete`, `cleanup.sweep_between_manifests`
+  and `cleanup.sweep_pre_dead_manifest_delete` with an index directory
+  already deleted; the retry reports no error, removes the remaining
+  manifests and leaves every retained root's paths present. The same three
+  fixtures run on the file backend, where Lance reports an absent index
+  directory as `NotFound`, and on S3 and Azure, where Lance lists the absent
+  prefix empty (`s3_collector_retry_converges_after_every_sweep_window` in
+  the RustFS failpoints job and
+  `azure_collector_retry_converges_after_every_sweep_window` in the Azurite
+  job). DST's shared-memory store lists it empty too.
 
 ### Acceptance thresholds
 
