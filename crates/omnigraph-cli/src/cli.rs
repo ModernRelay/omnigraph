@@ -1,7 +1,15 @@
 //! The clap surface: every command, subcommand, and argument struct
 //! (moved verbatim from main.rs in the modularization).
 
-use super::*;
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use omnigraph::loader::LoadMode;
+use omnigraph_server::PolicyAction;
+use serde::Serialize;
+
+use crate::embed::EmbedArgs;
+use crate::read_format::ReadOutputFormat;
 
 pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 

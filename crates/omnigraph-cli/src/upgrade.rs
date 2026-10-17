@@ -155,6 +155,7 @@ fn joined(items: &[String], separator: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn storage_upgrade_parses_explicit_route_and_check_options() {
