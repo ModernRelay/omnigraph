@@ -1,7 +1,10 @@
 //! Stored-query commands and alias resolution.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
@@ -1122,25 +1125,41 @@ fn queries_list_with_as_flag_errors() {
 
 #[test]
 fn queries_and_policy_wrong_server_scope_points_at_cluster_scope() {
-    let output = output_failure(cli().arg("--server").arg("prod").arg("queries").arg("list"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("pass --cluster <dir|uri>") && !stderr.contains("pass --config <dir>"),
-        "queries should point at --cluster, not --config; got: {stderr}"
-    );
-
-    let output = output_failure(
-        cli()
-            .arg("--server")
-            .arg("prod")
-            .arg("policy")
-            .arg("validate"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("pass --cluster <dir|uri>") && !stderr.contains("pass --config <dir>"),
-        "policy should point at --cluster, not --config; got: {stderr}"
-    );
+    let home = tempdir().unwrap();
+    fs::write(home.path().join("config.yaml"), "servers: [\n").unwrap();
+    let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
+    for args in [
+        vec!["queries", "list"],
+        vec!["queries", "validate"],
+        vec!["policy", "validate"],
+        vec!["policy", "test", "--tests", "missing-tests.yaml"],
+        vec!["policy", "explain", "--actor", "actor", "--action", "read"],
+    ] {
+        let output = output_failure(
+            cli()
+                .current_dir(home.path())
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["--server", &server.origin])
+                .args(&args),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("pass --cluster <dir|uri>") && !stderr.contains("pass --config <dir>"),
+            "{args:?} should point at --cluster, not --config; got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("could not parse operator config"),
+            "{stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert!(
+            server.requests().is_empty(),
+            "{args:?} must refuse before HTTP"
+        );
+        assert!(!home.path().join("__cluster").exists());
+        assert!(!home.path().join("graphs").exists());
+    }
+    server.assert_complete();
 }
 
 // RFC-011: `queries validate`/`list` source the registry + schemas from a
@@ -1410,6 +1429,8 @@ fn queries_validate_graph_filter_selects_one_graph() {
     let dir = temp.path();
     write_multi_graph_cluster_fixture(dir);
     apply_cluster_fixture(dir);
+    let state_path = dir.join("__cluster/state.json");
+    let before = fs::read(&state_path).unwrap();
     let output = output_success(
         cli()
             .arg("queries")
@@ -1420,6 +1441,27 @@ fn queries_validate_graph_filter_selects_one_graph() {
             .arg("knowledge"),
     );
     assert!(stdout_string(&output).contains("OK"));
+
+    let listed = parse_stdout_json(&output_success(
+        cli().args(["queries", "list", "--cluster"]).arg(dir).args([
+            "--graph",
+            "knowledge",
+            "--json",
+        ]),
+    ));
+    assert_eq!(listed["queries"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["queries"][0]["name"], "find_person");
+
+    let missing = output_failure(
+        cli()
+            .args(["queries", "validate", "--cluster"])
+            .arg(dir)
+            .args(["--graph", "missing", "--json"]),
+    );
+    assert!(missing.stdout.is_empty());
+    assert!(stderr_string(&missing).contains("graph `missing` is not applied"));
+    assert_eq!(fs::read(&state_path).unwrap(), before);
+    assert!(!dir.join("__cluster/lock.json").exists());
 }
 
 /// RFC 0047's diagnostics contract at the CLI: a refused query reports its

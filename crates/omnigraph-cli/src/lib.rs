@@ -9,15 +9,12 @@ use omnigraph_api_types::{
 };
 use omnigraph_cluster::{
     DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
-    ValidateOutput, force_unlock_config_dir, observe_config_dir, status_config_dir,
-    validate_config_dir,
+    ValidateOutput,
 };
 use omnigraph_compiler::{
     JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSeverity,
     QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, json_params_to_param_map,
 };
-use omnigraph_server::queries::{QueryRegistry, check};
-use omnigraph_server::{PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig};
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
@@ -62,7 +59,7 @@ use helpers::*;
 use invocation::{MachineErrors, ParsedInvocation};
 
 pub mod app;
-use app::{core_deployment_result, error_output_of, sync_dir};
+use app::{error_output_of, sync_dir};
 use output::*;
 
 #[cfg(test)]

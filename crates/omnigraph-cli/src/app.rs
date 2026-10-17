@@ -255,7 +255,7 @@ async fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    if cluster_remote::dispatch(&cli).await? {
+    if cluster_remote::dispatch(&cli, stdout, stderr).await? {
         return Ok(Completion::success());
     }
     if let Some(result) = managed::dispatch(&cli).await {
@@ -580,16 +580,17 @@ async fn run(
             .await;
         }
         Command::Queries { command } => {
-            let cluster =
-                require_cluster_scope(cli.cluster.as_deref(), cli.profile.as_deref(), "queries")?;
-            match command {
-                QueriesCommand::Validate { json } => {
-                    return execute_queries_validate(&cluster, cli.graph.as_deref(), json).await;
-                }
-                QueriesCommand::List { json } => {
-                    execute_queries_list(&cluster, cli.graph.as_deref(), json).await?;
-                }
-            }
+            return commands::control::run_queries(
+                command,
+                commands::control::ControlScope {
+                    cluster: cli.cluster.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    server: cli.server.as_deref(),
+                },
+                stdout,
+            )
+            .await;
         }
         Command::Snapshot(args) => {
             commands::history::run_snapshot(
@@ -681,51 +682,17 @@ async fn run(
         }
         Command::Alias(args) => commands::query::run_alias(args, machine, stdout).await?,
         Command::Policy { command } => {
-            // Policy tooling sources the Cedar bundle(s) from the cluster's
-            // applied policies (RFC-011): --cluster <dir>, + the global --graph
-            // to pick a graph's bundle when several apply.
-            let cluster =
-                require_cluster_scope(cli.cluster.as_deref(), cli.profile.as_deref(), "policy")?;
-            let graph = cli.graph.as_deref();
-            let graph_id = match graph {
-                Some(id) => graph_resource_id_for_selection(Some(id), ""),
-                None => graph_resource_id_for_selection(None, "default"),
-            };
-            let policies = read_cluster_policies(&cluster).await?;
-            match command {
-                PolicyCommand::Validate {} => {
-                    let bundle = select_cluster_policy(&cluster, &policies, graph)?;
-                    let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
-                    println!(
-                        "policy valid: bundle '{}' [{} actors]",
-                        bundle.name,
-                        engine.known_actor_count()
-                    );
-                }
-                PolicyCommand::Test { tests } => {
-                    let bundle = select_cluster_policy(&cluster, &policies, graph)?;
-                    let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
-                    let tests = PolicyTestConfig::load(&tests)?;
-                    engine.run_tests(&tests)?;
-                    println!("policy tests passed: {} cases", tests.cases.len());
-                }
-                PolicyCommand::Explain {
-                    actor,
-                    action,
-                    branch,
-                    target_branch,
-                } => {
-                    let bundle = select_cluster_policy(&cluster, &policies, graph)?;
-                    let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
-                    let request = PolicyRequest {
-                        action,
-                        branch,
-                        target_branch,
-                    };
-                    let decision = engine.authorize(&actor, &request)?;
-                    print_policy_explain(&decision, &actor, &request);
-                }
-            }
+            return commands::control::run_policy(
+                command,
+                commands::control::ControlScope {
+                    cluster: cli.cluster.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    server: cli.server.as_deref(),
+                },
+                stdout,
+            )
+            .await;
         }
         Command::Upgrade(args) => {
             return commands::maintenance::run_upgrade(args, maintenance_scope, stdout, stderr)
@@ -755,212 +722,34 @@ async fn run(
         Command::Use { .. } | Command::Organization { .. } => {
             unreachable!("managed dispatch handles organization commands and use")
         }
-        Command::Cluster { command, .. } => match command {
-            ClusterCommand::Validate { config, json } => {
-                let output = validate_config_dir(config);
-                return finish_cluster_validate(&output, json);
-            }
-            ClusterCommand::Plan { config, json, .. } => {
-                let output = omnigraph_cluster::plan_config_dir_as(
-                    config,
-                    resolve_cluster_actor(cli.as_actor.as_deref())?,
-                )
-                .await;
-                return finish_cluster_plan(&output, json);
-            }
-            ClusterCommand::Observe { config, json } => {
-                let output = observe_config_dir(config).await;
-                return finish_cluster_state_sync(&output, json);
-            }
-            ClusterCommand::Apply {
-                config,
-                json,
-                deployment_id,
-                writers_stopped,
-                ..
-            } => {
-                let caller = omnigraph_cluster::DeploymentCaller::storage_owner(
-                    resolve_cluster_actor(cli.as_actor.as_deref())?,
-                );
-                if let Some(root) = cli.cluster.as_deref() {
-                    let id = deployment_id.as_deref().ok_or_else(|| color_eyre::eyre::eyre!("root-addressed apply requires --deployment-id; it only reconciles the original deployment"))?;
-                    let result =
-                        omnigraph_cluster::reconcile_deployment(root, id, writers_stopped, &caller)
-                            .await;
-                    let status = omnigraph_cluster::deployment_status(root, None, &caller).await;
-                    if let Ok(status) = status {
-                        report_deployment_lock(&status);
-                    }
-                    finish_core_deployment(result, json)?;
-                } else {
-                    let result = omnigraph_cluster::apply_deployment(
-                        &config, deployment_id.as_deref(), &caller,
-                        |id, root, lock| {
-                            let root = omnigraph::storage::redacted_storage_uri(root);
-                            eprintln!(
-                                "Deployment-ID: {id}\nCluster-root: {root}\nAdmission lock: {lock}; retain until prior work is quiescent, then exact-ID force-unlock"
-                            );
-                        },
-                    )
-                    .await;
-                    finish_core_deployment(result, json)?;
-                }
-            }
-            ClusterCommand::UpgradeLedger {
-                writers_stopped,
-                json,
-            } => {
-                let root = cli.cluster.as_deref().ok_or_else(|| {
-                    color_eyre::eyre::eyre!("upgrade-ledger requires --cluster ROOT")
-                })?;
-                let caller = omnigraph_cluster::DeploymentCaller::storage_owner(
-                    resolve_cluster_actor(cli.as_actor.as_deref())?,
-                );
-                let status = core_deployment_result(
-                    omnigraph_cluster::upgrade_deployment_ledger(root, writers_stopped, &caller)
-                        .await,
-                    json,
-                )?;
-                print_json(&status)?;
-                report_deployment_lock(&status);
-            }
-            ClusterCommand::Status {
-                config,
-                json,
-                deployment_id,
-                ..
-            } => {
-                if let Some(root) = cli.cluster.as_deref() {
-                    let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
-                    let status = core_deployment_result(
-                        omnigraph_cluster::deployment_status(
-                            root,
-                            deployment_id.as_deref(),
-                            &caller,
-                        )
-                        .await,
-                        json,
-                    )?;
-                    print_json(&status)?;
-                } else {
-                    let output = status_config_dir(config).await;
-                    return finish_cluster_status(&output, json);
-                }
-            }
-            ClusterCommand::ForceUnlock {
-                lock_id,
-                config,
-                json,
-            } => {
-                if let Some(root) = cli.cluster.as_deref() {
-                    core_deployment_result(
-                        omnigraph_cluster::force_unlock_storage_root(root, &lock_id).await,
-                        json,
-                    )?;
-                    print_json(&serde_json::json!({"unlocked": true, "lock_id": lock_id}))?;
-                } else {
-                    let output = force_unlock_config_dir(config, lock_id).await;
-                    return finish_cluster_force_unlock(&output, json);
-                }
-            }
-            ClusterCommand::Create { .. }
-            | ClusterCommand::List { .. }
-            | ClusterCommand::Members { .. }
-            | ClusterCommand::Pull { .. }
-            | ClusterCommand::Push { .. }
-            | ClusterCommand::Delete { .. }
-            | ClusterCommand::UndoDelete { .. }
-            | ClusterCommand::Token { .. }
-            | ClusterCommand::Operation { .. }
-            | ClusterCommand::History { .. }
-            | ClusterCommand::Cancel { .. } => {
-                unreachable!("managed cluster commands dispatch first")
-            }
-        },
-        Command::Graphs { command } => match command {
-            GraphsCommand::List { json, discovery } => {
-                let (client, discovery) = if let Some(client) = managed_data {
-                    (client, true)
-                } else {
-                    // Explicit operator addressing retains the legacy catalog
-                    // unless discovery is explicitly requested. Token bytes do
-                    // not choose configuration or change static-token behavior.
-                    (
-                        client::GraphClient::resolve_registry(
-                            cli.server.as_deref(),
-                            cli.profile.as_deref(),
-                        )?,
-                        discovery,
-                    )
-                };
-                if discovery {
-                    let payload = client.discover_graphs().await?;
-                    if json {
-                        print_json(&payload)?;
-                    } else {
-                        for entry in payload.graphs {
-                            if entry.display_name == entry.graph_id {
-                                println!("{}", entry.graph_id);
-                            } else {
-                                println!("{}\t{}", entry.graph_id, entry.display_name);
-                            }
-                        }
-                    }
-                    return Ok(Completion::success());
-                }
-                let payload = client.list_graphs().await?;
-                if json {
-                    print_json(&payload)?;
-                } else {
-                    for entry in payload.graphs {
-                        println!("{}\t{}\t{}", entry.graph_id, entry.state, entry.uri);
-                    }
-                }
-            }
-        },
-    }
-    Ok(Completion::success())
-}
-
-pub(crate) fn core_deployment_result<T>(
-    result: std::result::Result<T, omnigraph_cluster::Diagnostic>,
-    json: bool,
-) -> Result<T> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            if json {
-                print_json(&serde_json::json!({"ok": false, "diagnostics": [&error]}))?;
-            } else {
-                print_cluster_diagnostics(std::slice::from_ref(&error));
-            }
-            bail!("{} {}: {}", error.code, error.path, error.message)
+        Command::Cluster { command, .. } => {
+            return commands::cluster::run(
+                command,
+                commands::cluster::ClusterScope {
+                    root: cli.cluster.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                },
+                stdout,
+                stderr,
+            )
+            .await;
+        }
+        Command::Graphs { command } => {
+            return commands::control::run_graphs(
+                command,
+                commands::control::ControlScope {
+                    cluster: cli.cluster.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    server: cli.server.as_deref(),
+                },
+                managed_data,
+                stdout,
+            )
+            .await;
         }
     }
-}
-
-fn finish_core_deployment(
-    result: std::result::Result<omnigraph_cluster::DeploymentLookup, omnigraph_cluster::Diagnostic>,
-    json: bool,
-) -> Result<()> {
-    let result = core_deployment_result(result, json)?;
-    print_json(&result)?;
-    if !matches!(result, omnigraph_cluster::DeploymentLookup::Complete { ref result } if result.converged)
-    {
-        bail!(
-            "deployment has not fully converged; inspect the original identity, never replay unknown work"
-        );
-    }
-    Ok(())
-}
-
-fn report_deployment_lock(status: &omnigraph_cluster::DeploymentStatus) {
-    if let Some(lock) = &status.lock_id {
-        eprintln!(
-            "Admission lock retained: {lock} ({}); establish prior-work quiescence before exact-ID force-unlock",
-            omnigraph::storage::redacted_storage_uri(&status.canonical_root)
-        );
-    }
+    Ok(Completion::success())
 }
 
 #[cfg(test)]

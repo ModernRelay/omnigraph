@@ -1119,3 +1119,186 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
         }
     }
 }
+
+#[tokio::test]
+async fn direct_deployment_delivery_failure_retains_one_result_and_original_identity() {
+    use crate::commands::cluster::apply_source;
+    use omnigraph_cluster::{DeploymentCaller, DeploymentLookup};
+
+    for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
+        for failed_stream in ["stdout", "stderr", "both"] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                temp.path().join("schema.pg"),
+                "node Person { slug: String @key }\n",
+            )
+            .unwrap();
+            std::fs::write(temp.path().join("cluster.yaml"),
+                "version: 1\nstate: { backend: cluster, lock: true }\ngraphs:\n  people:\n    schema: schema.pg\n").unwrap();
+            let caller = DeploymentCaller::storage_owner(Some("deployment-operator".to_owned()));
+            let mut failed_out = FailingOutput {
+                fault,
+                bytes: Vec::new(),
+            };
+            let mut failed_err = FailingOutput {
+                fault,
+                bytes: Vec::new(),
+            };
+            let mut delivered_out = Vec::new();
+            let mut delivered_err = Vec::new();
+            let stdout: &mut dyn Write = if failed_stream == "stderr" {
+                &mut delivered_out
+            } else {
+                &mut failed_out
+            };
+            let stderr: &mut dyn Write = if failed_stream == "stdout" {
+                &mut delivered_err
+            } else {
+                &mut failed_err
+            };
+            let error = apply_source(temp.path(), None, &caller, true, stdout, stderr)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+
+            let root = temp.path().to_str().unwrap();
+            let status = omnigraph_cluster::deployment_status(root, None, &caller)
+                .await
+                .unwrap();
+            assert_eq!(status.next_sequence, 2);
+            assert_eq!(status.result_revision, 1);
+            assert!(status.outstanding_id.is_none());
+            let state_path = temp.path().join("__cluster/state.json");
+            let state_bytes = std::fs::read(&state_path).unwrap();
+            let state: Value = serde_json::from_slice(&state_bytes).unwrap();
+            let results = state["deployment_results"].as_array().unwrap();
+            assert_eq!(results.len(), 1);
+            let id = results[0]["id"].as_str().unwrap();
+            let lock = status.lock_id.as_deref().unwrap();
+            let message = format!("{error:#}");
+            assert!(message.contains(id), "{message}");
+            assert!(message.contains(lock), "{message}");
+            assert!(!message.contains("command_outcome"));
+            let receipt = omnigraph_cluster::deployment_status(root, Some(id), &caller)
+                .await
+                .unwrap()
+                .lookup
+                .unwrap();
+            assert!(matches!(&receipt, DeploymentLookup::Complete { result } if result.converged));
+            let receipt = serde_json::to_value(receipt).unwrap();
+            assert_eq!(
+                receipt["result"]["authority"]["actor"],
+                "deployment-operator"
+            );
+            let graph_uri = temp
+                .path()
+                .join("graphs/people.omni")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let graph = crate::client::GraphClient::Embedded {
+                uri: graph_uri,
+                actor: None,
+            };
+            let snapshot = graph.snapshot("main").await.unwrap();
+            let commits = graph.list_commits(Some("main")).await.unwrap().commits;
+            let lock_path = temp.path().join("__cluster/lock.json");
+            let lock_bytes = std::fs::read(&lock_path).unwrap();
+
+            // Resubmitting the known identity observes the original result even
+            // while admission is retained. It must not run the deployment again.
+            let mut observed = Vec::new();
+            let mut custody = Vec::new();
+            apply_source(
+                temp.path(),
+                Some(id),
+                &caller,
+                true,
+                &mut observed,
+                &mut custody,
+            )
+            .await
+            .unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&observed).unwrap(), receipt);
+            assert!(custody.is_empty());
+            assert_eq!(std::fs::read(&state_path).unwrap(), state_bytes);
+            assert_eq!(std::fs::read(&lock_path).unwrap(), lock_bytes);
+            assert_eq!(
+                graph.snapshot("main").await.unwrap().graph_manifest_version,
+                snapshot.graph_manifest_version
+            );
+            assert_eq!(
+                graph
+                    .list_commits(Some("main"))
+                    .await
+                    .unwrap()
+                    .commits
+                    .len(),
+                commits.len()
+            );
+
+            // Root-only reconciliation also retains the complete identity if
+            // its lock warning cannot be delivered, without touching the ledger.
+            use crate::commands::cluster::{ClusterCommand, ClusterRunArgs, ClusterScope};
+            let mut failing = FailingOutput {
+                fault,
+                bytes: Vec::new(),
+            };
+            let mut output = Vec::new();
+            let error = crate::commands::cluster::run(
+                ClusterCommand::Apply {
+                    config: temp.path().join("missing-source"),
+                    deployment_id: Some(id.to_owned()),
+                    writers_stopped: true,
+                    json: true,
+                    plan: None,
+                    run: ClusterRunArgs::default(),
+                },
+                ClusterScope {
+                    root: Some(root),
+                    actor: Some("deployment-operator"),
+                },
+                &mut output,
+                &mut failing,
+            )
+            .await
+            .unwrap_err();
+            let message = format!("{error:#}");
+            for retained in [id, lock, status.canonical_root.as_str()] {
+                assert!(message.contains(retained), "{message}");
+            }
+            assert_eq!(serde_json::from_slice::<Value>(&output).unwrap(), receipt);
+            assert_eq!(std::fs::read(&state_path).unwrap(), state_bytes);
+            assert_eq!(std::fs::read(&lock_path).unwrap(), lock_bytes);
+
+            // A delivered unlock is not replayed when its result stream closes.
+            // Cover both root-addressed and config-addressed dispatch.
+            let mut failing = FailingOutput {
+                fault,
+                bytes: Vec::new(),
+            };
+            let error = crate::commands::cluster::run(
+                ClusterCommand::ForceUnlock {
+                    lock_id: lock.to_owned(),
+                    config: temp.path().to_owned(),
+                    json: true,
+                },
+                ClusterScope {
+                    root: (failed_stream != "stdout").then_some(root),
+                    actor: None,
+                },
+                &mut failing,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(lock), "{message}");
+            assert!(!lock_path.exists());
+            assert_eq!(std::fs::read(&state_path).unwrap(), state_bytes);
+        }
+    }
+}

@@ -658,7 +658,7 @@ mod tests {
             ];
             args.extend_from_slice(extra);
             let cli = Cli::try_parse_from(args).unwrap();
-            let error = crate::cluster_remote::dispatch(&cli)
+            let error = crate::cluster_remote::dispatch(&cli, &mut Vec::new(), &mut Vec::new())
                 .await
                 .unwrap_err()
                 .to_string();

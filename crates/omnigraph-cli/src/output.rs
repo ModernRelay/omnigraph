@@ -453,28 +453,35 @@ pub(crate) fn write_json<T: Serialize>(value: &T, writer: &mut dyn Write) -> Res
     Ok(())
 }
 
-pub(crate) fn print_cluster_validate_human(output: &ValidateOutput) {
+pub(crate) fn write_cluster_validate_human(
+    output: &ValidateOutput,
+    stdout: &mut dyn Write,
+) -> Result<()> {
     if output.ok {
-        println!(
+        writeln!(
+            stdout,
             "cluster config valid: {} resource(s), {} dependency edge(s)",
             output.resources.len(),
             output.dependencies.len()
-        );
+        )?;
     } else {
-        println!("cluster config invalid");
+        writeln!(stdout, "cluster config invalid")?;
     }
-    print_cluster_diagnostics(&output.diagnostics);
+    write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
+pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Write) -> Result<()> {
     if output.ok {
-        println!("cluster plan: {} change(s)", output.changes.len());
+        writeln!(stdout, "cluster plan: {} change(s)", output.changes.len())?;
         match output.authority {
             omnigraph_cluster::LedgerAuthority::Observed => {
-                println!("  authority: observed (no lock taken, nothing written)");
+                writeln!(
+                    stdout,
+                    "  authority: observed (no lock taken, nothing written)"
+                )?;
             }
             omnigraph_cluster::LedgerAuthority::Unlocked => {
-                println!("  authority: unlocked (state.lock is false)");
+                writeln!(stdout, "  authority: unlocked (state.lock is false)")?;
             }
             omnigraph_cluster::LedgerAuthority::Locked => {}
         }
@@ -484,111 +491,133 @@ pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
             } else {
                 ""
             };
-            println!("  {:?} {}{bindings}", change.operation, change.resource);
+            writeln!(
+                stdout,
+                "  {:?} {}{bindings}",
+                change.operation, change.resource
+            )?;
             if let Some(migration) = &change.migration {
                 if !migration.supported {
-                    println!("      migration UNSUPPORTED:");
+                    writeln!(stdout, "      migration UNSUPPORTED:")?;
                 }
                 for step in &migration.steps {
-                    println!(
+                    writeln!(
+                        stdout,
                         "      {}",
                         serde_json::to_string(step).unwrap_or_else(|_| format!("{step:?}"))
-                    );
+                    )?;
                 }
             }
         }
         if output.changes.is_empty() {
-            println!("  no changes");
+            writeln!(stdout, "  no changes")?;
         }
     } else {
-        println!("cluster plan failed");
+        writeln!(stdout, "cluster plan failed")?;
     }
-    print_cluster_diagnostics(&output.diagnostics);
+    write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn print_cluster_status_human(output: &StatusOutput) {
+pub(crate) fn write_cluster_status_human(
+    output: &StatusOutput,
+    stdout: &mut dyn Write,
+) -> Result<()> {
     if output.ok {
         let state = &output.state_observations;
         if state.state_found {
-            println!(
+            writeln!(
+                stdout,
                 "cluster state: revision {}, {} resource(s)",
                 state.state_revision, state.resource_count
-            );
+            )?;
             if let Some(digest) = state.applied_config_digest.as_deref() {
-                println!("  applied config: {digest}");
+                writeln!(stdout, "  applied config: {digest}")?;
             }
             if state.locked {
-                println!("  lock: held{}", cluster_lock_summary(state));
+                writeln!(stdout, "  lock: held{}", cluster_lock_summary(state))?;
             } else {
-                println!("  lock: not held");
+                writeln!(stdout, "  lock: not held")?;
             }
         } else {
-            println!("cluster state missing");
+            writeln!(stdout, "cluster state missing")?;
         }
     } else {
-        println!("cluster status failed");
+        writeln!(stdout, "cluster status failed")?;
     }
-    print_cluster_diagnostics(&output.diagnostics);
+    write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn print_cluster_state_sync_human(output: &StateSyncOutput) {
+pub(crate) fn write_cluster_state_sync_human(
+    output: &StateSyncOutput,
+    stdout: &mut dyn Write,
+) -> Result<()> {
     let operation = match output.operation {
         omnigraph_cluster::StateSyncOperation::Observe => "observe",
     };
     if output.ok {
         let state = &output.state_observations;
-        println!(
+        writeln!(
+            stdout,
             "cluster {operation}: revision {}, {} resource(s)",
             state.state_revision, state.resource_count
-        );
+        )?;
         match output.authority {
             omnigraph_cluster::LedgerAuthority::Observed => {
-                println!("  authority: observed (no lock taken, nothing written)");
+                writeln!(
+                    stdout,
+                    "  authority: observed (no lock taken, nothing written)"
+                )?;
             }
             omnigraph_cluster::LedgerAuthority::Unlocked => {
-                println!("  authority: unlocked (state.lock is false)");
+                writeln!(stdout, "  authority: unlocked (state.lock is false)")?;
             }
             omnigraph_cluster::LedgerAuthority::Locked => {}
         }
         if let Some(cas) = state.state_cas.as_deref() {
-            println!("  state_cas: {cas}");
+            writeln!(stdout, "  state_cas: {cas}")?;
         }
         if state.lock_acquired {
-            println!("  lock: acquired{}", cluster_lock_summary(state));
+            writeln!(stdout, "  lock: acquired{}", cluster_lock_summary(state))?;
         } else if state.locked {
-            println!(
+            writeln!(
+                stdout,
                 "  lock: held by another process{}",
                 cluster_lock_summary(state)
-            );
+            )?;
         } else {
-            println!("  lock: not acquired");
+            writeln!(stdout, "  lock: not acquired")?;
         }
     } else {
-        println!("cluster {operation} failed");
+        writeln!(stdout, "cluster {operation} failed")?;
     }
-    print_cluster_diagnostics(&output.diagnostics);
+    write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn print_cluster_force_unlock_human(output: &ForceUnlockOutput) {
+pub(crate) fn write_cluster_force_unlock_human(
+    output: &ForceUnlockOutput,
+    stdout: &mut dyn Write,
+) -> Result<()> {
     if output.ok {
         if output.lock_removed {
-            println!(
+            writeln!(
+                stdout,
                 "cluster force-unlock: removed lock{}",
                 cluster_lock_summary(&output.state_observations)
-            );
+            )?;
         } else {
-            println!("cluster force-unlock: no lock removed");
+            writeln!(stdout, "cluster force-unlock: no lock removed")?;
         }
     } else {
-        println!("cluster force-unlock failed");
+        writeln!(stdout, "cluster force-unlock failed")?;
         if output.state_observations.locked {
-            println!(
+            writeln!(
+                stdout,
                 "  lock: held{}",
                 cluster_lock_summary(&output.state_observations)
-            );
+            )?;
         }
     }
-    print_cluster_diagnostics(&output.diagnostics);
+    write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
 pub(crate) fn cluster_lock_summary(state: &omnigraph_cluster::StateObservations) -> String {
@@ -632,59 +661,76 @@ pub(crate) fn diagnostic_detail_lines(
     lines
 }
 
-pub(crate) fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagnostic]) {
+pub(crate) fn write_cluster_diagnostics(
+    diagnostics: &[omnigraph_cluster::Diagnostic],
+    stdout: &mut dyn Write,
+) -> Result<()> {
     for diagnostic in diagnostics {
         let label = match diagnostic.severity {
             DiagnosticSeverity::Error => "ERROR",
             DiagnosticSeverity::Warning => "WARN ",
         };
-        println!(
+        writeln!(
+            stdout,
             "{label} {} {}: {}",
             diagnostic.code, diagnostic.path, diagnostic.message
-        );
+        )?;
         if let Some(detail) = &diagnostic.detail {
             let detail = omnigraph_api_types::DiagnosticOutput::from(detail.as_ref());
             for line in diagnostic_detail_lines(&detail) {
-                println!("{line}");
+                writeln!(stdout, "{line}")?;
             }
         }
     }
+    Ok(())
 }
 
-pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Result<Completion> {
+pub(crate) fn finish_cluster_validate(
+    output: &ValidateOutput,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_cluster_validate_human(output);
+        write_cluster_validate_human(output, stdout)?;
     }
     if !output.ok {
-        io::stdout().flush()?;
+        stdout.flush()?;
         return Ok(Completion::exit(1));
     }
     Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<Completion> {
+pub(crate) fn finish_cluster_plan(
+    output: &PlanOutput,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_cluster_plan_human(output);
+        write_cluster_plan_human(output, stdout)?;
     }
     if !output.ok {
-        io::stdout().flush()?;
+        stdout.flush()?;
         return Ok(Completion::exit(1));
     }
     Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<Completion> {
+pub(crate) fn finish_cluster_status(
+    output: &StatusOutput,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_cluster_status_human(output);
+        write_cluster_status_human(output, stdout)?;
     }
     if !output.ok {
-        io::stdout().flush()?;
+        stdout.flush()?;
         return Ok(Completion::exit(1));
     }
     Ok(Completion::success())
@@ -693,14 +739,15 @@ pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result
 pub(crate) fn finish_cluster_state_sync(
     output: &StateSyncOutput,
     json: bool,
+    stdout: &mut dyn Write,
 ) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_cluster_state_sync_human(output);
+        write_cluster_state_sync_human(output, stdout)?;
     }
     if !output.ok {
-        io::stdout().flush()?;
+        stdout.flush()?;
         return Ok(Completion::exit(1));
     }
     Ok(Completion::success())
@@ -709,14 +756,15 @@ pub(crate) fn finish_cluster_state_sync(
 pub(crate) fn finish_cluster_force_unlock(
     output: &ForceUnlockOutput,
     json: bool,
+    stdout: &mut dyn Write,
 ) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_cluster_force_unlock_human(output);
+        write_cluster_force_unlock_human(output, stdout)?;
     }
     if !output.ok {
-        io::stdout().flush()?;
+        stdout.flush()?;
         return Ok(Completion::exit(1));
     }
     Ok(Completion::success())
@@ -1185,73 +1233,6 @@ pub(crate) fn write_commit_human(commit: &CommitOutput, writer: &mut dyn Write) 
     }
     writeln!(writer, "created_at: {}", commit.created_at)?;
     Ok(())
-}
-
-pub(crate) fn print_policy_explain(
-    decision: &PolicyDecision,
-    actor_id: &str,
-    request: &PolicyRequest,
-) {
-    println!(
-        "decision: {}",
-        if decision.allowed { "allow" } else { "deny" }
-    );
-    println!("actor: {}", actor_id);
-    println!("action: {}", request.action);
-    if let Some(branch) = &request.branch {
-        println!("branch: {}", branch);
-    }
-    if let Some(target_branch) = &request.target_branch {
-        println!("target_branch: {}", target_branch);
-    }
-    if let Some(rule_id) = &decision.matched_rule_id {
-        println!("matched_rule: {}", rule_id);
-    }
-    println!("message: {}", decision.message);
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct QueriesIssue {
-    pub(crate) query: String,
-    pub(crate) message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) diagnostic: Option<omnigraph_api_types::DiagnosticOutput>,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct QueriesValidateOutput {
-    pub(crate) ok: bool,
-    pub(crate) breakages: Vec<QueriesIssue>,
-    pub(crate) warnings: Vec<QueriesIssue>,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct QueriesParam {
-    pub(crate) name: String,
-    #[serde(rename = "type")]
-    pub(crate) type_name: String,
-    pub(crate) nullable: bool,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct QueriesListItem {
-    pub(crate) name: String,
-    pub(crate) mcp_expose: bool,
-    pub(crate) tool_name: Option<String>,
-    pub(crate) mutation: bool,
-    /// `@description` from the query declaration — what the query is for.
-    /// Carried so the CLI catalog matches the HTTP `GET /queries` surface.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) description: Option<String>,
-    /// `@instruction` from the query declaration — how/when to invoke it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) instruction: Option<String>,
-    pub(crate) params: Vec<QueriesParam>,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct QueriesListOutput {
-    pub(crate) queries: Vec<QueriesListItem>,
 }
 
 pub(crate) fn finish_login(

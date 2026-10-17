@@ -3365,6 +3365,8 @@ fn cluster_force_unlock_wrong_id_exits_nonzero() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     write_cluster_lock(temp.path(), "held-lock", "plan");
+    let lock_path = temp.path().join("__cluster/lock.json");
+    let before = fs::read(&lock_path).unwrap();
 
     let json = parse_stdout_json(&output_failure(
         cli()
@@ -3384,7 +3386,7 @@ fn cluster_force_unlock_wrong_id_exits_nonzero() {
             .iter()
             .any(|diagnostic| diagnostic["code"] == "state_lock_id_mismatch")
     );
-    assert!(temp.path().join("__cluster/lock.json").exists());
+    assert_eq!(fs::read(&lock_path).unwrap(), before);
 }
 
 #[test]

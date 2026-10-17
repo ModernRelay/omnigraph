@@ -161,6 +161,15 @@ actor retention, and target-output failure before writable admission. Extend
 `cli_data` and `cli_cluster` for cleanup preview/consent and maintenance addressing;
 `crossversion_upgrade` retains ownership of storage-upgrade compatibility.
 
+Cluster delivery tests extend the application and output owners. Direct apply
+tests fail supplied stdout/stderr writes and flushes, then inspect the original
+receipt, retained lock, single deployment result and stable graph history. The
+served adapter's tests verify identity delivery before POST and receipt/timeout output failures without
+resubmission. `cli_cluster` and `cli_queries` own exact unlock refusals, graph
+filtering and wrong-plane refusal before configuration or HTTP access. The existing
+`system_remote` deployment matrix owns real server completion after delivery loss;
+these CLI changes require no additional query-semantic GQT cases.
+
 The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation

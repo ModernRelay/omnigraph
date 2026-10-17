@@ -155,6 +155,16 @@ before any refusal error. The storage-upgrade adapter retains its existing
 conversion and recovery owner. These commands do not use the data-write outcome
 envelope or replay an operation after delivery failure.
 
+`commands/cluster` owns direct cluster arguments and dispatch; `cluster_remote`
+owns served deployment submission and observation. `commands/control` owns applied
+stored-query inspection, policy tooling and graph listing. Their reports use the
+application's supplied writers. Served apply writes and flushes its original ID
+before sending the POST. Direct apply's core identity callback cannot return an
+error: the CLI captures any diagnostic delivery failure, lets that one core call
+finish, then returns the failure with its original ID, root and retained lock.
+Neither path replays work to recover output. Deployment and recovery authority
+remain in the cluster crate.
+
 CLI unit tests own invocation preparation and presentation; CLI process tests
 own argument, environment, configuration, transport, output and exit behavior.
 GQT owns query semantics across its execution adapters. Keep those boundaries

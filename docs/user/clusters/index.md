@@ -221,6 +221,13 @@ OMNIGRAPH_BEARER_TOKEN='secret' omnigraph cluster status \
   --server https://graph.example.com --deployment-id '<DEPLOYMENT_ID>' --json
 ```
 
+An output failure also returns nonzero without proving that deployment failed.
+Served apply must write and flush its deployment ID before submitting. Direct
+apply finishes its one deployment attempt even if its identity diagnostic cannot
+be written, then returns the output error with the original ID, root and lock
+information. Observe that identity before taking further action; failed output
+does not cause automatic resubmission.
+
 Status is read-only. `active` is false for an older result after a newer revision
 activates. Only the current runtime can prove activation; a durable completion
 receipt alone cannot. Repeating apply with the same ID and identical captured input
