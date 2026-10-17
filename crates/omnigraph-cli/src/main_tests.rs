@@ -2,8 +2,8 @@
 
 use super::{
     DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, branch_statement_change_request,
-    branch_statement_query_request, normalize_bearer_token,
-    resolve_remote_bearer_token_with_config, sync_dir,
+    branch_statement_query_request, normalize_bearer_token, resolve_remote_bearer_token_with_input,
+    sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -126,7 +126,8 @@ fn resolve_remote_bearer_token_falls_back_to_default_env() {
     }
 
     assert_eq!(
-        resolve_remote_bearer_token_with_config(
+        resolve_remote_bearer_token_with_input(
+            &crate::operator::InvocationConfig::at(None, None),
             &crate::operator::OperatorConfig::default(),
             Some("https://override.example.com"),
         )

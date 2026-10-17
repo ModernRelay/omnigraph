@@ -1,7 +1,7 @@
 //! Graph-batch loading. Source reads and backend-specific limits stay in GraphClient.
 use super::{CliLoadMode, LoadArgs, TransferScope};
 use crate::client::{self, GraphClient};
-use crate::helpers::{confirm_destructive_with_writer, resolve_branch, write_target};
+use crate::helpers::{confirm_destructive, resolve_branch, write_target};
 use crate::output::{write_json, write_load_human};
 use color_eyre::eyre::Result;
 use omnigraph::settings::{SettingId, SettingValue};
@@ -22,6 +22,7 @@ pub(crate) async fn run_load(
     args: LoadArgs,
     scope: TransferScope<'_>,
     managed_client: Option<GraphClient>,
+    input: &mut crate::input::Input<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
@@ -39,6 +40,7 @@ pub(crate) async fn run_load(
         Some(client) => client,
         None => {
             GraphClient::resolve_with_policy(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
@@ -46,6 +48,7 @@ pub(crate) async fn run_load(
                 scope.actor,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?
         }
@@ -58,7 +61,16 @@ pub(crate) async fn run_load(
         settings,
         json,
     };
-    execute_load(&client, operation, scope.yes, scope.quiet, stdout, stderr).await
+    execute_load(
+        &client,
+        operation,
+        scope.yes,
+        scope.quiet,
+        input,
+        stdout,
+        stderr,
+    )
+    .await
 }
 
 pub(crate) async fn execute_load(
@@ -66,6 +78,7 @@ pub(crate) async fn execute_load(
     operation: LoadOperation,
     yes: bool,
     quiet: bool,
+    input: &mut crate::input::Input<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
@@ -78,7 +91,14 @@ pub(crate) async fn execute_load(
         json,
     } = operation;
     if matches!(mode, CliLoadMode::Overwrite) {
-        confirm_destructive_with_writer("load --mode overwrite", client.uri(), yes, json, stderr)?;
+        confirm_destructive(
+            "load --mode overwrite",
+            client.uri(),
+            yes,
+            json,
+            input,
+            stderr,
+        )?;
     }
     write_target(quiet, "load", client.uri(), client.is_remote(), stderr)?;
     let payload = client
@@ -88,6 +108,7 @@ pub(crate) async fn execute_load(
             &data.to_string_lossy(),
             mode,
             &settings,
+            stderr,
         )
         .await?;
     if json {

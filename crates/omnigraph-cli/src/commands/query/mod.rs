@@ -21,10 +21,11 @@ use crate::client::{GraphClient, parse_set_flags};
 use crate::graph_http::GraphHttpClient;
 use crate::helpers::{
     confirm_destructive, remote_json, remote_url, resolve_query_path,
-    resolve_remote_bearer_token_with_config, resolve_server_flag_with_config,
+    resolve_remote_bearer_token_with_input, resolve_server_flag_with_config,
 };
+use crate::input::Input;
 use crate::invocation::MachineErrors;
-use crate::operator::{self, OperatorAlias, OperatorConfig};
+use crate::operator::{InvocationConfig, OperatorAlias, OperatorConfig};
 use crate::output::{write_change_human, write_json};
 use crate::planes::Capability;
 use crate::presentation::ReadPresentation;
@@ -35,6 +36,7 @@ use prepare::{Envelope, MutationOperation, QueryInput, ReadOperation};
 
 /// Only the global arguments this command family consumes.
 pub(crate) struct GraphScope<'a> {
+    pub operator: &'a InvocationConfig,
     pub capability: Capability,
     pub server: Option<&'a str>,
     pub graph: Option<&'a str>,
@@ -50,6 +52,7 @@ pub(crate) async fn run_query(
     managed_client: Option<GraphClient>,
     machine: &mut Option<MachineErrors>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<()> {
     let QueryArgs {
         name,
@@ -66,18 +69,20 @@ pub(crate) async fn run_query(
     // Ordinary query routing and rendering share this snapshot. A managed
     // client has already resolved its own context; preserve its existing
     // tolerance of an invalid optional operator presentation file.
+    let fallback = OperatorConfig::default();
     let operator = if managed_client.is_some() {
-        operator::load_operator_config().unwrap_or_default()
+        scope.operator.optional_get(stderr)?.unwrap_or(&fallback)
     } else {
-        operator::load_operator_config()?
+        scope.operator.get(stderr)?
     };
-    let presentation = ReadPresentation::capture(&operator, format, json, None);
+    let presentation = ReadPresentation::capture(operator, format, json, None);
     *machine = presentation.machine_errors();
     let client = if let Some(client) = managed_client {
         client
     } else {
         GraphClient::resolve_with_config(
-            &operator,
+            scope.operator,
+            operator,
             scope.capability,
             scope.server,
             scope.graph,
@@ -149,7 +154,9 @@ pub(crate) async fn run_mutate(
     args: MutateArgs,
     scope: GraphScope<'_>,
     managed_client: Option<GraphClient>,
+    input: &mut Input<'_>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<()> {
     let MutateArgs {
         name,
@@ -166,6 +173,7 @@ pub(crate) async fn run_mutate(
         client
     } else {
         GraphClient::resolve_with_policy(
+            scope.operator,
             scope.capability,
             scope.server,
             scope.graph,
@@ -173,6 +181,7 @@ pub(crate) async fn run_mutate(
             scope.actor,
             scope.profile,
             scope.store,
+            stderr,
         )
         .await?
     };
@@ -201,6 +210,7 @@ pub(crate) async fn run_mutate(
                     params_json.as_ref(),
                     if_commit.as_deref(),
                     &settings,
+                    stderr,
                 )
                 .await?
         }
@@ -218,23 +228,37 @@ pub(crate) async fn run_mutate(
         }
         MutationOperation::Branch(source, write) => {
             if let BranchWrite::Delete { .. } = &write {
-                confirm_destructive("branch delete", client.uri(), scope.yes, json)?;
+                confirm_destructive(
+                    "branch delete",
+                    client.uri(),
+                    scope.yes,
+                    json,
+                    input,
+                    stderr,
+                )?;
             }
             client
-                .branch_write_statement(source, write, &settings)
+                .branch_write_statement(source, write, &settings, stderr)
                 .await?
         }
         MutationOperation::Commit(source, write) => {
             if let CommitWrite::Drop { .. } = &write {
-                confirm_destructive("commit drop", client.uri(), scope.yes, json)?;
+                confirm_destructive("commit drop", client.uri(), scope.yes, json, input, stderr)?;
             }
             client
-                .commit_write_statement(source, write, &settings)
+                .commit_write_statement(source, write, &settings, stderr)
                 .await?
         }
         MutationOperation::Load(source, statement) => {
             if statement.mode == LoadStmtMode::Overwrite {
-                confirm_destructive("load csv (mode overwrite)", client.uri(), scope.yes, json)?;
+                confirm_destructive(
+                    "load csv (mode overwrite)",
+                    client.uri(),
+                    scope.yes,
+                    json,
+                    input,
+                    stderr,
+                )?;
             }
             // This constructs permission for an embedded source; it neither
             // opens that source nor applies a local policy to served execution.
@@ -244,7 +268,14 @@ pub(crate) async fn run_mutate(
                 embedded_file_source_policy(&statement.source)?
             };
             client
-                .load_statement(branch.as_deref(), source, statement, policy, &settings)
+                .load_statement(
+                    branch.as_deref(),
+                    source,
+                    statement,
+                    policy,
+                    &settings,
+                    stderr,
+                )
                 .await?
         }
     };
@@ -257,9 +288,11 @@ pub(crate) async fn run_mutate(
 }
 
 pub(crate) async fn run_alias(
+    input: &InvocationConfig,
     args: AliasArgs,
     machine: &mut Option<MachineErrors>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<()> {
     let AliasArgs {
         name,
@@ -268,7 +301,7 @@ pub(crate) async fn run_alias(
         format,
         json,
     } = args;
-    let operator_config = operator::load_operator_config()?;
+    let operator_config = input.get(stderr)?;
     let Some(operator_alias) = operator_config.aliases.get(&name) else {
         let defined: Vec<&str> = operator_config.aliases.keys().map(String::as_str).collect();
         bail!(
@@ -278,10 +311,11 @@ pub(crate) async fn run_alias(
         );
     };
     let presentation =
-        ReadPresentation::capture(&operator_config, format, json, operator_alias.format);
+        ReadPresentation::capture(operator_config, format, json, operator_alias.format);
     *machine = presentation.machine_errors();
     let output = execute_operator_alias(
-        &operator_config,
+        input,
+        operator_config,
         &name,
         operator_alias,
         &args,
@@ -329,6 +363,7 @@ fn load_params_json(params: &ParamsArgs) -> Result<Option<Value>> {
 }
 
 async fn execute_operator_alias(
+    input: &InvocationConfig,
     operator_config: &OperatorConfig,
     alias_name: &str,
     alias: &OperatorAlias,
@@ -341,7 +376,7 @@ async fn execute_operator_alias(
         resolve_server_flag_with_config(operator_config, Some(&root), alias.graph.as_deref())?
             .expect("server name is present");
     let client = GraphHttpClient::new(&root)?;
-    let bearer_token = resolve_remote_bearer_token_with_config(operator_config, Some(&uri))?;
+    let bearer_token = resolve_remote_bearer_token_with_input(input, operator_config, Some(&uri))?;
     let params = prepare::alias_params(alias_name, alias, alias_args, explicit_params)?;
     let mut body = serde_json::Map::new();
     body.insert("expect_mutation".to_string(), Value::Bool(false));

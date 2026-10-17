@@ -12,6 +12,7 @@ pub(crate) async fn run_lint(
     args: LintArgs,
     scope: SchemaScope<'_>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let LintArgs {
         uri,
@@ -28,12 +29,14 @@ pub(crate) async fn run_lint(
     } else {
         Some(
             resolve_maintenance_uri(
+                scope.operator,
                 scope.profile.as_deref(),
                 scope.store.as_deref(),
                 scope.cluster,
                 scope.graph,
                 uri,
                 "lint",
+                stderr,
             )
             .await?,
         )

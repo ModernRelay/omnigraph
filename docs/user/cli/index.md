@@ -190,13 +190,18 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
 The token is stored separately from `config.yaml`. A server resolves the actor
 from the token; clients cannot override it with `--as`.
 
-Ordinary graph commands and `graphs list` use one copy of the operator configuration
-during client setup. Editing that file during discovery does not change the
-client's destination or which configured server supplies its credentials.
-Token values still use the usual environment and credentials-file lookup.
-Operator aliases and served `cluster plan`, `cluster apply`, and `cluster status`
-follow the same rule. `query` and aliases also retain their output format and
-table settings from that captured configuration through execution and rendering.
+Each invocation keeps its selected operator home and ambient profile, then reads
+the operator configuration once when needed. Editing that file during a command
+does not change its destination, actor defaults or presentation settings; unknown
+keys warn once. Ordinary graph clients also keep the token selected during setup,
+so replacing the credentials file during discovery cannot change the token
+between registry probing and the command. Token selection still follows the usual
+environment and credentials-file precedence. Managed session renewal follows its
+existing authentication flow.
+
+Named-server `login` without `--token` reads only the first line of stdin. Its
+credential writes and `logout` use the operator home selected when the invocation
+began.
 
 ## Output and errors
 
@@ -212,6 +217,13 @@ been captured, error formatting uses only explicit command-line flags.
 `mutate` still requires explicit `--json` for structured errors. For reads,
 unstructured transport failures and malformed error bodies remain diagnostics
 on stderr.
+
+Output delivery failures return nonzero without undoing completed work. A failed
+login/logout report may follow a completed credential change; skill export or
+embedding generation may have already written its files. The CLI does not repeat
+those operations to recover output. `skill show` keeps its existing exception:
+a reader closing the pipe early is accepted.
+
 See [output formats](reference.md#query-inputs-and-output)
 and [diagnostics](../queries/diagnostics.md).
 

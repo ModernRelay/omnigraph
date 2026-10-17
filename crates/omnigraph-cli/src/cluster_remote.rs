@@ -16,7 +16,7 @@ use crate::commands::cluster::core_deployment_result;
 use crate::graph_http::{ApiContractError, GraphHttpClient, ServerTransport};
 use crate::helpers::{
     RemoteErrorCli, apply_bearer_token, remote_response_json_bounded, remote_url,
-    resolve_remote_bearer_token_with_config, resolve_server_flag_with_config,
+    resolve_remote_bearer_token_with_input, resolve_server_flag_with_config,
 };
 use crate::output::write_json;
 
@@ -151,16 +151,20 @@ struct RemoteCluster {
 }
 
 impl RemoteCluster {
-    fn new(server: &str) -> Result<Self> {
+    fn new(
+        input: &crate::operator::InvocationConfig,
+        server: &str,
+        stderr: &mut dyn Write,
+    ) -> Result<Self> {
         // Preserve literal address errors before operator-config errors.
         // Named addresses need configuration first.
         if server.contains("://") {
             ServerTransport::parse(server)?;
         }
-        let operator_config = crate::operator::load_operator_config()?;
-        let root = resolve_server_flag_with_config(&operator_config, Some(server), None)?
+        let operator_config = input.get(stderr)?;
+        let root = resolve_server_flag_with_config(operator_config, Some(server), None)?
             .expect("explicit server");
-        let token = resolve_remote_bearer_token_with_config(&operator_config, Some(&root))?;
+        let token = resolve_remote_bearer_token_with_input(input, operator_config, Some(&root))?;
         let client = GraphHttpClient::new(&root)?;
         Ok(Self {
             root,
@@ -469,6 +473,7 @@ fn wait_timeout(
 }
 
 pub(crate) async fn dispatch(
+    input: &crate::operator::InvocationConfig,
     cli: &Cli,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -507,7 +512,7 @@ pub(crate) async fn dispatch(
     ) {
         bail!("--writers-stopped cannot be used with --server");
     }
-    let remote = RemoteCluster::new(server)?;
+    let remote = RemoteCluster::new(input, server, stderr)?;
     match command {
         ClusterCommand::Plan { config, json, .. } => remote.plan(config, *json, stdout).await?,
         ClusterCommand::Apply {

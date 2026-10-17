@@ -8,6 +8,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Write;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAX_CREDENTIAL: usize = 64 * 1024;
@@ -347,15 +348,22 @@ fn skips_context(cli: &Cli) -> bool {
 /// an unknown profile or matching-looking server URL is ambiguous beside a
 /// managed binding. Call it only after selecting a valid exact-directory
 /// context, so ordinary commands retain their own operator-config behavior.
-fn has_ambient_target() -> Result<bool> {
-    if std::env::var_os(crate::scope::PROFILE_ENV).is_some_and(|value| !value.is_empty()) {
+fn has_ambient_target(
+    input: &crate::operator::InvocationConfig,
+    stderr: &mut dyn Write,
+) -> Result<bool> {
+    if input.has_profile() {
         return Ok(true);
     }
-    let operator = crate::operator::load_operator_config().map_err(|_| {
-        Failure::refused(
-            "operator_config_invalid",
-            "cannot read valid operator configuration to exclude a competing data target",
-        )
+    let operator = input.get(stderr).map_err(|error| {
+        if error.downcast_ref::<std::io::Error>().is_some() {
+            Failure::output_delivery()
+        } else {
+            Failure::refused(
+                "operator_config_invalid",
+                "cannot read valid operator configuration to exclude a competing data target",
+            )
+        }
     })?;
     Ok(operator.default_server().is_some() || operator.default_store().is_some())
 }
@@ -422,7 +430,7 @@ async fn resolve_with_acquisition(
     cli: &Cli,
     cwd: &std::path::Path,
     store: &impl Store,
-    ambient: impl Fn() -> Result<bool>,
+    mut ambient: impl FnMut() -> Result<bool>,
     identity: impl AsyncFn(&Context) -> Result<Option<String>>,
     api: impl AsyncFn(&Context) -> Result<Api>,
 ) -> Result<Option<GraphClient>> {
@@ -433,7 +441,7 @@ async fn resolve_with_acquisition(
         return Ok(None);
     };
     // One folder/account binding owns the whole invocation, including renewal.
-    let mut resolved = resolve_context(cli, &context, store, &ambient);
+    let mut resolved = resolve_context(cli, &context, store, &mut ambient);
     let expected = if matches!(&resolved, Ok(Some(_))) {
         let expected = identity(&context).await?;
         if expected.as_ref().is_some_and(|id| {
@@ -500,7 +508,11 @@ async fn resolve_with_acquisition(
     }
 }
 
-pub(crate) async fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>, Output> {
+pub(crate) async fn client(
+    input: &crate::operator::InvocationConfig,
+    cli: &Cli,
+    stderr: &mut dyn Write,
+) -> std::result::Result<Option<GraphClient>, Output> {
     if skips_context(cli) {
         return Ok(None);
     }
@@ -530,7 +542,7 @@ pub(crate) async fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>
             cli,
             &cwd,
             &auth::DATA_STORE,
-            has_ambient_target,
+            || has_ambient_target(input, stderr),
             async |context| auth::selected_principal(&context.api, &context.organization_id).await,
             async |context| {
                 Api::authenticated(context.api.clone(), Some(&context.organization_id)).await

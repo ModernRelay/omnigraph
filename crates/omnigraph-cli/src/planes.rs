@@ -658,10 +658,15 @@ mod tests {
             ];
             args.extend_from_slice(extra);
             let cli = Cli::try_parse_from(args).unwrap();
-            let error = crate::cluster_remote::dispatch(&cli, &mut Vec::new(), &mut Vec::new())
-                .await
-                .unwrap_err()
-                .to_string();
+            let error = crate::cluster_remote::dispatch(
+                &crate::operator::InvocationConfig::at(None, None),
+                &cli,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
             assert!(error.contains(expected), "{error}");
         }
     }

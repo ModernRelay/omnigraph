@@ -2,7 +2,7 @@
 use super::prepare::{ChangeFilter, Pagination};
 use super::{BranchCommand, HistoryScope, run_diff};
 use crate::client::{self, GraphClient};
-use crate::helpers::{confirm_destructive_with_writer, resolve_branch, write_target};
+use crate::helpers::{confirm_destructive, resolve_branch, write_target};
 use crate::output::{write_json, write_merge_base_human};
 use color_eyre::eyre::Result;
 use std::io::Write;
@@ -10,6 +10,7 @@ use std::io::Write;
 pub(crate) async fn run_branch(
     command: BranchCommand,
     scope: HistoryScope<'_>,
+    input: &mut crate::input::Input<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
@@ -21,6 +22,7 @@ pub(crate) async fn run_branch(
             json,
         } => {
             let client = GraphClient::resolve_with_policy(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
@@ -28,6 +30,7 @@ pub(crate) async fn run_branch(
                 scope.actor,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?;
             let from = resolve_branch(from, None, "main");
@@ -38,7 +41,7 @@ pub(crate) async fn run_branch(
                 client.is_remote(),
                 stderr,
             )?;
-            let payload = client.branch_create_from(&from, &name).await?;
+            let payload = client.branch_create_from(&from, &name, stderr).await?;
             if json {
                 write_json(&payload, stdout)?;
             } else {
@@ -51,12 +54,14 @@ pub(crate) async fn run_branch(
         }
         BranchCommand::List { uri, json } => {
             let client = GraphClient::resolve(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
                 uri,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?;
             let payload = client.branch_list().await?;
@@ -70,6 +75,7 @@ pub(crate) async fn run_branch(
         }
         BranchCommand::Delete { uri, name, json } => {
             let client = GraphClient::resolve_with_policy(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
@@ -77,13 +83,15 @@ pub(crate) async fn run_branch(
                 scope.actor,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?;
-            confirm_destructive_with_writer(
+            confirm_destructive(
                 "branch delete",
                 client.uri(),
                 scope.yes,
                 json,
+                input,
                 stderr,
             )?;
             write_target(
@@ -93,7 +101,7 @@ pub(crate) async fn run_branch(
                 client.is_remote(),
                 stderr,
             )?;
-            let payload = client.branch_delete(&name).await?;
+            let payload = client.branch_delete(&name, stderr).await?;
             if json {
                 write_json(&payload, stdout)?;
             } else {
@@ -112,6 +120,7 @@ pub(crate) async fn run_branch(
         } => {
             let settings = client::parse_set_flags(&settings)?;
             let client = GraphClient::resolve_with_policy(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
@@ -119,6 +128,7 @@ pub(crate) async fn run_branch(
                 scope.actor,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?;
             let into = resolve_branch(into, None, "main");
@@ -132,7 +142,15 @@ pub(crate) async fn run_branch(
                 )?;
             }
             let payload = client
-                .branch_merge(&source, &into, delete_branch, as_commit, dry_run, &settings)
+                .branch_merge(
+                    &source,
+                    &into,
+                    delete_branch,
+                    as_commit,
+                    dry_run,
+                    &settings,
+                    stderr,
+                )
                 .await?;
             // Keep the successful merge receipt on stdout; optional
             // deletion has its own structured result and human warning.
@@ -188,12 +206,14 @@ pub(crate) async fn run_branch(
             json,
         } => {
             let client = GraphClient::resolve(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
                 uri,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?;
             let into = resolve_branch(into, None, "main");
@@ -218,12 +238,14 @@ pub(crate) async fn run_branch(
             json,
         } => {
             let client = GraphClient::resolve(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
                 uri,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?;
             let into = resolve_branch(into, None, "main");

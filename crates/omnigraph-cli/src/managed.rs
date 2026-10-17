@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use url::Url;
 
+pub(crate) mod args;
 mod auth;
 pub(crate) mod data;
 mod deployment;
@@ -53,6 +54,13 @@ impl Failure {
     fn refused(kind: &str, detail: &str) -> Self {
         Self::new(kind, detail, 2)
     }
+    fn output_delivery() -> Self {
+        Self::new(
+            "output_delivery_failed",
+            "could not deliver CLI diagnostic",
+            1,
+        )
+    }
     fn protocol() -> Self {
         Self::new(
             "api_response_invalid",
@@ -67,6 +75,7 @@ pub(crate) struct Output {
     exit: i32,
     json: bool,
     human: Option<String>,
+    recovery: Option<Value>,
 }
 
 impl Output {
@@ -77,40 +86,129 @@ impl Output {
                 exit,
                 json,
                 human: None,
+                recovery: None,
             },
             Err(err) => Self {
                 body: err.body,
                 exit: err.exit,
                 json,
                 human: None,
+                recovery: None,
             },
         }
     }
 
-    pub(crate) fn emit(self) -> color_eyre::Result<i32> {
-        if self.json {
-            println!("{}", serde_json::to_string(&self.body)?);
-        } else if let Some(human) = self.human {
-            print!("{human}");
-        } else if let Some(detail) = self.body.get("detail").and_then(Value::as_str) {
-            eprintln!(
-                "{}: {detail}",
-                self.body["type"].as_str().unwrap_or("error")
-            );
-            for field in [
-                "accepted_deployment",
-                "requested_deployment_id",
-                "submission",
-            ] {
-                if let Some(value) = self.body.get(field) {
-                    eprintln!("{field}: {value}");
+    pub(crate) fn emit(
+        self,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> color_eyre::Result<i32> {
+        let delivered = (|| -> color_eyre::Result<()> {
+            if self.json {
+                writeln!(stdout, "{}", serde_json::to_string(&self.body)?)?;
+                stdout.flush()?;
+            } else if let Some(human) = &self.human {
+                write!(stdout, "{human}")?;
+                stdout.flush()?;
+            } else if let Some(detail) = self.body.get("detail").and_then(Value::as_str) {
+                writeln!(
+                    stderr,
+                    "{}: {detail}",
+                    self.body["type"].as_str().unwrap_or("error")
+                )?;
+                for field in [
+                    "accepted_deployment",
+                    "requested_deployment_id",
+                    "submission",
+                ] {
+                    if let Some(value) = self.body.get(field) {
+                        writeln!(stderr, "{field}: {value}")?;
+                    }
                 }
+                if self.body["type"] == "output_delivery_failed" {
+                    let recovery = recovery_evidence(&self.body);
+                    for field in ["accepted_operation", "idempotency_key", "original_error"] {
+                        if let Some(value) = recovery.get(field) {
+                            writeln!(stderr, "{field}: {value}")?;
+                        }
+                    }
+                }
+                stderr.flush()?;
+            } else {
+                writeln!(stdout, "{}", serde_json::to_string_pretty(&self.body)?)?;
+                stdout.flush()?;
             }
-        } else {
-            println!("{}", serde_json::to_string_pretty(&self.body)?);
-        }
+            Ok(())
+        })();
+        delivered.map_err(|error| {
+            let mut evidence = recovery_evidence(&self.body);
+            if let Some(recovery) = &self.recovery {
+                evidence["request"] = recovery.clone();
+            }
+            error.wrap_err(format!(
+                "managed output delivery failed (result exit {}): {}",
+                self.exit, evidence
+            ))
+        })?;
         Ok(self.exit)
     }
+}
+
+/// Keep recovery facts if the selected stream cannot deliver the result. Do
+/// not copy source-export contents, human display text, or credential extras
+/// into an error that the process may subsequently report on another stream.
+fn recovery_evidence(body: &Value) -> Value {
+    let mut evidence = json!({});
+    for field in [
+        "type",
+        "title",
+        "detail",
+        "accepted_operation",
+        "accepted_deployment",
+        "requested_deployment_id",
+        "operation_id",
+        "submission",
+        "idempotency_key",
+    ] {
+        if let Some(value) = body.get(field) {
+            evidence[field] = value.clone();
+        }
+    }
+    if let Some(original) = body.get("original_error") {
+        evidence["original_error"] = recovery_evidence(original);
+    }
+    for field in [
+        "cluster_id",
+        "incarnation",
+        "operation_id",
+        "kind",
+        "state",
+        "deployment_id",
+        "native_deployment_id",
+        "preview_id",
+        "revision",
+        "delivery",
+        "archive",
+        "native_result_status",
+        "principal_id",
+        "account_id",
+        "expires_at",
+        "logged_out",
+        "local_credential_removed",
+        "revocation_performed",
+    ] {
+        if let Some(value) = body.get("data").and_then(|data| data.get(field)) {
+            evidence["data"][field] = value.clone();
+        }
+    }
+    evidence
+}
+
+fn write_diagnostic(stderr: &mut dyn Write, message: std::fmt::Arguments<'_>) -> Result<()> {
+    stderr
+        .write_fmt(message)
+        .and_then(|()| stderr.flush())
+        .map_err(|_| Failure::output_delivery())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,7 +653,7 @@ fn cluster_matches(body: &Value, cluster: &str) -> Result<()> {
     Ok(())
 }
 
-fn idempotency_key(value: Option<&str>) -> Result<String> {
+fn idempotency_key(value: Option<&str>, stderr: &mut dyn Write) -> Result<String> {
     let key = value.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     if key.is_empty() || key.len() > 256 || !key.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(Failure::refused(
@@ -563,7 +661,10 @@ fn idempotency_key(value: Option<&str>) -> Result<String> {
             "idempotency keys must contain 1–256 printable ASCII characters without spaces",
         ));
     }
-    eprintln!("Idempotency-Key: {key}");
+    write_diagnostic(stderr, format_args!("Idempotency-Key: {key}\n")).map_err(|mut error| {
+        error.body["idempotency_key"] = json!(key);
+        error
+    })?;
     Ok(key)
 }
 
@@ -609,6 +710,7 @@ async fn cluster_command(
     cli: &Cli,
     context: &Context,
     command: &ClusterCommand,
+    stderr: &mut dyn Write,
 ) -> Result<(Value, i32)> {
     if let ClusterCommand::Token { ttl, clear, .. } = command {
         return data::token(cli, context, *ttl, *clear)
@@ -616,11 +718,11 @@ async fn cluster_command(
             .map(|body| (body, 0));
     }
     let api = Api::authenticated(context.api.clone(), Some(&context.organization_id)).await?;
-    deployment::dispatch(&api, context, command).await
+    deployment::dispatch(&api, context, command, stderr).await
 }
 
 /// Only explicit managed commands and managed authentication enter this dispatcher.
-pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
+pub(crate) async fn dispatch(cli: &Cli, stderr: &mut dyn Write) -> Option<Output> {
     match &cli.command {
         Command::Organization {
             managed: true,
@@ -639,7 +741,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
             }) {
                 return Some(Output::from_result(Err(error), target.json, 2));
             }
-            Some(organization::dispatch(target, command).await)
+            Some(organization::dispatch(target, command, stderr).await)
         }
         Command::Login {
             api: Some(api),
@@ -652,7 +754,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
                 let origin = canonical_origin(api)?;
                 let selected =
                     session_organization(Path::new("."), &origin, organization.as_deref())?;
-                auth::login(origin, selected.as_deref()).await
+                auth::login(origin, selected.as_deref(), stderr).await
             }
             .await;
             Some(Output::from_result(result, *json, 0))
@@ -745,7 +847,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
                 return Some(members::list(config, json).await);
             }
             if lifecycle::handles(command) {
-                return Some(match lifecycle::dispatch(command).await {
+                return Some(match lifecycle::dispatch(command, stderr).await {
                     Ok((body, exit)) => Output::from_result(Ok(body), json, exit),
                     Err(err) => Output::from_result(Err(err), json, 1),
                 });
@@ -757,7 +859,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
                         "cluster --managed requires the selected folder's .omnigraph/context",
                     )
                 })?;
-                cluster_command(cli, &context, command).await
+                cluster_command(cli, &context, command, stderr).await
             }
             .await;
             Some(match result {

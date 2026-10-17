@@ -2,13 +2,11 @@
 //! remote HTTP, env/token handling, scaffolding (moved verbatim from
 //! main.rs in the modularization).
 
-use std::io::IsTerminal;
-
 use omnigraph_api_types::{ChangeRequest, QueryRequest, query_file_refusals};
 use omnigraph_compiler::query::ast::QueryFile;
 
 use super::*;
-use crate::operator::{self, OperatorConfig};
+use crate::operator::{self, InvocationConfig, OperatorConfig};
 
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
@@ -62,21 +60,18 @@ pub(crate) fn write_target(
 /// against a non-local scope (RFC-011 Decision 9). A local target needs no
 /// confirmation; otherwise `--yes` consents, an interactive TTY is prompted, and
 /// a non-TTY / `--json` run refuses rather than silently proceeding.
-pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool) -> Result<()> {
-    confirm_destructive_with_writer(label, uri, yes, json, &mut io::stderr())
-}
-
-pub(crate) fn confirm_destructive_with_writer(
+pub(crate) fn confirm_destructive(
     label: &str,
     uri: &str,
     yes: bool,
     json: bool,
+    input: &mut crate::input::Input<'_>,
     stderr: &mut dyn Write,
 ) -> Result<()> {
     if uri_is_local(uri) || yes {
         return Ok(());
     }
-    if json || !std::io::stdin().is_terminal() {
+    if json || !input.is_terminal {
         bail!(
             "refusing destructive `{label}` against non-local target {uri} without confirmation; \
              pass --yes to confirm (an interactive TTY would be prompted instead)"
@@ -87,8 +82,7 @@ pub(crate) fn confirm_destructive_with_writer(
         "About to run a destructive `{label}` against {uri} (not local). Type 'yes' to continue: "
     )?;
     stderr.flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
+    let answer = crate::input::read_line(input.reader)?;
     match answer.trim().to_ascii_lowercase().as_str() {
         "yes" | "y" => Ok(()),
         _ => bail!("aborted: destructive `{label}` not confirmed"),
@@ -158,14 +152,15 @@ pub(crate) struct ResolvedCliGraph {
 /// THE actor chain (RFC-011) — every command that needs an identity
 /// resolves through this one function (one path per concern):
 /// `--as` > `operator.actor` in ~/.omnigraph/config.yaml > none.
-pub(crate) fn resolve_actor(cli_as: Option<&str>) -> Result<Option<String>> {
+pub(crate) fn resolve_actor(
+    input: &InvocationConfig,
+    cli_as: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<Option<String>> {
     if let Some(actor) = cli_as {
         return Ok(Some(actor.to_string()));
     }
-    Ok(resolve_actor_with_config(
-        &operator::load_operator_config()?,
-        cli_as,
-    ))
+    Ok(resolve_actor_with_config(input.get(stderr)?, cli_as))
 }
 
 pub(crate) fn resolve_actor_with_config(
@@ -177,12 +172,20 @@ pub(crate) fn resolve_actor_with_config(
         .map(str::to_string)
 }
 
-pub(crate) fn resolve_cluster_actor(cli_as: Option<&str>) -> Result<Option<String>> {
-    resolve_actor(cli_as)
+pub(crate) fn resolve_cluster_actor(
+    input: &InvocationConfig,
+    cli_as: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<Option<String>> {
+    resolve_actor(input, cli_as, stderr)
 }
 
-pub(crate) fn resolve_cli_actor(cli_as: Option<&str>) -> Result<Option<String>> {
-    resolve_actor(cli_as)
+pub(crate) fn resolve_cli_actor(
+    input: &InvocationConfig,
+    cli_as: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<Option<String>> {
+    resolve_actor(input, cli_as, stderr)
 }
 
 /// The bearer token for a remote request (RFC-011): the operator keyed chain
@@ -190,24 +193,22 @@ pub(crate) fn resolve_cli_actor(cli_as: Option<&str>) -> Result<Option<String>> 
 /// file), then the default `OMNIGRAPH_BEARER_TOKEN` env. No omnigraph.yaml
 /// chain.
 ///
-/// Match against the captured server bindings, but read credentials live.
-pub(crate) fn resolve_remote_bearer_token_with_config(
+/// Match the captured bindings and credential-file location. Environment
+/// secrets are acquired only when this invocation selects a remote credential.
+pub(crate) fn resolve_remote_bearer_token_with_input(
+    input: &InvocationConfig,
     operator_config: &OperatorConfig,
     explicit_uri: Option<&str>,
 ) -> Result<Option<String>> {
-    // The keyed hop (RFC-007 §D4, gh-host model): when the effective remote
-    // URL belongs to an operator-defined server, that server's keyed chain
-    // applies first — OMNIGRAPH_TOKEN_<NAME> env, then the 0600 credentials
-    // file. The keyed token is structurally scoped to its own server: a URL
-    // matching no operator server never sees it.
     if let Some(remote_url) = explicit_uri.filter(|uri| is_remote_uri(uri)) {
         if let Some(server) = operator_config.find_server_for_url(remote_url) {
-            if let Some(token) = operator::resolve_keyed_token(server)? {
+            if let Some(token) =
+                operator::resolve_keyed_token_at(server, input.credentials_path().as_deref())?
+            {
                 return Ok(Some(token));
             }
         }
     }
-
     Ok(bearer_token_from_env(DEFAULT_BEARER_TOKEN_ENV))
 }
 
@@ -608,16 +609,20 @@ pub(crate) fn resolve_local_uri(cli_uri: Option<String>, operation: &str) -> Res
 /// capability (so a server scope is rejected, a cluster scope is allowed when the
 /// verb opts into cluster addressing), then mapped to a storage URI by
 /// `resolve_storage_uri`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_maintenance_uri(
+    input: &InvocationConfig,
     profile: Option<&str>,
     store: Option<&str>,
     cluster: Option<&str>,
     graph: Option<&str>,
     cli_uri: Option<String>,
     operation: &str,
+    stderr: &mut dyn Write,
 ) -> Result<String> {
-    let scope = scope::resolve_scope_from_env(
-        &operator::load_operator_config()?,
+    let scope = scope::resolve_scope(
+        input.get(stderr)?,
+        input.profile(),
         planes::Capability::Direct,
         scope::ScopeFlags {
             profile,
@@ -819,24 +824,141 @@ mod tests {
         assert!(!uri_is_local("gs://bucket/graph.omni"));
     }
 
-    // RFC-011 Decision 9: a non-local destructive write with `--json` (the CI
-    // shape — also covers the no-TTY case, since tests run without a terminal)
-    // refuses rather than proceeding; a local one and an explicit `--yes` pass.
     #[test]
     fn confirm_destructive_refuses_non_local_without_consent() {
-        let err = confirm_destructive("cleanup", "s3://b/g.omni", false, true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--yes"), "{err}");
+        for (terminal, json) in [(false, false), (false, true), (true, true)] {
+            let mut reader = std::io::Cursor::new(b"yes\n");
+            let mut stderr = Vec::new();
+            let error = confirm_destructive(
+                "cleanup",
+                "s3://b/g.omni",
+                false,
+                json,
+                &mut crate::input::Input {
+                    reader: &mut reader,
+                    is_terminal: terminal,
+                },
+                &mut stderr,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("--yes"), "{error}");
+            assert_eq!(reader.position(), 0);
+            assert!(stderr.is_empty());
+        }
     }
 
     #[test]
     fn confirm_destructive_allows_local_and_explicit_yes() {
-        // Local needs no confirmation, even with --json.
-        assert!(confirm_destructive("cleanup", "file:///tmp/g.omni", false, true).is_ok());
-        assert!(confirm_destructive("branch delete", "graph.omni", false, true).is_ok());
-        // --yes consents to a non-local target.
-        assert!(confirm_destructive("cleanup", "s3://b/g.omni", true, true).is_ok());
+        for (uri, yes) in [
+            ("file:///tmp/g.omni", false),
+            ("graph.omni", false),
+            ("s3://b/g.omni", true),
+        ] {
+            let mut reader = std::io::Cursor::new(b"no\n");
+            let mut stderr = Vec::new();
+            confirm_destructive(
+                "cleanup",
+                uri,
+                yes,
+                true,
+                &mut crate::input::Input {
+                    reader: &mut reader,
+                    is_terminal: false,
+                },
+                &mut stderr,
+            )
+            .unwrap();
+            assert_eq!(reader.position(), 0);
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn confirmation_uses_supplied_io_and_consumes_only_the_answer() {
+        use std::io::{self, Read, Write};
+        for (answer, accepted) in [(" YES ", true), ("y", true), ("no", false), ("", false)] {
+            let bytes = format!("{answer}\nnext payload");
+            let mut reader = io::Cursor::new(bytes);
+            let mut stderr = Vec::new();
+            let result = confirm_destructive(
+                "cleanup",
+                "s3://b/g.omni",
+                false,
+                false,
+                &mut crate::input::Input {
+                    reader: &mut reader,
+                    is_terminal: true,
+                },
+                &mut stderr,
+            );
+            assert_eq!(result.is_ok(), accepted);
+            assert_eq!(reader.position(), (answer.len() + 1) as u64);
+            assert_eq!(
+                String::from_utf8(stderr).unwrap(),
+                "About to run a destructive `cleanup` against s3://b/g.omni (not local). Type 'yes' to continue: "
+            );
+        }
+        struct FailedPrompt {
+            flush: bool,
+        }
+        impl Write for FailedPrompt {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        for flush in [false, true] {
+            let mut reader = io::Cursor::new(b"yes\n");
+            let error = confirm_destructive(
+                "cleanup",
+                "s3://b/g.omni",
+                false,
+                false,
+                &mut crate::input::Input {
+                    reader: &mut reader,
+                    is_terminal: true,
+                },
+                &mut FailedPrompt { flush },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(
+                reader.position(),
+                0,
+                "a failed prompt must not consume consent"
+            );
+        }
+        struct FailedInput;
+        impl Read for FailedInput {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::UnexpectedEof.into())
+            }
+        }
+        let error = confirm_destructive(
+            "cleanup",
+            "s3://b/g.omni",
+            false,
+            false,
+            &mut crate::input::Input {
+                reader: &mut FailedInput,
+                is_terminal: true,
+            },
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     // RFC-011 Decision 2: `--server` accepts a literal URL (value with `://`),

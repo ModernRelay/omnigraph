@@ -14,8 +14,6 @@
 //! mismatches (e.g. a server scope on a maintenance verb) only on the *new*
 //! resolution paths.
 
-use std::env;
-
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 
@@ -45,18 +43,6 @@ pub(crate) struct ScopeFlags<'a> {
     pub(crate) cluster: Option<&'a str>,
     pub(crate) graph: Option<&'a str>,
     pub(crate) uri: Option<String>,
-}
-
-/// Capture the ambient profile at the existing resolution boundary. Missing
-/// and non-Unicode values remain absent; the pure resolver ignores empty values.
-/// Configuration loading, credential acquisition and discovery stay with callers.
-pub(crate) fn resolve_scope_from_env(
-    op: &OperatorConfig,
-    capability: Capability,
-    flags: ScopeFlags<'_>,
-) -> Result<ResolvedScope> {
-    let ambient_profile = env::var(PROFILE_ENV).ok();
-    resolve_scope(op, ambient_profile.as_deref(), capability, flags)
 }
 
 /// Resolve only from supplied values, without environment or I/O access.

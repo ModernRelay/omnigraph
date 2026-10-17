@@ -16,6 +16,7 @@ pub(crate) use load::run_load;
 /// Only the existing global arguments consumed by this command family.
 #[derive(Clone, Copy)]
 pub(crate) struct TransferScope<'a> {
+    pub(crate) operator: &'a crate::operator::InvocationConfig,
     pub capability: Capability,
     pub server: Option<&'a str>,
     pub graph: Option<&'a str>,
@@ -30,6 +31,7 @@ pub(crate) async fn run_export(
     args: ExportArgs,
     scope: TransferScope<'_>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<()> {
     let ExportArgs {
         uri,
@@ -37,12 +39,14 @@ pub(crate) async fn run_export(
         type_names,
     } = args;
     let client = GraphClient::resolve(
+        scope.operator,
         scope.capability,
         scope.server,
         scope.graph,
         uri,
         scope.profile,
         scope.store,
+        stderr,
     )
     .await?;
     let branch = resolve_branch(branch, None, "main");

@@ -3,6 +3,7 @@ use crate::app::Completion;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
+    input: &crate::operator::InvocationConfig,
     profile: &Option<String>,
     store: &Option<String>,
     uri: Option<String>,
@@ -12,8 +13,9 @@ pub(crate) async fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let target = scope::resolve_scope_from_env(
-        &operator::load_operator_config()?,
+    let target = scope::resolve_scope(
+        input.get(stderr)?,
+        input.profile(),
         planes::Capability::Direct,
         scope::ScopeFlags {
             profile: profile.as_deref(),

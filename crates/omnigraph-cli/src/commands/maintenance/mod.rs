@@ -7,8 +7,8 @@ use omnigraph::db::{CleanupPolicyOptions, Omnigraph, RepairAction, RepairOptions
 
 use crate::app::Completion;
 use crate::helpers::{
-    confirm_destructive_with_writer, parse_duration_arg, resolve_cli_actor,
-    resolve_maintenance_uri, write_target,
+    confirm_destructive, parse_duration_arg, resolve_cli_actor, resolve_maintenance_uri,
+    write_target,
 };
 use crate::output::{write_cleanup, write_full_text_rebuild, write_optimize, write_repair};
 
@@ -20,6 +20,7 @@ pub(crate) use args::{
 /// Only the existing global arguments consumed by this command family.
 #[derive(Clone, Copy)]
 pub(crate) struct MaintenanceScope<'a> {
+    pub(crate) operator: &'a crate::operator::InvocationConfig,
     pub profile: Option<&'a str>,
     pub store: Option<&'a str>,
     pub cluster: Option<&'a str>,
@@ -36,6 +37,7 @@ pub(crate) async fn run_upgrade(
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     crate::upgrade::run(
+        scope.operator,
         args,
         scope.profile,
         scope.store,
@@ -54,16 +56,18 @@ pub(crate) async fn run_optimize(
 ) -> Result<Completion> {
     let OptimizeArgs { uri, json } = args;
     let uri = resolve_maintenance_uri(
+        scope.operator,
         scope.profile,
         scope.store,
         scope.cluster,
         scope.graph,
         uri,
         "optimize",
+        stderr,
     )
     .await?;
     write_target(scope.quiet, "optimize", &uri, false, stderr)?;
-    crate::admission::ensure_graph(&uri).await?;
+    crate::admission::ensure_graph(&uri, stderr).await?;
     let db = Omnigraph::open(&uri).await?;
     let stats = db.optimize().await?;
     write_optimize(&uri, &stats, json, stdout)?;
@@ -78,15 +82,17 @@ pub(crate) async fn run_full_text_rebuild(
 ) -> Result<Completion> {
     let RebuildFullTextIndexesArgs { uri, branch, json } = args;
     let uri = resolve_maintenance_uri(
+        scope.operator,
         scope.profile,
         scope.store,
         scope.cluster,
         scope.graph,
         uri,
         "rebuild-full-text-indexes",
+        stderr,
     )
     .await?;
-    let actor = resolve_cli_actor(scope.actor)?;
+    let actor = resolve_cli_actor(scope.operator, scope.actor, stderr)?;
     rebuild_full_text_indexes(
         &uri,
         &branch,
@@ -111,7 +117,7 @@ pub(crate) async fn rebuild_full_text_indexes(
     stderr: &mut dyn Write,
 ) -> Result<()> {
     write_target(quiet, "rebuild-full-text-indexes", uri, false, stderr)?;
-    crate::admission::ensure_graph(uri).await?;
+    crate::admission::ensure_graph(uri, stderr).await?;
     let db = Omnigraph::open(uri).await?;
     let result = db.rebuild_full_text_indices_on_as(branch, actor).await?;
     write_full_text_rebuild(uri, &result, json, stdout, stderr)
@@ -125,16 +131,18 @@ pub(crate) async fn run_repair(
 ) -> Result<Completion> {
     let RepairArgs { uri, json } = args;
     let uri = resolve_maintenance_uri(
+        scope.operator,
         scope.profile,
         scope.store,
         scope.cluster,
         scope.graph,
         uri,
         "repair",
+        stderr,
     )
     .await?;
     write_target(scope.quiet, "repair", &uri, false, stderr)?;
-    crate::admission::ensure_graph(&uri).await?;
+    crate::admission::ensure_graph(&uri, stderr).await?;
     let db = Omnigraph::open(&uri).await?;
     let stats = db.repair(RepairOptions::default()).await?;
     let refused_count = stats
@@ -156,6 +164,7 @@ pub(crate) async fn run_repair(
 pub(crate) async fn run_cleanup(
     args: CleanupArgs,
     scope: MaintenanceScope<'_>,
+    input: &mut crate::input::Input<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
@@ -167,12 +176,14 @@ pub(crate) async fn run_cleanup(
         json,
     } = args;
     let uri = resolve_maintenance_uri(
+        scope.operator,
         scope.profile,
         scope.store,
         scope.cluster,
         scope.graph,
         uri,
         "cleanup",
+        stderr,
     )
     .await?;
     let older_than_dur = older_than.as_deref().map(parse_duration_arg).transpose()?;
@@ -198,13 +209,13 @@ pub(crate) async fn run_cleanup(
     // Past the preview gate: a real destructive run. Against a non-local
     // scope this additionally requires --yes (or an interactive yes), so
     // `cleanup --confirm s3://…` in CI refuses rather than destroying.
-    confirm_destructive_with_writer("cleanup", &uri, scope.yes, json, stderr)?;
+    confirm_destructive("cleanup", &uri, scope.yes, json, input, stderr)?;
     write_target(scope.quiet, "cleanup", &uri, false, stderr)?;
     let options = CleanupPolicyOptions {
         keep_versions: keep,
         older_than: older_than_dur,
     };
-    crate::admission::ensure_graph(&uri).await?;
+    crate::admission::ensure_graph(&uri, stderr).await?;
     let db = Omnigraph::open(&uri).await?;
     let stats = db.cleanup(options.clone()).await?;
     write_cleanup(&uri, &options, &policy_desc, &stats, json, stdout)?;

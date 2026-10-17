@@ -22,6 +22,7 @@ pub(crate) use lint::run_lint;
 /// Only the existing global arguments consumed by this command family.
 #[derive(Clone, Copy)]
 pub(crate) struct SchemaScope<'a> {
+    pub(crate) operator: &'a crate::operator::InvocationConfig,
     pub capability: Capability,
     pub server: Option<&'a str>,
     pub graph: Option<&'a str>,
@@ -41,18 +42,21 @@ pub(crate) async fn run_schema(
     match command {
         SchemaCommand::Plan { uri, schema, json } => {
             let uri = resolve_maintenance_uri(
+                scope.operator,
                 scope.profile.as_deref(),
                 scope.store.as_deref(),
                 scope.cluster,
                 scope.graph,
                 uri,
                 "schema plan",
+                stderr,
             )
             .await?;
             plan_schema(&uri, &schema, json, stdout).await?;
         }
         SchemaCommand::Apply { uri, schema, json } => {
             let client = GraphClient::resolve_with_policy(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
@@ -60,12 +64,14 @@ pub(crate) async fn run_schema(
                 scope.actor,
                 scope.profile.as_deref(),
                 scope.store.as_deref(),
+                stderr,
             )
             .await?;
             apply_schema(&client, &schema, json, scope.quiet, stdout, stderr).await?;
         }
         SchemaCommand::UpgradeSystemColumns { uri, check, json } => {
             return crate::schema_upgrade::run(
+                scope.operator,
                 scope.profile,
                 scope.store,
                 uri,
@@ -79,12 +85,14 @@ pub(crate) async fn run_schema(
         }
         SchemaCommand::Show { uri, json } => {
             let client = GraphClient::resolve(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
                 uri,
                 scope.profile.as_deref(),
                 scope.store.as_deref(),
+                stderr,
             )
             .await?;
             show_schema(&client, json, stdout).await?;
@@ -160,7 +168,7 @@ pub(crate) async fn apply_schema(
         stderr,
     )?;
     let output = client
-        .apply_schema(&schema_source, |_catalog| Ok(()))
+        .apply_schema(&schema_source, |_catalog| Ok(()), stderr)
         .await?;
     if json {
         write_json(&output, stdout)?;

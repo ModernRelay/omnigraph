@@ -468,6 +468,10 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                             },
                             false,
                             true,
+                            &mut crate::input::Input {
+                                reader: &mut io::empty(),
+                                is_terminal: false,
+                            },
                             &mut stdout,
                             &mut stderr,
                         )
@@ -490,6 +494,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                                 json,
                             },
                             &mut stdout,
+                            &mut Vec::new(),
                         )
                         .await?;
                     }
@@ -579,6 +584,10 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
             },
             false,
             false,
+            &mut crate::input::Input {
+                reader: &mut io::empty(),
+                is_terminal: false,
+            },
             &mut stdout,
             &mut stderr,
         )
@@ -659,7 +668,7 @@ async fn transfer_reads_use_the_supplied_sink_and_propagate_delivery_errors() {
                         json: command == "stat-json",
                     }
                 };
-                execute_blob(&client, operation, &mut stdout).await
+                execute_blob(&client, operation, &mut stdout, &mut Vec::new()).await
             };
             let mut stderr = Vec::new();
             let error = finish(
@@ -991,10 +1000,14 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
                     None,
                     None,
                     &[],
+                    &mut Vec::new(),
                 )
                 .await
                 .unwrap();
-            client.branch_create_from("main", "search").await.unwrap();
+            client
+                .branch_create_from("main", "search", &mut Vec::new())
+                .await
+                .unwrap();
             let main_before = client
                 .snapshot("main")
                 .await
@@ -1258,6 +1271,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
                     run: ClusterRunArgs::default(),
                 },
                 ClusterScope {
+                    operator: &crate::operator::InvocationConfig::at(None, None),
                     root: Some(root),
                     actor: Some("deployment-operator"),
                 },
@@ -1287,6 +1301,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
                     json: true,
                 },
                 ClusterScope {
+                    operator: &crate::operator::InvocationConfig::at(None, None),
                     root: (failed_stream != "stdout").then_some(root),
                     actor: None,
                 },
@@ -1299,6 +1314,51 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             assert!(message.contains(lock), "{message}");
             assert!(!lock_path.exists());
             assert_eq!(std::fs::read(&state_path).unwrap(), state_bytes);
+
+            // A graph command acquires fresh admission after the explicit unlock.
+            // If its custody warning is lost, stop before opening for write and
+            // retain the new lock identity in the error for manual recovery.
+            let mut failing = FailingOutput {
+                fault,
+                bytes: Vec::new(),
+            };
+            let error = crate::admission::scope(graph.mutate(
+                None,
+                "query add() { insert Person { slug: \"never-written\" } }",
+                None,
+                None,
+                None,
+                &[],
+                &mut failing,
+            ))
+            .await
+            .unwrap_err();
+            let message = format!("{error:#}");
+            let retained: Value =
+                serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+            assert!(
+                message.contains(retained["lock_id"].as_str().unwrap()),
+                "{message}"
+            );
+            assert!(message.contains(&status.canonical_root), "{message}");
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(std::fs::read(&state_path).unwrap(), state_bytes);
+            assert_eq!(
+                graph.snapshot("main").await.unwrap().graph_manifest_version,
+                snapshot.graph_manifest_version
+            );
+            assert_eq!(
+                graph
+                    .list_commits(Some("main"))
+                    .await
+                    .unwrap()
+                    .commits
+                    .len(),
+                commits.len()
+            );
         }
     }
 }

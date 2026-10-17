@@ -112,6 +112,16 @@ an unrendered error remains a `Result` error. The
 [binary](../../crates/omnigraph-cli/src/main.rs) owns runtime startup, diagnostic
 hooks, process arguments and the final process exit status.
 
+Command handlers consume supplied input, terminal status and fallible output
+writers; the process-facing application wrapper supplies the actual standard
+streams. [`InvocationConfig`](../../crates/omnigraph-cli/src/operator.rs) captures
+the operator home and ambient profile once, then reads the configuration lazily
+at its first consumer. Every consumer shares that result, including a failed
+load; unknown-key warnings go through the supplied diagnostic writer once.
+Ordinary remote client setup resolves its bearer token before discovery and
+retains it through registry probing and the command. Managed credential renewal
+remains with the managed authentication owner.
+
 `commands/query` owns `query`, `mutate` and alias execution. Its
 [pure preparation](../../crates/omnigraph-cli/src/commands/query/prepare.rs)
 classifies captured source and argument combinations without I/O. It enforces
@@ -164,6 +174,16 @@ error: the CLI captures any diagnostic delivery failure, lets that one core call
 finish, then returns the failure with its original ID, root and retained lock.
 Neither path replays work to recover output. Deployment and recovery authority
 remain in the cluster crate.
+
+`commands/local` owns ordinary login/logout, profile inspection, version and
+bundled skill/embedding dispatch. Login reads only one line from the supplied
+reader when no explicit token is present; credential changes use the invocation's
+captured operator home. Skill export and embedding generation finish their file
+work before delivering the report. Output failure does not undo or repeat that
+work. `skill show` retains its existing narrow suppression of `BrokenPipe` while
+writing or flushing the selected file. Managed account, organization and
+lifecycle handlers keep their existing owners and use the same supplied output
+boundary, including identity diagnostics before dispatch.
 
 CLI unit tests own invocation preparation and presentation; CLI process tests
 own argument, environment, configuration, transport, output and exit behavior.

@@ -115,22 +115,26 @@ pub(crate) async fn run_blob(
     stdin: &mut dyn Read,
     stdin_is_terminal: bool,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<()> {
     let operation = capture_blob(command, stdin, stdin_is_terminal)?;
     let client = match &operation {
         BlobOperation::Get { .. } | BlobOperation::Stat { .. } => {
             GraphClient::resolve(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
                 None,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?
         }
         BlobOperation::Write { .. } => {
             GraphClient::resolve_with_policy(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
@@ -138,17 +142,19 @@ pub(crate) async fn run_blob(
                 scope.actor,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?
         }
     };
-    execute_blob(&client, operation, stdout).await
+    execute_blob(&client, operation, stdout, stderr).await
 }
 
 pub(crate) async fn execute_blob(
     client: &GraphClient,
     operation: BlobOperation,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<()> {
     match operation {
         BlobOperation::Get { query, range, out } => match out {
@@ -174,7 +180,7 @@ pub(crate) async fn execute_blob(
             json,
         } => {
             let output = client
-                .blob_write(&query, bytes, if_match.as_deref(), precondition)
+                .blob_write(&query, bytes, if_match.as_deref(), precondition, stderr)
                 .await?;
             if json {
                 write_json(&output, stdout)?;

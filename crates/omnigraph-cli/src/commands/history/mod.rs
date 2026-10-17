@@ -23,6 +23,7 @@ use prepare::{ChangeFilter, Pagination};
 /// Only the existing global arguments this command family consumes.
 #[derive(Clone, Copy)]
 pub(crate) struct HistoryScope<'a> {
+    pub(crate) operator: &'a crate::operator::InvocationConfig,
     pub capability: Capability,
     pub server: Option<&'a str>,
     pub graph: Option<&'a str>,
@@ -37,15 +38,18 @@ pub(crate) async fn run_snapshot(
     args: SnapshotArgs,
     scope: HistoryScope<'_>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<()> {
     let SnapshotArgs { uri, branch, json } = args;
     let client = GraphClient::resolve(
+        scope.operator,
         scope.capability,
         scope.server,
         scope.graph,
         uri,
         scope.profile,
         scope.store,
+        stderr,
     )
     .await?;
     let branch = resolve_branch(branch, None, "main");
@@ -68,6 +72,7 @@ pub(crate) async fn run_diff_command(
     args: DiffArgs,
     scope: HistoryScope<'_>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<()> {
     let DiffArgs {
         uri,
@@ -81,12 +86,14 @@ pub(crate) async fn run_diff_command(
         json,
     } = args;
     let client = GraphClient::resolve(
+        scope.operator,
         scope.capability,
         scope.server,
         scope.graph,
         uri,
         scope.profile,
         scope.store,
+        stderr,
     )
     .await?;
     let sides = client::DiffSidesArg::Between {

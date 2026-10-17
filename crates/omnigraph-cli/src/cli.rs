@@ -5,7 +5,12 @@ use std::path::PathBuf;
 
 pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
-use clap::{Args, Parser, Subcommand};
+pub(crate) use crate::commands::local::{ProfileCommand, SkillCommand};
+pub(crate) use crate::managed::args::{
+    OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
+    OrganizationMembersCommand,
+};
+use clap::{Parser, Subcommand};
 
 pub(crate) use crate::commands::history::{BranchCommand, ChangesCommand, CommitCommand};
 use crate::commands::history::{DiffArgs, SnapshotArgs};
@@ -24,7 +29,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]
-#[command(version = crate::output::PACKAGE_VERSION.as_str(), disable_version_flag = true)]
+#[command(version = crate::commands::local::output::PACKAGE_VERSION.as_str(), disable_version_flag = true)]
 // Subcommands render in declaration order (clap can't print labeled headings
 // between groups), so this legend names the capability each command needs —
 // the user-facing vocabulary (RFC-011). `Plane` stays the internal classifier.
@@ -292,133 +297,5 @@ pub(crate) enum Command {
         /// Emit the same facts as one JSON object.
         #[arg(long)]
         json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum SkillCommand {
-    /// Write the agent skill into a directory, creating it when missing.
-    ///
-    /// Refuses when any file the export writes already exists, unless
-    /// --force. A record of the written files (`.omnigraph-skill.json`) lets a
-    /// later --force export remove files this skill no longer has, but only
-    /// while their bytes are unchanged. Other files are never touched.
-    Export {
-        /// Skill directory, e.g. ~/.claude/skills/omnigraph.
-        dir: PathBuf,
-        /// Replace the skill's files and remove unchanged files that an
-        /// earlier export recorded and this skill no longer has.
-        #[arg(long)]
-        force: bool,
-        /// Emit JSON: the files written, the skill version, the CLI version
-        /// and the HTTP contract.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Print one file of the agent skill to stdout.
-    Show {
-        /// Path below the skill root.
-        #[arg(default_value = "SKILL.md", value_name = "PATH")]
-        path: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ProfileCommand {
-    /// List the profiles defined in ~/.omnigraph/config.yaml.
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show a profile's resolved scope. With no name, shows the active
-    /// (`$OMNIGRAPH_PROFILE`) profile, else the flat operator defaults.
-    Show {
-        /// Profile name (optional).
-        name: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct OrganizationArgs {
-    /// API origin; may be omitted in a bound configuration directory.
-    #[arg(long, global = true)]
-    pub(crate) api: Option<String>,
-    /// Organization ID; omission uses the folder binding or sole cached organization.
-    #[arg(long, global = true)]
-    pub(crate) organization: Option<String>,
-    /// Configuration folder supplying an optional managed context.
-    #[arg(long, global = true, default_value = ".")]
-    pub(crate) config: PathBuf,
-    /// Emit the validated API envelope instead of readable text.
-    #[arg(long, global = true)]
-    pub(crate) json: bool,
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum OrganizationCommand {
-    /// Inspect or change local enrollment, admission and control permissions.
-    Members {
-        #[command(subcommand)]
-        command: OrganizationMembersCommand,
-    },
-    /// Manage provider invitations; acceptance does not grant cluster access.
-    Invitations {
-        #[command(subcommand)]
-        command: OrganizationInvitationsCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum OrganizationMembersCommand {
-    /// List provider members and retained local enrollment, including current versions.
-    List,
-    /// Apply a versioned YAML add/update/remove patch; graph policy is unchanged.
-    Apply {
-        file: PathBuf,
-        /// Stable request key; retain it if the result is uncertain.
-        #[arg(long)]
-        idempotency_key: String,
-    },
-    /// Remove local access, organization membership and its sessions.
-    /// Deploy Cedar revocation and verify old graph credentials first.
-    Offboard {
-        user_id: String,
-        /// Current local grant version; zero for an unenrolled person.
-        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
-        expected_version: i64,
-        /// Stable request key; retain it if the result is uncertain.
-        #[arg(long)]
-        idempotency_key: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum OrganizationInvitationsCommand {
-    /// List one provider page of up to 100 invitations.
-    List {
-        /// Continue from the previous page's exact cursor.
-        #[arg(long)]
-        after: Option<String>,
-    },
-    /// Email an invitation to join this organization.
-    Send {
-        email: String,
-        /// Stable request key; retain it if the result is uncertain.
-        #[arg(long)]
-        idempotency_key: String,
-    },
-    /// Resend one exact pending invitation.
-    Resend {
-        invitation_id: String,
-        #[arg(long)]
-        idempotency_key: String,
-    },
-    /// Revoke one exact pending invitation.
-    Revoke {
-        invitation_id: String,
-        #[arg(long)]
-        idempotency_key: String,
     },
 }

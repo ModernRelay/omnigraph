@@ -3072,6 +3072,22 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         let home = tempdir().unwrap();
         let config = home.path().join("config.yaml");
         let replacement = home.path().join("replacement.yaml");
+        let credentials = home.path().join("credentials");
+        let replacement_credentials = home.path().join("replacement-credentials");
+        fs::write(
+            &credentials,
+            "[prod]\ntoken = captured-root-token\n[graph-owner]\ntoken = captured-graph-token\n",
+        )
+        .unwrap();
+        let replacement_tokens = "[prod]\ntoken = changed-root-token\n[graph-owner]\ntoken = changed-graph-token\n[replacement]\ntoken = replacement-token\n";
+        fs::write(&replacement_credentials, replacement_tokens).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&credentials, &replacement_credentials] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
         let trap = IntentApiFixture::graph(vec![]);
         let mut replies = Vec::new();
         if graph.is_none() {
@@ -3089,7 +3105,12 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         let server = IntentApiFixture::graph_with_discovery_hook(replies, {
             let config = config.clone();
             let replacement = replacement.clone();
-            move || fs::rename(replacement, config).unwrap()
+            let credentials = credentials.clone();
+            let replacement_credentials = replacement_credentials.clone();
+            move || {
+                fs::rename(replacement, config).unwrap();
+                fs::rename(replacement_credentials, credentials).unwrap();
+            }
         });
         fs::write(
             &config,
@@ -3109,9 +3130,9 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         command
             .current_dir(home.path())
             .env("OMNIGRAPH_HOME", home.path())
-            .env("OMNIGRAPH_TOKEN_PROD", "captured-root-token")
-            .env("OMNIGRAPH_TOKEN_GRAPH_OWNER", "captured-graph-token")
-            .env("OMNIGRAPH_TOKEN_REPLACEMENT", "replacement-token")
+            .env_remove("OMNIGRAPH_TOKEN_PROD")
+            .env_remove("OMNIGRAPH_TOKEN_GRAPH_OWNER")
+            .env_remove("OMNIGRAPH_TOKEN_REPLACEMENT")
             .env_remove("OMNIGRAPH_BEARER_TOKEN")
             .env_remove("OMNIGRAPH_PROFILE")
             .args([
@@ -3128,6 +3149,14 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         let output = command.output().unwrap();
         assert_eq!(fs::read_to_string(&config).unwrap(), replacement_config);
         assert!(!replacement.exists(), "discovery must replace the config");
+        assert_eq!(
+            fs::read_to_string(&credentials).unwrap(),
+            replacement_tokens
+        );
+        assert!(
+            !replacement_credentials.exists(),
+            "discovery must replace the credentials"
+        );
         assert!(trap.requests().is_empty(), "setup changed destination");
         assert!(output.status.success(), "{graph:?} {flags:?}: {output:?}");
         let stdout = stdout_string(&output);

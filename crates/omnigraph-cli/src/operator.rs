@@ -15,7 +15,9 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
@@ -280,17 +282,120 @@ pub(crate) fn operator_dir() -> Option<PathBuf> {
     env::home_dir().map(|home| home.join(OPERATOR_DIR))
 }
 
+/// Configuration inputs selected once for this invocation. Reading the file is
+/// lazy so wrong-mode and argument refusals still precede configuration access.
+/// Only routing/configuration is retained; managed token renewal stays with its
+/// existing credential owner.
+#[derive(Debug)]
+pub(crate) struct InvocationConfig {
+    directory: Option<PathBuf>,
+    profile: Option<String>,
+    profile_present: bool,
+    captured: OnceLock<CapturedOperator>,
+    warnings: OnceLock<std::result::Result<(), (io::ErrorKind, String)>>,
+}
+
+#[derive(Debug)]
+struct CapturedOperator {
+    config: std::result::Result<OperatorConfig, String>,
+    warnings: Vec<u8>,
+}
+
+impl InvocationConfig {
+    pub(crate) fn capture() -> Self {
+        let profile = env::var_os(crate::scope::PROFILE_ENV);
+        let mut input = Self::at(
+            operator_dir(),
+            profile
+                .as_ref()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        );
+        // Managed ambiguity detection also rejects a non-Unicode ambient
+        // profile, while the ordinary profile resolver cannot select that name.
+        input.profile_present = profile.is_some_and(|value| !value.is_empty());
+        input
+    }
+
+    pub(crate) fn at(directory: Option<PathBuf>, profile: Option<String>) -> Self {
+        Self {
+            directory,
+            profile_present: profile.as_ref().is_some_and(|value| !value.is_empty()),
+            profile,
+            captured: OnceLock::new(),
+            warnings: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn has_profile(&self) -> bool {
+        self.profile_present
+    }
+
+    pub(crate) fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+
+    pub(crate) fn credentials_path(&self) -> Option<PathBuf> {
+        self.directory
+            .as_ref()
+            .map(|dir| dir.join(CREDENTIALS_FILE))
+    }
+
+    fn captured(&self, stderr: &mut dyn Write) -> Result<&CapturedOperator> {
+        let captured = self.captured.get_or_init(|| {
+            let mut warnings = Vec::new();
+            let config = match &self.directory {
+                Some(dir) => load_operator_config_at_with_writer(
+                    &dir.join(OPERATOR_CONFIG_FILE),
+                    &mut warnings,
+                ),
+                None => Ok(OperatorConfig::default()),
+            }
+            .map_err(|error| error.to_string());
+            CapturedOperator { config, warnings }
+        });
+        let warnings = self.warnings.get_or_init(|| {
+            if captured.warnings.is_empty() {
+                return Ok(());
+            }
+            stderr
+                .write_all(&captured.warnings)
+                .and_then(|()| stderr.flush())
+                .map_err(|error| (error.kind(), error.to_string()))
+        });
+        if let Err((kind, message)) = warnings {
+            return Err(io::Error::new(*kind, message.clone()).into());
+        }
+        Ok(captured)
+    }
+
+    pub(crate) fn get(&self, stderr: &mut dyn Write) -> Result<&OperatorConfig> {
+        self.captured(stderr)?
+            .config
+            .as_ref()
+            .map_err(|message| eyre!(message.clone()))
+    }
+
+    /// Existing managed query presentation tolerates an invalid optional config.
+    /// Diagnostic delivery failures still propagate; they are not config absence.
+    pub(crate) fn optional_get(&self, stderr: &mut dyn Write) -> Result<Option<&OperatorConfig>> {
+        Ok(self.captured(stderr)?.config.as_ref().ok())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
+    load_operator_config_at_with_writer(path, &mut io::sink())
+}
+
 /// Load the operator layer. Absent file (or unresolvable home) is an empty
 /// layer, never an error; a present-but-malformed file is a loud error (the
 /// operator owns it and can fix it); unknown keys warn to stderr once.
-pub(crate) fn load_operator_config() -> Result<OperatorConfig> {
-    let Some(dir) = operator_dir() else {
-        return Ok(OperatorConfig::default());
-    };
-    load_operator_config_at(&dir.join(OPERATOR_CONFIG_FILE))
-}
-
-pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
+fn load_operator_config_at_with_writer(
+    path: &Path,
+    stderr: &mut dyn Write,
+) -> Result<OperatorConfig> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -310,7 +415,11 @@ pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
         )
     })?;
     for warning in config.unknown_key_warnings() {
-        eprintln!("warning: {warning} in operator config '{}'", path.display());
+        writeln!(
+            stderr,
+            "warning: {warning} in operator config '{}'",
+            path.display()
+        )?;
     }
     config.validate_defaults()?;
     Ok(config)
@@ -352,10 +461,6 @@ impl OperatorConfig {
 pub(crate) const CREDENTIALS_FILE: &str = "credentials";
 const TOKEN_ENV_PREFIX: &str = "OMNIGRAPH_TOKEN_";
 
-pub(crate) fn credentials_path() -> Option<PathBuf> {
-    operator_dir().map(|dir| dir.join(CREDENTIALS_FILE))
-}
-
 /// `intel-dev` → `OMNIGRAPH_TOKEN_INTEL_DEV`.
 pub(crate) fn token_env_name(server: &str) -> String {
     let mut name = String::from(TOKEN_ENV_PREFIX);
@@ -373,17 +478,17 @@ pub(crate) fn token_env_name(server: &str) -> String {
 /// `Ok(None)` means "no keyed token" — callers fall through to the legacy
 /// chain; a present-but-unreadable/over-permissive credentials file is a
 /// loud error, never a silent skip.
-pub(crate) fn resolve_keyed_token(server: &str) -> Result<Option<String>> {
+pub(crate) fn resolve_keyed_token_at(server: &str, path: Option<&Path>) -> Result<Option<String>> {
     if let Ok(token) = env::var(token_env_name(server)) {
         let token = token.trim();
         if !token.is_empty() {
             return Ok(Some(token.to_string()));
         }
     }
-    let Some(path) = credentials_path() else {
+    let Some(path) = path else {
         return Ok(None);
     };
-    read_credential_at(&path, server)
+    read_credential_at(path, server)
 }
 
 pub(crate) fn read_credential_at(path: &Path, server: &str) -> Result<Option<String>> {
@@ -421,23 +526,6 @@ pub(crate) fn read_credential_at(path: &Path, server: &str) -> Result<Option<Str
         }
     }
     Ok(None)
-}
-
-/// Write (or rotate) one server's token, preserving every other section.
-/// Temp file + rename (#139 finding 7), created 0600.
-pub(crate) fn write_credential(server: &str, token: &str) -> Result<PathBuf> {
-    let path = credentials_path()
-        .ok_or_else(|| eyre!("no home directory resolvable for the credentials file"))?;
-    rewrite_credentials_at(&path, server, Some(token))?;
-    Ok(path)
-}
-
-/// Remove one server's section. Idempotent: absent file or section is fine.
-pub(crate) fn remove_credential(server: &str) -> Result<PathBuf> {
-    let path = credentials_path()
-        .ok_or_else(|| eyre!("no home directory resolvable for the credentials file"))?;
-    rewrite_credentials_at(&path, server, None)?;
-    Ok(path)
 }
 
 pub(crate) fn rewrite_credentials_at(path: &Path, server: &str, token: Option<&str>) -> Result<()> {
@@ -621,6 +709,83 @@ mod tests {
         .unwrap();
         let err = load_operator_config_at(&path).unwrap_err().to_string();
         assert!(err.contains("already a single graph"), "{err}");
+    }
+
+    #[test]
+    fn invocation_config_is_lazy_and_retains_a_failed_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(OPERATOR_CONFIG_FILE);
+        fs::write(&path, "servers: [\n").unwrap();
+        let input = InvocationConfig::at(Some(home.path().to_owned()), Some("selected".into()));
+        assert!(input.captured.get().is_none());
+        assert_eq!(
+            input.credentials_path(),
+            Some(home.path().join(CREDENTIALS_FILE))
+        );
+        assert_eq!(input.profile(), Some("selected"));
+        assert!(input.has_profile());
+        let error = input.get(&mut Vec::new()).unwrap_err().to_string();
+        fs::write(&path, "defaults: { store: graph.omni }\n").unwrap();
+        assert_eq!(input.get(&mut Vec::new()).unwrap_err().to_string(), error);
+        assert!(input.optional_get(&mut Vec::new()).unwrap().is_none());
+        let fresh = InvocationConfig::at(Some(home.path().to_owned()), None);
+        assert_eq!(
+            fresh.get(&mut Vec::new()).unwrap().default_store(),
+            Some("graph.omni")
+        );
+    }
+
+    #[test]
+    fn invocation_warning_failure_is_not_config_absence_or_retried_delivery() {
+        struct FailedWarning {
+            flush: bool,
+            writes: usize,
+        }
+        impl Write for FailedWarning {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                if self.flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(OPERATOR_CONFIG_FILE);
+        for flush in [false, true] {
+            fs::write(&path, "future: true\ndefaults: { store: original.omni }\n").unwrap();
+            let input = InvocationConfig::at(Some(home.path().to_owned()), None);
+            let mut stderr = FailedWarning { flush, writes: 0 };
+            let error = input.get(&mut stderr).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(stderr.writes, 1);
+            fs::write(&path, "defaults: { store: replacement.omni }\n").unwrap();
+            let mut retry = Vec::new();
+            let error = input.optional_get(&mut retry).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert!(retry.is_empty());
+            assert_eq!(
+                input
+                    .captured
+                    .get()
+                    .unwrap()
+                    .config
+                    .as_ref()
+                    .unwrap()
+                    .default_store(),
+                Some("original.omni")
+            );
+        }
     }
 
     #[test]

@@ -255,17 +255,22 @@ async fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    if cluster_remote::dispatch(&cli, stdout, stderr).await? {
+    let operator = operator::InvocationConfig::capture();
+    let mut input = crate::input::Input {
+        reader: stdin,
+        is_terminal: stdin_is_terminal,
+    };
+    if cluster_remote::dispatch(&operator, &cli, stdout, stderr).await? {
         return Ok(Completion::success());
     }
-    if let Some(result) = managed::dispatch(&cli).await {
-        let code = result.emit()?;
+    if let Some(result) = managed::dispatch(&cli, stderr).await {
+        let code = result.emit(stdout, stderr)?;
         return Ok(Completion::exit(code));
     }
-    let managed_data = match managed::data::client(&cli).await {
+    let managed_data = match managed::data::client(&operator, &cli, stderr).await {
         Ok(client) => client,
         Err(output) => {
-            let code = output.emit()?;
+            let code = output.emit(stdout, stderr)?;
             return Ok(Completion::exit(code));
         }
     };
@@ -277,6 +282,7 @@ async fn run(
     // resolver and the guard share one classification (planes.rs).
     let capability = planes::command_capability(&cli.command);
     let maintenance_scope = commands::maintenance::MaintenanceScope {
+        operator: &operator,
         profile: cli.profile.as_deref(),
         store: cli.store.as_deref(),
         cluster: cli.cluster.as_deref(),
@@ -289,168 +295,30 @@ async fn run(
         Command::Login {
             name, token, json, ..
         } => {
-            let name = name.expect("clap requires a server name without --api");
-            let token = match token {
-                Some(token) => token,
-                None => {
-                    let mut line = String::new();
-                    std::io::stdin().read_line(&mut line)?;
-                    line
-                }
-            };
-            let Some(token) = normalize_bearer_token(Some(token)) else {
-                color_eyre::eyre::bail!(
-                    "no token provided: pass --token <TOKEN> or pipe it on stdin (echo $TOKEN | omnigraph login {name})"
-                );
-            };
-            let operator_config = crate::operator::load_operator_config()?;
-            let declared = operator_config.servers.contains_key(&name);
-            let path = crate::operator::write_credential(&name, &token)?;
-            finish_login(&name, &path, declared, json)?;
+            commands::local::run_login(
+                &operator,
+                name.expect("clap requires a server name without --api"),
+                token,
+                json,
+                input.reader,
+                stdout,
+                stderr,
+            )?;
         }
         Command::Logout { name, json, .. } => {
-            let name = name.expect("clap requires a server name without --api");
-            let path = crate::operator::remove_credential(&name)?;
-            finish_logout(&name, &path, json)?;
+            commands::local::run_logout(
+                &operator,
+                name.expect("clap requires a server name without --api"),
+                json,
+                stdout,
+            )?;
         }
         Command::Profile { command } => {
-            use crate::operator::ScopeBinding;
-            let op = crate::operator::load_operator_config()?;
-            let active = std::env::var(scope::PROFILE_ENV)
-                .ok()
-                .filter(|s| !s.is_empty());
-            match command {
-                ProfileCommand::List { json } => {
-                    let items: Vec<ProfileListItem> = op
-                        .profiles
-                        .iter()
-                        .map(|(name, profile)| {
-                            let (binding, scope_kind, target, valid, error) =
-                                match profile.binding(name) {
-                                    Ok(ScopeBinding::Server(s)) => (
-                                        format!("server: {s}"),
-                                        "server".to_string(),
-                                        Some(s),
-                                        true,
-                                        None,
-                                    ),
-                                    Ok(ScopeBinding::Cluster(c)) => (
-                                        format!("cluster: {c}"),
-                                        "cluster".to_string(),
-                                        Some(c),
-                                        true,
-                                        None,
-                                    ),
-                                    Ok(ScopeBinding::Store(u)) => (
-                                        format!("store: {u}"),
-                                        "store".to_string(),
-                                        Some(u),
-                                        true,
-                                        None,
-                                    ),
-                                    Err(e) => (
-                                        format!("invalid: {e}"),
-                                        "invalid".to_string(),
-                                        None,
-                                        false,
-                                        Some(e.to_string()),
-                                    ),
-                                };
-                            ProfileListItem {
-                                name: name.clone(),
-                                binding,
-                                scope_kind,
-                                target,
-                                valid,
-                                error,
-                                default_graph: profile.default_graph.clone(),
-                                active: active.as_deref() == Some(name.as_str()),
-                            }
-                        })
-                        .collect();
-                    print_profile_list(&items, json)?;
-                }
-                ProfileCommand::Show { name, json } => {
-                    let detail = match name.or(active) {
-                        Some(name) => {
-                            let profile = op.profile(&name).ok_or_else(|| {
-                                color_eyre::eyre::eyre!(
-                                    "unknown profile '{name}' (not defined under `profiles:`)"
-                                )
-                            })?;
-                            let (kind, target, endpoint) = match profile.binding(&name)? {
-                                ScopeBinding::Server(s) => {
-                                    let endpoint = op.servers.get(&s).map(|sv| sv.url.clone());
-                                    ("server", Some(s), endpoint)
-                                }
-                                ScopeBinding::Cluster(c) => {
-                                    let endpoint = op.cluster_root(&c).map(str::to_string);
-                                    ("cluster", Some(c), endpoint)
-                                }
-                                ScopeBinding::Store(u) => ("store", Some(u.clone()), Some(u)),
-                            };
-                            ProfileDetail {
-                                name,
-                                scope_kind: kind.to_string(),
-                                target,
-                                endpoint,
-                                default_graph: profile
-                                    .default_graph
-                                    .clone()
-                                    .or_else(|| op.default_graph().map(str::to_string)),
-                                output_format: op
-                                    .output()
-                                    .and_then(|f| f.to_possible_value())
-                                    .map(|v| v.get_name().to_string()),
-                            }
-                        }
-                        // No name and no active profile: the flat operator defaults.
-                        None => {
-                            let (kind, target, endpoint) = if let Some(s) = op.default_server() {
-                                let endpoint = op.servers.get(s).map(|sv| sv.url.clone());
-                                ("server", Some(s.to_string()), endpoint)
-                            } else if let Some(u) = op.default_store() {
-                                ("store", Some(u.to_string()), Some(u.to_string()))
-                            } else {
-                                ("none", None, None)
-                            };
-                            ProfileDetail {
-                                name: "(defaults)".to_string(),
-                                scope_kind: kind.to_string(),
-                                target,
-                                endpoint,
-                                default_graph: op.default_graph().map(str::to_string),
-                                output_format: op
-                                    .output()
-                                    .and_then(|f| f.to_possible_value())
-                                    .map(|v| v.get_name().to_string()),
-                            }
-                        }
-                    };
-                    print_profile_detail(&detail, json)?;
-                }
-            }
+            commands::local::run_profile(&operator, command, stdout, stderr)?
         }
-        Command::Skill { command } => match command {
-            SkillCommand::Export { dir, force, json } => {
-                let output = skill::export(&dir, force)?;
-                if json {
-                    print_json(&output)?;
-                } else {
-                    skill::print_export_human(&output);
-                }
-            }
-            SkillCommand::Show { path } => skill::show(&path)?,
-        },
-        Command::Version { json } => print_version(&VersionOutput::current(), json)?,
-        Command::Embed(args) => {
-            let output = execute_embed(&args).await?;
-            if args.json {
-                print_json(&output)?;
-            } else {
-                print_embed_human(&output);
-            }
-        }
+        Command::Skill { command } => commands::local::run_skill(command, stdout)?,
+        Command::Version { json } => commands::local::run_version(json, stdout)?,
+        Command::Embed(args) => commands::local::run_embed(args, stdout).await?,
         Command::Init(args) => {
             commands::schema::run_init(args, stdout).await?;
         }
@@ -458,6 +326,7 @@ async fn run(
             commands::transfer::run_load(
                 args,
                 commands::transfer::TransferScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -468,6 +337,7 @@ async fn run(
                     quiet: cli.quiet,
                 },
                 managed_data,
+                &mut input,
                 stdout,
                 stderr,
             )
@@ -477,6 +347,27 @@ async fn run(
             commands::history::run_branch(
                 command,
                 commands::history::HistoryScope {
+                    operator: &operator,
+                    capability,
+                    server: cli.server.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    store: cli.store.as_deref(),
+                    yes: cli.yes,
+                    quiet: cli.quiet,
+                },
+                &mut input,
+                stdout,
+                stderr,
+            )
+            .await?;
+        }
+        Command::Diff(args) => {
+            commands::history::run_diff_command(
+                args,
+                commands::history::HistoryScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -491,27 +382,11 @@ async fn run(
             )
             .await?;
         }
-        Command::Diff(args) => {
-            commands::history::run_diff_command(
-                args,
-                commands::history::HistoryScope {
-                    capability,
-                    server: cli.server.as_deref(),
-                    graph: cli.graph.as_deref(),
-                    actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
-                    yes: cli.yes,
-                    quiet: cli.quiet,
-                },
-                stdout,
-            )
-            .await?;
-        }
         Command::Commit { command } => {
             commands::history::run_commit(
                 command,
                 commands::history::HistoryScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -522,6 +397,7 @@ async fn run(
                     quiet: cli.quiet,
                 },
                 managed_data,
+                &mut input,
                 stdout,
                 stderr,
             )
@@ -531,6 +407,7 @@ async fn run(
             commands::history::run_changes(
                 command,
                 commands::history::HistoryScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -541,6 +418,7 @@ async fn run(
                     quiet: cli.quiet,
                 },
                 stdout,
+                stderr,
             )
             .await?;
         }
@@ -548,6 +426,7 @@ async fn run(
             return commands::schema::run_schema(
                 command,
                 commands::schema::SchemaScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -566,6 +445,7 @@ async fn run(
             return commands::schema::run_lint(
                 args,
                 commands::schema::SchemaScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -576,6 +456,7 @@ async fn run(
                     quiet: cli.quiet,
                 },
                 stdout,
+                stderr,
             )
             .await;
         }
@@ -583,12 +464,14 @@ async fn run(
             return commands::control::run_queries(
                 command,
                 commands::control::ControlScope {
+                    operator: &operator,
                     cluster: cli.cluster.as_deref(),
                     profile: cli.profile.as_deref(),
                     graph: cli.graph.as_deref(),
                     server: cli.server.as_deref(),
                 },
                 stdout,
+                stderr,
             )
             .await;
         }
@@ -596,6 +479,7 @@ async fn run(
             commands::history::run_snapshot(
                 args,
                 commands::history::HistoryScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -606,6 +490,7 @@ async fn run(
                     quiet: cli.quiet,
                 },
                 stdout,
+                stderr,
             )
             .await?;
         }
@@ -613,6 +498,7 @@ async fn run(
             commands::transfer::run_export(
                 args,
                 commands::transfer::TransferScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -623,6 +509,7 @@ async fn run(
                     quiet: cli.quiet,
                 },
                 stdout,
+                stderr,
             )
             .await?;
         }
@@ -630,6 +517,7 @@ async fn run(
             commands::transfer::run_blob(
                 command,
                 commands::transfer::TransferScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -639,9 +527,10 @@ async fn run(
                     yes: cli.yes,
                     quiet: cli.quiet,
                 },
-                stdin,
-                stdin_is_terminal,
+                input.reader,
+                input.is_terminal,
                 stdout,
+                stderr,
             )
             .await?;
         }
@@ -649,6 +538,7 @@ async fn run(
             commands::query::run_query(
                 args,
                 commands::query::GraphScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -660,6 +550,7 @@ async fn run(
                 managed_data,
                 machine,
                 stdout,
+                stderr,
             )
             .await?;
         }
@@ -667,6 +558,7 @@ async fn run(
             commands::query::run_mutate(
                 args,
                 commands::query::GraphScope {
+                    operator: &operator,
                     capability,
                     server: cli.server.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -676,21 +568,27 @@ async fn run(
                     yes: cli.yes,
                 },
                 managed_data,
+                &mut input,
                 stdout,
+                stderr,
             )
             .await?;
         }
-        Command::Alias(args) => commands::query::run_alias(args, machine, stdout).await?,
+        Command::Alias(args) => {
+            commands::query::run_alias(&operator, args, machine, stdout, stderr).await?
+        }
         Command::Policy { command } => {
             return commands::control::run_policy(
                 command,
                 commands::control::ControlScope {
+                    operator: &operator,
                     cluster: cli.cluster.as_deref(),
                     profile: cli.profile.as_deref(),
                     graph: cli.graph.as_deref(),
                     server: cli.server.as_deref(),
                 },
                 stdout,
+                stderr,
             )
             .await;
         }
@@ -716,8 +614,14 @@ async fn run(
                 .await;
         }
         Command::Cleanup(args) => {
-            return commands::maintenance::run_cleanup(args, maintenance_scope, stdout, stderr)
-                .await;
+            return commands::maintenance::run_cleanup(
+                args,
+                maintenance_scope,
+                &mut input,
+                stdout,
+                stderr,
+            )
+            .await;
         }
         Command::Use { .. } | Command::Organization { .. } => {
             unreachable!("managed dispatch handles organization commands and use")
@@ -726,6 +630,7 @@ async fn run(
             return commands::cluster::run(
                 command,
                 commands::cluster::ClusterScope {
+                    operator: &operator,
                     root: cli.cluster.as_deref(),
                     actor: cli.as_actor.as_deref(),
                 },
@@ -738,6 +643,7 @@ async fn run(
             return commands::control::run_graphs(
                 command,
                 commands::control::ControlScope {
+                    operator: &operator,
                     cluster: cli.cluster.as_deref(),
                     profile: cli.profile.as_deref(),
                     graph: cli.graph.as_deref(),
@@ -745,6 +651,7 @@ async fn run(
                 },
                 managed_data,
                 stdout,
+                stderr,
             )
             .await;
         }

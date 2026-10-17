@@ -14,6 +14,7 @@ use std::io::Write;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ClusterScope<'a> {
+    pub(crate) operator: &'a crate::operator::InvocationConfig,
     pub(crate) root: Option<&'a str>,
     pub(crate) actor: Option<&'a str>,
 }
@@ -30,9 +31,11 @@ pub(crate) async fn run(
             return finish_cluster_validate(&output, json, stdout);
         }
         ClusterCommand::Plan { config, json, .. } => {
-            let output =
-                omnigraph_cluster::plan_config_dir_as(config, resolve_cluster_actor(scope.actor)?)
-                    .await;
+            let output = omnigraph_cluster::plan_config_dir_as(
+                config,
+                resolve_cluster_actor(scope.operator, scope.actor, stderr)?,
+            )
+            .await;
             return finish_cluster_plan(&output, json, stdout);
         }
         ClusterCommand::Observe { config, json } => {
@@ -47,7 +50,9 @@ pub(crate) async fn run(
             ..
         } => {
             let caller = omnigraph_cluster::DeploymentCaller::storage_owner(resolve_cluster_actor(
+                scope.operator,
                 scope.actor,
+                stderr,
             )?);
             if let Some(root) = scope.root {
                 let id = deployment_id.as_deref().ok_or_else(|| color_eyre::eyre::eyre!("root-addressed apply requires --deployment-id; it only reconciles the original deployment"))?;
@@ -93,7 +98,9 @@ pub(crate) async fn run(
                 .root
                 .ok_or_else(|| color_eyre::eyre::eyre!("upgrade-ledger requires --cluster ROOT"))?;
             let caller = omnigraph_cluster::DeploymentCaller::storage_owner(resolve_cluster_actor(
+                scope.operator,
                 scope.actor,
+                stderr,
             )?);
             let status = retain_delivery_identity(
                 core_deployment_result(

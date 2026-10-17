@@ -6,9 +6,10 @@ use crate::app::Completion;
 use crate::commands::maintenance::args::UpgradeArgs;
 use crate::helpers::{resolve_local_uri, write_target};
 use crate::output::write_json;
-use crate::{operator, planes, scope};
+use crate::{planes, scope};
 
 pub(crate) async fn run(
+    input: &crate::operator::InvocationConfig,
     args: UpgradeArgs,
     profile: Option<&str>,
     store: Option<&str>,
@@ -22,8 +23,9 @@ pub(crate) async fn run(
         to_format,
         json,
     } = args;
-    let target = scope::resolve_scope_from_env(
-        &operator::load_operator_config()?,
+    let target = scope::resolve_scope(
+        input.get(stderr)?,
+        input.profile(),
         planes::Capability::Direct,
         scope::ScopeFlags {
             profile,

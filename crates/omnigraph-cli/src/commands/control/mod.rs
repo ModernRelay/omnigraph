@@ -9,7 +9,7 @@ use omnigraph_server::{PolicyEngine, PolicyRequest, PolicyTestConfig};
 use crate::app::Completion;
 use crate::client::GraphClient;
 use crate::helpers::graph_resource_id_for_selection;
-use crate::{operator, scope};
+use crate::operator;
 
 mod args;
 mod output;
@@ -22,6 +22,7 @@ use output::{
 /// Only the existing global arguments consumed by these control tools.
 #[derive(Clone, Copy)]
 pub(crate) struct ControlScope<'a> {
+    pub operator: &'a operator::InvocationConfig,
     pub cluster: Option<&'a str>,
     pub profile: Option<&'a str>,
     pub graph: Option<&'a str>,
@@ -32,8 +33,15 @@ pub(crate) async fn run_queries(
     command: QueriesCommand,
     scope: ControlScope<'_>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let cluster = require_cluster_scope(scope.cluster, scope.profile, "queries")?;
+    let cluster = require_cluster_scope(
+        scope.operator,
+        scope.cluster,
+        scope.profile,
+        "queries",
+        stderr,
+    )?;
     match command {
         QueriesCommand::Validate { json } => {
             return execute_queries_validate(&cluster, scope.graph, json, stdout).await;
@@ -49,11 +57,18 @@ pub(crate) async fn run_policy(
     command: PolicyCommand,
     scope: ControlScope<'_>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<Completion> {
     // Policy tooling sources the Cedar bundle(s) from the cluster's
     // applied policies (RFC-011): --cluster <dir>, + the global --graph
     // to pick a graph's bundle when several apply.
-    let cluster = require_cluster_scope(scope.cluster, scope.profile, "policy")?;
+    let cluster = require_cluster_scope(
+        scope.operator,
+        scope.cluster,
+        scope.profile,
+        "policy",
+        stderr,
+    )?;
     let graph = scope.graph;
     let graph_id = match graph {
         Some(id) => graph_resource_id_for_selection(Some(id), ""),
@@ -103,6 +118,7 @@ pub(crate) async fn run_graphs(
     scope: ControlScope<'_>,
     managed_data: Option<GraphClient>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<Completion> {
     match command {
         GraphsCommand::List { json, discovery } => {
@@ -113,7 +129,12 @@ pub(crate) async fn run_graphs(
                 // unless discovery is explicitly requested. Token bytes do
                 // not choose configuration or change static-token behavior.
                 (
-                    GraphClient::resolve_registry(scope.server, scope.profile)?,
+                    GraphClient::resolve_registry(
+                        scope.operator,
+                        scope.server,
+                        scope.profile,
+                        stderr,
+                    )?,
                     discovery,
                 )
             };
@@ -135,11 +156,13 @@ pub(crate) async fn run_graphs(
 /// passed through. A `--profile`/`OMNIGRAPH_PROFILE` cluster binding also
 /// resolves here when `--cluster` is absent. No omnigraph.yaml.
 fn require_cluster_scope(
+    input: &operator::InvocationConfig,
     cluster: Option<&str>,
     profile: Option<&str>,
     command: &str,
+    stderr: &mut dyn Write,
 ) -> Result<String> {
-    let op = operator::load_operator_config()?;
+    let op = input.get(stderr)?;
     let resolve_name = |name: &str| {
         op.cluster_root(name)
             .map(str::to_string)
@@ -149,16 +172,12 @@ fn require_cluster_scope(
         return Ok(resolve_name(cluster));
     }
     // A cluster profile (flag, else OMNIGRAPH_PROFILE) binds the cluster too.
-    let profile_name = profile.map(str::to_string).or_else(|| {
-        std::env::var(scope::PROFILE_ENV)
-            .ok()
-            .filter(|s| !s.is_empty())
-    });
+    let profile_name = profile.or_else(|| input.profile().filter(|name| !name.is_empty()));
     if let Some(name) = profile_name {
-        let profile = op.profile(&name).ok_or_else(|| {
+        let profile = op.profile(name).ok_or_else(|| {
             color_eyre::eyre::eyre!("unknown profile '{name}' (not defined under `profiles:`)")
         })?;
-        if let crate::operator::ScopeBinding::Cluster(cluster) = profile.binding(&name)? {
+        if let crate::operator::ScopeBinding::Cluster(cluster) = profile.binding(name)? {
             return Ok(resolve_name(&cluster));
         }
     }

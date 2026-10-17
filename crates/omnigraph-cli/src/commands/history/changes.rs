@@ -65,6 +65,7 @@ pub(crate) async fn run_changes(
     command: ChangesCommand,
     scope: HistoryScope<'_>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<()> {
     match command {
         ChangesCommand::Poll {
@@ -81,12 +82,14 @@ pub(crate) async fn run_changes(
         } => {
             let settings = client::parse_set_flags(&settings)?;
             let client = GraphClient::resolve(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
                 uri,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?;
             let filter = ChangeFilter::from_args(kinds, types, ops);
@@ -148,12 +151,14 @@ pub(crate) async fn run_changes(
             json,
         } => {
             let client = GraphClient::resolve(
+                scope.operator,
                 scope.capability,
                 scope.server,
                 scope.graph,
                 uri,
                 scope.profile,
                 scope.store,
+                stderr,
             )
             .await?;
             let filter = ChangeFilter::from_args(kinds, types, ops);

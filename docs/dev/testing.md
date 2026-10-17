@@ -170,6 +170,17 @@ filtering and wrong-plane refusal before configuration or HTTP access. The exist
 `system_remote` deployment matrix owns real server completion after delivery loss;
 these CLI changes require no additional query-semantic GQT cases.
 
+Local command tests in `commands/local` own supplied login input, credential
+changes after report failure, captured profile configuration, and completed skill
+or embedding files after output loss. `skill.rs` owns exact file delivery and its
+existing broken-pipe exception. Extend `cli_schema_config` for version and skill
+process behavior and `cli_data` for profile/embedding output. Its existing
+discovery-swap fixture also replaces the credential file, requiring registry
+probing and the subsequent command to retain the original token. Application and
+managed-output tests own completion, partial-write and flush failures; managed
+authentication/lifecycle fixtures own the pre-dispatch diagnostic gates. These
+are CLI boundary contracts; query-semantic GQT cases remain unchanged.
+
 The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation

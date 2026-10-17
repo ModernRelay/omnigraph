@@ -1,6 +1,5 @@
 #![recursion_limit = "256"]
 
-use clap::ValueEnum;
 use color_eyre::eyre::{Result, bail};
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
@@ -28,8 +27,6 @@ mod embed;
 mod operator;
 mod read_format;
 
-use embed::{EmbedOutput, execute_embed};
-
 mod admission;
 mod blob_cli;
 mod cli;
@@ -39,6 +36,7 @@ mod command_outcome;
 mod commands;
 mod graph_http;
 mod helpers;
+mod input;
 mod invocation;
 mod managed;
 #[cfg(test)]
