@@ -58,6 +58,13 @@ The served listing needs the same `read` as `GET /branches`, and reports
 details only for the branches the caller may `read`; another branch appears in
 `branches` alone.
 
+Each branch is read on its own, so the details are not one cut across
+branches: a branch written or created during the listing may show its state
+from just before or just after that write. A branch whose create is still
+recording its actor lists with `actor_id: null` for that moment. After a create
+that reports an uncertain outcome, a retry answers `409` (`already exists`);
+list the branches to confirm the branch exists.
+
 Creating a branch defaults to `main` when `--from` is omitted. A load can create
 a missing target branch by combining `--branch <name>` with `--from <base>`.
 

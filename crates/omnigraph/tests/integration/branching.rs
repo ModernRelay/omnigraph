@@ -469,6 +469,23 @@ async fn branch_list_detailed_reports_head_fork_creator_and_lifetime() {
         ["main", "feature"],
         "a branch the caller may not read lists by name alone"
     );
+
+    // A fast-forward into a branch that has written nothing publishes a new
+    // commit on it: the head and `updated_at` follow that commit, and the fork
+    // stays where the branch was created.
+    let created_from = newest_commit(&db, "main").await;
+    db.branch_create("ff").await.unwrap();
+    mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Fay"))
+        .await
+        .unwrap();
+    let outcome = db.branch_merge("main", "ff").await.unwrap();
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
+    let fast_forwarded = newest_commit(&db, "ff").await;
+    let details = detailed_branches(&db).await;
+    let ff = &details["ff"];
+    assert_eq!(ff.head, fast_forwarded);
+    assert_eq!(ff.fork.as_ref(), Some(&created_from));
+    assert_eq!(ff.updated_at, fast_forwarded.created_at);
 }
 
 #[tokio::test]

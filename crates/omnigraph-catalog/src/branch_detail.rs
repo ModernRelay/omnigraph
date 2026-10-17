@@ -13,7 +13,40 @@ use crate::branch_control::list_live_manifest_branch_contents;
 use crate::error::{OmniError, Result};
 use crate::history::ExtentCache;
 use crate::layout::open_manifest_dataset_with_session;
-use crate::state::{GraphLineageRow, read_manifest_rows_projected};
+use crate::state::{GraphLineageRow, exact_head, read_manifest_rows_projected};
+
+/// One live named graph branch: its logical name and the native ref, with
+/// that ref's contents, of its current lifetime.
+pub(crate) struct LiveBranch {
+    pub(crate) name: String,
+    pub(crate) native: String,
+    pub(crate) contents: BranchContents,
+}
+
+/// The live named graph branches of a `__manifest`, sorted by name: each live
+/// native ref mapped to its one logical name, `main` excluded. A name with
+/// more than one live incarnation fails loudly. The one enumeration both
+/// branch listings use, so names and details agree on what is live.
+pub(crate) async fn live_named_branches(dataset: &Dataset) -> Result<Vec<LiveBranch>> {
+    let mut named: Vec<_> = list_live_manifest_branch_contents(dataset)
+        .await?
+        .into_iter()
+        .filter(|(native, _)| native != "main")
+        .map(|(native, contents)| LiveBranch {
+            name: crate::branch_names::logical_branch_name(&native).to_string(),
+            native,
+            contents,
+        })
+        .collect();
+    named.sort_by(|left, right| left.name.cmp(&right.name));
+    if let Some(pair) = named.windows(2).find(|pair| pair[0].name == pair[1].name) {
+        return Err(OmniError::manifest_conflict(format!(
+            "branch '{}' has more than one live native incarnation; run cleanup before using it",
+            pair[0].name
+        )));
+    }
+    Ok(named)
+}
 
 /// How many branches a listing reads at once.
 const BRANCH_DETAIL_READ_CONCURRENCY: usize = 8;
@@ -64,31 +97,17 @@ pub async fn list_graph_branches_detailed(
 ) -> Result<GraphBranchListing> {
     let root = root_uri.trim_end_matches('/');
     let main = open_manifest_dataset_with_session(root, None, control_session).await?;
-    let mut named = Vec::new();
-    for (native, contents) in list_live_manifest_branch_contents(&main).await? {
-        if native == "main" {
-            continue;
-        }
-        let logical = crate::branch_names::logical_branch_name(&native).to_string();
-        named.push((logical, native, contents));
-    }
-    named.sort_by(|left, right| left.0.cmp(&right.0));
-    if let Some(pair) = named.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return Err(OmniError::manifest_conflict(format!(
-            "branch '{}' has more than one live native incarnation; run cleanup before using it",
-            pair[0].0
-        )));
-    }
-
+    let named = live_named_branches(&main).await?;
     let branches = std::iter::once("main".to_string())
-        .chain(named.iter().map(|(logical, _, _)| logical.clone()))
+        .chain(named.iter().map(|branch| branch.name.clone()))
         .collect();
     let mut details = Vec::with_capacity(named.len() + 1);
     if can_read("main") {
+        let head = read_manifest_rows_projected(&main).await?.head;
         details.push(GraphBranchDetail {
             name: "main".to_string(),
-            head: read_manifest_rows_projected(&main).await?.head,
-            head_is_own: true,
+            head_is_own: exact_head(&head, None).is_some(),
+            head,
             from: None,
             fork: None,
             actor_id: None,
@@ -97,13 +116,13 @@ pub async fn list_graph_branches_detailed(
     }
     let admitted: Vec<_> = named
         .into_iter()
-        .filter(|(logical, _, _)| can_read(logical))
+        .filter(|branch| can_read(&branch.name))
         .collect();
     let legacy = ExtentCache::default();
     let mut reads = futures::stream::iter(admitted)
-        .map(|(logical, native, contents)| {
+        .map(|branch| {
             let (main, legacy) = (&main, &legacy);
-            async move { branch_detail(root, main, legacy, logical, native, contents).await }
+            async move { branch_detail(root, main, legacy, branch).await }
         })
         .buffered(BRANCH_DETAIL_READ_CONCURRENCY);
     while let Some(detail) = reads.next().await {
@@ -116,13 +135,16 @@ async fn branch_detail(
     root: &str,
     main: &Dataset,
     legacy: &ExtentCache,
-    logical: String,
-    native: String,
-    contents: BranchContents,
+    branch: LiveBranch,
 ) -> Result<Option<GraphBranchDetail>> {
+    let LiveBranch {
+        name: logical,
+        native,
+        contents,
+    } = branch;
     match read_branch(root, main, legacy, &native, &contents).await {
         Ok((head, fork_commit)) => {
-            let head_is_own = head.native_branch.as_deref() == Some(native.as_str());
+            let head_is_own = exact_head(&head, Some(&native)).is_some();
             let from = contents
                 .parent_branch
                 .as_deref()
@@ -163,7 +185,7 @@ async fn read_branch(
         .await
         .map_err(OmniError::storage)?;
     let head = read_manifest_rows_projected(&branch).await?.head;
-    if head.native_branch.as_deref() != Some(native) {
+    if exact_head(&head, Some(native)).is_none() {
         return Ok((head, None));
     }
     let created = branch

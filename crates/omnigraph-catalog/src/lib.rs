@@ -2470,23 +2470,10 @@ impl ManifestCoordinator {
     /// Logical graph branches, `main` first. Each live native ref maps to
     /// exactly one logical name; a duplicate incarnation fails loudly.
     pub async fn list_graph_branches(&self) -> Result<Vec<String>> {
-        let branches = list_live_manifest_branch_contents(&self.dataset).await?;
-        let mut names = Vec::with_capacity(branches.len());
-        let mut seen = HashSet::with_capacity(branches.len());
-        for native in branches.keys().filter(|name| *name != "main") {
-            let logical = crate::branch_names::logical_branch_name(native).to_string();
-            if !seen.insert(logical.clone()) {
-                return Err(OmniError::manifest_conflict(format!(
-                    "branch '{logical}' has more than one live native incarnation; run cleanup \
-                     before using it"
-                )));
-            }
-            names.push(logical);
-        }
-        names.sort();
-        let mut all = vec!["main".to_string()];
-        all.extend(names);
-        Ok(all)
+        let named = branch_detail::live_named_branches(&self.dataset).await?;
+        Ok(std::iter::once("main".to_string())
+            .chain(named.into_iter().map(|branch| branch.name))
+            .collect())
     }
 }
 
