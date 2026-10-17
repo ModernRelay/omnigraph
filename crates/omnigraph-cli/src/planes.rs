@@ -205,7 +205,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     | Command::Branch {
                         command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
                     }
-                    | Command::Query { .. }
+                    | Command::Query(_)
             ),
             Control => matches!(
                 cmd,
@@ -267,8 +267,8 @@ pub(crate) fn command_capability(cmd: &Command) -> Capability {
 /// `schema show` is data; `queries`/`policy` read cluster applied state).
 pub(crate) fn command_plane(cmd: &Command) -> Plane {
     match cmd {
-        Command::Query { .. }
-        | Command::Mutate { .. }
+        Command::Query(_)
+        | Command::Mutate(_)
         | Command::Load { .. }
         | Command::Branch { .. }
         | Command::Snapshot { .. }
@@ -300,7 +300,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Cleanup { .. }
         | Command::Lint { .. } => Plane::Storage,
         Command::Cluster { .. } | Command::Organization { .. } => Plane::Control,
-        Command::Alias { .. }
+        Command::Alias(_)
         | Command::Embed(_)
         | Command::Login { .. }
         | Command::Logout { .. }
@@ -353,9 +353,9 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             ChangesCommand::Poll { .. } => "changes poll",
             ChangesCommand::Baseline { .. } => "changes baseline",
         },
-        Command::Query { .. } => "query",
-        Command::Mutate { .. } => "mutate",
-        Command::Alias { .. } => "alias",
+        Command::Query(_) => "query",
+        Command::Mutate(_) => "mutate",
+        Command::Alias(_) => "alias",
         Command::Policy { .. } => "policy",
         Command::Upgrade { .. } => "upgrade",
         Command::Optimize { .. } => "optimize",
@@ -415,7 +415,7 @@ fn accepts_graph_selector(cmd: &Command) -> bool {
 ///
 /// RFC 0010 Slice 1, generalized for RFC 0011 cluster addressing.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
-    if let Command::Alias { .. } = &cli.command {
+    if let Command::Alias(_) = &cli.command {
         // The binding owns all addressing. The listing keeps its historical
         // flag order (error text is observable contract).
         let flags: Vec<&str> = [

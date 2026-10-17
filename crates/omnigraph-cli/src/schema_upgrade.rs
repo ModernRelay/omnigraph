@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::Completion;
 
 pub(crate) async fn run(
     profile: &Option<String>,
@@ -7,8 +8,8 @@ pub(crate) async fn run(
     check: bool,
     json: bool,
     quiet: bool,
-) -> Result<()> {
-    let target = scope::resolve_scope(
+) -> Result<Completion> {
+    let target = scope::resolve_scope_from_env(
         &operator::load_operator_config()?,
         planes::Capability::Direct,
         scope::ScopeFlags {
@@ -54,9 +55,9 @@ pub(crate) async fn run(
         print_human(&report)?;
     }
     if !report.success() {
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
 fn print_human(report: &omnigraph::db::SystemColumnUpgradeReport) -> Result<()> {
@@ -90,6 +91,7 @@ fn print_human(report: &omnigraph::db::SystemColumnUpgradeReport) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn system_column_upgrade_parses_check_and_json() {

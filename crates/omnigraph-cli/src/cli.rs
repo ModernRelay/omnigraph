@@ -1,7 +1,15 @@
 //! The clap surface: every command, subcommand, and argument struct
 //! (moved verbatim from main.rs in the modularization).
 
-use super::*;
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use omnigraph::loader::LoadMode;
+use omnigraph_server::PolicyAction;
+use serde::Serialize;
+
+use crate::commands::query::{AliasArgs, MutateArgs, QueryArgs};
+use crate::embed::EmbedArgs;
 
 pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 
@@ -115,83 +123,11 @@ pub(crate) enum Command {
     /// Execute a read query, a branch read (`branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`), or an `explain` statement against a branch or snapshot.
     ///
     /// Run a read query.
-    Query {
-        /// Query name. With no `--query`/`-e`, the stored query to invoke from
-        /// the catalog (served — addressed via --server/--profile). With
-        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
-        name: Option<String>,
-        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one
-        /// branch read statement (`branch list`, `branch diff`,
-        /// `branch merge-base`, `branch merge … dry run`), or one
-        /// `explain query …` statement, which answers the plan the query
-        /// would run under as results.
-        #[arg(long, conflicts_with = "query_string")]
-        query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
-        /// a branch read statement, which takes no name, params, --branch or
-        /// --snapshot, or an `explain query …` statement.
-        #[arg(
-            short = 'e',
-            long = "query-string",
-            value_name = "GQ",
-            conflicts_with = "query"
-        )]
-        query_string: Option<String>,
-        #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long, conflicts_with = "snapshot")]
-        branch: Option<String>,
-        #[arg(long, conflicts_with = "branch")]
-        snapshot: Option<String>,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long, conflicts_with = "json")]
-        format: Option<ReadOutputFormat>,
-        #[arg(long, conflicts_with = "format")]
-        json: bool,
-    },
+    Query(QueryArgs),
     /// Execute a mutation, or one `branch create`/`delete`/`merge` statement.
     ///
     /// Run a mutation.
-    Mutate {
-        /// Query name. With no `--query`/`-e`, the stored mutation to invoke
-        /// from the catalog (served — addressed via --server/--profile). With
-        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
-        name: Option<String>,
-        /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass), or
-        /// one `branch create`/`branch delete`/`branch merge` statement.
-        #[arg(long, conflicts_with = "query_string")]
-        query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
-        /// one `branch create`/`branch delete`/`branch merge` statement, which
-        /// takes no name, params, --branch or --if-commit.
-        #[arg(
-            short = 'e',
-            long = "query-string",
-            value_name = "GQ",
-            conflicts_with = "query"
-        )]
-        query_string: Option<String>,
-        #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long)]
-        branch: Option<String>,
-        /// Compare-and-swap: run only while the branch head still equals this commit id
-        /// (from `omnigraph query --json` or `omnigraph commit list`). A lost race exits
-        /// 4 against a server, 1 embedded; --json prints `precondition_failure`.
-        #[arg(long = "if-commit", value_name = "COMMIT_ID")]
-        if_commit: Option<String>,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Mutate(MutateArgs),
     /// Invoke an operator alias.
     ///
     /// An alias is a personal binding under `aliases:` in
@@ -200,18 +136,7 @@ pub(crate) enum Command {
     /// stored query on its server. Living in its own namespace, an alias can
     /// never shadow or be shadowed by a built-in verb. Replaces the removed
     /// `--alias` flag on `query`/`mutate`.
-    Alias {
-        /// Alias name (a key under `aliases:` in ~/.omnigraph/config.yaml).
-        name: String,
-        /// Positional args bound to the alias's declared `args` params, in order.
-        args: Vec<String>,
-        #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long, conflicts_with = "json")]
-        format: Option<ReadOutputFormat>,
-        #[arg(long, conflicts_with = "format")]
-        json: bool,
-    },
+    Alias(AliasArgs),
     /// Load data into a graph (local, remote, or the selected managed cluster)
     Load {
         /// Graph URI
@@ -1432,14 +1357,6 @@ pub(crate) enum QueriesCommand {
         #[arg(long)]
         json: bool,
     },
-}
-
-#[derive(Debug, Args, Clone)]
-pub(crate) struct ParamsArgs {
-    #[arg(long, conflicts_with = "params_file")]
-    pub(crate) params: Option<String>,
-    #[arg(long, conflicts_with = "params")]
-    pub(crate) params_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]

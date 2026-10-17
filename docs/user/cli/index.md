@@ -190,6 +190,31 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
 The token is stored separately from `config.yaml`. A server resolves the actor
 from the token; clients cannot override it with `--as`.
 
+Ordinary graph commands and `graphs list` use one copy of the operator configuration
+during client setup. Editing that file during discovery does not change the
+client's destination or which configured server supplies its credentials.
+Token values still use the usual environment and credentials-file lookup.
+Operator aliases and served `cluster plan`, `cluster apply`, and `cluster status`
+follow the same rule. `query` and aliases also retain their output format and
+table settings from that captured configuration through execution and rendering.
+
+## Output and errors
+
+For `query` and `alias`, output selection follows `--json`, then `--format`,
+then the alias's `format`, then operator `defaults.output`, then `table`.
+The selected JSON or JSONL format also applies to structured execution errors:
+JSON writes an error object to stdout; JSONL writes one error line. Explicit
+`--format table` selects human output and diagnostics even when a default
+requests JSON.
+
+Before valid operator configuration and, for an alias, its selected binding have
+been captured, error formatting uses only explicit command-line flags.
+`mutate` still requires explicit `--json` for structured errors. For reads,
+unstructured transport failures and malformed error bodies remain diagnostics
+on stderr.
+See [output formats](reference.md#query-inputs-and-output)
+and [diagnostics](../queries/diagnostics.md).
+
 ## Use a server through a Unix socket
 
 A server may also be reached through a Unix-domain socket, for example a local

@@ -2,6 +2,7 @@
 //! main.rs in the modularization).
 
 use super::*;
+use crate::app::Completion;
 
 pub(crate) fn graph_type_subject(type_key: &str) -> String {
     if let Some(type_name) = type_key.strip_prefix("node:") {
@@ -176,7 +177,7 @@ pub(crate) fn print_query_lint_human(output: &QueryLintOutput) {
     );
 }
 
-pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -185,14 +186,19 @@ pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<
 
     if output.status == QueryLintStatus::Error {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
 
-    Ok(())
+    Ok(Completion::success())
 }
 
 pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+pub(crate) fn write_json<T: Serialize>(value: &T, writer: &mut dyn Write) -> Result<()> {
+    writeln!(writer, "{}", serde_json::to_string_pretty(value)?)?;
     Ok(())
 }
 
@@ -394,7 +400,7 @@ pub(crate) fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagno
     }
 }
 
-pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -402,12 +408,12 @@ pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Re
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -415,12 +421,12 @@ pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()>
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -428,12 +434,15 @@ pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_state_sync(output: &StateSyncOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_state_sync(
+    output: &StateSyncOutput,
+    json: bool,
+) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -441,12 +450,15 @@ pub(crate) fn finish_cluster_state_sync(output: &StateSyncOutput, json: bool) ->
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_force_unlock(output: &ForceUnlockOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_force_unlock(
+    output: &ForceUnlockOutput,
+    json: bool,
+) -> Result<Completion> {
     if json {
         print_json(output)?;
     } else {
@@ -454,9 +466,9 @@ pub(crate) fn finish_cluster_force_unlock(output: &ForceUnlockOutput, json: bool
     }
     if !output.ok {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
 pub(crate) fn print_load_human(payload: &LoadOutput) {
@@ -779,46 +791,43 @@ pub(crate) fn print_blob_stat_human(output: &BlobStatOutput) {
     println!("resolved_snapshot: {}", output.target.resolved_snapshot);
 }
 
-pub(crate) fn print_read_output(output: &ReadOutput, format: ReadOutputFormat) -> Result<()> {
-    println!(
-        "{}",
-        render_read(output, format, &resolve_table_render_options())?
-    );
-    Ok(())
-}
-
 /// A branch statement's `ChangeOutput` prints the line its `branch` verb
 /// prints; a mutation's prints the affected counts.
-pub(crate) fn print_change_human(output: &ChangeOutput) {
+pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) -> Result<()> {
     match &output.outcome {
         Some(BranchOutcomeOutput::Created { from, name }) => {
-            println!("created branch {name} from {from}");
+            writeln!(writer, "created branch {name} from {from}")?;
         }
-        Some(BranchOutcomeOutput::Deleted { name }) => println!("deleted branch {name}"),
+        Some(BranchOutcomeOutput::Deleted { name }) => writeln!(writer, "deleted branch {name}")?,
         Some(BranchOutcomeOutput::Merged {
             source,
             target,
             merge,
-        }) => println!("merged {source} into {target}: {}", merge.as_str()),
-        Some(BranchOutcomeOutput::Published) => println!(
+        }) => writeln!(writer, "merged {source} into {target}: {}", merge.as_str())?,
+        Some(BranchOutcomeOutput::Published) => writeln!(
+            writer,
             "published commit {} on {}",
             output
                 .commit
                 .as_ref()
                 .map_or("?", |commit| commit.graph_commit_id.as_str()),
             output.branch
-        ),
-        Some(BranchOutcomeOutput::Dropped { graph_commit_id }) => {
-            println!("dropped commit {graph_commit_id} on {}", output.branch)
-        }
-        None => println!(
+        )?,
+        Some(BranchOutcomeOutput::Dropped { graph_commit_id }) => writeln!(
+            writer,
+            "dropped commit {graph_commit_id} on {}",
+            output.branch
+        )?,
+        None => writeln!(
+            writer,
             "changed {} via {}: {} nodes, {} edges",
             output.branch, output.query_name, output.affected_nodes, output.affected_edges
-        ),
+        )?,
     }
     if let Some(actor_id) = &output.actor_id {
-        println!("actor_id: {}", actor_id);
+        writeln!(writer, "actor_id: {}", actor_id)?;
     }
+    Ok(())
 }
 
 pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
@@ -1142,15 +1151,6 @@ pub(crate) fn print_version(output: &VersionOutput, json: bool) -> Result<()> {
         println!("commit {commit}");
     }
     Ok(())
-}
-
-/// Table prefs cascade (RFC-011): operator defaults.table_* > built-in.
-pub(crate) fn resolve_table_render_options() -> ReadRenderOptions {
-    let operator = crate::operator::load_operator_config().unwrap_or_default();
-    ReadRenderOptions {
-        max_column_width: operator.defaults.table_max_column_width.unwrap_or(80),
-        cell_layout: operator.defaults.table_cell_layout.unwrap_or_default(),
-    }
 }
 
 pub(crate) fn print_change_cause_human(cause: &omnigraph_api_types::ChangeCauseOutput) {

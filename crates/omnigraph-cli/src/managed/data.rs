@@ -325,8 +325,8 @@ fn skips_context(cli: &Cli) -> bool {
     cli.direct
         || !matches!(
             cli.command,
-            Command::Query { .. }
-                | Command::Mutate { .. }
+            Command::Query(_)
+                | Command::Mutate(_)
                 | Command::Graphs {
                     command: GraphsCommand::List { .. }
                 }
@@ -504,10 +504,15 @@ pub(crate) async fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>
         return Ok(None);
     }
     let json = match &cli.command {
-        Command::Query { json, format, .. } => {
-            *json || matches!(format, Some(crate::read_format::ReadOutputFormat::Json))
+        Command::Query(args) => {
+            args.json
+                || matches!(
+                    args.format,
+                    Some(crate::read_format::ReadOutputFormat::Json)
+                )
         }
-        Command::Mutate { json, .. } | Command::Load { json, .. } => *json,
+        Command::Mutate(args) => args.json,
+        Command::Load { json, .. } => *json,
         Command::Commit {
             command: CommitCommand::List { json, .. } | CommitCommand::Show { json, .. },
         } => *json,
