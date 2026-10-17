@@ -75,7 +75,7 @@ def main() -> int:
         )
 
     publishers = {
-        "release-edge.yml": ("build_release", "publish_edge_release"),
+        "release-edge.yml": ("build_release", "publish_edge_release", "publish_edge_image"),
         "release.yml": ("build_release", "publish_release", "update_homebrew_tap"),
         "publish-image.yml": ("publish_image",),
         "publish-crates.yml": ("publish_crates",),
@@ -164,6 +164,18 @@ def main() -> int:
             require(
                 "scripts/edge_release.py check-version" in job_block(text, "prepare_edge_release"),
                 "release-edge.yml: an edge version must sort after the latest stable release",
+                failures,
+            )
+            image_job = job_block(text, "publish_edge_image")
+            require(
+                '--source-digest "$SOURCE_SHA"' in image_job
+                and "BASE_IMAGE=public.ecr.aws/debian/debian:trixie-slim" in image_job,
+                "release-edge.yml: the edge image packages the attested archive of this commit on trixie",
+                failures,
+            )
+            require(
+                ":latest" not in text,
+                "release-edge.yml: an edge build must never move a `latest` image tag",
                 failures,
             )
             require(

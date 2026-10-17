@@ -1,7 +1,12 @@
 # Pulled from ECR Public (the Debian team mirrors official images there)
 # instead of Docker Hub to avoid anonymous-pull rate limits from AWS
 # CodeBuild, which shares an outbound IP pool with many other accounts.
-FROM public.ecr.aws/debian/debian:bookworm-slim
+# The base must carry the glibc the binaries in target/release were linked
+# against: bookworm for the bookworm-built stable image (publish-image.yml),
+# trixie for the edge image, which packages the Ubuntu-built release archives
+# (glibc 2.39 or newer; release-edge.yml).
+ARG BASE_IMAGE=public.ecr.aws/debian/debian:bookworm-slim
+FROM ${BASE_IMAGE}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tini \

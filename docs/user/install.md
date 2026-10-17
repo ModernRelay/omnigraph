@@ -54,6 +54,14 @@ To deploy an edge build, pin it by its tag, so every machine installs the same
 binaries and you can return to them: `VERSION=edge-20261016-9c2b367` on
 macOS/Linux or `-Version edge-20261016-9c2b367` on Windows.
 
+Each edge build is also a [container image](deployment.md#container) with the
+same tag, `modernrelay/omnigraph-server:edge-20261016-9c2b367` on Docker Hub
+and `ghcr.io/modernrelay/omnigraph-server:edge-20261016-9c2b367`, holding that
+build's Linux x86_64 binaries on Debian trixie. The `edge` image tag follows the
+rolling `edge` release; `latest` stays on the newest stable release. Pin a
+deployment to the image's digest, which the run's summary lists, and check it
+with `gh attestation verify oci://<image>@<digest> --repo ModernRelay/omnigraph`.
+
 Read the build's release description before pointing it at a graph that a
 stable release must still read. It lists the storage format the build writes
 and the HTTP contract it speaks next to the latest stable release's. A branch

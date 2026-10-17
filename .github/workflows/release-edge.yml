@@ -316,6 +316,196 @@ jobs:
             gh release delete "$tag" --cleanup-tag --yes
           done < "$RUNNER_TEMP/edge-builds-to-delete.txt"
 
+  # The container image of the same build: the published build release's
+  # Linux x86_64 archive, checked against its checksum and its attestation
+  # (this workflow, this commit), on a trixie base because the archives need
+  # glibc 2.39 or newer. Tagged like the release, `edge-<commit date>-<short
+  # commit>`, which never changes once pushed, and `edge` only when the rolling
+  # release moved; never `latest`.
+  publish_edge_image:
+    name: Publish edge image
+    needs: [vocabulary_gate, prepare_edge_release, publish_edge_release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      BUILD_TAG: ${{ needs.prepare_edge_release.outputs.build_tag }}
+      SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
+      MOVED: ${{ needs.publish_edge_release.outputs.moved }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
+          persist-credentials: false
+
+      # The provenance predicate names the run's commit (its OIDC `sha`
+      # claim), so the image is attested only for the run's own commit.
+      - name: Require the run's commit to be the built commit
+        run: |
+          [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]] || {
+            echo "::error::this run is for ${GITHUB_SHA} but built ${SOURCE_SHA}; its provenance would name the wrong commit"
+            exit 1
+          }
+
+      # `.dockerignore` admits only target/release/<binary>, the paths the
+      # Dockerfile copies.
+      - name: Take the build's Linux binaries from its release
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/archive"
+          mkdir -p "$archive" target/release
+          gh release download "$BUILD_TAG" --pattern 'omnigraph-linux-x86_64.*' --dir "$archive"
+          (cd "$archive" && sha256sum --strict -c omnigraph-linux-x86_64.sha256)
+          gh attestation verify "$archive/omnigraph-linux-x86_64.tar.gz" --repo "$GH_REPO" \
+            --source-digest "$SOURCE_SHA" --signer-workflow "${GH_REPO}/.github/workflows/release-edge.yml"
+          tar -C target/release -xzf "$archive/omnigraph-linux-x86_64.tar.gz"
+
+      - name: Log in to GHCR
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      # A rerun keeps the image first pushed for this build and checks it again.
+      - name: Build, check and push the build's image
+        id: ghcr
+        run: |
+          set -euo pipefail
+          # Only a definite "not found" means the tag is free; any other
+          # registry answer stops the run rather than overwrite a pushed tag.
+          image_exists() {
+            local out
+            if out="$(docker buildx imagetools inspect "$1" 2>&1)"; then
+              return 0
+            fi
+            if grep -q ': not found' <<<"$out"; then
+              return 1
+            fi
+            echo "::error::cannot tell whether $1 exists: ${out}"
+            exit 1
+          }
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/omnigraph-server"
+          if image_exists "${image}:${BUILD_TAG}"; then
+            docker pull "${image}:${BUILD_TAG}"
+            pushed=false
+          else
+            docker build --build-arg BASE_IMAGE=public.ecr.aws/debian/debian:trixie-slim \
+              -t "${image}:${BUILD_TAG}" .
+            pushed=true
+          fi
+          docker run --rm --entrypoint /usr/local/bin/omnigraph "${image}:${BUILD_TAG}" version
+          docker run --rm --entrypoint /usr/local/bin/omnigraph "${image}:${BUILD_TAG}" version --json \
+            > "$RUNNER_TEMP/version.json"
+          python3 - "$RUNNER_TEMP/version.json" <<'PY'
+          import json, os, sys
+          facts = json.load(open(sys.argv[1]))
+          expected = ("edge", os.environ["SOURCE_SHA"])
+          if (facts["channel"], facts["commit"]) != expected:
+              raise SystemExit(f"image reports {facts['channel']}/{facts['commit']}, expected {expected}")
+          PY
+          docker run --rm --entrypoint /usr/local/bin/omnigraph-server "${image}:${BUILD_TAG}" --help > /dev/null
+          docker run --rm --entrypoint /usr/local/bin/omnigraph-azure-admission "${image}:${BUILD_TAG}" --help > /dev/null
+          if [[ "$pushed" == true ]]; then
+            docker push "${image}:${BUILD_TAG}"
+          fi
+          digest="$(docker buildx imagetools inspect "${image}:${BUILD_TAG}" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ steps.ghcr.outputs.image }}
+          subject-digest: ${{ steps.ghcr.outputs.digest }}
+          push-to-registry: true
+
+      - name: Move the rolling edge image
+        if: env.MOVED == 'true'
+        env:
+          IMAGE: ${{ steps.ghcr.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker tag "${IMAGE}:${BUILD_TAG}" "${IMAGE}:edge"
+          docker push "${IMAGE}:edge"
+
+      # Skipped when the DOCKERHUB_* secrets are not configured. With an org
+      # access token, DOCKERHUB_USERNAME is the org name and the image
+      # namespace.
+      - name: Push to Docker Hub
+        id: dockerhub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE: ${{ steps.ghcr.outputs.image }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo "DOCKERHUB_* secrets not configured; skipping Docker Hub publish."
+            exit 0
+          fi
+          echo "${DOCKERHUB_TOKEN}" | docker login docker.io --username "${DOCKERHUB_USERNAME}" --password-stdin
+          image_exists() {
+            local out
+            if out="$(docker buildx imagetools inspect "$1" 2>&1)"; then
+              return 0
+            fi
+            if grep -q ': not found' <<<"$out"; then
+              return 1
+            fi
+            echo "::error::cannot tell whether $1 exists: ${out}"
+            exit 1
+          }
+          hub="docker.io/${DOCKERHUB_USERNAME}/omnigraph-server"
+          if ! image_exists "${hub}:${BUILD_TAG}"; then
+            docker tag "${IMAGE}:${BUILD_TAG}" "${hub}:${BUILD_TAG}"
+            docker push "${hub}:${BUILD_TAG}"
+          fi
+          if [[ "$MOVED" == true ]]; then
+            docker tag "${IMAGE}:${BUILD_TAG}" "${hub}:edge"
+            docker push "${hub}:edge"
+          fi
+          digest="$(docker buildx imagetools inspect "${hub}:${BUILD_TAG}" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "image=${hub}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      # Stored with GitHub's attestations, which `gh attestation verify
+      # oci://docker.io/...` reads by digest.
+      - name: Attest Docker Hub image provenance
+        if: steps.dockerhub.outputs.digest != ''
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ steps.dockerhub.outputs.image }}
+          subject-digest: ${{ steps.dockerhub.outputs.digest }}
+          push-to-registry: false
+
+      - name: Report pinned digests
+        env:
+          GHCR_IMAGE: ${{ steps.ghcr.outputs.image }}
+          GHCR_DIGEST: ${{ steps.ghcr.outputs.digest }}
+          HUB_IMAGE: ${{ steps.dockerhub.outputs.image }}
+          HUB_DIGEST: ${{ steps.dockerhub.outputs.digest }}
+        run: |
+          {
+            echo "## Edge image published"
+            echo
+            echo '```'
+            echo "${GHCR_IMAGE}:${BUILD_TAG}"
+            echo "${GHCR_IMAGE}@${GHCR_DIGEST}"
+            if [[ -n "$HUB_DIGEST" ]]; then
+              echo "${HUB_IMAGE}:${BUILD_TAG}"
+              echo "${HUB_IMAGE}@${HUB_DIGEST}"
+            fi
+            echo '```'
+            echo
+            echo "Pin deployments to the digest form."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   smoke_installers:
     name: Smoke ${{ matrix.runner }} installer
     needs: [vocabulary_gate, prepare_edge_release, publish_edge_release]
