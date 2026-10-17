@@ -58,10 +58,10 @@ use crate::cli::CliLoadMode;
 use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::helpers::{
     PreconditionFailedCli, apply_bearer_token, apply_server_flag, branch_statement_change_request,
-    branch_statement_query_request, is_remote_uri, precondition_failed_cli, query_params_from_json,
-    remote_json, remote_json_bounded, remote_no_content, remote_response_json_bounded, remote_url,
-    resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag,
-    select_named_query,
+    branch_statement_query_request, is_remote_uri, missing_credential, precondition_failed_cli,
+    query_params_from_json, remote_json, remote_json_bounded, remote_no_content,
+    remote_response_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
+    resolve_server_flag, select_named_query, served_client,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
@@ -332,9 +332,9 @@ impl GraphClient {
     /// `graphs list` registry factory.
     fn registry_client(server: &str) -> Result<Self> {
         let base = resolve_server_flag(Some(server), None)?.expect("server name is present");
-        let token = resolve_remote_bearer_token(Some(&base))?;
+        let (http, token) = served_client(&base, &base)?;
         Ok(GraphClient::Remote {
-            http: GraphHttpClient::new(&base)?,
+            http,
             base_url: base,
             token,
             response_limit: None,
@@ -416,12 +416,13 @@ impl GraphClient {
         let via_server = server.is_some();
         let server_root = resolve_server_flag(server, None)?;
         let uri = apply_server_flag(server_root.as_deref(), graph, uri)?;
-        let token = resolve_remote_bearer_token(uri.as_deref())?;
         let uri = crate::helpers::resolve_uri(uri)?;
         reject_positional_remote(via_server, &uri)?;
         if is_remote_uri(&uri) {
+            let (http, token) =
+                served_client(server_root.as_deref().expect("remote server scope"), &uri)?;
             Ok(GraphClient::Remote {
-                http: GraphHttpClient::new(server_root.as_deref().expect("remote server scope"))?,
+                http,
                 base_url: uri,
                 token,
                 response_limit: None,
@@ -437,7 +438,7 @@ impl GraphClient {
     /// carries `policy_file`/`graph_id`/`selected`), and with the actor
     /// resolved up front. The embedded arm then opens WITH policy. The
     /// resolution order matches the write arms exactly: server flag →
-    /// bearer token → graph.
+    /// graph → the served credential.
     pub(crate) async fn resolve_with_policy(
         capability: crate::planes::Capability,
         server: Option<&str>,
@@ -476,7 +477,6 @@ impl GraphClient {
         let via_server = server.is_some();
         let server_root = resolve_server_flag(server, None)?;
         let uri = apply_server_flag(server_root.as_deref(), graph, scope.uri.clone())?;
-        let token = resolve_remote_bearer_token(uri.as_deref())?;
         let resolved = resolve_cli_graph(uri)?;
         reject_positional_remote(via_server, &resolved.uri)?;
         if resolved.is_remote {
@@ -491,8 +491,12 @@ impl GraphClient {
             }
             // Complete local addressing/identity validation before discovery.
             require_graph_for_multi_graph_server(&scope).await?;
+            let (http, token) = served_client(
+                server_root.as_deref().expect("remote server scope"),
+                &resolved.uri,
+            )?;
             Ok(GraphClient::Remote {
-                http: GraphHttpClient::new(server_root.as_deref().expect("remote server scope"))?,
+                http,
                 base_url: resolved.uri,
                 token,
                 response_limit: None,
@@ -2396,7 +2400,7 @@ impl GraphClient {
                     StatusCode::OK
                 };
                 if status != expected_status {
-                    return Err(remote_blob_error(status));
+                    return Err(remote_blob_error(status, missing_credential(&response)));
                 }
                 let headers = managed_response_headers(response.headers())?;
                 if let Some(range) = range {
@@ -2477,7 +2481,7 @@ impl GraphClient {
                         let (uri, snapshot_id) = external_response_headers(response.headers())?;
                         Ok(BlobStatOutput::external(query, snapshot_id, uri))
                     }
-                    status => Err(remote_blob_error(status)),
+                    status => Err(remote_blob_error(status, missing_credential(&response))),
                 }
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("blob stat")),
@@ -2985,12 +2989,19 @@ mod tests {
         assert_eq!(gateway.connections(), 2, "both requests used the socket");
         server.assert_complete();
 
-        let escaped = resolve_server_flag(Some(&root), Some("../.."))
-            .unwrap()
-            .unwrap();
+        // `--graph` refuses anything but one plain segment before any URL is
+        // composed; the transport still refuses a composed URL that climbs
+        // out of the root.
+        let refusal = resolve_server_flag(Some(&root), Some("../..")).unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("a graph name is one path segment"),
+            "{refusal}"
+        );
         for outside in [
             format!("{root}2/graphs"),
-            remote_url(&escaped, &["snapshot"], &[]).unwrap(),
+            remote_url(&format!("{root}/graphs/../.."), &["snapshot"], &[]).unwrap(),
         ] {
             let error = http.request(Method::GET, outside.clone()).unwrap_err();
             assert!(

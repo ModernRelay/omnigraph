@@ -21,6 +21,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use serde::Deserialize;
 
+use crate::graph_http::RequestTarget;
 use crate::read_format::{ReadOutputFormat, TableCellLayout};
 
 pub(crate) const OPERATOR_HOME_ENV: &str = "OMNIGRAPH_HOME";
@@ -171,21 +172,21 @@ impl OperatorConfig {
         self.defaults.output
     }
 
-    /// The gh-host model: which operator server (if any) does this request
-    /// URL belong to? Longest-prefix match after trailing-slash
-    /// normalization, so `url: http://h:8080` matches
-    /// `http://h:8080/graphs/spike` but never `http://h:8080-evil`.
-    pub(crate) fn find_server_for_url(&self, request_url: &str) -> Option<&str> {
-        let request = request_url.trim_end_matches('/');
+    /// The gh-host model: which operator server (if any) does a request
+    /// sent to `target` belong to? The server whose own target has the same
+    /// endpoint and whose path segments lead the request's, deepest first, so
+    /// `url: http://h:8080` covers `http://h:8080/graphs/spike` but never
+    /// `http://h:8080-evil`, a `..` that climbs out of a path-prefixed `url`,
+    /// or another socket. An entry the transport cannot address matches
+    /// nothing.
+    pub(crate) fn find_server_for_target(&self, target: &RequestTarget) -> Option<&str> {
         let mut best: Option<(&str, usize)> = None;
         for (name, server) in &self.servers {
-            let base = server.url.trim_end_matches('/');
-            let matches = request == base
-                || request
-                    .strip_prefix(base)
-                    .is_some_and(|rest| rest.starts_with('/'));
-            if matches && best.is_none_or(|(_, len)| base.len() > len) {
-                best = Some((name, base.len()));
+            let Ok(base) = RequestTarget::of(&server.url, &server.url) else {
+                continue;
+            };
+            if target.is_under(&base) && best.is_none_or(|(_, depth)| base.depth() > depth) {
+                best = Some((name, base.depth()));
             }
         }
         best.map(|(name, _)| name)
@@ -370,9 +371,9 @@ pub(crate) fn token_env_name(server: &str) -> String {
 
 /// The keyed token chain for a named server (§D4 steps 1–2):
 /// `OMNIGRAPH_TOKEN_<NAME>` env → `[<name>]` in the credentials file.
-/// `Ok(None)` means "no keyed token" — callers fall through to the legacy
-/// chain; a present-but-unreadable/over-permissive credentials file is a
-/// loud error, never a silent skip.
+/// `Ok(None)` means "no keyed token": the request carries no credential. A
+/// present-but-unreadable/over-permissive credentials file is a loud error,
+/// never a silent skip.
 pub(crate) fn resolve_keyed_token(server: &str) -> Result<Option<String>> {
     if let Ok(token) = env::var(token_env_name(server)) {
         let token = token.trim();
@@ -740,28 +741,57 @@ profiles:
     }
 
     #[test]
-    fn find_server_for_url_longest_prefix_no_substring_traps() {
+    fn find_server_for_target_matches_where_the_request_is_sent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         fs::write(
             &path,
-            "servers:\n  dev:\n    url: http://h:8080\n  dev-spike:\n    url: http://h:8080/graphs/spike\n",
+            "servers:\n  dev:\n    url: http://h:8080\n  dev-spike:\n    url: http://h:8080/graphs/spike\n  \
+               tenant:\n    url: https://t.example/tenant-a/\n  og:\n    url: unix:///tmp/og/og.sock\n",
         )
         .unwrap();
         let config = load_operator_config_at(&path).unwrap();
-        assert_eq!(config.find_server_for_url("http://h:8080"), Some("dev"));
+        let server = |url: &str| {
+            let target = RequestTarget::of(url, url).unwrap();
+            config.find_server_for_target(&target)
+        };
+        assert_eq!(server("http://h:8080"), Some("dev"));
+        assert_eq!(server("http://H:8080/graphs/other"), Some("dev"));
+        // The deepest base wins.
         assert_eq!(
-            config.find_server_for_url("http://h:8080/graphs/other"),
-            Some("dev")
-        );
-        // longest prefix wins
-        assert_eq!(
-            config.find_server_for_url("http://h:8080/graphs/spike/queries/q"),
+            server("http://h:8080/graphs/spike/queries/q"),
             Some("dev-spike")
         );
-        // no substring trap: a different port/host must not match
-        assert_eq!(config.find_server_for_url("http://h:8080-evil/x"), None);
-        assert_eq!(config.find_server_for_url("http://other:9999"), None);
+        assert_eq!(server("http://h:8080/graphs/spike/../other"), Some("dev"));
+        assert_eq!(
+            server("http://h:8080/graphs/x/../spike/queries/q"),
+            Some("dev-spike")
+        );
+        // A different host, port or scheme is a different server; a port
+        // that does not parse addresses nothing.
+        assert!(RequestTarget::of("http://h:8080-evil/x", "http://h:8080-evil/x").is_err());
+        assert_eq!(server("http://h-evil:8080/x"), None);
+        assert_eq!(server("http://other:9999"), None);
+        assert_eq!(server("https://h:8080"), None);
+        // The default port is the same endpoint; a sibling prefix is not.
+        assert_eq!(
+            server("https://t.example:443/tenant-a/graphs/g"),
+            Some("tenant")
+        );
+        assert_eq!(server("https://t.example/tenant-ab/graphs/g"), None);
+        assert_eq!(server("https://t.example/tenant-a/../tenant-b"), None);
+        assert_eq!(server("https://t.example/tenant-a/%2e%2e/tenant-b"), None);
+        // A socket is matched by the path the transport connects to.
+        #[cfg(unix)]
+        {
+            let socket = |root: &str| {
+                let target = RequestTarget::of(root, &format!("{root}/graphs/g")).unwrap();
+                config.find_server_for_target(&target)
+            };
+            assert_eq!(socket("unix:///tmp/og/og.sock"), Some("og"));
+            assert_eq!(socket("unix:///tmp/og/./og.sock"), Some("og"));
+            assert_eq!(socket("unix:///tmp/og/og.sock/../evil.sock"), None);
+        }
     }
 
     #[test]

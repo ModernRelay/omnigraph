@@ -108,9 +108,10 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
                 serde_json::json!({"error":"deployment_fixture_reached", "code":"conflict"}),
             ),
         ]);
+        let operator = KeyedServer::new(&api.origin);
         let output = output_failure(
             cli()
-                .env("OMNIGRAPH_BEARER_TOKEN", "capture-token")
+                .envs(operator.env("capture-token"))
                 .args([
                     "cluster",
                     "apply",
@@ -473,9 +474,10 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
     // is binding evidence, never permission to silently retarget the bundle.
     fs::write(&config, format!("storage: {remote_root}-other\n{source}")).unwrap();
     let api = IntentApiFixture::graph(vec![IntentReply::json(200, status)]);
+    let operator = KeyedServer::new(&api.origin);
     output_failure(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "capture-token")
+            .envs(operator.env("capture-token"))
             .args(["cluster", "apply", "--server", &api.origin, "--config"])
             .arg(temp.path())
             .arg("--json"),
@@ -1626,10 +1628,11 @@ fn managed_data_direct_override_uses_only_explicit_legacy_transport() {
             "columns":["value"], "rows":[{"value":42}], "graph_commit_id":"head-a"
         }),
     )]);
+    let operator = KeyedServer::new(&data.origin);
     let output = output_success(
         cli()
             .current_dir(temp.path())
-            .env("OMNIGRAPH_BEARER_TOKEN", "explicit-legacy-token")
+            .envs(operator.env("explicit-legacy-token"))
             .env("OMNIGRAPH_CONTROL_TOKEN", "never-data")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args(["query", "q", "--graph", "knowledge", "--server"])
@@ -1903,7 +1906,6 @@ fn managed_data_issue_633_folder_context_does_not_gate_local_graph_work() {
             .current_dir(temp.path())
             .env("OMNIGRAPH_HOME", &home)
             .env_remove("OMNIGRAPH_PROFILE")
-            .env_remove("OMNIGRAPH_BEARER_TOKEN")
             .timeout(std::time::Duration::from_secs(30));
         command
     };

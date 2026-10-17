@@ -110,9 +110,23 @@ Edit and validate the bundle, then submit it to the running owner:
 
 ```bash
 omnigraph cluster validate --config ./company-brain
-OMNIGRAPH_BEARER_TOKEN='secret' omnigraph cluster apply \
-  --server https://graph.example.com --config ./company-brain --json
+OMNIGRAPH_TOKEN_PRODUCTION='secret' omnigraph cluster apply \
+  --server production --config ./company-brain --json
 ```
+
+`production` names a server declared in the operator config, and the CLI sends
+its token only to that server's URL:
+
+```yaml
+# ~/.omnigraph/config.yaml
+servers:
+  production:
+    url: https://graph.example.com
+```
+
+`omnigraph login production` stores the token instead of the variable. A
+literal `--server https://…` URL that matches no declared server gets no token;
+see [server credentials](../cli/index.md#use-a-server).
 
 With `--server`, omitted `storage` binds the bundle to the selected server’s
 canonical root. An explicit absolute `storage` must match that root; relative
@@ -220,8 +234,8 @@ schema effects. It is not remote authentication.
 A lost connection does not mean failure. Observe the original ID:
 
 ```bash
-OMNIGRAPH_BEARER_TOKEN='secret' omnigraph cluster status \
-  --server https://graph.example.com --deployment-id '<DEPLOYMENT_ID>' --json
+OMNIGRAPH_TOKEN_PRODUCTION='secret' omnigraph cluster status \
+  --server production --deployment-id '<DEPLOYMENT_ID>' --json
 ```
 
 Status is read-only. `active` is false for an older result after a newer revision
