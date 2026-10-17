@@ -762,7 +762,7 @@ pub(crate) async fn resolve_maintenance_uri(
     cli_uri: Option<String>,
     operation: &str,
 ) -> Result<String> {
-    let scope = scope::resolve_scope(
+    let scope = scope::resolve_scope_from_env(
         &operator::load_operator_config()?,
         planes::Capability::Direct,
         scope::ScopeFlags {
