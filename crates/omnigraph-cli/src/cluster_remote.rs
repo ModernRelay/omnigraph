@@ -1,9 +1,10 @@
 //! Live cluster deployment: submit once, then observe the original identity.
 
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::{Result, WrapErr, bail};
 use omnigraph_cluster::{CapturedDeployment, DeploymentLookup, DeploymentStatus};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -11,11 +12,13 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 
 use crate::cli::{Cli, ClusterCommand, Command};
-use crate::graph_http::{ApiContractError, GraphHttpClient};
+use crate::commands::cluster::core_deployment_result;
+use crate::graph_http::{ApiContractError, GraphHttpClient, ServerTransport};
 use crate::helpers::{
     RemoteErrorCli, apply_bearer_token, remote_response_json_bounded, remote_url,
-    resolve_remote_bearer_token, resolve_server_flag,
+    resolve_remote_bearer_token_with_config, resolve_server_flag_with_config,
 };
+use crate::output::write_json;
 
 const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
@@ -95,8 +98,19 @@ impl ApplyResponse {
             )
     }
 
-    fn finish(&self, acceptance_only: bool) -> Result<()> {
-        crate::print_json(self)?;
+    fn write(&self, id: &str, stdout: &mut dyn Write) -> Result<()> {
+        (|| -> Result<()> {
+            write_json(self, stdout)?;
+            stdout.flush()?;
+            Ok(())
+        })()
+        .wrap_err_with(|| format!(
+            "could not deliver deployment receipt; Deployment-ID: {id}; inspect its original identity; never replay unknown work"
+        ))
+    }
+
+    fn finish(&self, id: &str, acceptance_only: bool, stdout: &mut dyn Write) -> Result<()> {
+        self.write(id, stdout)?;
         if self.active
             || (acceptance_only
                 && self.in_progress
@@ -138,8 +152,15 @@ struct RemoteCluster {
 
 impl RemoteCluster {
     fn new(server: &str) -> Result<Self> {
-        let root = resolve_server_flag(Some(server), None)?.expect("explicit server");
-        let token = resolve_remote_bearer_token(Some(&root))?;
+        // Preserve literal address errors before operator-config errors.
+        // Named addresses need configuration first.
+        if server.contains("://") {
+            ServerTransport::parse(server)?;
+        }
+        let operator_config = crate::operator::load_operator_config()?;
+        let root = resolve_server_flag_with_config(&operator_config, Some(server), None)?
+            .expect("explicit server");
+        let token = resolve_remote_bearer_token_with_config(&operator_config, Some(&root))?;
         let client = GraphHttpClient::new(&root)?;
         Ok(Self {
             root,
@@ -184,32 +205,33 @@ impl RemoteCluster {
         .await?
     }
 
-    async fn capture(
-        &self,
+    fn capture(
         config: &Path,
+        status: &StatusResponse,
         json_output: bool,
-        deadline: Instant,
-    ) -> Result<(StatusResponse, CapturedDeployment)> {
-        let status: StatusResponse = self
-            .request(Method::GET, &["cluster", "deployments"], None, deadline)
-            .await?;
+        stdout: &mut dyn Write,
+    ) -> Result<CapturedDeployment> {
         // Source files belong to the caller. The authenticated server owns
         // storage resolution; the CLI never opens its storage root.
-        let deployment = crate::core_deployment_result(
+        let deployment = core_deployment_result(
             omnigraph_cluster::capture_deployment_for_server(config, &status.status.canonical_root),
             json_output,
+            stdout,
         )?;
         if status.status.canonical_root != deployment.canonical_root() {
             bail!(
                 "cluster config addresses a different storage root from the selected server; no deployment was sent"
             );
         }
-        Ok((status, deployment))
+        Ok(deployment)
     }
 
-    async fn plan(&self, config: &Path, json_output: bool) -> Result<()> {
+    async fn plan(&self, config: &Path, json_output: bool, stdout: &mut dyn Write) -> Result<()> {
         let deadline = Instant::now() + DEFAULT_WAIT;
-        let (_, deployment) = self.capture(config, json_output, deadline).await?;
+        let status = self
+            .request(Method::GET, &["cluster", "deployments"], None, deadline)
+            .await?;
+        let deployment = Self::capture(config, &status, json_output, stdout)?;
         let plan: Value = self
             .request(
                 Method::POST,
@@ -218,8 +240,9 @@ impl RemoteCluster {
                 deadline,
             )
             .await?;
-        crate::print_json(&plan)?;
+        write_json(&plan, stdout)?;
         if plan.get("ok").and_then(Value::as_bool) != Some(true) {
+            stdout.flush()?;
             bail!("deployment plan refused; inspect its diagnostics");
         }
         Ok(())
@@ -233,6 +256,7 @@ impl RemoteCluster {
         Ok(response)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn wait(
         &self,
         id: &str,
@@ -240,6 +264,8 @@ impl RemoteCluster {
         deadline: Instant,
         acceptance_only: bool,
         expected_input: Option<&str>,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
     ) -> Result<()> {
         loop {
             if let Some(response) = &last {
@@ -247,35 +273,41 @@ impl RemoteCluster {
                     response.verify_input(expected)?;
                 }
                 if (acceptance_only && response.accepted()) || !response.pending() {
-                    return response.finish(acceptance_only);
+                    return response.finish(id, acceptance_only, stdout);
                 }
             }
             if Instant::now() >= deadline {
-                return wait_timeout(Some(id), last.as_ref());
+                return wait_timeout(Some(id), last.as_ref(), stdout, stderr);
             }
             tokio::time::sleep_until((Instant::now() + POLL_INTERVAL).min(deadline)).await;
             if Instant::now() >= deadline {
-                return wait_timeout(Some(id), last.as_ref());
+                return wait_timeout(Some(id), last.as_ref(), stdout, stderr);
             }
             match self.observe(id, deadline).await {
                 Ok(response) => last = Some(response),
                 Err(error) if retry_observation(&error) => {
                     if Instant::now() >= deadline {
-                        return wait_timeout(Some(id), last.as_ref());
+                        return wait_timeout(Some(id), last.as_ref(), stdout, stderr);
                     }
                 }
                 Err(error) => {
                     // Preserve the caller's recovery identity even if access
                     // or the protocol changes while observing the operation.
-                    eprintln!(
+                    writeln!(
+                        stderr,
                         "Deployment-ID: {id}; observation failed; never resubmit unknown work"
-                    );
+                    )
+                    .and_then(|()| stderr.flush())
+                    .wrap_err_with(|| format!(
+                        "could not deliver observation failure; Deployment-ID: {id}; never resubmit unknown work"
+                    ))?;
                     return Err(error);
                 }
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply(
         &self,
         config: &Path,
@@ -283,14 +315,25 @@ impl RemoteCluster {
         json_output: bool,
         no_wait: bool,
         timeout: Option<u64>,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
     ) -> Result<()> {
         let deadline = Instant::now() + timeout.map(Duration::from_secs).unwrap_or(DEFAULT_WAIT);
-        let (status, deployment) = match self.capture(config, json_output, deadline).await {
-            Ok(captured) => captured,
-            Err(error) if is_wait_timeout(&error, deadline) => return wait_timeout(None, None),
+        // Only transport expiry becomes a caller wait timeout. A failed local
+        // capture diagnostic must return once, even when its delivery crossed
+        // the deadline; it cannot authorize another diagnostic or a submission.
+        let status = match self
+            .request(Method::GET, &["cluster", "deployments"], None, deadline)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) if is_wait_timeout(&error, deadline) => {
+                return wait_timeout(None, None, stdout, stderr);
+            }
             Err(error) => return Err(error),
         };
-        let input_digest = crate::core_deployment_result(deployment.input_digest(), json_output)?;
+        let deployment = Self::capture(config, &status, json_output, stdout)?;
+        let input_digest = core_deployment_result(deployment.input_digest(), json_output, stdout)?;
         if requested_id.is_none()
             && let Some(id) = &status.status.outstanding_id
         {
@@ -304,7 +347,13 @@ impl RemoteCluster {
         if id.is_empty() || id.len() > 75 || id.chars().any(char::is_control) {
             bail!("invalid deployment identity; no deployment was sent");
         }
-        eprintln!("Deployment-ID: {id}");
+        // Make recovery identity observable before handing the operation to
+        // the server, including for callers supplying a buffered writer.
+        writeln!(stderr, "Deployment-ID: {id}")
+            .and_then(|()| stderr.flush())
+            .wrap_err_with(|| {
+                format!("could not deliver Deployment-ID: {id}; no deployment was sent")
+            })?;
         // Exactly one submission. A lost response only permits GET observation.
         let response = self
             .request::<ApplyResponse>(
@@ -317,18 +366,41 @@ impl RemoteCluster {
         match response {
             Ok(response) => {
                 response.verify(&id)?;
-                self.wait(&id, Some(response), deadline, no_wait, Some(&input_digest))
-                    .await
+                self.wait(
+                    &id,
+                    Some(response),
+                    deadline,
+                    no_wait,
+                    Some(&input_digest),
+                    stdout,
+                    stderr,
+                )
+                .await
             }
-            Err(error) if is_wait_timeout(&error, deadline) => wait_timeout(Some(&id), None),
+            Err(error) if is_wait_timeout(&error, deadline) => {
+                wait_timeout(Some(&id), None, stdout, stderr)
+            }
             Err(error) if retry_observation(&error) => {
-                self.wait(&id, None, deadline, no_wait, Some(&input_digest))
-                    .await
+                self.wait(
+                    &id,
+                    None,
+                    deadline,
+                    no_wait,
+                    Some(&input_digest),
+                    stdout,
+                    stderr,
+                )
+                .await
             }
             Err(error) => {
-                eprintln!(
+                writeln!(
+                    stderr,
                     "Inspect cluster status --server <SERVER> --deployment-id {id}; a lost response does not authorize replay."
-                );
+                )
+                .and_then(|()| stderr.flush())
+                .wrap_err_with(|| format!(
+                    "could not deliver submission failure; Deployment-ID: {id}; a lost response does not authorize replay"
+                ))?;
                 Err(error)
             }
         }
@@ -367,23 +439,40 @@ fn retry_observation(error: &color_eyre::Report) -> bool {
             })
 }
 
-fn wait_timeout(id: Option<&str>, last: Option<&ApplyResponse>) -> Result<()> {
-    crate::print_json(&json!({
-        "deployment_id": id,
-        "outcome": "wait_timeout",
-        "last_observation": last,
-    }))?;
-    if id.is_some() {
-        eprintln!(
-            "Caller wait deadline reached; server work was not cancelled. Observe the original Deployment-ID before taking further action."
-        );
-    } else {
-        eprintln!("Caller wait deadline reached before submission; no deployment was sent.");
-    }
+fn wait_timeout(
+    id: Option<&str>,
+    last: Option<&ApplyResponse>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    (|| -> Result<()> {
+        write_json(&json!({
+            "deployment_id": id,
+            "outcome": "wait_timeout",
+            "last_observation": last,
+        }), stdout)?;
+        stdout.flush()?;
+        if id.is_some() {
+            writeln!(stderr,
+                "Caller wait deadline reached; server work was not cancelled. Observe the original Deployment-ID before taking further action."
+            )?;
+        } else {
+            writeln!(stderr, "Caller wait deadline reached before submission; no deployment was sent.")?;
+        }
+        stderr.flush()?;
+        Ok(())
+    })().wrap_err_with(|| match id {
+        Some(id) => format!("could not deliver wait timeout; Deployment-ID: {id}; observe its original identity before taking further action"),
+        None => "could not deliver wait timeout; no deployment was sent".to_owned(),
+    })?;
     Err(WaitTimeout.into())
 }
 
-pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
+pub(crate) async fn dispatch(
+    cli: &Cli,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<bool> {
     let Some(server) = cli.server.as_deref() else {
         return Ok(false);
     };
@@ -420,7 +509,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
     }
     let remote = RemoteCluster::new(server)?;
     match command {
-        ClusterCommand::Plan { config, json, .. } => remote.plan(config, *json).await?,
+        ClusterCommand::Plan { config, json, .. } => remote.plan(config, *json, stdout).await?,
         ClusterCommand::Apply {
             config,
             deployment_id,
@@ -435,6 +524,8 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
                     *json,
                     run.no_wait,
                     run.timeout,
+                    stdout,
+                    stderr,
                 )
                 .await?
         }
@@ -453,18 +544,233 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
                     Err(error) => return Err(error),
                 };
                 if *wait {
-                    remote.wait(id, response, deadline, false, None).await?;
+                    remote
+                        .wait(id, response, deadline, false, None, stdout, stderr)
+                        .await?;
                 } else {
-                    crate::print_json(&response.unwrap())?;
+                    response.unwrap().write(id, stdout)?;
                 }
             } else {
                 let status: StatusResponse = remote
                     .request(Method::GET, &["cluster", "deployments"], None, deadline)
                     .await?;
-                crate::print_json(&status)?;
+                write_json(&status, stdout)?;
             }
         }
         _ => unreachable!(),
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
+    use std::io;
+
+    #[derive(Clone, Copy, Debug)]
+    enum OutputFault {
+        AfterPrefix,
+        Flush,
+    }
+
+    struct Output {
+        fault: Option<OutputFault>,
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Output {
+        fn new(fault: Option<OutputFault>) -> Self {
+            Self {
+                fault,
+                bytes: Vec::new(),
+                flushes: 0,
+            }
+        }
+    }
+
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = if matches!(self.fault, Some(OutputFault::AfterPrefix)) {
+                let remaining = 5 - self.bytes.len();
+                if remaining == 0 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "output closed"));
+                }
+                remaining.min(bytes.len())
+            } else {
+                bytes.len()
+            };
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if matches!(self.fault, Some(OutputFault::Flush)) {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "output closed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_output_failure_preserves_identity_and_never_replays_submission() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("people.pg"),
+            "node Person {\n  name: String @key\n}\n",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("cluster.yaml"), "version: 1\nmetadata:\n  name: output-fixture\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  knowledge:\n    schema: ./people.pg\n").unwrap();
+        let root = "file:///server-only-storage";
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV:1:01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let digest = omnigraph_cluster::capture_deployment_for_server(source.path(), root)
+            .unwrap()
+            .input_digest()
+            .unwrap();
+        let status = json!({
+            "status": {"canonical_root":root,"ledger_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "state_revision":1,"result_revision":0,"next_sequence":1,
+                "lock_id":"server-owner","outstanding_id":null,"lookup":null},
+            "active":false,"in_progress":false,
+        });
+        let accepted = json!({
+            "deployment":{"status":"outstanding","id":id,"input_digest":digest,"graphs":{"knowledge":"started"}},
+            "active":false,"in_progress":true,
+        });
+        for fail_identity in [true, false] {
+            for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
+                let mut replies = vec![IntentReply::json(200, status.clone())];
+                if !fail_identity {
+                    replies.push(IntentReply::json(202, accepted.clone()));
+                }
+                let api = IntentApiFixture::graph(replies);
+                // Supplied routing avoids ambient operator configuration in this
+                // output-boundary test; the fixture still owns actual HTTP.
+                let remote = RemoteCluster {
+                    root: api.origin.clone(),
+                    token: Some("fixture-secret".into()),
+                    client: GraphHttpClient::new(&api.origin).unwrap(),
+                };
+                let mut stdout = Output::new((!fail_identity).then_some(fault));
+                let mut stderr = Output::new(fail_identity.then_some(fault));
+                let error = remote
+                    .apply(
+                        source.path(),
+                        Some(id),
+                        true,
+                        true,
+                        Some(10),
+                        &mut stdout,
+                        &mut stderr,
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().kind(),
+                    io::ErrorKind::BrokenPipe
+                );
+                assert!(error.to_string().contains(id), "{error:?}");
+                assert!(!error.is::<WaitTimeout>());
+                assert!(!retry_observation(&error));
+                let requests = api.workflow_requests();
+                assert_eq!(requests.len(), if fail_identity { 1 } else { 2 });
+                assert_eq!(
+                    (&*requests[0].method, &*requests[0].path),
+                    ("GET", "/cluster/deployments")
+                );
+                if fail_identity {
+                    assert!(stdout.bytes.is_empty());
+                    assert!(error.to_string().contains("no deployment was sent"));
+                } else {
+                    assert_eq!(
+                        (&*requests[1].method, &*requests[1].path),
+                        ("POST", "/cluster/deployments")
+                    );
+                    assert_eq!(requests[1].body["deployment_id"], id);
+                    assert_eq!(stderr.bytes, format!("Deployment-ID: {id}\n").as_bytes());
+                    assert_eq!(stderr.flushes, 1, "identity delivered before submission");
+                    assert!(error.to_string().contains("never replay unknown work"));
+                    if matches!(fault, OutputFault::Flush) {
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&stdout.bytes).unwrap(),
+                            accepted
+                        );
+                    }
+                }
+                for request in requests {
+                    assert_eq!(request.headers["authorization"], "Bearer fixture-secret");
+                }
+                assert!(!source.path().join("__cluster").exists());
+                assert!(!source.path().join("graphs").exists());
+                api.assert_complete();
+            }
+        }
+    }
+
+    #[test]
+    fn refused_receipt_is_flushed_before_its_domain_error() {
+        let response = ApplyResponse {
+            deployment: DeploymentLookup::NotRecorded,
+            active: false,
+            in_progress: false,
+        };
+        let mut stdout = Output::new(None);
+        let error = response
+            .finish("original-id", false, &mut stdout)
+            .unwrap_err();
+        assert!(error.to_string().contains("acceptance is not recorded"));
+        assert_eq!(stdout.flushes, 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&stdout.bytes).unwrap(),
+            json!({"deployment":{"status":"not_recorded"},"active":false,"in_progress":false})
+        );
+    }
+
+    #[test]
+    fn wait_timeout_requires_delivery_before_selecting_exit_five() {
+        for id in [None, Some("original-id")] {
+            let mut stdout = Output::new(None);
+            let mut stderr = Output::new(None);
+            let error = wait_timeout(id, None, &mut stdout, &mut stderr).unwrap_err();
+            assert!(error.is::<WaitTimeout>());
+            assert_eq!(stdout.flushes, 1);
+            assert_eq!(stderr.flushes, 1);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&stdout.bytes).unwrap(),
+                json!({"deployment_id":id,"outcome":"wait_timeout","last_observation":null})
+            );
+            assert_eq!(
+                String::from_utf8(stderr.bytes).unwrap(),
+                if id.is_some() {
+                    "Caller wait deadline reached; server work was not cancelled. Observe the original Deployment-ID before taking further action.\n"
+                } else {
+                    "Caller wait deadline reached before submission; no deployment was sent.\n"
+                }
+            );
+            for fail_stdout in [true, false] {
+                for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
+                    let mut stdout = Output::new(fail_stdout.then_some(fault));
+                    let mut stderr = Output::new((!fail_stdout).then_some(fault));
+                    let error = wait_timeout(id, None, &mut stdout, &mut stderr).unwrap_err();
+                    assert!(!error.is::<WaitTimeout>());
+                    assert!(!retry_observation(&error));
+                    assert_eq!(
+                        error.downcast_ref::<io::Error>().unwrap().kind(),
+                        io::ErrorKind::BrokenPipe
+                    );
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(id.unwrap_or("no deployment was sent"))
+                    );
+                    if fail_stdout {
+                        assert!(stderr.bytes.is_empty());
+                    }
+                }
+            }
+        }
+    }
 }

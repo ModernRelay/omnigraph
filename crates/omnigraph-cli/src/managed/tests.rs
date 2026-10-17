@@ -1,5 +1,5 @@
 use super::*;
-use clap::{CommandFactory, FromArgMatches, Parser};
+use clap::Parser;
 
 #[test]
 fn origins_are_canonical_and_credentials_cannot_change_destination() {
@@ -108,14 +108,7 @@ fn contexts_are_exact_and_cannot_hide_unknown_authority() {
 }
 
 fn parse_cluster(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
-    let matches = Cli::command().try_get_matches_from(args)?;
-    let cli = Cli::from_arg_matches(&matches)?;
-    let mut command_matches = &matches;
-    while let Some((_, sub_matches)) = command_matches.subcommand() {
-        command_matches = sub_matches;
-    }
-    crate::validate_cluster_arguments(&cli, command_matches)?;
-    Ok(cli)
+    crate::invocation::parse_from(args).map(|parsed| parsed.cli)
 }
 
 #[tokio::test]

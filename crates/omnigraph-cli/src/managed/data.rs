@@ -3,6 +3,7 @@ use super::auth::{self, Store};
 use super::{Api, Context, Failure, Method, Output, Result, canonical_origin, json};
 use crate::cli::{Cli, Command, CommitCommand, GraphsCommand};
 use crate::client::GraphClient;
+use crate::commands::transfer::LoadArgs;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -325,12 +326,12 @@ fn skips_context(cli: &Cli) -> bool {
     cli.direct
         || !matches!(
             cli.command,
-            Command::Query { .. }
-                | Command::Mutate { .. }
+            Command::Query(_)
+                | Command::Mutate(_)
                 | Command::Graphs {
                     command: GraphsCommand::List { .. }
                 }
-                | Command::Load { uri: None, .. }
+                | Command::Load(LoadArgs { uri: None, .. })
                 | Command::Commit {
                     command: CommitCommand::List { uri: None, .. }
                         | CommitCommand::Show { uri: None, .. }
@@ -504,10 +505,15 @@ pub(crate) async fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>
         return Ok(None);
     }
     let json = match &cli.command {
-        Command::Query { json, format, .. } => {
-            *json || matches!(format, Some(crate::read_format::ReadOutputFormat::Json))
+        Command::Query(args) => {
+            args.json
+                || matches!(
+                    args.format,
+                    Some(crate::read_format::ReadOutputFormat::Json)
+                )
         }
-        Command::Mutate { json, .. } | Command::Load { json, .. } => *json,
+        Command::Mutate(args) => args.json,
+        Command::Load(args) => args.json,
         Command::Commit {
             command: CommitCommand::List { json, .. } | CommitCommand::Show { json, .. },
         } => *json,
