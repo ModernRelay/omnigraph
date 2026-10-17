@@ -139,7 +139,10 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
 workspace gate; its required-cell checks reject removed or ignored cases. The
 lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
-timeout without replaying a committed merge. Its deployment matrix holds a real
+timeout without replaying a committed merge or commit publication/drop (a drop's
+empty response has no body to truncate). Output unit tests inject write and flush
+failures; application tests check baseline file-lock custody through cursor flush.
+Its deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server

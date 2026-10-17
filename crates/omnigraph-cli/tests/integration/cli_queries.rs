@@ -864,7 +864,7 @@ fn alias_unknown_name_errors_listing_defined() {
     let home = tempdir().unwrap();
     std::fs::write(
         home.path().join("config.yaml"),
-        "servers:\n  dev:\n    url: https://x\naliases:\n  who:\n    server: dev\n    query: find_person\n",
+        "servers:\n  dev:\n    url: https://x\ndefaults:\n  output: json\naliases:\n  who:\n    server: dev\n    query: find_person\n",
     )
     .unwrap();
     let output = output_failure(
@@ -878,6 +878,183 @@ fn alias_unknown_name_errors_listing_defined() {
         stderr.contains("unknown alias 'nope'") && stderr.contains("who"),
         "expected an unknown-alias error listing defined aliases; got: {stderr}"
     );
+    assert!(
+        output.stdout.is_empty(),
+        "an error before alias capture cannot inherit its output defaults: {output:?}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn alias_setup_keeps_one_operator_config_across_params_file() {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    use serde_json::json;
+
+    let cases = [
+        ("csv", "json", &["--json"][..], false, "json"),
+        ("csv", "json", &[][..], false, "csv"),
+        ("json", "csv", &[][..], true, "json"),
+        ("jsonl", "csv", &[][..], true, "jsonl"),
+        ("json", "jsonl", &["--format", "table"][..], true, "human"),
+    ];
+    for (alias_format, default_format, flags, refused, expected_format) in cases {
+        let home = tempdir().unwrap();
+        let config = home.path().join("config.yaml");
+        let replacement = home.path().join("replacement.yaml");
+        let params_file = home.path().join("params.json");
+        let trap = IntentApiFixture::graph(vec![]);
+        let refusal = json!({"error": "captured alias denied", "code": "forbidden"});
+        let response = if refused {
+            IntentReply::json(403, refusal.clone())
+        } else {
+            IntentReply::json(
+                200,
+                json!({
+                    "query_name": "find_person",
+                    "target": {"branch": "main"},
+                    "row_count": 1,
+                    "rows": [{"p.name": "original-server"}]
+                }),
+            )
+        };
+        let server = IntentApiFixture::graph(vec![response]);
+        let captured_config = format!(
+            "servers:\n  prod:\n    url: '{}'\n  graph-owner:\n    url: '{}/graphs/knowledge'\ndefaults:\n  output: {default_format}\naliases:\n  who:\n    server: prod\n    graph: knowledge\n    query: find_person\n    args: [name, limit]\n    params: {{name: fixed, limit: 1, source: original-alias}}\n    format: {alias_format}\ncaptured_only: true\n",
+            server.origin, server.origin
+        );
+        fs::write(&config, captured_config).unwrap();
+        let replacement_config = format!(
+            "servers:\n  prod:\n    url: '{}'\n  replacement:\n    url: '{}/graphs/knowledge'\naliases:\n  who:\n    server: prod\n    graph: replacement\n    query: replacement_query\n    params: {{source: replacement-alias}}\nreplacement_only: true\n",
+            trap.origin, server.origin
+        );
+        fs::write(&replacement, &replacement_config).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&params_file)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let mut command = assert_cmd::Command::from(cli_process());
+        command
+            .current_dir(home.path())
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_TOKEN_PROD", "captured-root-token")
+            .env("OMNIGRAPH_TOKEN_GRAPH_OWNER", "captured-graph-token")
+            .env("OMNIGRAPH_TOKEN_REPLACEMENT", "replacement-token")
+            .env_remove("OMNIGRAPH_BEARER_TOKEN")
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["alias", "who", "positional-name", "2", "--params-file"])
+            .arg(&params_file)
+            .args(flags)
+            .timeout(Duration::from_secs(15));
+        let output = std::thread::scope(|scope| {
+            // assert_cmd kills and reaps the child on timeout, including if the
+            // barrier fails before a writer can release its parameter-file read.
+            let child = scope.spawn(move || command.output().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut params = loop {
+                match OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&params_file)
+                {
+                    Ok(params) => break params,
+                    Err(error)
+                        if error.raw_os_error() == Some(libc::ENXIO)
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("CLI did not open its parameter file: {error}"),
+                }
+            };
+            // Opening the FIFO writer succeeds only once the CLI has opened its
+            // reader, after loading the alias. Readiness, not the polling delay,
+            // orders replacement before execute_operator_alias can start.
+            fs::rename(&replacement, &config).unwrap();
+            params
+                .write_all(br#"{"name":"explicit-name","extra":"file"}"#)
+                .unwrap();
+            drop(params);
+            child.join().unwrap()
+        });
+
+        assert_eq!(fs::read_to_string(&config).unwrap(), replacement_config);
+        assert!(
+            trap.requests().is_empty(),
+            "alias setup changed destination"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(if refused { 1 } else { 0 }),
+            "{expected_format}: {output:?}"
+        );
+        let stdout = stdout_string(&output);
+        if refused {
+            if expected_format == "human" {
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(
+                    stderr_string(&output).contains("captured alias denied"),
+                    "{output:?}"
+                );
+            } else {
+                assert_eq!(parse_stdout_json(&output), refusal, "{output:?}");
+                assert!(
+                    !stderr_string(&output).contains("captured alias denied"),
+                    "{output:?}"
+                );
+                if expected_format == "jsonl" {
+                    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+                }
+            }
+        } else if expected_format == "csv" {
+            assert_eq!(stdout, "p.name\noriginal-server\n");
+        } else {
+            assert_eq!(
+                parse_stdout_json(&output)["rows"][0]["p.name"],
+                "original-server"
+            );
+        }
+        trap.assert_complete();
+        server.assert_complete();
+        let requests = server.workflow_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/graphs/knowledge/queries/find_person");
+        assert_eq!(
+            requests[0].headers["authorization"],
+            "Bearer captured-graph-token"
+        );
+        assert_eq!(
+            requests[0].body,
+            json!({
+                "expect_mutation": false,
+                "params": {
+                    "name": "explicit-name", "limit": 2,
+                    "source": "original-alias", "extra": "file"
+                }
+            })
+        );
+        let stderr = stderr_string(&output);
+        assert_eq!(
+            stderr.matches("unknown key `captured_only`").count(),
+            1,
+            "{stderr}"
+        );
+        // Success and failure presentation use the same config as alias dispatch.
+        assert_eq!(
+            stderr.matches("unknown key `replacement_only`").count(),
+            0,
+            "{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1312,6 +1489,46 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
         stdout_string(&human).is_empty(),
         "the human lane writes nothing to stdout"
     );
+
+    let operator_home = tempdir().unwrap();
+    let cases: &[(&str, &[&str], &str)] = &[
+        ("json", &[], "json"),
+        ("jsonl", &[], "jsonl"),
+        ("json", &["--format", "table"], "human"),
+        ("jsonl", &["--format", "csv"], "human"),
+        ("csv", &["--json"], "json"),
+        ("csv", &["--format", "jsonl"], "jsonl"),
+    ];
+    for &(default_format, flags, expected_format) in cases {
+        std::fs::write(
+            operator_home.path().join("config.yaml"),
+            format!("defaults:\n  output: {default_format}\n"),
+        )
+        .unwrap();
+        let output = output_failure(
+            embedded("query", &graph)
+                .env("OMNIGRAPH_HOME", operator_home.path())
+                .args(["-e", refused])
+                .args(flags),
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        if expected_format == "human" {
+            assert!(output.stdout.is_empty(), "{output:?}");
+            let stderr = stderr_string(&output);
+            assert!(stderr.contains("error[Q002]:"), "{stderr}");
+            assert!(stderr.contains("fix: query name()"), "{stderr}");
+        } else {
+            assert_eq!(
+                parse_stdout_json(&output),
+                json,
+                "{default_format} {flags:?}"
+            );
+            assert!(output.stderr.is_empty(), "{output:?}");
+            if expected_format == "jsonl" {
+                assert_eq!(stdout_string(&output).lines().count(), 1, "{output:?}");
+            }
+        }
+    }
 
     let (_cluster, server) = served_graph();
     let json = parse_stdout_json(&output_failure(

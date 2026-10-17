@@ -8,7 +8,7 @@ use omnigraph_api_types::{ErrorCode, ErrorOutput};
 use reqwest::StatusCode;
 use serde::Serialize;
 
-use crate::cli::{BlobCommand, BranchCommand, Cli, Command, SchemaCommand};
+use crate::cli::{BlobCommand, BranchCommand, Cli, Command, CommitCommand, SchemaCommand};
 use crate::graph_http::ApiContractError;
 use crate::helpers::{PreconditionFailedCli, RemoteErrorCli};
 
@@ -29,11 +29,14 @@ pub(crate) fn applies(cli: &Cli) -> bool {
     matches!(
         &cli.command,
         Command::Load { .. }
-            | Command::Mutate { .. }
+            | Command::Mutate(_)
             | Command::Branch {
                 command: BranchCommand::Create { .. }
                     | BranchCommand::Delete { .. }
                     | BranchCommand::Merge { .. }
+            }
+            | Command::Commit {
+                command: CommitCommand::Publish { .. } | CommitCommand::Drop { .. }
             }
             | Command::Schema {
                 command: SchemaCommand::Apply { .. }

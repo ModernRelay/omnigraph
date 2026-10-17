@@ -14,6 +14,7 @@ use crate::support::*;
 fn short_version_flag_prints_current_cli_version() {
     let output = output_success(cli().arg("-v"));
     let stdout = stdout_string(&output);
+    assert!(output.stderr.is_empty(), "{output:?}");
 
     assert_eq!(
         stdout.trim(),
@@ -25,6 +26,7 @@ fn short_version_flag_prints_current_cli_version() {
 fn long_version_flag_prints_current_cli_version() {
     let output = output_success(cli().arg("--version"));
     let stdout = stdout_string(&output);
+    assert!(output.stderr.is_empty(), "{output:?}");
 
     assert_eq!(
         stdout.trim(),
@@ -2458,6 +2460,10 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         vec!["branch", "create", "review"],
         vec!["branch", "delete", "review", "--yes"],
         vec!["branch", "merge", "review"],
+        vec!["mutate", "-e", "commit publish \"proposal\""],
+        vec!["mutate", "-e", "commit drop \"proposal\"", "--yes"],
+        vec!["commit", "publish", "proposal"],
+        vec!["commit", "drop", "proposal", "--yes"],
         vec!["load", "--data", data, "--mode", "append"],
         vec![
             "load", "--data", data, "--mode", "merge", "--branch", "review", "--from", "main",
@@ -2889,6 +2895,136 @@ fn read_supports_inline_query_string() {
 }
 
 #[test]
+fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
+    let cases: &[(Option<&str>, &[&str], &str)] = &[
+        (None, &["--json"], "json"),
+        (Some("knowledge"), &["--json"], "json"),
+        (Some("knowledge"), &[], "csv"),
+        (Some("knowledge"), &["--format", "table"], "table"),
+    ];
+    for &(graph, flags, expected_format) in cases {
+        let home = tempdir().unwrap();
+        let config = home.path().join("config.yaml");
+        let replacement = home.path().join("replacement.yaml");
+        let trap = IntentApiFixture::graph(vec![]);
+        let mut replies = Vec::new();
+        if graph.is_none() {
+            replies.push(IntentReply::json(200, json!({"graphs": []})));
+        }
+        replies.push(IntentReply::json(
+            200,
+            json!({
+                "query_name": "q",
+                "target": {"branch": "main"},
+                "row_count": 1,
+                "rows": [{"p.name": "original-server"}]
+            }),
+        ));
+        let server = IntentApiFixture::graph_with_discovery_hook(replies, {
+            let config = config.clone();
+            let replacement = replacement.clone();
+            move || fs::rename(replacement, config).unwrap()
+        });
+        fs::write(
+            &config,
+            format!(
+                "servers:\n  prod:\n    url: '{}'\n  graph-owner:\n    url: '{}/graphs/knowledge'\ndefaults:\n  output: csv\n  table_max_column_width: 8\n  table_cell_layout: wrap\ncaptured_only: true\n",
+                server.origin, server.origin
+            ),
+        )
+        .unwrap();
+        let replacement_config = format!(
+            "servers:\n  prod:\n    url: '{}'\n  replacement:\n    url: '{}'\ndefaults:\n  output: json\n  table_max_column_width: 80\n  table_cell_layout: truncate\nreplacement_only: true\n",
+            trap.origin, server.origin
+        );
+        fs::write(&replacement, &replacement_config).unwrap();
+
+        let mut command = cli();
+        command
+            .current_dir(home.path())
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_TOKEN_PROD", "captured-root-token")
+            .env("OMNIGRAPH_TOKEN_GRAPH_OWNER", "captured-graph-token")
+            .env("OMNIGRAPH_TOKEN_REPLACEMENT", "replacement-token")
+            .env_remove("OMNIGRAPH_BEARER_TOKEN")
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args([
+                "query",
+                "--server",
+                "prod",
+                "-e",
+                "query q() { match { $p: Person } return { $p.name } }",
+            ])
+            .args(flags);
+        if let Some(graph) = graph {
+            command.args(["--graph", graph]);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), replacement_config);
+        assert!(!replacement.exists(), "discovery must replace the config");
+        assert!(trap.requests().is_empty(), "setup changed destination");
+        assert!(output.status.success(), "{graph:?} {flags:?}: {output:?}");
+        let stdout = stdout_string(&output);
+        match expected_format {
+            "json" => assert_eq!(
+                parse_stdout_json(&output)["rows"][0]["p.name"],
+                "original-server"
+            ),
+            "csv" => assert_eq!(stdout, "p.name\noriginal-server\n"),
+            "table" => {
+                assert!(stdout.lines().any(|line| line == "original"), "{stdout}");
+                assert!(
+                    stdout.lines().any(|line| line.trim_end() == "-server"),
+                    "{stdout}"
+                );
+                assert!(!stdout.contains("original-server"), "{stdout}");
+            }
+            _ => unreachable!(),
+        }
+        trap.assert_complete();
+        server.assert_complete();
+
+        let requests = server.workflow_requests();
+        let (data_path, token) = if graph.is_some() {
+            ("/graphs/knowledge/query", "captured-graph-token")
+        } else {
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[0].path, "/graphs");
+            assert_eq!(
+                requests[0].headers["authorization"],
+                "Bearer captured-root-token"
+            );
+            ("/query", "captured-root-token")
+        };
+        let data = requests.last().unwrap();
+        assert_eq!(data.method, "POST");
+        assert_eq!(data.path, data_path);
+        assert_eq!(data.headers["authorization"], format!("Bearer {token}"));
+        for request in server
+            .requests()
+            .iter()
+            .filter(|request| request.method == "HEAD")
+        {
+            assert!(!request.headers.contains_key("authorization"));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches("unknown key `captured_only`").count(),
+            1,
+            "{stderr}"
+        );
+        // Destination, credentials and presentation share the captured config.
+        assert_eq!(
+            stderr.matches("unknown key `replacement_only`").count(),
+            0,
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
 fn ambiguous_or_positional_http_scopes_are_rejected_without_network_io() {
     use crate::support::managed_http::IntentApiFixture;
 
@@ -3304,6 +3440,8 @@ fn quiet_suppresses_the_write_target_echo() {
 
 #[test]
 fn branch_delete_against_non_local_scope_refuses_without_yes() {
+    use crate::support::managed_http::IntentApiFixture;
+
     // No bucket needed: the confirm gate fires before the graph is opened.
     let output = output_failure(
         cli()
@@ -3318,6 +3456,40 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
     let error = output["error"].as_str().unwrap();
     assert!(error.contains("refusing destructive `branch delete`") && error.contains("--yes"));
     assert_eq!(output["command_outcome"]["effects"], "none");
+
+    // Both commit-drop spellings use the same consent gate before submission.
+    for arguments in [
+        vec!["commit", "drop", "proposal"],
+        vec!["mutate", "-e", "commit drop \"proposal\""],
+    ] {
+        let server = IntentApiFixture::graph(vec![]);
+        let output = output_failure(cli().args(&arguments).args([
+            "--server",
+            &server.origin,
+            "--graph",
+            "knowledge",
+            "--json",
+        ]));
+        let error = parse_stdout_json(&output);
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("refusing destructive `commit drop`"),
+            "{arguments:?}: {error}"
+        );
+        assert_eq!(
+            error["command_outcome"],
+            serde_json::json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
+            "{arguments:?}"
+        );
+        let requests = server.requests();
+        assert!(
+            requests.is_empty(),
+            "consent precedes discovery and submission: {arguments:?}"
+        );
+        server.assert_complete();
+    }
 }
 
 #[test]

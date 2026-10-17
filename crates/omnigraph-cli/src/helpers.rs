@@ -4,16 +4,12 @@
 
 use std::io::IsTerminal;
 
-use omnigraph_api_types::{
-    ChangeRequest, QueryRequest, branch_statement_refusals, query_file_refusals,
-};
-use omnigraph_compiler::query::ast::{
-    BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
-};
-use omnigraph_compiler::settings::SettingId;
+use omnigraph_api_types::{ChangeRequest, QueryRequest, query_file_refusals};
+use omnigraph_compiler::query::ast::QueryFile;
 
 use super::*;
-use crate::operator;
+use crate::app::Completion;
+use crate::operator::{self, OperatorConfig};
 
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
@@ -43,8 +39,19 @@ pub(crate) fn uri_is_local(uri: &str) -> bool {
 /// local)`. stderr so `--json` consumers reading stdout are unaffected; the line
 /// legitimately differs embedded-vs-served (that visibility is the point).
 pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: bool) {
+    write_target(quiet, label, uri, served, &mut io::stderr())
+        .expect("failed printing resolved write target to stderr");
+}
+
+pub(crate) fn write_target(
+    quiet: bool,
+    label: &str,
+    uri: &str,
+    served: bool,
+    stderr: &mut dyn Write,
+) -> Result<()> {
     if quiet {
-        return;
+        return Ok(());
     }
     let access = if served {
         "served"
@@ -53,7 +60,8 @@ pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: boo
     } else {
         "direct, remote"
     };
-    eprintln!("omnigraph {label} → {uri} ({access})");
+    writeln!(stderr, "omnigraph {label} → {uri} ({access})")?;
+    Ok(())
 }
 
 /// Gate a destructive write (`cleanup`, overwrite `load`, `branch delete`)
@@ -61,6 +69,16 @@ pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: boo
 /// confirmation; otherwise `--yes` consents, an interactive TTY is prompted, and
 /// a non-TTY / `--json` run refuses rather than silently proceeding.
 pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool) -> Result<()> {
+    confirm_destructive_with_writer(label, uri, yes, json, &mut io::stderr())
+}
+
+pub(crate) fn confirm_destructive_with_writer(
+    label: &str,
+    uri: &str,
+    yes: bool,
+    json: bool,
+    stderr: &mut dyn Write,
+) -> Result<()> {
     if uri_is_local(uri) || yes {
         return Ok(());
     }
@@ -70,10 +88,11 @@ pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool)
              pass --yes to confirm (an interactive TTY would be prompted instead)"
         );
     }
-    eprint!(
+    write!(
+        stderr,
         "About to run a destructive `{label}` against {uri} (not local). Type 'yes' to continue: "
-    );
-    io::stderr().flush()?;
+    )?;
+    stderr.flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     match answer.trim().to_ascii_lowercase().as_str() {
@@ -273,9 +292,19 @@ pub(crate) fn resolve_actor(cli_as: Option<&str>) -> Result<Option<String>> {
     if let Some(actor) = cli_as {
         return Ok(Some(actor.to_string()));
     }
-    Ok(operator::load_operator_config()?
-        .actor()
-        .map(str::to_string))
+    Ok(resolve_actor_with_config(
+        &operator::load_operator_config()?,
+        cli_as,
+    ))
+}
+
+pub(crate) fn resolve_actor_with_config(
+    operator_config: &OperatorConfig,
+    cli_as: Option<&str>,
+) -> Option<String> {
+    cli_as
+        .or_else(|| operator_config.actor())
+        .map(str::to_string)
 }
 
 pub(crate) fn resolve_cluster_actor(cli_as: Option<&str>) -> Result<Option<String>> {
@@ -290,14 +319,18 @@ pub(crate) fn resolve_cli_actor(cli_as: Option<&str>) -> Result<Option<String>> 
 /// for the matching server (`OMNIGRAPH_TOKEN_<NAME>` env → 0600 credentials
 /// file), then the default `OMNIGRAPH_BEARER_TOKEN` env. No omnigraph.yaml
 /// chain.
-pub(crate) fn resolve_remote_bearer_token(explicit_uri: Option<&str>) -> Result<Option<String>> {
+///
+/// Match against the captured server bindings, but read credentials live.
+pub(crate) fn resolve_remote_bearer_token_with_config(
+    operator_config: &OperatorConfig,
+    explicit_uri: Option<&str>,
+) -> Result<Option<String>> {
     // The keyed hop (RFC-007 §D4, gh-host model): when the effective remote
     // URL belongs to an operator-defined server, that server's keyed chain
     // applies first — OMNIGRAPH_TOKEN_<NAME> env, then the 0600 credentials
     // file. The keyed token is structurally scoped to its own server: a URL
     // matching no operator server never sees it.
     if let Some(remote_url) = explicit_uri.filter(|uri| is_remote_uri(uri)) {
-        let operator_config = operator::load_operator_config()?;
         if let Some(server) = operator_config.find_server_for_url(remote_url) {
             if let Some(token) = operator::resolve_keyed_token(server)? {
                 return Ok(Some(token));
@@ -314,7 +347,8 @@ pub(crate) fn resolve_remote_bearer_token(explicit_uri: Option<&str>) -> Result<
 /// resolution and the keyed-token URL match work unchanged — the flag is
 /// sugar for a URI the operator already owns. Unknown names fail loudly,
 /// listing what IS defined.
-pub(crate) fn resolve_server_flag(
+pub(crate) fn resolve_server_flag_with_config(
+    operator_config: &OperatorConfig,
     server: Option<&str>,
     graph: Option<&str>,
 ) -> Result<Option<String>> {
@@ -329,7 +363,6 @@ pub(crate) fn resolve_server_flag(
         crate::graph_http::ServerTransport::parse(server)?;
         server.to_string()
     } else {
-        let operator_config = operator::load_operator_config()?;
         let Some(entry) = operator_config.servers.get(server) else {
             let known = operator_config
                 .servers
@@ -356,61 +389,12 @@ pub(crate) fn resolve_server_flag(
 /// Execute an OPERATOR alias (RFC-007 PR 3): a pure binding invoking a
 /// stored query by name on a named server — POST {base}/queries/{name}.
 /// Param precedence: --params > positional args > the alias's fixed
-/// params. The keyed token applies via the ordinary URL match.
-pub(crate) async fn execute_operator_alias(
-    alias_name: &str,
-    alias: &crate::operator::OperatorAlias,
-    alias_args: &[String],
-    explicit_params: Option<Value>,
-) -> Result<ReadOutput> {
-    let root = resolve_server_flag(Some(&alias.server), None)?.expect("server name is present");
-    let uri =
-        resolve_server_flag(Some(&root), alias.graph.as_deref())?.expect("server name is present");
-    let client = crate::graph_http::GraphHttpClient::new(&root)?;
-    let bearer_token = resolve_remote_bearer_token(Some(&uri))?;
-
-    let mut params = serde_json::Map::new();
-    for (key, value) in &alias.params {
-        let Some(key) = key.as_str() else {
-            bail!("alias '{alias_name}': params keys must be strings");
-        };
-        params.insert(key.to_string(), serde_json::to_value(value)?);
-    }
-    if alias_args.len() > alias.args.len() {
-        bail!(
-            "alias '{alias_name}' takes {} positional arg(s) ({}), got {}",
-            alias.args.len(),
-            alias.args.join(", "),
-            alias_args.len()
-        );
-    }
-    for (name, value) in alias.args.iter().zip(alias_args) {
-        params.insert(name.clone(), parse_alias_value(value));
-    }
-    if let Some(Value::Object(explicit)) = explicit_params {
-        for (key, value) in explicit {
-            params.insert(key, value);
-        }
-    }
-
-    let mut body = serde_json::Map::new();
-    body.insert("expect_mutation".to_string(), Value::Bool(false));
-    if !params.is_empty() {
-        body.insert("params".to_string(), Value::Object(params));
-    }
-    remote_json(
-        &client,
-        Method::POST,
-        remote_url(&uri, &["queries", &alias.query], &[])?,
-        Some(Value::Object(body)),
-        bearer_token.as_deref(),
-    )
-    .await
-}
-
+/// params. Server and credential-owner selection use the captured config;
+/// the keyed token applies via the ordinary URL match.
 /// Apply `--server`/`--graph` to a command's uri/target slots: exclusive
 /// with both (loud error, not silent precedence), no-op when absent.
 pub(crate) fn apply_server_flag(
+    operator_config: &OperatorConfig,
     server: Option<&str>,
     graph: Option<&str>,
     uri: Option<String>,
@@ -423,7 +407,7 @@ pub(crate) fn apply_server_flag(
             "--server is exclusive with a positional URI — pick one way to address the graph"
         );
     }
-    resolve_server_flag(server, graph)
+    resolve_server_flag_with_config(operator_config, server, graph)
 }
 
 pub(crate) fn apply_bearer_token(
@@ -762,7 +746,7 @@ pub(crate) async fn resolve_maintenance_uri(
     cli_uri: Option<String>,
     operation: &str,
 ) -> Result<String> {
-    let scope = scope::resolve_scope(
+    let scope = scope::resolve_scope_from_env(
         &operator::load_operator_config()?,
         planes::Capability::Direct,
         scope::ScopeFlags {
@@ -847,20 +831,6 @@ pub(crate) fn resolve_branch(
         .unwrap_or_else(|| default_branch.to_string())
 }
 
-pub(crate) fn resolve_read_target(
-    cli_branch: Option<String>,
-    cli_snapshot: Option<String>,
-    alias_branch: Option<String>,
-) -> Result<ReadTarget> {
-    if cli_branch.is_some() && cli_snapshot.is_some() {
-        bail!("read target may specify branch or snapshot, not both");
-    }
-    Ok(read_target_from_cli(
-        cli_branch.or(alias_branch),
-        cli_snapshot,
-    ))
-}
-
 pub(crate) fn resolve_query_path(
     explicit_query: Option<&PathBuf>,
     alias_query: Option<&str>,
@@ -875,64 +845,6 @@ pub(crate) fn resolve_query_path(
                 "exactly one of --query, --query-string, or --alias must be provided"
             )
         })
-}
-
-pub(crate) fn resolve_query_source(
-    explicit_query: Option<&PathBuf>,
-    inline_query: Option<&str>,
-    alias_query: Option<&str>,
-) -> Result<String> {
-    if let Some(inline) = inline_query {
-        if inline.trim().is_empty() {
-            bail!("--query-string must not be empty");
-        }
-        return Ok(inline.to_string());
-    }
-    Ok(fs::read_to_string(resolve_query_path(
-        explicit_query,
-        alias_query,
-    )?)?)
-}
-
-pub(crate) fn parse_alias_value(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
-}
-
-/// The format cascade (RFC-011): `--json` > `--format` > alias format >
-/// operator `defaults.output` > table.
-pub(crate) fn resolve_read_format(
-    cli_format: Option<ReadOutputFormat>,
-    json: bool,
-    alias_format: Option<ReadOutputFormat>,
-) -> ReadOutputFormat {
-    if json {
-        return ReadOutputFormat::Json;
-    }
-    cli_format
-        .or(alias_format)
-        .or_else(|| {
-            operator::load_operator_config()
-                .ok()
-                .and_then(|operator| operator.output())
-        })
-        .unwrap_or_default()
-}
-
-pub(crate) fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
-    if let Some(snapshot) = snapshot {
-        ReadTarget::snapshot(SnapshotId::new(snapshot))
-    } else {
-        ReadTarget::branch(branch.unwrap_or_else(|| "main".to_string()))
-    }
-}
-
-pub(crate) fn load_params_json(params: &ParamsArgs) -> Result<Option<Value>> {
-    match (&params.params, &params.params_file) {
-        (Some(inline), None) => Ok(Some(serde_json::from_str(inline)?)),
-        (None, Some(path)) => Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?)),
-        (None, None) => Ok(None),
-        (Some(_), Some(_)) => bail!("only one of --params or --params-file may be provided"),
-    }
 }
 
 /// Pick the query the caller named out of an already-parsed source. An
@@ -969,79 +881,6 @@ pub(crate) fn query_params_from_json(
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
-}
-
-/// The server's refusal for a control write sent through `query`. The door
-/// rule and its rationale live on `refuse_wrong_door` in
-/// `crates/omnigraph-server/src/handlers/dispatch.rs`; this side only restates it.
-pub(crate) fn control_write_at_read_door(write: &BranchWrite) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
-        write.statement_name(),
-    )
-}
-
-/// The server's refusal for `commit publish` or `commit drop` sent through
-/// `query`: a control write, under the statement's own name.
-pub(crate) fn commit_write_at_read_door(write: &CommitWrite) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
-        write.statement_name(),
-    )
-}
-
-/// The server's refusal for `load csv` sent through `query`: a control
-/// write, under the statement's own name.
-pub(crate) fn load_at_read_door(stmt: &omnigraph_compiler::query::ast::LoadStmt) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
-        stmt.statement_name(),
-    )
-}
-
-/// The server's refusal for a branch read (`branch list`, `branch diff`, …)
-/// sent through `mutate`.
-pub(crate) fn read_at_write_door(statement_name: &str) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::READ_AT_WRITE_DOOR,
-        statement_name,
-    )
-}
-
-/// `show` is a read: the same refusal `branch list` meets at the write door.
-pub(crate) fn show_at_write_door(id: Option<SettingId>) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::READ_AT_WRITE_DOOR,
-        &show_statement_name(id),
-    )
-}
-
-/// The server's refusal for an `explain` statement sent through `mutate`.
-pub(crate) fn explain_at_write_door() -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::READ_AT_WRITE_DOOR,
-        EXPLAIN_STATEMENT_NAME,
-    )
-}
-
-/// The server's envelope refusals for a branch statement, checked in its
-/// order: a request target, then a query name or parameters, then a commit
-/// precondition. Runs before any round trip or engine open.
-pub(crate) fn refuse_statement_envelope(
-    has_target: bool,
-    has_name_or_params: bool,
-    has_expected_head: bool,
-) -> Result<()> {
-    if has_target {
-        bail!(branch_statement_refusals::REQUEST_TARGET);
-    }
-    if has_name_or_params {
-        bail!(branch_statement_refusals::NAME_OR_PARAMS);
-    }
-    if has_expected_head {
-        bail!(branch_statement_refusals::COMMIT_PRECONDITION);
-    }
-    Ok(())
 }
 
 /// The `POST /query` body for `branch list` or `show`: the source alone; the
@@ -1151,7 +990,7 @@ pub(crate) async fn execute_queries_validate(
     cluster: &str,
     graph: Option<&str>,
     json: bool,
-) -> Result<()> {
+) -> Result<Completion> {
     let snapshot = read_serving_snapshot_or_report(cluster).await?;
 
     // Type-check per graph: each graph's stored queries against its own schema
@@ -1237,9 +1076,9 @@ pub(crate) async fn execute_queries_validate(
 
     if has_breakages {
         io::stdout().flush()?;
-        std::process::exit(1);
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
 /// Print a stored-query annotation under its `queries list` entry. A
@@ -1344,6 +1183,7 @@ pub(crate) async fn execute_queries_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omnigraph_compiler::query::parser::parse_query;
 
     #[test]
     fn stored_query_parse_failures_keep_diagnostics_in_validation_output() {
@@ -1449,13 +1289,55 @@ mod tests {
     #[test]
     fn server_flag_accepts_a_literal_url() {
         assert_eq!(
-            resolve_server_flag(Some("https://graph.example.com"), None).unwrap(),
+            resolve_server_flag_with_config(
+                &OperatorConfig::default(),
+                Some("https://graph.example.com"),
+                None
+            )
+            .unwrap(),
             Some("https://graph.example.com".to_string())
         );
         // trailing slash trimmed; `--graph` appends the multi-graph path.
         assert_eq!(
-            resolve_server_flag(Some("https://graph.example.com/"), Some("knowledge")).unwrap(),
+            resolve_server_flag_with_config(
+                &OperatorConfig::default(),
+                Some("https://graph.example.com/"),
+                Some("knowledge")
+            )
+            .unwrap(),
             Some("https://graph.example.com/graphs/knowledge".to_string())
+        );
+
+        let config: OperatorConfig = yaml_serde::from_str(
+            "servers:\n  captured:\n    url: https://captured.example.com/proxy/\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_server_flag_with_config(&config, Some("captured"), Some("knowledge")).unwrap(),
+            Some("https://captured.example.com/proxy/graphs/knowledge".to_string())
+        );
+        assert_eq!(
+            apply_server_flag(&config, Some("captured"), Some("knowledge"), None).unwrap(),
+            Some("https://captured.example.com/proxy/graphs/knowledge".to_string())
+        );
+        let error = resolve_server_flag_with_config(&config, Some("missing"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown server 'missing'"), "{error}");
+        assert!(error.contains("[captured]"), "{error}");
+    }
+
+    #[test]
+    fn actor_resolution_uses_supplied_config_and_explicit_override() {
+        let config: OperatorConfig =
+            yaml_serde::from_str("operator:\n  actor: configured-actor\n").unwrap();
+        assert_eq!(
+            resolve_actor_with_config(&config, None).as_deref(),
+            Some("configured-actor")
+        );
+        assert_eq!(
+            resolve_actor_with_config(&config, Some("explicit-actor")).as_deref(),
+            Some("explicit-actor")
         );
     }
 
@@ -1466,9 +1348,13 @@ mod tests {
     #[test]
     fn server_flag_resolves_unix_sockets_and_refuses_other_schemes_issue_979() {
         let refusal = |root: &str| {
-            let error = resolve_server_flag(Some(root), Some("knowledge"))
-                .unwrap_err()
-                .to_string();
+            let error = resolve_server_flag_with_config(
+                &OperatorConfig::default(),
+                Some(root),
+                Some("knowledge"),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(
                 error.starts_with("invalid server address: "),
                 "{root}: {error}"
@@ -1498,7 +1384,12 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(
-                resolve_server_flag(Some("unix:///tmp/og.sock/"), Some("knowledge")).unwrap(),
+                resolve_server_flag_with_config(
+                    &OperatorConfig::default(),
+                    Some("unix:///tmp/og.sock/"),
+                    Some("knowledge")
+                )
+                .unwrap(),
                 Some("unix:///tmp/og.sock/graphs/knowledge".to_string())
             );
             for root in [
@@ -1507,7 +1398,11 @@ mod tests {
                 "unix:///tmp/gate way/og.sock",
                 "unix:///tmp/gate%20way/og.sock",
             ] {
-                assert!(resolve_server_flag(Some(root), None).is_ok(), "{root}");
+                assert!(
+                    resolve_server_flag_with_config(&OperatorConfig::default(), Some(root), None)
+                        .is_ok(),
+                    "{root}"
+                );
             }
             for (root, expected) in [
                 ("unix://host/tmp/og.sock", "unix:///ABSOLUTE/PATH.sock"),
