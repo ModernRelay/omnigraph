@@ -33,11 +33,12 @@ The default is the latest stable release; if none exists, the installer falls
 back to `edge`.
 
 Edge builds are prereleases built once a day from the tip of `main`, after its
-CI audit passes, when `main` has moved since the last one. Each is
+whole CI run passes, when `main` has moved since the last one. Each is
 published as its own release, `edge-<commit date>-<commit>` (for example
 `edge-20261016-9c2b367`), whose files never change; the rolling `edge` release
-always holds the newest one. The 30 newest edge builds are kept. To install the
-newest:
+always holds the newest one. The 30 newest edge builds are kept, and so is the
+newest build of every storage format they no longer cover, since that build can
+still export a graph written at that format. To install the newest:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh \
@@ -136,8 +137,10 @@ commit 9c2b3679e8f66062252e7ed6270a9478b4b77413
 }
 ```
 
-An edge build reports a SemVer pre-release of the package version, so
-`0.14.0-edge+9c2b367` sorts before the `0.14.0` release. `channel` is `stable`
+An edge build reports a SemVer pre-release of the package version, such as
+`0.14.0-edge+9c2b367`. Edge builds are published only while the package version
+is above the latest stable release, so an edge version sorts after every
+published stable release and before the release it precedes. `channel` is `stable`
 or `edge` for a GitHub release archive and null for any other build. `commit`
 is the commit a packaged build was compiled from; a plain source build reports
 it as null and prints no `commit` line. The server reports the same commit as

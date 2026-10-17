@@ -1,7 +1,7 @@
 name: Release Edge
 
-# Once a day, the tip of `main` is built and published twice once its
-# vocabulary audit passes, unless `edge` already holds it. A run builds only
+# Once a day, the tip of `main` is built and published twice once its whole
+# CI run has passed, unless `edge` already holds it. A run builds only
 # its own commit, the one its build provenance names. Its own
 # prerelease, `edge-<commit date>-<short commit>`, never changes once
 # published, so a deployment can pin it and roll back to it; the rolling `edge`
@@ -64,6 +64,19 @@ jobs:
           fi
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
+      # An edge build of X.Y.Z reports X.Y.Z-edge+<commit>, which sorts before
+      # X.Y.Z: refuse it until main's version is above the latest stable.
+      - name: Refuse a version that sorts before the latest stable release
+        if: steps.freshness.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          package_version="$(python3 -c 'import tomllib; print(tomllib.load(open("crates/omnigraph-cli/Cargo.toml", "rb"))["package"]["version"])')"
+          stable_tag="$(gh release view --json tagName --jq '.tagName' 2>/dev/null || true)"
+          python3 scripts/edge_release.py check-version \
+            --package-version "$package_version" --stable-tag "$stable_tag"
+
       # The commit's own date, not the run's, so a rerun names the same build.
       - name: Name the edge build
         id: name
@@ -84,13 +97,18 @@ jobs:
     uses: ./.github/workflows/release-vocabulary-gate.yml
     with:
       source_ref: ${{ github.sha }}
-      # The tip's CI run may still be queued behind earlier runs on main.
-      wait_minutes: 90
+      # A pinnable, attested build comes only from a commit whose whole CI
+      # passed; its run may still be queued behind earlier runs on main.
+      require_ci_gate: true
+      wait_minutes: 180
+      # A run cancelled because main moved on is not a failure; the next
+      # scheduled run builds the newer commit.
+      superseded_ok: true
 
   build_release:
     name: Build edge archives
     needs: [vocabulary_gate, prepare_edge_release]
-    if: needs.prepare_edge_release.outputs.publish == 'true'
+    if: needs.prepare_edge_release.outputs.publish == 'true' && needs.vocabulary_gate.outputs.superseded != 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/build-release-archives.yml
@@ -114,7 +132,8 @@ jobs:
       SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      # Edge builds kept as their own prereleases; older ones are deleted.
+      # Edge builds kept as their own prereleases, besides the newest build of
+      # each storage format; older ones are deleted.
       EDGE_BUILDS_RETAINED: "30"
     steps:
       - name: Checkout audited source
@@ -206,7 +225,7 @@ jobs:
           for kind in build rolling; do
             rolling=()
             [[ "$kind" == rolling ]] && rolling=(--rolling)
-            python3 scripts/edge_release_body.py \
+            python3 scripts/edge_release.py body \
               --repository "$GH_REPO" --commit "$SOURCE_SHA" --build-tag "$BUILD_TAG" \
               --build-version "$RUNNER_TEMP/build-version.json" --notes "$RUNNER_TEMP/notes.md" \
               "${stable[@]}" "${rolling[@]}" > "$RUNNER_TEMP/${kind}-body.md"
@@ -283,16 +302,19 @@ jobs:
           git push origin refs/tags/edge --force
           echo "moved=true" >> "$GITHUB_OUTPUT"
 
+      # The newest build of every storage format survives the count: it is the
+      # build that can still export a graph at an abandoned development format.
       - name: Delete edge builds beyond the retained count
         run: |
           set -euo pipefail
-          gh release list --limit 1000 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | test("^edge-[0-9]{8}-[0-9a-f]{7}$"))] | sort_by(.createdAt) | reverse | .[].tagName' \
-            > "$RUNNER_TEMP/edge-builds.txt"
-          tail -n +"$((EDGE_BUILDS_RETAINED + 1))" "$RUNNER_TEMP/edge-builds.txt" | while read -r tag; do
-            [[ "$tag" =~ ^edge-[0-9]{8}-[0-9a-f]{7}$ && "$tag" != "$BUILD_TAG" ]] || continue
+          gh api "repos/${GH_REPO}/releases" --paginate \
+            --jq '.[] | {tag_name, created_at, draft, body} | tojson' > "$RUNNER_TEMP/releases.jsonl"
+          python3 scripts/edge_release.py prune --releases "$RUNNER_TEMP/releases.jsonl" \
+            --retain "$EDGE_BUILDS_RETAINED" --current "$BUILD_TAG" > "$RUNNER_TEMP/edge-builds-to-delete.txt"
+          while read -r tag; do
+            [[ "$tag" =~ ^edge-[0-9]{8}-[0-9a-f]{7}$ && "$tag" != "$BUILD_TAG" ]]
             gh release delete "$tag" --cleanup-tag --yes
-          done
+          done < "$RUNNER_TEMP/edge-builds-to-delete.txt"
 
   smoke_installers:
     name: Smoke ${{ matrix.runner }} installer

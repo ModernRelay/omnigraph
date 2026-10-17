@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Compose the GitHub release text of an edge build.
+"""Decisions and text of an edge build, for `.github/workflows/release-edge.yml`.
 
 An edge build is published twice: as its own prerelease, `edge-<date>-<commit>`,
-and as the rolling `edge` release. Both say what a deployer needs before
-running the build against data: the commit, the storage format it writes and
-serves next to the latest stable release's, the HTTP contract, how to pin the
-build, and the release notes recorded since the last stable release, which
-`release_notes.py preview` renders.
+and as the rolling `edge` release.
+
+- `check-version` refuses a build whose package version is not above the
+  latest stable release, since its `X.Y.Z-edge+<commit>` would sort before
+  that release.
+- `body` composes the release text: what a deployer needs before running the
+  build against data (the commit, the storage format it writes and serves next
+  to the latest stable release's, the HTTP contract, how to pin the build) and
+  the release notes recorded since the last stable release, which
+  `release_notes.py preview` renders. A marker line records the build's commit
+  and storage format for `prune`.
+- `prune` lists the edge builds to delete: everything beyond the newest
+  retained count, except the newest build of every storage format, which is
+  the build that can still export a graph at that format.
 """
 
 from __future__ import annotations
@@ -21,6 +30,8 @@ from pathlib import Path
 # GitHub refuses a release body above 125,000 characters; stay clear of it.
 BODY_LIMIT = 120_000
 BUILD_TAG = re.compile(r"edge-[0-9]{8}-[0-9a-f]{7}")
+CORE_VERSION = re.compile(r"v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+].*)?")
+MARKER = re.compile(r"^<!-- edge-build: (\{.*\}) -->$", re.MULTILINE)
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SCHEMA_LINE = re.compile(r"internal-schema ([0-9]+) \(serves v([0-9]+) to v([0-9]+)\)")
 PREVIEW_HEADING = re.compile(r"# OmniGraph (v[0-9]+\.[0-9]+\.[0-9]+)")
@@ -70,6 +81,25 @@ def parse_facts(raw: str) -> Facts:
         serves=(int(schema.group(2)), int(schema.group(3))),
         http_contract=contract,
     )
+
+
+def core_version(version: str) -> tuple[int, int, int]:
+    match = CORE_VERSION.fullmatch(version)
+    if match is None:
+        raise BodyError(f"not a version: {version!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+def require_newer_than_stable(package_version: str, stable_tag: str | None) -> None:
+    """An edge build of `X.Y.Z` reports `X.Y.Z-edge+<commit>`, which SemVer ranks
+    below `X.Y.Z`; it is published only while `X.Y.Z` is above every stable
+    release."""
+    if stable_tag and core_version(package_version) <= core_version(stable_tag):
+        raise BodyError(
+            f"the package version {package_version} is not above the latest stable release "
+            f"{stable_tag}, so its edge build would sort before {stable_tag}; advance the "
+            f"workspace version past {stable_tag} to publish edge builds"
+        )
 
 
 def compatibility(build: Facts, stable_tag: str | None, stable: Facts | None, upgrade_guide: str) -> str:
@@ -163,12 +193,15 @@ def compose(
         raise BodyError("commit must be a full lowercase commit id")
     if not BUILD_TAG.fullmatch(build_tag) or not build_tag.endswith(commit[:7]):
         raise BodyError("build tag must be edge-<YYYYMMDD>-<first seven characters of the commit>")
+    require_newer_than_stable(build.version, stable_tag if stable else None)
     site = f"https://github.com/{repository}"
     raw = f"https://raw.githubusercontent.com/{repository}/main/scripts"
+    marker = json.dumps({"format": 1, "commit": commit, "writes": build.writes}, sort_keys=True)
     intro = [
+        f"<!-- edge-build: {marker} -->\n",
         f"Edge build of [`{commit[:7]}`]({site}/commit/{commit}) from `main`, published as "
         f"[`{build_tag}`]({site}/releases/tag/{build_tag}). Edge builds are prereleases built once a day "
-        "from `main`; they do not receive the qualification a stable release does."
+        "from a commit on `main` whose CI passed; they do not receive the qualification a stable release does."
     ]
     if stable_tag:
         intro.append(f" The latest stable release is [{stable_tag}]({site}/releases/tag/{stable_tag}).")
@@ -211,22 +244,74 @@ def compose(
     return body.rstrip("\n") + "\n"
 
 
+def build_writes(body: str | None) -> int | None:
+    """The storage format a build release's marker records, if it has one."""
+    match = MARKER.search(body or "")
+    if match is None:
+        return None
+    try:
+        writes = json.loads(match.group(1)).get("writes")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    return writes if isinstance(writes, int) else None
+
+
+def releases_to_delete(releases: list[dict], retain: int, current: str) -> list[str]:
+    """Edge build tags beyond the newest `retain`, keeping the newest build of
+    every storage format and `current`. `releases` are GitHub release objects
+    (`tag_name`, `created_at`, `draft`, `body`); other tags and drafts are
+    never listed."""
+    if retain < 1:
+        raise BodyError("retain at least one edge build")
+    builds = sorted(
+        (release for release in releases if not release.get("draft") and BUILD_TAG.fullmatch(release.get("tag_name", ""))),
+        key=lambda release: release["created_at"],
+        reverse=True,
+    )
+    keep = {release["tag_name"] for release in builds[:retain]} | {current}
+    newest_of_format: dict[int, str] = {}
+    for release in builds:
+        writes = build_writes(release.get("body"))
+        if writes is not None:
+            newest_of_format.setdefault(writes, release["tag_name"])
+    keep |= set(newest_of_format.values())
+    return [release["tag_name"] for release in builds if release["tag_name"] not in keep]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repository", required=True, help="owner/name")
-    parser.add_argument("--commit", required=True)
-    parser.add_argument("--build-tag", required=True)
-    parser.add_argument("--build-version", required=True, type=Path, help="`omnigraph version --json` of this build")
-    parser.add_argument("--stable-tag", default="", help="latest stable release tag, empty when none exists")
-    parser.add_argument("--stable-version", type=Path, help="`omnigraph version` output of that release")
-    parser.add_argument("--notes", required=True, type=Path, help="`release_notes.py preview` output")
-    parser.add_argument("--rolling", action="store_true", help="compose the rolling `edge` release text")
+    commands = parser.add_subparsers(dest="command", required=True)
+    body = commands.add_parser("body", help="compose a build's release text")
+    body.add_argument("--repository", required=True, help="owner/name")
+    body.add_argument("--commit", required=True)
+    body.add_argument("--build-tag", required=True)
+    body.add_argument("--build-version", required=True, type=Path, help="`omnigraph version --json` of this build")
+    body.add_argument("--stable-tag", default="", help="latest stable release tag, empty when none exists")
+    body.add_argument("--stable-version", type=Path, help="`omnigraph version` output of that release")
+    body.add_argument("--notes", required=True, type=Path, help="`release_notes.py preview` output")
+    body.add_argument("--rolling", action="store_true", help="compose the rolling `edge` release text")
+    check = commands.add_parser("check-version", help="refuse a package version not above the latest stable")
+    check.add_argument("--package-version", required=True)
+    check.add_argument("--stable-tag", default="", help="latest stable release tag, empty when none exists")
+    prune = commands.add_parser("prune", help="list edge build tags to delete, one per line")
+    prune.add_argument("--releases", required=True, type=Path, help="GitHub release objects, one JSON object per line")
+    prune.add_argument("--retain", required=True, type=int)
+    prune.add_argument("--current", required=True, help="the tag of the build this run published")
     args = parser.parse_args(argv)
     try:
+        if args.command == "check-version":
+            require_newer_than_stable(args.package_version, args.stable_tag or None)
+            return 0
+        if args.command == "prune":
+            lines = args.releases.read_text(encoding="utf-8").splitlines()
+            releases = [json.loads(line) for line in lines if line.strip()]
+            for tag in releases_to_delete(releases, args.retain, args.current):
+                print(tag)
+            return 0
         stable_tag = args.stable_tag or None
         if bool(stable_tag) != bool(args.stable_version):
             raise BodyError("--stable-tag and --stable-version go together")
-        body = compose(
+        text = compose(
             repository=args.repository,
             commit=args.commit,
             build_tag=args.build_tag,
@@ -236,10 +321,10 @@ def main(argv: list[str] | None = None) -> int:
             preview=args.notes.read_text(encoding="utf-8"),
             rolling=args.rolling,
         )
-    except (BodyError, OSError) as error:
-        print(f"edge release body: {error}", file=sys.stderr)
+    except (BodyError, OSError, json.JSONDecodeError) as error:
+        print(f"edge release: {error}", file=sys.stderr)
         return 1
-    sys.stdout.write(body)
+    sys.stdout.write(text)
     return 0
 
 

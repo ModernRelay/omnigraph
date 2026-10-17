@@ -199,6 +199,8 @@ snapshot: each shows the unreleased preview at its commit
 ([release workflows](ci.md#release-workflows)).
 After publication, update the configuration for the next release: set its base
 to the release just published, advance the version and set `legacy` to `null`.
+Advance the workspace package version too: edge builds are refused while it is
+not above the latest stable release ([release workflows](ci.md#release-workflows)).
 
 The hand-written v0.12.0 document was converted into two notes before its
 snapshot, `changelog.d/a-release-highlights.added.md` and

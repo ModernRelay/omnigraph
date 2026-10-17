@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Edge release text: compatibility facts, pinning and the unreleased notes."""
+"""Edge release decisions and text: version order, compatibility facts,
+pinning, the unreleased notes and which old builds are kept."""
 
 import json
+import tempfile
 import unittest
+import unittest.mock
+from pathlib import Path
 
-import edge_release_body as body
+import edge_release as body
 
 COMMIT = "9c2b3679e8f66062252e7ed6270a9478b4b77413"
 TAG = "edge-20261016-9c2b367"
@@ -108,6 +112,73 @@ class EdgeReleaseBodyTests(unittest.TestCase):
         self.assertIn("- Regenerate saved plans.", text)
         self.assertNotIn("Feature 0 ", text)
         self.assertIn(f"/tree/{COMMIT}/changelog.d", text)
+
+    def test_refuses_a_package_version_not_above_the_latest_stable(self):
+        for package, stable in (("0.13.0-edge+9c2b367", "v0.13.0"), ("0.12.9", "v0.13.0"), ("0.13.0", "v0.13.0")):
+            with self.subTest(package=package, stable=stable), self.assertRaisesRegex(body.BodyError, "advance the workspace version"):
+                body.require_newer_than_stable(package, stable)
+        body.require_newer_than_stable("0.14.0-edge+9c2b367", "v0.13.0")
+        body.require_newer_than_stable("0.13.1", "v0.13.0")
+        body.require_newer_than_stable("0.13.0", None)
+        with self.assertRaisesRegex(body.BodyError, "would sort before v0.13.0"):
+            compose(build=body.Facts("0.13.0-edge+9c2b367", 14, (14, 14), "0.13"))
+
+    def test_check_version_exits_by_the_same_rule(self):
+        self.assertEqual(body.main(["check-version", "--package-version", "0.14.0", "--stable-tag", "v0.13.0"]), 0)
+        self.assertEqual(body.main(["check-version", "--package-version", "0.13.0", "--stable-tag", "v0.13.0"]), 1)
+        self.assertEqual(body.main(["check-version", "--package-version", "0.13.0"]), 0)
+
+    def test_marks_the_build_with_its_commit_and_storage_format(self):
+        text = compose()
+        self.assertTrue(text.startswith("<!-- edge-build: "))
+        self.assertEqual(body.build_writes(text), 16)
+        self.assertIn(f'"commit": "{COMMIT}"', text.splitlines()[0])
+        for unmarked in (None, "", "Edge build of `9c2b367`.", '<!-- edge-build: {"writes": "16"} -->'):
+            with self.subTest(body=unmarked):
+                self.assertIsNone(body.build_writes(unmarked))
+
+
+def release(tag, day, writes=None, draft=False):
+    text = "" if writes is None else f'<!-- edge-build: {{"commit": "x", "format": 1, "writes": {writes}}} -->\nText.'
+    return {"tag_name": tag, "created_at": f"2026-10-{day:02d}T04:30:00Z", "draft": draft, "body": text}
+
+
+class EdgeBuildRetentionTests(unittest.TestCase):
+    def test_keeps_the_newest_builds_and_the_newest_of_each_storage_format(self):
+        releases = [
+            release("edge-20261001-aaaaaaa", 1, writes=13),
+            release("edge-20261002-bbbbbbb", 2, writes=13),
+            release("edge-20261003-ccccccc", 3, writes=14),
+            release("edge-20261004-ddddddd", 4, writes=16),
+            release("edge-20261005-eeeeeee", 5, writes=16),
+            release("edge-20261006-fffffff", 6, writes=16),
+        ]
+        deleted = body.releases_to_delete(releases, retain=2, current="edge-20261006-fffffff")
+        # Kept: the two newest (05, 06), and the newest build that wrote 13 (02) and 14 (03).
+        self.assertEqual(deleted, ["edge-20261004-ddddddd", "edge-20261001-aaaaaaa"])
+
+    def test_never_lists_the_current_build_other_tags_or_drafts(self):
+        releases = [
+            release("v0.13.0", 1),
+            release("edge", 2),
+            release("edge-20261003-ccccccc", 3, draft=True),
+            release("edge-20261004-ddddddd", 4),
+            release("edge-20261005-eeeeeee", 5),
+        ]
+        self.assertEqual(body.releases_to_delete(releases, retain=1, current="edge-20261004-ddddddd"), [])
+        self.assertEqual(body.releases_to_delete(releases, retain=1, current="edge-20261005-eeeeeee"), ["edge-20261004-ddddddd"])
+        with self.assertRaises(body.BodyError):
+            body.releases_to_delete(releases, retain=0, current="edge-20261005-eeeeeee")
+
+    def test_prune_reads_one_release_per_line(self):
+        releases = [release("edge-20261004-ddddddd", 4, writes=16), release("edge-20261005-eeeeeee", 5, writes=16)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "releases.jsonl"
+            path.write_text("".join(json.dumps(item) + "\n" for item in releases), encoding="utf-8")
+            with unittest.mock.patch("sys.stdout") as stdout:
+                code = body.main(["prune", "--releases", str(path), "--retain", "1", "--current", "edge-20261005-eeeeeee"])
+            self.assertEqual(code, 0)
+            self.assertEqual("".join(call.args[0] for call in stdout.write.call_args_list), "edge-20261004-ddddddd\n")
 
 
 if __name__ == "__main__":

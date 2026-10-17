@@ -570,7 +570,7 @@ impl ServerHandler for GraphTools {
         )
         .with_server_info(Implementation::new(
             "omnigraph-server",
-            env!("CARGO_PKG_VERSION"),
+            crate::api::build::reported_version(env!("CARGO_PKG_VERSION")),
         ))
         .with_instructions(instructions(self.state.mcp_settings()))
     }

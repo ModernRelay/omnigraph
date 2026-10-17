@@ -151,6 +151,22 @@ def main() -> int:
                 failures,
             )
             require(
+                "require_ci_gate: true" in gate_call,
+                "release-edge.yml: a pinnable edge build needs its commit's whole CI to pass",
+                failures,
+            )
+            require(
+                "superseded_ok: true" in gate_call
+                and "needs.vocabulary_gate.outputs.superseded != 'true'" in job_block(text, "build_release"),
+                "release-edge.yml: a superseded commit must end the run without a build",
+                failures,
+            )
+            require(
+                "scripts/edge_release.py check-version" in job_block(text, "prepare_edge_release"),
+                "release-edge.yml: an edge version must sort after the latest stable release",
+                failures,
+            )
+            require(
                 'git merge-base --is-ancestor "$current" "$SOURCE_SHA"' in text,
                 "release-edge.yml: the rolling edge tag must only move forward",
                 failures,
@@ -210,6 +226,30 @@ def main() -> int:
     require(
         "deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))" in gate,
         "release-vocabulary-gate.yml: waiting for an audit must be bounded",
+        failures,
+    )
+    require(
+        'passed("CI Gate")' in gate,
+        "release-vocabulary-gate.yml: require_ci_gate must check the same run's CI Gate",
+        failures,
+    )
+    require(
+        'all(.status == "completed" and .conclusion == "cancelled")' in gate
+        and '"$current_main" != "$SOURCE_SHA"' in gate,
+        "release-vocabulary-gate.yml: only a cancelled commit that main moved past is superseded",
+        failures,
+    )
+
+    # Tags before v0.14.0 predate the stamp; the cutoff is written in Python in
+    # release.yml and in bash in publish-image.yml, so the two must agree.
+    release_cutoff = re.search(r">= \((\d+), (\d+), (\d+)\)", (WORKFLOW_ROOT / "release.yml").read_text())
+    image_cutoff = re.search(r"\(\( version >= (\d+) \)\)", (WORKFLOW_ROOT / "publish-image.yml").read_text())
+    require(
+        release_cutoff is not None
+        and image_cutoff is not None
+        and int(release_cutoff.group(1)) * 1_000_000 + int(release_cutoff.group(2)) * 1_000 + int(release_cutoff.group(3))
+        == int(image_cutoff.group(1)),
+        "release.yml and publish-image.yml must share one release-attestation cutoff",
         failures,
     )
 

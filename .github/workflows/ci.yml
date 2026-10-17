@@ -174,11 +174,27 @@ jobs:
       - name: Test release-note composition
         run: python3 scripts/test_release_notes.py
 
-      - name: Test edge release text
-        run: python3 scripts/test_edge_release_body.py
+      - name: Test edge release decisions and text
+        run: python3 scripts/test_edge_release.py
 
       - name: Render release-note preview
         run: python3 scripts/release_notes.py preview --target HEAD > "$RUNNER_TEMP/release-notes-preview.md"
+
+      # The edge publisher composes its release text from this preview
+      # (`scripts/edge_release.py body`), so a renderer change that breaks
+      # the composer fails here, in its own pull request.
+      - name: Compose edge release text from the preview
+        run: |
+          set -euo pipefail
+          commit=0000000000000000000000000000000000000000
+          printf '%s\n' "{\"version\":\"0.0.1-edge+0000000\",\"channel\":\"edge\",\"commit\":\"${commit}\",\"http_contract\":\"0.0\",\"internal_schema\":{\"writes\":1,\"serves\":[1,1]}}" \
+            > "$RUNNER_TEMP/edge-version.json"
+          python3 scripts/edge_release.py body --repository "$GITHUB_REPOSITORY" --commit "$commit" \
+            --build-tag edge-20260101-0000000 --build-version "$RUNNER_TEMP/edge-version.json" \
+            --notes "$RUNNER_TEMP/release-notes-preview.md" > /dev/null
+          python3 scripts/edge_release.py body --repository "$GITHUB_REPOSITORY" --commit "$commit" \
+            --build-tag edge-20260101-0000000 --build-version "$RUNNER_TEMP/edge-version.json" \
+            --notes "$RUNNER_TEMP/release-notes-preview.md" --rolling > /dev/null
 
       - name: Upload release-note preview
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

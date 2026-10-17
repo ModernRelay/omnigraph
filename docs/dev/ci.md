@@ -347,10 +347,12 @@ re-verifies the authorizing CI run, resolves its source once to an immutable
 commit, and builds only that commit. Version tags are checked again immediately
 before publication. The daily edge build has no authorizing run: it builds its
 own commit, the tip of `main` when the schedule fired, and its gate waits up to
-90 minutes for that commit's CI run, which may be queued behind earlier runs on
-`main`, to pass the vocabulary audit. A run builds only its own commit because
-its build provenance names that commit; the rolling `edge` tag never moves
-backward. A manual backfill must already have a successful non-PR vocabulary
+180 minutes for that commit's CI run, which may be queued behind earlier runs on
+`main`, to pass both the vocabulary audit and `CI Gate`, since the build becomes
+a pinnable, attested release. A run cancelled while pending because `main`
+moved on ends the edge run with a notice and no build; a failed check or the
+timeout fails it. A run builds only its own commit because its build provenance
+names that commit; the rolling `edge` tag never moves backward. A manual backfill must already have a successful non-PR vocabulary
 audit for the exact commit. The current manual workflows therefore fail closed
 for historical pre-guard tags rather than offering a force bypass.
 
@@ -641,14 +643,14 @@ and migration source ancestry are still required. The publisher installs the
 same pinned parser in a temporary environment after the historical cutoff. It
 derives the GitHub body from that same snapshot with links pinned to the release
 tag. Earlier manual backfills keep their asset-only route. Edge builds need no
-snapshot: `scripts/edge_release_body.py` puts the build's compatibility facts,
+snapshot: `scripts/edge_release.py body` puts the build's compatibility facts,
 read from its own `omnigraph version --json` and the latest stable release's,
 before the unreleased preview rendered at the build's commit.
 
 | Workflow | Trigger and output |
 |---|---|
 | `build-release-archives.yml` | Called by the two release workflows only; builds the four platform archives stamped with their commit and channel (`OMNIGRAPH_SOURCE_VERSION`, `OMNIGRAPH_RELEASE_CHANNEL`), runs each on its platform, and verifies the exact archive set and checksums. It uploads workflow artifacts and writes no release. |
-| `release-edge.yml` | Daily at 04:17 UTC, and by manual dispatch on `main`; builds the run's commit, the tip of `main`, once its vocabulary audit passes, unless `edge` already holds it. After every archive is built, one job attests their provenance and publishes the build as its own prerelease, `edge-<commit date>-<short commit>`, which never changes once published, then copies that release's archives to the rolling `edge` release when `edge` holds an ancestor of the build and the build is still on `main`; it keeps the 30 newest edge builds and smoke-tests both through the installers on every platform. Runs never overlap, so a newer build cannot move `edge` under an older run's installer checks. A day whose new commits change only documentation still gets a build; the container image is published from tags only. |
+| `release-edge.yml` | Daily at 04:17 UTC, and by manual dispatch on `main`; builds the run's commit, the tip of `main`, once its whole CI run passes, unless `edge` already holds it. It refuses, before building, while the workspace package version is not above the latest stable release, since `X.Y.Z-edge+<commit>` sorts before `X.Y.Z`. After every archive is built, one job attests their provenance and publishes the build as its own prerelease, `edge-<commit date>-<short commit>`, which never changes once published, then copies that release's archives to the rolling `edge` release when `edge` holds an ancestor of the build and the build is still on `main`; it keeps the 30 newest edge builds plus the newest build of each storage format, recorded in a marker line of the release text (`scripts/edge_release.py prune`), and smoke-tests both through the installers on every platform. Runs never overlap, so a newer build cannot move `edge` under an older run's installer checks. A day whose new commits change only documentation still gets a build; the container image is published from tags only. |
 | `release.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds platform archives, attests their provenance, publishes the GitHub release, updates Homebrew when credentials are available, and smoke-tests the installers on every platform. The provenance names the run's commit, so a manual backfill is dispatched at the tag itself (`gh workflow run release.yml --ref <tag> -f tag=<tag>`); from v0.14.0 a backfill run at any other commit is refused. A backfill of a tag before v0.14.0 builds a source that predates the commit stamp, so its archives are run but their stamp is not checked, and it publishes without provenance when run at another commit. |
 | `publish-crates.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; publication remains paused until the registry-ownership policy changes. |
 | `publish-image.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds the bookworm-compatible public server image for GHCR and, when configured, Docker Hub. Its binaries carry the commit and `stable` channel stamp, checked in the image before it is pushed, and the pushed GHCR digest is attested. As in `release.yml`, a backfill from v0.14.0 is dispatched at the tag itself, and an older tag backfilled from elsewhere publishes without provenance. Manual backfills do not move `latest`. |
