@@ -1099,16 +1099,35 @@ fn registry_profile_home() -> tempfile::TempDir {
 
 #[test]
 fn graphs_list_without_scope_needs_server() {
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
     // No addressing and no operator defaults: the served-registry resolver
     // asks for a server scope — not the graph-shaped "no graph addressed"
     // advice, which points at flags graphs list cannot consume.
-    let output = output_failure(cli().arg("graphs").arg("list"));
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("`graphs list` needs a server scope")
-            && stderr.contains("--server <name|url> or --profile <name>"),
-        "expected the needs-a-server-scope error in stderr; got:\n{stderr}"
-    );
+    for ambient in [
+        None,
+        Some(OsString::new()),
+        #[cfg(unix)]
+        Some(OsString::from_vec(vec![0xff])),
+    ] {
+        let mut command = cli();
+        command
+            .args(["graphs", "list"])
+            .env_remove("OMNIGRAPH_PROFILE");
+        if let Some(value) = &ambient {
+            command.env("OMNIGRAPH_PROFILE", value);
+        }
+        let output = output_failure(&mut command);
+        assert!(output.stdout.is_empty(), "{ambient:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("`graphs list` needs a server scope")
+                && stderr.contains("--server <name|url> or --profile <name>"),
+            "expected the needs-a-server-scope error for {ambient:?}; got:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1117,20 +1136,34 @@ fn graphs_list_rejects_store_bound_profile() {
     // is server-scoped, so resolution fails with scope-shaped advice instead
     // of the late embedded-arm engine-limitation message.
     let home = registry_profile_home();
-    let output = output_failure(
-        cli()
+    for (profile, ambient) in [
+        (Some("localdev"), None),
+        (None, Some("localdev")),
+        (Some("localdev"), Some("unknown-profile")),
+    ] {
+        let mut command = cli();
+        command
             .env("OMNIGRAPH_HOME", home.path())
-            .arg("graphs")
-            .arg("list")
-            .arg("--profile")
-            .arg("localdev"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("requires a server")
-            && stderr.contains("profile 'localdev' resolves a store scope"),
-        "expected the served store-scope rejection in stderr; got:\n{stderr}"
-    );
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["graphs", "list"]);
+        if let Some(value) = ambient {
+            command.env("OMNIGRAPH_PROFILE", value);
+        }
+        if let Some(value) = profile {
+            command.args(["--profile", value]);
+        }
+        let output = output_failure(&mut command);
+        assert!(
+            output.stdout.is_empty(),
+            "{profile:?}/{ambient:?}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("requires a server")
+                && stderr.contains("profile 'localdev' resolves a store scope"),
+            "expected the served store-scope rejection for {profile:?}/{ambient:?}; got:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1139,21 +1172,35 @@ fn graphs_list_rejects_cluster_bound_profile() {
     // points at `cluster status` for cluster-graph enumeration instead of the
     // misleading graph-data-command error.
     let home = registry_profile_home();
-    let output = output_failure(
-        cli()
+    for (profile, ambient) in [
+        (Some("brain-admin"), None),
+        (None, Some("brain-admin")),
+        (Some("brain-admin"), Some("unknown-profile")),
+    ] {
+        let mut command = cli();
+        command
             .env("OMNIGRAPH_HOME", home.path())
-            .arg("graphs")
-            .arg("list")
-            .arg("--profile")
-            .arg("brain-admin"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("requires a server")
-            && stderr.contains("profile 'brain-admin' resolves a cluster scope")
-            && stderr.contains("cluster status"),
-        "expected the served cluster-scope rejection in stderr; got:\n{stderr}"
-    );
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["graphs", "list"]);
+        if let Some(value) = ambient {
+            command.env("OMNIGRAPH_PROFILE", value);
+        }
+        if let Some(value) = profile {
+            command.args(["--profile", value]);
+        }
+        let output = output_failure(&mut command);
+        assert!(
+            output.stdout.is_empty(),
+            "{profile:?}/{ambient:?}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("requires a server")
+                && stderr.contains("profile 'brain-admin' resolves a cluster scope")
+                && stderr.contains("cluster status"),
+            "expected the served cluster-scope rejection for {profile:?}/{ambient:?}; got:\n{stderr}"
+        );
+    }
 }
 
 #[test]

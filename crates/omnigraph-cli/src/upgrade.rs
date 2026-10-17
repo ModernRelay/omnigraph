@@ -9,7 +9,7 @@ pub(crate) async fn run(
     json: bool,
     quiet: bool,
 ) -> Result<()> {
-    let target = scope::resolve_scope(
+    let target = scope::resolve_scope_from_env(
         &operator::load_operator_config()?,
         planes::Capability::Direct,
         scope::ScopeFlags {

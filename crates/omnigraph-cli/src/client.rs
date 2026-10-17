@@ -359,7 +359,7 @@ impl GraphClient {
     /// `--graph` never reaches here — the addressing guard rejects it.
     pub(crate) fn resolve_registry(server: Option<&str>, profile: Option<&str>) -> Result<Self> {
         let operator = operator::load_operator_config()?;
-        let scope = crate::scope::resolve_scope(
+        let scope = crate::scope::resolve_scope_from_env(
             &operator,
             crate::planes::Capability::Served,
             crate::scope::ScopeFlags {
@@ -403,7 +403,7 @@ impl GraphClient {
         // classification; every current caller is a data-plane (`Any`) verb —
         // registry-scoped `graphs list` uses `resolve_registry` instead.
         let operator = operator::load_operator_config()?;
-        let scope = crate::scope::resolve_scope(
+        let scope = crate::scope::resolve_scope_from_env(
             &operator,
             capability,
             crate::scope::ScopeFlags {
@@ -458,7 +458,7 @@ impl GraphClient {
         // through unchanged, and the caller threads its verb's declared
         // capability.
         let operator = operator::load_operator_config()?;
-        let scope = crate::scope::resolve_scope(
+        let scope = crate::scope::resolve_scope_from_env(
             &operator,
             capability,
             crate::scope::ScopeFlags {
