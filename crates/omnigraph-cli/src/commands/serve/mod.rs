@@ -71,8 +71,12 @@ struct ReadyLine<'a> {
     record: String,
 }
 
+/// The ready line for `target`'s use of the server `record` names. Targets
+/// sharing a destination share its server but not their default graph, so
+/// `graph_id` and `binding` are always the requesting target's.
 fn ready_line<'a>(
     record: &'a Record,
+    target: &'a TargetUse,
     records: &Records,
     reused: bool,
     stdout_is_terminal: bool,
@@ -83,13 +87,19 @@ fn ready_line<'a>(
         reused,
         url: &record.url,
         scope: &record.scope,
-        graph_id: record.graph_id.as_deref(),
+        graph_id: target.graph_id.as_deref(),
         access: &record.access,
         actor: record.actor.as_deref(),
-        binding: &record.binding,
+        binding: &target.binding,
         token: (!stdout_is_terminal).then_some(record.token.as_str()),
         record: records.record_path(&record.id).display().to_string(),
     }
+}
+
+/// What the requesting target names in its ready line.
+struct TargetUse {
+    graph_id: Option<String>,
+    binding: String,
 }
 
 fn access_name(access: LocalAccess) -> &'static str {
@@ -166,7 +176,6 @@ pub(crate) async fn run_serve(
         })?
         .to_string();
     let binding = config.target(&name)?.binding(&name)?;
-    let binding_digest = binding.digest();
     let (scope_name, uri, graph_id) = match &binding {
         TargetBinding::DirectGraph { uri } => ("graph", uri.clone(), Some("default".to_string())),
         TargetBinding::DirectRoot { uri, default_graph } => {
@@ -180,6 +189,10 @@ pub(crate) async fn run_serve(
                 ),
             ));
         }
+    };
+    let target = TargetUse {
+        graph_id,
+        binding: binding.digest(),
     };
     let access = if args.write {
         LocalAccess::ReadWrite
@@ -223,7 +236,7 @@ pub(crate) async fn run_serve(
                 record.actor.as_deref().unwrap_or("(none)")
             )?;
             if args.json {
-                let line = ready_line(&record, &records, true, stdout_is_terminal);
+                let line = ready_line(&record, &target, &records, true, stdout_is_terminal);
                 writeln!(stdout, "{}", serde_json::to_string(&line)?)?;
                 stdout.flush()?;
             }
@@ -231,6 +244,10 @@ pub(crate) async fn run_serve(
         }
     };
 
+    // Bind before opening: a read-write cluster open takes the cluster's
+    // serving admission, and nothing after it may fail without releasing it.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
+    let port = listener.local_addr()?.port();
     let local_binding = LocalBinding::from_root(&destination.root)
         .map_err(|error| color_eyre::eyre::eyre!("{error}"))?;
     let scope = match scope_name {
@@ -257,8 +274,6 @@ pub(crate) async fn run_serve(
         }
         other => color_eyre::eyre::eyre!("{other}"),
     })?;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
-    let port = listener.local_addr()?.port();
     // From here a shutdown signal stops the local server gracefully, so the
     // ready line below never precedes signal handling.
     let serving = omnigraph_server::start_local(state, listener, move |router| {
@@ -273,8 +288,8 @@ pub(crate) async fn run_serve(
         root: destination.root.clone(),
         destination: destination.digest.clone(),
         scope: scope_name.to_string(),
-        binding: binding_digest,
-        graph_id,
+        binding: target.binding.clone(),
+        graph_id: target.graph_id.clone(),
         url: format!("http://127.0.0.1:{port}"),
         token: credential.reveal(),
         access: access_name(access).to_string(),
@@ -304,7 +319,7 @@ pub(crate) async fn run_serve(
         )?;
         stderr.flush()?;
         if args.json {
-            let line = ready_line(&record, &records, false, stdout_is_terminal);
+            let line = ready_line(&record, &target, &records, false, stdout_is_terminal);
             writeln!(stdout, "{}", serde_json::to_string(&line)?)?;
             stdout.flush()?;
         }

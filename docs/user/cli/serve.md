@@ -78,7 +78,9 @@ Records live in a directory only the account may use:
 |---|---|
 | macOS | `~/Library/Application Support/OmniGraph/servers` |
 | Linux | `~/.local/state/omnigraph/servers` |
-| Windows | `%LOCALAPPDATA%\OmniGraph\servers` |
+
+Other platforms cannot yet restrict a record to its account, so `serve`
+refuses there with `local_server_records_unsafe`.
 
 `OMNIGRAPH_LOCAL_SERVERS_DIR` names another directory. A directory another
 account owns, or one with group or other access, refuses with
@@ -91,8 +93,8 @@ process is gone, killed included, is not live: readers ignore it and remove it.
 There is at most one live local server per destination, which is the target's
 scope and its root on this machine. A second start for the same destination
 refuses with `local_server_exists`. With `--reuse` it prints the live server's
-ready line, with `reused: true`, and exits 0, unless that server cannot serve
-what this start asks for:
+ready line, with `reused: true` and this target's `graph_id`, and
+exits 0, unless that server cannot serve what this start asks for:
 
 | Code | When |
 |---|---|
@@ -106,7 +108,8 @@ another start of it to publish its record, then refuses with
 
 `omnigraph target list --json` and `target show NAME --json` name each direct
 target's live local servers under `local_servers`, with their `id`, `url`,
-`access` and `actor`, never their token.
+`access` and `actor`, never their token; `local_servers` is absent when no
+records directory exists or it cannot be read safely.
 
 ## Loopback only
 

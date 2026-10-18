@@ -87,12 +87,22 @@ pub(crate) fn records_dir() -> Result<PathBuf> {
     }
 }
 
+/// Only Unix permissions are checked, so every other platform refuses: a
+/// record holds a bearer token.
+#[cfg(not(unix))]
+fn ensure_dir(dir: &Path) -> Result<()> {
+    Err(unsafe_records(format!(
+        "{}: this platform cannot yet restrict local server records to this account",
+        dir.display()
+    )))
+}
+
 /// Create the directory owner-only, and refuse one another account owns or
 /// that grants group or other access.
+#[cfg(unix)]
 fn ensure_dir(dir: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
@@ -108,7 +118,6 @@ fn ensure_dir(dir: &Path) -> Result<()> {
             dir.display()
         )));
     }
-    #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no preconditions.
@@ -314,6 +323,21 @@ impl Records {
             dir,
             machine: machine_id(),
         })
+    }
+
+    /// The records directory for a reader, which creates nothing: `None`
+    /// when no local server has written it yet.
+    pub(crate) fn existing() -> Result<Option<Self>> {
+        let dir = records_dir()?;
+        match std::fs::symlink_metadata(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            _ => {}
+        }
+        ensure_dir(&dir)?;
+        Ok(Some(Self {
+            dir,
+            machine: machine_id(),
+        }))
     }
 
     pub(crate) fn machine(&self) -> &str {

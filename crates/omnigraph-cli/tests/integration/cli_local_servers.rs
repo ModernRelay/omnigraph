@@ -1,5 +1,6 @@
 //! Local servers: `serve` for you, its ready line, its record, reuse and
-//! election, the loopback guard, and access.
+//! election, the loopback guard, and access. Unix only: other platforms
+//! refuse to keep a record.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -205,7 +206,6 @@ fn record_path(server: &LocalServer) -> PathBuf {
     PathBuf::from(server.line["record"].as_str().unwrap())
 }
 
-#[cfg(unix)]
 #[test]
 fn a_read_only_local_server_serves_its_target_behind_the_loopback_guard() {
     let fixture = fixture_with_graph();
@@ -224,7 +224,6 @@ fn a_read_only_local_server_serves_its_target_behind_the_loopback_guard() {
     assert_eq!(record["token"], line["token"]);
     assert_eq!(record["url"], line["url"]);
     assert_eq!(record["pid"], server.child.id());
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(record_path(&server))
@@ -307,7 +306,6 @@ fn a_read_only_local_server_serves_its_target_behind_the_loopback_guard() {
     assert_eq!(listing["targets"][0]["local_servers"], json!([]));
 }
 
-#[cfg(unix)]
 #[test]
 fn a_read_write_local_server_writes_as_its_actor_and_reuse_keeps_that_actor() {
     let fixture = fixture_with_graph();
@@ -343,7 +341,6 @@ fn a_read_write_local_server_writes_as_its_actor_and_reuse_keeps_that_actor() {
     assert!(server.stop().success());
 }
 
-#[cfg(unix)]
 #[test]
 fn serve_refuses_what_it_cannot_serve_before_opening_anything() {
     let fixture = fixture_with_graph();
@@ -385,7 +382,6 @@ fn serve_refuses_what_it_cannot_serve_before_opening_anything() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn concurrent_starts_of_one_destination_elect_one_local_server() {
     let fixture = fixture_with_graph();
@@ -448,7 +444,6 @@ fn concurrent_starts_of_one_destination_elect_one_local_server() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn a_killed_local_server_leaves_no_live_record() {
     let fixture = fixture_with_graph();
@@ -468,7 +463,6 @@ fn a_killed_local_server_leaves_no_live_record() {
     assert!(next.stop().success());
 }
 
-#[cfg(unix)]
 #[test]
 fn a_local_cluster_server_serves_as_its_actor_under_the_cluster_policy() {
     let cluster = converged_loaded_cluster("g1", Some(POLICY_YAML));
@@ -476,7 +470,8 @@ fn a_local_cluster_server_serves_as_its_actor_under_the_cluster_policy() {
     std::fs::write(
         fixture.home.join("config.yaml"),
         format!(
-            "target_config_version: 1\ntargets:\n  root:\n    kind: direct\n    scope: root\n    uri: '{}'\n    default_graph: g1\n",
+            "target_config_version: 1\ntargets:\n  root:\n    kind: direct\n    scope: root\n    uri: '{0}'\n    default_graph: g1\n  \
+             other:\n    kind: direct\n    scope: root\n    uri: '{0}'\n    default_graph: g2\n",
             cluster.path().display()
         ),
     )
@@ -512,5 +507,17 @@ fn a_local_cluster_server_serves_as_its_actor_under_the_cluster_policy() {
         "--json",
     ]);
     assert_eq!(json_of(&reused)["id"], server.line["id"]);
+    // Another target of the same root shares its server, not its graph.
+    let other = json_of(&fixture.run(&[
+        "serve",
+        "--target",
+        "other",
+        "--reuse",
+        "--as",
+        "act-bruno",
+        "--json",
+    ]));
+    assert_eq!(other["id"], server.line["id"]);
+    assert_eq!(other["graph_id"], "g2");
     assert!(server.stop().success());
 }
