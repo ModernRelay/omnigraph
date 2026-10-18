@@ -366,16 +366,24 @@ admission as a deployment does, so it refuses while another owner holds it
 apply` against the root refuses the same way. A clean shutdown releases
 admission on local and S3 roots, as a deployment's does. Admission has no
 lease: after a crash, as after any owner's, the lock stays until `omnigraph
-cluster force-unlock` names it once the process is gone. Azure roots keep their
+cluster force-unlock` names it once the process is gone.
+[#1067](https://github.com/ModernRelay/omnigraph/issues/1067) proposes a leased takeover, so a successor restarts without an
+operator; on local roots, which have no update-if-unchanged, that needs lock
+generations written if absent. Azure roots keep their
 existing rule that even a clean exit retains admission.
 
 #### Lifetime and output
 
 A local server runs in the foreground until interrupted, or until its parent
-closes it, and shuts down through the server's bounded shutdown. An uncertain
-write completion makes it exit 2; nothing replays the write. Logs and the
-startup line (the resolved target, access mode, actor and URL) go to stderr.
-With `--json`, stdout carries exactly one line, when it is ready:
+closes it, and shuts down through the server's bounded shutdown. It handles a
+storage write of unknown outcome as a deployment does. Today that stops the
+process, which keeps its admission and exits 2; after
+[#1067](https://github.com/ModernRelay/omnigraph/issues/1067), the write's own
+request reports `outcome_unknown` and the server keeps serving. Read-write local
+servers wait for that change, so one storage error cannot take a graph away from
+Studio. Nothing replays the write. Logs and the startup line (the resolved
+target, access mode, actor and URL) go to stderr. With `--json`, stdout carries
+exactly one line, when it is ready:
 
 ```json
 {"protocol":1,"id":"01JA9…","reused":false,"url":"http://127.0.0.1:53211","scope":"graph","graph_id":"default","access":"read_write","actor":"act-me","binding":"sha256:9e1c…","token":"<bearer>","record":"/Users/me/Library/Application Support/OmniGraph/servers/01JA9….json"}
@@ -430,8 +438,8 @@ deliberate choice of address. Everything else carries over from
   restricted log targets;
 - admission, snapshot capture before binding, clean release, and the
   `OMNIGRAPH_LISTEN_ADDR=` line and logs on stdout;
-- exit 0 on clean shutdown and 2 on an uncertain write or an exhausted
-  shutdown grace.
+- exit 0 on clean shutdown and 2 when it stops with an unknown outcome or an
+  exhausted shutdown grace, whose triggers [#1067](https://github.com/ModernRelay/omnigraph/issues/1067) narrows.
 
 It takes the cluster root as its one positional argument and refuses a root that
 is not a cluster (`serve_requires_cluster`). `/healthz`, `/readyz`,
@@ -553,6 +561,19 @@ Every failure, from a server or from the CLI, has one shape: today's
   `command_outcome` does today for data writes, so a lost response becomes
   `unknown` and `reconcile` and is never replayed. Every command reports it, not
   only data writes.
+- **A write has three results.** It is committed, not committed, or of unknown
+  outcome, the same on every surface, as
+  [#1067](https://github.com/ModernRelay/omnigraph/issues/1067) proposes. A server reports unknown only when it could not settle
+  the attempt itself, and then as `outcome_unknown`, never as a plain
+  `internal`. `outcome.check` carries what a later read needs to settle it: the
+  branch, its head before the write and the attempt's transaction id.
+
+  ```json
+  {"error":"the write may have published","code":"outcome_unknown",
+   "outcome":{"execution":"unknown","effects":"unknown","action":"reconcile",
+              "check":{"branch":"main","head_before":"01JAC…","attempt":"0c410ce6-…"}}}
+  ```
+
 - **Exit codes follow from the outcome**, the same for every command:
 
 | Exit | Meaning | Today |
@@ -598,6 +619,8 @@ The new codes:
 | `branch_deleted` | Every write to a branch | The branch was deleted while the write prepared |
 | `commit_dropped` | `commit publish` | The proposal was dropped first |
 | `commit_published` | `commit drop` | The proposal was published first |
+| `outcome_unknown` | Every write | The server could not settle whether the attempt published |
+| `storage_unavailable` | Every write | Storage is failing broadly and writes are refused for now, with `Retry-After` ([#1067](https://github.com/ModernRelay/omnigraph/issues/1067)) |
 
 A read-only local server's write routes and its loopback guard answer with the
 existing `forbidden`.
@@ -876,16 +899,19 @@ leaves every other step a derived, idempotent follow-up:
    unlink follow as today, and a crash between them leaves a tombstoned branch
    that the next delete, cleanup or `repair` finishes. A publisher reading a
    tombstone refuses with `branch_deleted`.
-2. **The branch namespace is registered on main.** Creating a branch publishes
-   a head-preserving registration of its logical name and native identity on
+2. **The branch namespace is registered on main.** Creating a branch publishes a
+   head-preserving registration of its logical name and native identity on
    main's `__manifest`, after the native ref exists; deleting it publishes the
    matching deregistration after the tombstone. Two creates of one name race on
    main's version: the loser reloads, finds the name registered, reclaims its
    own native ref and tree, which nobody else can have registered, and refuses
-   with `branch_exists`. Unretired, registered refs define the logical
-   branches. Because a create now moves main's version, schema apply's
-   `ExactGraphVersion` loses to a create made after its main-only check, and so
-   does system-column upgrade.
+   with `branch_exists`. Because each create mints its own ULID, a ref conflict
+   on that exact name can only be its own retried request, which Lance's
+   `put_ref_if_absent` reports as `RefConflict` without checking; the create
+   reads the ref back and treats it as landed. Unretired, registered refs define
+   the logical branches. Because a create now moves main's version, schema
+   apply's `ExactGraphVersion` loses to a create made after its main-only check,
+   and so does system-column upgrade.
 3. **Cleanup reclaims only what no registration can still claim.** A tree that
    no registration names and no tombstone retired, such as a create's tree
    before it registers, is reclaimed only after the collector's existing
@@ -907,6 +933,25 @@ leaves every other step a derived, idempotent follow-up:
    on `for_root`, the schema gate or the branch gates any longer, and their
    comments say so. The exclusive schema permit around branch creation becomes
    shared.
+
+**Late requests are harmless by construction.** Every storage mutation in this
+design is one of three kinds, the classification
+[#1067](https://github.com/ModernRelay/omnigraph/issues/1067) proposes for all of them:
+
+- a fresh, uniquely named object, such as a data, deletion, index or
+  transaction file or a detached manifest, which nothing names until a
+  publication does;
+- a conditional publication, a `__manifest` version written only if absent;
+- a follow-up of a publication whose late or repeated landing changes nothing
+  logical: retirement's marker rewrite, the archive, the unlink, a losing
+  create's reclaim and a drop's tag release.
+
+The marker rewrite is unconditional in Lance 11: `Branches::replace_metadata`
+reads the ref, edits it and puts it back with no version check. A late one can
+even recreate a ref the delete already unlinked. That ref is retired and
+unregistered, so it names no logical branch, and cleanup reclaims it. A guard
+against unconditional writes of mutable keys, as #1067 proposes, admits these
+only as follow-ups of a publication.
 
 **Format.** Tombstones, registrations and drop records are new `__manifest`
 rows, so a graph that uses them carries the next storage stamp, which older
@@ -985,7 +1030,7 @@ pub enum LocalOpenError {
     Policy(PolicyError),
 }
 
-/// `Uncertain` when a write's completion is unknown; callers exit 2.
+/// `Uncertain` when the process stopped with an unknown outcome; callers exit 2.
 pub enum ServeOutcome { Clean, Uncertain }
 
 impl AppState {
@@ -1422,7 +1467,7 @@ repositories' changes are listed as dependencies, made and reviewed there.
 | Connections | Remove the operator-config and credentials parsers (`graph_store/src/cli_config.rs`), the name-based token lookup and Studio's own server list: list targets and aliases with `omnigraph target list --json`, add a server with `omnigraph target add` and `omnigraph login --target NAME` on standard input, and move existing keychain servers the same way once. |
 | Static tokens | Obtain them with `omnigraph credential get --json`, keep them in memory, send them only to URLs under `endpoint`, and run it again after a 401. |
 | Access | Show only the actions `omnigraph access` or the access route allows, for the target, graph and branch on screen; hide write affordances on a read-only local server. |
-| Failures | Read `code` and `outcome` from every error body; never resubmit on `unknown`. |
+| Failures | Read `code` and `outcome` from every error body; never resubmit on `unknown`, and settle it from `outcome.check`. Show writes as degraded, not the graph as gone, on `storage_unavailable` or a degraded readiness report. |
 | Agents | Keep the agent gateway for panel agents and point it at the local server's URL and token; say when a read-only local server refuses their branch writes. Create each conversation's CLI home with `omnigraph target add` under that home's `OMNIGRAPH_HOME`, so the CLI writes its format, and refuse `--target` in the agent wrapper as it refuses `--server` and `--as`. Never pass the captured environment to agents. Bring the agent panel to Windows. |
 | Releases | Configure the Apple secrets so every release is Developer ID signed and notarized; the workflow already does both when they are set, but releases so far are pre-releases signed ad hoc. A fixed, documented team identifier the CLI can pin; full releases with version-free asset names, so a latest URL resolves for each architecture; an updater inside the app; a package identity when Windows ships as an installer rather than a zip. Installing Studio waits for these ([omnigraph-studio#3](https://github.com/ModernRelay/omnigraph-studio/issues/3)). |
 | Specs | Rewrite spec 012's E1–E5 and E15 as this RFC, drop spec 013's note that the launcher passes its CLI path, and update specs 002 (links), 003 (connections), 011 and 013 (agents). |
@@ -1455,9 +1500,10 @@ Each phase is one or more pull requests titled in Conventional Commits, each
 with its single-bullet `changelog.d` note, the public Rust APIs included.
 
 1. **Outcomes, identity and access over HTTP.** The code registry, `outcome` on
-   every failure, the exit codes, `omnigraph-expect-actor` and the `--as`
-   assertion, and `GET /graphs/{graph_id}/access`, under one HTTP contract
-   bump. `implementation: in-progress`.
+   every failure with the three write results and `outcome_unknown`, the exit
+   codes, `omnigraph-expect-actor` and the `--as` assertion, and
+   `GET /graphs/{graph_id}/access`, under one HTTP contract bump. This is the
+   result surface [#1067](https://github.com/ModernRelay/omnigraph/issues/1067) asks for in its sixth step. `implementation: in-progress`.
 2. **Targets.** `target list|show|add|remove` with RFC 0059, `credential get`,
    `access`, and `protocols` in `version --json`.
 3. **Read-only local servers.** `AppState::local` for graphs and clusters,
@@ -1466,7 +1512,9 @@ with its single-bullet `changelog.d` note, the public Rust APIs included.
 4. **Read-write local servers and serving for others.** `--write`, `mcp
    --write`, and `serve --listen` replacing the `omnigraph-server` binary in
    images, archives, tests and docs. The user page states the interim
-   one-writer-process boundary.
+   one-writer-process boundary. Read-write local servers wait for
+   [#1067](https://github.com/ModernRelay/omnigraph/issues/1067)'s first change: a storage error ends its own operation, not the
+   process, and its trigger is logged.
 5. **Cross-process writes.** The engine changes in
    [Cross-process writes](#cross-process-writes); the support boundary is
    lifted and the interim note removed.
@@ -1683,3 +1731,10 @@ changes and pointing at this RFC.
   contract bump each need per-deployment handling there; managed failures keep
   the control plane's own problem body; deployment tooling keeps a literal root
   for the root-scoped cluster administration commands.
+- 2026-10-18: Aligned with [#1067](https://github.com/ModernRelay/omnigraph/issues/1067), the server stopping on one storage
+  write of unknown outcome. Its result surface became part of rule 6
+  (`outcome_unknown` with `outcome.check`, `storage_unavailable`); the serving
+  lifecycle is inherited from it rather than promised, and read-write local
+  servers wait for its first change; the engine design states the late-request
+  classification it proposes, and why branch-ref rewrites fall in its last
+  class.
