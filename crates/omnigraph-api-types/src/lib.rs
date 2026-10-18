@@ -1861,6 +1861,55 @@ pub enum AccessAction {
     InvokeQuery,
 }
 
+impl AccessAction {
+    /// Every action the access report names, in report order.
+    pub const ALL: [AccessAction; 10] = [
+        AccessAction::Read,
+        AccessAction::Export,
+        AccessAction::Change,
+        AccessAction::SchemaApply,
+        AccessAction::BranchCreate,
+        AccessAction::BranchDelete,
+        AccessAction::BranchMerge,
+        AccessAction::CommitPublish,
+        AccessAction::CommitDrop,
+        AccessAction::InvokeQuery,
+    ];
+}
+
+/// Where the access report puts a named branch for an action: the slot of
+/// the policy request the route that performs it builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessSlot {
+    /// Decided only graph-wide: the action names no branch.
+    GraphWide,
+    /// The named branch is the source (`read`, `export`, `change`).
+    Source,
+    /// The named branch is the target (`schema_apply`, `branch_delete`,
+    /// `commit_publish`, `commit_drop`).
+    Target,
+    /// From the named branch into `target_branch` (`branch_create`,
+    /// `branch_merge`).
+    Transition,
+}
+
+/// Each policy action's slot in the access report, or `None` for one no
+/// graph's report names. The match is exhaustive, so a new policy action is
+/// classified here before it compiles, for the route and the CLI at once.
+fn access_slot(action: omnigraph_policy::PolicyAction) -> Option<AccessSlot> {
+    use omnigraph_policy::PolicyAction as P;
+    match action {
+        P::Read | P::Export | P::Change => Some(AccessSlot::Source),
+        P::SchemaApply | P::BranchDelete | P::CommitPublish | P::CommitDrop => {
+            Some(AccessSlot::Target)
+        }
+        P::BranchCreate | P::BranchMerge => Some(AccessSlot::Transition),
+        P::InvokeQuery => Some(AccessSlot::GraphWide),
+        // Server- or operator-scoped: no graph's access report names them.
+        P::Admin | P::GraphList | P::ConfigManage => None,
+    }
+}
+
 impl From<AccessAction> for omnigraph_policy::PolicyAction {
     fn from(access: AccessAction) -> Self {
         use omnigraph_policy::PolicyAction as P;
@@ -1915,44 +1964,33 @@ impl AccessOutput {
         target_branch: Option<String>,
         mut allowed: impl FnMut(AccessAction, Option<&str>, Option<&str>) -> Result<bool, E>,
     ) -> Result<Self, E> {
-        use AccessAction as A;
         let mut graph_wide = Vec::new();
-        for access in [
-            A::Read,
-            A::Export,
-            A::Change,
-            A::SchemaApply,
-            A::BranchCreate,
-            A::BranchDelete,
-            A::BranchMerge,
-            A::CommitPublish,
-            A::CommitDrop,
-            A::InvokeQuery,
-        ] {
+        for access in AccessAction::ALL {
             if allowed(access, None, None)? {
                 graph_wide.push(access);
             }
         }
         let mut actions = Vec::new();
         if let Some(branch) = branch.as_deref() {
-            for access in [A::Read, A::Export, A::Change] {
-                if allowed(access, Some(branch), None)? {
-                    actions.push(access);
-                }
-            }
-            for access in [
-                A::SchemaApply,
-                A::BranchDelete,
-                A::CommitPublish,
-                A::CommitDrop,
+            for slot in [
+                AccessSlot::Source,
+                AccessSlot::Target,
+                AccessSlot::Transition,
             ] {
-                if allowed(access, None, Some(branch))? {
-                    actions.push(access);
-                }
-            }
-            if let Some(target) = target_branch.as_deref() {
-                for access in [A::BranchCreate, A::BranchMerge] {
-                    if allowed(access, Some(branch), Some(target))? {
+                for access in AccessAction::ALL {
+                    if access_slot(access.into()) != Some(slot) {
+                        continue;
+                    }
+                    let (source, target) = match slot {
+                        AccessSlot::Source => (Some(branch), None),
+                        AccessSlot::Target => (None, Some(branch)),
+                        AccessSlot::Transition => match target_branch.as_deref() {
+                            Some(target) => (Some(branch), Some(target)),
+                            None => continue,
+                        },
+                        AccessSlot::GraphWide => continue,
+                    };
+                    if allowed(access, source, target)? {
                         actions.push(access);
                     }
                 }
@@ -3130,6 +3168,16 @@ pub struct GraphDiscoveryResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_reported_access_action_has_a_slot() {
+        for access in AccessAction::ALL {
+            assert!(
+                access_slot(access.into()).is_some(),
+                "{access:?} is reported but has no slot"
+            );
+        }
+    }
+
     #[test]
     fn edge_builds_report_a_prerelease_naming_their_commit() {
         use super::build::versioned;
