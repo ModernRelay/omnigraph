@@ -103,7 +103,7 @@ Three distinct instruments, complementary — none subsumes another:
    each verb needs a workload that reaches its supported methods. Seeded
    engine-effect failures use existing pre-publication decision seams.
    Lance-call weather retains the semantic oracles but is outside strict replay.
-2. **Crash-window hunt**: a named failpoint (72 in `catalog::CRASH_WINDOWS`)
+2. **Crash-window hunt**: a named failpoint (53 in `catalog::CRASH_WINDOWS`)
    armed at a seeded op index. Aimed — guarantees a specific dangerous
    moment is exercised.
 3. **Crash-state enumeration** (ALICE-style): kill at completion #k for
@@ -119,9 +119,15 @@ and `tests/integration/lane_b.rs`.
 
 ## Fault axes
 
-- **Crash windows**: `Scenario::crash_at` arms any of the engine's 72 named
+- **Crash windows**: `Scenario::crash_at` arms any of the engine's 53 named
   failpoints (`catalog::CRASH_WINDOWS`) at a seeded op index. The ignored
-  `dst_hunt_crash_window_sweep` test sweeps the whole catalog.
+  `dst_hunt_crash_window_sweep` test sweeps the whole catalog. A window
+  inside `cleanup`'s per-table pass defers that table instead of failing the
+  op; the universe records `deferred:<window>@op<i>` and runs the obligation
+  pass a crashed cleanup gets. A window whose precondition is an earlier
+  crash's aftermath names that crash in `harness::setup_crash_for`;
+  `Scenario::setup_crash` schedules it before the window, and the reach
+  census, the hunt and the fleet all use it.
 - **Injected storage faults**: `Scenario::faults` installs a seeded `FaultPlan`
   on the adapter and optionally Lance. Latency uses virtual time. Lance supports
   errors, latency and lost acknowledgements; adapter text corruption and

@@ -9782,6 +9782,246 @@ async fn collector_retry_treats_an_index_directory_an_interrupted_pass_removed_a
     assert_eq!(count_rows(&db, "node:Person").await, rows);
 }
 
+/// A pass stopped between two manifests of its sweep has deleted every file
+/// the sweep frees, index directories included, and its first manifest only.
+/// The manifests it left still name those directories, so the next pass plans
+/// them again; it finds them gone, removes the rest and converges.
+#[tokio::test]
+#[serial]
+async fn collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    insert_person(&db, "main", "between-first").await;
+    insert_person(&db, "main", "between-second").await;
+    let rows = count_rows(&db, "node:Person").await;
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    let swept = plan.would_remove();
+    assert!(
+        swept.len() >= 2,
+        "the fixture must sweep a manifest after its first: {swept:?}"
+    );
+    let swept_indices: Vec<_> = plan
+        .sweep_paths
+        .iter()
+        .filter(|path| path.starts_with("_indices/"))
+        .cloned()
+        .collect();
+    assert!(
+        !swept_indices.is_empty(),
+        "the fixture must sweep an index directory: {:?}",
+        plan.sweep_paths
+    );
+
+    let stats = {
+        let _fp = catalog::CLEANUP_SWEEP_BETWEEN_MANIFESTS.fire_always();
+        db.cleanup(keep_one()).await.unwrap()
+    };
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|error| error.contains("cleanup.sweep_between_manifests")),
+        "the interrupted pass reports the window: {row:?}"
+    );
+    assert_eq!(
+        row.manifests_removed, 1,
+        "the pass stopped after its first manifest: {row:?}"
+    );
+    let remaining = detached_versions(&person_uri).await;
+    assert!(!remaining.contains(&swept[0]), "{remaining:?}");
+    for version in &swept[1..] {
+        assert!(
+            remaining.contains(version),
+            "{version} outlives the interrupted pass: {remaining:?}"
+        );
+    }
+    for path in &swept_indices {
+        assert!(
+            !std::path::Path::new(&person_uri).join(path).exists(),
+            "the interrupted pass deleted the files before stopping: {path}"
+        );
+    }
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert_eq!(
+        plan.would_remove()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        swept[1..].iter().copied().collect(),
+        "the next pass plans the manifests the interrupted one left"
+    );
+    assert!(
+        swept_indices
+            .iter()
+            .any(|path| plan.sweep_paths.contains(path)),
+        "the next pass deletes again an index directory the interrupted one removed: {:?}",
+        plan.sweep_paths
+    );
+
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert_eq!(row.manifests_removed as usize, swept.len() - 1, "{row:?}");
+    let remaining = detached_versions(&person_uri).await;
+    for version in &swept {
+        assert!(!remaining.contains(version), "{version} is gone");
+    }
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    for plan in &report.tables {
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        assert!(
+            plan.would_remove().is_empty(),
+            "{}: {:?}",
+            plan.location,
+            plan.would_remove()
+        );
+    }
+    assert_eq!(
+        db.cleanup_plan_missing_paths(&report).await.unwrap(),
+        Vec::<(String, String)>::new(),
+        "every retained root's paths still exist"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, rows);
+}
+
+/// A dead staging's files are deleted before its manifest as well. A pass
+/// stopped in between leaves the dead manifest with its index directory gone;
+/// the next pass judges the staging dead again, finds the directory gone,
+/// removes the manifest and converges.
+#[tokio::test]
+#[serial]
+async fn collector_retry_after_a_pass_stopped_before_the_dead_manifests_removes_them() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = graph_with_unbuilt_indexes(&dir).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let before = detached_versions(&person_uri).await;
+    {
+        let _fp = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
+        let outcome = db.ensure_indices().await;
+        assert!(
+            outcome.is_err(),
+            "the seam fails the index build before publish"
+        );
+    }
+    let stranded = &detached_versions(&person_uri).await - &before;
+    assert!(
+        !stranded.is_empty(),
+        "the interrupted index build strands its staging"
+    );
+    insert_person(&db, "main", "after").await;
+    let rows = count_rows(&db, "node:Person").await;
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert_eq!(
+        plan.dead_stagings()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        stranded,
+        "the head moved past the staging's recorded one: {:?}",
+        plan.unpublished
+    );
+    let dead_indices: Vec<_> = plan
+        .dead_paths
+        .iter()
+        .filter(|path| path.starts_with("_indices/"))
+        .cloned()
+        .collect();
+    assert!(
+        !dead_indices.is_empty(),
+        "the fixture must reclaim an index directory only the dead staging names: {:?}",
+        plan.dead_paths
+    );
+
+    let stats = {
+        let _fp = catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.fire_always();
+        db.cleanup(keep_one()).await.unwrap()
+    };
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|error| error.contains("cleanup.sweep_pre_dead_manifest_delete")),
+        "the interrupted pass reports the window: {row:?}"
+    );
+    assert!(
+        stranded.is_subset(&detached_versions(&person_uri).await),
+        "the dead manifests outlive the interrupted pass"
+    );
+    for path in &dead_indices {
+        assert!(
+            !std::path::Path::new(&person_uri).join(path).exists(),
+            "the interrupted pass deleted the files before stopping: {path}"
+        );
+    }
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert_eq!(
+        plan.dead_stagings()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        stranded,
+        "the next pass judges the stagings dead again: {:?}",
+        plan.unpublished
+    );
+    assert!(
+        dead_indices
+            .iter()
+            .any(|path| plan.dead_paths.contains(path)),
+        "the next pass deletes again an index directory the interrupted one removed: {:?}",
+        plan.dead_paths
+    );
+
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert_eq!(
+        row.manifests_removed as usize,
+        stranded.len(),
+        "the interrupted pass swept the published manifests; the retry removes the dead ones: {row:?}"
+    );
+    let remaining = detached_versions(&person_uri).await;
+    for version in &stranded {
+        assert!(!remaining.contains(version), "{version} is gone");
+    }
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    for plan in &report.tables {
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        assert!(
+            plan.would_remove().is_empty() && plan.unpublished.is_empty(),
+            "{}: {:?} {:?}",
+            plan.location,
+            plan.would_remove(),
+            plan.unpublished
+        );
+    }
+    assert_eq!(
+        db.cleanup_plan_missing_paths(&report).await.unwrap(),
+        Vec::<(String, String)>::new(),
+        "every retained root's paths still exist"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, rows);
+}
+
 /// A failed publish acknowledgement and unavailable readback leave publication
 /// indeterminate. Its input protection survives the returned error until cleanup
 /// observes the target publication and can safely expire the old witness.
