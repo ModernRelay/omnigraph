@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - azimafroozeh
 created: 2026-10-12
-updated: 2026-10-12
+updated: 2026-10-17
 discussion: null
 supersedes: []
 superseded_by: []
@@ -264,7 +264,7 @@ An upgrade plan records only grants already consumed by its fenced attempt.
 | Blocks granted per branch at `branch create`, cursor in the branch's `__manifest` | Correct for one writer per branch. Two writers on one branch read the same cursor, stage fragments with the same numbers, and the loser of the publish CAS must re-stage with fresh numbers. Per-session blocks keep allocation independent of publication retries, while each retry still revalidates its graph read set |
 | Random 48-bit numbers | No coordination at all, and birthday collisions become likely around sixteen million rows in one table. Not acceptable for an identity |
 | Static writer prefix, `writer_id << 40` | A fixed cap on writers and a fixed share of the space per writer. The block design is this with dynamic sizing and no registry of writers |
-| Lance row addresses or move-stable row ids as the numbers | Owned by Lance, renumbered by compaction or reassigned on update and on merge, allocated per lineage. Not a logical identity, which is invariant 1's line |
+| Lance row addresses or move-stable row ids as the numbers | Owned by Lance. Row addresses are renumbered by compaction. Stable row ids survive update and `merge_insert` in Lance 11, but are allocated per dataset lineage, starting at 0 in every table, and a delete plus re-insert mints a new one. Not a logical identity, which is invariant 1's line |
 
 Precedent audit. The nearest in-repo pattern is `Allocator` for type ids: a
 counter whose correctness rests on a single-writer rule. This RFC diverges by

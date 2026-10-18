@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - azimafroozeh
 created: 2026-10-12
-updated: 2026-10-12
+updated: 2026-10-17
 discussion: null
 supersedes: []
 superseded_by: []
@@ -171,12 +171,16 @@ including gaps, not just live rows. Both halves are rename-stable (invariant
 with the new canonical name.
 
 One `UInt64` was chosen over two columns and over 16-byte forms for three
-reasons: Lance's BTREE and Bitmap scalar indexes and `IN (...)` pushdown on
-`UInt64` are proven today; a type-only predicate such as cascade's "every edge
-to a `Person`" is one range scan, `packed BETWEEN type << 48 AND
-((type << 48) | (2^48 - 1))`; and the pairing of type and id is in the value, not
-in a convention two columns must keep. The 16/48 split is a per-graph constant
-recorded in the accepted `SchemaIR`, never a code constant.
+reasons: Lance's BTREE scalar index and `IN (...)` pushdown on `UInt64` are
+proven today, including packed values above 2^63; a type-only predicate such
+as cascade's "every edge to a `Person`" is one range scan, `packed BETWEEN
+type << 48 AND ((type << 48) | (2^48 - 1))`; and the pairing of type and id is
+in the value, not in a convention two columns must keep. The 16/48 split is a
+per-graph constant recorded in the accepted `SchemaIR`, never a code constant.
+
+The index on each packed endpoint column is a BTREE. A bitmap index answers
+the same predicates, but it loads every distinct key when opened
+(`lance-index` `scalar/bitmap.rs`), and packed endpoints are nearly unique.
 
 ### `NodeRef`
 
@@ -186,7 +190,11 @@ checked construction, `pack()` and `unpack()`. Construction rejects a type
 id above 65535 or row id at least `2^48` before shifting. Unpacking validates
 the type against the captured schema; row existence remains an integrity
 check. Endpoint-type range bounds use the masked maximum above, including
-for type 65535, without shifting 65536 into a `u64`. Traversal
+for type 65535, without shifting 65536 into a `u64`. Every filter over a
+packed column (cascade, referential integrity, endpoint-type ranges,
+traversal probes) is built from `u64` literals. A value that passes through
+`i64` loses the index silently, because Lance then compares through a cast
+instead of probing. Traversal
 frontiers, visited sets, the graph index interner, dedup, cycle closing,
 anti-join keys, rank-fusion identity, hydration lookups, cascade filters, the
 change feed's endpoint images and export all take a `NodeRef`. A bare `u64` or
@@ -206,6 +214,21 @@ New rows take their `__id` from the sequence cache. A moved graph head returns
 `ReadSetChanged` under `ExactGraphHead`; retries capture a fresh snapshot,
 resolve keys and validate again, and restage where required. A retained
 confirmed allocation can supply the same ids, but cannot validate stale reads.
+
+Group commit ([#785](https://github.com/ModernRelay/omnigraph/pull/785))
+admits append-only entries together when their inserted id sets are disjoint,
+and its proof equates id absence with natural-key absence. Allocated ids break
+that premise: two writers can both find `Person.slug = "acme"` absent and
+receive different ids, so their id sets are disjoint while their keys
+conflict. The `ExactGraphHead` retry above stays safe; only the batching
+relaxation loses its justification. When the two designs combine, admission,
+in group commit's existing admission owner, compares the natural-key tuples
+that staging tested (for a keyed edge, its packed endpoints and declared key
+properties), or classifies keyed inserts and upserts as exclusive until that
+proof exists. Unkeyed inserts have no natural key, so disjoint ids still
+suffice for them. Endpoint key resolution reads the endpoint tables, which
+group commit already counts as validation reads, so a concurrent key change,
+an exclusive write there, refuses the entry.
 
 Referential integrity, cardinality and uniqueness validation run on packed
 references. A `@card` bound is counted per `(src packed)` over one edge table.
@@ -482,7 +505,7 @@ lock presented as fencing (the sequence RFC's conditional put is the fence).
 | Two columns per endpoint, type and id | Same information, pairing by convention; a type-only filter needs a second indexed column; nothing it does that one packed value does not |
 | `FixedSizeBinary(16)` or `Decimal128` per endpoint | 64 bits of id space, and Lance scalar indexes on those types need a probe that `UInt64` does not |
 | Hash of the key as the low 48 bits | No allocator and branch-safe by construction, but no insertion order or locality and a collision rule at about sixteen million rows per type |
-| Lance row address or move-stable row id as the low half | Renumbered by compaction or reassigned on update and merge, allocated per lineage, owned by Lance |
+| Lance row address or move-stable row id as the low half | Row addresses are renumbered by compaction. Stable row ids survive update and `merge_insert` in Lance 11 (`write/update.rs` `make_rowid_capture_stream`, `test_row_ids_stable_after_update`), but they are allocated per dataset lineage, starting at 0 in every table, a delete plus re-insert mints a new one, and Lance owns them |
 | Kùzu's dense per-table offset | Needs one allocator per table; branches are many allocators. The distributed sequence is this offset made branch-safe |
 | Discard the remap after each merge | After coalescing source id S into target id T, a later merge can have S in its base and T in its target. Mutable keys prevent recovering correspondence by current key. A version-pinned relation retains it under the existing commit authority without replaying full history |
 
@@ -541,6 +564,10 @@ Following [the testing map](../dev/testing.md):
   while preserving internal references.
 - **DST:** concurrent branch inserts with merges, oracle "one row per key per
   type on every branch and after every merge, every endpoint resolves".
+- **Group commit:** with #785's publisher on, a focused concurrent-write test
+  in which two entries insert one duplicate key under distinct id grants and
+  are not published together, plus a distinct-key control that is. A
+  sequential GQT cannot establish this interleaving.
 - **Reference engine:** refuses the new IR.
 
 Acceptance thresholds: every existing GQT case passes unchanged except those
@@ -589,3 +616,8 @@ mutable-key identity across repeated merges through correspondence in accepted
 history. The offline upgrade freezes source pins and numeric assignments
 before conversion, and export/load distinguishes existing-row updates from
 fresh supplied-id reservations.
+
+2026-10-17: carried the Lance 11 recheck from the polymorphic RFC: packed
+endpoint indexes are BTREE, packed filters use `u64` literals, and stable row
+ids are rejected for per-lineage allocation and re-insert, not for update.
+Recorded the group-commit admission rule for allocated ids.
