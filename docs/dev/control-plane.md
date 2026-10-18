@@ -561,16 +561,20 @@ which refuses a changed revision or an outstanding deployment, and adds a Cedar
 `forbid` for every write action to each policy it loads, so a policy answer
 reports the refusal (rule `local-read-only`). A read-write one acquires the
 cluster's serving admission and refuses while another owner holds it
-(`LocalOpenError::Cluster` with `state_lock_held`); `serve_local` releases it
-after a clean drain, through the release `serve` runs, and keeps it when a
+(`LocalOpenError::Cluster` with `state_lock_held`); `LocalServing::serve` releases
+it after a clean drain, through the release `serve` runs, and keeps it when a
 completion is uncertain.
 
-`serve_local(state, listener, extend)` serves such a state on a loopback
-listener the caller bound, through the lifecycle `serve` runs: the signal and
-uncertain-owner listener, the shutdown watchdog, graceful HTTP shutdown and the
-logical-owner drain. `extend` adds the caller's outermost layers to the router.
-It writes nothing to stdout, disarms the watchdog when it returns, and reports
+`start_local(state, listener, extend)` installs, on a loopback listener the
+caller bound, the lifecycle `serve` runs: the signal and uncertain-owner
+listener, the shutdown watchdog, graceful HTTP shutdown and the logical-owner
+drain. `extend` adds the caller's outermost layers to the router. Every
+lifecycle registers its `SIGTERM` and `SIGINT` handlers before it returns, so
+a caller announces readiness between `start_local` and `LocalServing::serve`,
+and a signal in that window stops the server gracefully. `serve` writes
+nothing to stdout, disarms the watchdog when it returns, and reports
 `ServeOutcome::Uncertain` instead of exiting; the caller exits 2.
+`serve_local` is the two calls in one.
 `install_log_subscriber(writer)` installs the `init_tracing` filter on another
 writer. A read-write local server is not fenced against another process writing
 the same graph; keep one writer per graph.

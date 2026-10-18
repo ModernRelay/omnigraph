@@ -1,0 +1,1 @@
+- `omnigraph-server` registers its `SIGTERM` and `SIGINT` handlers before it opens anything, rather than when its shutdown listener first runs, so a signal delivered during startup always takes the graceful shutdown path instead of ending the process with the signal.

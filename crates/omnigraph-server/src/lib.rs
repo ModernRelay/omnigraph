@@ -3165,13 +3165,25 @@ struct Lifecycle {
     listener_failed: Arc<tokio::sync::Notify>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     disarm: std::sync::mpsc::Sender<()>,
+    listener_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Lifecycle {
+    /// A lifecycle that never served stops listening; one that served has
+    /// already seen its shutdown, so its listener task is finished.
+    fn drop(&mut self) {
+        self.listener_task.abort();
+    }
 }
 
 impl Lifecycle {
     /// Install the shutdown listener before anything else (RFC 0049), so the
-    /// shutdown bound covers startup. The first of a signal, an uncertain
-    /// owner or a failed listener closes admission, sets `draining`, arms the
-    /// watchdog with `grace` and releases the graceful shutdown.
+    /// shutdown bound covers startup. The signal handlers are registered
+    /// before this returns, so a signal delivered after it is observed and
+    /// never meets the default disposition. The first of a signal, an
+    /// uncertain owner or a failed listener closes admission, sets
+    /// `draining`, arms the watchdog with `grace` and releases the graceful
+    /// shutdown.
     fn start(
         operations: operations::OperationRuntime,
         draining: Arc<std::sync::atomic::AtomicBool>,
@@ -3180,13 +3192,14 @@ impl Lifecycle {
         let listener_failed = Arc::new(tokio::sync::Notify::new());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (disarm, disarmed) = std::sync::mpsc::channel();
-        {
+        let signals = ShutdownSignals::register();
+        let listener_task = {
             let operations = operations.clone();
             let listener_failed = Arc::clone(&listener_failed);
             tokio::spawn(async move {
                 // The first signal or uncertain owner fixes the one deadline.
                 tokio::select! {
-                    () = shutdown_signal() => {},
+                    () = signals.received() => info!("shutdown signal received"),
                     () = operations.fatal() => error!("owned completion uncertain; containing process"),
                     () = listener_failed.notified() => error!("listener or graph startup failed; containing admitted work"),
                 }
@@ -3194,13 +3207,14 @@ impl Lifecycle {
                 draining.store(true, std::sync::atomic::Ordering::SeqCst);
                 arm_shutdown_watchdog(grace, disarmed);
                 let _ = shutdown_tx.send(true);
-            });
-        }
+            })
+        };
         Self {
             operations,
             listener_failed,
             shutdown_rx,
             disarm,
+            listener_task,
         }
     }
 
@@ -3242,18 +3256,31 @@ impl Lifecycle {
     }
 }
 
-/// Serve a local server's state on `listener` until shutdown.
+/// A local server whose lifecycle is installed and which has not yet served.
+///
+/// From [`start_local`] on, a shutdown signal stops it gracefully, so its
+/// caller announces readiness between the two calls. Dropping it unserved
+/// stops its shutdown listener, but Tokio keeps its signal handlers for the
+/// rest of the process: a later `SIGTERM` or `SIGINT` no longer ends the
+/// process by default.
+pub struct LocalServing {
+    lifecycle: Lifecycle,
+    listener: TcpListener,
+    app: Router,
+    retained_admission: Option<omnigraph_cluster::ClusterAdmission>,
+}
+
+/// Install a local server's lifecycle over `state` and `listener`, inside a
+/// Tokio runtime.
 ///
 /// The caller binds the listener, so it knows the port before announcing
-/// readiness; `serve_local` refuses one that is not loopback. `extend`
-/// receives the router built from `state`, for the caller's own outermost
-/// layers. It runs the lifecycle the server binary runs, prints nothing to
-/// stdout, and returns an uncertain outcome instead of exiting the process.
-pub async fn serve_local(
+/// readiness; this refuses one that is not loopback. `extend` receives the
+/// router built from `state`, for the caller's own outermost layers.
+pub fn start_local(
     state: AppState,
     listener: TcpListener,
     extend: impl FnOnce(Router) -> Router,
-) -> Result<ServeOutcome> {
+) -> Result<LocalServing> {
     let address = listener.local_addr()?;
     if !address.ip().is_loopback() {
         bail!("a local server listens on loopback only, not {address}");
@@ -3268,19 +3295,48 @@ pub async fn serve_local(
     );
     let retained_admission = state.cluster_admission.clone();
     let app = extend(build_app(state));
-    let served = lifecycle.serve(listener, app).await;
-    let mut outcome = lifecycle.drain().await;
-    let released = match retained_admission {
-        // An uncertain completion keeps the admission, as a deployment does.
-        Some(owner) if outcome == ServeOutcome::Clean => release_serving_admission(owner).await,
-        _ => Ok(outcome),
-    };
-    lifecycle.disarm();
-    outcome = released?;
-    if outcome == ServeOutcome::Clean {
-        served?;
+    Ok(LocalServing {
+        lifecycle,
+        listener,
+        app,
+        retained_admission,
+    })
+}
+
+impl LocalServing {
+    /// Serve until shutdown. This runs the lifecycle the server binary runs,
+    /// prints nothing to stdout, and returns an uncertain outcome instead of
+    /// exiting the process.
+    pub async fn serve(self) -> Result<ServeOutcome> {
+        let Self {
+            lifecycle,
+            listener,
+            app,
+            retained_admission,
+        } = self;
+        let served = lifecycle.serve(listener, app).await;
+        let mut outcome = lifecycle.drain().await;
+        let released = match retained_admission {
+            // An uncertain completion keeps the admission, as a deployment does.
+            Some(owner) if outcome == ServeOutcome::Clean => release_serving_admission(owner).await,
+            _ => Ok(outcome),
+        };
+        lifecycle.disarm();
+        outcome = released?;
+        if outcome == ServeOutcome::Clean {
+            served?;
+        }
+        Ok(outcome)
     }
-    Ok(outcome)
+}
+
+/// [`start_local`], then [`LocalServing::serve`].
+pub async fn serve_local(
+    state: AppState,
+    listener: TcpListener,
+    extend: impl FnOnce(Router) -> Router,
+) -> Result<ServeOutcome> {
+    start_local(state, listener, extend)?.serve().await
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
@@ -4001,43 +4057,79 @@ async fn open_prepared_graph(
     })
 }
 
-async fn wait_for_ctrl_c() {
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        error!(error = %err, "failed to install ctrl-c handler");
-    }
+/// The process's shutdown signals, `SIGTERM` and `SIGINT` (Ctrl-C), with
+/// their handlers registered when constructed rather than when first polled.
+/// A handler that cannot be registered is logged and never fires.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    interrupt: Option<tokio::signal::windows::CtrlC>,
 }
 
-#[cfg(unix)]
-async fn wait_for_shutdown_signal_with_terminate(mut terminate: tokio::signal::unix::Signal) {
-    tokio::select! {
-        () = wait_for_ctrl_c() => {},
-        received = terminate.recv() => {
-            if received.is_none() {
-                error!("SIGTERM handler closed before receiving a signal");
+impl ShutdownSignals {
+    #[cfg(unix)]
+    fn register() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        let register = |kind: SignalKind, name: &str| {
+            signal(kind)
+                .inspect_err(|err| error!(error = %err, "failed to install the {name} handler"))
+                .ok()
+        };
+        Self {
+            terminate: register(SignalKind::terminate(), "SIGTERM"),
+            interrupt: register(SignalKind::interrupt(), "SIGINT"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn register() -> Self {
+        Self {
+            interrupt: tokio::signal::windows::ctrl_c()
+                .inspect_err(|err| error!(error = %err, "failed to install the ctrl-c handler"))
+                .ok(),
+        }
+    }
+
+    /// Resolve at the first signal.
+    async fn received(self) {
+        #[cfg(unix)]
+        {
+            let Self {
+                terminate,
+                interrupt,
+            } = self;
+            tokio::select! {
+                () = Self::next(terminate, "SIGTERM") => {},
+                () = Self::next(interrupt, "SIGINT") => {},
+            }
+        }
+        #[cfg(windows)]
+        {
+            match self.interrupt {
+                Some(mut interrupt) => {
+                    if interrupt.recv().await.is_none() {
+                        error!("ctrl-c handler closed before receiving a signal");
+                    }
+                }
+                None => std::future::pending().await,
             }
         }
     }
-}
 
-#[cfg(unix)]
-async fn wait_for_shutdown_signal() {
-    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(terminate) => wait_for_shutdown_signal_with_terminate(terminate).await,
-        Err(err) => {
-            error!(error = %err, "failed to install SIGTERM handler; waiting for ctrl-c only");
-            wait_for_ctrl_c().await
+    #[cfg(unix)]
+    async fn next(signal: Option<tokio::signal::unix::Signal>, name: &str) {
+        match signal {
+            Some(mut signal) => {
+                if signal.recv().await.is_none() {
+                    error!("{name} handler closed before receiving a signal");
+                }
+            }
+            None => std::future::pending().await,
         }
     }
-}
-
-#[cfg(not(unix))]
-async fn wait_for_shutdown_signal() {
-    wait_for_ctrl_c().await
-}
-
-async fn shutdown_signal() {
-    wait_for_shutdown_signal().await;
-    info!("shutdown signal received");
 }
 
 /// One absolute deadline on graceful shutdown (RFC 0049): in-flight work
@@ -4096,17 +4188,16 @@ mod shutdown_signal_tests {
             return;
         }
 
-        let terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        // Ready before the signals are first polled: registration alone
+        // must keep the default disposition from ending the process.
+        let signals = ShutdownSignals::register();
         let ready_path = std::env::var(SIGTERM_READY_PATH_ENV).unwrap();
         std::fs::write(ready_path, b"ready").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
 
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            wait_for_shutdown_signal_with_terminate(terminate),
-        )
-        .await
-        .expect("SIGTERM was not observed before the child deadline");
+        tokio::time::timeout(Duration::from_secs(5), signals.received())
+            .await
+            .expect("SIGTERM was not observed before the child deadline");
     }
 
     #[test]
