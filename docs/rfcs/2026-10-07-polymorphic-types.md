@@ -722,11 +722,18 @@ from a member. The data dependency is any row whose endpoint names `M`.
 Cluster apply preflight already typechecks the desired queries against the
 desired catalog, so a query and the schema can change in one apply; a
 standalone apply has no registry, so served startup refuses instead. The
-registry also records, per stored query, each binding name's kind and
-`StableTypeId` and the result descriptor, and refuses when a name later
-resolves to a different kind or id or the descriptor changes. A fork that
+registry also records, per stored query, the kind and `StableTypeId` of every
+type and edge name the query resolves (bindings, rebindings, traversal edges
+and alternation members, type tests, typed endpoints, and mutation and load
+targets) and the result descriptor. It refuses when any of those names later
+resolves to a different kind or id, or the descriptor changes. A fork that
 renames `node Event` and later adds `interface Event` therefore cannot silently
-widen an old `$e: Event` view.
+widen an old `$e: Event` view. Nor can one apply that renames `edge OwnedBy`
+away and adds a new `edge OwnedBy` silently retarget a stored traversal of
+`ownedBy`: the migration table refuses only cross-kind reuse in one apply, so
+pinning is what catches same-kind reuse. A move under
+[Schema namespaces](https://github.com/ModernRelay/omnigraph/pull/1015) is a
+rename and relies on the same guard.
 
 ### Wire, API and descriptor
 
@@ -854,6 +861,12 @@ sub-pipelines), no cost-blind plan choice, and no maintained parallel truth.
 - Wire changes are additive: optional endpoint types, a new catalog route,
   and `@type` only when projected. Tower and other clients gate the grammar by
   engine capability.
+- Every type name this RFC adds to the grammar (endpoint sets and unions,
+  `implements`, abstract bindings, type tests and typed endpoints) is the type
+  reference that
+  [Schema namespaces](https://github.com/ModernRelay/omnigraph/pull/1015)
+  qualifies, so the two RFCs share one spelling, `crm::Contact`, in either
+  shipping order.
 - Language and explain allocations follow [Queries](#queries). Union scans
   require a new serialized-plan envelope version; its decoder preserves
   compatibility for older saved plans that contain no union scan.
@@ -1027,7 +1040,7 @@ code were spot-checked on `origin/main`.
 | 11 | Live views | Expanding at cursor creation freezes membership. | Per-commit expansion and membership refusal. |
 | 12 | Remove-`implements` dependency | "Depends" was undefined. | Typecheck-based rule and registry pinning. |
 | 13 | Per-type policy | A denied member was silently filtered. | Member sets from the actor's schema view, with `view.restricted` as the completeness signal. |
-| 14 | Shared core name collision | `interface Event` and `node Event` coexist on main; reusing a renamed name changes stored queries silently. | One namespace; same-apply reuse refused; registry pinning. |
+| 14 | Shared core name collision | `interface Event` and `node Event` coexist on main; reusing a renamed name changes stored queries silently. | No interface shares a name with a node or edge type; same-apply reuse refused; registry pinning. |
 
 Packed references dissolve none of these: they concern typing, planning,
 catalog and lifecycle contracts, not stored identity. Local measurements for
@@ -1097,6 +1110,10 @@ extended:
   interface fixture, with scores unchanged when a type-test filter is added;
   in `tests/search.rs`, scores unchanged while one member's postings are
   unreconciled.
+- **Cluster:** apply preflight refuses a stored query whose traversal edge,
+  type test, typed endpoint or mutation target would resolve to a different
+  id after a same-kind rename and re-add in one apply, and accepts a rename
+  that every stored query still resolves to the same id.
 - **Tower:** catalog-route parity and grammar capability gating.
 
 Acceptance thresholds:
@@ -1152,7 +1169,7 @@ graph.
      interface-wide `update`/`delete`.
    - Interface inheritance behind `interface-inheritance`; the catalog route
      with its full field list; the schema hash on reads; stored-query pinning
-     of binding kinds and ids.
+     of the kind and id of every type and edge name a query resolves.
 3. **Phase 2, polymorphic edges.**
    - Endpoint declarations behind `polymorphic-endpoints`.
    - Typed endpoint writes, validation, cascade, loads, export and
@@ -1262,3 +1279,10 @@ reopen after eviction still sends a HEAD and a GET today; answering a
 detached pin from its recorded manifest location is a phase-1 change, not
 current behavior. The public paging tuple names every key property, and a
 hidden type id's refusal matches an unknown id apart from the echoed value.
+
+2026-10-18: stored-query pinning covers every type and edge name a query
+resolves, not only bindings: the migration table refuses only cross-kind
+reuse in one apply, so a same-kind rename and re-add, including a move under
+Schema namespaces, is caught by pinning. Type references share Schema
+namespaces' qualified spelling. Item 14's fix is worded without "namespace",
+which that RFC now uses for qualified names.
