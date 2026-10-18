@@ -7,7 +7,8 @@ pub const NOW_PARAM_NAME: &str = "__nanograph_now";
 
 /// A parsed `.gq` source: the `set` and `reset` lines at its head, then its
 /// body, which is a list of `query` declarations, one branch statement, one
-/// `show` statement, or one `explain` statement wrapping a read declaration.
+/// `show` statement, or one `explain` statement wrapping a read declaration
+/// or a load statement.
 #[derive(Debug, Clone)]
 pub struct QueryFile {
     pub settings: Vec<SettingStmt>,
@@ -24,6 +25,9 @@ pub enum FileBody {
     Load(LoadStmt),
     Show(Option<SettingId>),
     Explain(QueryDecl),
+    /// `explain load csv …`: the read doors answer the accepted load plan
+    /// as explain rows, reading no payload byte.
+    ExplainLoad(LoadStmt),
 }
 
 /// A top-level load statement: `load csv "<uri>" into node:Person mode
@@ -47,7 +51,8 @@ pub struct LoadStmt {
 
 /// The declared type a load statement fills, as spelled: `node:Person` or
 /// `edge:Knows`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LoadTarget {
     Node(String),
     Edge(String),
@@ -70,7 +75,8 @@ impl LoadTarget {
 }
 
 /// `mode overwrite | append | merge`, the load modes `omnigraph load` takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LoadStmtMode {
     Overwrite,
     Append,
@@ -211,6 +217,12 @@ pub fn show_statement_name(id: Option<SettingId>) -> String {
 /// [`BranchStmt::not_a_declaration_message`].
 const EXPLAIN_NOT_A_DECLARATION: &str = "`explain` is a statement, not a query declaration";
 
+/// Refusal text for a read-declaration consumer that got `explain load csv`:
+/// the read doors match the variant before selecting declarations and answer
+/// the load plan themselves.
+const EXPLAIN_LOAD_NOT_A_READ_DECLARATION: &str =
+    "`explain load csv` is answered as a load plan by the read doors, not as a query declaration";
+
 /// The statement name of `explain`, as the door refusals spell it.
 pub const EXPLAIN_STATEMENT_NAME: &str = "explain";
 
@@ -232,6 +244,7 @@ impl FileBody {
                 show_statement_name(id)
             )),
             FileBody::Explain(_) => Err(EXPLAIN_NOT_A_DECLARATION.to_string()),
+            FileBody::ExplainLoad(_) => Err(EXPLAIN_NOT_A_DECLARATION.to_string()),
         }
     }
 
@@ -241,7 +254,9 @@ impl FileBody {
     /// # Errors
     ///
     /// As [`FileBody::into_declarations`] for a branch or `show` statement,
-    /// and the `explain` refusal when the wrapped declaration holds mutations.
+    /// the `explain` refusal when the wrapped declaration holds mutations,
+    /// and the load-plan refusal for `explain load csv`, which a read door
+    /// answers itself before it selects declarations.
     pub fn into_read_declarations(self) -> Result<Vec<QueryDecl>, String> {
         match self {
             FileBody::Explain(decl) if !decl.mutations.is_empty() => Err(format!(
@@ -249,11 +264,13 @@ impl FileBody {
                 decl.name
             )),
             FileBody::Explain(decl) => Ok(vec![decl]),
+            FileBody::ExplainLoad(_) => Err(EXPLAIN_LOAD_NOT_A_READ_DECLARATION.to_string()),
             body => body.into_declarations(),
         }
     }
 
-    /// Whether this body is an `explain` statement.
+    /// Whether this body is an `explain` statement wrapping a query
+    /// declaration; `explain load csv` answers no declaration's plan.
     pub fn is_explain(&self) -> bool {
         matches!(self, FileBody::Explain(_))
     }
@@ -303,7 +320,9 @@ impl QueryFile {
             FileBody::Commit(write) => panic!("{}", write.not_a_declaration_message()),
             FileBody::Load(stmt) => panic!("{}", stmt.not_a_declaration_message()),
             FileBody::Show(id) => panic!("`{}` is not a declaration", show_statement_name(*id)),
-            FileBody::Explain(_) => panic!("{EXPLAIN_NOT_A_DECLARATION}"),
+            FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
+                panic!("{EXPLAIN_NOT_A_DECLARATION}")
+            }
         }
     }
 }

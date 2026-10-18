@@ -577,7 +577,11 @@ fn patch_human(data: &Value, patch: &Patch) -> Result<String> {
     ))
 }
 
-pub(super) async fn dispatch(target: &OrganizationArgs, command: &OrganizationCommand) -> Output {
+pub(super) async fn dispatch(
+    target: &OrganizationArgs,
+    command: &OrganizationCommand,
+    stderr: &mut dyn Write,
+) -> Output {
     let key = match command {
         OrganizationCommand::Members {
             command:
@@ -603,7 +607,7 @@ pub(super) async fn dispatch(target: &OrganizationArgs, command: &OrganizationCo
         _ => None,
     };
     let result = async {
-        if let Some(key) = key { idempotency_key(Some(key))?; }
+        if let Some(key) = key { idempotency_key(Some(key), stderr)?; }
         // Validate all caller-provided write targets before authentication or HTTP.
         let patch = match command {
             OrganizationCommand::Members { command: Members::Apply { file, .. } } => Some(read_patch(file)?),
@@ -681,15 +685,25 @@ pub(super) async fn dispatch(target: &OrganizationArgs, command: &OrganizationCo
             human: Some(human),
             exit,
             json: target.json,
+            recovery: key.map(|key| json!({"idempotency_key":key})),
         },
         Err(mut error) => {
             if let Some(key) = key {
                 // A lost acknowledgement never allocates or submits a replacement action.
                 if key.len() <= 256 && key.bytes().all(|b| b.is_ascii_graphic()) {
                     error.body["idempotency_key"] = json!(key);
-                    eprintln!(
-                        "Retain this idempotency key; inspect the result or repeat the identical request with the same key. A new key starts a new action."
-                    );
+                    if error.body["type"] != "output_delivery_failed" {
+                        if let Err(mut delivery) = write_diagnostic(
+                            stderr,
+                            format_args!(
+                                "Retain this idempotency key; inspect the result or repeat the identical request with the same key. A new key starts a new action.\n"
+                            ),
+                        ) {
+                            delivery.body["original_error"] = error.body;
+                            delivery.body["idempotency_key"] = json!(key);
+                            error = delivery;
+                        }
+                    }
                 }
             }
             Output::from_result(Err(error), target.json, 1)

@@ -1,5 +1,303 @@
 use super::*;
-use clap::{CommandFactory, FromArgMatches, Parser};
+use clap::Parser;
+
+#[derive(Clone, Copy)]
+pub(super) enum OutputFault {
+    PartialWrite,
+    Flush,
+}
+
+pub(super) struct FailedOutput {
+    pub(super) bytes: Vec<u8>,
+    fault: OutputFault,
+    allowed_flushes: usize,
+    flushes: usize,
+    partial: bool,
+}
+
+impl FailedOutput {
+    pub(super) fn new(fault: OutputFault, allowed_flushes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            fault,
+            allowed_flushes,
+            flushes: 0,
+            partial: false,
+        }
+    }
+}
+
+impl Write for FailedOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let len = if self.flushes >= self.allowed_flushes
+            && matches!(self.fault, OutputFault::PartialWrite)
+        {
+            if self.partial {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed output",
+                ));
+            }
+            self.partial = true;
+            bytes.len().min(5)
+        } else {
+            bytes.len()
+        };
+        self.bytes.extend_from_slice(&bytes[..len]);
+        Ok(len)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.flushes >= self.allowed_flushes && matches!(self.fault, OutputFault::Flush) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed output",
+            ));
+        }
+        self.flushes += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn managed_output_preserves_bytes_and_recovery_details_on_delivery_failure() {
+    let accepted = json!({"deployment_id":"delivery-original","native_deployment_id":"native-original","preview_id":"preview-original"});
+    let problem = json!({"type":"wait_timeout","detail":"retain original IDs","accepted_deployment":accepted,"requested_deployment_id":"delivery-original","submission":{"idempotency_key":"original-key","acceptance":"unknown"}});
+    let success = json!({"data":{"deployment_id":"delivery-original","native_deployment_id":"native-original","preview_id":"preview-original","files":{"secret.pg":"private-source-content"},"access_token":"private-token-extra"},"meta":{}});
+    for (body, json, human, exit, expected_out, expected_err) in [
+        (
+            problem.clone(),
+            true,
+            None,
+            5,
+            format!("{problem}\n"),
+            String::new(),
+        ),
+        (
+            problem.clone(),
+            false,
+            None,
+            5,
+            String::new(),
+            format!(
+                "wait_timeout: retain original IDs\naccepted_deployment: {accepted}\nrequested_deployment_id: \"delivery-original\"\nsubmission: {}\n",
+                problem["submission"]
+            ),
+        ),
+        (
+            success.clone(),
+            false,
+            None,
+            0,
+            format!("{}\n", serde_json::to_string_pretty(&success).unwrap()),
+            String::new(),
+        ),
+        (
+            success.clone(),
+            false,
+            Some("result bytes\n".to_owned()),
+            0,
+            "result bytes\n".to_owned(),
+            String::new(),
+        ),
+    ] {
+        let output = || Output {
+            body: body.clone(),
+            exit,
+            json,
+            human: human.clone(),
+            recovery: Some(json!({"idempotency_key":"kept-key"})),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(output().emit(&mut stdout, &mut stderr).unwrap(), exit);
+        assert_eq!(stdout, expected_out.as_bytes());
+        assert_eq!(stderr, expected_err.as_bytes());
+        for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+            let mut failed = FailedOutput::new(fault, 0);
+            let mut other = Vec::new();
+            let error = if expected_err.is_empty() {
+                output().emit(&mut failed, &mut other).unwrap_err()
+            } else {
+                assert_eq!(output().emit(&mut other, &mut failed).unwrap(), 1);
+                let recovery: Value = serde_json::from_slice(&other).unwrap();
+                assert_eq!(recovery["type"], "output_delivery_failed");
+                assert_eq!(recovery["accepted_deployment"], accepted);
+                assert_eq!(recovery["idempotency_key"], "original-key");
+                assert!(recovery.get("submission").is_none());
+                assert!(recovery.get("original_error").is_none());
+                output()
+                    .emit(
+                        &mut FailedOutput::new(fault, 0),
+                        &mut FailedOutput::new(fault, 0),
+                    )
+                    .unwrap_err()
+            };
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            let message = format!("{error:#}");
+            assert!(message.contains("kept-key"));
+            for identity in ["delivery-original", "native-original", "preview-original"] {
+                assert!(message.contains(identity), "{message}");
+            }
+            assert!(!message.contains("private-source-content"));
+            assert!(!message.contains("private-token-extra"));
+            if exit == 5 {
+                assert!(message.contains("original-key"));
+                assert!(message.contains("retain original IDs"));
+            }
+            if expected_err.is_empty() {
+                assert!(other.is_empty());
+            } else {
+                assert!(message.contains("stdout recovery delivery also failed"));
+            }
+        }
+    }
+
+    // A lifecycle identity receives the same narrow fallback. Extra fields and
+    // reflected error text must never turn recovery into source/secret export.
+    let identity = json!({"cluster_id":"cluster-original","incarnation":"incarnation-original","operation_id":"operation-original","kind":"create"});
+    for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+        let mut body = json!({"type":"output_delivery_failed","detail":"private-error-content","accepted_operation":identity,"submission":{"idempotency_key":"original-key","request":{"source":"private-request-content"}},"access_token":"private-token-extra","data":{"files":{"secret.pg":"private-source-content"}}});
+        body["accepted_operation"]["token"] = json!("private-identity-extra");
+        let mut stdout = Vec::new();
+        assert_eq!(
+            Output::from_result(Err(Failure { body, exit: 1 }), false, 1)
+                .emit(&mut stdout, &mut FailedOutput::new(fault, 0))
+                .unwrap(),
+            1
+        );
+        let recovery: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(recovery["accepted_operation"], identity);
+        assert_eq!(recovery["idempotency_key"], "original-key");
+        assert!(!String::from_utf8(stdout).unwrap().contains("private-"));
+
+        let mut stdout = Vec::new();
+        let error = Output::from_result(
+            Err(Failure::refused(
+                "invalid_input",
+                "no operation was accepted",
+            )),
+            false,
+            2,
+        )
+        .emit(&mut stdout, &mut FailedOutput::new(fault, 0))
+        .unwrap_err();
+        assert!(stdout.is_empty());
+        assert!(format!("{error:#}").contains("invalid_input"));
+    }
+}
+
+#[tokio::test]
+async fn managed_deployment_delivery_failures_never_submit_or_poll_again() {
+    use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
+    for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+        for fail_after_key in [false, true] {
+            let accepted = json!({"meta":{"cluster_id":"cluster-one"},"data":{"deployment_id":"delivery-original","native_deployment_id":"native-original","preview_id":"preview-original","delivery":"queued","archive":"pending","native_result_status":null,"observation":{"state":"not_observed"}}});
+            let server = IntentApiFixture::new(if fail_after_key {
+                vec![IntentReply::json(202, accepted)]
+            } else {
+                vec![]
+            });
+            let api =
+                Api::new(server.origin.clone(), Some("automation-secret".to_owned())).unwrap();
+            let context = Context {
+                version: 2,
+                cluster: "cluster-one".to_owned(),
+                api: server.origin.clone(),
+                organization_id: "org_one".to_owned(),
+            };
+            let cli = parse_cluster(&[
+                "omnigraph",
+                "cluster",
+                "apply",
+                "--managed",
+                "--plan",
+                "preview-original",
+                "--idempotency-key",
+                "original-key",
+            ])
+            .unwrap();
+            let Command::Cluster { command, .. } = cli.command else {
+                panic!("cluster command")
+            };
+            let mut stderr = FailedOutput::new(fault, usize::from(fail_after_key));
+            let error = deployment::dispatch(&api, &context, &command, &mut stderr)
+                .await
+                .unwrap_err();
+            assert_eq!(error.body["type"], "output_delivery_failed");
+            assert_eq!(error.exit, 1);
+            if fail_after_key {
+                assert_eq!(
+                    error.body["accepted_deployment"],
+                    json!({"deployment_id":"delivery-original","native_deployment_id":"native-original","preview_id":"preview-original"})
+                );
+            } else {
+                assert_eq!(error.body["idempotency_key"], "original-key");
+            }
+            let requests = server.requests();
+            assert_eq!(requests.len(), usize::from(fail_after_key));
+            if let Some(request) = requests.first() {
+                assert_eq!(request.method, "POST");
+                assert_eq!(request.path, "/v1/clusters/cluster-one/deployments");
+                assert_eq!(request.headers["idempotency-key"], "original-key");
+                assert_eq!(request.body, json!({"preview_id":"preview-original"}));
+            }
+            assert!(!error.body.to_string().contains("automation-secret"));
+            let output = || {
+                Output::from_result(
+                    Err(Failure {
+                        body: error.body.clone(),
+                        exit: error.exit,
+                    }),
+                    false,
+                    1,
+                )
+            };
+            let mut stdout = Vec::new();
+            let delivered = output().emit(&mut stdout, &mut stderr);
+            if fail_after_key {
+                assert_eq!(delivered.unwrap(), 1);
+                let recovery: Value = serde_json::from_slice(&stdout).unwrap();
+                assert_eq!(recovery["type"], "output_delivery_failed");
+                assert_eq!(
+                    recovery["accepted_deployment"],
+                    error.body["accepted_deployment"]
+                );
+                assert!(
+                    !String::from_utf8(stdout)
+                        .unwrap()
+                        .contains("automation-secret")
+                );
+            } else {
+                assert!(delivered.is_err());
+                assert!(
+                    stdout.is_empty(),
+                    "pre-dispatch failures do not use recovery fallback"
+                );
+            }
+            let undelivered = output()
+                .emit(
+                    &mut FailedOutput::new(fault, 0),
+                    &mut FailedOutput::new(fault, 0),
+                )
+                .unwrap_err();
+            let message = format!("{undelivered:#}");
+            assert!(!message.contains("automation-secret"));
+            if fail_after_key {
+                for identity in ["delivery-original", "native-original", "preview-original"] {
+                    assert!(message.contains(identity), "{message}");
+                }
+                assert!(message.contains("stdout recovery delivery also failed"));
+            } else {
+                assert!(message.contains("original-key"));
+            }
+            assert_eq!(server.requests().len(), usize::from(fail_after_key));
+            server.assert_complete();
+        }
+    }
+}
 
 #[test]
 fn origins_are_canonical_and_credentials_cannot_change_destination() {
@@ -108,14 +406,7 @@ fn contexts_are_exact_and_cannot_hide_unknown_authority() {
 }
 
 fn parse_cluster(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
-    let matches = Cli::command().try_get_matches_from(args)?;
-    let cli = Cli::from_arg_matches(&matches)?;
-    let mut command_matches = &matches;
-    while let Some((_, sub_matches)) = command_matches.subcommand() {
-        command_matches = sub_matches;
-    }
-    crate::validate_cluster_arguments(&cli, command_matches)?;
-    Ok(cli)
+    crate::invocation::parse_from(args).map(|parsed| parsed.cli)
 }
 
 #[tokio::test]
@@ -143,13 +434,13 @@ async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
         ],
     ] {
         let managed = parse_cluster(&args).unwrap();
-        let output = dispatch(&managed).await.unwrap();
+        let output = dispatch(&managed, &mut Vec::new()).await.unwrap();
         assert_eq!(output.exit, 2);
         assert_eq!(output.body["type"], "context_invalid");
     }
     for verb in ["validate", "plan", "apply", "status", "observe"] {
         let local = parse_cluster(&["omnigraph", "cluster", verb, "--config", config]).unwrap();
-        assert!(dispatch(&local).await.is_none(), "{verb}");
+        assert!(dispatch(&local, &mut Vec::new()).await.is_none(), "{verb}");
     }
     // Conflicting selectors refuse before the deliberately malformed context is read.
     for extra in [
@@ -173,7 +464,7 @@ async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
         .chain(extra.iter().copied())
         .collect::<Vec<_>>();
         let cli = parse_cluster(&args).unwrap();
-        let output = dispatch(&cli).await.unwrap();
+        let output = dispatch(&cli, &mut Vec::new()).await.unwrap();
         assert_eq!(output.exit, 2, "{extra:?}");
         assert_eq!(output.body["type"], "managed_scope_conflict", "{extra:?}");
     }
@@ -196,7 +487,7 @@ async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
         .chain(extra)
         .collect::<Vec<_>>();
         let cli = parse_cluster(&args).unwrap();
-        let output = dispatch(&cli).await.unwrap();
+        let output = dispatch(&cli, &mut Vec::new()).await.unwrap();
         assert_eq!(output.exit, 2);
         assert_eq!(output.body["type"], kind);
     }

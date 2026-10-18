@@ -101,6 +101,9 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
                         "step {ordinal} (load csv source without an absolute URI)"
                     ));
                 }
+                if let ControlWrite::Load { plan: Some(_), .. } = &control.write {
+                    refused.push(format!("step {ordinal} (expect plan on a load)"));
+                }
             }
             Step::Show(show) if !show.prefix.is_empty() => {
                 refused.push(format!("step {ordinal} (show with a settings prefix)"));

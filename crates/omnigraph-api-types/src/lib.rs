@@ -33,6 +33,73 @@ pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
 /// Exact header value; consumers must reject missing or repeated values.
 pub const HTTP_API_CONTRACT: &str = "0.13";
 
+/// How a binary identifies its build: the one derivation the CLI's
+/// `omnigraph version`, the server's `/healthz` and its MCP server info all
+/// report. The release workflows (`.github/workflows/build-release-archives.yml`
+/// and `publish-image.yml`) stamp both values at compile time; a local or
+/// source build carries neither, and a malformed stamp fails the build.
+pub mod build {
+    /// `stable` or `edge` for a release build; none for any other build.
+    pub const RELEASE_CHANNEL: Option<&str> = option_env!("OMNIGRAPH_RELEASE_CHANNEL");
+    /// The full commit a packaged build was compiled from.
+    pub const SOURCE_COMMIT: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
+
+    pub(crate) const fn is_full_commit(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        if bytes.len() != 40 {
+            return false;
+        }
+        let mut index = 0;
+        while index < bytes.len() {
+            if !matches!(bytes[index], b'0'..=b'9' | b'a'..=b'f') {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    pub(crate) const fn is_release_channel(value: &[u8]) -> bool {
+        matches!(value, b"stable" | b"edge")
+    }
+
+    // A malformed stamp fails the build instead of reporting a version no
+    // release has.
+    const _: () = {
+        if let Some(commit) = SOURCE_COMMIT {
+            assert!(
+                is_full_commit(commit),
+                "OMNIGRAPH_SOURCE_VERSION must be a full lowercase commit id"
+            );
+        }
+        if let Some(channel) = RELEASE_CHANNEL {
+            assert!(
+                is_release_channel(channel.as_bytes()),
+                "OMNIGRAPH_RELEASE_CHANNEL must be stable or edge"
+            );
+            assert!(
+                SOURCE_COMMIT.is_some(),
+                "OMNIGRAPH_RELEASE_CHANNEL requires OMNIGRAPH_SOURCE_VERSION"
+            );
+        }
+    };
+
+    /// The version a binary of `package` reports. An edge build is a SemVer
+    /// pre-release of the package version, `0.14.0-edge+9c2b367`, naming its
+    /// commit; the edge publisher refuses a build whose package version is not
+    /// above the latest stable release, so it also sorts after that release.
+    pub fn reported_version(package: &str) -> String {
+        versioned(package, RELEASE_CHANNEL, SOURCE_COMMIT)
+    }
+
+    pub(crate) fn versioned(package: &str, channel: Option<&str>, commit: Option<&str>) -> String {
+        match (channel, commit) {
+            (Some("edge"), Some(commit)) => format!("{package}-edge+{}", &commit[..7]),
+            _ => package.to_string(),
+        }
+    }
+}
+
 /// Lowercase wire name for the raw graph-head conditional-write token.
 /// Documentation presents the canonical spelling
 /// `Omnigraph-If-Graph-Commit`; HTTP header names are case-insensitive.
@@ -122,8 +189,9 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = load_source_max_bytes_schema)]
     pub load_source_max_bytes: Option<i64>,
-    /// `query_memory_bytes`: the memory pool one read query runs under, at
-    /// least `1`; an `i64` like `traversal_work_limit`.
+    /// `query_memory_bytes`: the memory pool one read query runs under, and
+    /// the allowance a load statement's read-reuse buffers are admitted
+    /// against, at least `1`; an `i64` like `traversal_work_limit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = query_memory_bytes_schema)]
     pub query_memory_bytes: Option<i64>,
@@ -801,6 +869,16 @@ impl From<GraphCommitKind> for CommitKindOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
+    /// The head a paged listing's first page resolved; every later page
+    /// answers for its first-parent chain and repeats it as its page token
+    /// carries it, unchecked. Present only when the request set `limit` or
+    /// `page_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_commit_id: Option<String>,
+    /// Continue THIS listing below the last commit of the page. Absent on the
+    /// last page and on an unpaged listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
 }
 
 /// Logical operation of one change. Ordering rank is frozen:
@@ -1158,7 +1236,11 @@ pub struct QueryRequest {
     /// running it, as one result per plan node (fields `tree`, `depth`, `node`,
     /// `detail`: the logical, physical and available DataFusion trees, then `plan` entries for
     /// the passes and the document's other fields), under the same `params`,
-    /// `branch`, or `snapshot` as the query itself.
+    /// `branch`, or `snapshot` as the query itself. `explain load csv …` answers the accepted
+    /// load plan as the same results (`logical_initial`, `logical`, `physical`, then `plan`
+    /// entries), under `branch` alone: `snapshot`, `name` and `params` are refused.
+    /// It requires the load's `change` permission before probing source metadata,
+    /// reads no payload byte, and publishes nothing.
     #[schema(
         example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
     )]
@@ -1771,6 +1853,16 @@ pub struct CommitListQuery {
     /// the branch's history. Refused together with `unpublished`.
     #[serde(default)]
     pub unattached: bool,
+    /// Commits per page of the branch's history, 1 to 1000; the page names
+    /// the head it resolved and a `next_page_token`. Without `limit` and
+    /// `page_token` the whole history is listed. Refused with `unpublished`
+    /// or `unattached`; above 1000 the request fails with 413.
+    #[param(minimum = 1, maximum = 1000)]
+    pub limit: Option<usize>,
+    /// Opaque continuation from the preceding page of this listing, sent with
+    /// the same `branch`; 100 commits per page unless `limit` is set. Later
+    /// pages answer for the head the first page resolved.
+    pub page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2841,6 +2933,38 @@ pub struct GraphDiscoveryResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edge_builds_report_a_prerelease_naming_their_commit() {
+        use super::build::versioned;
+        let commit = "9c2b3679e8f66062252e7ed6270a9478b4b77413";
+        assert_eq!(
+            versioned("0.14.0", Some("edge"), Some(commit)),
+            "0.14.0-edge+9c2b367"
+        );
+        assert_eq!(versioned("0.14.0", Some("stable"), Some(commit)), "0.14.0");
+        assert_eq!(versioned("0.14.0", None, Some(commit)), "0.14.0");
+        assert_eq!(versioned("0.14.0", None, None), "0.14.0");
+    }
+
+    #[test]
+    fn build_stamps_accept_only_full_commits_and_known_channels() {
+        use super::build::{is_full_commit, is_release_channel};
+        assert!(is_full_commit("9c2b3679e8f66062252e7ed6270a9478b4b77413"));
+        for commit in [
+            "9c2b367",
+            "9C2B3679E8F66062252E7ED6270A9478B4B77413",
+            "9c2b3679e8f66062252e7ed6270a9478b4b7741g",
+            "",
+        ] {
+            assert!(!is_full_commit(commit), "{commit:?}");
+        }
+        assert!(is_release_channel(b"stable"));
+        assert!(is_release_channel(b"edge"));
+        for channel in ["nightly", "Edge", ""] {
+            assert!(!is_release_channel(channel.as_bytes()), "{channel:?}");
+        }
+    }
+
     use super::*;
     use omnigraph_compiler::settings::SettingScope;
     use serde_json::json;

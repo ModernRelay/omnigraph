@@ -447,6 +447,17 @@ struct BranchArguments {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CommitsListArguments {
+    graph: String,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    page_token: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommitArguments {
     graph: String,
     commit_id: String,
@@ -572,7 +583,7 @@ impl ServerHandler for GraphTools {
         )
         .with_server_info(Implementation::new(
             "omnigraph-server",
-            env!("CARGO_PKG_VERSION"),
+            crate::api::build::reported_version(env!("CARGO_PKG_VERSION")),
         ))
         .with_instructions(instructions(self.state.mcp_settings()))
     }
@@ -991,7 +1002,7 @@ impl GraphTools {
                 bounded_result(&output.0)
             }
             "commits_list" => {
-                let args: BranchArguments = arguments_as(arguments)?;
+                let args: CommitsListArguments = arguments_as(arguments)?;
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
                 let output = handlers::server_commit_list(
                     Extension(handle),
@@ -1000,6 +1011,8 @@ impl GraphTools {
                         branch: args.branch,
                         unpublished: false,
                         unattached: false,
+                        limit: args.limit,
+                        page_token: args.page_token,
                     }),
                 )
                 .await?;
@@ -1396,7 +1409,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "read",
         title: "Run a GQ read",
-        description: "Run a GQ read query you write. Call `schema` first. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; pick one declared query with `name` when the source declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Also answers `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` and `explain query …`, sent without `branch`, `snapshot`, `name` or `params`. Mutations and branch writes are refused. Returns `rows`, `row_count` and `graph_commit_id`.",
+        description: "Run a GQ read query you write. Call `schema` first. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; pick one declared query with `name` when the source declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Also answers `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` and `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; and `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations and branch writes are refused. Returns `rows`, `row_count` and `graph_commit_id`.",
         input: read_schema,
         output: None,
         effect: Effect::Read,
@@ -1423,8 +1436,8 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "commits_list",
         title: "List commits",
-        description: "List a branch's commits (default `main`), newest first, each with its `graph_commit_id`, parents, actor and time.",
-        input: branch_schema,
+        description: "List a branch's commits (default `main`), newest first, each with its `graph_commit_id`, parents, actor and time. Pass `limit` to page a long history: the page names `head_commit_id` and continues with its `next_page_token` as `page_token`, keeping the same `branch`.",
+        input: commits_list_schema,
         output: None,
         effect: Effect::Read,
         gate: Gate::Always,
@@ -1610,6 +1623,17 @@ fn branch_schema() -> Value {
     )
 }
 
+fn commits_list_schema() -> Value {
+    arguments(
+        json!({
+            "branch": text_schema("Branch. Defaults to `main`."),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Commits in this page; without it and `page_token`, the whole history."},
+            "page_token": text_schema("The previous page's `next_page_token`."),
+        }),
+        &[],
+    )
+}
+
 fn commit_schema() -> Value {
     arguments(
         json!({"commit_id": text_schema("A `graph_commit_id`.")}),
@@ -1631,7 +1655,7 @@ fn query_schema() -> Value {
 fn read_schema() -> Value {
     arguments(
         json!({
-            "query": text_schema("GQ source declaring one or more read queries, or one branch read or `explain` statement."),
+            "query": text_schema("GQ source declaring one or more read queries, or one branch read or `explain` statement (`explain query …` or `explain load csv …`)."),
             "name": text_schema("Which declared query to run when `query` declares several."),
             "params": {"type": "object", "description": "Values keyed by the query's declared parameter names, without `$`."},
             "branch": text_schema("Branch to read. Defaults to `main`. Not with `snapshot`."),

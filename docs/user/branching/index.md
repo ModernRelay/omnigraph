@@ -129,6 +129,29 @@ omnigraph commit show <commit-id> --uri graph.omni
 `main`; selecting a branch includes the history inherited at its fork plus its
 own commits.
 
+A long history can be read a page at a time:
+
+```bash
+omnigraph commit list graph.omni --branch main --limit 50 --json
+omnigraph commit list graph.omni --branch main --page-token <token> --json
+```
+
+`--limit` (1 to 1,000) returns one page with `head_commit_id`, the head the
+listing resolved, and `next_page_token` while older commits remain. Pass the
+token back with the same `--branch` for the next page, of 100 commits unless
+`--limit` sets the size. Later pages answer for that head even after the
+branch moves, so a page never repeats or skips a commit. A page reads only the
+history it returns; without `--limit` or `--page-token` the whole history is
+read and listed at once. Served under a policy, a caller whose `read` does
+not cover every branch continues only from a commit of the branch's history,
+and is refused with `400` otherwise: a commit the branch still holds, or one a
+branch the caller may read published, costs nothing more, and any other is
+looked for down the branch's history, which costs what the whole listing
+costs. Served, the same listing is
+`GET /commits?branch=<name>&limit=<n>` continued with `page_token=<token>`.
+Paging applies to a branch's history, not to `--unpublished` or
+`--unattached`.
+
 ### Start a branch at a commit
 
 A branch can start at a published graph commit instead of a branch's head. It
@@ -180,13 +203,14 @@ commit drop "<commit-id>"
 ```
 
 `commit publish` installs the commit on the branch it recorded as its target.
-A published commit is answered as it stands by a repeat publish and is never
-dropped. An unpublished commit expires once an ordinary write moves its target
-branch's head past the commit's parent, or when that branch is deleted or
-recreated, and can then only be dropped: a publish is refused (a moved head
-fails its precondition), reads at its id (`--snapshot`, `commit show`,
-`commit changes`) answer `not found`, and it leaves the `--unpublished`
-listing.
+The published commit keeps the actor and timestamp of the write that created
+it; the publish records no publisher. A published commit is answered as it
+stands by a repeat publish and is never dropped. An unpublished commit expires
+once an ordinary write moves its target branch's head past the commit's
+parent, or when that branch is deleted or recreated, and can then only be
+dropped: a publish is refused (a moved head fails its precondition), reads at
+its id (`--snapshot`, `commit show`, `commit changes`) answer `not found`, and
+it leaves the `--unpublished` listing.
 
 ```bash
 omnigraph branch merge feature --into main --as-commit --uri graph.omni

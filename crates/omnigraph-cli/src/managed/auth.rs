@@ -1,6 +1,7 @@
 //! Managed human credentials never share the legacy named-server token file.
-use super::{Api, Failure, Method, Result, Value, canonical_origin, json};
+use super::{Api, Failure, Method, Result, Value, canonical_origin, json, write_diagnostic};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::Instant;
@@ -332,6 +333,7 @@ async fn login_with(
     config: provider::Config,
     provider: &provider::Provider,
     organization: Option<&str>,
+    stderr: &mut dyn Write,
 ) -> Result<Value> {
     let _ = store.get(origin)?;
     if let Some(saved) = renewal::load_selected(store, origin, organization)?
@@ -400,7 +402,10 @@ async fn login_with(
     let lifetime = seconds(device.expires_in, 1, 600)?;
     let mut interval = seconds(device.interval.unwrap_or(5.0), 5, 600)?;
     let deadline = started + Duration::from_secs(lifetime);
-    eprintln!("Open {uri}\nEnter code: {}", device.user_code);
+    write_diagnostic(
+        stderr,
+        format_args!("Open {uri}\nEnter code: {}\n", device.user_code),
+    )?;
     loop {
         let next = Instant::now() + Duration::from_secs(interval);
         if next >= deadline {
@@ -463,12 +468,24 @@ async fn accept_device(
     Ok(body)
 }
 
-pub(super) async fn login(origin: String, organization: Option<&str>) -> Result<Value> {
+pub(super) async fn login(
+    origin: String,
+    organization: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<Value> {
     let _lock = coordination::lock(&origin).await?;
     let _ = AUTHKIT_STORE.get(&origin)?;
     let config = provider::Config::discover(&origin).await?;
     let provider = provider::Provider::new(&config)?;
-    login_with(&AUTHKIT_STORE, &origin, config, &provider, organization).await
+    login_with(
+        &AUTHKIT_STORE,
+        &origin,
+        config,
+        &provider,
+        organization,
+        stderr,
+    )
+    .await
 }
 
 pub(super) async fn logout(origin: String, organization: Option<&str>) -> Result<Value> {

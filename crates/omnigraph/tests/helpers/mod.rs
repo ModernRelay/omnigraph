@@ -881,3 +881,19 @@ async fn write_ranged_external_blob_row(
         .unwrap();
     table_uri
 }
+
+/// `token` with its payload edited and its checksum recomputed, as any caller
+/// can: a continuation's envelope is `base64url(json ‖ sha256(json))`.
+pub fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let bytes = engine.decode(token).unwrap();
+    let (payload, _) = bytes.split_at(bytes.len() - 32);
+    let mut payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    edit(&mut payload);
+    let mut encoded = serde_json::to_vec(&payload).unwrap();
+    let checksum = sha2::Sha256::digest(&encoded);
+    encoded.extend_from_slice(&checksum);
+    engine.encode(encoded)
+}

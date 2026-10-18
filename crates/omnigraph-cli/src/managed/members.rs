@@ -137,6 +137,7 @@ pub(super) async fn list(config: &Path, json: bool) -> Output {
             exit: 0,
             json,
             human: Some(human),
+            recovery: None,
         },
         Err(error) => Output::from_result(Err(error), json, 1),
     }

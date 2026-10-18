@@ -2045,6 +2045,136 @@ async fn open_refresh_and_branch_reads_issue_no_request_to_history() {
     .await;
 }
 
+/// A page of the commit list reads the `__history` objects its own commits
+/// occupy and nothing below them. The newest page of a branch is its buffer
+/// and reads nothing; the oldest page of a deep history reads what it reads in
+/// a short one, while the whole listing reads every released block.
+#[tokio::test]
+async fn a_commit_list_page_reads_the_history_it_returns() {
+    const PAGE: usize = 4;
+    let mut curve: Vec<CommitPagePoint> = Vec::new();
+    for releases in [2usize, 6] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = init_and_load(&dir).await;
+        let release_writer = with_setting(&writer, "history_release_bytes", "2048");
+        let (probes, history) = HistoryPlane::install();
+        let point = with_query_io_probes(
+            probes,
+            Box::pin(async {
+                for release in 0..releases {
+                    publish_until_history_is_written(
+                        &release_writer,
+                        &history,
+                        &format!("release_{release}"),
+                    )
+                    .await;
+                }
+                insert_people(&writer, "buffered", PAGE).await;
+                let listed = writer.list_commits(Some("main")).await.unwrap();
+                let mut paged = Vec::new();
+                let mut oldest_token = None;
+                let mut next = None;
+                loop {
+                    let page = writer
+                        .list_commits_page(None, next.as_deref(), Some(PAGE))
+                        .await
+                        .unwrap();
+                    paged.extend(page.commits);
+                    match page.next_page_token {
+                        Some(token) => {
+                            oldest_token = Some(token.clone());
+                            next = Some(token);
+                        }
+                        None => break,
+                    }
+                }
+                assert_eq!(paged, listed, "pages across released blocks");
+                let oldest_token = oldest_token.expect("test setup: more than one page");
+                history.requests();
+
+                let cold = || async { session(Omnigraph::open(uri).await.unwrap()) };
+                let reader = cold().await;
+                history.requests();
+                let first = reader
+                    .list_commits_page(None, None, Some(PAGE))
+                    .await
+                    .unwrap();
+                assert_eq!(first.commits, listed[..PAGE]);
+                let first = history.requests();
+
+                let reader = cold().await;
+                history.requests();
+                let oldest = reader
+                    .list_commits_page(None, Some(&oldest_token), Some(PAGE))
+                    .await
+                    .unwrap();
+                assert!(oldest.next_page_token.is_none());
+                assert_eq!(oldest.commits.last(), listed.last());
+                let oldest = history.requests();
+
+                let reader = cold().await;
+                history.requests();
+                assert_eq!(reader.list_commits(Some("main")).await.unwrap(), listed);
+                let whole = history.requests();
+                eprintln!(
+                    "COMMIT PAGE releases={releases} commits={}: first={first:?} \
+                     oldest={oldest:?} whole={whole:?}",
+                    listed.len()
+                );
+                CommitPagePoint {
+                    releases,
+                    first,
+                    oldest,
+                    whole,
+                }
+            }),
+        )
+        .await;
+        curve.push(point);
+    }
+    for point in &curve {
+        let releases = point.releases;
+        assert_eq!(
+            point.first,
+            (0, 0),
+            "{releases} releases: the newest page is the branch's buffer"
+        );
+        assert_eq!(
+            point.oldest.1 + point.whole.1,
+            0,
+            "{releases} releases: a read writes nothing"
+        );
+        assert!(
+            point.oldest.0 < point.whole.0,
+            "{releases} releases: a page reads less than the whole listing"
+        );
+    }
+    let (short, deep) = (&curve[0], &curve[1]);
+    assert!(
+        deep.whole.0 > short.whole.0,
+        "the instrument sees history: the whole listing reads more blocks when there are more"
+    );
+    assert!(
+        deep.oldest.0 <= short.oldest.0 + 1,
+        "the oldest page must not read more of `__history` as the history above it grows: \
+         {} releases read {}, {} releases read {}",
+        short.releases,
+        short.oldest.0,
+        deep.releases,
+        deep.oldest.0
+    );
+}
+
+/// The `(read, write)` requests a cold handle sends `__history` for the first
+/// page, the oldest page and the whole listing, after `releases` releases.
+struct CommitPagePoint {
+    releases: usize,
+    first: (u64, u64),
+    oldest: (u64, u64),
+    whole: (u64, u64),
+}
+
 /// The `Person` rows of the graph as of `commit`, read by commit id.
 async fn people_as_of(db: &Session, commit: &omnigraph::db::GraphCommit) -> usize {
     let id = omnigraph::db::SnapshotId::new(commit.graph_commit_id.clone());

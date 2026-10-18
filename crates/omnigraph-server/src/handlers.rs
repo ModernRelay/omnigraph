@@ -69,9 +69,9 @@ use dispatch::{
 pub(crate) async fn server_health() -> Json<HealthOutput> {
     Json(HealthOutput {
         status: "ok".to_string(),
-        version: SERVER_VERSION.to_string(),
+        version: crate::api::build::reported_version(SERVER_VERSION),
         internal_schema_version: SERVER_INTERNAL_SCHEMA_VERSION,
-        source_version: SERVER_SOURCE_VERSION.map(str::to_string),
+        source_version: crate::api::build::SOURCE_COMMIT.map(str::to_string),
     })
 }
 
@@ -801,6 +801,7 @@ pub(crate) async fn server_snapshot(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
+        (status = 424, description = "A load explain could not probe an allowed external source", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -810,7 +811,8 @@ pub(crate) async fn server_snapshot(
 /// names (`query`, `name`) match the CLI `-e` flag and the GQ `query`
 /// keyword. Mutations (`insert`/`update`/`delete`) are rejected with 400
 /// -- use `POST /mutate` for writes. Select a branch or snapshot and obtain
-/// the pinned graph-commit token with the response. Cedar authorizes Read.
+/// the pinned graph-commit token with the response. Cedar authorizes Read for
+/// read queries and Change for `explain load csv`.
 ///
 /// The GQ statement `branch list` is also served here, with no `branch`,
 /// `snapshot`, `name`, or `params`: it answers one result per branch (field
@@ -829,7 +831,11 @@ pub(crate) async fn server_snapshot(
 /// run, and the result describes its v2 logical, physical and available
 /// DataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by
 /// `plan` entries for the passes and the document's other fields, under the
-/// request's target and `params`.
+/// request's target and `params`. `explain load csv …` answers the accepted
+/// load plan the same way (`logical_initial`, `logical`, `physical`, then
+/// `plan` entries), under the request's `branch` alone. It requires the load's
+/// Change decision before probing the external source's metadata; it reads
+/// no payload byte and publishes nothing.
 pub(crate) async fn server_query(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
@@ -1637,7 +1643,7 @@ pub(crate) async fn run_mutate(
             .await;
         }
         FileBody::Show(id) => return Err(show_at_write_door(id)),
-        FileBody::Explain(_) => {
+        FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
             refuse_explain(door)?;
             return Err(explain_at_write_door());
         }
@@ -1843,6 +1849,36 @@ pub(crate) async fn run_query(
             refuse_explain(door)?;
             body.into_read_declarations()
                 .map_err(ApiError::bad_request)?
+        }
+        FileBody::ExplainLoad(stmt) => {
+            refuse_explain(door)?;
+            refuse_statement_envelope(
+                snapshot.is_some(),
+                name.is_some() || params_json.is_some(),
+                false,
+            )?;
+            let branch = branch.unwrap_or_else(|| "main".to_string());
+            authorize_request(
+                actor,
+                handle.policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::Change,
+                    branch: Some(branch.clone()),
+                    target_branch: None,
+                },
+            )?;
+            let target = ReadTarget::Branch(branch);
+            let session = session_with_prefix(&session, &file.settings)?;
+            let (result, graph_commit_id) = session
+                .explain_load(target.clone(), &stmt)
+                .await
+                .map_err(ApiError::from_omni)?;
+            return Ok(ReadDispatch::Rows {
+                query_name: stmt.statement_name().to_string(),
+                target,
+                result,
+                graph_commit_id,
+            });
         }
     };
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
@@ -3208,8 +3244,11 @@ async fn delete_merged_source_branch(
     params(CommitListQuery),
     responses(
         (status = 200, description = "List of commits", body = CommitListOutput),
+        (status = 400, description = "Two listings selected, a page parameter with `unpublished` or `unattached`, a zero `limit`, or a rejected page token", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Branch not found", body = ErrorOutput),
+        (status = 413, description = "Requested limit exceeds 1000 commits per page", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -3219,16 +3258,28 @@ async fn delete_merged_source_branch(
 /// reachable from that branch's head (the main commits inherited up to the
 /// fork plus the branch-authored commits); omitting it returns `main`'s
 /// history. There is no cross-branch listing. Ordering is part of the
-/// contract — newest first by (graph-manifest version, created-at, commit id) — and
-/// a future `cursor`/`limit` pagination will be keyset-based on that same
-/// order. Read-only.
+/// contract: newest first along the branch's first-parent chain, which is
+/// falling generation and falling (graph-manifest version, created-at, commit
+/// id). Read-only.
+///
+/// `limit` pages the history: each page names the head its listing resolved
+/// (`head_commit_id`) and continues with `next_page_token`, sent back as
+/// `page_token` with the same `branch`; later pages answer for that head's
+/// chain even after the branch moves. A page reads only the history it
+/// returns. Without `limit` and `page_token` the whole history is one answer.
+/// A caller whose `read` does not cover every branch continues only from a
+/// commit of `branch`'s history: one the branch still holds or a readable
+/// branch published costs nothing more; any other is looked for down the
+/// branch's history, which costs what the whole listing costs, and a commit
+/// the history does not reach is refused (400).
 ///
 /// `unpublished=true` lists instead the unpublished commits whose recorded
 /// target is `branch` (writes `as commit` awaiting `commit publish`), newest
 /// first; each carries `published: false`. `unattached=true` lists instead
 /// the live unattached snapshots whose recorded target is `branch` (writes
 /// `as unattached branch`), newest first, each with `kind: "unattached"`;
-/// the two filters together are refused (400).
+/// the two filters together are refused (400), as is either with `limit` or
+/// `page_token`.
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -3237,6 +3288,17 @@ pub(crate) async fn server_commit_list(
     if query.unattached && query.unpublished {
         return Err(ApiError::bad_request(
             "`unattached=true` and `unpublished=true` select different listings; pass one",
+        ));
+    }
+    let paged = query.limit.is_some() || query.page_token.is_some();
+    if paged && (query.unattached || query.unpublished) {
+        return Err(ApiError::bad_request(
+            "`limit` and `page_token` page a branch's history, not `unpublished` or `unattached`",
+        ));
+    }
+    if query.limit == Some(0) {
+        return Err(ApiError::bad_request(
+            "commit list page limit must be greater than zero",
         ));
     }
     // An omitted `branch` means main's history, so the policy gate must
@@ -3253,6 +3315,49 @@ pub(crate) async fn server_commit_list(
         },
     )?;
     let db = &handle.engine;
+    if paged {
+        // A page token is checksummed, not signed, so the commit it continues
+        // from is the caller's claim. A caller allowed graph-wide `read` (the
+        // gate of `GET /commits/{commit_id}`) may read any commit by id and
+        // follow its parents, so its claim needs no proof; any other caller's
+        // continuation is proven on the branch's history.
+        let actor = actor.as_ref().map(|Extension(actor)| actor);
+        let policy = handle.policy.as_deref();
+        let any_commit = query.page_token.is_none()
+            || matches!(
+                authorize(
+                    actor,
+                    policy,
+                    PolicyRequest {
+                        action: PolicyAction::Read,
+                        branch: None,
+                        target_branch: None,
+                    },
+                )?,
+                Authz::Allowed
+            );
+        let (branch, page_token) = (Some(branch.as_str()), query.page_token.as_deref());
+        let page = if any_commit {
+            db.list_commits_page(branch, page_token, query.limit).await
+        } else {
+            let mut failure = None;
+            let page = db
+                .list_commits_page_readable(branch, page_token, query.limit, &mut |branch| {
+                    read_decision(actor, policy, &mut failure, branch)
+                })
+                .await;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            page
+        }
+        .map_err(ApiError::from_omni)?;
+        return Ok(Json(CommitListOutput {
+            commits: page.commits.iter().map(api::commit_output).collect(),
+            head_commit_id: Some(page.head_commit_id),
+            next_page_token: page.next_page_token,
+        }));
+    }
     let commits = if query.unattached {
         db.list_unattached_commits(Some(branch.as_str())).await
     } else if query.unpublished {
@@ -3263,6 +3368,8 @@ pub(crate) async fn server_commit_list(
     .map_err(ApiError::from_omni)?;
     Ok(Json(CommitListOutput {
         commits: commits.iter().map(api::commit_output).collect(),
+        head_commit_id: None,
+        next_page_token: None,
     }))
 }
 
@@ -4207,42 +4314,66 @@ pub(crate) async fn two_point_diff_page(
     page_token: Option<String>,
     max_changes: Option<usize>,
 ) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
+    readable_diff_page(
+        handle,
+        actor,
+        omnigraph::changes::GraphDiffRequest {
+            sides: omnigraph::changes::GraphDiffSides::Between { from, to },
+            scope,
+            page_token,
+            max_changes,
+            max_bytes: None,
+        },
+    )
+    .await
+}
+
+/// One diff page read under `actor`'s `read` decisions, which the engine asks
+/// for each branch a two-point side reads and for each commit a continuation
+/// names that its side no longer resolves to. A policy failure (a missing
+/// bearer, an evaluation error) is not a denial: it stops the read, and its
+/// own error answers.
+async fn readable_diff_page(
+    handle: &GraphRequest,
+    actor: Option<&AuthenticatedActor>,
+    request: omnigraph::changes::GraphDiffRequest,
+) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
     let policy = handle.policy.as_deref();
-    // A policy failure (a missing bearer, an evaluation error) is not a
-    // denial: it stops the read, and its own error answers.
     let mut failure = None;
-    let mut can_read = |branch: &str| {
-        let request = PolicyRequest {
-            action: PolicyAction::Read,
-            branch: Some(branch.to_string()),
-            target_branch: None,
-        };
-        match authorize(actor, policy, request) {
-            Ok(Authz::Allowed) => true,
-            Ok(Authz::Denied(_)) => false,
-            Err(error) => {
-                failure.get_or_insert(error);
-                false
-            }
-        }
-    };
     let page = handle
         .engine
-        .diff_page_readable(
-            &omnigraph::changes::GraphDiffRequest {
-                sides: omnigraph::changes::GraphDiffSides::Between { from, to },
-                scope,
-                page_token,
-                max_changes,
-                max_bytes: None,
-            },
-            &mut can_read,
-        )
+        .diff_page_readable(&request, &mut |branch| {
+            read_decision(actor, policy, &mut failure, branch)
+        })
         .await;
     if let Some(error) = failure {
         return Err(error);
     }
     page.map_err(change_route_error)
+}
+
+/// `actor`'s `read` decision on `branch`, for the engine's read checks. A
+/// policy failure (a missing bearer, an evaluation error) is not a denial: it
+/// is kept in `failure`, and the caller answers with it.
+fn read_decision(
+    actor: Option<&AuthenticatedActor>,
+    policy: Option<&PolicyEngine>,
+    failure: &mut Option<ApiError>,
+    branch: &str,
+) -> bool {
+    let request = PolicyRequest {
+        action: PolicyAction::Read,
+        branch: Some(branch.to_string()),
+        target_branch: None,
+    };
+    match authorize(actor, policy, request) {
+        Ok(Authz::Allowed) => true,
+        Ok(Authz::Denied(_)) => false,
+        Err(error) => {
+            failure.get_or_insert(error);
+            false
+        }
+    }
 }
 
 /// Authorize `read` on each named branch of a branch diff or merge base.
@@ -4313,7 +4444,9 @@ pub(crate) async fn server_branch_diff(
 
 /// One page of what `source` changed since its merge base with `target`
 /// (`main` when absent), for `GET /branches/diff` and the `branch diff`
-/// statement: `read` on both named branches before any lineage is read.
+/// statement: `read` on both named branches before any lineage is read, and on
+/// the branch of each commit a continuation names that the branches no longer
+/// resolve to.
 pub(crate) async fn branch_diff_page(
     handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
@@ -4326,17 +4459,18 @@ pub(crate) async fn branch_diff_page(
     let source = requested_branch(Some(source))?;
     let target = requested_branch(target)?;
     authorize_branch_reads(actor, handle.policy.as_deref(), [&source, &target])?;
-    handle
-        .engine
-        .diff_page(&omnigraph::changes::GraphDiffRequest {
+    readable_diff_page(
+        handle,
+        actor,
+        omnigraph::changes::GraphDiffRequest {
             sides: omnigraph::changes::GraphDiffSides::Branch { source, target },
             scope,
             page_token,
             max_changes,
             max_bytes: None,
-        })
-        .await
-        .map_err(change_route_error)
+        },
+    )
+    .await
 }
 
 #[utoipa::path(

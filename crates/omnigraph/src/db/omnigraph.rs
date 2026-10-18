@@ -80,6 +80,23 @@ use super::schema_state::{
 use super::snapshot::Snapshot;
 use super::{ReadTarget, ResolvedTarget, SnapshotId};
 
+/// Commits one page of a commit list holds when the caller sets no limit.
+pub const COMMIT_LIST_DEFAULT_PAGE_COMMITS: usize = 100;
+/// The most commits one page of a commit list may hold.
+pub const COMMIT_LIST_MAX_PAGE_COMMITS: usize = 1000;
+
+/// One page of a branch's commit list ([`Omnigraph::list_commits_page`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitListPage {
+    /// The head the first page resolved; every page of the list answers for
+    /// its first-parent chain.
+    pub head_commit_id: String,
+    /// Newest first.
+    pub commits: Vec<GraphCommit>,
+    /// Continues the list below `commits`; absent on its last page.
+    pub next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeOutcome {
     AlreadyUpToDate,
@@ -2328,6 +2345,7 @@ impl Omnigraph {
                 .set_read_caches(crate::db::manifest::SnapshotReadCaches {
                     session: self.read_caches.session.clone(),
                     handles: self.read_caches.handles.clone(),
+                    table_wrapper: None,
                 });
         }
         Ok(resolved)
@@ -2755,9 +2773,12 @@ impl Omnigraph {
     /// its snapshot opens, and a side `can_read` refuses is
     /// [`OmniError::ReadTargetNotFound`] naming it, exactly as a side that
     /// names nothing: the answer is not an existence oracle. A continuation
-    /// classifies and authorizes its sides again before it reopens the
-    /// token's commits. The branch form names its branches outright, so its
-    /// caller authorizes them before the call.
+    /// classifies and authorizes its sides again, then reopens only the
+    /// token's commits its sides reach: what a side resolves to now, or a
+    /// commit `can_read` allows as a side of its own; any other is
+    /// [`OmniError::ChangeCursorRejected`]. The branch form names its branches
+    /// outright, so its caller authorizes them before the call, and
+    /// `can_read` decides only a continuation's commits.
     pub async fn diff_page_readable(
         &self,
         request: &crate::changes::GraphDiffRequest,
@@ -2807,20 +2828,15 @@ impl Omnigraph {
                         "diff page token was minted for a different filter scope",
                     ));
                 }
-                if let Some(can_read) = can_read
-                    && let crate::changes::GraphDiffSides::Between { from, to } = &request.sides
-                {
-                    for side in [from, to] {
-                        self.authorized_diff_side(side, Some(&mut *can_read))
-                            .await?;
-                    }
-                }
+                // A caller with no read check reads every branch: its token
+                // is held to the same sides, under an allow-all decision.
+                let mut read_all = |_: &str| true;
+                let can_read: &mut ReadCheck<'_> = match can_read {
+                    Some(can_read) => can_read,
+                    None => &mut read_all,
+                };
                 let endpoints = self
-                    .reopen_diff_endpoints(
-                        &decoded.from_commit_id,
-                        &decoded.to_commit_id,
-                        decoded.base_commit_id.clone(),
-                    )
+                    .reopen_diff_continuation(&request.sides, &decoded, can_read)
                     .await?;
                 let resume = crate::changes::enumerate::ContinuationKey {
                     type_id: decoded.type_id,
@@ -3032,24 +3048,183 @@ impl Omnigraph {
         }
     }
 
-    /// Reopen the exact commits a diff page token names.
-    async fn reopen_diff_endpoints(
+    /// Reopen the commits a diff page token names, once its sides reach them.
+    /// The sides are classified and authorized as the first page did, then
+    /// each commit is checked. A token is checksummed, not signed, so its
+    /// commits are the caller's claim. A commit is reached when its side
+    /// resolves to it now, or, for a side that moves (a branch head, a merge
+    /// base), when it was an earlier head of the side's branch or the caller
+    /// could name it as a side itself. A side spelled as a commit reaches only
+    /// that commit. A commit the sides do not reach, unknown or unreadable
+    /// alike, refuses the page before any snapshot opens. Each commit opens
+    /// through what reached it, so a continuation reads what its first page
+    /// read and never asks another branch for a commit its side holds.
+    async fn reopen_diff_continuation(
         &self,
-        from_commit_id: &str,
-        to_commit_id: &str,
-        base_commit_id: Option<String>,
+        sides: &crate::changes::GraphDiffSides,
+        decoded: &crate::changes::token::DiffPageTokenV1,
+        can_read: &mut ReadCheck<'_>,
     ) -> Result<DiffEndpoints> {
+        use crate::changes::GraphDiffSides;
+        let from = &decoded.from_commit_id;
+        let to = &decoded.to_commit_id;
+        let (from_reach, to_reach) = match sides {
+            GraphDiffSides::Between {
+                from: from_side,
+                to: to_side,
+            } => {
+                if decoded.base_commit_id.is_some() {
+                    return Err(diff_token_unreached());
+                }
+                let from_now = self
+                    .authorized_diff_side(from_side, Some(&mut *can_read))
+                    .await?;
+                let to_now = self
+                    .authorized_diff_side(to_side, Some(&mut *can_read))
+                    .await?;
+                (
+                    self.reach_side(from, from_side, from_now, can_read).await?,
+                    self.reach_side(to, to_side, to_now, can_read).await?,
+                )
+            }
+            GraphDiffSides::Branch { source, target } => {
+                if decoded.base_commit_id.as_ref() != Some(from) {
+                    return Err(diff_token_unreached());
+                }
+                let source_branch = normalize_branch_name(source)?;
+                let target_branch = normalize_branch_name(target)?;
+                let (source_head, target_head, base, source_snapshot, target_snapshot) =
+                    self.capture_merge_base(source, target).await?;
+                let from_reach = if *from == base.graph_commit_id {
+                    if *from == source_head {
+                        DiffReach::Resolved(Box::new(source_snapshot.clone()))
+                    } else if *from == target_head {
+                        DiffReach::Resolved(Box::new(target_snapshot))
+                    } else {
+                        DiffReach::ById(from.clone())
+                    }
+                } else {
+                    self.reach_moved(from, &[source_branch.clone(), target_branch], can_read)
+                        .await?
+                };
+                let to_reach = if *to == source_head {
+                    DiffReach::Resolved(Box::new(source_snapshot))
+                } else {
+                    self.reach_moved(to, &[source_branch], can_read).await?
+                };
+                (from_reach, to_reach)
+            }
+        };
         Ok(DiffEndpoints {
-            from_commit_id: from_commit_id.to_string(),
-            to_commit_id: to_commit_id.to_string(),
-            base_commit_id,
-            from_snapshot: self
-                .diff_endpoint_snapshot(from_commit_id, from_commit_id)
-                .await?,
-            to_snapshot: self
-                .diff_endpoint_snapshot(to_commit_id, to_commit_id)
-                .await?,
+            from_commit_id: from.clone(),
+            to_commit_id: to.clone(),
+            base_commit_id: decoded.base_commit_id.clone(),
+            from_snapshot: self.open_reached(from, from_reach).await?,
+            to_snapshot: self.open_reached(to, to_reach).await?,
         })
+    }
+
+    /// How the commit `named` is reached from the two-point side `spelling`,
+    /// classified now as `side`.
+    async fn reach_side(
+        &self,
+        named: &str,
+        spelling: &str,
+        side: DiffReadTarget,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<DiffReach> {
+        match side {
+            DiffReadTarget::Branch(resolved)
+                if resolved.graph_commit_id.as_deref() == Some(named) =>
+            {
+                Ok(DiffReach::Resolved(Box::new(resolved.snapshot)))
+            }
+            DiffReadTarget::Branch(resolved) => {
+                self.reach_moved(named, &[resolved.branch], can_read).await
+            }
+            DiffReadTarget::Commit(commit) if commit.graph_commit_id == named => {
+                Ok(DiffReach::ById(spelling.to_string()))
+            }
+            DiffReadTarget::Commit(_) => Err(diff_token_unreached()),
+        }
+    }
+
+    /// How the commit `named` is reached from a side that moved since the
+    /// first page and follows `branches`: as an earlier head of one of them,
+    /// else as a commit the caller could name as a side itself.
+    async fn reach_moved(
+        &self,
+        named: &str,
+        branches: &[Option<String>],
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<DiffReach> {
+        for branch in branches {
+            if let Some(coordinator) = self.headed_by(branch.as_deref(), named).await? {
+                return Ok(DiffReach::Head(Box::new(coordinator)));
+            }
+        }
+        match self.authorized_diff_side(named, Some(can_read)).await {
+            Ok(DiffReadTarget::Commit(commit)) if commit.graph_commit_id == named => {
+                Ok(DiffReach::ById(named.to_string()))
+            }
+            Ok(_)
+            | Err(OmniError::ReadTargetNotFound { .. })
+            | Err(OmniError::AmbiguousReadTarget { .. }) => Err(diff_token_unreached()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The coordinator of `branch` when `commit_id` was a head of it: walking
+    /// first parents from the branch's head now, it is reached before any
+    /// commit another branch published, within
+    /// [`DIFF_CONTINUATION_WALK_COMMITS`] commits. A head another branch
+    /// published, such as a fork's first head, is reached this way, though the
+    /// caller may not read the branch that published it; a commit below it is
+    /// not. The walk reads the commits the branch published since, which its
+    /// `__manifest` usually still buffers.
+    async fn headed_by(
+        &self,
+        branch: Option<&str>,
+        commit_id: &str,
+    ) -> Result<Option<GraphCoordinator>> {
+        let coordinator = self.open_coordinator_for_branch(branch).await?;
+        let branch = branch.unwrap_or("main");
+        let mut next = coordinator
+            .head_commit_id()
+            .await?
+            .map(|id| id.as_str().to_string());
+        for _ in 0..DIFF_CONTINUATION_WALK_COMMITS {
+            let Some(id) = next else {
+                return Ok(None);
+            };
+            if id == commit_id {
+                return Ok(Some(coordinator));
+            }
+            let commit = coordinator.resolve_commit(&SnapshotId::new(&id)).await?;
+            if commit.graph_branch.as_deref().unwrap_or("main") != branch {
+                return Ok(None);
+            }
+            next = commit.parent_commit_id;
+        }
+        Ok(None)
+    }
+
+    /// The graph as of `commit_id`, opened through what reached it.
+    async fn open_reached(&self, commit_id: &str, reach: DiffReach) -> Result<Snapshot> {
+        match reach {
+            DiffReach::Resolved(snapshot) => Ok(*snapshot),
+            DiffReach::ById(spelling) => self.diff_endpoint_snapshot(commit_id, &spelling).await,
+            DiffReach::Head(coordinator) => coordinator
+                .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(commit_id)))
+                .await
+                .map(|resolved| resolved.snapshot)
+                .map_err(|error| match error {
+                    OmniError::BranchNotFound { .. } => OmniError::ReadTargetNotFound {
+                        target: commit_id.to_string(),
+                    },
+                    error => error,
+                }),
+        }
     }
 
     /// The graph as of one commit, published or not.
@@ -3910,8 +4085,9 @@ impl Omnigraph {
     }
 
     /// List the branch's reachable graph lineage, **most recent first** (by
-    /// [`GraphCommit::lineage_key`] — the same total order head selection and
-    /// any future keyset pagination cursor derive from).
+    /// [`GraphCommit::lineage_key`], the order head selection derives from,
+    /// which along one first-parent chain is falling generation: the order
+    /// [`Self::list_commits_page`] walks).
     ///
     /// `branch: None` (or `"main"`) lists main's lineage projection. A named
     /// branch lists the history reachable from that branch's head: the main
@@ -3932,6 +4108,168 @@ impl Omnigraph {
         let mut commits = coordinator.list_commits().await?;
         commits.reverse();
         Ok(commits)
+    }
+
+    /// One page of [`Self::list_commits`]: up to `limit` commits
+    /// ([`COMMIT_LIST_DEFAULT_PAGE_COMMITS`] when `None`), newest first, and
+    /// a token that continues the list below them.
+    ///
+    /// The first page resolves the branch's head and names it; a continuation
+    /// (`page_token`) answers for that head's first-parent chain, whatever
+    /// the branch did since. The token carries a digest of the branch, never
+    /// its name. A page reads the branch's `__manifest` and the `__history`
+    /// extents its own commits occupy, so its cost follows the page, not the
+    /// history below it.
+    ///
+    /// The token is checksummed, not signed. A continuation is refused for
+    /// another graph or branch digest, but the commit it continues from, and
+    /// the head it names, are the caller's claim: the walk starts at any
+    /// commit this handle can find, on any branch. That is no authority for a
+    /// caller who may read every commit by id; a caller who may read only some
+    /// branches uses [`Self::list_commits_page_readable`].
+    pub async fn list_commits_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<CommitListPage> {
+        self.commit_list_page(branch, page_token, limit, None).await
+    }
+
+    /// [`Self::list_commits_page`] for a caller who may read only some
+    /// branches; `can_read` answers for a branch by name, as for
+    /// [`Self::diff_page_readable`]. A continuation lists from its commit only
+    /// when that commit is on `branch`'s history: held by the branch's
+    /// `__manifest` (its head or a buffered commit), published on a branch
+    /// `can_read` allows, or else the first commit below the token's
+    /// generation on the branch's first-parent chain from its head, a walk
+    /// that costs what [`Self::list_commits`] costs. Any other commit, unknown
+    /// or unreadable alike, is [`OmniError::ChangeCursorRejected`].
+    pub async fn list_commits_page_readable(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<CommitListPage> {
+        self.commit_list_page(branch, page_token, limit, Some(can_read))
+            .await
+    }
+
+    /// One commit list page; with `can_read`, a continuation's commit is held
+    /// to the branch's history.
+    async fn commit_list_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        can_read: Option<&mut ReadCheck<'_>>,
+    ) -> Result<CommitListPage> {
+        use crate::changes::token;
+
+        self.ensure_schema_state_valid().await?;
+        let limit = limit.unwrap_or(COMMIT_LIST_DEFAULT_PAGE_COMMITS);
+        if limit == 0 {
+            return Err(OmniError::manifest(
+                "commit list page limit must be greater than zero",
+            ));
+        }
+        if limit > COMMIT_LIST_MAX_PAGE_COMMITS {
+            return Err(OmniError::resource_limit(
+                "commit_list_page_commits",
+                COMMIT_LIST_MAX_PAGE_COMMITS as u64,
+                limit as u64,
+            ));
+        }
+        let branch = match branch {
+            Some(branch) => normalize_branch_name(branch)?,
+            None => None,
+        };
+        let graph_identity =
+            token::hashed_identity(&self.schema_view.load().schema_identity_domain);
+        let scope = token::BranchScopeV1::for_branch(branch.as_deref());
+        let resume = page_token
+            .map(token::decode_commit_list_page_token)
+            .transpose()?;
+        if let Some(resume) = &resume
+            && (resume.graph_identity != graph_identity || resume.branch != scope)
+        {
+            return Err(token::cursor_rejected(
+                "commit list page token does not match this graph and branch",
+            ));
+        }
+        let coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        let start = resume.as_ref().map(|resume| resume.next_commit_id.as_str());
+        let (head, page) = coordinator.first_parent_page(start, limit).await?;
+        // A commit the branch's history does not reach is refused as an
+        // unknown one is, so the refusal tells a caller nothing it may not read.
+        let unreached = || {
+            token::cursor_rejected(
+                "commit list page token names a commit off this branch's history",
+            )
+        };
+        let Some(page) = page else {
+            return Err(match (&resume, &can_read) {
+                (Some(_), Some(_)) => unreached(),
+                (Some(_), None) => token::cursor_rejected(
+                    "commit list page token names a commit this graph does not hold",
+                ),
+                (None, _) => OmniError::manifest_internal(format!(
+                    "the head '{}' of the branch is not held",
+                    head.graph_commit_id
+                )),
+            });
+        };
+        if let (Some(resume), Some(can_read)) = (&resume, can_read) {
+            // The cheap proofs first: a commit the branch's `__manifest` holds
+            // is on its first-parent run to the head, and one published on a
+            // branch the caller may read lists that branch's history. Only a
+            // commit neither covers, such as one an unreadable branch the
+            // branch forked from published, is looked for down the chain.
+            let first = &page.commits[0];
+            let reached = coordinator.holds_commit(&first.graph_commit_id)
+                || can_read(first.graph_branch.as_deref().unwrap_or("main"))
+                || coordinator
+                    .first_parent_below(resume.below_generation)
+                    .await?
+                    .is_some_and(|commit| commit.graph_commit_id == resume.next_commit_id);
+            if !reached {
+                return Err(unreached());
+            }
+        }
+        if let Some(resume) = &resume
+            && page
+                .commits
+                .first()
+                .is_some_and(|first| first.generation >= resume.below_generation)
+        {
+            return Err(token::cursor_rejected(
+                "commit list page token names a commit that is not below the page before it",
+            ));
+        }
+        let head_commit_id = match resume {
+            Some(resume) => resume.head_commit_id,
+            None => head.graph_commit_id,
+        };
+        let next_page_token = match (page.next, page.commits.last()) {
+            (Some(next_commit_id), Some(last)) => {
+                Some(token::encode_token(&token::CommitListPageTokenV1 {
+                    version: token::TOKEN_VERSION,
+                    kind: token::KIND_COMMIT_LIST_PAGE.to_string(),
+                    graph_identity,
+                    branch: scope,
+                    head_commit_id: head_commit_id.clone(),
+                    next_commit_id,
+                    below_generation: last.generation,
+                })?)
+            }
+            _ => None,
+        };
+        Ok(CommitListPage {
+            head_commit_id,
+            commits: page.commits,
+            next_page_token,
+        })
     }
 
     /// The unpublished commits whose target is `branch` (`None` = main) and
@@ -4770,8 +5108,31 @@ pub(crate) fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result
 }
 
 /// A caller's answer to "may it read this branch?", asked once per two-point
-/// graph diff side; see [`Omnigraph::diff_page_readable`].
+/// graph diff side and, on a continuation, per commit the page token names
+/// that its side no longer resolves to; see [`Omnigraph::diff_page_readable`].
 pub type ReadCheck<'a> = dyn FnMut(&str) -> bool + Send + 'a;
+
+/// How a diff continuation reached a commit its token names, which is how
+/// it opens the commit.
+enum DiffReach {
+    /// Its side resolves to it now: the side's snapshot, already open.
+    Resolved(Box<Snapshot>),
+    /// Named as a side of its own, opened by id under this spelling.
+    ById(String),
+    /// An earlier head of a moved branch side, opened through that branch.
+    Head(Box<GraphCoordinator>),
+}
+
+/// Commits a diff continuation walks down a moved branch side's first-parent
+/// chain, from its head now, to find the head the first page resolved: the
+/// commits the branch published between the two pages.
+const DIFF_CONTINUATION_WALK_COMMITS: usize = 1024;
+
+/// The one refusal of a diff page token naming a commit its sides do not
+/// reach, whether the commit is unknown or the caller may not read it.
+fn diff_token_unreached() -> OmniError {
+    crate::changes::token::cursor_rejected("diff page token names a commit its sides do not reach")
+}
 
 /// What one graph diff endpoint names.
 enum DiffReadTarget {

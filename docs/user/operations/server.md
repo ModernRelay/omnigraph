@@ -96,7 +96,7 @@ Choose one static token source:
 | `OMNIGRAPH_SERVER_BEARER_TOKEN` | One bearer token; actor is `default` |
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON` | Actor-to-token object, e.g. `{"act-alice":"secret-a"}` |
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object |
-| `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` | Secrets Manager mapping; requires the AWS-enabled build |
+| `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` | Secrets Manager mapping; requires an AWS-enabled build: the container images, the release archives from v0.14.0 and every edge build, or a source build with `cargo build -p omnigraph-server --features aws` |
 
 Send `Authorization: Bearer secret-a`. The token selects the actor for
 authorization and commit attribution; clients cannot claim another actor.
@@ -215,7 +215,7 @@ endpoint, its tools, settings and limits.
 | `/graphs/{id}/load`, `/load/ndjson` | Bounded batch loading |
 | `/graphs/{id}/blob` | GET/HEAD one Blob cell; PUT/DELETE to replace or clear it |
 | `/graphs/{id}/branches` | Branch management and merge, a merge dry run (`dry_run: true`), a branch's diff against its merge base (`GET /branches/diff`) and that merge base (`GET /branches/merge-base`) |
-| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, per-commit changes, and the unpublished commits of a branch (`GET /commits?unpublished=true`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
+| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history (paged with `limit` and `page_token`), per-commit changes, and the unpublished commits of a branch (`GET /commits?unpublished=true`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
 | `/graphs/{id}/changes`, `/diff` | Poll a branch feed, establish a baseline, or diff two points (branches or commit ids) |
 | `/graphs/{id}/schema` | Show the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |

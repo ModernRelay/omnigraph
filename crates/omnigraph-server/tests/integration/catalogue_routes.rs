@@ -86,6 +86,21 @@ async fn catalogue_scope_serves_reads_and_refuses_everything_else() {
     let (status, body) = json_response(&app, catalogue_query(Some("token-a"), &with_branch)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
+    for prefix in ["", "explain "] {
+        let mut request = operators_request();
+        request.query = format!(
+            "{prefix}load csv \"file:///unavailable.csv\" into node:Person mode overwrite header"
+        );
+        let (status, body) = json_response(&app, catalogue_query(Some("token-a"), &request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let error: ErrorOutput = serde_json::from_value(body).unwrap();
+        assert!(
+            error.error.contains("serves read query declarations"),
+            "{}",
+            error.error
+        );
+    }
+
     let mut mutation = operators_request();
     mutation.query = "query add() { insert @Operator { name: \"X\" } }".to_string();
     let (status, body) = json_response(&app, catalogue_query(Some("token-a"), &mutation)).await;

@@ -36,7 +36,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
-| `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
+| `omnigraph-cli` | In-source application, runtime, parsing, output and transport tests plus `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-skill` | In-source `src/lib.rs`: the embedded table is sorted and `file` finds every path. The CLI owns the rest. In-source `src/skill.rs` holds the skill's command index (`references/commands.md`) and condensed reference (`SKILL.md`) to the clap tree and its storage-format line to `omnigraph version`; `integration/cli_schema_config.rs` owns `skill export` and `skill show`, including byte identity with `skills/omnigraph`; `scripts/check-docs.py` holds `metadata.version` and the declared HTTP contract to the CLI | None |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `integration/lane_b.rs`, `integration/torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
@@ -72,7 +72,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Export and lineage | `integration/export.rs`, `integration/lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `integration/legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
 | System-column upgrade (RFC 0040 step 3: respelling in place on a supported standalone graph; vintage is independent of the storage stamp) | `system_column_upgrade.rs`: check and execute, preflight refusals, every window before the manifest commit leaving no residue, a complete contract and table state after a post-commit failure, same-handle retry, the control-object cost; needs `--features failpoints` |
-| Cost and benchmark contracts | `integration/write_cost.rs`, `integration/write_cost_s3.rs`, `integration/warm_read_cost.rs`, `integration/branch_control_cost.rs`, `integration/merge_cost.rs`, `integration/changes_cost.rs`, the checkpoint/head lookup instruments, the correlated-block strategy instrument `integration/anti_join_cost.rs`, and the GQT benchmark adapter tests in `omnigraph-bench` |
+| Cost and benchmark contracts | `integration/write_cost.rs`, `integration/write_cost_s3.rs`, `integration/warm_read_cost.rs`, `integration/branch_control_cost.rs`, `integration/merge_cost.rs`, `integration/changes_cost.rs`, the checkpoint/head lookup instruments, the correlated-block strategy instrument `integration/anti_join_cost.rs`, the GQT benchmark adapter tests in `omnigraph-bench`, and, for the exact storage calls of one operation, the [DST storage-cost golden](#dst-storage-cost-golden) |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`; graphs whose rows trip the ordered-scan sorter cap belong in `tests/helpers/wide_rows.rs`.
 
@@ -139,7 +139,54 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
 workspace gate; its required-cell checks reject removed or ignored cases. The
 lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
-timeout without replaying a committed merge. Its deployment matrix holds a real
+timeout without replaying a committed merge or commit publication/drop (a drop's
+empty response has no body to truncate). Output unit tests inject write and flush
+failures; application tests check baseline file-lock custody through cursor flush,
+transfer receipt failures after a single dispatched write, and raw stream failures
+without mixed diagnostics. `blob_cli` unit tests own bounded stdin capture and
+interrupted reads. Extend `cli_data` for load consent and source-read ordering,
+Blob preconditions and output-file lifecycle; reuse its HTTP fixture and the
+existing parity matrix. Query semantics remain in GQT, not duplicated in these
+CLI boundary tests.
+Schema-family application tests verify that failed result delivery preserves an
+applied schema and its actor with one publication, and that an undeliverable
+target line precedes writable open. Init output failure leaves a readable graph;
+lint report failures and subsequent invocations remain reusable. Extend the
+existing `cli_schema_config`, `cli_cluster` and `cli_data` owners for addressing,
+cluster ownership and offline source-read ordering.
+
+Maintenance delivery tests use the existing output and application owners.
+They cover partial writes and flush failures, full-text rebuild publication and
+actor retention, and target-output failure before writable admission. Extend
+`cli_data` and `cli_cluster` for cleanup preview/consent and maintenance addressing;
+`crossversion_upgrade` retains ownership of storage-upgrade compatibility.
+
+Cluster delivery tests extend the application and output owners. Direct apply
+tests fail supplied stdout/stderr writes and flushes, then inspect the original
+receipt, retained lock, single deployment result and stable graph history. The
+served adapter's tests verify identity delivery before POST and receipt/timeout output failures without
+resubmission. `cli_cluster` and `cli_queries` own exact unlock refusals, graph
+filtering and wrong-plane refusal before configuration or HTTP access. The existing
+`system_remote` deployment matrix owns real server completion after delivery loss;
+these CLI changes require no additional query-semantic GQT cases.
+
+Local command tests in `commands/local` own supplied login input, credential
+changes after report failure, captured profile configuration, and completed skill
+or embedding files after output loss. `skill.rs` owns exact file delivery and its
+existing broken-pipe exception. Extend `cli_schema_config` for version and skill
+process behavior and `cli_data` for profile/embedding output. Its existing
+discovery-swap fixture also replaces the credential file, requiring registry
+probing and the subsequent command to retain the original token. Application and
+managed-output tests own completion, partial-write and flush failures; managed
+authentication/lifecycle fixtures own the pre-dispatch diagnostic gates and
+accepted-identity recovery output when stderr fails. Application tests keep
+single-result stdout intact and preserve delivered refusal statuses; served
+cluster tests retain typed refusals through failed hints. The binary's channel
+barrier test proves reported failures do not wait for blocked runtime work;
+`cli_schema_config` owns help/version/refusal statuses with closed streams.
+These are CLI boundary contracts; query-semantic GQT cases remain unchanged.
+
+The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server
@@ -413,8 +460,12 @@ case-only pull request needs no Rust change, and `cargo-nextest` sees each
 case (an IDE's test-results view lists cases from the
 libtest-shaped output; no per-case gutter runnable exists, since no source
 item does). `--test-threads=<n>` bounds how many cases run
-concurrently (default: the machine's available parallelism); each case fails
-if it exceeds `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS=<n>` seconds (default 10);
+concurrently (default: the machine's available parallelism). Each case fails
+when it runs past the `timeout_ms` its `--- runner` section declares; the field
+is required, and the corpus refuses a value above 10000 before the case runs.
+No environment variable changes a budget: a set
+`OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` makes every case fail with `invalid_case`. On
+a loaded host, run fewer cases at once with a lower `--test-threads`.
 `OMNIGRAPH_GQ_BLESS=1` rewrites the failing step's expect rows, or its shape
 lines, in place (local workflow only, never CI). Every rows step carries a `--- expect shape`
 section, one `<name>: <type>` line per result column in `.pg` property syntax
@@ -509,6 +560,49 @@ Historical HTTP records remain readable by `scripts/analyze-http-perf.py` and
 is available for GQT query and traversal workloads.
 
 Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; deterministic engine cost contracts remain in `crates/omnigraph/tests/`.
+
+### DST storage-cost golden
+
+`crates/omnigraph-dst/cost_table.txt` records the exact object-store calls of
+each labeled operation on deterministic memory storage: `l.` verbs reach Lance
+(`__manifest`, `__history` and the table datasets), `a.` verbs the control
+objects behind `StorageAdapter`. `dst_bench_cost_count_golden` in
+`crates/omnigraph-dst/tests/scenarios.rs` builds the table from a seeded run of
+random operations and from labeled scenarios (`labeled_cost_rows`), refuses a
+build that does not replay identically, and compares it with the file, so a
+cost change fails as a named line. The `DST pinned suite` job of `dst.yml` runs
+it on every pull request that changes engine input, as a reporting context.
+
+Add or update a row when:
+
+- a change adds an operation whose storage cost is part of its contract, or
+  changes what an existing one reads or writes: a route, a page or
+  continuation, a write path, a maintenance step. Add a labeled scenario that
+  measures that one operation on a reopened handle, with setup and
+  verification under `_`-prefixed labels, as `merge_history_cost_rows` does;
+- the contract is that a cost stays flat in something (history depth, live
+  branches, rows): record the operation at two sizes of it under two labels,
+  as `MergeTargetHistory2` and `MergeTargetHistory32` do. Equal rows show the
+  claim in the golden itself.
+
+A changed line is a cost change. Regenerate only on purpose, and say in the
+pull request why each changed line moved; a line that moved for no stated
+reason is a regression to find, not a golden to refresh.
+
+The golden pins exact counts on one backend. It does not replace the curve
+tests in `crates/omnigraph/tests/` (`write_cost.rs`, `warm_read_cost.rs`,
+`changes_cost.rs` and the other cost owners above), which assert a shape (flat
+or growing) through the `IoCounts` harness; a storage-cost contract has both.
+Query operator cost belongs to GQT (`--measure`), and wall time and memory to
+the benchmark harness.
+
+Regenerate, then verify, from `crates/omnigraph-dst`, whose Cargo
+configuration the suite needs:
+
+```bash
+DST_REGEN_COSTS=1 cargo test --locked --test scenarios dst_bench_cost_count_golden
+cargo test --locked --test scenarios dst_bench_cost_count_golden
+```
 
 For embedded execution, the benchmark runner executes `gqt-v1` dataset/query
 pairs through the same

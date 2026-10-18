@@ -318,6 +318,106 @@ pub(super) fn classify_failure(
     OmniError::datafusion(error)
 }
 
+/// One load statement's admitted read-reuse allowance: a named reservation on
+/// the statement's pool, held until the statement's reuse caches drop (RFC
+/// 2026-10-15 bulk load as a query plan).
+pub(crate) struct LoadReuseReservation {
+    reservation: MemoryReservation,
+}
+
+impl LoadReuseReservation {
+    pub(in crate::engine) fn admit(pool: Arc<dyn MemoryPool>, limit: u64) -> Option<Self> {
+        let available = limit.saturating_sub(pool.reserved() as u64);
+        let want = (available / 4).min(64 * 1024 * 1024);
+        if want < 1024 * 1024 {
+            return None;
+        }
+        let reservation = MemoryConsumer::new("load read reuse").register(&pool);
+        reservation.try_grow(usize::try_from(want).ok()?).ok()?;
+        Some(Self { reservation })
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.reservation.size()
+    }
+}
+
+/// One load statement's tracked memory: the engine's pool sized by
+/// `query_memory_bytes`, shared by the read-reuse caches, the retained
+/// source, every decoded batch, validation state and the staging working
+/// set, so several individually small parts still exhaust one allowance.
+pub(crate) struct LoadMemory {
+    context: QueryContext,
+}
+
+impl LoadMemory {
+    pub(crate) fn new(query_memory_bytes: u64) -> Result<Self> {
+        Ok(Self {
+            context: QueryContext::with_traversal_limit(query_memory_bytes, None)?,
+        })
+    }
+
+    pub(crate) fn limit(&self) -> u64 {
+        self.context.memory_limit
+    }
+
+    /// The context a load plan runs under: this statement's pool.
+    pub(super) fn context(&self) -> &QueryContext {
+        &self.context
+    }
+
+    /// Admit optional caches from the pool's currently unreserved bytes.
+    pub(crate) fn admit_read_reuse(&self) -> Option<LoadReuseReservation> {
+        LoadReuseReservation::admit(
+            Arc::clone(&self.context.pool) as Arc<dyn MemoryPool>,
+            self.limit(),
+        )
+    }
+
+    /// A named charge on the statement's pool, freed when dropped.
+    pub(crate) fn charge(&self, name: &str) -> Result<LoadCharge> {
+        super::operators::memory::WorkMemory::new(self.context.task_ctx(), name)
+            .map(LoadCharge)
+            .map_err(|error| self.context.classify(error))
+    }
+}
+
+/// One named charge of a load statement: grows by bytes or by held batches,
+/// each refusal the typed `query_memory_bytes` resource error.
+pub(crate) struct LoadCharge(super::operators::memory::WorkMemory);
+
+impl fmt::Debug for LoadCharge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadCharge").finish_non_exhaustive()
+    }
+}
+
+impl LoadCharge {
+    /// Release temporary capture headroom after only the final bytes remain.
+    pub(crate) fn shrink_to(&self, bytes: u64) {
+        self.0
+            .shrink_to(usize::try_from(bytes).unwrap_or(usize::MAX));
+    }
+    pub(crate) fn grow(&self, bytes: u64) -> Result<()> {
+        self.0
+            .grow(usize::try_from(bytes).unwrap_or(usize::MAX))
+            .map_err(|error| self.0.error(error))
+    }
+
+    /// Charge `count` entries of a collection of `T`, hash overhead included.
+    pub(crate) fn entries<T>(&self, count: usize) -> Result<()> {
+        self.0
+            .entries::<T>(count)
+            .map_err(|error| self.0.error(error))
+    }
+
+    /// Hold `batch`'s buffers for this charge's lifetime, each shared buffer
+    /// charged once across every holder.
+    pub(crate) fn hold(&self, batch: &arrow_array::RecordBatch) -> Result<()> {
+        self.0.hold(batch).map_err(|error| self.0.error(error))
+    }
+}
+
 /// The sizes of one refused reservation: what the pool held and what was asked.
 #[derive(Clone, Copy, Debug)]
 struct Refusal {
@@ -462,6 +562,26 @@ impl MemoryPool for SpillHeadroomPool {
 mod tests {
     use super::*;
     use futures::FutureExt;
+
+    #[test]
+    fn load_reuse_uses_only_headroom_after_mandatory_admission() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        const MIB: usize = 1024 * 1024;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16 * MIB));
+        let mandatory = MemoryConsumer::new("validation facts").register(&pool);
+        mandatory.try_grow(12 * MIB).unwrap();
+        let reuse = LoadReuseReservation::admit(Arc::clone(&pool), (16 * MIB) as u64).unwrap();
+        assert_eq!(reuse.bytes(), MIB);
+        assert_eq!(pool.reserved(), 13 * MIB);
+        drop(reuse);
+        assert_eq!(pool.reserved(), 12 * MIB);
+        mandatory.try_grow(3 * MIB).unwrap();
+        assert!(LoadReuseReservation::admit(Arc::clone(&pool), (16 * MIB) as u64).is_none());
+        assert_eq!(pool.reserved(), 15 * MIB);
+        drop(mandatory);
+        assert_eq!(pool.reserved(), 0);
+    }
 
     /// Child registration and closure race inside the executor, not in GQ.
     #[tokio::test]

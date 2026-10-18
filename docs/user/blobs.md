@@ -183,9 +183,11 @@ streams the complete value. `--offset N` reads from `N` to the end;
 zero is rejected. An end beyond the value is clamped to EOF, while a start at or
 beyond the end of a non-empty value is unsatisfiable.
 
-If transfer fails after output begins, stdout or `--out` may contain the prefix
-already written. For atomic file replacement, write to a temporary path, check
-the exit status, then rename it.
+A failure before transfer begins leaves an existing `--out` file untouched. A
+successful empty value creates or truncates the file. If transfer fails after
+output begins, stdout or `--out` may contain the prefix already written. For
+atomic file replacement, write to a temporary path, check the exit status, then
+rename it.
 
 `blob stat --json` reports the selector, value kind, and exact resolved snapshot.
 A managed value also reports `size` and `etag`; a whole-object external value

@@ -22,7 +22,7 @@ means the data request was not sent. HTTP discovery refusals retain their status
 | Status | Meaning | Usual action |
 |---:|---|---|
 | 400 | Invalid request, query, schema, configuration, or external-Blob policy, including an update that must carry a stored external Blob reference the policy does not admit | Correct the request; retrying unchanged will fail again. For a stored reference, assign that property in the same update (a new value or null), or admit its base in the policy |
-| 401 | Missing or invalid bearer token | Supply a token configured by the server |
+| 401 | Missing or invalid bearer token | Supply a token configured by the server. The CLI sends a token only to the server it is keyed to; see [server credentials](../cli/index.md#use-a-server) |
 | 403 | The resolved actor is not authorized | Change policy or use an authorized identity |
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
 | 409 | Concurrent change, duplicate ID, merge conflict, existing resource, or incompatible full-text index | Inspect structured details; not every conflict is retryable |
@@ -72,6 +72,14 @@ CLI data-write failures preserve structured details and add `command_outcome`:
 fields to stdout; human mode prints the action on stderr. HTTP failures also
 retain `http_status` and, when present, the original `retry_after` string.
 
+This includes `commit publish` and `commit drop`, as well as their `mutate`
+statement forms. If a response or result output is lost, inspect the commit's
+current state before another attempt; an output failure does not undo the write.
+The same applies to `load`, `blob put`, `blob clear` and `schema apply`: a closed
+output pipe or failed result flush can follow a successful write. The CLI exits with a failure
+and does not repeat the operation. If stdout cannot carry a JSON failure, stderr
+reports the undelivered diagnostic and its outcome.
+
 | CLI exit | What to do |
 |---:|---|
 | 0 | The operation succeeded or was a no-op. A merge can separately report a source-deletion failure without losing its successful result. |
@@ -84,6 +92,10 @@ A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
 and `action: refresh`. The server answers these before it admits the write:
 bearer authentication, then the API contract header, then policy. Fix the
 credential, the policy grant or the client before running the command again.
+When the CLI sent no credential, the refusal also carries `missing_credential`:
+`server` names a declared server with no stored token, or `unbound` names an
+address under no declared server, and `hint` says how to bind one. The server's
+`error` text is unchanged.
 The status counts only with its matching `code` in a response that carries the
 server's API contract header: a bare `403` from a proxy stays `unknown` with
 `reconcile`, and a refusal that also reports recovery work stays `recover`.
@@ -166,6 +178,12 @@ between graph roots.
 See [Operating a cluster](../clusters/index.md).
 
 ## Maintenance failures
+
+If `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes` or `upgrade` cannot
+write or flush its output, the CLI returns a failure without repeating the
+operation. An output failure does not undo completed work. Inspect the graph's
+state before another attempt; for an interrupted upgrade, follow the
+[upgrade recovery procedure](upgrade.md).
 
 - Recovery required: reopen the graph read-write or restart its server. A
   graph carrying a sidecar from a release before 0.12 must first be opened

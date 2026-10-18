@@ -1478,7 +1478,9 @@ fn parse_branch(input: &str) -> BranchStmt {
             queries.len()
         ),
         FileBody::Show(id) => panic!("expected a branch statement, got show {id:?}"),
-        FileBody::Explain(_) => panic!("expected a branch statement, got an explain statement"),
+        FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
+            panic!("expected a branch statement, got an explain statement")
+        }
         FileBody::Commit(write) => panic!("expected a branch statement, got {write:?}"),
         FileBody::Load(stmt) => panic!("expected a branch statement, got {stmt:?}"),
     }
@@ -2090,6 +2092,52 @@ fn explain_statement_never_shares_a_file_with_a_declaration() {
                 diagnostic.kind == crate::query::diagnostic::QueryDiagnosticKind::Parse
             }),
             "{input}: {error}"
+        );
+    }
+}
+
+#[test]
+fn explain_load_statement_wraps_the_bare_load_statement() {
+    const LOAD: &str = "load csv \"s3://b/k.csv\" into edge:Knows mode overwrite header";
+    let bare = parse_load(LOAD);
+    let file = parse_query(&format!("explain {LOAD}")).unwrap();
+    let FileBody::ExplainLoad(stmt) = &file.body else {
+        panic!("expected an explain load statement, got {:?}", file.body);
+    };
+    assert_eq!(*stmt, bare);
+    assert!(!file.body.is_explain());
+    assert_eq!(
+        file.body.clone().into_read_declarations().unwrap_err(),
+        "`explain load csv` is answered as a load plan by the read doors, not as a query declaration"
+    );
+    assert_eq!(
+        file.body.into_declarations().unwrap_err(),
+        "`explain` is a statement, not a query declaration"
+    );
+}
+
+#[test]
+fn explain_load_statement_meets_the_load_and_explain_refusals() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let cases = [
+        (
+            "explain load csv \"s3://b/k.csv\" into edge:Knows header\n".to_string(),
+            "names its mode",
+        ),
+        (
+            format!("explain load csv \"s3://b/k.csv\" into edge:Knows mode overwrite header\n{decl}"),
+            "an `explain` statement stands alone in its file",
+        ),
+        (
+            "explain load csv \"s3://b/k.csv\" into edge:Knows mode overwrite header\nbranch list\n".to_string(),
+            "an `explain` statement stands alone in its file",
+        ),
+    ];
+    for (input, expected) in cases {
+        let error = parse_query(&input).unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "{input}: expected {expected:?} in {error:?}"
         );
     }
 }

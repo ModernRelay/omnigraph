@@ -841,6 +841,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch: RecordBatch,
     ) -> Result<StagedHandle>;
 
+    /// Stage an overwrite from the batches as they were produced: one
+    /// `Operation::Overwrite` whose fragments hold every row, sized by Lance;
+    /// see `TableStore::stage_overwrite_batches`.
+    async fn stage_overwrite_batches(
+        &self,
+        snapshot: &SnapshotHandle,
+        batches: Vec<RecordBatch>,
+    ) -> Result<StagedHandle>;
+
     /// Stage a rename-only column alteration; see
     /// `TableStore::stage_rename_columns`. Committed through `commit_staged_exact`.
     async fn stage_rename_columns(
@@ -1418,6 +1427,16 @@ impl TableStorage for TableStore {
         batch: RecordBatch,
     ) -> Result<StagedHandle> {
         TableStore::stage_overwrite(self, snapshot.dataset(), batch)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn stage_overwrite_batches(
+        &self,
+        snapshot: &SnapshotHandle,
+        batches: Vec<RecordBatch>,
+    ) -> Result<StagedHandle> {
+        TableStore::stage_overwrite_batches(self, snapshot.dataset(), batches)
             .await
             .map(StagedHandle::new)
     }
