@@ -3797,3 +3797,300 @@ async fn live_deployment_fixture(mode: &str) {
         StatusCode::OK
     );
 }
+
+/// A local server runs the deployment's lifecycle in its embedder's process:
+/// the embedder binds the listener, owns stdout and decides the exit.
+mod local_serving {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const ROOT: &str = "OMNIGRAPH_LOCAL_SERVING_TEST_ROOT";
+    const MODE: &str = "OMNIGRAPH_LOCAL_SERVING_TEST_MODE";
+    const BEGIN: &str = "local-serving-begin";
+    const END: &str = "local-serving-end";
+
+    struct ContainedChild(Child);
+    impl Drop for ContainedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    async fn local_state(
+        graph: &Path,
+        access: omnigraph_server::LocalAccess,
+    ) -> (AppState, String) {
+        local_state_of(graph, access, false).await
+    }
+
+    async fn local_state_of(
+        root: &Path,
+        access: omnigraph_server::LocalAccess,
+        cluster: bool,
+    ) -> (AppState, String) {
+        let binding = omnigraph_server::LocalBinding::from_root(root.to_str().unwrap()).unwrap();
+        let (state, credential) = AppState::local(
+            if cluster {
+                omnigraph_server::LocalScope::Cluster(binding)
+            } else {
+                omnigraph_server::LocalScope::Graph(binding)
+            },
+            omnigraph_server::LocalOptions {
+                access,
+                actor: Some("act-local".into()),
+                process_defaults: omnigraph_server::ProcessDefaults::default(),
+            },
+        )
+        .await
+        .unwrap();
+        (state, credential.reveal())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serve_local_refuses_a_listener_off_loopback_and_a_state_it_did_not_open() {
+        let temp = init_loaded_graph().await;
+        let graph = graph_path(temp.path());
+        let (state, _) = local_state(&graph, omnigraph_server::LocalAccess::ReadOnly).await;
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let refused = omnigraph_server::serve_local(state, listener, |router| router)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("loopback"), "{refused}");
+
+        let deployment = AppState::open_with_bearer_tokens(graph.to_string_lossy(), Vec::new())
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = omnigraph_server::serve_local(deployment, listener, |router| router)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("AppState::local"), "{refused}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "instrument: subprocess helper for serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller"]
+    async fn local_server_child() {
+        let Some(root) = std::env::var_os(ROOT).map(PathBuf::from) else {
+            return;
+        };
+        let mode = std::env::var(MODE).unwrap();
+        omnigraph_server::install_log_subscriber(std::io::stderr);
+        let (state, token) = if mode == "cluster" {
+            local_state_of(&root, omnigraph_server::LocalAccess::ReadWrite, true).await
+        } else {
+            local_state(&graph_path(&root), omnigraph_server::LocalAccess::ReadWrite).await
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _guard = (mode == "uncertain").then(|| {
+            let fault_root = root.clone();
+            omnigraph::seams::catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.observe(move || {
+                fs::write(fault_root.join("fault-reached"), b"reached").unwrap();
+                panic!("contained local-server engine panic");
+            })
+        });
+        fs::write(root.join("listening.tmp"), format!("{address}\n{token}")).unwrap();
+        fs::rename(root.join("listening.tmp"), root.join("listening")).unwrap();
+        println!("{BEGIN}");
+        std::io::stdout().flush().unwrap();
+        let outcome = omnigraph_server::serve_local(state, listener, |router| {
+            router.route("/extended", axum::routing::get(|| async { "extended" }))
+        })
+        .await;
+        println!("{END}");
+        std::io::stdout().flush().unwrap();
+        fs::write(root.join("outcome"), format!("{outcome:?}")).unwrap();
+        std::process::exit(match outcome {
+            Ok(omnigraph_server::ServeOutcome::Clean) => 0,
+            Ok(omnigraph_server::ServeOutcome::Uncertain) => 2,
+            Err(_) => 1,
+        });
+    }
+
+    fn wait_for(path: &Path, child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !path.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "child exited before {}",
+                path.display()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "never reached {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn mutation(address: &str, token: &str, graph: &str, name: &str) -> String {
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let body = if graph == "default" {
+            serde_json::json!({
+                "query": MUTATION_QUERIES, "name": "insert_person", "params": {"name": name, "age": 17}
+            })
+        } else {
+            serde_json::json!({
+                "query": "query add($name: String) { insert Person { name: $name } }",
+                "params": {"name": name}
+            })
+        }
+        .to_string();
+        write!(
+            socket,
+            "POST /graphs/{graph}/mutate HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        socket.flush().unwrap();
+        let mut response = String::new();
+        let _ = socket.read_to_string(&mut response);
+        response
+    }
+
+    async fn serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller(mode: &str) {
+        let cluster = mode == "cluster";
+        let temp = if cluster {
+            local_cluster_dir().await
+        } else {
+            init_loaded_graph().await
+        };
+        let root = temp.path();
+        let (graph_id, graph) = if cluster {
+            ("knowledge", root.join("graphs/knowledge.omni"))
+        } else {
+            ("default", graph_path(root))
+        };
+        let commits = || async {
+            Omnigraph::open_read_only(graph.to_str().unwrap())
+                .await
+                .unwrap()
+                .list_commits(None)
+                .await
+                .unwrap()
+                .len()
+        };
+        let before = commits().await;
+        let mut child = ContainedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "local_serving::local_server_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(ROOT, root)
+                .env(MODE, mode)
+                .env_remove("RUST_LOG")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let stdout = std::thread::spawn(move || {
+            BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+                .collect::<Vec<_>>()
+        });
+        let mut stderr = child.0.stderr.take().unwrap();
+        let stderr = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        });
+        wait_for(&root.join("listening"), &mut child.0);
+        let listening = fs::read_to_string(root.join("listening")).unwrap();
+        let (address, token) = listening.split_once('\n').unwrap();
+        // A read-write local server of a cluster is its serving owner.
+        assert_eq!(root.join("__cluster/lock.json").exists(), cluster);
+
+        let client = reqwest::Client::new();
+        let ready: Value = client
+            .get(format!("http://{address}/readyz"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(ready["status"], "serving", "{ready}");
+        let extended = client
+            .get(format!("http://{address}/extended"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(extended.status(), StatusCode::OK);
+
+        if mode == "uncertain" {
+            // The publish lands and its owner panics: the outcome is unknown.
+            let _lost = mutation(address, token, graph_id, "Uncertain");
+            wait_for(&root.join("fault-reached"), &mut child.0);
+        } else {
+            let response = mutation(address, token, graph_id, "Settled");
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert_eq!(
+                unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+                0
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a local server did not stop within its process bound"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = stdout.join().unwrap();
+        let stderr = stderr.join().unwrap();
+        let outcome = fs::read_to_string(root.join("outcome")).unwrap();
+        if mode == "uncertain" {
+            assert_eq!(status.code(), Some(2), "{stderr}");
+            assert_eq!(outcome, "Ok(Uncertain)");
+            assert!(stderr.contains("owned completion uncertain"), "{stderr}");
+        } else {
+            assert_eq!(status.code(), Some(0), "{stderr}");
+            assert_eq!(outcome, "Ok(Clean)");
+            assert!(stderr.contains("shutdown signal received"), "{stderr}");
+        }
+        assert_eq!(commits().await, before + 1, "{stderr}");
+        // A clean shutdown releases the admission, as a deployment's does.
+        assert!(!root.join("__cluster/lock.json").exists());
+        // Nothing the server says reaches stdout, which belongs to its caller.
+        let begin = stdout.iter().position(|line| line == BEGIN).unwrap();
+        assert_eq!(
+            stdout.get(begin + 1).map(String::as_str),
+            Some(END),
+            "{stdout:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller_clean() {
+        serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller("clean").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller_cluster() {
+        serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller("cluster").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller_uncertain() {
+        serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller("uncertain").await;
+    }
+}

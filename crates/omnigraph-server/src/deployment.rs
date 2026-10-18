@@ -668,7 +668,15 @@ async fn execute(
         );
         let uri = omnigraph::storage::normalize_root_uri(&graph.uri)
             .map_err(|error| uncertain(format!("achieved graph URI is invalid: {error}")))?;
-        let mut prepared = match crate::prepare_single_graph(graph, Some(contract.clone())) {
+        let scope = state
+            .cluster_admission
+            .as_ref()
+            .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
+        let prepared = match crate::prepare_single_graph(
+            graph,
+            Some(contract.clone()),
+            crate::GraphOpenAccess::Writable(scope),
+        ) {
             Ok(prepared) => prepared,
             Err(error) if !live.contains_key(&id) => {
                 unavailable.push(Arc::new(crate::BlockedGraph {
@@ -685,10 +693,6 @@ async fn execute(
                 )));
             }
         };
-        prepared.io_scope = state
-            .cluster_admission
-            .as_ref()
-            .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
         if let Some(engine) = live.get(&id) {
             let policy = prepared
                 .pending
@@ -802,9 +806,11 @@ fn validate_serving_candidate(
     crate::load_catalogue_policy(catalogue_policy.as_ref())
         .map_err(|error| ApiError::conflict(format!("invalid catalogue policy: {error}")))?;
     for graph in graphs {
-        let prepared = crate::prepare_single_graph(graph, None).map_err(|error| {
-            ApiError::conflict(format!("deployment serving preparation failed: {error}"))
-        })?;
+        let prepared =
+            crate::prepare_single_graph(graph, None, crate::GraphOpenAccess::Writable(None))
+                .map_err(|error| {
+                    ApiError::conflict(format!("deployment serving preparation failed: {error}"))
+                })?;
         let engine = match state.routing.registry.get(&prepared.pending.key) {
             RegistryLookup::Ready(view) | RegistryLookup::Transitioning(view) => {
                 Some(Arc::clone(&view.engine))

@@ -8,6 +8,7 @@ mod export_transport;
 mod handlers;
 mod http_contract;
 mod ingress;
+mod local;
 mod mcp;
 pub mod operations;
 mod redacted_cause;
@@ -32,6 +33,9 @@ pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, AuthenticatedActor, GraphKey, ResolvedActor, Scope, TenantId};
+pub use local::{
+    LocalAccess, LocalBinding, LocalCredential, LocalOpenError, LocalOptions, LocalScope,
+};
 pub use mcp::McpSettings;
 pub use registry::{
     BlockedGraph, GraphEntry, GraphHandle, GraphRegistry, InsertError, LoadingGraph,
@@ -431,6 +435,9 @@ pub struct AppState {
     /// returns to (the Session settings RFC): the settings definition's defaults, replaced
     /// by `serve` with the values `settings::from_env` read at startup.
     process_defaults: Arc<ProcessDefaults>,
+    /// Set for a local server: it mounts no deployment routes, and a
+    /// read-only one refuses every write route before its body.
+    local: Option<LocalAccess>,
 }
 
 /// The settings a process door seeds every session with, and where each
@@ -799,6 +806,7 @@ impl AppState {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             process_defaults: Arc::new(ProcessDefaults::default()),
+            local: None,
         }
     }
 
@@ -853,6 +861,7 @@ impl AppState {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             process_defaults: Arc::new(ProcessDefaults::default()),
+            local: None,
         })
     }
 
@@ -885,6 +894,17 @@ impl AppState {
         self.draining = draining;
         self.shutdown_grace = shutdown_grace;
         self
+    }
+
+    /// Mark this state as a local server's.
+    pub(crate) fn into_local(mut self, access: LocalAccess) -> Self {
+        self.local = Some(access);
+        self
+    }
+
+    /// Whether this is a local server that may not change its graph.
+    pub(crate) fn is_read_only_local(&self) -> bool {
+        self.local == Some(LocalAccess::ReadOnly)
     }
 
     /// Attach the process defaults every session starts from (the Session settings RFC).
@@ -2626,7 +2646,7 @@ mod external_blob_startup_tests {
                 policy: None,
             }),
             expected: None,
-            io_scope: None,
+            access: GraphOpenAccess::Writable(None),
         };
         let error = match open_prepared_graph(prepared).await {
             Ok(_) => panic!("a missing root must not open"),
@@ -2704,7 +2724,7 @@ mod external_blob_startup_tests {
         fs::write(&policy_path, "version: 1\ngroups:\n  readers: [alice]\nrules:\n  - id: read\n    allow:\n      actors: {group: readers}\n      actions: [read]\n").unwrap();
         let mut valid = cfg;
         valid.policy = Some(PolicySource::File(policy_path.clone()));
-        let prepared = prepare_single_graph(valid, None).unwrap();
+        let prepared = prepare_single_graph(valid, None, GraphOpenAccess::Writable(None)).unwrap();
         let captured_policy = prepared.pending.policy.clone().unwrap();
         fs::write(policy_path, "invalid policy after preparation").unwrap();
         let opened = open_prepared_graph(prepared).await.unwrap();
@@ -2752,10 +2772,19 @@ where
 /// and `lance::file_audit` targets, and their `::` children, to WARN/ERROR
 /// even when other targets use DEBUG/TRACE.
 pub fn init_tracing() {
+    install_log_subscriber(io::stdout);
+}
+
+/// Install the restricted server subscriber [`init_tracing`] installs, writing
+/// to `writer` instead of stdout, for an embedder that reserves stdout.
+pub fn install_log_subscriber<W>(writer: W)
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
     use tracing_subscriber::util::SubscriberInitExt as _;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = server_log_subscriber(filter, io::stdout).try_init();
+    let _ = server_log_subscriber(filter, writer).try_init();
 }
 
 /// Captures what the server's log subscriber writes, for tests that assert
@@ -3094,11 +3123,14 @@ pub fn build_app(state: AppState) -> Router {
 
     // RFC-011 cluster-only: per-graph routes always nest under
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
-    let protected: Router<AppState> = Router::new()
+    let mut protected: Router<AppState> = Router::new()
         .nest(CATALOGUE_ROUTE_PREFIX, catalogue)
         .nest("/graphs/{graph_id}", per_graph_protected)
-        .merge(management)
-        .merge(deployments);
+        .merge(management);
+    // A local server serves one graph and owns no cluster deployment.
+    if state.local.is_none() {
+        protected = protected.merge(deployments);
+    }
 
     let mut app = Router::new()
         .route("/healthz", get(server_health))
@@ -3114,6 +3146,141 @@ pub fn build_app(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// How a serving lifecycle ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeOutcome {
+    /// Every logical owner finished with a settled completion.
+    Clean,
+    /// A write's completion is unknown. The caller stops without claiming
+    /// success and exits 2, as the server binary does in this case.
+    Uncertain,
+}
+
+/// The serving lifecycle every entry point runs: one shutdown listener, the
+/// watchdog it arms, graceful HTTP shutdown and the logical-owner drain.
+struct Lifecycle {
+    operations: operations::OperationRuntime,
+    listener_failed: Arc<tokio::sync::Notify>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    disarm: std::sync::mpsc::Sender<()>,
+}
+
+impl Lifecycle {
+    /// Install the shutdown listener before anything else (RFC 0049), so the
+    /// shutdown bound covers startup. The first of a signal, an uncertain
+    /// owner or a failed listener closes admission, sets `draining`, arms the
+    /// watchdog with `grace` and releases the graceful shutdown.
+    fn start(
+        operations: operations::OperationRuntime,
+        draining: Arc<std::sync::atomic::AtomicBool>,
+        grace: std::time::Duration,
+    ) -> Self {
+        let listener_failed = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (disarm, disarmed) = std::sync::mpsc::channel();
+        {
+            let operations = operations.clone();
+            let listener_failed = Arc::clone(&listener_failed);
+            tokio::spawn(async move {
+                // The first signal or uncertain owner fixes the one deadline.
+                tokio::select! {
+                    () = shutdown_signal() => {},
+                    () = operations.fatal() => error!("owned completion uncertain; containing process"),
+                    () = listener_failed.notified() => error!("listener or graph startup failed; containing admitted work"),
+                }
+                operations.close();
+                draining.store(true, std::sync::atomic::Ordering::SeqCst);
+                arm_shutdown_watchdog(grace, disarmed);
+                let _ = shutdown_tx.send(true);
+            });
+        }
+        Self {
+            operations,
+            listener_failed,
+            shutdown_rx,
+            disarm,
+        }
+    }
+
+    /// Serve `app` until the shutdown listener releases it.
+    async fn serve(&self, listener: TcpListener, app: Router) -> std::io::Result<()> {
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        let served = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                while !*shutdown_rx.borrow() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        if served.is_err() {
+            self.operations.close();
+            self.listener_failed.notify_one();
+        }
+        served
+    }
+
+    /// Wait for every logical owner and report whether any completion is
+    /// uncertain.
+    async fn drain(&self) -> ServeOutcome {
+        if self.operations.wait_logical_owners().await {
+            ServeOutcome::Clean
+        } else {
+            ServeOutcome::Uncertain
+        }
+    }
+
+    /// Stop the watchdog once nothing is left for it to bound, so an
+    /// embedder that keeps running after the lifecycle returns is not
+    /// stopped by it. A deployment never disarms: its watchdog also bounds
+    /// the admission release after the drain and the process exit.
+    fn disarm(&self) {
+        let _ = self.disarm.send(());
+    }
+}
+
+/// Serve a local server's state on `listener` until shutdown.
+///
+/// The caller binds the listener, so it knows the port before announcing
+/// readiness; `serve_local` refuses one that is not loopback. `extend`
+/// receives the router built from `state`, for the caller's own outermost
+/// layers. It runs the lifecycle the server binary runs, prints nothing to
+/// stdout, and returns an uncertain outcome instead of exiting the process.
+pub async fn serve_local(
+    state: AppState,
+    listener: TcpListener,
+    extend: impl FnOnce(Router) -> Router,
+) -> Result<ServeOutcome> {
+    let address = listener.local_addr()?;
+    if !address.ip().is_loopback() {
+        bail!("a local server listens on loopback only, not {address}");
+    }
+    if state.local.is_none() {
+        bail!("serve_local serves a state built by AppState::local");
+    }
+    let lifecycle = Lifecycle::start(
+        state.operations.clone(),
+        Arc::clone(&state.draining),
+        state.shutdown_grace,
+    );
+    let retained_admission = state.cluster_admission.clone();
+    let app = extend(build_app(state));
+    let served = lifecycle.serve(listener, app).await;
+    let mut outcome = lifecycle.drain().await;
+    let released = match retained_admission {
+        // An uncertain completion keeps the admission, as a deployment does.
+        Some(owner) if outcome == ServeOutcome::Clean => release_serving_admission(owner).await,
+        _ => Ok(outcome),
+    };
+    lifecycle.disarm();
+    outcome = released?;
+    if outcome == ServeOutcome::Clean {
+        served?;
+    }
+    Ok(outcome)
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
@@ -3144,25 +3311,7 @@ async fn serve_config(
     let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_grace = config.shutdown_grace;
     let operations = operations::OperationRuntime::new();
-    let listener_failed = Arc::new(tokio::sync::Notify::new());
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    {
-        let draining = Arc::clone(&draining);
-        let operations = operations.clone();
-        let listener_failed = Arc::clone(&listener_failed);
-        tokio::spawn(async move {
-            // The first signal or uncertain owner fixes the one deadline.
-            tokio::select! {
-                () = shutdown_signal() => {},
-                () = operations.fatal() => error!("owned completion uncertain; containing process"),
-                () = listener_failed.notified() => error!("listener or graph startup failed; containing admitted work"),
-            }
-            operations.close();
-            draining.store(true, std::sync::atomic::Ordering::SeqCst);
-            arm_shutdown_watchdog(shutdown_grace);
-            let _ = shutdown_tx.send(true);
-        });
-    }
+    let lifecycle = Lifecycle::start(operations.clone(), Arc::clone(&draining), shutdown_grace);
 
     let token_source = resolve_token_source().await?;
     info!(source = token_source.name(), "loaded bearer token source");
@@ -3270,7 +3419,7 @@ async fn serve_config(
         .own_startup()
         .map_err(|error| eyre!(error.message))?;
     let startup_state = state.clone();
-    let startup_failed = Arc::clone(&listener_failed);
+    let startup_failed = Arc::clone(&lifecycle.listener_failed);
     let startup = tokio::spawn(async move {
         let result =
             finish_graph_startup(startup_state.clone(), prepared, config.require_all_graphs).await;
@@ -3281,24 +3430,11 @@ async fn serve_config(
         startup_owner.finish();
         result
     });
-    let mut shutdown_rx = shutdown_rx;
-    let served = axum::serve(listener, build_app(state))
-        .with_graceful_shutdown(async move {
-            while !*shutdown_rx.borrow() {
-                if shutdown_rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        })
-        .await;
-    if served.is_err() {
-        operations.close();
-        listener_failed.notify_one();
-    }
+    let served = lifecycle.serve(listener, build_app(state)).await;
     // Never abort a graph-open future when HTTP shutdown finishes first. The
     // one original process watchdog also bounds this retained startup owner.
     let startup_result = startup.await;
-    if !operations.wait_logical_owners().await {
+    if lifecycle.drain().await == ServeOutcome::Uncertain {
         // All known logical owners have finished. Retain unresolved
         // reservations until this nonzero process exit; this is containment,
         // not a native-I/O settlement or reusable-engine drain proof.
@@ -3308,32 +3444,43 @@ async fn serve_config(
     served?;
     startup_result.wrap_err("graph startup owner failed")??;
     if let Some(owner) = retained_admission {
-        if owner.canonical_root().starts_with("az://") {
-            // Azure keeps its existing stopped-process boundary until its
-            // native clean-release path has independent qualification.
-            warn!("Azure cluster admission retained after logical shutdown");
-            return Ok(());
-        }
-        let scope = owner.io_scope().ok_or_else(|| {
-            eyre!("cluster storage lifetime is untracked; retaining its admission")
-        })?;
-        scope.close();
-        scope.wait_idle().await;
-        if scope.is_uncertain() {
+        if release_serving_admission(owner).await? == ServeOutcome::Uncertain {
             return Err(eyre!(
                 "storage completion uncertain; retaining cluster admission"
             ));
         }
-        // Axum's connection completion notification can precede destruction
-        // of its Hyper service and AppState. Drain those actual owners too;
-        // the original process watchdog still bounds this wait.
-        owner.wait_for_exclusive_owner().await;
-        owner
-            .release_after_settlement()
-            .await
-            .map_err(|error| eyre!("clean cluster release refused: {error:?}"))?;
     }
     Ok(())
+}
+
+/// Release a serving owner's cluster admission once its logical owners have
+/// drained. Storage whose completion is uncertain keeps the admission and is
+/// reported as uncertain. The caller's process watchdog bounds the wait.
+async fn release_serving_admission(
+    owner: omnigraph_cluster::ClusterAdmission,
+) -> Result<ServeOutcome> {
+    if owner.canonical_root().starts_with("az://") {
+        // Azure keeps its existing stopped-process boundary until its
+        // native clean-release path has independent qualification.
+        warn!("Azure cluster admission retained after logical shutdown");
+        return Ok(ServeOutcome::Clean);
+    }
+    let scope = owner
+        .io_scope()
+        .ok_or_else(|| eyre!("cluster storage lifetime is untracked; retaining its admission"))?;
+    scope.close();
+    scope.wait_idle().await;
+    if scope.is_uncertain() {
+        return Ok(ServeOutcome::Uncertain);
+    }
+    // Axum's connection completion notification can precede destruction
+    // of its Hyper service and AppState. Drain those actual owners too.
+    owner.wait_for_exclusive_owner().await;
+    owner
+        .release_after_settlement()
+        .await
+        .map_err(|error| eyre!("clean cluster release refused: {error:?}"))?;
+    Ok(ServeOutcome::Clean)
 }
 
 /// Load a graph-scoped policy bundle from either source kind.
@@ -3521,11 +3668,11 @@ async fn prepare_multi_graph_state(
             GraphId::try_from(cfg.graph_id.clone()).expect("validated startup graph id"),
         );
         let uri = cfg.uri.clone();
-        match prepare_single_graph(cfg, expected) {
-            Ok(mut graph) => {
-                graph.io_scope = admission
-                    .as_ref()
-                    .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
+        let scope = admission
+            .as_ref()
+            .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
+        match prepare_single_graph(cfg, expected, GraphOpenAccess::Writable(scope)) {
+            Ok(graph) => {
                 entries.push(GraphEntry::Loading(Arc::clone(&graph.pending)));
                 prepared.push(graph);
             }
@@ -3664,7 +3811,16 @@ struct PreparedGraphOpen {
     cfg: GraphStartupConfig,
     pending: Arc<LoadingGraph>,
     expected: Option<omnigraph::db::SchemaContractDigest>,
-    io_scope: Option<omnigraph::storage::StorageIoScope>,
+    access: GraphOpenAccess,
+}
+
+/// How a prepared graph opens.
+enum GraphOpenAccess {
+    /// Writable, inside the serving owner's storage scope when it has one.
+    Writable(Option<omnigraph::storage::StorageIoScope>),
+    /// Read-only, validated against the cluster ledger revision captured
+    /// before the open; its policy forbids every write.
+    ReadOnly(omnigraph_cluster::GraphReadAuthority),
 }
 
 #[cfg(test)]
@@ -3672,13 +3828,19 @@ async fn open_single_graph(
     cfg: GraphStartupConfig,
     expected: Option<omnigraph::db::SchemaContractDigest>,
 ) -> std::result::Result<OpenedGraph, GraphOpenFailure> {
-    open_prepared_graph(prepare_single_graph(cfg, expected)?).await
+    open_prepared_graph(prepare_single_graph(
+        cfg,
+        expected,
+        GraphOpenAccess::Writable(None),
+    )?)
+    .await
 }
 
 /// Validate and capture policy before the listener or any engine open.
 fn prepare_single_graph(
     mut cfg: GraphStartupConfig,
     expected: Option<omnigraph::db::SchemaContractDigest>,
+    access: GraphOpenAccess,
 ) -> std::result::Result<PreparedGraphOpen, GraphOpenFailure> {
     let initial_failure = |cause| GraphOpenFailure {
         failure: StartupFailure::OpenFailed,
@@ -3699,10 +3861,19 @@ fn prepare_single_graph(
             cause: eyre!("graph configuration was refused before graph open"),
         });
     }
+    let read_only = matches!(access, GraphOpenAccess::ReadOnly(_));
     let policy = cfg
         .policy
         .as_ref()
-        .map(|source| load_graph_policy(source, graph_id.as_str()).map(Arc::new))
+        .map(|source| {
+            let policy = load_graph_policy(source, graph_id.as_str())?;
+            if read_only {
+                local::forbid_writes(policy)
+            } else {
+                Ok(policy)
+            }
+            .map(Arc::new)
+        })
         .transpose()
         .map_err(|cause| GraphOpenFailure {
             failure: StartupFailure::InvalidPolicy,
@@ -3743,7 +3914,7 @@ fn prepare_single_graph(
             policy,
         }),
         expected,
-        io_scope: None,
+        access,
     })
 }
 
@@ -3754,7 +3925,7 @@ async fn open_prepared_graph(
         cfg,
         pending,
         expected,
-        io_scope,
+        access,
     } = prepared;
     let graph_id = &pending.key.graph_id;
     let uri = pending.uri.clone();
@@ -3764,9 +3935,14 @@ async fn open_prepared_graph(
         policy: policy.clone(),
         cause,
     };
-    let opened = match io_scope {
-        Some(scope) => Omnigraph::open_with_io_scope(&uri, scope).await,
-        None => Omnigraph::open(&uri).await,
+    let (opened, read_authority) = match access {
+        GraphOpenAccess::Writable(Some(scope)) => {
+            (Omnigraph::open_with_io_scope(&uri, scope).await, None)
+        }
+        GraphOpenAccess::Writable(None) => (Omnigraph::open(&uri).await, None),
+        GraphOpenAccess::ReadOnly(authority) => {
+            (Omnigraph::open_read_only(&uri).await, Some(authority))
+        }
     };
     let db = opened.map_err(|err| {
         failure(
@@ -3778,6 +3954,14 @@ async fn open_prepared_graph(
             ),
         )
     })?;
+    if let Some(authority) = read_authority {
+        authority.validate_opened(&db).await.map_err(|diagnostic| {
+            failure(
+                StartupFailure::OpenFailed,
+                eyre!("[{}] {}", diagnostic.code, diagnostic.message),
+            )
+        })?;
+    }
     verify_server_schema_contract(&db, expected.as_ref())
         .map_err(|cause| failure(StartupFailure::OpenFailed, cause))?;
     let db = db
@@ -3863,7 +4047,10 @@ async fn shutdown_signal() {
 /// a stalled teardown, or a runtime that never polls again cannot postpone
 /// it. The exit is crash-equivalent for the work it interrupts, and the
 /// engine's durability and next-open recovery remain the authority for it.
-fn arm_shutdown_watchdog(grace: std::time::Duration) {
+///
+/// A message on `disarmed` before the deadline stops the watchdog; a dropped
+/// sender does not, so a lifecycle that ends without disarming stays bounded.
+fn arm_shutdown_watchdog(grace: std::time::Duration, disarmed: std::sync::mpsc::Receiver<()>) {
     if grace.is_zero() {
         error!("shutdown grace is zero; exiting immediately with unfinished work");
         std::process::exit(2);
@@ -3875,7 +4062,14 @@ fn arm_shutdown_watchdog(grace: std::time::Duration) {
     std::thread::Builder::new()
         .name("shutdown-watchdog".to_string())
         .spawn(move || {
-            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match disarmed.recv_timeout(remaining) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
             error!(
                 grace_seconds = grace.as_secs(),
                 "shutdown deadline reached with unfinished work; exiting 2"
@@ -3956,10 +4150,18 @@ mod shutdown_signal_tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "subprocess helper; exercised by the_shutdown_watchdog_exits_nonzero_at_the_deadline"]
     async fn watchdog_child_outlives_its_deadline() {
-        if std::env::var_os(WATCHDOG_CHILD_ENV).is_none() {
+        let Some(mode) = std::env::var_os(WATCHDOG_CHILD_ENV) else {
             return;
+        };
+        let (disarm, disarmed) = std::sync::mpsc::channel();
+        arm_shutdown_watchdog(Duration::from_millis(500), disarmed);
+        if mode == "disarm" {
+            disarm.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+            std::process::exit(0);
         }
-        arm_shutdown_watchdog(Duration::from_millis(500));
+        // A dropped sender never disarms it.
+        drop(disarm);
         // Non-cooperative work: block the only runtime thread so no task,
         // timer, or teardown can run. Only a thread watchdog ends this.
         std::thread::sleep(Duration::from_secs(60));
@@ -4003,5 +4205,18 @@ mod shutdown_signal_tests {
             "the watchdog did not bound the process: {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_disarmed_watchdog_lets_its_process_outlive_the_deadline() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("shutdown_signal_tests::watchdog_child_outlives_its_deadline")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(WATCHDOG_CHILD_ENV, "disarm")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "{status}");
     }
 }

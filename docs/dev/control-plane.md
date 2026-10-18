@@ -536,6 +536,45 @@ In-process hosts that assemble `AppState` and call its existing
 the managed settings loader when the library should validate the applied
 snapshot and trust binding together.
 
+A local server serves one standalone graph to clients of the same OS account.
+`AppState::local(LocalScope::Graph(binding), options)` opens it and returns
+its state with a `LocalCredential`: one generated bearer token, revealed once,
+never printed by `Debug`, and held by the server only as a hash. It refuses a
+root inside a cluster (`LocalOpenError::ClusterGraph`) and takes no cluster
+admission. It installs a generated Cedar policy for its one actor on the engine
+as well as at the HTTP layer, and `local.rs` gives every `PolicyAction` a local
+class: reads and exports always; changes and branch and commit controls only
+for `LocalAccess::ReadWrite`, which requires an actor; `graph_list` as the
+server-scoped grant; schema apply, administration, stored queries and
+configuration never. A read-only local server opens its graph read-only and
+refuses every write-class route in ingress before reading the body. No local
+server mounts a `/cluster/*` route; each enables MCP ad-hoc reads and lists MCP
+write tools only when it writes.
+
+`LocalScope::Cluster(binding)` serves a cluster's storage root from its applied
+state, and needs an actor whatever its access. The cluster's own policies,
+stored queries, embedding-provider bindings and external-Blob rules apply, and
+the generated token resolves to the actor, so the cluster's policy decides for
+it as a deployment's would. A read-only one captures one ledger revision
+without admission, opens every graph read-only through `GraphReadAuthority`,
+which refuses a changed revision or an outstanding deployment, and adds a Cedar
+`forbid` for every write action to each policy it loads, so a policy answer
+reports the refusal (rule `local-read-only`). A read-write one acquires the
+cluster's serving admission and refuses while another owner holds it
+(`LocalOpenError::Cluster` with `state_lock_held`); `serve_local` releases it
+after a clean drain, through the release `serve` runs, and keeps it when a
+completion is uncertain.
+
+`serve_local(state, listener, extend)` serves such a state on a loopback
+listener the caller bound, through the lifecycle `serve` runs: the signal and
+uncertain-owner listener, the shutdown watchdog, graceful HTTP shutdown and the
+logical-owner drain. `extend` adds the caller's outermost layers to the router.
+It writes nothing to stdout, disarms the watchdog when it returns, and reports
+`ServeOutcome::Uncertain` instead of exiting; the caller exits 2.
+`install_log_subscriber(writer)` installs the `init_tracing` filter on another
+writer. A read-write local server is not fenced against another process writing
+the same graph; keep one writer per graph.
+
 ## Azure boundary
 
 `az://container/prefix` uses the same control-object and graph-root model as

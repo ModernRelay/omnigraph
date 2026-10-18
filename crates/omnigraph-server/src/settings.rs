@@ -44,7 +44,7 @@ pub(crate) async fn load_cluster_settings(
 /// Only completed read-only settings validation reaches this release. No graph
 /// open, native effect or child owner has started; cancellation still retains
 /// admission because it does not execute this branch.
-async fn release_settings_refusal(
+pub(crate) async fn release_settings_refusal(
     error: color_eyre::Report,
     admission: Option<omnigraph_cluster::ClusterAdmission>,
 ) -> color_eyre::Report {

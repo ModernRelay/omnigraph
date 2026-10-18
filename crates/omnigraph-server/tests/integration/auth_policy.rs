@@ -3912,3 +3912,398 @@ async fn access_reports_the_callers_own_actions_as_routes_decide_them() {
         ])
     );
 }
+
+fn local_request(method: Method, uri: &str, token: &str, body: impl Into<Body>) -> Request<Body> {
+    Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .uri(uri)
+        .method(method)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(body.into())
+        .unwrap()
+}
+
+async fn local_app(
+    graph: &std::path::Path,
+    access: omnigraph_server::LocalAccess,
+    actor: Option<&str>,
+) -> (axum::Router, String) {
+    let binding = omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap();
+    let (state, credential) = AppState::local(
+        omnigraph_server::LocalScope::Graph(binding),
+        omnigraph_server::LocalOptions {
+            access,
+            actor: actor.map(str::to_string),
+            process_defaults: omnigraph_server::ProcessDefaults::default(),
+        },
+    )
+    .await
+    .unwrap();
+    (build_app(state), credential.reveal())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_local_server_reads_and_refuses_every_write_before_its_body() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let before = manifest_dataset_version(&graph).await;
+    let (app, token) = local_app(&graph, omnigraph_server::LocalAccess::ReadOnly, None).await;
+
+    // Its own token lists the one graph and reads it; no other credential does.
+    let (status, body) = json_response(&app, get_request("/graphs", &token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["graphs"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["graphs"][0]["graph_id"], "default", "{body}");
+    let (status, body) =
+        json_response(&app, get_request(&g("/snapshot?branch=main"), &token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read = json!({"query": "query n() { match { $p: Person } return { $p.name } }"});
+    let (status, body) = json_response(
+        &app,
+        local_request(Method::POST, &g("/query"), &token, read.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for credential in ["wrong", ""] {
+        let (status, _) = json_response(&app, get_request(&g("/snapshot"), credential)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{credential:?}");
+    }
+
+    // Every write route refuses before reading its body: a body no route
+    // could parse still answers `forbidden`, and nothing is written.
+    for (method, path) in [
+        (Method::POST, "/mutate"),
+        (Method::POST, "/mutate/if-graph-commit"),
+        (Method::POST, "/load"),
+        (Method::POST, "/load/ndjson"),
+        (Method::POST, "/branches"),
+        (Method::DELETE, "/branches/feature"),
+        (Method::POST, "/branches/merge"),
+        (Method::POST, "/commits/c/publish"),
+        (Method::DELETE, "/commits/c"),
+        (Method::PUT, "/blob?type=Person&id=Alice&property=photo"),
+        (Method::DELETE, "/blob?type=Person&id=Alice&property=photo"),
+    ] {
+        let (status, body) = json_response(
+            &app,
+            local_request(method.clone(), &g(path), &token, "not a body"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        assert_eq!(body["code"], "forbidden", "{method} {path}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("read-only"),
+            "{method} {path}: {body}"
+        );
+    }
+    // A local server owns no cluster deployment.
+    for (method, path) in [
+        (Method::POST, "/cluster/plan"),
+        (Method::GET, "/cluster/deployments"),
+        (Method::POST, "/cluster/deployments"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(local_request(method.clone(), path, &token, "{}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_write_local_server_acts_as_its_actor_and_grants_no_more() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let refused = AppState::local(
+        omnigraph_server::LocalScope::Graph(
+            omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap(),
+        ),
+        omnigraph_server::LocalOptions {
+            access: omnigraph_server::LocalAccess::ReadWrite,
+            actor: None,
+            process_defaults: omnigraph_server::ProcessDefaults::default(),
+        },
+    )
+    .await
+    .err()
+    .expect("a read-write local server without an actor is refused");
+    assert!(
+        matches!(refused, omnigraph_server::LocalOpenError::ActorRequired),
+        "{refused}"
+    );
+
+    let (app, token) = local_app(
+        &graph,
+        omnigraph_server::LocalAccess::ReadWrite,
+        Some("act-local"),
+    )
+    .await;
+    let change = ChangeRequest {
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "Mina", "age": 28 })),
+        branch: Some("main".to_string()),
+        settings: None,
+    };
+    let (status, body) = json_response(
+        &app,
+        local_request(
+            Method::POST,
+            &g("/mutate"),
+            &token,
+            serde_json::to_vec(&change).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = json_response(&app, get_request(&g("/commits?branch=main"), &token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commits"][0]["actor_id"], "act-local", "{body}");
+
+    let create = BranchCreateRequest {
+        from: Some("main".to_string()),
+        name: "feature".to_string(),
+    };
+    let (status, body) = json_response(
+        &app,
+        local_request(
+            Method::POST,
+            &g("/branches"),
+            &token,
+            serde_json::to_vec(&create).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Stored queries are outside a local server; the refusal hides whether
+    // one exists, as a denied invoke does on any server.
+    let (status, _) = json_response(&app, invoke_request("insert_person", &token, json!({}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_server_refuses_a_graph_inside_a_cluster() {
+    let temp = converged_cluster_dir("").await;
+    let graph = temp.path().join("graphs/knowledge.omni");
+    for access in [
+        omnigraph_server::LocalAccess::ReadOnly,
+        omnigraph_server::LocalAccess::ReadWrite,
+    ] {
+        let refused = AppState::local(
+            omnigraph_server::LocalScope::Graph(
+                omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap(),
+            ),
+            omnigraph_server::LocalOptions {
+                access,
+                actor: Some("act-local".into()),
+                process_defaults: omnigraph_server::ProcessDefaults::default(),
+            },
+        )
+        .await
+        .err()
+        .expect("a graph inside a cluster is refused");
+        assert!(
+            matches!(
+                refused,
+                omnigraph_server::LocalOpenError::ClusterGraph { .. }
+            ),
+            "{access:?}: {refused}"
+        );
+    }
+    // Refusing took no cluster admission.
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+}
+
+async fn local_cluster_state(
+    root: &std::path::Path,
+    access: omnigraph_server::LocalAccess,
+    actor: Option<&str>,
+) -> Result<(AppState, String), omnigraph_server::LocalOpenError> {
+    let binding = omnigraph_server::LocalBinding::from_root(root.to_str().unwrap()).unwrap();
+    AppState::local(
+        omnigraph_server::LocalScope::Cluster(binding),
+        omnigraph_server::LocalOptions {
+            access,
+            actor: actor.map(str::to_string),
+            process_defaults: omnigraph_server::ProcessDefaults::default(),
+        },
+    )
+    .await
+    .map(|(state, credential)| (state, credential.reveal()))
+}
+
+fn knowledge_policy(state: &AppState) -> Arc<omnigraph_policy::PolicyEngine> {
+    let key = omnigraph_server::GraphKey::cluster(
+        omnigraph_server::GraphId::try_from("knowledge").unwrap(),
+    );
+    match state.routing().registry.get(&key) {
+        omnigraph_server::registry::RegistryLookup::Ready(view) => {
+            view.handle().policy.clone().unwrap()
+        }
+        _ => panic!("knowledge is not serving"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_local_cluster_server_applies_the_clusters_policy_and_forbids_writes() {
+    let temp = local_cluster_dir().await;
+    let refused = local_cluster_state(temp.path(), omnigraph_server::LocalAccess::ReadOnly, None)
+        .await
+        .err()
+        .expect("a cluster's local server needs an actor");
+    assert!(
+        matches!(refused, omnigraph_server::LocalOpenError::ActorRequired),
+        "{refused}"
+    );
+    let state_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let (state, token) = local_cluster_state(
+        temp.path(),
+        omnigraph_server::LocalAccess::ReadOnly,
+        Some("act-local"),
+    )
+    .await
+    .unwrap();
+    // A read-only consumer takes no admission.
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+
+    // The cluster's policy permits change; the local server forbids it, so
+    // a policy answer names the forbid while reads stay granted.
+    let policy = knowledge_policy(&state);
+    let decide = |action| {
+        policy
+            .authorize(
+                "act-local",
+                &omnigraph_policy::PolicyRequest {
+                    action,
+                    branch: Some("main".into()),
+                    target_branch: None,
+                },
+            )
+            .unwrap()
+    };
+    assert!(decide(omnigraph_policy::PolicyAction::Read).allowed);
+    let change = decide(omnigraph_policy::PolicyAction::Change);
+    assert!(!change.allowed);
+    assert_eq!(change.matched_rule_id.as_deref(), Some("local-read-only"));
+
+    let app = build_app(state);
+    let (status, body) = json_response(&app, get_request("/graphs", &token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["graphs"][0]["graph_id"], "knowledge", "{body}");
+    let (status, body) = json_response(
+        &app,
+        local_request(
+            Method::POST,
+            "/graphs/knowledge/queries/find_person",
+            &token,
+            json!({"params": {"name": "Ada"}}).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let insert = json!({"query": "query add() { insert Person { name: \"Ada\" } }"});
+    let (status, body) = json_response(
+        &app,
+        local_request(
+            Method::POST,
+            "/graphs/knowledge/mutate",
+            &token,
+            insert.to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        state_before
+    );
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_write_local_cluster_server_holds_admission_and_writes_as_its_actor() {
+    let temp = local_cluster_dir().await;
+    let (state, token) = local_cluster_state(
+        temp.path(),
+        omnigraph_server::LocalAccess::ReadWrite,
+        Some("act-local"),
+    )
+    .await
+    .unwrap();
+    assert!(temp.path().join("__cluster/lock.json").exists());
+    // One serving owner at a time; a read-only consumer may still read.
+    let refused = local_cluster_state(
+        temp.path(),
+        omnigraph_server::LocalAccess::ReadWrite,
+        Some("act-local"),
+    )
+    .await
+    .err()
+    .expect("a second serving owner is refused");
+    assert!(
+        matches!(&refused, omnigraph_server::LocalOpenError::Cluster { code, .. } if code == "state_lock_held"),
+        "{refused}"
+    );
+    let (reader, reader_token) = local_cluster_state(
+        temp.path(),
+        omnigraph_server::LocalAccess::ReadOnly,
+        Some("act-local"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        knowledge_policy(&state)
+            .authorize(
+                "act-local",
+                &omnigraph_policy::PolicyRequest {
+                    action: omnigraph_policy::PolicyAction::Change,
+                    branch: Some("main".into()),
+                    target_branch: None,
+                },
+            )
+            .unwrap()
+            .allowed
+    );
+
+    let app = build_app(state);
+    let insert = json!({"query": "query add() { insert Person { name: \"Ada\" } }"});
+    let (status, body) = json_response(
+        &app,
+        local_request(
+            Method::POST,
+            "/graphs/knowledge/mutate",
+            &token,
+            insert.to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = json_response(
+        &app,
+        get_request("/graphs/knowledge/commits?branch=main", &token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commits"][0]["actor_id"], "act-local", "{body}");
+    // The reader serves the revision it captured; its token is its own.
+    let reader = build_app(reader);
+    let (status, _) = json_response(&reader, get_request("/graphs", &token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = json_response(&reader, get_request("/graphs", &reader_token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // No deployment route is mounted beside the admission it holds.
+    let response = app
+        .clone()
+        .oneshot(local_request(
+            Method::GET,
+            "/cluster/deployments",
+            &token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

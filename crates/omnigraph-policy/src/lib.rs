@@ -574,6 +574,20 @@ impl PolicyEngine {
         PolicyCompiler::compile(&config, graph_id)
     }
 
+    /// Compile a per-graph policy built in code rather than read from a
+    /// file, with the same kind check `load_graph` applies.
+    pub fn graph_from_config(config: &PolicyConfig, graph_id: &str) -> Result<Self> {
+        validate_kind_alignment(config, PolicyEngineKind::Graph)?;
+        PolicyCompiler::compile(config, graph_id)
+    }
+
+    /// Compile a server-level policy built in code, with the same kind check
+    /// `load_server` applies.
+    pub fn server_from_config(config: &PolicyConfig) -> Result<Self> {
+        validate_kind_alignment(config, PolicyEngineKind::Server)?;
+        PolicyCompiler::compile(config, SERVER_RESOURCE_ID)
+    }
+
     /// Load a server-level policy file. Rejects rules whose actions
     /// are per-graph (e.g. `read`, `change`) — those belong in a
     /// per-graph policy file, not the server one. Takes no `graph_id`:
@@ -605,6 +619,33 @@ impl PolicyEngine {
         let config = PolicyConfig::from_source(source)?;
         validate_kind_alignment(&config, PolicyEngineKind::Cluster)?;
         PolicyCompiler::compile(&config, CLUSTER_RESOURCE_ID)
+    }
+
+    /// The same engine with every action in `actions` forbidden to every
+    /// actor, whatever its rules permit: a Cedar `forbid` overrides every
+    /// `permit`. A denial it decides names `rule_id`.
+    pub fn forbidding(mut self, rule_id: &str, actions: &[PolicyAction]) -> Result<Self> {
+        for action in actions {
+            let policy_id = PolicyId::new(format!("{rule_id}:{}", action.as_str()));
+            let source = format!(
+                "forbid (principal, action == Omnigraph::Action::{}, resource);",
+                cedar_literal(action.as_str())
+            );
+            self.policies
+                .add(Policy::parse(Some(policy_id.clone()), source.as_str())?)?;
+            self.policy_to_rule
+                .insert(policy_id.to_string(), rule_id.to_string());
+        }
+        let validation =
+            Validator::new(self.schema.clone()).validate(&self.policies, ValidationMode::Strict);
+        let errors = validation
+            .validation_errors()
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            bail!("policy validation failed:\n{}", errors.join("\n"));
+        }
+        Ok(self)
     }
 
     /// Evaluate a request. `actor_id` is supplied as a separate
@@ -1232,6 +1273,44 @@ rules:
         BranchNameError, PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine,
         PolicyExpectation, PolicyRequest, PolicyResourceKind, PolicyTestCase, PolicyTestConfig,
     };
+
+    #[test]
+    fn a_forbidden_action_is_denied_whatever_permits_it() {
+        let yaml = r#"
+version: 1
+groups:
+  team: [act-me]
+rules:
+  - id: everything
+    allow:
+      actors: { group: team }
+      actions: [read, change]
+      branch_scope: any
+"#;
+        let request = |action| PolicyRequest {
+            action,
+            branch: Some("main".into()),
+            target_branch: None,
+        };
+        let engine = PolicyEngine::load_graph_from_source(yaml, "g1")
+            .unwrap()
+            .forbidding(
+                "read-only",
+                &[PolicyAction::Change, PolicyAction::BranchCreate],
+            )
+            .unwrap();
+        assert!(
+            engine
+                .authorize("act-me", &request(PolicyAction::Read))
+                .unwrap()
+                .allowed
+        );
+        let denied = engine
+            .authorize("act-me", &request(PolicyAction::Change))
+            .unwrap();
+        assert!(!denied.allowed);
+        assert_eq!(denied.matched_rule_id.as_deref(), Some("read-only"));
+    }
 
     #[test]
     fn rejects_duplicate_rule_ids() {

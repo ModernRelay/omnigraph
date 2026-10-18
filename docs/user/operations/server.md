@@ -45,8 +45,9 @@ claim, not a restart or recovery path; see
 ### Logs
 
 The server logs to standard output at `info` unless `RUST_LOG` sets other
-levels. `omnigraph_server::init_tracing()` limits three dependency targets, and
-their `::` children, to warnings and errors even with `RUST_LOG=trace`: `rmcp`,
+levels. `omnigraph_server::init_tracing()`, like `install_log_subscriber(writer)`
+on another writer, limits three dependency targets, and their `::` children,
+to warnings and errors even with `RUST_LOG=trace`: `rmcp`,
 whose verbose SDK logs contain query arguments and results, and Lance's
 `lance::dataset_events` and `lance::file_audit`, which at `info` name every
 table's full storage URI, every file Lance creates or deletes, and each delete
