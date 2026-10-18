@@ -3863,6 +3863,18 @@ mod local_serving {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "instrument: subprocess helper for serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller"]
     async fn local_server_child() {
+        run_local_server_child().await;
+    }
+
+    /// One runtime thread, so nothing polls the lifecycle while the caller
+    /// blocks between start and serve.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "instrument: subprocess helper for a_signal_after_start_local_stops_the_local_server_gracefully"]
+    async fn local_server_child_on_one_thread() {
+        run_local_server_child().await;
+    }
+
+    async fn run_local_server_child() {
         let Some(root) = std::env::var_os(ROOT).map(PathBuf::from) else {
             return;
         };
@@ -3879,14 +3891,21 @@ mod local_serving {
                 panic!("contained local-server engine panic");
             })
         });
+        // The caller announces between start and serve, as `omnigraph serve`
+        // does; a signal from then on stops the server gracefully.
+        let serving = omnigraph_server::start_local(state, listener, |router| {
+            router.route("/extended", axum::routing::get(|| async { "extended" }))
+        })
+        .unwrap();
         fs::write(root.join("listening.tmp"), format!("{address}\n{token}")).unwrap();
         fs::rename(root.join("listening.tmp"), root.join("listening")).unwrap();
         println!("{BEGIN}");
         std::io::stdout().flush().unwrap();
-        let outcome = omnigraph_server::serve_local(state, listener, |router| {
-            router.route("/extended", axum::routing::get(|| async { "extended" }))
-        })
-        .await;
+        if mode == "announced" {
+            // The signal lands before the first poll of anything.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let outcome = serving.serve().await;
         println!("{END}");
         std::io::stdout().flush().unwrap();
         fs::write(root.join("outcome"), format!("{outcome:?}")).unwrap();
@@ -3953,7 +3972,11 @@ mod local_serving {
             Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "local_serving::local_server_child",
+                    if mode == "announced" {
+                        "local_serving::local_server_child_on_one_thread"
+                    } else {
+                        "local_serving::local_server_child"
+                    },
                     "--ignored",
                     "--nocapture",
                 ])
@@ -3981,6 +4004,25 @@ mod local_serving {
         wait_for(&root.join("listening"), &mut child.0);
         let listening = fs::read_to_string(root.join("listening")).unwrap();
         let (address, token) = listening.split_once('\n').unwrap();
+        if mode == "announced" {
+            assert_eq!(
+                unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+                0
+            );
+            let status = child.0.wait().unwrap();
+            let stderr = stderr.join().unwrap();
+            assert_eq!(status.code(), Some(0), "{stderr}");
+            assert_eq!(
+                fs::read_to_string(root.join("outcome")).unwrap(),
+                "Ok(Clean)"
+            );
+            assert!(stderr.contains("shutdown signal received"), "{stderr}");
+            assert_eq!(commits().await, before);
+            let stdout = stdout.join().unwrap();
+            let begin = stdout.iter().position(|line| line == BEGIN).unwrap();
+            assert_eq!(stdout.get(begin + 1).map(String::as_str), Some(END));
+            return;
+        }
 
         let client = reqwest::Client::new();
         let ready: Value = client
@@ -4052,5 +4094,10 @@ mod local_serving {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller_uncertain() {
         serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller("uncertain").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_signal_after_start_local_stops_the_local_server_gracefully() {
+        serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller("announced").await;
     }
 }
