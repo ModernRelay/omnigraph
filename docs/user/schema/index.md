@@ -152,12 +152,17 @@ omnigraph schema apply --schema next.pg graph.omni
 Supported changes include adding types, adding nullable properties, renaming
 nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, updating descriptions or instructions, and
-dropping node, edge, or property declarations.
+dropping node, edge, or property declarations. Dropping a property also drops
+every constraint that names only dropped properties: its own `@index`,
+`@unique`, `@range` or `@check`, and a composite constraint whose members are
+all dropped.
 
 None of these changes rewrites existing rows. Adding a nullable property,
 renaming a property, or dropping a property changes only the table's metadata:
 existing rows read the new property as null, no stored value or Blob is read,
-and existing indexes keep covering the rows they covered. The time and memory
+and the indexes of the remaining properties keep covering the rows they
+covered. A dropped property's index is removed by the same commit, and index
+maintenance does not build it again. The time and memory
 the apply takes therefore do not grow with the number of rows or the size of
 their values. They still grow with the table's metadata: its columns, its
 indexes and its fragments, of which a table written by many small commits has
@@ -169,8 +174,12 @@ same accepted source again leaves the graph unchanged.
 
 Changes such as adding a required property to existing entities, changing a property
 type (except enum widening), changing edge endpoints or cardinality, changing a
-node's implemented interfaces, and adding or removing most constraints are
-rejected. The plan reports the exact unsupported step before anything changes.
+node's implemented interfaces, adding a constraint other than `@index`,
+removing a constraint from a property that stays, and adding, removing or
+changing an existing type's `@key` are rejected. A drop is rejected when it
+would remove a constraint that also names a field that stays, such as
+`@unique(a, b)` when only `a` is dropped. The plan reports the exact
+unsupported step before anything changes.
 
 A drop removes the declaration from the current schema and reclaims no storage
 at apply. Older commits still read the dropped data until `omnigraph cleanup`
