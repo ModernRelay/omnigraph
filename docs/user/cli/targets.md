@@ -147,7 +147,8 @@ by rename. A file it cannot edit that way, such as one whose `targets` is a flow
 mapping or indented with tabs, refuses with `config_not_editable`; edit it by hand.
 
 Each refusal carries its `code`, and the `target` and `credential` commands
-report an `outcome` of `not_started`; see
+report an `outcome` of `not_started`, except an edit that fails after it
+replaced the file, which reports `unknown`; see
 [failed commands](../operations/troubleshooting.md#failed-data-write-commands).
 `omnigraph version --json` reports the output versions as `protocols.target`,
 `protocols.credential` and `protocols.access`.

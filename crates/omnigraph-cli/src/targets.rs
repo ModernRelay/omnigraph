@@ -314,36 +314,69 @@ pub(crate) fn validate_config(config: &OperatorConfig) -> Result<()> {
     validate_credential_owners(config)
 }
 
+/// One credential binding: who holds the credential for requests under
+/// `base`, and the entry that declares it.
+struct ServerBinding<'a> {
+    label: String,
+    owner: CredentialOwner<'a>,
+    base: RequestTarget,
+    address: String,
+}
+
+/// Every credential binding the file declares: each `servers:` entry and
+/// each server target that validates. The ownership checks and credential
+/// lookup read this one list, so an entry that fails validation never
+/// supplies a credential.
+fn server_bindings(config: &OperatorConfig) -> Vec<ServerBinding<'_>> {
+    let mut bindings = Vec::new();
+    for (name, server) in &config.servers {
+        if let Ok(base) = RequestTarget::of(&server.url, &server.url) {
+            bindings.push(ServerBinding {
+                label: format!("server `{name}`"),
+                owner: CredentialOwner::Keyed(name),
+                base,
+                address: server.url.clone(),
+            });
+        }
+    }
+    for (name, entry) in &config.targets {
+        let Ok(TargetBinding::Server { endpoint, .. }) = entry.binding(name) else {
+            continue;
+        };
+        let owner = match (entry.credential.as_deref(), entry.auth) {
+            (Some(owner), None) => CredentialOwner::Keyed(owner),
+            (None, Some(TargetAuth::Anonymous)) => CredentialOwner::Anonymous { target: name },
+            _ => continue,
+        };
+        let Ok(base) = RequestTarget::of(&endpoint, &endpoint) else {
+            continue;
+        };
+        bindings.push(ServerBinding {
+            label: format!("target `{name}`"),
+            owner,
+            base,
+            address: endpoint,
+        });
+    }
+    bindings
+}
+
 /// One credential binds to one endpoint scope: an owner never serves two
 /// endpoints, an endpoint never has two owners, and an anonymous target never
 /// shares an endpoint with a keyed one. Owners also share the token variable
 /// namespace with `servers:` names.
 fn validate_credential_owners(config: &OperatorConfig) -> Result<()> {
     let conflict = |message: String| CliRefusal::report(ErrorCode::TargetInvalid, message);
-    let mut bindings: Vec<(String, Option<String>, RequestTarget, String)> = Vec::new();
-    for (name, server) in &config.servers {
-        if let Ok(base) = RequestTarget::of(&server.url, &server.url) {
-            bindings.push((
-                format!("server `{name}`"),
-                Some(name.clone()),
-                base,
-                server.url.clone(),
-            ));
-        }
-    }
-    for (name, entry) in &config.targets {
-        let Ok(TargetBinding::Server { endpoint, auth, .. }) = entry.binding(name) else {
-            continue;
-        };
-        let Ok(base) = RequestTarget::of(&endpoint, &endpoint) else {
-            continue;
-        };
-        let owner = match auth {
-            ServerAuth::Token { owner } => Some(owner),
-            ServerAuth::Anonymous => None,
-        };
-        bindings.push((format!("target `{name}`"), owner, base, endpoint));
-    }
+    let bindings: Vec<(String, Option<String>, RequestTarget, String)> = server_bindings(config)
+        .into_iter()
+        .map(|binding| {
+            let owner = match binding.owner {
+                CredentialOwner::Keyed(owner) => Some(owner.to_string()),
+                CredentialOwner::Anonymous { .. } => None,
+            };
+            (binding.label, owner, binding.base, binding.address)
+        })
+        .collect();
     let mut owners: BTreeMap<String, (&str, &RequestTarget, &str)> = BTreeMap::new();
     let mut variables: BTreeMap<String, &str> = BTreeMap::new();
     for (label, owner, base, address) in &bindings {
@@ -410,30 +443,12 @@ impl OperatorConfig {
         &self,
         request: &RequestTarget,
     ) -> Option<CredentialOwner<'_>> {
-        let mut candidates: Vec<(CredentialOwner<'_>, RequestTarget)> = Vec::new();
-        for (name, server) in &self.servers {
-            if let Ok(base) = RequestTarget::of(&server.url, &server.url) {
-                candidates.push((CredentialOwner::Keyed(name), base));
-            }
-        }
-        for (name, entry) in &self.targets {
-            let (Some(endpoint), TargetKind::Server) = (entry.endpoint.as_deref(), entry.kind)
-            else {
-                continue;
-            };
-            let owner = match (entry.credential.as_deref(), entry.auth) {
-                (Some(owner), None) => CredentialOwner::Keyed(owner),
-                (None, Some(TargetAuth::Anonymous)) => CredentialOwner::Anonymous { target: name },
-                _ => continue,
-            };
-            if let Ok(base) = RequestTarget::of(endpoint, endpoint) {
-                candidates.push((owner, base));
-            }
-        }
         let mut best: Option<(CredentialOwner<'_>, usize)> = None;
-        for (owner, base) in candidates {
-            if request.is_under(&base) && best.is_none_or(|(_, depth)| base.depth() > depth) {
-                best = Some((owner, base.depth()));
+        for binding in server_bindings(self) {
+            if request.is_under(&binding.base)
+                && best.is_none_or(|(_, depth)| binding.base.depth() > depth)
+            {
+                best = Some((binding.owner, binding.base.depth()));
             }
         }
         best.map(|(owner, _)| owner)
@@ -833,6 +848,7 @@ pub(crate) fn replace_file(path: &Path, text: &str) -> Result<()> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)?;
+        crate::command_outcome::local_effect();
         crate::sync_dir(parent)?;
         Ok(())
     })();

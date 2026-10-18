@@ -203,6 +203,23 @@ fn a_target_token_goes_only_to_urls_under_its_endpoint() {
     );
     assert_eq!(owner("https://public.example/elsewhere"), None);
     assert_eq!(owner("https://staging.example.evil/graphs/g"), None);
+
+    // An entry that fails validation supplies no credential, though the file
+    // still loads: neither one sorting first at the anonymous target's
+    // endpoint nor one bound deeper below it sends `staging-auth` there.
+    let config = parse(&format!(
+        "{TARGETS}  aaa:\n    kind: server\n    scope: graph\n    endpoint: https://public.example/base\n    credential: staging-auth\n  \
+         deeper:\n    kind: server\n    scope: graph\n    endpoint: https://public.example/base/graphs\n    credential: staging-auth\n"
+    ))
+    .unwrap();
+    let owner = |url: &str| {
+        let request = RequestTarget::of(url, url).unwrap();
+        config.credential_owner_for(&request)
+    };
+    assert_eq!(
+        owner("https://public.example/base/graphs/g"),
+        Some(CredentialOwner::Anonymous { target: "public" })
+    );
 }
 
 fn resolve(

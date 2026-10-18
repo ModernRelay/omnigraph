@@ -234,6 +234,15 @@ fn write_machine<T: Serialize>(
     }
 }
 
+/// The exit for an error `run_from` returns: a classified failure that could
+/// not be delivered keeps the exit its outcome chose, since a write may have
+/// committed; every other error exits 1.
+pub fn exit_code(error: &color_eyre::Report) -> i32 {
+    error
+        .downcast_ref::<UndeliveredFailure>()
+        .map_or(1, |undelivered| undelivered.failure.exit)
+}
+
 #[derive(Debug)]
 struct UndeliveredFailure {
     failure: command_outcome::Failure,

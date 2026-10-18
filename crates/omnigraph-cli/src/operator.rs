@@ -308,8 +308,16 @@ pub(crate) struct InvocationConfig {
 
 #[derive(Debug)]
 struct CapturedOperator {
-    config: std::result::Result<OperatorConfig, String>,
+    config: std::result::Result<OperatorConfig, CapturedRefusal>,
     warnings: Vec<u8>,
+}
+
+/// A load failure kept for every later read of the capture, with the code a
+/// typed refusal carried, so each read reports it as the load did.
+#[derive(Debug)]
+struct CapturedRefusal {
+    code: Option<omnigraph_api_types::ErrorCode>,
+    message: String,
 }
 
 impl InvocationConfig {
@@ -380,7 +388,12 @@ impl InvocationConfig {
                 ),
                 None => Ok(OperatorConfig::default()),
             }
-            .map_err(|error| error.to_string());
+            .map_err(|error| CapturedRefusal {
+                code: error
+                    .downcast_ref::<crate::helpers::CliRefusal>()
+                    .map(|refusal| refusal.code),
+                message: error.to_string(),
+            });
             CapturedOperator { config, warnings }
         });
         let warnings = self.warnings.get_or_init(|| {
@@ -402,7 +415,10 @@ impl InvocationConfig {
         self.captured(stderr)?
             .config
             .as_ref()
-            .map_err(|message| eyre!(message.clone()))
+            .map_err(|refusal| match refusal.code {
+                Some(code) => crate::helpers::CliRefusal::report(code, refusal.message.clone()),
+                None => eyre!(refusal.message.clone()),
+            })
     }
 
     /// Existing managed query presentation tolerates an invalid optional config.

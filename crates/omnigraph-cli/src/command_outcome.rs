@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use crate::cli::{
     BlobCommand, BranchCommand, Cli, Command, CommitCommand, GraphsCommand, QueriesCommand,
-    SchemaCommand,
+    SchemaCommand, TargetCommand,
 };
 use crate::graph_http::ApiContractError;
 use crate::helpers::{CliRefusal, MissingCredential, PreconditionFailedCli, RemoteErrorCli};
@@ -47,69 +47,74 @@ tokio::task_local! {
 
 /// The kind of a command whose failure reports an outcome. Commands with
 /// their own failure reports (`lint`, `queries validate`, cluster and managed
-/// commands) and maintenance report none yet.
+/// commands) and maintenance report none yet. The match is exhaustive, so a
+/// new command declares how its failure reads.
 pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
-    if writes(cli) {
-        return Some(CommandKind::Write);
-    }
-    matches!(
-        &cli.command,
+    use CommandKind::{Read, Write};
+    match &cli.command {
+        // An alias invokes a stored query as a read; the server refuses a
+        // mutation behind one before it runs.
         Command::Query(_)
-            | Command::Snapshot(_)
-            | Command::Export(_)
-            | Command::Diff(_)
-            | Command::Changes { .. }
-            | Command::Queries {
-                command: QueriesCommand::List { .. }
-            }
-            | Command::Graphs {
-                command: GraphsCommand::List { .. }
-            }
-            | Command::Branch {
-                command: BranchCommand::List { .. }
-                    | BranchCommand::Diff { .. }
-                    | BranchCommand::MergeBase { .. }
-            }
-            | Command::Commit {
-                command: CommitCommand::List { .. }
-                    | CommitCommand::Show { .. }
-                    | CommitCommand::Changes { .. }
-            }
-            | Command::Schema {
-                command: SchemaCommand::Plan { .. } | SchemaCommand::Show { .. }
-            }
-            | Command::Blob {
-                command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
-            }
-            // A target edit replaces the operator config by one rename, so a
-            // failure leaves nothing changed.
-            | Command::Target { .. }
-            | Command::Credential { .. }
-            | Command::Access(_)
-    )
-    .then_some(CommandKind::Read)
-}
-
-fn writes(cli: &Cli) -> bool {
-    matches!(
-        &cli.command,
-        Command::Load(_)
-            | Command::Mutate(_)
-            | Command::Branch {
-                command: BranchCommand::Create { .. }
-                    | BranchCommand::Delete { .. }
-                    | BranchCommand::Merge { .. }
-            }
-            | Command::Commit {
-                command: CommitCommand::Publish { .. } | CommitCommand::Drop { .. }
-            }
-            | Command::Schema {
-                command: SchemaCommand::Apply { .. }
-            }
-            | Command::Blob {
-                command: BlobCommand::Put { .. } | BlobCommand::Clear { .. }
-            }
-    )
+        | Command::Alias(_)
+        | Command::Snapshot(_)
+        | Command::Export(_)
+        | Command::Diff(_)
+        | Command::Changes { .. } => Some(Read),
+        Command::Load(_) | Command::Mutate(_) => Some(Write),
+        Command::Branch { command, .. } => Some(match command {
+            BranchCommand::Create { .. }
+            | BranchCommand::Delete { .. }
+            | BranchCommand::Merge { .. } => Write,
+            BranchCommand::List { .. }
+            | BranchCommand::Diff { .. }
+            | BranchCommand::MergeBase { .. } => Read,
+        }),
+        Command::Commit { command, .. } => Some(match command {
+            CommitCommand::Publish { .. } | CommitCommand::Drop { .. } => Write,
+            CommitCommand::List { .. }
+            | CommitCommand::Show { .. }
+            | CommitCommand::Changes { .. } => Read,
+        }),
+        Command::Schema { command, .. } => match command {
+            SchemaCommand::Apply { .. } => Some(Write),
+            SchemaCommand::Plan { .. } | SchemaCommand::Show { .. } => Some(Read),
+            SchemaCommand::UpgradeSystemColumns { .. } => None,
+        },
+        Command::Blob { command, .. } => Some(match command {
+            BlobCommand::Put { .. } | BlobCommand::Clear { .. } => Write,
+            BlobCommand::Get { .. } | BlobCommand::Stat { .. } => Read,
+        }),
+        Command::Queries { command, .. } => match command {
+            QueriesCommand::List { .. } => Some(Read),
+            QueriesCommand::Validate { .. } => None,
+        },
+        Command::Graphs { command, .. } => match command {
+            GraphsCommand::List { .. } => Some(Read),
+        },
+        // A target edit replaces the operator config by one rename.
+        Command::Target { command, .. } => Some(match command {
+            TargetCommand::Add { .. } | TargetCommand::Remove { .. } => Write,
+            TargetCommand::List { .. } | TargetCommand::Show { .. } => Read,
+        }),
+        Command::Credential { .. } | Command::Access(_) => Some(Read),
+        Command::Organization { .. }
+        | Command::Init(_)
+        | Command::Upgrade(_)
+        | Command::Optimize(_)
+        | Command::RebuildFullTextIndexes(_)
+        | Command::Repair(_)
+        | Command::Cleanup(_)
+        | Command::Lint(_)
+        | Command::Cluster { .. }
+        | Command::Policy { .. }
+        | Command::Embed(_)
+        | Command::Login { .. }
+        | Command::Logout { .. }
+        | Command::Use { .. }
+        | Command::Profile { .. }
+        | Command::Skill { .. }
+        | Command::Version { .. } => None,
+    }
 }
 
 pub(crate) async fn observe<F: std::future::Future>(
@@ -188,6 +193,13 @@ pub(crate) fn single_request() -> bool {
 /// ([`EngineWriteError`]) can then say that nothing ran; any other later
 /// error, such as one rendering a committed receipt, must not claim it.
 pub(crate) fn writable_open() {
+    update(|state| state.writable_open = true);
+}
+
+/// A local edit took effect, as replacing the operator config by its rename
+/// does; a later failure, such as syncing the directory or rendering the
+/// result, must not claim that nothing changed.
+pub(crate) fn local_effect() {
     update(|state| state.writable_open = true);
 }
 
