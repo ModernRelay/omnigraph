@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use crate::cli::{
     BlobCommand, BranchCommand, Cli, Command, CommitCommand, GraphsCommand, QueriesCommand,
-    SchemaCommand,
+    SchemaCommand, TargetCommand,
 };
 use crate::graph_http::ApiContractError;
 use crate::helpers::{CliRefusal, MissingCredential, PreconditionFailedCli, RemoteErrorCli};
@@ -81,9 +81,9 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
             | Command::Blob {
                 command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
             }
-            // A target edit replaces the operator config by one rename, so a
-            // failure leaves nothing changed.
-            | Command::Target { .. }
+            | Command::Target {
+                command: TargetCommand::List { .. } | TargetCommand::Show { .. }
+            }
             | Command::Credential { .. }
     )
     .then_some(CommandKind::Read)
@@ -94,6 +94,10 @@ fn writes(cli: &Cli) -> bool {
         &cli.command,
         Command::Load(_)
             | Command::Mutate(_)
+            // A target edit replaces the operator config by one rename.
+            | Command::Target {
+                command: TargetCommand::Add { .. } | TargetCommand::Remove { .. }
+            }
             | Command::Branch {
                 command: BranchCommand::Create { .. }
                     | BranchCommand::Delete { .. }
@@ -187,6 +191,13 @@ pub(crate) fn single_request() -> bool {
 /// ([`EngineWriteError`]) can then say that nothing ran; any other later
 /// error, such as one rendering a committed receipt, must not claim it.
 pub(crate) fn writable_open() {
+    update(|state| state.writable_open = true);
+}
+
+/// A local edit took effect, as replacing the operator config by its rename
+/// does; a later failure, such as syncing the directory or rendering the
+/// result, must not claim that nothing changed.
+pub(crate) fn local_effect() {
     update(|state| state.writable_open = true);
 }
 

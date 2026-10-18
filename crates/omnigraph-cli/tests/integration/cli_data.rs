@@ -5740,6 +5740,18 @@ fn target_commands_edit_one_entry_and_keep_the_rest_of_the_file() {
     assert!(text.starts_with(original), "{text}");
     assert!(!text.contains("local:"), "{text}");
     assert!(text.contains("  staging:"), "{text}");
+
+    // A file every command refuses reports its code through every reader,
+    // listings and graph commands alike.
+    fs::write(&path, "target_config_version: 2\ntargets: {}\n").unwrap();
+    let refused = target(&["list", "--json"], None);
+    assert_eq!(json(&refused)["code"], "target_invalid", "{refused:?}");
+    let refused = cli()
+        .env("OMNIGRAPH_HOME", home.path())
+        .args(["snapshot", "--server", "http://127.0.0.1:1", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json(&refused)["code"], "target_invalid", "{refused:?}");
 }
 
 /// `login --target` stores a token under the target's credential owner, and

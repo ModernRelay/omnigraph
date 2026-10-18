@@ -1282,6 +1282,47 @@ fn queries_list_prints_registered_query() {
         stdout.contains("$name: String"),
         "list should show typed params; stdout:\n{stdout}"
     );
+
+    // A cluster-root target addresses it too, named or as `defaults.target`,
+    // and as a complete address it excludes `--cluster`.
+    let home = tempfile::tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "target_config_version: 1\ndefaults:\n  target: ops\ntargets:\n  ops:\n    kind: direct\n    scope: root\n    uri: '{}'\n  \
+             remote:\n    kind: server\n    endpoint: https://graphs.example\n    auth: anonymous\n",
+            cluster.path().display()
+        ),
+    )
+    .unwrap();
+    for args in [&["--target", "ops"][..], &[][..]] {
+        let output = output_success(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["queries", "list"])
+                .args(args),
+        );
+        assert!(stdout_string(&output).contains("find_person"), "{args:?}");
+    }
+    let refused = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["queries", "list", "--target", "ops", "--cluster"])
+            .arg(cluster.path()),
+    );
+    assert!(
+        stderr_string(&refused).contains("mutually exclusive"),
+        "{refused:?}"
+    );
+    let refused = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["queries", "list", "--target", "remote"]),
+    );
+    assert!(
+        stderr_string(&refused).contains("not a cluster root"),
+        "{refused:?}"
+    );
 }
 
 #[test]
