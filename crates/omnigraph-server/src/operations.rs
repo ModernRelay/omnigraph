@@ -12,6 +12,52 @@ use tracing::Instrument;
 
 use crate::ApiError;
 
+/// What the request being served has done that an error it returns
+/// afterwards may follow.
+#[derive(Default)]
+struct RequestWrites {
+    /// It submitted an owned write. An error it returns afterwards, from the
+    /// write or from anything the handler does after it, may follow effects.
+    submitted: std::cell::Cell<bool>,
+    /// Its operation may publish more than once, as a load that forks its
+    /// branch does, so a typed refusal of a later step may follow an earlier
+    /// publication.
+    compound: std::cell::Cell<bool>,
+}
+
+tokio::task_local! {
+    static REQUEST_WRITES: RequestWrites;
+}
+
+/// Serve one request with its own record of the writes it submitted.
+pub(crate) async fn scope_request<F: Future>(request: F) -> F::Output {
+    REQUEST_WRITES
+        .scope(RequestWrites::default(), request)
+        .await
+}
+
+/// Whether the request being served has submitted an owned write; false
+/// outside a served request.
+pub(crate) fn request_submitted_write() -> bool {
+    REQUEST_WRITES
+        .try_with(|writes| writes.submitted.get())
+        .unwrap_or(false)
+}
+
+/// Record that the request being served runs an operation that may publish
+/// more than once.
+pub(crate) fn mark_compound_write() {
+    let _ = REQUEST_WRITES.try_with(|writes| writes.compound.set(true));
+}
+
+/// Whether the request being served runs an operation that may publish more
+/// than once; false outside a served request.
+pub(crate) fn request_compound_write() -> bool {
+    REQUEST_WRITES
+        .try_with(|writes| writes.compound.get())
+        .unwrap_or(false)
+}
+
 pub const DEFAULT_READ_OBSERVERS: usize = 128;
 pub const DEFAULT_WRITE_OBSERVERS: usize = 64;
 
@@ -239,6 +285,7 @@ impl OperationRuntime {
             }
             state.active_writes += 1;
         }
+        let _ = REQUEST_WRITES.try_with(|writes| writes.submitted.set(true));
         let owner = WriteOwner {
             inner: Arc::clone(&self.inner),
             reservation: Some(Box::new(reservation)),
@@ -318,6 +365,7 @@ impl<T> OwnedResponse<T> {
                 "owned write result was lost; effects are unknown and require reconciliation",
             )),
         }
+        .map_err(ApiError::after_owned_write)
     }
 }
 

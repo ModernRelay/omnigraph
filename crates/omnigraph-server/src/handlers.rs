@@ -494,6 +494,7 @@ pub(crate) async fn require_expected_actor(
     };
     Err(ApiError {
         completion_uncertain: false,
+        owned_write: false,
         status: StatusCode::PRECONDITION_FAILED,
         code: Some(ErrorCode::ActorMismatch),
         message: message.into_boxed_str(),
@@ -620,6 +621,7 @@ pub(crate) fn resolve_registered_graph(
     }
     Err(ApiError {
         completion_uncertain: false,
+        owned_write: false,
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: Some(ErrorCode::GraphUnavailable),
         message: message.into(),
@@ -2533,6 +2535,10 @@ async fn run_json_load(
 ) -> std::result::Result<IngestOutput, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let from = request.from;
+    if from.is_some() {
+        // A missing branch is forked first, which publishes on its own.
+        crate::operations::mark_compound_write();
+    }
     let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
@@ -2690,6 +2696,10 @@ pub(crate) async fn server_load_ndjson(
     let actor = actor.as_ref().map(|Extension(actor)| actor);
     let branch = query.branch.unwrap_or_else(|| "main".to_string());
     let from = query.from;
+    if from.is_some() {
+        // A missing branch is forked first, which publishes on its own.
+        crate::operations::mark_compound_write();
+    }
     let mode = query.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
 
     authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
@@ -3120,7 +3130,7 @@ pub(crate) async fn server_branch_merge(
                     Ok(()) => (Some(true), None),
                     Err(error) => {
                         uncertain = error.completion_uncertain();
-                        (Some(false), Some(error.into_output()))
+                        (Some(false), Some(error.into_step_output()))
                     }
                 }
             } else {

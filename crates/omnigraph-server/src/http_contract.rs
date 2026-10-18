@@ -26,6 +26,7 @@ pub(crate) async fn require_contract(request: Request, next: Next) -> Result<Res
     {
         return Err(ApiError {
             completion_uncertain: false,
+            owned_write: false,
             status: StatusCode::BAD_REQUEST,
             code: Some(ErrorCode::ApiContractMismatch),
             message: mismatch_message().into_boxed_str(),

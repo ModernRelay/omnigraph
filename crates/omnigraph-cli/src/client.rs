@@ -3392,7 +3392,7 @@ mod tests {
         assert_eq!(compound.exit, 1);
         assert_eq!(single.exit, 75);
         assert_eq!(
-            serde_json::to_value(compound).unwrap()["command_outcome"],
+            serde_json::to_value(compound).unwrap()["outcome"],
             json!({
                 "execution":"unknown", "effects":"unknown", "action":"reconcile"
             })
@@ -3400,7 +3400,7 @@ mod tests {
         let single = serde_json::to_value(single).unwrap();
         assert_eq!(single["retry_after"], "Wed, 21 Oct 2026 07:28:00 GMT");
         assert_eq!(
-            single["command_outcome"],
+            single["outcome"],
             json!({
                 "execution":"not_started", "effects":"none", "action":"retry"
             })
@@ -3417,20 +3417,20 @@ mod tests {
             let compound = attempt(true, read_refusal, kind).await;
             assert_eq!(compound.exit, 1);
             assert_eq!(
-                serde_json::to_value(compound).unwrap()["command_outcome"]["effects"],
+                serde_json::to_value(compound).unwrap()["outcome"]["effects"],
                 "unknown"
             );
         }
         let conditional = attempt(false, false, Refusal::Condition).await;
         assert_eq!(conditional.exit, 4);
         assert_eq!(
-            serde_json::to_value(conditional).unwrap()["command_outcome"],
+            serde_json::to_value(conditional).unwrap()["outcome"],
             json!({"execution":"not_started","effects":"none","action":"refresh"})
         );
         let denied = attempt(false, false, Refusal::Denied).await;
         assert_eq!(denied.exit, 1);
         assert_eq!(
-            serde_json::to_value(denied).unwrap()["command_outcome"],
+            serde_json::to_value(denied).unwrap()["outcome"],
             json!({"execution":"not_started","effects":"none","action":"refresh"})
         );
     }

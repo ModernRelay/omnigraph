@@ -4,7 +4,10 @@
 use std::sync::{Arc, Mutex};
 
 use color_eyre::Report;
-use omnigraph_api_types::{ErrorCode, ErrorOutput};
+use omnigraph_api_types::{
+    ErrorCode, ErrorOutput, OutcomeAction as Action, OutcomeEffects as Effects,
+    OutcomeExecution as Execution, OutcomeOutput,
+};
 use reqwest::StatusCode;
 use serde::Serialize;
 
@@ -119,41 +122,13 @@ pub(crate) fn writable_open() {
     update(|state| state.writable_open = true);
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Execution {
-    NotStarted,
-    Unknown,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Effects {
-    None,
-    Unknown,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Action {
-    Retry,
-    Refresh,
-    Recover,
-    Reconcile,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct CommandOutcome {
-    execution: Execution,
-    effects: Effects,
-    action: Action,
-}
-
+/// The failure the CLI prints for a data write: the server's error body, its
+/// `outcome` reconciled with what this command's own requests show, and the
+/// transport facts beside it.
 #[derive(Debug, Serialize)]
 pub(crate) struct Failure {
     #[serde(flatten)]
     pub(crate) output: ErrorOutput,
-    pub(crate) command_outcome: CommandOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) http_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,6 +143,13 @@ pub(crate) struct Failure {
 }
 
 impl Failure {
+    /// The whole command's outcome, which `classify` always sets.
+    pub(crate) fn outcome(&self) -> OutcomeOutput {
+        self.output
+            .outcome
+            .expect("a classified failure carries its outcome")
+    }
+
     pub(crate) fn classify(error: Report, evidence: Evidence) -> Self {
         let remote = error.downcast_ref::<RemoteErrorCli>();
         let precondition = error.downcast_ref::<PreconditionFailedCli>();
@@ -203,6 +185,17 @@ impl Failure {
             evidence.retry_after
         };
         let missing_credential = remote.and_then(|remote| remote.missing_credential.clone());
+        // A server states the outcome of the one request it answered; that is
+        // the whole command's outcome only when that request was the
+        // command's sole effectful one.
+        let served = remote
+            .filter(|_| single)
+            .and_then(|remote| remote.output.outcome)
+            .or_else(|| {
+                precondition
+                    .filter(|_| single)
+                    .and_then(|value| value.output.outcome)
+            });
         let output = if let Some(remote) = remote {
             remote.output.clone()
         } else if let Some(precondition) = precondition {
@@ -243,21 +236,23 @@ impl Failure {
         } else {
             Action::Reconcile
         };
+        let outcome = served.unwrap_or(OutcomeOutput {
+            execution: if not_started {
+                Execution::NotStarted
+            } else {
+                Execution::Unknown
+            },
+            effects: if not_started {
+                Effects::None
+            } else {
+                Effects::Unknown
+            },
+            action,
+        });
+        let mut output = output;
+        output.outcome = Some(outcome);
         Self {
             output,
-            command_outcome: CommandOutcome {
-                execution: if not_started {
-                    Execution::NotStarted
-                } else {
-                    Execution::Unknown
-                },
-                effects: if not_started {
-                    Effects::None
-                } else {
-                    Effects::Unknown
-                },
-                action,
-            },
             http_status,
             retry_after,
             request_dispatched,

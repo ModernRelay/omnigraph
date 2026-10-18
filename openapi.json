@@ -10982,6 +10982,17 @@
           "error": {
             "type": "string"
           },
+          "outcome": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutcomeOutput",
+                "description": "Whether the operation ran and what to do next, as on [`ErrorOutput`]."
+              }
+            ]
+          },
           "recovery_required": {
             "oneOf": [
               {
@@ -11542,6 +11553,11 @@
           "bad_request",
           "api_contract_mismatch",
           "actor_mismatch",
+          "outcome_unknown",
+          "precondition_failed",
+          "recovery_required",
+          "external_blob_source",
+          "change_feed_gap",
           "not_found",
           "method_not_allowed",
           "conflict",
@@ -11675,6 +11691,17 @@
             "items": {
               "$ref": "#/components/schemas/MergeConflictOutput"
             }
+          },
+          "outcome": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutcomeOutput",
+                "description": "Whether the operation ran and what to do next. Servers set it on every\nerror response; it is absent only from a body built outside a server."
+              }
+            ]
           },
           "precondition_failure": {
             "oneOf": [
@@ -12307,6 +12334,49 @@
           },
           "type_name": {
             "type": "string"
+          }
+        }
+      },
+      "OutcomeAction": {
+        "type": "string",
+        "enum": [
+          "retry",
+          "refresh",
+          "recover",
+          "reconcile"
+        ]
+      },
+      "OutcomeEffects": {
+        "type": "string",
+        "enum": [
+          "none",
+          "unknown"
+        ]
+      },
+      "OutcomeExecution": {
+        "type": "string",
+        "enum": [
+          "not_started",
+          "unknown"
+        ]
+      },
+      "OutcomeOutput": {
+        "type": "object",
+        "description": "Whether a refused or failed operation ran, whether it changed anything,\nand what its caller should do next. A server states it on every error\nresponse, computed where that knowledge is; a client that lost the response\nknows less, and says so.",
+        "required": [
+          "execution",
+          "effects",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/OutcomeAction"
+          },
+          "effects": {
+            "$ref": "#/components/schemas/OutcomeEffects"
+          },
+          "execution": {
+            "$ref": "#/components/schemas/OutcomeExecution"
           }
         }
       },

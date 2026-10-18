@@ -738,7 +738,7 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
         stat_etag(readme).as_str()
     );
     assert!(refused.get("precondition_failure").is_none(), "{refused}");
-    assert_eq!(refused["command_outcome"]["action"], "refresh");
+    assert_eq!(refused["outcome"]["action"], "refresh");
 
     let cleared = parse_stdout_json(&output_success(
         blob("clear", readme)
@@ -809,7 +809,7 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             "actual": 32 * 1024 * 1024 + 1,
         })
     );
-    assert_eq!(refused["command_outcome"]["execution"], "not_started");
+    assert_eq!(refused["outcome"]["execution"], "not_started");
     assert!(!absent.exists(), "neither arm opened the store");
 
     // If-Match precedes reading the input; a missing input in turn precedes
@@ -838,7 +838,7 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             "{validator}: {refused}"
         );
         assert_eq!(
-            refused["command_outcome"],
+            refused["outcome"],
             json!({"execution":"not_started", "effects":"none", "action":"refresh"})
         );
         assert!(server.requests().is_empty());
@@ -2451,7 +2451,7 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
         Value::String(stale_head)
     );
     assert_eq!(
-        body["command_outcome"],
+        body["outcome"],
         serde_json::json!({"execution":"unknown","effects":"unknown","action":"refresh"})
     );
 
@@ -2513,7 +2513,7 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
         assert_eq!(error["http_status"], status);
         assert_eq!(error["request_dispatched"], false);
         assert_eq!(
-            error["command_outcome"],
+            error["outcome"],
             serde_json::json!({
                 "execution":"not_started", "effects":"none", "action":"refresh"
             })
@@ -2797,16 +2797,16 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 };
                 assert_eq!(actual["http_status"], status);
                 assert_eq!(
-                    actual["command_outcome"]["execution"], execution,
+                    actual["outcome"]["execution"], execution,
                     "{arguments:?}: {actual}"
                 );
                 assert_eq!(
-                    actual["command_outcome"]["effects"], effects,
+                    actual["outcome"]["effects"], effects,
                     "{arguments:?}: {actual}"
                 );
                 let fields = actual.as_object_mut().unwrap();
                 fields.remove("http_status");
-                fields.remove("command_outcome");
+                fields.remove("outcome");
             }
             assert_eq!(
                 actual, body,
@@ -2989,11 +2989,11 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             assert_eq!(actual["http_status"], *status);
             assert_eq!(actual["retry_after"], "17");
             assert_eq!(
-                &actual["command_outcome"], outcome,
+                &actual["outcome"], outcome,
                 "{arguments:?} HTTP {status} {body}"
             );
             let fields = actual.as_object_mut().unwrap();
-            fields.remove("command_outcome");
+            fields.remove("outcome");
             fields.remove("http_status");
             fields.remove("retry_after");
             // No credential is bound to the fixture's URL, so a 401 also says
@@ -3048,7 +3048,7 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         assert_eq!(output.status.code(), Some(1));
         let actual = parse_stdout_json(&output);
         assert_eq!(
-            actual["command_outcome"],
+            actual["outcome"],
             serde_json::json!({"execution":"unknown","effects":"unknown","action":"reconcile"})
         );
         assert_eq!(actual["http_status"], 200);
@@ -3649,7 +3649,7 @@ fn as_on_a_served_write_asserts_the_actor() {
         let error = parse_stdout_json(&output);
         assert_eq!(error["code"], "actor_mismatch", "{write:?}: {error}");
         assert_eq!(
-            error["command_outcome"],
+            error["outcome"],
             json!({"execution":"not_started","effects":"none","action":"refresh"}),
             "{write:?}: {error}"
         );
@@ -4025,7 +4025,7 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
     let output = parse_stdout_json(&output);
     let error = output["error"].as_str().unwrap();
     assert!(error.contains("refusing destructive `branch delete`") && error.contains("--yes"));
-    assert_eq!(output["command_outcome"]["effects"], "none");
+    assert_eq!(output["outcome"]["effects"], "none");
 
     // Both commit-drop spellings use the same consent gate before submission.
     for arguments in [
@@ -4049,7 +4049,7 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
             "{arguments:?}: {error}"
         );
         assert_eq!(
-            error["command_outcome"],
+            error["outcome"],
             serde_json::json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
             "{arguments:?}"
         );
@@ -4141,7 +4141,7 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
             .unwrap()
             .contains("refusing destructive `load --mode overwrite`")
     );
-    assert_eq!(output["command_outcome"]["effects"], "none");
+    assert_eq!(output["outcome"]["effects"], "none");
 
     let temp = tempdir().unwrap();
     let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
@@ -4160,7 +4160,7 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
         "consent must precede reading --data: {refused}"
     );
     assert_eq!(
-        refused["command_outcome"],
+        refused["outcome"],
         json!({"execution":"not_started", "effects":"none", "action":"refresh"})
     );
     assert!(
@@ -4954,7 +4954,7 @@ fn cli_fails_for_missing_schema_or_data_file() {
         "{refused}"
     );
     assert_eq!(
-        refused["command_outcome"],
+        refused["outcome"],
         json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"}),
         "embedded load opens writable storage before reading --data"
     );
@@ -4985,7 +4985,7 @@ fn cli_fails_for_missing_schema_or_data_file() {
             "{settings:?}: {refused}"
         );
         assert_eq!(
-            refused["command_outcome"],
+            refused["outcome"],
             json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
             "served load validates settings and reads --data before HTTP"
         );

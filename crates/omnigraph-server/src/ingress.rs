@@ -208,7 +208,7 @@ pub(crate) async fn admit(
             observer
                 .spawn_read((lease, graph, mcp_graph), async move {
                     Ok(observe_response(
-                        next.run(request).await,
+                        crate::operations::scope_request(next.run(request)).await,
                         response_observer,
                         response_input,
                         response_graph,
@@ -221,7 +221,7 @@ pub(crate) async fn admit(
         // Effectful handlers register through the owned-write boundary once
         // their typed input, actor and operation reservations are captured.
         AdmissionClass::Write => Ok(observe_response(
-            next.run(request).await,
+            crate::operations::scope_request(next.run(request)).await,
             observer,
             lease,
             graph,

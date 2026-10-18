@@ -165,8 +165,8 @@ fn finish(
                     }
                     writeln!(
                         stderr,
-                        "command_outcome: {}",
-                        serde_json::to_string(&failure.command_outcome)?
+                        "outcome: {}",
+                        serde_json::to_string(&failure.outcome())?
                     )?;
                     stderr.flush()?;
                 }

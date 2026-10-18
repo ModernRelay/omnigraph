@@ -3666,10 +3666,17 @@ const SHOW_AT_WRITE_DOOR: &str = "statement 'show merge_lineage' is a read; use 
 const SHOW_COLUMNS: [&str; 5] = ["name", "value", "default", "source", "scope"];
 
 /// Every settings refusal is `ApiError::bad_request`: the message, the code,
-/// and nothing else in the body.
+/// the outcome of a refusal, and nothing else in the body.
 fn assert_settings_refusal(status: StatusCode, body: &Value, error: &str) {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body, &json!({"error": error, "code": "bad_request"}));
+    assert_eq!(
+        body,
+        &json!({
+            "error": error,
+            "code": "bad_request",
+            "outcome": {"execution": "not_started", "effects": "none", "action": "refresh"},
+        })
+    );
 }
 
 /// A refusal whose sentence the settings definition owns: the 400 and the
@@ -3699,7 +3706,8 @@ async fn assert_unknown_settings_field(app: &axum::Router, request: Request<Body
     assert_eq!(body["code"], "bad_request", "{body}");
     let error = body["error"].as_str().unwrap_or_default();
     assert!(error.contains("unknown field"), "{error}");
-    assert_eq!(body.as_object().unwrap().len(), 2, "{body}");
+    assert_eq!(body.as_object().unwrap().len(), 3, "{body}");
+    assert_eq!(body["outcome"]["execution"], "not_started", "{body}");
 }
 
 fn show_row(name: &str, value: &str, default: &str, source: &str, scope: &str) -> Value {
@@ -6909,8 +6917,10 @@ async fn mutate_graph_commit_precondition_issue_365() {
         "stale graph-commit precondition must be rejected with 412, got {status}: {body}"
     );
     let error: ErrorOutput = serde_json::from_value(body).unwrap();
-    // code stays None: closed wire contract (`recovery_required` precedent).
-    assert_eq!(error.code, None);
+    assert_eq!(
+        error.code,
+        Some(omnigraph_server::api::ErrorCode::PreconditionFailed)
+    );
     let failure = error
         .precondition_failure
         .expect("412 body must carry structured precondition_failure details");

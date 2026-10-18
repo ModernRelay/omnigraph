@@ -1190,6 +1190,9 @@ pub struct ChangeErrorOutput {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<ErrorCode>,
+    /// Whether the operation ran and what to do next, as on [`ErrorOutput`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<OutcomeOutput>,
     /// Set when a requested limit exceeds a public ceiling, or a single change
     /// exceeds the poll's own byte ceiling.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1912,6 +1915,22 @@ pub enum ErrorCode {
     /// 412: the request's `omnigraph-expect-actor` header names another actor
     /// than its credential resolves to. Nothing ran.
     ActorMismatch,
+    /// A write whose completion the server could not settle: it may or may not
+    /// have published. Read the target before writing again; never replay the
+    /// write blindly.
+    OutcomeUnknown,
+    /// 412: a mutation's graph-commit precondition no longer holds; see
+    /// `precondition_failure`.
+    PreconditionFailed,
+    /// 503: an overlapping durable recovery intent must be resolved first; see
+    /// `recovery_required`.
+    RecoveryRequired,
+    /// 424: an admitted external Blob source could not be probed or read; see
+    /// `external_blob_source`.
+    ExternalBlobSource,
+    /// 410: retained history can no longer reconstruct a change continuation;
+    /// see `change_feed_gap`.
+    ChangeFeedGap,
     NotFound,
     /// 405 Method Not Allowed — the route exists but the active server
     /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
@@ -2181,11 +2200,57 @@ impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
     }
 }
 
+/// Whether a refused or failed operation ran, whether it changed anything,
+/// and what its caller should do next. A server states it on every error
+/// response, computed where that knowledge is; a client that lost the response
+/// knows less, and says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct OutcomeOutput {
+    pub execution: OutcomeExecution,
+    pub effects: OutcomeEffects,
+    pub action: OutcomeAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeExecution {
+    /// The operation took no effect: it was refused, or lost to another before
+    /// anything it staged became reachable.
+    NotStarted,
+    /// The operation may have taken effect.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeEffects {
+    None,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeAction {
+    /// Repeat the same request later, honoring `Retry-After` when present.
+    Retry,
+    /// Read the current state, then decide; repeating unchanged will fail the
+    /// same way.
+    Refresh,
+    /// Resolve the durable recovery intent the error names first.
+    Recover,
+    /// Find out whether the operation took effect before writing again.
+    Reconcile,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<ErrorCode>,
+    /// Whether the operation ran and what to do next. Servers set it on every
+    /// error response; it is absent only from a body built outside a server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<OutcomeOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_conflicts: Vec<MergeConflictOutput>,
     /// Set when the conflict is a publisher CAS rejection. The caller's
@@ -2259,6 +2324,7 @@ impl ErrorOutput {
         Self {
             error: error.into(),
             code: None,
+            outcome: None,
             merge_conflicts: Vec::new(),
             published_dataset_version_conflict: None,
             read_set_conflict: None,

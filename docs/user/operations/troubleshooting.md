@@ -66,11 +66,16 @@ the same way. See [Diagnostics](../queries/diagnostics.md).
 
 ## Failed data-write commands
 
-CLI data-write failures preserve structured details and add `command_outcome`:
+Every server error body, and every CLI data-write failure, carries an `outcome`:
 `execution` is `not_started` or `unknown`, `effects` is `none` or `unknown`, and
-`action` is `retry`, `refresh`, `recover` or `reconcile`. JSON mode writes these
-fields to stdout; human mode prints the action on stderr. HTTP failures also
-retain `http_status` and, when present, the original `retry_after` string.
+`action` is `retry`, `refresh`, `recover` or `reconcile`. The server states it
+for the request it answered: only a write whose completion it could not settle
+is `unknown`, with `code: outcome_unknown`; a refusal, a lost conflict or a read
+failure is `not_started`. The CLI reports the server's outcome when that request
+was the command's only effectful one, and otherwise its own account of the whole
+command, so a lost response is `unknown` with `reconcile`. JSON mode writes the
+failure to stdout; human mode prints the `outcome` line on stderr. HTTP failures
+also retain `http_status` and, when present, the original `retry_after` string.
 
 This includes `commit publish` and `commit drop`, as well as their `mutate`
 statement forms. If a response or result output is lost, inspect the commit's

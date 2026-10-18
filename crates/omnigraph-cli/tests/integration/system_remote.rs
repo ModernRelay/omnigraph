@@ -294,11 +294,8 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
             .arg("--json"),
     );
     let refusal = parse_stdout_json(&output);
-    assert_eq!(
-        refusal["command_outcome"]["execution"], "not_started",
-        "{refusal}"
-    );
-    assert_eq!(refusal["command_outcome"]["effects"], "none", "{refusal}");
+    assert_eq!(refusal["outcome"]["execution"], "not_started", "{refusal}");
+    assert_eq!(refusal["outcome"]["effects"], "none", "{refusal}");
     assert!(refusal.get("http_status").is_none(), "{refusal}");
     assert!(
         refusal["error"]
@@ -683,9 +680,11 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
                 error.get("commit").is_none(),
                 "lost delivery is not success"
             );
-            assert!(
-                error.get("outcome").is_none(),
-                "lost delivery is not success"
+            // A merge's success body names its merge `outcome`; a failure's
+            // `outcome` is the whole command's, and a lost delivery's is unknown.
+            assert_eq!(
+                error["outcome"]["execution"], "unknown",
+                "lost delivery is not success: {error}"
             );
         }
 
@@ -873,7 +872,7 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
                     "{operation}/{fault:?}: {error}"
                 );
                 assert_eq!(
-                    error["command_outcome"],
+                    error["outcome"],
                     json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"}),
                     "{operation}/{fault:?}"
                 );
@@ -1887,7 +1886,7 @@ query insert_person($name: String, $age: I32) {
         let body = parse_stdout_json(output);
         assert_eq!(body["http_status"], status, "{body}");
         assert_eq!(
-            body["command_outcome"],
+            body["outcome"],
             serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
             "{body}"
         );
@@ -2272,7 +2271,7 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     assert_eq!(body["precondition_failure"]["expected"], json!(stale_id));
     assert_eq!(body["http_status"], 412);
     assert_eq!(
-        body["command_outcome"],
+        body["outcome"],
         json!({"execution":"not_started","effects":"none","action":"refresh"})
     );
 

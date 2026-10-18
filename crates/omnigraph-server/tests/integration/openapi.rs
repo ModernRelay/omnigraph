@@ -1478,6 +1478,7 @@ fn change_error_output_schema_matches_every_change_route_detail() {
     for field in [
         "error",
         "code",
+        "outcome",
         "resource_limit",
         "recovery_required",
         "change_feed_gap",
@@ -1490,7 +1491,7 @@ fn change_error_output_schema_matches_every_change_route_detail() {
     }
     assert_eq!(
         props.len(),
-        6,
+        7,
         "change errors must not grow generic storage-conflict details: {props:?}"
     );
 }
@@ -1664,6 +1665,11 @@ fn error_code_schema_has_expected_variants() {
             "bad_request",
             "api_contract_mismatch",
             "actor_mismatch",
+            "outcome_unknown",
+            "precondition_failed",
+            "recovery_required",
+            "external_blob_source",
+            "change_feed_gap",
             "not_found",
             "method_not_allowed",
             "conflict",

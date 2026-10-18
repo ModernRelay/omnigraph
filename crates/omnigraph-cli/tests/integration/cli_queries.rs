@@ -292,7 +292,7 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
         "--json fails closed too: {refusal}"
     );
     assert_eq!(
-        refusal["command_outcome"],
+        refusal["outcome"],
         serde_json::json!({
             "execution":"not_started", "effects":"none", "action":"refresh"
         })
@@ -574,14 +574,14 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
         if verb == "mutate" {
             assert_eq!(actual["http_status"], 400);
             assert_eq!(
-                actual["command_outcome"],
+                actual["outcome"],
                 serde_json::json!({
                     "execution":"unknown", "effects":"unknown", "action":"reconcile"
                 })
             );
             let fields = actual.as_object_mut().unwrap();
             fields.remove("http_status");
-            fields.remove("command_outcome");
+            fields.remove("outcome");
         }
         assert_eq!(
             actual, refusal,
