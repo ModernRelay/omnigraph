@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Cursor};
@@ -3639,41 +3640,77 @@ pub(crate) fn validate_value_constraints(
     node_type: &omnigraph_compiler::catalog::NodeType,
 ) -> Result<()> {
     use arrow_array::Array;
+    use arrow_array::cast::AsArray;
 
-    // Range constraints
+    // Range constraints. A list property bounds each element.
     for rc in &node_type.range_constraints {
         let Some(col) = batch.column_by_name(&rc.property) else {
             continue;
         };
-        for row in 0..batch.num_rows() {
-            if col.is_null(row) {
-                continue;
+        // Nulls are never bounded, so an all-null column has nothing to check
+        // whatever its physical type.
+        if col.logical_null_count() == col.len() {
+            continue;
+        }
+        let bounds = [
+            (rc.min.as_ref(), Ordering::Less, "<", "min"),
+            (rc.max.as_ref(), Ordering::Greater, ">", "max"),
+        ]
+        .map(|(bound, refused, relation, name)| {
+            (bound.map(RangeOperand::bound), refused, relation, name)
+        });
+        let check = |value: RangeOperand| -> Result<()> {
+            if value.is_nan() {
+                return Err(OmniError::manifest(format!(
+                    "@range violation on {}.{}: value is NaN",
+                    node_type.name, rc.property
+                )));
             }
-            let value = extract_numeric_value(col, row);
-            if let Some(val) = value {
-                if val.is_nan() {
+            for (bound, refused, relation, name) in bounds {
+                let Some(bound) = bound else {
+                    continue;
+                };
+                let order = value.compare(bound).ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "@range on {}.{} has a NaN {name} bound",
+                        node_type.name, rc.property
+                    ))
+                })?;
+                if order == refused {
                     return Err(OmniError::manifest(format!(
-                        "@range violation on {}.{}: value is NaN",
+                        "@range violation on {}.{}: value {value} {relation} {name} {bound}",
                         node_type.name, rc.property
                     )));
                 }
-                if let Some(ref min) = rc.min {
-                    let min_f = literal_value_to_f64(min);
-                    if val < min_f {
-                        return Err(OmniError::manifest(format!(
-                            "@range violation on {}.{}: value {} < min {}",
-                            node_type.name, rc.property, val, min_f
-                        )));
+            }
+            Ok(())
+        };
+        let unchecked = |data_type: &DataType| {
+            OmniError::manifest(format!(
+                "@range on {}.{} cannot check values of type {data_type}",
+                node_type.name, rc.property
+            ))
+        };
+        if let DataType::List(_) = col.data_type() {
+            let list = col.as_list::<i32>();
+            let elements = list.values();
+            let values =
+                RangeColumn::new(elements).ok_or_else(|| unchecked(elements.data_type()))?;
+            for (row, span) in list.value_offsets().windows(2).enumerate() {
+                if list.is_null(row) {
+                    continue;
+                }
+                for index in span[0] as usize..span[1] as usize {
+                    if !elements.is_null(index) {
+                        check(values.value(index))?;
                     }
                 }
-                if let Some(ref max) = rc.max {
-                    let max_f = literal_value_to_f64(max);
-                    if val > max_f {
-                        return Err(OmniError::manifest(format!(
-                            "@range violation on {}.{}: value {} > max {}",
-                            node_type.name, rc.property, val, max_f
-                        )));
-                    }
+            }
+        } else {
+            let values = RangeColumn::new(col).ok_or_else(|| unchecked(col.data_type()))?;
+            for row in 0..col.len() {
+                if !col.is_null(row) {
+                    check(values.value(row))?;
                 }
             }
         }
@@ -4022,37 +4059,113 @@ fn explicit_id_matches_node_key(
     Ok(false)
 }
 
-fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
-    use arrow_array::{
-        Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
-    };
-    if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
-        return Some(a.value(row));
-    }
-    None
+/// The values of a `@range` column in their declared type.
+enum RangeColumn<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+    UInt32(&'a UInt32Array),
+    UInt64(&'a UInt64Array),
+    Float32(&'a Float32Array),
+    Float64(&'a Float64Array),
 }
 
-fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
-    use omnigraph_compiler::catalog::LiteralValue;
-    match v {
-        LiteralValue::Integer(n) => *n as f64,
-        LiteralValue::Float(f) => *f,
+impl<'a> RangeColumn<'a> {
+    /// `None` for a type `@range` cannot check, which the caller refuses
+    /// rather than skips.
+    fn new(col: &'a ArrayRef) -> Option<Self> {
+        let any = col.as_any();
+        Some(match col.data_type() {
+            DataType::Int32 => Self::Int32(any.downcast_ref()?),
+            DataType::Int64 => Self::Int64(any.downcast_ref()?),
+            DataType::UInt32 => Self::UInt32(any.downcast_ref()?),
+            DataType::UInt64 => Self::UInt64(any.downcast_ref()?),
+            DataType::Float32 => Self::Float32(any.downcast_ref()?),
+            DataType::Float64 => Self::Float64(any.downcast_ref()?),
+            _ => return None,
+        })
     }
+
+    fn value(&self, row: usize) -> RangeOperand {
+        match self {
+            Self::Int32(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::Int64(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::UInt32(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::UInt64(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::Float32(values) => RangeOperand::Float(values.value(row).into()),
+            Self::Float64(values) => RangeOperand::Float(values.value(row)),
+        }
+    }
+}
+
+/// A `@range` value or bound, compared without rounding. Integers widen to
+/// i128, which holds every I32, I64, U32 and U64 value and every Integer
+/// bound; F32 widens to F64 exactly. An integer and a double compare against
+/// the double's exact value, so a Float bound on an integer property, or an
+/// Integer bound on a float property, rounds neither side.
+#[derive(Clone, Copy)]
+enum RangeOperand {
+    Integer(i128),
+    Float(f64),
+}
+
+impl RangeOperand {
+    fn bound(literal: &omnigraph_compiler::catalog::LiteralValue) -> Self {
+        use omnigraph_compiler::catalog::LiteralValue;
+        match literal {
+            LiteralValue::Integer(value) => Self::Integer((*value).into()),
+            LiteralValue::Float(value) => Self::Float(*value),
+        }
+    }
+
+    fn is_nan(self) -> bool {
+        matches!(self, Self::Float(value) if value.is_nan())
+    }
+
+    /// `None` when either side is NaN.
+    fn compare(self, other: Self) -> Option<Ordering> {
+        match (self, other) {
+            (Self::Integer(left), Self::Integer(right)) => Some(left.cmp(&right)),
+            (Self::Float(left), Self::Float(right)) => left.partial_cmp(&right),
+            (Self::Integer(left), Self::Float(right)) => integer_cmp_float(left, right),
+            (Self::Float(left), Self::Integer(right)) => {
+                integer_cmp_float(right, left).map(Ordering::reverse)
+            }
+        }
+    }
+}
+
+impl fmt::Display for RangeOperand {
+    /// The exact value compared: an integral double prints as its integer,
+    /// since f64's shortest form pads with zeros past 17 digits (2^63 would
+    /// read 9223372036854776000).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Float(value) if value.fract() == 0.0 && value.abs() < i128::MAX as f64 => {
+                write!(f, "{}", value as i128)
+            }
+            Self::Float(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+/// Orders an integer against a double's exact value: the double's integral
+/// part is itself an integer, exact in i128 within i128's range, and when the
+/// two integral parts are equal the double's fraction decides. `None` for NaN.
+fn integer_cmp_float(integer: i128, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    let whole = float.trunc();
+    // `i128::MAX as f64` rounds up to 2^127, above every i128;
+    // `i128::MIN as f64` is -2^127 exactly. Infinities land here too.
+    if whole >= i128::MAX as f64 {
+        return Some(Ordering::Less);
+    }
+    if whole < i128::MIN as f64 {
+        return Some(Ordering::Greater);
+    }
+    Some(integer.cmp(&(whole as i128)).then(whole.total_cmp(&float)))
 }
 
 #[cfg(test)]
@@ -5278,6 +5391,55 @@ node Doc {
         assert!(result.is_err(), "expected NaN to be rejected");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("NaN"), "error should mention NaN: {}", err);
+    }
+
+    /// The schema grammar cannot spell an infinite, NaN or negative-zero
+    /// bound, nor reach i128's edges, so the comparator's corners and the
+    /// spelling of a large integral bound are pinned here; the `.gqt` case
+    /// `range_constraint_compares_integers_exactly` owns the observable
+    /// refusals.
+    #[test]
+    fn range_operands_compare_exactly() {
+        use RangeOperand::{Float, Integer};
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        let two_53 = 9_007_199_254_740_992_i128;
+        let two_63 = 9_223_372_036_854_775_808_i128;
+        for (value, bound, expected) in [
+            (Integer(two_53 + 1), Integer(two_53), Some(Greater)),
+            (Integer(two_53 + 1), Float(two_53 as f64), Some(Greater)),
+            (Integer(two_63), Integer(two_63 - 1), Some(Greater)),
+            (
+                Integer(u64::MAX.into()),
+                Float(18_446_744_073_709_551_616.0),
+                Some(Less),
+            ),
+            (Integer(2), Float(2.5), Some(Less)),
+            (Integer(3), Float(2.5), Some(Greater)),
+            (Integer(-2), Float(-2.5), Some(Greater)),
+            (Integer(-3), Float(-2.5), Some(Less)),
+            (Integer(0), Float(-0.0), Some(Equal)),
+            (Integer(0), Float(-0.5), Some(Greater)),
+            (Integer(-1), Float(-0.5), Some(Less)),
+            (Integer(i128::MAX), Float(f64::INFINITY), Some(Less)),
+            (Integer(i128::MIN), Float(f64::NEG_INFINITY), Some(Greater)),
+            (Integer(i128::MIN), Float(i128::MIN as f64), Some(Equal)),
+            (Integer(i128::MAX), Float(i128::MAX as f64), Some(Less)),
+            (Integer(0), Float(f64::NAN), None),
+            (Float(two_53 as f64), Integer(two_53 + 1), Some(Less)),
+            (Float(0.5), Float(0.5), Some(Equal)),
+            (Float(f64::NAN), Float(0.0), None),
+        ] {
+            assert_eq!(value.compare(bound), expected, "{value} against {bound}");
+        }
+        for (operand, shown) in [
+            (Float(9_223_372_036_854_775_808.0), "9223372036854775808"),
+            (Float(-2.5), "-2.5"),
+            (Float(f64::INFINITY), "inf"),
+            (Integer(u64::MAX.into()), "18446744073709551615"),
+        ] {
+            assert_eq!(operand.to_string(), shown);
+        }
     }
 
     #[test]
