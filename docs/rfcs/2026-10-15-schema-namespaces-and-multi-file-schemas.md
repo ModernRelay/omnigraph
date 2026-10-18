@@ -8,7 +8,7 @@ authors:
   - ragnorc
 created: 2026-10-15
 updated: 2026-10-18
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/issues/838
 supersedes: []
 superseded_by: []
 blocked_on: []
@@ -27,8 +27,12 @@ never decides a type's name. Composition is declared once, in `cluster.yaml` or
 on the command line, and the loader joins the files in a fixed order into one
 canonical source text. Plan, apply, the stored contract, the contract digest and
 the cluster ledger all see that one text, as they see one file today. No storage
-format, IR, ledger or wire shape changes, and a schema given as one file keeps
-byte-identical source and digests. Errors name the file and line.
+format, IR or ledger field changes. A schema given as one file keeps
+byte-identical source and digests, and a single directory path keeps the shape
+of every bundle a server receives. The list form is new `cluster.yaml` syntax
+that servers without this change refuse (see Compatibility). Errors name the
+file and line. This replaces the `import` design that issue #838 proposed (see
+[Relation to issue #838](#relation-to-issue-838)).
 
 **Namespaces.** A declaration may sit in a namespace block,
 `namespace crm { node Contact { … } }`, which gives it the canonical name
@@ -67,10 +71,13 @@ id.
   - `GraphConfig.schema` is one `PathBuf` (`crates/omnigraph-cluster/src/types.rs`).
   - Queries can already be a file, a directory or a list (`QueriesDecl` in
     `crates/omnigraph-cluster/src/config.rs`).
-- **Names are flat.** `type_name = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }`
-  in both grammars, so two templates that each declare `Event` or `OwnedBy`
-  cannot coexist. Edge names are also unique after case folding across the
-  whole graph (`normalize_edge_name` in `catalog/mod.rs`).
+- **Names are flat.** The `.pg` grammar has
+  `type_name = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }`. The `.gq`
+  rule is the same, plus the `@` prefix of the
+  [Engine catalogue](2026-10-16-engine-catalogue.md) types. Two templates that
+  each declare `Event` or `OwnedBy` therefore cannot coexist. Edge names are
+  also unique after case folding across the whole graph (`normalize_edge_name`
+  in `catalog/mod.rs`).
 - **Workarounds don't scale.** A prefix convention such as `Crm_Contact` works
   today and costs nothing. It gives no scope to a query, to a future per-type
   policy rule, or to an author reading a 400-type schema.
@@ -78,6 +85,31 @@ id.
 An issue is not enough: both halves add a grammar surface, and namespaces add a
 spelling that is persisted in `__manifest` table keys and in immutable
 `__history` extents.
+
+### Relation to issue #838
+
+Issue #838 (accepted) asks for `import` statements in `.pg` files. This RFC
+replaces that design: composition is declared once in configuration, and
+namespaces, not imports, give names a scope.
+
+- **Kept from #838:**
+  - one schema split across files;
+  - a core file shared by several graphs of one cluster, as a list entry;
+  - errors that give a file and line;
+  - a server that never opens caller paths, since the bundle carries the
+    composed source.
+- **Dropped:**
+  - named, selective imports;
+  - a `.pg` file that can be checked alone. An editor or a one-file `lint`
+    cannot resolve `core::Named` in `crm.pg` without the declaration that
+    composes the files. `omnigraph lint --schema <dir>` checks a directory;
+  - sharing a core file across clusters, because `check_config_path` refuses
+    `..`.
+- **Decided differently:** #838 includes a definition reached through several
+  paths once. Without imports there is no diamond: a file reaches the
+  composition only by being named. A file named twice, as in
+  `[schema/core.pg, schema/]`, is an error naming both entries, not a silent
+  deduplication.
 
 ## User and operational behavior
 
@@ -95,25 +127,51 @@ graphs:
 omnigraph schema plan --schema schema/ graph.omni
 ```
 
-Discovery copies the `queries:` rules exactly, so one rule covers both.
+Discovery copies the `queries:` rules with one difference, so one rule covers
+both.
 
 - **What a path may name.** A single path may be a file or a directory, and a
   list may mix both.
   - A directory contributes its top-level `*.pg` files, with no recursion.
   - Each directory's files are sorted by path. A list keeps its own order.
+  - A file named twice, directly or through a directory, is an error naming
+    both entries.
 - **Refusals and caps.**
   - Symlinks and `..` components are refused (`check_config_path`).
-  - Reads go through `SourceCapture`, with the same per-file and total byte caps
-    and the same discovery cap as queries.
-  - A directory with no `.pg` file is an error, not a warning, because a graph
-    has to have a schema.
+  - Reads go through `SourceCapture`, with the same per-file cap and the same
+    discovery cap as queries.
+  - The composed source, banners included, is one bundle source, and
+    `validate_bundle` refuses any source above `MAX_CONFIG_SOURCE_BYTES`
+    (1 MiB). A schema therefore stays within 1 MiB, as one file does today;
+    the 8 MiB total cap does not raise that limit.
+  - **The one difference:** a directory with no `.pg` file is an error, while
+    an empty query directory is the warning `query_dir_empty`. A graph has to
+    have a schema.
 - **Composition.**
-  - The composed source is each file's bytes in order. Each file is preceded by
-    a banner line `// file: <path>` and ends with exactly one newline.
-  - `<path>` is relative to the declared directory, or to the `cluster.yaml`
-    directory for list entries.
-  - A schema declared as one file is composed as that file's bytes with no
-    banner, so every existing graph keeps its digest.
+  - The composed source is each file's bytes in order, each ending with exactly
+    one newline.
+  - With two or more files, each file is preceded by a banner line
+    `// file: <path>`. With exactly one file there is no banner, whatever the
+    form of the declaration. Every existing graph therefore keeps its digest,
+    and so does a directory that holds one file.
+  - `<path>` is the path discovery already records for a query file,
+    `declared.join(file_name)` (`config.rs`), relative to the `cluster.yaml`
+    directory and written with `/`. One file has one banner in every form:
+    `schema: schema/`, `schema: [schema/]` and `[schema/a.pg, schema/b.pg]`
+    compose the same bytes.
+  - On the command line (`--schema <dir>`), `<path>` is the directory's final
+    component joined with the file name. The same files then compose the same
+    bytes from any working directory, and the same bytes as a cluster that
+    declares that directory beside its `cluster.yaml`. A graph is applied
+    either standalone or through its cluster, never both (`schema apply`
+    refuses a cluster graph), so the two never compete for one contract.
+  - Banners become part of `source_hash` for every multi-file graph, so their
+    format is a compatibility surface: changing it later gives each such graph
+    a new contract with no schema steps.
+- **Validate and plan output.** `ResourceSummary.path` in `cluster validate`
+  and `plan --json` holds the declared path for a single path. For a list it
+  is absent, and a new optional `paths` field lists the composed files in
+  order. Both are additive to that output.
 - **What sees the composed text.** It is what `schema plan`, `schema apply`,
   the contract's `source`, `source_hash`, the `schema.<graph>` resource digest
   and `schema show` see.
@@ -148,7 +206,9 @@ node Note { body: String }               // the root namespace: today's schemas
 
 - **Paths.** A namespace path is one or more lowercase segments
   `[a-z][a-z0-9_]*` joined by `::`, as in `namespace acme::crm { … }`. The path
-  is flat: `acme::crm` is one namespace, and `acme` gains nothing from it.
+  is flat: `acme::crm` is one namespace, and `acme` gains nothing from it. A
+  segment may not be one of the `.gq` reserved words (`and`, `or`, `not`, `is`,
+  `null`, `in`).
 - **Blocks.**
   - Blocks do not nest.
   - Blocks with the same path merge, across files too.
@@ -219,6 +279,12 @@ query open_deals() {
   names.
 - **Telling a binding from an edge.** The parser decides by the case of the
   final segment, as it decides by the case of the whole name today.
+- **Edges named by reserved words.** Today such an edge is written as a string,
+  `$i "in" $b` (`query.pest`).
+  - The string may hold a qualified name: `$i "crm::in" $b`.
+  - The bare form `$i crm::in $b` is accepted too. After `::` the final segment
+    is never read as a reserved word, because the `::` already marks a name.
+  - Namespace segments themselves are never reserved words (see Paths).
 - **Engine catalogue types.** The built-in types of the
   [Engine catalogue](2026-10-16-engine-catalogue.md) (`@Operator`, `@Setting`
   and the rest) keep their `@` spelling and belong to no namespace. A qualified
@@ -264,12 +330,15 @@ query open_deals() {
     ([Actor views and subgraph sharing](https://github.com/ModernRelay/omnigraph/pull/951))
     stays decided per concrete type.
   - Name resolution for a restricted actor runs on its view catalog, as Actor
-    views specifies: an ambiguous name's candidate list and the
-    unknown-namespace error never name a hidden type or namespace. A rule written over a namespace pattern
-    (`crm::*`) would be sugar, expanded to `StableTypeId`s when the policy is
-    applied, and schema plan would report any move that changes the set.
-  - Type names stay Cedar entity ids (strings) and never become Cedar entity
-    types, because Cedar already uses `::` for those (`Omnigraph::…`).
+    views specifies. An ambiguous name's candidate list and the
+    unknown-namespace error never name a hidden type or namespace.
+  - A rule written over a namespace pattern (`crm::*`) would be sugar, expanded
+    to `StableTypeId`s when the policy is applied. Schema plan would report any
+    move that changes the set.
+  - No type name is a Cedar entity today: the policy engine builds only actor,
+    action, group, graph, server and cluster entities. If per-type policy lands,
+    type names become Cedar entity ids, never entity types, because Cedar
+    already uses `::` for its entity types (`Omnigraph::Actor`).
 
 ### Moving existing types
 
@@ -287,10 +356,33 @@ namespace crm {
   - Old commits keep `node:Contact` in their immutable history extents.
     Historical reads rebind by identity (`bind_catalog_aliases`), so they keep
     working.
-- **Prerequisite: refuse dropping populated types.** A move without
+- **Hints are canonical names.** A `@rename_from` hint is always the canonical
+  name of an accepted declaration. The in-namespace reference rule never
+  applies to it:
+  - `@rename_from("Contact")` always means the root `Contact`;
+  - `@rename_from("crm::Contact")` moves a type out of `crm`, or to another
+    namespace.
+
+  The resolver already looks a hint up as an accepted name. Its
+  `IgnoredExactMatchRenameHint` diagnostic still applies when the new
+  canonical name already exists.
+- **A probable move without a hint fails closed.** A move without
   `@rename_from` plans today as `DropType` plus `AddType`, and a populated drop
-  is accepted silently (issue #984). With namespaces that mistake becomes easy,
-  so populated drops must fail closed, owned by #984, before namespaces ship.
+  is accepted silently (issue #984, currently undecided). Namespaces make that
+  mistake easy, so this RFC owns a narrow refusal:
+  - **What is refused.** A plan that drops a populated declaration and adds one
+    of the same kind with the same final segment in another namespace (root
+    `X` to `crm::X`, `crm::X` to `hr::X`, or back to the root), with no
+    `@rename_from`.
+  - **The refusal.** A new migration code, allocated at implementation, whose
+    message names the two declarations and suggests `@rename_from`.
+  - **Dropping and re-creating on purpose.** Split it into two applies: drop
+    in one, add in the next.
+  - **Why it is safe.** The refusal infers no identity and changes nothing it
+    accepts, so invariant 6 holds. Ordinary populated drops keep their current
+    behavior, which #984 decides separately.
+  - **No existing graph is affected.** The pattern needs a qualified name, so
+    no plan that runs today can trigger it.
 - **Interfaces wait.** Interfaces cannot be renamed today, so existing
   interfaces cannot move until
   [Polymorphic types](https://github.com/ModernRelay/omnigraph/pull/884) lands
@@ -389,9 +481,31 @@ declined namespaces partly because "adding a field can break queries". Gel
 resolves within one active module and never searches others.
 
 The rule here goes one step stricter. A name either resolves to exactly one
-declaration among the root and the `use`d namespaces, or it is an error. Every
-name is bound at compile time to a `StableTypeId` in the typed IR, so a later
-schema change can produce a loud plan-time error but never a different binding.
+declaration among the root and the `use`d namespaces, or it is an error.
+
+The compiler resolves every name to its canonical name. The IR carries that
+canonical name (`IROp::NodeScan { type_name }`,
+`IROp::Expand { src_type, dst_type }`), and the planner and engine find tables
+by it (`node:{type_name}`), not by `StableTypeId`. Four existing mechanisms keep
+that safe, and the fifth arrives with Polymorphic types:
+1. **One snapshot per query** (invariant 3), so the name lookup and the catalog
+   agree for the whole run.
+2. **Stored queries are type-checked again** at `cluster plan`
+   (`validate_query_source`), at apply and at server load, so a schema change
+   that breaks one is caught before it serves.
+3. **The resolver gives an exact `(kind, name)` match priority over a hint**
+   (`resolve` in `catalog/schema_ir.rs`). One apply therefore cannot release a
+   name and reuse it with the same kind: `node Beta @rename_from("Alpha")` plus
+   a new `node Alpha` is refused as "consumed by more than one desired
+   declaration".
+4. **The exactly-one rule above.**
+5. **Registry pinning** by kind and `StableTypeId`, which
+   [Polymorphic types](https://github.com/ModernRelay/omnigraph/pull/884)
+   adds for stored queries.
+
+A later schema change can produce a loud plan-time error, but not a silent
+rebinding of a stored query. Carrying ids in the query IR would change the
+planner and engine as well as the compiler; it is outside this RFC.
 
 **Files and namespaces stay independent.** Protobuf made packages independent of
 files and the ecosystem pushed them back together with lint (Buf
@@ -424,8 +538,9 @@ Where they meet, this is how they compose.
   - edge alternations (`(crm::ownedBy | hr::ownedBy)`).
 
   In a union, each member resolves on its own. The grammar has one
-  `type_ref = (segment "::")* type_name` rule that both RFCs use, so they never
-  grow two spellings.
+  `qualified_type_name = (segment "::")* type_name` rule that both RFCs use, so
+  they never grow two spellings. The name avoids `type_ref`, which both grammars
+  already use for property and parameter types.
 - **Interfaces span namespaces.** An interface's member set is its concrete
   implementors in any namespace. `$x: core::Named` reads `crm::Contact` and
   `hr::Employee` alike. Namespaces never filter membership; a query narrows
@@ -511,11 +626,15 @@ with a one-component id.
 - **6, identity from stable ids.** A namespace is part of a name. Moves are
   renames that must be declared; nothing infers identity from a name, a
   namespace, a file or a path.
-- **8, loud failures.** Ambiguous names, unknown namespaces, duplicate
-  declarations across files, reserved names and populated drops (#984) are
-  typed refusals.
-- **9, typed semantics.** `use` and qualified names are AST and IR structures.
-  Resolution finishes in the compiler, and execution sees only type ids.
+- **8, loud failures.** These are typed refusals:
+  - ambiguous names and unknown namespaces;
+  - duplicate declarations across files, and a file named twice;
+  - reserved names;
+  - a probable move without `@rename_from`.
+- **9, typed semantics.** `use` and qualified names are AST structures.
+  Resolution finishes in the compiler against the query's snapshot. The IR and
+  execution receive only resolved canonical names, never a relative or
+  unresolved one.
 - **12, one source of truth.** No namespace registry exists, and the composed
   source is the only stored schema text. File layout is not persisted; the
   repository owns it.
@@ -523,10 +642,25 @@ with a one-component id.
 
 ## Compatibility and reversibility
 
-- **Multi-file schemas.** There is no storage stamp, IR, ledger or HTTP change.
-  A single-file schema keeps byte-identical source and digests, and
-  `cluster.yaml` gains an untagged alternative, a minor change under the
-  compatibility-surfaces RFC.
+- **Multi-file schemas.**
+  - **No format changes.** There is no storage stamp, IR or ledger field
+    change, and a single-file schema keeps byte-identical source and digests.
+  - **The `cluster.yaml` change.** It gains an untagged alternative, a minor
+    change under the compatibility-surfaces RFC.
+  - **The single-path form is safe across versions.** A file or one directory
+    stays a string in `config_semantics`, the JSON of the whole
+    `RawClusterConfig` that a deployment bundle carries to the server
+    (`PlanRequest`, `DeploymentRequest`) and stores as `deployment/{digest}.json`.
+    A server reads only the composed source from the bundle, so any version
+    accepts it.
+  - **The list form is a skew rule.** It is a JSON array where an older server
+    expects a path. `validate_bundle` re-parses `config_semantics` into
+    `RawClusterConfig`, so an older server refuses the bundle with
+    `deployment_input_invalid`, and an older binary refuses a stored bundle
+    that holds one. This fails closed. Use the list form only once every server
+    and binary that receives or reads the cluster's bundles has this change.
+  - **CLI JSON.** `cluster validate` and `plan --json` gain the optional
+    `ResourceSummary.paths` field, an additive change to that surface.
 - **Namespaces.**
   - PG and GQ grammars gain a block, a `use` line and qualified names, all minor
     changes. Neither adds a reserved word, so every accepted schema and query
@@ -544,7 +678,7 @@ with a one-component id.
 | Alternative | Reason not selected |
 |---|---|
 | A prefix convention (`Crm_Contact`) | Works today with no engine change, and stays the baseline until a need appears. It gives no query scope, no policy scope, and edge names still collide across the graph. |
-| `import "./x.pg"` between files | With declared namespaces, imports add cycle and order rules and nothing else. Protobuf shows file imports leak file structure to callers (`import public`, Buf `IMPORT_NO_PUBLIC`). Composition is declared once, in configuration. |
+| `import "./x.pg"` between files (issue #838) | With declared namespaces, imports add cycle and order rules and nothing else. Protobuf shows file imports leak file structure to callers (`import public`, Buf `IMPORT_NO_PUBLIC`). Composition is declared once, in configuration. The cost of that choice: a `.pg` file does not describe itself, so an editor or a one-file `lint` needs the composing declaration to resolve a name from another file. |
 | File or directory = namespace (Go, TypeScript) | Ties persisted names to file layout: moving or renaming a file becomes a schema migration, and templates copied into different folders get different type names. |
 | File-scoped `namespace crm;` header | Breaks joining files by concatenation, unless the loader rewrites the text, so the stored source would no longer be the files' bytes. Possible later as sugar the composer expands. |
 | Namespace as a separate IR field | New uniqueness and sort keys, a namespace copy in every IR reference type and a new planner step, while every wire surface still needs one string. |
@@ -579,9 +713,24 @@ Tests extend the existing owners in [testing](../dev/testing.md):
     and a move into a namespace producing `RenameType`.
   - Query parser and typecheck tests: `use`, ambiguity, unknown namespaces, and
     the binding/edge choice by final segment.
-- **Cluster.** Config tests that mirror the `QueriesDecl` tests: directory,
-  list, symlink and `..` refusal, caps, an empty directory, sorted order, and an
-  unchanged digest for the single-path form.
+- **Cluster.**
+  - Config tests that mirror the `QueriesDecl` tests: directory, list, symlink
+    and `..` refusal, caps, an empty directory, a file named twice, sorted
+    order, and an unchanged digest for the single-path form.
+  - `schema: schema/`, `schema: [schema/]` and the explicit file list compose
+    identical bytes, and the composed 1 MiB bound refuses one byte more.
+  - The list form sent through `validate_bundle`, pinning the skew rule.
+- **Refusal and compatibility.**
+  - `crates/omnigraph/src/db/catalog_tests.rs` already proves that an unknown
+    feature name refuses open before any effect. Adding `namespaces` there pins
+    the older-binary refusal; the envelope gate in `schema_state.rs` runs before
+    the source is parsed.
+  - A probable move without `@rename_from` is refused with its code, while an
+    ordinary populated drop plans as it does today.
+  - `.gqt` cases under `crates/omnigraph-gqt/cases/` for the ambiguity,
+    unknown-namespace and reserved-segment errors.
+  - A regression row proving that a property named `namespace` or `use`, an
+    edge `Use` and the alias `as use` keep parsing. All four work today.
 - **CLI.**
   - `--schema <dir>` for every command that takes a schema.
   - Errors with `file:line`.
@@ -605,16 +754,17 @@ Tests extend the existing owners in [testing](../dev/testing.md):
    - The shared loader and source map, `SchemaDecl` in `cluster.yaml`, and
      `--schema <dir>`.
    - No format change.
-2. **Fail-closed populated drops (#984).** A prerequisite for step 3.
-3. **Namespaces.**
+2. **Namespaces.**
    - `.pg` blocks and the `namespaces` IR feature.
+   - The refusal of a probable move without `@rename_from`, in the same change
+     as the blocks.
    - `.gq` qualified names and `use`.
    - Qualified names on every wire surface.
    - The selector and GQT parser fixes.
-4. **Moving interfaces.** Follows interface `@rename_from` in Polymorphic
+3. **Moving interfaces.** Follows interface `@rename_from` in Polymorphic
    types. Abstract bindings, unions and polymorphic endpoints take qualified
    names whenever both RFCs have shipped, in either order.
-5. **Later, each on demand.**
+4. **Later, each on demand.**
    - Namespace-scoped per-type policy rules.
    - A layout lint.
    - A helper that writes `@rename_from` hints for a bulk move.
@@ -625,10 +775,6 @@ Tests extend the existing owners in [testing](../dev/testing.md):
 - **Where `use` binds.** It applies per query text here. Gel binds per
   statement (`with module`). Is a per-query clause better for stored queries
   that share a file?
-- **File banners.** They make `schema show` readable and let tools split the
-  stored text, but they also become part of the digest of every multi-file graph.
-  The alternative is no banners, with source maps on the client only, as Gel
-  does.
 - **Recursive discovery.** It matches `queries:` (top level only) here. Should
   both recurse together?
 - **Bulk moves.** Are per-type `@rename_from` hints enough, or is a block-level
@@ -666,3 +812,17 @@ protected. A move respells integer-identity handles, which parse at their
 last `:`. Added the GQT load-plan and `type`/`cast` parsers to the fix list,
 view-catalog name resolution from Actor views, and the block form of a
 namespaced interface declaration.
+
+2026-10-18: answered the first review:
+- linked issue #838 as the discussion and recorded which of its needs this
+  design keeps, drops or decides differently;
+- replaced the #984 prerequisite with a narrow refusal this RFC owns, a
+  probable move without `@rename_from`;
+- restated the safety argument on the mechanisms that exist, since the query
+  IR carries canonical names rather than `StableTypeId`;
+- stated the list-form skew rule for `config_semantics` and the new
+  `ResourceSummary.paths`;
+- fixed one banner path rule, the composed 1 MiB bound, the error for a file
+  named twice, canonical rename hints, reserved-word segments, quoted
+  qualified edges and the `qualified_type_name` rule name;
+- added refusal and compatibility tests.
