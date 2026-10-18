@@ -3825,15 +3825,15 @@ mod local_serving {
         graph: &Path,
         access: omnigraph_server::LocalAccess,
     ) -> (AppState, String) {
-        let binding = omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap();
-        let (state, credential) = AppState::local(
+        let binding = omnigraph_server::LocalBinding::local(graph).unwrap();
+        let (state, credential) = omnigraph_server::with_local_read_write(AppState::local(
             omnigraph_server::LocalScope::Graph(binding),
             omnigraph_server::LocalOptions {
                 access,
                 actor: Some("act-local".into()),
                 process_defaults: omnigraph_server::ProcessDefaults::default(),
             },
-        )
+        ))
         .await
         .unwrap();
         (state, credential.reveal())

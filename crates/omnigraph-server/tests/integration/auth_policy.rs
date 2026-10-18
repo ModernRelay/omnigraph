@@ -3609,15 +3609,15 @@ async fn local_app(
     access: omnigraph_server::LocalAccess,
     actor: Option<&str>,
 ) -> (axum::Router, String) {
-    let binding = omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap();
-    let (state, credential) = AppState::local(
+    let binding = omnigraph_server::LocalBinding::local(graph).unwrap();
+    let (state, credential) = omnigraph_server::with_local_read_write(AppState::local(
         omnigraph_server::LocalScope::Graph(binding),
         omnigraph_server::LocalOptions {
             access,
             actor: actor.map(str::to_string),
             process_defaults: omnigraph_server::ProcessDefaults::default(),
         },
-    )
+    ))
     .await
     .unwrap();
     (build_app(state), credential.reveal())
@@ -3697,16 +3697,33 @@ async fn a_read_only_local_server_reads_and_refuses_every_write_before_its_body(
 async fn a_read_write_local_server_acts_as_its_actor_and_grants_no_more() {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
-    let refused = AppState::local(
-        omnigraph_server::LocalScope::Graph(
-            omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap(),
+    // Read-write is not available yet: only the test scope opens it.
+    let gated = AppState::local(
+        omnigraph_server::LocalScope::Graph(omnigraph_server::LocalBinding::local(&graph).unwrap()),
+        omnigraph_server::LocalOptions {
+            access: omnigraph_server::LocalAccess::ReadWrite,
+            actor: Some("act-local".into()),
+            process_defaults: omnigraph_server::ProcessDefaults::default(),
+        },
+    )
+    .await
+    .err()
+    .expect("read-write is gated");
+    assert!(
+        matches!(
+            gated,
+            omnigraph_server::LocalOpenError::ReadWriteUnavailable
         ),
+        "{gated}"
+    );
+    let refused = omnigraph_server::with_local_read_write(AppState::local(
+        omnigraph_server::LocalScope::Graph(omnigraph_server::LocalBinding::local(&graph).unwrap()),
         omnigraph_server::LocalOptions {
             access: omnigraph_server::LocalAccess::ReadWrite,
             actor: None,
             process_defaults: omnigraph_server::ProcessDefaults::default(),
         },
-    )
+    ))
     .await
     .err()
     .expect("a read-write local server without an actor is refused");
@@ -3772,16 +3789,16 @@ async fn a_local_server_refuses_a_graph_inside_a_cluster() {
         omnigraph_server::LocalAccess::ReadOnly,
         omnigraph_server::LocalAccess::ReadWrite,
     ] {
-        let refused = AppState::local(
+        let refused = omnigraph_server::with_local_read_write(AppState::local(
             omnigraph_server::LocalScope::Graph(
-                omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap(),
+                omnigraph_server::LocalBinding::local(&graph).unwrap(),
             ),
             omnigraph_server::LocalOptions {
                 access,
                 actor: Some("act-local".into()),
                 process_defaults: omnigraph_server::ProcessDefaults::default(),
             },
-        )
+        ))
         .await
         .err()
         .expect("a graph inside a cluster is refused");

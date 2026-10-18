@@ -26,21 +26,71 @@ use crate::{AppState, GraphId, GraphKey, McpSettings, ProcessDefaults, workload}
 pub enum LocalAccess {
     /// Reads and exports only; every write route refuses before its body.
     ReadOnly,
-    /// Also changes, branch controls and unpublished-commit controls.
+    /// Also changes, branch controls and unpublished-commit controls. Not
+    /// available yet: [`AppState::local`] refuses it with
+    /// [`LocalOpenError::ReadWriteUnavailable`] while a write whose outcome
+    /// is unknown still stops the server that ran it.
     ReadWrite,
 }
 
-/// The destination a local server opens, captured once by its caller.
+#[cfg(any(test, feature = "test-util"))]
+tokio::task_local! {
+    static READ_WRITE_FOR_TESTS: ();
+}
+
+/// Run `future` with read-write local servers available to the
+/// [`AppState::local`] calls it makes on its own task. Tests only: the
+/// read-write path exists before its availability, and a build with this
+/// feature still refuses read-write everywhere outside this scope.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn with_local_read_write<F: std::future::Future>(future: F) -> F::Output {
+    READ_WRITE_FOR_TESTS.scope((), future).await
+}
+
+/// Whether this call may open a read-write local server.
+fn read_write_available() -> bool {
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        READ_WRITE_FOR_TESTS.try_with(|_| ()).is_ok()
+    }
+    #[cfg(not(any(test, feature = "test-util")))]
+    {
+        false
+    }
+}
+
+/// The destination a local server opens, captured once by its caller: a root
+/// on this machine's file system.
+///
+/// A remote root's endpoint and credentials would come from the process
+/// environment when it opens, which a captured binding must not depend on,
+/// so a local server serves local roots only until a binding carries the
+/// storage settings its caller resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalBinding {
     root: String,
 }
 
 impl LocalBinding {
-    /// A binding for a graph root the caller resolved, normalized as the
-    /// engine normalizes roots.
-    pub fn from_root(root: &str) -> Result<Self, LocalOpenError> {
-        let root = omnigraph::storage::normalize_root_uri(root)
+    /// A binding for the root at `path`, made absolute and normalized as the
+    /// engine normalizes roots. A URI, `file://` included, is refused: pass
+    /// the path it names.
+    pub fn local(path: impl AsRef<std::path::Path>) -> Result<Self, LocalOpenError> {
+        let path = path.as_ref();
+        let text = path.to_str().ok_or_else(|| {
+            LocalOpenError::Root(format!("{} is not a UTF-8 path", path.display()))
+        })?;
+        if text.contains("://") {
+            return Err(LocalOpenError::Root(format!(
+                "a local server serves a root on this machine's file system, not {text}"
+            )));
+        }
+        let absolute = std::path::absolute(path)
+            .map_err(|error| LocalOpenError::Root(format!("{}: {error}", path.display())))?;
+        let absolute = absolute.to_str().ok_or_else(|| {
+            LocalOpenError::Root(format!("{} is not a UTF-8 path", absolute.display()))
+        })?;
+        let root = omnigraph::storage::normalize_root_uri(absolute)
             .map_err(|error| LocalOpenError::Root(error.to_string()))?;
         Ok(Self { root })
     }
@@ -87,6 +137,11 @@ impl fmt::Debug for LocalCredential {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LocalOpenError {
+    /// `ReadWrite` is not available yet; serve read-only.
+    #[error(
+        "a read-write local server is not available yet: a write whose outcome is unknown would stop it; serve read-only"
+    )]
+    ReadWriteUnavailable,
     /// `ReadWrite` needs an actor to attribute writes to.
     #[error("a read-write local server needs an actor: pass --as or set operator.actor")]
     ActorRequired,
@@ -243,6 +298,9 @@ impl AppState {
         scope: LocalScope,
         options: LocalOptions,
     ) -> Result<(AppState, LocalCredential), LocalOpenError> {
+        if options.access == LocalAccess::ReadWrite && !read_write_available() {
+            return Err(LocalOpenError::ReadWriteUnavailable);
+        }
         let LocalScope::Graph(binding) = scope;
         let actor = match (options.access, options.actor) {
             (_, Some(actor)) => actor,
@@ -356,6 +414,99 @@ mod tests {
                     .allowed
             );
         }
+    }
+
+    #[test]
+    fn a_local_binding_is_an_absolute_path_and_never_a_uri() {
+        let binding = LocalBinding::local("relative/graph.omni").unwrap();
+        assert!(
+            std::path::Path::new(binding.root()).is_absolute(),
+            "{binding:?}"
+        );
+        assert!(
+            binding.root().ends_with("relative/graph.omni"),
+            "{binding:?}"
+        );
+        for uri in [
+            "s3://bucket/graph",
+            "az://container/graph",
+            "file:///tmp/graph",
+        ] {
+            assert!(
+                matches!(LocalBinding::local(uri), Err(LocalOpenError::Root(_))),
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_write_opens_only_inside_the_test_scope() {
+        let options = || LocalOptions {
+            access: LocalAccess::ReadWrite,
+            actor: Some("act-me".into()),
+            process_defaults: ProcessDefaults::default(),
+        };
+        let scope = || LocalScope::Graph(LocalBinding::local("/nonexistent/graph.omni").unwrap());
+        assert!(matches!(
+            AppState::local(scope(), options()).await,
+            Err(LocalOpenError::ReadWriteUnavailable)
+        ));
+        // Inside the scope the gate passes and the open itself fails.
+        let opened = with_local_read_write(AppState::local(scope(), options())).await;
+        assert!(
+            !matches!(opened, Err(LocalOpenError::ReadWriteUnavailable)),
+            "{:?}",
+            opened.err()
+        );
+    }
+
+    /// The engine refuses a write the HTTP layer never sees: an embedder
+    /// holding a read-only local server's graph handle cannot change it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_only_local_servers_engine_refuses_a_direct_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("graph.omni");
+        std::fs::create_dir_all(&root).unwrap();
+        Omnigraph::init(
+            root.to_str().unwrap(),
+            "node Person {\n    name: String @key\n}\n",
+        )
+        .await
+        .unwrap();
+        let (state, _) = AppState::local(
+            LocalScope::Graph(LocalBinding::local(&root).unwrap()),
+            LocalOptions {
+                access: LocalAccess::ReadOnly,
+                actor: Some("act-me".into()),
+                process_defaults: ProcessDefaults::default(),
+            },
+        )
+        .await
+        .ok()
+        .unwrap();
+        let key = GraphKey::cluster(GraphId::try_from("default").unwrap());
+        let crate::registry::RegistryLookup::Ready(view) = state.routing.registry.get(&key) else {
+            panic!("the local graph is served");
+        };
+        let session = omnigraph::Session::from_defaults(
+            view.handle().engine.clone(),
+            omnigraph::settings::SessionSettings::default(),
+        );
+        let mut params: omnigraph_compiler::ParamMap = Default::default();
+        params.insert(
+            "name".to_string(),
+            omnigraph_compiler::Literal::String("Direct".to_string()),
+        );
+        let refused = session
+            .mutate_as(
+                "main",
+                "query add($name: String) { insert Person { name: $name } }",
+                "add",
+                &params,
+                Some("act-me"),
+            )
+            .await;
+        assert!(matches!(refused, Err(OmniError::Policy(_))), "{refused:?}");
     }
 
     #[test]

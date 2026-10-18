@@ -539,17 +539,25 @@ snapshot and trust binding together.
 A local server serves one standalone graph to clients of the same OS account.
 `AppState::local(LocalScope::Graph(binding), options)` opens it and returns
 its state with a `LocalCredential`: one generated bearer token, revealed once,
-never printed by `Debug`, and held by the server only as a hash. It refuses a
-root inside a cluster (`LocalOpenError::ClusterGraph`) and takes no cluster
+never printed by `Debug`, and held by the server only as a hash.
+`LocalBinding::local(path)` takes a root on this machine's file system, made
+absolute, and refuses a URI: a remote root's endpoint and credentials would
+come from the process environment when it opens, so remote roots wait for a
+binding that carries the storage settings its caller resolved. `local` refuses
+a root inside a cluster (`LocalOpenError::ClusterGraph`) and takes no cluster
 admission. It installs a generated Cedar policy for its one actor on the engine
 as well as at the HTTP layer, and `local.rs` gives every `PolicyAction` a local
 class: reads and exports always; changes and branch and commit controls only
 for `LocalAccess::ReadWrite`, which requires an actor; `graph_list` as the
 server-scoped grant; schema apply, administration, stored queries and
-configuration never. A read-only local server opens its graph read-only and
-refuses every write-class route in ingress before reading the body. No local
-server mounts a `/cluster/*` route; each enables MCP ad-hoc reads and lists MCP
-write tools only when it writes.
+configuration never. `ReadWrite` is refused with
+`LocalOpenError::ReadWriteUnavailable` until a write whose outcome is unknown
+no longer stops the server that ran it; the `test-util` feature's
+`with_local_read_write` scope opens it for tests alone. A read-only local
+server opens its graph read-only and refuses every write-class route in
+ingress before reading the body, and its engine policy refuses every writer
+the HTTP layer does not see. No local server mounts a `/cluster/*` route; each
+enables MCP ad-hoc reads and lists MCP write tools only when it writes.
 
 `start_local(state, listener, extend)` installs, on a loopback listener the
 caller bound, the lifecycle `serve` runs: the signal and uncertain-owner
@@ -557,13 +565,20 @@ listener, the shutdown watchdog, graceful HTTP shutdown and the logical-owner
 drain. `extend` adds the caller's outermost layers to the router. Every
 lifecycle registers its `SIGTERM` and `SIGINT` handlers before it returns, so
 a caller announces readiness between `start_local` and `LocalServing::serve`,
-and a signal in that window stops the server gracefully. `serve` writes
+and a signal in that window stops the server gracefully. Tokio keeps those
+handlers for the rest of the process, so after `start_local` a `SIGTERM` or
+`SIGINT` no longer ends it by default, even once `serve` returns or an
+unserved `LocalServing` is dropped; a caller that keeps running installs its
+own handling. `serve` writes
 nothing to stdout, disarms the watchdog when it returns, and reports
 `ServeOutcome::Uncertain` instead of exiting; the caller exits 2.
-`serve_local` is the two calls in one.
+`serve_local` is the two calls in one; both refuse a listener off loopback
+and a state `AppState::local` did not build. They do not check a request's
+`Host` or `Origin`: a caller a browser can reach adds that guard in `extend`
+(an exact loopback `Host`, a refused `Origin`, no CORS header and
+`Cross-Origin-Resource-Policy: same-origin`), as `omnigraph serve` does.
 `install_log_subscriber(writer)` installs the `init_tracing` filter on another
-writer. A read-write local server is not fenced against another process writing
-the same graph; keep one writer per graph.
+writer.
 
 ## Azure boundary
 
