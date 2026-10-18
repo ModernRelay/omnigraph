@@ -5828,3 +5828,131 @@ fn login_and_credential_get_follow_the_target_credential_owner() {
         "{refused:?}"
     );
 }
+
+/// `access` says what the caller may do: a cluster graph's applied policy
+/// decides for the declared actor, a standalone graph without a policy allows
+/// everything, and a server answers through its access route with the target's
+/// token.
+#[test]
+fn access_reports_what_the_caller_may_do_at_a_target() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
+    let actions = |report: &Value, key: &str| -> Vec<String> {
+        report[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key}: {report}"))
+            .iter()
+            .map(|action| action.as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // A cluster graph: its applied policy decides for the declared actor.
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
+    let decide = |actor: Option<&str>, branch: &str| -> Value {
+        let mut command = cli();
+        command
+            .arg("access")
+            .arg("--cluster")
+            .arg(cluster.path())
+            .args(["--graph", "knowledge", "--branch", branch, "--json"]);
+        if let Some(actor) = actor {
+            command.args(["--as", actor]);
+        }
+        parse_stdout_json(&output_success(&mut command))
+    };
+    let feature = decide(Some("act-bruno"), "feature");
+    assert_eq!(feature["source"], "direct", "{feature}");
+    assert_eq!(feature["graph_id"], "knowledge");
+    assert_eq!(feature["actor"], "act-bruno");
+    assert!(
+        actions(&feature, "actions").contains(&"change".to_string()),
+        "{feature}"
+    );
+    let main = decide(Some("act-bruno"), "main");
+    assert!(
+        actions(&main, "actions").contains(&"read".to_string()),
+        "{main}"
+    );
+    assert!(
+        !actions(&main, "actions").contains(&"change".to_string()),
+        "{main}"
+    );
+    let nobody = decide(None, "feature");
+    assert!(actions(&nobody, "graph_wide").is_empty(), "{nobody}");
+    assert!(actions(&nobody, "actions").is_empty(), "{nobody}");
+
+    // A standalone graph without a policy allows every action.
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let home = tempdir().unwrap();
+    let rows = IntentReply::json(
+        200,
+        json!({
+            "actor":"act-me", "graph_id":"knowledge", "graph_wide":["read"],
+            "branch":"main", "target_branch":null, "actions":["read","change"]
+        }),
+    );
+    let served = IntentApiFixture::graph(vec![rows]);
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "target_config_version: 1\ntargets:\n  \
+             local:\n    kind: direct\n    scope: graph\n    uri: '{}'\n  \
+             served:\n    kind: server\n    endpoint: '{}'\n    credential: served\n    default_graph: knowledge\n",
+            graph.to_string_lossy(),
+            served.origin
+        ),
+    )
+    .unwrap();
+    let local = parse_stdout_json(&output_success(
+        cli().env("OMNIGRAPH_HOME", home.path()).args([
+            "access",
+            "--target",
+            "local",
+            "--branch",
+            "main",
+            "--target-branch",
+            "feature",
+            "--json",
+        ]),
+    ));
+    assert_eq!(local["target"], "local");
+    assert_eq!(local["source"], "direct");
+    for action in [
+        "read",
+        "change",
+        "branch_create",
+        "branch_merge",
+        "commit_publish",
+    ] {
+        assert!(
+            actions(&local, "actions").contains(&action.to_string()),
+            "{action}: {local}"
+        );
+    }
+
+    // A server target asks its access route, with the target's token.
+    let report = parse_stdout_json(&output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_TOKEN_SERVED", "served-token")
+            .args(["access", "--target", "served", "--branch", "main", "--json"]),
+    ));
+    assert_eq!(report["source"], "server", "{report}");
+    assert_eq!(report["target"], "served");
+    assert_eq!(actions(&report, "actions"), ["read", "change"]);
+    let requests = served.workflow_requests();
+    let request = requests.last().unwrap();
+    assert_eq!(request.method, "GET");
+    assert!(
+        request.path.starts_with("/graphs/knowledge/access"),
+        "{}",
+        request.path
+    );
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer served-token")
+    );
+    served.assert_complete();
+}

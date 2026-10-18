@@ -174,6 +174,8 @@ pub(crate) struct ProtocolsOutput {
     pub(crate) target: u32,
     /// `credential get --json`.
     pub(crate) credential: u32,
+    /// `access --json`.
+    pub(crate) access: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +217,7 @@ impl VersionOutput {
             protocols: ProtocolsOutput {
                 target: crate::targets::TARGET_PROTOCOL,
                 credential: crate::targets::TARGET_PROTOCOL,
+                access: crate::targets::TARGET_PROTOCOL,
             },
         }
     }

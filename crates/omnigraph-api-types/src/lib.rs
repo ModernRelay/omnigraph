@@ -1861,6 +1861,24 @@ pub enum AccessAction {
     InvokeQuery,
 }
 
+impl From<AccessAction> for omnigraph_policy::PolicyAction {
+    fn from(access: AccessAction) -> Self {
+        use omnigraph_policy::PolicyAction as P;
+        match access {
+            AccessAction::Read => P::Read,
+            AccessAction::Export => P::Export,
+            AccessAction::Change => P::Change,
+            AccessAction::SchemaApply => P::SchemaApply,
+            AccessAction::BranchCreate => P::BranchCreate,
+            AccessAction::BranchDelete => P::BranchDelete,
+            AccessAction::BranchMerge => P::BranchMerge,
+            AccessAction::CommitPublish => P::CommitPublish,
+            AccessAction::CommitDrop => P::CommitDrop,
+            AccessAction::InvokeQuery => P::InvokeQuery,
+        }
+    }
+}
+
 /// What the caller's own credential may do on one graph, by the graph's
 /// installed policy. It names actions, never the rules that allow them, and
 /// says nothing about any other actor.
@@ -1882,6 +1900,73 @@ pub struct AccessOutput {
     /// target. With `target_branch` as well, also `branch_create` and
     /// `branch_merge` from `branch` into it. Empty without `branch`.
     pub actions: Vec<AccessAction>,
+}
+
+impl AccessOutput {
+    /// Decide every action in the shape a policy decides it: graph-wide; on
+    /// `branch` (`read`, `export` and `change` as the request's branch, the
+    /// branch-targeted actions as its target); and from `branch` to
+    /// `target_branch` for `branch_create` and `branch_merge`. `allowed`
+    /// is the decision for one action with its branch and target branch.
+    pub fn evaluate<E>(
+        actor: Option<String>,
+        graph_id: String,
+        branch: Option<String>,
+        target_branch: Option<String>,
+        mut allowed: impl FnMut(AccessAction, Option<&str>, Option<&str>) -> Result<bool, E>,
+    ) -> Result<Self, E> {
+        use AccessAction as A;
+        let mut graph_wide = Vec::new();
+        for access in [
+            A::Read,
+            A::Export,
+            A::Change,
+            A::SchemaApply,
+            A::BranchCreate,
+            A::BranchDelete,
+            A::BranchMerge,
+            A::CommitPublish,
+            A::CommitDrop,
+            A::InvokeQuery,
+        ] {
+            if allowed(access, None, None)? {
+                graph_wide.push(access);
+            }
+        }
+        let mut actions = Vec::new();
+        if let Some(branch) = branch.as_deref() {
+            for access in [A::Read, A::Export, A::Change] {
+                if allowed(access, Some(branch), None)? {
+                    actions.push(access);
+                }
+            }
+            for access in [
+                A::SchemaApply,
+                A::BranchDelete,
+                A::CommitPublish,
+                A::CommitDrop,
+            ] {
+                if allowed(access, None, Some(branch))? {
+                    actions.push(access);
+                }
+            }
+            if let Some(target) = target_branch.as_deref() {
+                for access in [A::BranchCreate, A::BranchMerge] {
+                    if allowed(access, Some(branch), Some(target))? {
+                        actions.push(access);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            actor,
+            graph_id,
+            graph_wide,
+            branch,
+            target_branch,
+            actions,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]

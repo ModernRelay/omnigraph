@@ -85,6 +85,7 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
             // failure leaves nothing changed.
             | Command::Target { .. }
             | Command::Credential { .. }
+            | Command::Access(_)
     )
     .then_some(CommandKind::Read)
 }

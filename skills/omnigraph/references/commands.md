@@ -55,6 +55,7 @@ prints the exact flags of the installed binary.
 | `logout` | — | Remove a stored token or a managed session |
 | `use` | — | Select a managed cluster for a config folder |
 | `target` | `list` `show` `add` `remove` | List and edit the named targets in the operator config |
+| `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
 | `credential` | `get` | Hand a server target's stored token to a pipe, never a terminal |
 | `profile` | `list` `show` | Inspect operator profiles |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
@@ -353,6 +354,7 @@ omnigraph logout <server>                  # remove it (idempotent)
 omnigraph target list --json               # named targets and aliases, no secrets, no network
 echo '{"kind":"server","endpoint":"https://g.example","credential":"g"}' | omnigraph target add g --json
 omnigraph credential get --target g --json # the target's token, to a pipe only
+omnigraph access --target g --branch main --json  # my actor and the actions I may take
 omnigraph login --api <origin>             # managed Intent API session (OS keychain)
 omnigraph logout --api <origin>            # revoke that session and remove its keychain entry
 ```

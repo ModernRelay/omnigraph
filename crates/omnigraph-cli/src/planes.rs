@@ -304,6 +304,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Commit { .. }
         | Command::Diff(_)
         | Command::Changes { .. }
+        | Command::Access(_)
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
             command: SchemaCommand::Show { .. },
@@ -356,6 +357,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             crate::cli::TargetCommand::Remove { .. } => "target remove",
         },
         Command::Credential { .. } => "credential get",
+        Command::Access(_) => "access",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",
@@ -429,6 +431,8 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
             // `lint` can type-check a `.gq` against a cluster graph's schema
             // (RFC 0011): `--cluster <dir> --graph <id>`.
             | Command::Lint(_)
+            // `access` reads a cluster graph's applied policy directly.
+            | Command::Access(_)
             // The policy/queries tooling addresses a cluster's applied state
             // (RFC 0011): `--cluster <dir>` selects the cluster, `--graph <id>`
             // picks a graph's bundle/registry within it.

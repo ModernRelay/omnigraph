@@ -92,6 +92,29 @@ Without `--json` it prints the token alone. It refuses when stdout is a terminal
 anonymous server (`credential_anonymous`) and when no token is stored
 (`credential_missing`). `source` is `environment` or `credentials_file`.
 
+## What you may do at a target
+
+```bash
+omnigraph access --target staging --branch main --json
+```
+
+```json
+{"protocol":1,"target":"staging","source":"server","actor":"act-me","graph_id":"knowledge",
+ "graph_wide":["read","export"],"branch":"main","target_branch":null,"actions":["read","export","change"]}
+```
+
+`access` names the actor and the actions the graph's policy grants it:
+`graph_wide`, then with `--branch` the actions on that branch (`read`, `export`
+and `change` there, and the branch-targeted ones with it as the target), and
+with `--target-branch` too `branch_create` and `branch_merge` from one into the
+other. A server target asks the server's
+[access route](../operations/policy.md#learn-your-access) (`source: server`),
+with the target's token. For direct storage the CLI decides itself
+(`source: direct`) for the actor `--as` or `operator.actor` names: a cluster
+graph by its applied policy, which allows nothing without an actor, and a
+standalone graph, which carries no policy, allows every action, as direct writes
+do. It also accepts `--server`, `--store`, `--cluster` and `--profile`.
+
 ## Listing and editing targets
 
 ```bash
@@ -126,5 +149,5 @@ mapping or indented with tabs, refuses with `config_not_editable`; edit it by ha
 Each refusal carries its `code`, and the `target` and `credential` commands
 report an `outcome` of `not_started`; see
 [failed commands](../operations/troubleshooting.md#failed-data-write-commands).
-`omnigraph version --json` reports the output versions as
-`protocols.target` and `protocols.credential`.
+`omnigraph version --json` reports the output versions as `protocols.target`,
+`protocols.credential` and `protocols.access`.

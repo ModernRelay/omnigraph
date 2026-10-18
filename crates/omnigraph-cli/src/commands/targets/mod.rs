@@ -4,7 +4,7 @@
 
 mod args;
 
-pub(crate) use args::{CredentialCommand, TargetCommand};
+pub(crate) use args::{AccessArgs, CredentialCommand, TargetCommand};
 
 use std::io::{Read, Write};
 
@@ -340,6 +340,205 @@ pub(crate) fn run_credential(
             Ok(())
         }
     }
+}
+
+/// The addressing `access` resolves, from the global flags.
+pub(crate) struct AccessScope<'a> {
+    pub(crate) server: Option<&'a str>,
+    pub(crate) profile: Option<&'a str>,
+    pub(crate) store: Option<&'a str>,
+    pub(crate) cluster: Option<&'a str>,
+    pub(crate) graph: Option<&'a str>,
+    pub(crate) actor: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct AccessReport<'a> {
+    protocol: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'a str>,
+    /// `server` when a server decided, `direct` when the CLI did.
+    source: &'static str,
+    #[serde(flatten)]
+    access: omnigraph_api_types::AccessOutput,
+}
+
+/// `access`: who the caller is at a target and what it may do there. A
+/// server decides through its access route; for direct storage the CLI
+/// evaluates the graph's installed policy for the declared actor, and a
+/// graph without one allows every action, as direct writes do.
+pub(crate) async fn run_access(
+    input: &InvocationConfig,
+    scope: AccessScope<'_>,
+    args: AccessArgs,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    use omnigraph_api_types::AccessOutput;
+    for branch in [args.branch.as_deref(), args.target_branch.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        omnigraph_policy::ensure_canonical_branch_name(branch)
+            .map_err(|error| CliRefusal::report(ErrorCode::BadRequest, error.to_string()))?;
+    }
+    let config = input.get(stderr)?;
+    let resolved = crate::scope::resolve_scope(
+        config,
+        input.profile(),
+        crate::planes::Capability::Control,
+        crate::scope::ScopeFlags {
+            target: input.target(),
+            profile: scope.profile,
+            store: scope.store,
+            server: scope.server,
+            cluster: scope.cluster,
+            graph: scope.graph,
+            uri: None,
+        },
+    )?;
+    let actor = scope
+        .actor
+        .map(str::to_string)
+        .or_else(|| config.actor().map(str::to_string));
+    let target = input.target().or(
+        if scope.server.is_none()
+            && scope.store.is_none()
+            && scope.cluster.is_none()
+            && scope.profile.is_none()
+        {
+            config.default_target()
+        } else {
+            None
+        },
+    );
+    let (source, access) = if let Some(server) = resolved.server.as_deref() {
+        let graph = resolved.graph.as_deref().ok_or_else(|| {
+            CliRefusal::report(
+                ErrorCode::BadRequest,
+                "access needs a graph: pass --graph ID, or give the target a default_graph",
+            )
+        })?;
+        let base =
+            crate::helpers::resolve_server_flag_with_config(config, Some(server), Some(graph))?
+                .expect("a server address resolves");
+        let root = crate::helpers::resolve_server_flag_with_config(config, Some(server), None)?
+            .expect("a server address resolves");
+        let (http, token) = crate::helpers::served_client_with_config(input, config, &root, &base)?;
+        let http = http.with_expected_actor(scope.actor);
+        let mut query = Vec::new();
+        if let Some(branch) = args.branch.as_deref() {
+            query.push(("branch", branch));
+        }
+        if let Some(target_branch) = args.target_branch.as_deref() {
+            query.push(("target_branch", target_branch));
+        }
+        let url = crate::helpers::remote_url(&base, &["access"], &query)?;
+        let access: AccessOutput =
+            crate::helpers::remote_json(&http, reqwest::Method::GET, url, None, token.as_deref())
+                .await?;
+        ("server", access)
+    } else if let Some(cluster) = resolved.cluster.as_deref() {
+        let graph = resolved.cluster_graph.as_deref().ok_or_else(|| {
+            CliRefusal::report(
+                ErrorCode::BadRequest,
+                "access on a cluster needs a graph: pass --graph ID, or give the target a default_graph",
+            )
+        })?;
+        let snapshot = crate::commands::control::read_serving_snapshot_or_report(cluster).await?;
+        let binding = format!("graph.{graph}");
+        let bundles: Vec<_> = snapshot
+            .policies
+            .iter()
+            .filter(|policy| policy.applies_to.iter().any(|scope| scope == &binding))
+            .collect();
+        let engine = match bundles.as_slice() {
+            [] => None,
+            [bundle] => Some(omnigraph_policy::PolicyEngine::load_graph_from_source(
+                &bundle.source,
+                graph,
+            )?),
+            many => color_eyre::eyre::bail!(
+                "graph `{graph}` matches {} policy bundles; the cluster binds one per graph",
+                many.len()
+            ),
+        };
+        let access = AccessOutput::evaluate(
+            actor.clone(),
+            graph.to_string(),
+            args.branch.clone(),
+            args.target_branch.clone(),
+            |access, branch, target_branch| -> Result<bool> {
+                let Some(engine) = &engine else {
+                    return Ok(true);
+                };
+                let Some(actor) = actor.as_deref() else {
+                    return Ok(false);
+                };
+                Ok(engine
+                    .authorize(
+                        actor,
+                        &omnigraph_policy::PolicyRequest {
+                            action: access.into(),
+                            branch: branch.map(str::to_string),
+                            target_branch: target_branch.map(str::to_string),
+                        },
+                    )?
+                    .allowed)
+            },
+        )?;
+        ("direct", access)
+    } else if resolved.uri.is_some() {
+        let access = AccessOutput::evaluate(
+            actor.clone(),
+            "default".to_string(),
+            args.branch.clone(),
+            args.target_branch.clone(),
+            |_, _, _| Ok::<_, color_eyre::Report>(true),
+        )?;
+        ("direct", access)
+    } else {
+        return Err(CliRefusal::report(
+            ErrorCode::TargetUnknown,
+            "access needs a target: pass --target NAME or set `defaults.target`",
+        ));
+    };
+    let report = AccessReport {
+        protocol: TARGET_PROTOCOL,
+        target,
+        source,
+        access,
+    };
+    if args.json {
+        return write_json(&report, stdout);
+    }
+    let names = |actions: &[omnigraph_api_types::AccessAction]| -> String {
+        let names: Vec<String> = actions
+            .iter()
+            .map(|action| {
+                serde_json::to_value(action)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default()
+            })
+            .collect();
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+    writeln!(
+        stdout,
+        "actor: {}",
+        report.access.actor.as_deref().unwrap_or("(none)")
+    )?;
+    writeln!(stdout, "graph: {} ({source})", report.access.graph_id)?;
+    writeln!(stdout, "graph-wide: {}", names(&report.access.graph_wide))?;
+    if let Some(branch) = &report.access.branch {
+        writeln!(stdout, "on {branch}: {}", names(&report.access.actions))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

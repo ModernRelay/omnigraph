@@ -347,6 +347,23 @@ async fn run(
         Command::Target { command } => {
             commands::targets::run_target(&operator, command, input.reader, stdout, stderr)?
         }
+        Command::Access(args) => {
+            commands::targets::run_access(
+                &operator,
+                commands::targets::AccessScope {
+                    server: cli.server.as_deref(),
+                    profile: cli.profile.as_deref(),
+                    store: cli.store.as_deref(),
+                    cluster: cli.cluster.as_deref(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                },
+                args,
+                stdout,
+                stderr,
+            )
+            .await?
+        }
         Command::Credential { command } => commands::targets::run_credential(
             &operator,
             command,

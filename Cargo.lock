@@ -5491,6 +5491,7 @@ version = "0.14.0"
 dependencies = [
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-policy",
  "serde",
  "serde_json",
  "utoipa",
