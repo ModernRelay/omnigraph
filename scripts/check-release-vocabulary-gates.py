@@ -257,6 +257,14 @@ def main() -> int:
         failures,
     )
 
+    # A Linux archive needs the glibc of the runner image it was linked on, so
+    # its runners name an image release; `ubuntu-latest` changes underneath.
+    require(
+        "runner: ubuntu-latest" not in (WORKFLOW_ROOT / "build-release-archives.yml").read_text(),
+        "build-release-archives.yml: Linux archives build on a pinned runner image, which sets their glibc floor",
+        failures,
+    )
+
     # Every release artifact ships one server feature set.
     for filename in ("build-release-archives.yml", "publish-image.yml"):
         require(

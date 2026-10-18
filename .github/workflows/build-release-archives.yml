@@ -33,7 +33,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          # The Linux runners are pinned: a Linux archive needs the glibc it
+          # was linked against (2.39 on Ubuntu 24.04), which the trixie edge
+          # image and the documented support floor rely on. `ubuntu-latest`
+          # moves to Ubuntu 26.04 between 2026-10-19 and 2026-11-19
+          # (actions/runner-images#14748).
+          - runner: ubuntu-24.04
             asset_name: omnigraph-linux-x86_64
           - runner: ubuntu-24.04-arm
             asset_name: omnigraph-linux-arm64

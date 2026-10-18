@@ -10,7 +10,8 @@ The installer downloads a release archive, verifies its SHA-256 checksum, and
 installs the binaries in `~/.local/bin`.
 
 Prebuilt archives support Linux x86_64 and arm64, macOS arm64, and Windows
-x86_64. Build from source on other platforms, including Intel macOS.
+x86_64. The Linux archives need glibc 2.39 or newer, as on Ubuntu 24.04 and
+Debian 13. Build from source on other platforms, including Intel macOS.
 
 Homebrew is also supported:
 
