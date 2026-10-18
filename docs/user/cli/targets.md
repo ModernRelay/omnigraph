@@ -113,7 +113,9 @@ with the target's token. For direct storage the CLI decides itself
 (`source: direct`) for the actor `--as` or `operator.actor` names: a cluster
 graph by its applied policy, which allows nothing without an actor, and a
 standalone graph, which carries no policy, allows every action, as direct writes
-do. It also accepts `--server`, `--store`, `--cluster` and `--profile`.
+do. A cluster graph the cluster does not apply refuses with `not_found`, and
+one it quarantined with `graph_unavailable`, as a server refuses them. It also
+accepts `--server`, `--store`, `--cluster` and `--profile`.
 
 ## Listing and editing targets
 

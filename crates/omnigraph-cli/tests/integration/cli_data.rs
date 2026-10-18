@@ -5924,6 +5924,21 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
     let nobody = decide(None, "feature");
     assert!(actions(&nobody, "graph_wide").is_empty(), "{nobody}");
     assert!(actions(&nobody, "actions").is_empty(), "{nobody}");
+    // A graph the cluster does not serve has no policy to read, so access
+    // refuses rather than report every action allowed.
+    let unknown = output_failure(
+        cli()
+            .arg("access")
+            .arg("--cluster")
+            .arg(cluster.path())
+            .args(["--graph", "missing", "--json"]),
+    );
+    let refusal = parse_stdout_json(&unknown);
+    assert_eq!(refusal["code"], "not_found", "{refusal}");
+    assert!(
+        refusal["error"].as_str().unwrap().contains("knowledge"),
+        "{refusal}"
+    );
 
     // A standalone graph without a policy allows every action.
     let temp = tempdir().unwrap();
