@@ -11859,7 +11859,15 @@
           "target_kind_unsupported",
           "credential_terminal",
           "credential_anonymous",
-          "credential_missing"
+          "credential_missing",
+          "actor_required",
+          "local_server_exists",
+          "local_server_starting",
+          "local_server_actor_mismatch",
+          "local_server_destination_unknown",
+          "local_server_access_mismatch",
+          "local_server_cli_incompatible",
+          "local_server_records_unsafe"
         ]
       },
       "ErrorOutput": {

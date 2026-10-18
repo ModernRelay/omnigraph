@@ -347,6 +347,20 @@ async fn run(
         Command::Target { command } => {
             commands::targets::run_target(&operator, command, input.reader, stdout, stderr)?
         }
+        Command::Serve(args) => {
+            let completion = commands::serve::run_serve(
+                &operator,
+                cli.as_actor.as_deref(),
+                args,
+                std::io::stdout().is_terminal(),
+                stdout,
+                stderr,
+            )
+            .await?;
+            if completion.code() != 0 {
+                return Ok(completion);
+            }
+        }
         Command::Access(args) => {
             commands::targets::run_access(
                 &operator,

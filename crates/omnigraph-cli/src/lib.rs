@@ -38,6 +38,7 @@ mod graph_http;
 mod helpers;
 mod input;
 mod invocation;
+mod local_servers;
 mod managed;
 #[cfg(test)]
 #[path = "../tests/support/managed_http.rs"]

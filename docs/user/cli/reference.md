@@ -28,7 +28,7 @@ Common global flags:
 
 | Flag | Meaning |
 |---|---|
-| `--as <ACTOR>` | Actor for direct writes and cluster operations |
+| `--as <ACTOR>` | Actor for direct writes, cluster operations and a [`serve`](serve.md) local server |
 | `--yes` | Non-interactive consent for destructive writes to non-local storage |
 | `--quiet` | Suppress the resolved write target printed to stderr |
 
@@ -222,7 +222,7 @@ aliases:
 ```
 
 Each profile binds exactly one of `server`, `cluster`, or `store`. Select it with
-`--profile` or `OMNIGRAPH_PROFILE`; explicit flags override values it fills. [Named targets](targets.md) bind one complete address each.
+`--profile` or `OMNIGRAPH_PROFILE`; explicit flags override values it fills. [Named targets](targets.md) bind one complete address each, and [`serve`](serve.md) serves a direct one on loopback for this account.
 
 Bearer tokens never belong in `config.yaml`. Bind one to a declared server with
 `omnigraph login <server>` or `OMNIGRAPH_TOKEN_<NAME>`; the CLI sends it only to

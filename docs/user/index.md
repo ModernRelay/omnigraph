@@ -32,6 +32,7 @@ deployment.
 - [CLI guide](cli/index.md)
 - [CLI reference](cli/reference.md)
 - [Named targets](cli/targets.md)
+- [Local servers](cli/serve.md)
 - [Managed data credentials and queries](cli/managed-data.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [Managed organization members and invitations](cli/managed-team.md)

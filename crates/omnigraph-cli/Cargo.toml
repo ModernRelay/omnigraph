@@ -27,6 +27,8 @@ color-eyre = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
+axum = { workspace = true }
+ulid = { workspace = true }
 yaml_serde = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util"] }
 reqwest = { workspace = true, features = ["blocking", "stream"] }
@@ -48,6 +50,7 @@ keyring = { version = "3.6.3", features = ["windows-native"] }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
 
 [dev-dependencies]
+tower = { workspace = true }
 assert_cmd = "2"
 predicates = "3"
 serde_json = { workspace = true }

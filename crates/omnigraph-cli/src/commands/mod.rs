@@ -7,5 +7,6 @@ pub(crate) mod local;
 pub(crate) mod maintenance;
 pub(crate) mod query;
 pub(crate) mod schema;
+pub(crate) mod serve;
 pub(crate) mod targets;
 pub(crate) mod transfer;

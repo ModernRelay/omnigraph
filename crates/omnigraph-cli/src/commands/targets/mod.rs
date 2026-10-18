@@ -55,7 +55,8 @@ pub(crate) fn run_target(
     match command {
         TargetCommand::List { json } => {
             let config = input.get(stderr)?;
-            let listing = targets::list_output(config);
+            let mut listing = targets::list_output(config);
+            attach_local_servers(config, &mut listing.targets)?;
             if json {
                 return write_json(&listing, stdout);
             }
@@ -73,7 +74,9 @@ pub(crate) fn run_target(
         }
         TargetCommand::Show { name, json } => {
             let config = input.get(stderr)?;
-            let target = TargetOutput::of(&name, config.target(&name)?);
+            let mut target = vec![TargetOutput::of(&name, config.target(&name)?)];
+            attach_local_servers(config, &mut target)?;
+            let target = target.pop().expect("one target");
             let default = config.default_target() == Some(name.as_str());
             if json {
                 return write_json(
@@ -168,6 +171,51 @@ pub(crate) fn run_target(
             Ok(())
         }
     }
+}
+
+/// Each direct target's live local servers, from the records: the ones whose
+/// destination is the target's. A target whose destination cannot be
+/// established lists none.
+fn attach_local_servers(config: &OperatorConfig, targets: &mut [TargetOutput]) -> Result<()> {
+    if !targets
+        .iter()
+        .any(|target| target.kind == targets::TargetKind::Direct)
+    {
+        return Ok(());
+    }
+    let records = crate::local_servers::Records::open()?;
+    let live = records.live_records()?;
+    for target in targets.iter_mut() {
+        let Ok(entry) = config.target(&target.name) else {
+            continue;
+        };
+        let destination = match entry.binding(&target.name) {
+            Ok(TargetBinding::DirectGraph { uri }) => {
+                crate::local_servers::Destination::of("graph", &uri).ok()
+            }
+            Ok(TargetBinding::DirectRoot { uri, .. }) => {
+                crate::local_servers::Destination::of("cluster", &uri).ok()
+            }
+            _ => None,
+        };
+        let Some(destination) = destination else {
+            continue;
+        };
+        target.local_servers = Some(
+            live.iter()
+                .filter(|record| record.destination == destination.digest)
+                .map(|record| {
+                    serde_json::json!({
+                        "id": record.id,
+                        "url": record.url,
+                        "access": record.access,
+                        "actor": record.actor,
+                    })
+                })
+                .collect(),
+        );
+    }
+    Ok(())
 }
 
 fn config_path(input: &InvocationConfig) -> Result<std::path::PathBuf> {

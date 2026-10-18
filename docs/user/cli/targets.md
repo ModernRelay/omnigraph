@@ -150,4 +150,5 @@ Each refusal carries its `code`, and the `target` and `credential` commands
 report an `outcome` of `not_started`; see
 [failed commands](../operations/troubleshooting.md#failed-data-write-commands).
 `omnigraph version --json` reports the output versions as `protocols.target`,
-`protocols.credential` and `protocols.access`.
+`protocols.credential` and `protocols.access`. `target list` and `target show`
+also name each direct target's live [local servers](serve.md).

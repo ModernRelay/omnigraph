@@ -2106,6 +2106,27 @@ pub enum ErrorCode {
     CredentialAnonymous,
     /// CLI only: no token is stored for the target's credential owner.
     CredentialMissing,
+    /// CLI only: a read-write local server needs an actor, from `--as` or
+    /// `operator.actor`.
+    ActorRequired,
+    /// CLI only: a live local server serves the destination and `--reuse`
+    /// was not given.
+    LocalServerExists,
+    /// CLI only: another start for the destination held the election past
+    /// the deadline.
+    LocalServerStarting,
+    /// CLI only: the live local server's actor differs from the one this
+    /// start would resolve.
+    LocalServerActorMismatch,
+    /// CLI only: the target's binding does not establish its destination.
+    LocalServerDestinationUnknown,
+    /// CLI only: `--write` was asked of a read-only live local server.
+    LocalServerAccessMismatch,
+    /// CLI only: the live local server's CLI speaks another HTTP contract.
+    LocalServerCliIncompatible,
+    /// CLI only: the local server records directory has an unsafe owner,
+    /// mode or file.
+    LocalServerRecordsUnsafe,
 }
 
 /// Structured details for a publisher-level OCC failure. Surfaces alongside

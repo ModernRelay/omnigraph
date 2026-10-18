@@ -239,7 +239,9 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                         command: SchemaCommand::Apply { .. }
                     }
             ),
-            Served | Local => false,
+            // `serve` names the actor its local server acts as.
+            Local => matches!(cmd, Command::Serve(_)),
+            Served => false,
         },
         // A profile is consumed wherever scope resolution runs: the data/
         // served resolvers, the maintenance-URI resolver, and the policy/
@@ -264,7 +266,10 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Control => !matches!(cmd, Command::Cluster { .. }),
             Local => matches!(
                 cmd,
-                Command::Login { .. } | Command::Logout { .. } | Command::Credential { .. }
+                Command::Login { .. }
+                    | Command::Logout { .. }
+                    | Command::Credential { .. }
+                    | Command::Serve(_)
             ),
         },
     }
@@ -334,6 +339,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Logout { .. }
         | Command::Target { .. }
         | Command::Credential { .. }
+        | Command::Serve(_)
         | Command::Use { .. }
         | Command::Profile { .. }
         | Command::Skill { .. }
@@ -358,6 +364,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         },
         Command::Credential { .. } => "credential get",
         Command::Access(_) => "access",
+        Command::Serve(_) => "serve",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",

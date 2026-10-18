@@ -176,6 +176,10 @@ pub(crate) struct ProtocolsOutput {
     pub(crate) credential: u32,
     /// `access --json`.
     pub(crate) access: u32,
+    /// `serve --json`'s ready line.
+    pub(crate) serve: u32,
+    /// The record a running local server keeps for same-account clients.
+    pub(crate) local_server_record: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +222,8 @@ impl VersionOutput {
                 target: crate::targets::TARGET_PROTOCOL,
                 credential: crate::targets::TARGET_PROTOCOL,
                 access: crate::targets::TARGET_PROTOCOL,
+                serve: crate::commands::serve::SERVE_PROTOCOL,
+                local_server_record: crate::local_servers::RECORD_FORMAT,
             },
         }
     }
