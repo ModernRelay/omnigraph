@@ -166,6 +166,20 @@ def main() -> int:
                 "release-edge.yml: an edge version must sort after the latest stable release",
                 failures,
             )
+            workflow_diff = '-- .github/workflows'
+            require(
+                workflow_diff in job_block(text, "prepare_edge_release")
+                and workflow_diff in job_block(text, "publish_edge_release")
+                and "steps.taggable.outputs.go == 'true'" in job_block(text, "publish_edge_release"),
+                "release-edge.yml: a build is tagged only while main's workflow files match its commit's",
+                failures,
+            )
+            for gated in ("publish_edge_image", "smoke_installers"):
+                require(
+                    "if: needs.publish_edge_release.outputs.published == 'true'" in job_block(text, gated),
+                    f"release-edge.yml:{gated}: runs only for a published build",
+                    failures,
+                )
             image_job = job_block(text, "publish_edge_image")
             require(
                 '--source-digest "$SOURCE_SHA"' in image_job
