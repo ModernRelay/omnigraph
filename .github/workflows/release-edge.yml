@@ -405,9 +405,29 @@ jobs:
         run: |
           echo "$GH_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
 
+      # GitHub-hosted runners reach ECR Public anonymously from shared
+      # addresses, whose data limit is often spent ("429 Too Many Requests:
+      # Data limit exceeded"). With the DOCKERHUB_* secrets the base is the
+      # Docker Official Image, pulled logged in; without them, ECR Public.
+      - name: Choose the base image
+        id: base
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_TOKEN}" ]]; then
+            echo "${DOCKERHUB_TOKEN}" | docker login docker.io --username "${DOCKERHUB_USERNAME}" --password-stdin
+            echo "image=docker.io/library/debian:trixie-slim" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=public.ecr.aws/debian/debian:trixie-slim" >> "$GITHUB_OUTPUT"
+          fi
+
       # A rerun keeps the image first pushed for this build and checks it again.
       - name: Build, check and push the build's image
         id: ghcr
+        env:
+          BASE_IMAGE: ${{ steps.base.outputs.image }}
         run: |
           set -euo pipefail
           # Only a definite "not found" means the tag is free; any other
@@ -428,7 +448,7 @@ jobs:
             docker pull "${image}:${BUILD_TAG}"
             pushed=false
           else
-            docker build --build-arg BASE_IMAGE=public.ecr.aws/debian/debian:trixie-slim \
+            docker build --build-arg BASE_IMAGE="$BASE_IMAGE" \
               -t "${image}:${BUILD_TAG}" .
             pushed=true
           fi

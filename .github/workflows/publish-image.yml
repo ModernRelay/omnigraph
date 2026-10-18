@@ -107,6 +107,25 @@ jobs:
         with:
           ref: ${{ needs.vocabulary_gate.outputs.source_sha }}
 
+      # Both pulls below come from registries that throttle GitHub-hosted
+      # runners' shared addresses when anonymous: the builder from Docker Hub,
+      # the base from ECR Public ("429 Too Many Requests: Data limit
+      # exceeded"). With the DOCKERHUB_* secrets both come from Docker Hub,
+      # logged in; the base is then the Docker Official Image.
+      - name: Choose the base image
+        id: base
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_TOKEN}" ]]; then
+            echo "${DOCKERHUB_TOKEN}" | docker login docker.io --username "${DOCKERHUB_USERNAME}" --password-stdin
+            echo "image=docker.io/library/debian:bookworm-slim" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=public.ecr.aws/debian/debian:bookworm-slim" >> "$GITHUB_OUTPUT"
+          fi
+
       # Read at compile time by `omnigraph version` and the server's
       # `/healthz` `source_version`.
       - name: Build release binaries (bookworm builder)
@@ -151,11 +170,12 @@ jobs:
         id: push
         env:
           STAMPED: ${{ steps.tag.outputs.stamped }}
+          BASE_IMAGE: ${{ steps.base.outputs.image }}
         run: |
           set -euo pipefail
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           image="ghcr.io/${owner}/omnigraph-server"
-          docker build -t "${image}:${RELEASE_TAG}" .
+          docker build --build-arg BASE_IMAGE="$BASE_IMAGE" -t "${image}:${RELEASE_TAG}" .
           docker run --rm --entrypoint /usr/local/bin/omnigraph \
             "${image}:${RELEASE_TAG}" version
           if [[ "$STAMPED" == true ]]; then

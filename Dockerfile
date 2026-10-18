@@ -4,7 +4,9 @@
 # The base must carry the glibc the binaries in target/release were linked
 # against: bookworm for the bookworm-built stable image (publish-image.yml),
 # trixie for the edge image, which packages the Ubuntu-built release archives
-# (glibc 2.39 or newer; release-edge.yml).
+# (glibc 2.39 or newer; release-edge.yml). On GitHub-hosted runners, whose
+# anonymous ECR Public pulls are throttled, those workflows pass the Docker
+# Official Image instead when they are logged in to Docker Hub.
 ARG BASE_IMAGE=public.ecr.aws/debian/debian:bookworm-slim
 FROM ${BASE_IMAGE}
 

@@ -183,7 +183,8 @@ def main() -> int:
             image_job = job_block(text, "publish_edge_image")
             require(
                 '--source-digest "$SOURCE_SHA"' in image_job
-                and "BASE_IMAGE=public.ecr.aws/debian/debian:trixie-slim" in image_job,
+                and "debian:trixie-slim" in image_job
+                and "bookworm" not in image_job,
                 "release-edge.yml: the edge image packages the attested archive of this commit on trixie",
                 failures,
             )
