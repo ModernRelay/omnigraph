@@ -555,15 +555,33 @@ write tools only when it writes.
 state, and needs an actor whatever its access. The cluster's own policies,
 stored queries, embedding-provider bindings and external-Blob rules apply, and
 the generated token resolves to the actor, so the cluster's policy decides for
-it as a deployment's would. A read-only one captures one ledger revision
-without admission, opens every graph read-only through `GraphReadAuthority`,
-which refuses a changed revision or an outstanding deployment, and adds a Cedar
-`forbid` for every write action to each policy it loads, so a policy answer
-reports the refusal (rule `local-read-only`). A read-write one acquires the
-cluster's serving admission and refuses while another owner holds it
-(`LocalOpenError::Cluster` with `state_lock_held`); `LocalServing::serve` releases
-it after a clean drain, through the release `serve` runs, and keeps it when a
-completion is uncertain.
+it as a deployment's would. A graph the cluster binds no policy to is granted
+`read` alone, which is what a deployment's routes allow without a bundle, and
+the grant is installed on its engine as well, so an embedder holding the handle
+cannot write through it. `/readyz` and `/graphs` report the ledger revision
+served.
+
+A read-only one captures one ledger revision without admission, opens every
+graph read-only, validates each against that revision through
+`GraphReadAuthority`, and adds a Cedar `forbid` for every write action to each
+policy it loads, the catalogue's included, so a policy answer reports the
+refusal (rule `local-read-only`). It serves one revision or none: the whole
+server refuses (`LocalOpenError::Cluster`) when the ledger cannot be read or
+needs conversion, a deployment is outstanding, a graph's root is outside the
+captured layout, or the revision changes before a graph's open is validated. A
+graph that fails to open, or whose schema drifted from its achieved contract,
+is blocked alone, as normal serving blocks it, unless no graph opens or
+`OMNIGRAPH_REQUIRE_ALL_GRAPHS` is set; then the server refuses
+(`LocalOpenError::Serving`), as a deployment's startup does.
+
+A read-write one acquires the cluster's serving admission and refuses while
+another owner holds it (`LocalOpenError::Cluster` with `state_lock_held`). A
+refusal before any graph opens releases the admission; once a graph has
+opened, a failed startup keeps it and names its lock
+(`LocalOpenError::AdmissionRetained`). `LocalServing::serve` releases it after
+a clean drain, through the release `serve` runs, and keeps it when a
+completion is uncertain. `LocalBinding::from_root` makes a local root
+absolute, so a relative spelling names the same cluster in both modes.
 
 `start_local(state, listener, extend)` installs, on a loopback listener the
 caller bound, the lifecycle `serve` runs: the signal and uncertain-owner
@@ -574,7 +592,11 @@ a caller announces readiness between `start_local` and `LocalServing::serve`,
 and a signal in that window stops the server gracefully. `serve` writes
 nothing to stdout, disarms the watchdog when it returns, and reports
 `ServeOutcome::Uncertain` instead of exiting; the caller exits 2.
-`serve_local` is the two calls in one.
+`serve_local` is the two calls in one. A caller that fails between the two
+calls ends the server with `LocalServing::release`, which closes request
+admission, drains, releases a retained cluster admission as `serve` does and
+disarms the watchdog; that release waits for every other clone of the state.
+Dropping an unserved `LocalServing` keeps the admission.
 `install_log_subscriber(writer)` installs the `init_tracing` filter on another
 writer. A read-write local server is not fenced against another process writing
 the same graph; keep one writer per graph.

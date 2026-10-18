@@ -2999,10 +2999,12 @@ impl Lifecycle {
 /// A local server whose lifecycle is installed and which has not yet served.
 ///
 /// From [`start_local`] on, a shutdown signal stops it gracefully, so its
-/// caller announces readiness between the two calls. Dropping it unserved
-/// stops its shutdown listener, but Tokio keeps its signal handlers for the
-/// rest of the process: a later `SIGTERM` or `SIGINT` no longer ends the
-/// process by default.
+/// caller announces readiness between the two calls. A caller that fails
+/// before serving calls [`LocalServing::release`], which releases a
+/// read-write cluster's serving admission; dropping it unserved stops its
+/// shutdown listener and keeps that admission. Either way Tokio keeps the
+/// signal handlers for the rest of the process: a later `SIGTERM` or `SIGINT`
+/// no longer ends the process by default.
 pub struct LocalServing {
     lifecycle: Lifecycle,
     listener: TcpListener,
@@ -3067,6 +3069,33 @@ impl LocalServing {
             served?;
         }
         Ok(outcome)
+    }
+
+    /// Stop without serving, for a caller that fails after [`start_local`]:
+    /// close request admission, drain the logical owners and, after a clean
+    /// drain, release a retained cluster admission as [`LocalServing::serve`]
+    /// does. That release waits for every other clone of the state the server
+    /// was started from, so the caller drops its own first. A signal already
+    /// received has armed the watchdog, which bounds the release; it is
+    /// disarmed when this returns.
+    pub async fn release(self) -> Result<ServeOutcome> {
+        let Self {
+            lifecycle,
+            listener,
+            app,
+            retained_admission,
+        } = self;
+        // Nothing was accepted, so the router holds the state's last owners.
+        drop(app);
+        drop(listener);
+        lifecycle.operations.close();
+        let outcome = lifecycle.drain().await;
+        let released = match retained_admission {
+            Some(owner) if outcome == ServeOutcome::Clean => release_serving_admission(owner).await,
+            _ => Ok(outcome),
+        };
+        lifecycle.disarm();
+        released
     }
 }
 
@@ -3586,6 +3615,9 @@ struct GraphOpenFailure {
     failure: StartupFailure,
     policy: Option<Arc<PolicyEngine>>,
     cause: color_eyre::Report,
+    /// The cluster's refusal of the ledger revision a read-only open
+    /// captured, for a caller that serves that one revision or none.
+    cluster_refusal: Option<omnigraph_cluster::Diagnostic>,
 }
 
 impl std::fmt::Debug for GraphOpenFailure {
@@ -3642,6 +3674,7 @@ fn prepare_single_graph(
         failure: StartupFailure::OpenFailed,
         policy: None,
         cause,
+        cluster_refusal: None,
     };
     let graph_id = GraphId::try_from(cfg.graph_id.clone())
         .map_err(|err| initial_failure(eyre!("graph id '{}': {err}", cfg.graph_id)))?;
@@ -3655,6 +3688,7 @@ fn prepare_single_graph(
             failure: StartupFailure::InvalidConfiguration,
             policy: None,
             cause: eyre!("graph configuration was refused before graph open"),
+            cluster_refusal: None,
         });
     }
     let read_only = matches!(access, GraphOpenAccess::ReadOnly(_));
@@ -3675,11 +3709,13 @@ fn prepare_single_graph(
             failure: StartupFailure::InvalidPolicy,
             policy: None,
             cause,
+            cluster_refusal: None,
         })?;
     let failure = |failure, cause| GraphOpenFailure {
         failure,
         policy: policy.clone(),
         cause,
+        cluster_refusal: None,
     };
 
     if let Some(refused) = cfg.startup_failure {
@@ -3730,6 +3766,7 @@ async fn open_prepared_graph(
         failure,
         policy: policy.clone(),
         cause,
+        cluster_refusal: None,
     };
     let (opened, read_authority) = match access {
         GraphOpenAccess::Writable(Some(scope)) => {
@@ -3752,10 +3789,12 @@ async fn open_prepared_graph(
     })?;
     if let Some(authority) = read_authority {
         authority.validate_opened(&db).await.map_err(|diagnostic| {
-            failure(
+            let mut refused = failure(
                 StartupFailure::OpenFailed,
                 eyre!("[{}] {}", diagnostic.code, diagnostic.message),
-            )
+            );
+            refused.cluster_refusal = Some(diagnostic);
+            refused
         })?;
     }
     verify_server_schema_contract(&db, expected.as_ref())
