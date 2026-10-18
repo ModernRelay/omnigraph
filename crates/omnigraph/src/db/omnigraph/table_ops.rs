@@ -1351,7 +1351,12 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             "publication branch differs from its captured write transaction",
         ));
     }
-    let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn)).await?;
+    // Every step before `publish_prepared` reads; the detached effects the
+    // updates name are unreachable until the publisher's one CAS, so a failure
+    // here is definite.
+    let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn))
+        .await
+        .map_err(OmniError::unpublished)?;
 
     debug_assert_eq!(lineage_intent.actor_id.as_deref(), actor_id);
     let changes = prepared
@@ -1370,14 +1375,20 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     // so only an exact captured view is reused without a fresh open.
     let mut active = db.coordinator.write().await;
     let published = if branch == active.current_branch() {
-        let captured_view_matches = active.branch_identifier().await?
+        let captured_view_matches = active
+            .branch_identifier()
+            .await
+            .map_err(OmniError::unpublished)?
             == txn.authority.branch_identifier
             && active.exact_graph_head() == txn.authority.graph_head
             && active.version() == txn.base.graph_manifest_version();
         if !captured_view_matches {
             // Keep the handle's binding while replacing only stale state.
             // The publisher still reads fresh authority and applies its CAS.
-            *active = db.open_coordinator_for_branch(branch).await?;
+            *active = db
+                .open_coordinator_for_branch(branch)
+                .await
+                .map_err(OmniError::unpublished)?;
         }
         publish_prepared(
             &mut active,
@@ -1398,7 +1409,11 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             let matches = if let Some((key, coordinator)) = cache.as_ref() {
                 key == cache_key
                     && coordinator.current_branch() == branch
-                    && coordinator.branch_identifier().await? == txn.authority.branch_identifier
+                    && coordinator
+                        .branch_identifier()
+                        .await
+                        .map_err(OmniError::unpublished)?
+                        == txn.authority.branch_identifier
                     && coordinator.exact_graph_head() == txn.authority.graph_head
                     && coordinator.version() == txn.base.graph_manifest_version()
             } else {
@@ -1412,7 +1427,10 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         };
         let mut coordinator = match captured {
             Some(coordinator) => coordinator,
-            None => db.open_coordinator_for_branch(branch).await?,
+            None => db
+                .open_coordinator_for_branch(branch)
+                .await
+                .map_err(OmniError::unpublished)?,
         };
         // The cache supplies only the already captured starting view. The
         // publisher still reads fresh state and enforces ExactGraphHead on

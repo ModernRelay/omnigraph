@@ -2244,10 +2244,15 @@ impl StorageAdapter for ObjectStorageAdapter {
         // still-present. remove_dir_all reclaims them in one call.
         if self.codec == UriCodec::Local {
             let path = absolutize_lexically(local_path_from_uri(prefix_uri)?)?;
+            let request = scoped::Request::new(
+                "delete_prefix",
+                &object_store::path::Path::from(path.to_string_lossy().as_ref()),
+                false,
+            );
             let mutation = self
                 .scope
                 .as_ref()
-                .map(StorageIoScope::begin)
+                .map(|scope| scope.begin(request))
                 .transpose()
                 .map_err(|error| storage_backend_error("delete_prefix", prefix_uri, error))?;
             let result = match tokio::fs::remove_dir_all(&path).await {

@@ -498,7 +498,7 @@ carried stored external reference the policy refuses fails as
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |
-| Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone |
+| Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob and merge writers mark the steps between, so a server keeps serving on it, while a typed refusal keeps its shape; the publisher alone reports an outcome it could not read back as in doubt |
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
 | A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
 | A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |

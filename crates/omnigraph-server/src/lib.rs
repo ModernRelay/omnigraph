@@ -1638,8 +1638,15 @@ impl ApiError {
             OmniError::Completion { .. } => unreachable!("completion evidence was unwrapped"),
         };
         response.completion_uncertain |= uncertain;
+        // The engine's evidence is the authority: a definite failure, before
+        // any effect or after detached effects no manifest names, keeps the
+        // process serving whatever status it maps to. Without evidence the
+        // status-class default above stands, which fails closed for a 500.
         match evidence {
-            Some(omnigraph::error::CompletionEvidence::BeforeEffect) => {
+            Some(
+                omnigraph::error::CompletionEvidence::BeforeEffect
+                | omnigraph::error::CompletionEvidence::Unpublished,
+            ) => {
                 response.completion_uncertain = false;
             }
             Some(omnigraph::error::CompletionEvidence::Uncertain) => {

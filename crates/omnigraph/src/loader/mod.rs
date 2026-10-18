@@ -1194,9 +1194,12 @@ async fn load_jsonl_reader_once<R: BufRead>(
     if let Some(staging_charge) = &staging_charge {
         staging_charge.grow(staged_bytes)?;
     }
+    // From the first staged file to the publisher call nothing is
+    // graph-visible: a failure is definite (`Unpublished`) whatever its cause.
     let staged = staging
         .stage_all_with_concurrency(db, branch, stage_write_concurrency)
-        .await?;
+        .await
+        .map_err(OmniError::unpublished)?;
     let commit =
         publish_staged_load(db, staged, &txn, branch, actor_id, history_release_bytes).await?;
 
@@ -1304,17 +1307,23 @@ async fn publish_staged_load(
     actor_id: Option<&str>,
     history_release_bytes: HistoryReleaseBytes,
 ) -> Result<crate::db::GraphCommit> {
-    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
     let lineage_intent = db
         .new_lineage_intent_for_branch(branch, actor_id, history_release_bytes)
-        .await?;
+        .await
+        .map_err(OmniError::unpublished)?;
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
         detached: _,
         gates: _held_gates,
-    } = staged.commit_all(db, branch, txn).await?;
-    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+    } = staged
+        .commit_all(db, branch, txn)
+        .await
+        .map_err(OmniError::unpublished)?;
+    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;
+    // The publisher alone decides between a definite loss and an outcome it
+    // could not read back.
     db.commit_updates_on_branch_with_expected(
         branch,
         &updates,
