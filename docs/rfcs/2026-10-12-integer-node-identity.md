@@ -89,6 +89,13 @@ and it introduces the first consumer of the distributed sequence.
   Handles are graph-local and never prove the origin of imported data.
 - `$e.@id` for every edge, keyed or unkeyed, is the String handle
   `EdgeType:number`. It replaces both derived keyed-edge ids and ULIDs.
+- A canonical name may be qualified under
+  [Schema namespaces](https://github.com/ModernRelay/omnigraph/pull/1015), as
+  in `crm::Note:1048576`. A handle parses at its last `:`: the name is
+  everything before it, and the number is the decimal digits after it. A
+  move into, out of or between namespaces is a rename, so it changes the
+  spelling of every unkeyed node and edge handle of that type, and of `@src`
+  and `@dst` wherever they render one, and the old spelling is not an alias.
   `$e.@src` and `$e.@dst` render the endpoint node's public address: its key
   for a keyed node, or `Type:number` for an unkeyed one. Filtering these
   pseudo-properties resolves the address against the captured schema and
@@ -564,7 +571,8 @@ Following [the testing map](../dev/testing.md):
 - **GQT:** cases mirroring the merge truth table for the insert-insert case;
   `@id` rendering and filters for unkeyed nodes and all edge kinds; endpoint
   pseudo-properties; a key change by `update`; rename changes handle spelling
-  while preserving internal references.
+  while preserving internal references; once namespaces exist, a qualified
+  type's handle parses at its last `:`.
 - **DST:** concurrent branch inserts with merges, oracle "one row per key per
   type on every branch and after every merge, every endpoint resolves".
 - **Group commit:** with #785's publisher on, a focused concurrent-write test
@@ -624,3 +632,6 @@ fresh supplied-id reservations.
 endpoint indexes are BTREE, packed filters use `u64` literals, and stable row
 ids are rejected for per-lineage allocation and re-insert, not for update.
 Recorded the group-commit admission rule for allocated ids.
+
+2026-10-18: a handle parses at its last `:`, so qualified names from Schema
+namespaces fit, and a namespace move respells handles as any rename does.
