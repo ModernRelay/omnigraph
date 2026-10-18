@@ -5,6 +5,7 @@
 # notes: A Float bound on an integer column, and an Integer bound on a float column, compare against the bound's exact value.
 # notes: A list property's @range bounds each element; the loader used to skip list columns without checking them.
 # notes: U64 values above i64::MAX reach @range through a load; mutation parameters stop at i64::MAX.
+# notes: Upper-only bounds are maxima for scalar and list properties; omitted minima permit negative values.
 # notes: The seed loads each boundary value; the final read shows that every refused write stored nothing.
 
 --- runner
@@ -21,11 +22,15 @@ node Counter {
     small: I32?
     reading: F64?
     counts: [I64]?
+    ceiling: I64?
+    ceilings: [I64]?
     @range(count, 0..9007199254740992)
     @range(unsigned, 0..9223372036854775807)
     @range(small, -2.5..2.5)
     @range(reading, 9007199254740993..)
     @range(counts, 0..9007199254740992)
+    @range(ceiling, ..10)
+    @range(ceilings, ..10)
 }
 
 --- seed
@@ -34,6 +39,7 @@ node Counter {
 {"type":"Counter","data":{"name":"small_inside","small":-2}}
 {"type":"Counter","data":{"name":"reading_above","reading":9007199254740994.0}}
 {"type":"Counter","data":{"name":"counts_inside","counts":[0,9007199254740992]}}
+{"type":"Counter","data":{"name":"ceilings_at","ceiling":10,"ceilings":[10]}}
 
 --- mutate
 query count_above_max() { insert Counter { name: "count_above", count: 9007199254740993 } }
@@ -81,10 +87,24 @@ query reading_below_integer_min() { insert Counter { name: "reading_below", read
 query counts_element_above_max() { insert Counter { name: "counts_above", counts: [0, 9007199254740993] } }
 --- expect error: @range violation on Counter.counts: value 9007199254740993 > max 9007199254740992
 
+--- mutate
+query ceilings_below_max($ceiling: I64, $ceilings: [I64]) { insert Counter { name: "ceilings_below", ceiling: $ceiling, ceilings: $ceilings } }
+--- params
+{"ceiling": -1, "ceilings": [-1, 10]}
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query ceiling_above_max() { insert Counter { name: "ceiling_above", ceiling: 11 } }
+--- expect error: @range violation on Counter.ceiling: value 11 > max 10
+
+--- mutate
+query ceilings_element_above_max() { insert Counter { name: "ceilings_above", ceilings: [10, 11] } }
+--- expect error: @range violation on Counter.ceilings: value 11 > max 10
+
 --- query
 query counters() {
     match { $c: Counter }
-    return { $c.name, $c.count, $c.unsigned, $c.small, $c.reading, $c.counts }
+    return { $c.name, $c.count, $c.unsigned, $c.small, $c.reading, $c.counts, $c.ceiling, $c.ceilings }
 }
 --- expect unordered
 {"c.name": "count_at", "c.count": 9007199254740992}
@@ -92,6 +112,8 @@ query counters() {
 {"c.name": "small_inside", "c.small": -2}
 {"c.name": "reading_above", "c.reading": 9007199254740994.0}
 {"c.name": "counts_inside", "c.counts": [0, 9007199254740992]}
+{"c.name": "ceilings_at", "c.ceiling": 10, "c.ceilings": [10]}
+{"c.name": "ceilings_below", "c.ceiling": -1, "c.ceilings": [-1, 10]}
 --- expect shape
 c.name: String
 c.count: I64?
@@ -99,3 +121,5 @@ c.unsigned: U64?
 c.small: I32?
 c.reading: F64?
 c.counts: [I64]?
+c.ceiling: I64?
+c.ceilings: [I64]?

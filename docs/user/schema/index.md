@@ -90,6 +90,21 @@ also have a single-property shorthand.
 | `@check(p, "regex")` | node | Requires a String property to match the expression. |
 | `@card(min..max)` | edge | Restricts the number of edges; omit `max` for an unbounded range, as in `@card(1..)`. The default is unbounded from zero. |
 
+`@range(p, ..10)` supplies only a maximum, and `@range(p, 10..)` supplies
+only a minimum; both endpoints are inclusive. Integer bounds must fit `I64`
+(`-9223372036854775808` through `9223372036854775807`), even for a `U64`
+property. Decimal bounds use their `F64` value.
+
+Already accepted graph schemas keep their stored bounds. Older versions
+interpreted an upper-only bound as a minimum and converted oversized integer
+bounds to `F64`, possibly rounding their value. Opening or upgrading a graph
+does not rewrite those accepted meanings. Reapplying that source, or using an
+exported schema to create another graph, uses the corrected admission rules:
+to preserve the accepted constraint, spell the historical minimum as `min..`
+and a stored floating-point bound as a decimal with the recorded value.
+Complete outstanding deployments containing affected schema source before
+upgrading the binary; deployment source validation uses the admission rules.
+
 `Blob`, list, and vector properties cannot be keys. Blob properties also cannot
 be unique or indexed.
 

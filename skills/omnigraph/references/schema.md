@@ -210,6 +210,11 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@range(prop, min..max)` — node-only inclusive numeric bounds, compared exactly; a list property bounds each element; either bound may be omitted
 - `@check(prop, "regex")` — node-only String regular-expression constraint
 
+Integer bounds must fit `I64`; `..max` is upper-only and `min..` is lower-only.
+Decimal bounds use `F64`. Existing accepted schemas retain their bounds: before
+restating a historical schema, write an old upper-only bound as `min..` and an
+oversized integer bound as a decimal with its stored value.
+
 ## Interfaces
 
 Supported but rarely used. Declare shared property contracts and node types implement them:
