@@ -3769,3 +3769,146 @@ async fn expected_actor_header_narrows_a_request_and_never_supplies_an_actor() {
     assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
     assert_code(body, ErrorCode::ActorMismatch, "unauthenticated");
 }
+
+async fn access(app: &axum::Router, query: &str, token: Option<&str>) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .uri(g(&format!("/access{query}")))
+        .method(Method::GET);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    json_response(app, request.body(Body::empty()).unwrap()).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_reports_the_callers_own_actions_as_routes_decide_them() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_YAML).unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![
+                ("act-bruno".to_string(), "bruno-token".to_string()),
+                ("act-ragnor".to_string(), "ragnor-token".to_string()),
+            ],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+
+    // Branch-scoped grants count graph-wide only when a rule covers every
+    // branch; a target-scoped grant needs its target named. Branches are
+    // judged by name: `feature` does not exist.
+    for (token, query, expected) in [
+        (
+            "bruno-token",
+            "",
+            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+                   "branch":null,"target_branch":null,"actions":[]}),
+        ),
+        (
+            "bruno-token",
+            "?branch=main",
+            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+                   "branch":"main","target_branch":null,"actions":["read"]}),
+        ),
+        (
+            "bruno-token",
+            "?branch=feature&target_branch=main",
+            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+                   "branch":"feature","target_branch":"main","actions":["read","change"]}),
+        ),
+        (
+            "ragnor-token",
+            "?branch=main",
+            json!({"actor":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
+                   "branch":"main","target_branch":null,
+                   "actions":["read","export","branch_delete"]}),
+        ),
+        (
+            "ragnor-token",
+            "?branch=feature&target_branch=main",
+            json!({"actor":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
+                   "branch":"feature","target_branch":"main",
+                   "actions":["read","export","change","branch_merge"]}),
+        ),
+    ] {
+        let (status, body) = access(&app, query, Some(token)).await;
+        assert_eq!(status, StatusCode::OK, "{token} {query}: {body}");
+        assert_eq!(body, expected, "{token} {query}");
+    }
+
+    for query in [
+        "?target_branch=main",
+        "?branch=main&branch=feature",
+        "?actor=act-ragnor",
+        "?branch=%20main",
+    ] {
+        let (status, body) = access(&app, query, Some("bruno-token")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        let error: ErrorOutput = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            error.code,
+            Some(omnigraph_server::api::ErrorCode::BadRequest),
+            "{query}"
+        );
+    }
+    let (status, _) = access(&app, "", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Without a graph policy a static token only reads, as `authorize`
+    // decides; without authentication every graph action is open.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path()).to_string_lossy().to_string();
+    let app = build_app(
+        AppState::open_with_bearer_tokens(
+            graph.clone(),
+            vec![("act-bruno".to_string(), "bruno-token".to_string())],
+        )
+        .await
+        .unwrap(),
+    );
+    let (status, body) = access(&app, "?branch=main", Some("bruno-token")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["graph_wide"], json!(["read"]));
+    assert_eq!(body["actions"], json!(["read"]));
+    drop(app);
+
+    let app = build_app(AppState::open(graph).await.unwrap());
+    let (status, body) = access(&app, "?branch=main&target_branch=feature", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["actor"], Value::Null);
+    assert_eq!(
+        body["graph_wide"],
+        json!([
+            "read",
+            "export",
+            "change",
+            "schema_apply",
+            "branch_create",
+            "branch_delete",
+            "branch_merge",
+            "commit_publish",
+            "commit_drop",
+            "invoke_query"
+        ])
+    );
+    assert_eq!(
+        body["actions"],
+        json!([
+            "read",
+            "export",
+            "change",
+            "schema_apply",
+            "branch_delete",
+            "commit_publish",
+            "commit_drop",
+            "branch_create",
+            "branch_merge"
+        ])
+    );
+}

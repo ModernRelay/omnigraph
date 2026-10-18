@@ -224,6 +224,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/commits/{commit_id}/changes",
     "/graphs/{graph_id}/changes",
     "/graphs/{graph_id}/changes/baseline",
+    "/graphs/{graph_id}/access",
 ];
 
 /// The routes that answer in the change vocabulary: the change feed, a

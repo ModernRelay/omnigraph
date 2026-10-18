@@ -1833,6 +1833,57 @@ pub struct SnapshotQuery {
     pub branch: Option<String>,
 }
 
+/// Query parameters for `GET /graphs/{graph_id}/access`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct AccessQuery {
+    /// A branch whose actions to report, by name; it need not exist.
+    pub branch: Option<String>,
+    /// With `branch`, the branch `branch_create` would create and
+    /// `branch_merge` would merge into, by name.
+    pub target_branch: Option<String>,
+}
+
+/// A graph action a policy decides, as the access route reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessAction {
+    Read,
+    Export,
+    Change,
+    SchemaApply,
+    BranchCreate,
+    BranchDelete,
+    BranchMerge,
+    CommitPublish,
+    CommitDrop,
+    InvokeQuery,
+}
+
+/// What the caller's own credential may do on one graph, by the graph's
+/// installed policy. It names actions, never the rules that allow them, and
+/// says nothing about any other actor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AccessOutput {
+    /// The actor the credential resolves to. Absent only on a server that runs
+    /// without authentication.
+    pub actor: Option<String>,
+    pub graph_id: String,
+    /// Actions allowed whatever the branch: the graph-scoped ones, and the
+    /// branch-scoped ones a rule allows on every branch.
+    pub graph_wide: Vec<AccessAction>,
+    /// The branch asked about, when one was.
+    pub branch: Option<String>,
+    /// The target branch asked about, when one was.
+    pub target_branch: Option<String>,
+    /// With `branch`, the actions allowed on it, including `branch_delete`,
+    /// `commit_publish`, `commit_drop` and `schema_apply` with it as their
+    /// target. With `target_branch` as well, also `branch_create` and
+    /// `branch_merge` from `branch` into it. Empty without `branch`.
+    pub actions: Vec<AccessAction>,
+}
+
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct CommitListQuery {
     pub branch: Option<String>,

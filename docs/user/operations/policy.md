@@ -157,6 +157,43 @@ before activating matching HTTP and engine permissions. Later requests use the
 new rules. Cluster management policy changes take effect in the same deployment;
 a newly granted administrator cannot authorize that grant.
 
+## Learn your access
+
+`GET /graphs/{graph_id}/access` tells the caller what its own credential may do
+on a graph, so a client can show only the actions it is allowed instead of
+learning them from a refusal:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.13" \
+  "https://graph.example/graphs/knowledge/access?branch=feature&target_branch=main"
+```
+
+```json
+{"actor":"act-bruno","graph_id":"knowledge","graph_wide":["read"],
+ "branch":"feature","target_branch":"main","actions":["read","change"]}
+```
+
+- `graph_wide` lists the actions allowed whatever the branch: `invoke_query`,
+  and the branch-scoped actions a rule allows on every branch.
+- With `branch`, `actions` lists the actions allowed on it: `read`, `export`
+  and `change`, and `branch_delete`, `commit_publish`, `commit_drop` and
+  `schema_apply` with that branch as their target.
+- With `target_branch` as well, `actions` also lists `branch_create` from
+  `branch` into the target and `branch_merge` of `branch` into it.
+
+The route evaluates the installed policy for the caller's resolved actor, each
+action shaped as the route that performs it shapes it, so it answers exactly as
+those routes decide. It needs no action of its own, reads no graph data, and
+judges branches by name without checking that they exist. It names actions,
+never the rules behind them, and reveals nothing about other actors. A static
+token on a graph without a policy gets `read` alone, and a signed data
+credential without one nothing, as those routes decide; a server without
+authentication allows every graph action and reports no `actor`. The MCP
+`access` tool returns the same body.
+
+It reports policy actions, not actor views, so a view can still refuse a
+`change` the policy allows.
+
 ## Actor identity
 
 For HTTP requests, the server maps the bearer token to an actor. Headers,
