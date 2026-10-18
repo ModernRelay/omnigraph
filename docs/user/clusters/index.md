@@ -48,7 +48,8 @@ enforces an installed graph policy and requires an authorized `--as` actor.
 Deployment status reveals management
 metadata under `config_manage`; it does not require data access on unrelated
 graphs. New graphs need suitable declared policies too.
-The server derives the actor from its bearer token; `--as` is for direct access.
+The server derives the actor from its bearer token; `--as` names the actor of
+direct access, and with `--server` asserts the token's actor instead.
 
 ## Bootstrap a cluster
 

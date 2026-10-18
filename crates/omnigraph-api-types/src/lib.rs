@@ -32,6 +32,11 @@ pub use omnigraph_compiler::settings;
 pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
 /// Exact header value; consumers must reject missing or repeated values.
 pub const HTTP_API_CONTRACT: &str = "0.13";
+/// An optional request header naming the actor the caller expects its
+/// credential to resolve to. The server refuses a mismatch with
+/// [`ErrorCode::ActorMismatch`] before graph lookup or effects; a matching
+/// value changes nothing, so the header can only narrow a request.
+pub const EXPECT_ACTOR_HEADER: &str = "omnigraph-expect-actor";
 
 /// How a binary identifies its build: the one derivation the CLI's
 /// `omnigraph version`, the server's `/healthz` and its MCP server info all
@@ -1904,6 +1909,9 @@ pub enum ErrorCode {
     /// 400: the request lacks the exact supported HTTP contract header.
     /// Authentication and contract admission precede graph access and effects.
     ApiContractMismatch,
+    /// 412: the request's `omnigraph-expect-actor` header names another actor
+    /// than its credential resolves to. Nothing ran.
+    ActorMismatch,
     NotFound,
     /// 405 Method Not Allowed — the route exists but the active server
     /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph

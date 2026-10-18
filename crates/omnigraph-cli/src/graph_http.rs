@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use color_eyre::Result;
 use color_eyre::eyre::bail;
-use omnigraph_api_types::{ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
+use omnigraph_api_types::{
+    EXPECT_ACTOR_HEADER, ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER,
+};
 use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 
@@ -271,6 +273,10 @@ pub(crate) struct GraphHttpClient {
     /// Why this client's requests carry no credential, attached to a 401
     /// response so its refusal says how to bind one.
     missing_credential: Option<Box<MissingCredential>>,
+    /// The actor `--as` asserts, sent as `omnigraph-expect-actor` on every
+    /// data request, so the server refuses a credential that resolves to
+    /// another actor before anything runs.
+    expected_actor: Option<String>,
 }
 
 impl GraphHttpClient {
@@ -316,11 +322,18 @@ impl GraphHttpClient {
             transport,
             health_url,
             missing_credential: None,
+            expected_actor: None,
         })
     }
 
     pub(crate) fn with_missing_credential(mut self, missing: MissingCredential) -> Self {
         self.missing_credential = Some(Box::new(missing));
+        self
+    }
+
+    /// Assert `actor` on every data request this client sends.
+    pub(crate) fn with_expected_actor(mut self, actor: Option<&str>) -> Self {
+        self.expected_actor = actor.map(str::to_owned);
         self
     }
 
@@ -332,6 +345,7 @@ impl GraphHttpClient {
             transport: self.transport.clone(),
             health_url: self.health_url.clone(),
             missing_credential: self.missing_credential.clone(),
+            expected_actor: self.expected_actor.clone(),
         })
     }
 
@@ -355,9 +369,11 @@ impl GraphHttpClient {
             return Err(ApiContractError::discovery(Some(discovery.status())).into());
         }
         drop(discovery);
-        let request = request
-            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .build()?;
+        let mut request = request.header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT);
+        if let Some(actor) = &self.expected_actor {
+            request = request.header(EXPECT_ACTOR_HEADER, actor);
+        }
+        let request = request.build()?;
         let bearer = request
             .headers()
             .get(reqwest::header::AUTHORIZATION)

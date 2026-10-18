@@ -541,15 +541,10 @@ impl GraphClient {
         let resolved = resolve_cli_graph(uri)?;
         reject_positional_remote(via_server, &resolved.uri)?;
         if resolved.is_remote {
-            // A served write resolves the actor server-side from the bearer
-            // token; `--as` cannot set identity here and is rejected.
-            if cli_as.is_some() {
-                bail!(
-                    "`--as` is not allowed on a served write — the server resolves the actor \
-                     from the bearer token. Remove `--as`, or run the write directly against \
-                     storage with `--store <uri>`."
-                );
-            }
+            // A served write's actor is the one its bearer token resolves
+            // to. `--as` cannot set it; the server refuses the request when
+            // the token resolves to another actor. `operator.actor` names the
+            // direct actor and is not asserted against servers.
             // Complete local addressing/identity validation before discovery.
             // With no selected graph, this is already the registry address.
             let (http, token) = served_client_with_config(
@@ -558,6 +553,7 @@ impl GraphClient {
                 server_root.as_deref().expect("remote server scope"),
                 &resolved.uri,
             )?;
+            let http = http.with_expected_actor(cli_as);
             let client = GraphClient::Remote {
                 http,
                 base_url: resolved.uri,

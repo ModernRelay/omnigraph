@@ -108,6 +108,20 @@ on a trusted development network. Static tokens without a policy allow only the
 `read` action. Stored-query invocation, export, graph listing, writes, and other
 actions remain denied.
 
+### Assert the actor
+
+A client that means to act as a particular actor sends
+`Omnigraph-Expect-Actor: <actor>` with any protected request, `/mcp` included.
+The server compares it with the actor the credential resolved to, after
+authentication and the contract check and before graph lookup, body decoding
+or any effect:
+
+a match changes nothing, a mismatch is `412 actor_mismatch` with nothing run (a
+server without authentication resolves no actor), and a repeated or padded
+header is `400 bad_request`. The header only narrows a request; it never
+supplies the actor. The CLI sends it for `--as` on served writes and `cluster
+--server` commands.
+
 ### Signed data credentials
 
 To accept short-lived credentials from an issuer, mount its public trust file

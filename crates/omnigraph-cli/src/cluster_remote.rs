@@ -154,6 +154,7 @@ impl RemoteCluster {
     fn new(
         input: &crate::operator::InvocationConfig,
         server: &str,
+        expected_actor: Option<&str>,
         stderr: &mut dyn Write,
     ) -> Result<Self> {
         // Preserve literal address errors before operator-config errors.
@@ -165,6 +166,7 @@ impl RemoteCluster {
         let root = resolve_server_flag_with_config(operator_config, Some(server), None)?
             .expect("explicit server");
         let (client, token) = served_client_with_config(input, operator_config, &root, &root)?;
+        let client = client.with_expected_actor(expected_actor);
         Ok(Self {
             root,
             token,
@@ -501,11 +503,6 @@ pub(crate) async fn dispatch(
     if cli.cluster.is_some() {
         bail!("--server and --cluster are mutually exclusive");
     }
-    if cli.as_actor.is_some() {
-        bail!(
-            "--as cannot be used with --server; the server resolves the actor from the bearer token"
-        );
-    }
     if matches!(
         command,
         ClusterCommand::Apply {
@@ -515,7 +512,7 @@ pub(crate) async fn dispatch(
     ) {
         bail!("--writers-stopped cannot be used with --server");
     }
-    let remote = RemoteCluster::new(input, server, stderr)?;
+    let remote = RemoteCluster::new(input, server, cli.as_actor.as_deref(), stderr)?;
     match command {
         ClusterCommand::Plan { config, json, .. } => remote.plan(config, *json, stdout).await?,
         ClusterCommand::Apply {

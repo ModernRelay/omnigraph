@@ -82,6 +82,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -129,6 +138,27 @@
           },
           "403": {
             "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -219,6 +249,15 @@
               "enum": [
                 "0.13"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -359,6 +398,27 @@
               }
             }
           },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "413": {
             "description": "; Request body exceeds its route limit before operation admission",
             "headers": {
@@ -463,6 +523,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -510,6 +579,27 @@
           },
           "403": {
             "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -602,6 +692,15 @@
               "enum": [
                 "0.13"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -721,6 +820,27 @@
               }
             }
           },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "413": {
             "description": "; Request body exceeds its route limit before operation admission",
             "headers": {
@@ -817,6 +937,15 @@
               "enum": [
                 "0.13"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -925,6 +1054,27 @@
                 }
               }
             }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -951,6 +1101,15 @@
               "enum": [
                 "0.13"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1020,6 +1179,27 @@
           },
           "403": {
             "description": "Identity credential required",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1177,6 +1357,15 @@
               "enum": [
                 "0.13"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1434,7 +1623,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not strongly match the selected managed Blob validator",
+            "description": "If-Match did not strongly match the selected managed Blob validator; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "Accept-Ranges": {
                 "schema": {
@@ -1672,6 +1861,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -1842,7 +2040,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator",
+            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "ETag": {
                 "schema": {
@@ -2071,6 +2269,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2201,7 +2408,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator",
+            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "ETag": {
                 "schema": {
@@ -2454,6 +2661,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2623,7 +2839,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not strongly match the selected managed Blob validator; HEAD responses have no body",
+            "description": "If-Match did not strongly match the selected managed Blob validator; HEAD responses have no body; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "Accept-Ranges": {
                 "schema": {
@@ -2736,6 +2952,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2804,6 +3029,27 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2905,6 +3151,15 @@
               "enum": [
                 "0.13"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -3026,6 +3281,27 @@
           },
           "409": {
             "description": "Branch already exists",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3224,6 +3500,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -3374,6 +3659,27 @@
               }
             }
           },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
           "413": {
             "description": "Requested limit exceeds the public change ceiling",
             "headers": {
@@ -3501,6 +3807,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -3621,6 +3936,27 @@
           },
           "409": {
             "description": "Merge conflict",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3785,6 +4121,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -3874,6 +4219,27 @@
           },
           "404": {
             "description": "A branch is not found",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4008,6 +4374,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4097,6 +4472,27 @@
           },
           "404": {
             "description": "Branch not found",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4291,6 +4687,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4441,6 +4846,27 @@
               }
             }
           },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
           "413": {
             "description": "Requested limit exceeds the public change ceiling",
             "headers": {
@@ -4568,6 +4994,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -4688,6 +5123,27 @@
           },
           "408": {
             "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4889,6 +5345,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4978,6 +5443,27 @@
           },
           "404": {
             "description": "Branch not found",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5112,6 +5598,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -5201,6 +5696,27 @@
           },
           "404": {
             "description": "Commit not found",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5312,6 +5828,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -5394,6 +5919,27 @@
           },
           "409": {
             "description": "The commit is published",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5574,6 +6120,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -5684,6 +6239,27 @@
           },
           "410": {
             "description": "Required retained history is no longer readable; see change_feed_gap and capture a new baseline",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5839,6 +6415,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -5948,7 +6533,7 @@
             }
           },
           "412": {
-            "description": "The target head moved past the commit's captured parent; the commit can only be dropped",
+            "description": "The target head moved past the commit's captured parent; the commit can only be dropped; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6126,6 +6711,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -6236,6 +6830,27 @@
           },
           "410": {
             "description": "Retained history for an endpoint is no longer readable; see change_feed_gap",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6381,6 +6996,15 @@
               "enum": [
                 "0.13"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -6538,6 +7162,27 @@
               }
             }
           },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "413": {
             "description": "Export cut or transport capacity exhausted; Request body exceeds its route limit before operation admission",
             "headers": {
@@ -6665,6 +7310,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -6785,6 +7439,27 @@
           },
           "409": {
             "description": "Prepared load authority changed before effects",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6971,6 +7646,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -7113,6 +7797,27 @@
           },
           "409": {
             "description": "Prepared load authority changed before effects",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -7280,6 +7985,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -7440,6 +8154,27 @@
               }
             }
           },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "413": {
             "description": "Keyed write exceeds the per-commit entity or byte ceiling; Request body exceeds its route limit before operation admission",
             "headers": {
@@ -7575,6 +8310,15 @@
               "enum": [
                 "0.13"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -7716,7 +8460,7 @@
             }
           },
           "412": {
-            "description": "Graph-commit precondition failed; the write had no effect",
+            "description": "Graph-commit precondition failed; the write had no effect; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -7863,6 +8607,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -7931,6 +8684,27 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -8043,6 +8817,15 @@
               "enum": [
                 "0.13"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -8191,6 +8974,27 @@
           },
           "409": {
             "description": "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required); neither is cleared by retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -8376,6 +9180,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -8543,7 +9356,7 @@
             }
           },
           "412": {
-            "description": "Stored mutation graph-commit precondition failed; the write had no effect",
+            "description": "Stored mutation graph-commit precondition failed; the write had no effect; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -8711,6 +9524,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -8831,6 +9653,27 @@
           },
           "409": {
             "description": "A full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required); neither is cleared by retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -8977,6 +9820,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -9045,6 +9897,27 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -9160,6 +10033,15 @@
                 "0.13"
               ]
             }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -9228,6 +10110,27 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -10638,6 +11541,7 @@
           "forbidden",
           "bad_request",
           "api_contract_mismatch",
+          "actor_mismatch",
           "not_found",
           "method_not_allowed",
           "conflict",

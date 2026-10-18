@@ -187,7 +187,7 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
   --server prod --graph knowledge
 ```
 
-The server resolves the actor from its token; clients cannot override it with `--as`.
+The server resolves the actor from its token; on a served write `--as` only asserts it.
 
 `login` writes the token to `~/.omnigraph/credentials` with mode `0600`.
 `OMNIGRAPH_TOKEN_<NAME>`, the server name uppercased with `-` written as `_`,

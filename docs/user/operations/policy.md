@@ -171,8 +171,9 @@ For direct CLI writes, actor resolution is:
 2. `operator.actor` in `~/.omnigraph/config.yaml`;
 3. no actor.
 
-When a policy is installed, a missing actor is denied. Served writes reject
-`--as` because only the server may resolve their actor.
+When a policy is installed, a missing actor is denied. Only the server
+resolves a served write's actor; there `--as` is an assertion the server checks
+against the token ([Assert the actor](server.md#assert-the-actor)).
 
 Successful graph commits record the actor for the whole atomic change. Inspect
 the audit trail with:

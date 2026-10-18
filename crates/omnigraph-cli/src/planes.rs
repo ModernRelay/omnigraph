@@ -672,7 +672,6 @@ mod tests {
     #[tokio::test]
     async fn live_cluster_scope_conflicts_refuse_before_discovery() {
         let cases: &[(&[&str], &str)] = &[
-            (&["--as", "spoofed"], "--as cannot be used with --server"),
             (
                 &["--cluster", "file:///unused"],
                 "--server and --cluster are mutually exclusive",

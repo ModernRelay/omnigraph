@@ -212,6 +212,7 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
                 next.run(request).await
             },
         ))
+        .route_layer(middleware::from_fn(handlers::require_expected_actor))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             handlers::require_bearer_auth,

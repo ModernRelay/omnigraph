@@ -32,8 +32,8 @@ Common global flags:
 | `--yes` | Non-interactive consent for destructive writes to non-local storage |
 | `--quiet` | Suppress the resolved write target printed to stderr |
 
-A served write refuses `--as` ("`--as` is not allowed on a served write"): the
-server resolves the actor from the bearer token. Drop it, or use `--store <uri>`.
+On a served write `--as` asserts the actor the bearer token must resolve to; a mismatch exits 4
+with nothing run. See [Assert the actor](../operations/server.md#assert-the-actor).
 
 ## Commands
 

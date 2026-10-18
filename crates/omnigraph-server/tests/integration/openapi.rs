@@ -1663,6 +1663,7 @@ fn error_code_schema_has_expected_variants() {
             "forbidden",
             "bad_request",
             "api_contract_mismatch",
+            "actor_mismatch",
             "not_found",
             "method_not_allowed",
             "conflict",
