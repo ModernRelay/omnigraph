@@ -3,6 +3,25 @@
 //! This is process-local settlement evidence, never a writer fence. Every
 //! wrapped remote client must disable retries before construction: a successful
 //! retry cannot establish what happened to an earlier, unacknowledged request.
+//!
+//! What an unacknowledged request can still do decides whether it poisons the
+//! scope, and that is a property of the key it names ([`KeyClass`]):
+//!
+//! - Lance writes its table files once under fresh names (`data/*.lance` and
+//!   the Blob sidecars below them, `_transactions/*.txn`, `_deletions/*`,
+//!   `_indices/<uuid>/*`, detached `_versions/d*.manifest`) and its numbered
+//!   `_versions/*.manifest` put-if-absent. A request to one of those keys
+//!   that lands late or twice changes nothing a `__manifest` publication
+//!   resolves: a file nothing names is reclaimable garbage, a detached
+//!   version's random id is never reused, and a numbered manifest's
+//!   precondition admits one copy, which the next reader observes. Such a
+//!   request settles with its definite error.
+//! - Every other key (a Lance ref under `_refs/`, the version hint, a
+//!   control object under `__cluster/`, a path this module does not know)
+//!   may be rewritten or removed by a request that lands after the owner
+//!   gave up on it, so an unsettled request there permanently makes the
+//!   scope uncertain. The first such request is logged with its key and
+//!   error; nothing else records the cause.
 
 use std::fmt;
 use std::ops::Range;
@@ -87,7 +106,7 @@ impl StorageIoScope {
         })
     }
 
-    pub(crate) fn begin(&self) -> Result<Mutation> {
+    pub(crate) fn begin(&self, request: Request) -> Result<Mutation> {
         let mut state = self.inner.state.lock().unwrap();
         if state.closed {
             return Err(closed_error());
@@ -99,10 +118,11 @@ impl StorageIoScope {
         Ok(Mutation {
             scope: self.clone(),
             settled: false,
+            request,
         })
     }
 
-    fn begin_child(&self, cleanup: bool) -> Result<Mutation> {
+    fn begin_child(&self, request: Request, cleanup: bool) -> Result<Mutation> {
         // Only an admitted multipart lifetime can call this. Its outstanding
         // guard prevents an idle observation before the child is registered.
         let mut state = self.inner.state.lock().unwrap();
@@ -113,8 +133,87 @@ impl StorageIoScope {
         Ok(Mutation {
             scope: self.clone(),
             settled: false,
+            request,
         })
     }
+}
+
+/// Whether a request to this key that lands after its owner gave up on it,
+/// or lands twice, can change what a later owner reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyClass {
+    /// A Lance table file written once under a fresh name, or a manifest
+    /// version written put-if-absent: a late or duplicate landing is
+    /// unreachable garbage or a refused duplicate.
+    Immutable,
+    /// A key a later owner may read or rewrite in place.
+    Mutable,
+}
+
+/// One mutating request as the scope accounts for it.
+#[derive(Clone, Debug)]
+pub(crate) struct Request {
+    op: &'static str,
+    path: Path,
+    /// A put-if-absent or if-match request, whose conflict is a definite
+    /// refusal and whose late landing applies at most once.
+    conditional: bool,
+    class: KeyClass,
+}
+
+impl Request {
+    pub(crate) fn new(op: &'static str, path: &Path, conditional: bool) -> Self {
+        Self {
+            op,
+            path: path.clone(),
+            conditional,
+            class: key_class(path, conditional),
+        }
+    }
+}
+
+/// Classify a key by Lance's table layout, anchored at the tail of the path
+/// so a root prefix never matches. A numbered manifest is immutable only
+/// through a conditional request; the version hint beside it, every ref and
+/// every unknown path is mutable.
+pub(crate) fn key_class(path: &Path, conditional: bool) -> KeyClass {
+    let owned: Vec<String> = path.parts().map(|part| part.as_ref().to_owned()).collect();
+    let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let [.., parent, name] = parts.as_slice() else {
+        return KeyClass::Mutable;
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let immutable = match *parent {
+        "data" => name.ends_with(".lance"),
+        "_transactions" => name.ends_with(".txn"),
+        "_deletions" => name.ends_with(".arrow") || name.ends_with(".bin"),
+        "_versions" => match name.strip_suffix(".manifest") {
+            Some(version) => match version.strip_prefix('d') {
+                Some(detached) => digits(detached),
+                None => conditional && digits(version),
+            },
+            None => false,
+        },
+        _ => false,
+    };
+    if immutable {
+        return KeyClass::Immutable;
+    }
+    // Blob v2 sidecars: `data/<data file key>/<blob id>.blob`.
+    if let [.., grandparent, _, _] = parts.as_slice()
+        && *grandparent == "data"
+        && name.ends_with(".blob")
+    {
+        return KeyClass::Immutable;
+    }
+    // Index files: anything below `_indices/<uuid>/`.
+    let index_dir = parts[..parts.len() - 1]
+        .windows(2)
+        .any(|pair| pair[0] == "_indices" && pair[1].len() == 36);
+    if index_dir {
+        return KeyClass::Immutable;
+    }
+    KeyClass::Mutable
 }
 
 fn closed_error() -> object_store::Error {
@@ -135,22 +234,58 @@ fn uncertain_error() -> object_store::Error {
 pub(crate) struct Mutation {
     scope: StorageIoScope,
     settled: bool,
+    request: Request,
 }
 
 impl Mutation {
-    pub(crate) fn finish<T>(mut self, result: Result<T>, conditional: bool) -> Result<T> {
-        self.settled = result.is_ok()
-            || (conditional
-                && matches!(
-                    result,
-                    Err(object_store::Error::AlreadyExists { .. }
-                        | object_store::Error::Precondition { .. })
-                ));
+    /// Settle on success, on a conditional request's definite refusal, and
+    /// on any failure of an immutable key. Everything else leaves the scope
+    /// uncertain when this guard drops, and is logged here because the error
+    /// may be swallowed above and the later refusals name only the scope.
+    pub(crate) fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        let Err(error) = &result else {
+            self.settled = true;
+            return result;
+        };
+        let conflict = self.request.conditional
+            && matches!(
+                error,
+                object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::Precondition { .. }
+            );
+        self.settled = conflict || self.request.class == KeyClass::Immutable;
+        // An ordinary CAS loss is the caller's own outcome and is not logged.
+        if conflict {
+            return result;
+        }
+        if self.settled {
+            tracing::warn!(
+                op = self.request.op,
+                path = %self.request.path,
+                conditional = self.request.conditional,
+                error = %error,
+                "storage request failed on an immutable key; the outcome is definite"
+            );
+        } else {
+            tracing::error!(
+                op = self.request.op,
+                path = %self.request.path,
+                conditional = self.request.conditional,
+                error = %error,
+                "storage request outcome unknown on a mutable key; the owned storage scope is now uncertain"
+            );
+        }
         result
     }
 
     pub(crate) fn settle(mut self) {
         self.settled = true;
+    }
+
+    /// Account the second phase of a two-request mutation under its own key.
+    fn with_request(mut self, request: Request) -> Self {
+        self.request = request;
+        self
     }
 }
 
@@ -188,8 +323,8 @@ impl ObjectStore for ScopedObjectStore {
         opts: PutOptions,
     ) -> Result<PutResult> {
         let conditional = !matches!(opts.mode, object_store::PutMode::Overwrite);
-        let mutation = self.scope.begin()?;
-        mutation.finish(self.inner.put_opts(path, payload, opts).await, conditional)
+        let mutation = self.scope.begin(Request::new("put", path, conditional))?;
+        mutation.finish(self.inner.put_opts(path, payload, opts).await)
     }
 
     async fn put_multipart_opts(
@@ -197,14 +332,16 @@ impl ObjectStore for ScopedObjectStore {
         path: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        let lifetime = self.scope.begin()?;
+        let request = Request::new("multipart", path, false);
+        let lifetime = self.scope.begin(request.clone())?;
         match self.inner.put_multipart_opts(path, opts).await {
             Ok(inner) => Ok(Box::new(ScopedUpload {
                 inner,
                 lifetime: Some(lifetime),
                 scope: self.scope.clone(),
+                request,
             })),
-            Err(error) => lifetime.finish(Err(error), false),
+            Err(error) => lifetime.finish(Err(error)),
         }
     }
 
@@ -230,8 +367,8 @@ impl ObjectStore for ScopedObjectStore {
                 let scope = scope.clone();
                 async move {
                     let path = path?;
-                    let mutation = scope.begin()?;
-                    mutation.finish(inner.delete(&path).await, false)?;
+                    let mutation = scope.begin(Request::new("delete", &path, false))?;
+                    mutation.finish(inner.delete(&path).await)?;
                     Ok(path)
                 }
             })
@@ -257,29 +394,35 @@ impl ObjectStore for ScopedObjectStore {
 
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> Result<()> {
         let conditional = matches!(opts.mode, object_store::CopyMode::Create);
-        let mutation = self.scope.begin()?;
-        mutation.finish(self.inner.copy_opts(from, to, opts).await, conditional)
+        let mutation = self.scope.begin(Request::new("copy", to, conditional))?;
+        mutation.finish(self.inner.copy_opts(from, to, opts).await)
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()> {
-        let mutation = self.scope.begin()?;
         if opts.target_mode == object_store::RenameTargetMode::Create {
             // The standard conditional rename is copy-Create then delete.
             // Keep its phases visible: a copy conflict is known no-effect,
             // whereas an error after a successful copy must not inherit that
             // classification. The outer owner spans both requests, even if
             // new admission closes between them.
+            let mutation = self.scope.begin(Request::new("rename", to, true))?;
             let copy = CopyOptions {
                 mode: object_store::CopyMode::Create,
                 extensions: opts.extensions,
             };
             match self.inner.copy_opts(from, to, copy).await {
-                Err(error) => mutation.finish(Err(error), true),
-                Ok(()) => mutation.finish(self.inner.delete(from).await, false),
+                Err(error) => mutation.finish(Err(error)),
+                Ok(()) => {
+                    let delete = self.inner.delete(from).await;
+                    mutation
+                        .with_request(Request::new("rename source delete", from, false))
+                        .finish(delete)
+                }
             }
         } else {
             // Preserve the backend's optimized atomic overwrite rename.
-            mutation.finish(self.inner.rename_opts(from, to, opts).await, false)
+            let mutation = self.scope.begin(Request::new("rename", to, false))?;
+            mutation.finish(self.inner.rename_opts(from, to, opts).await)
         }
     }
 }
@@ -289,6 +432,16 @@ struct ScopedUpload {
     inner: Box<dyn MultipartUpload>,
     lifetime: Option<Mutation>,
     scope: StorageIoScope,
+    request: Request,
+}
+
+impl ScopedUpload {
+    fn child(&self, op: &'static str) -> Request {
+        Request {
+            op,
+            ..self.request.clone()
+        }
+    }
 }
 
 #[async_trait]
@@ -299,20 +452,22 @@ impl MultipartUpload for ScopedUpload {
         }
         // Register before invoking the synchronous backend method: a backend
         // may start work there, before its returned future is first polled.
-        let mutation = match self.scope.begin_child(false) {
+        let mutation = match self.scope.begin_child(self.child("multipart part"), false) {
             Ok(mutation) => mutation,
             Err(error) => return Box::pin(async move { Err(error) }),
         };
         let part = self.inner.put_part(payload);
-        Box::pin(async move { mutation.finish(part.await, false) })
+        Box::pin(async move { mutation.finish(part.await) })
     }
 
     async fn complete(&mut self) -> Result<PutResult> {
         if self.lifetime.is_none() {
             return Err(closed_error());
         }
-        let mutation = self.scope.begin_child(false)?;
-        let result = mutation.finish(self.inner.complete().await, false);
+        let mutation = self
+            .scope
+            .begin_child(self.child("multipart complete"), false)?;
+        let result = mutation.finish(self.inner.complete().await);
         if result.is_ok() {
             self.lifetime.take().unwrap().settle();
         }
@@ -323,8 +478,10 @@ impl MultipartUpload for ScopedUpload {
         if self.lifetime.is_none() {
             return Err(closed_error());
         }
-        let mutation = self.scope.begin_child(true)?;
-        let result = mutation.finish(self.inner.abort().await, false);
+        let mutation = self
+            .scope
+            .begin_child(self.child("multipart abort"), true)?;
+        let result = mutation.finish(self.inner.abort().await);
         if result.is_ok() {
             self.lifetime.take().unwrap().settle();
         }
@@ -581,6 +738,194 @@ mod tests {
             );
             assert!(store.get(&Path::from("later")).await.is_err());
         }
+    }
+
+    /// Lance's table layout, anchored at the tail of a key: the files it
+    /// writes once and the manifest versions it writes put-if-absent are
+    /// immutable; refs, the version hint, control objects and unknown keys
+    /// are mutable. A root prefix that happens to spell a layout name does
+    /// not match.
+    #[test]
+    fn key_class_follows_lance_table_layout_issue_1067() {
+        let immutable = [
+            ("g/node_Person/data/3f2c4d9e-1a2b.lance", false),
+            ("g/node_Person/data/3f2c4d9e-1a2b/7.blob", false),
+            (
+                "g/node_Person/_transactions/12770445047132701458-0c41-c45b.txn",
+                false,
+            ),
+            ("g/node_Person/_deletions/4-1733.arrow", false),
+            ("g/node_Person/_deletions/4-1733.bin", false),
+            (
+                "g/node_Person/_indices/1b4e28ba-2fa1-11d2-883f-0016d3cca427/index.idx",
+                false,
+            ),
+            (
+                "g/node_Person/_indices/1b4e28ba-2fa1-11d2-883f-0016d3cca427/part/0.idx",
+                false,
+            ),
+            (
+                "g/node_Person/_versions/d12770445047132701458.manifest",
+                false,
+            ),
+            ("g/__manifest/_versions/18446744073709551602.manifest", true),
+            ("g/__manifest/_versions/14.manifest", true),
+        ];
+        for (key, conditional) in immutable {
+            assert_eq!(
+                key_class(&Path::from(key), conditional),
+                KeyClass::Immutable,
+                "{key}"
+            );
+        }
+        let mutable = [
+            ("g/__manifest/_versions/14.manifest", false),
+            ("g/__manifest/_versions/latest_version_hint.json", false),
+            ("g/__manifest/_refs/branches/main", true),
+            ("g/__manifest/_refs/tags/unpublished_01J.json", false),
+            ("g/__cluster/lock.json", true),
+            ("g/__cluster/state.json", true),
+            ("g/__graph_index/csr-current.bin", false),
+            ("data/graphs/g/node_Person/schema.pg", false),
+            ("data/x.lance/state.json", false),
+            ("g/node_Person/_indices/not-a-uuid/index.idx", false),
+            ("g/node_Person/_versions/dx.manifest", false),
+            ("g/node_Person/_versions/d.manifest", false),
+            ("lance", false),
+        ];
+        for (key, conditional) in mutable {
+            assert_eq!(
+                key_class(&Path::from(key), conditional),
+                KeyClass::Mutable,
+                "{key}"
+            );
+        }
+    }
+
+    /// A lost acknowledgement on an immutable key fails the request but
+    /// leaves the scope settled: a late landing is unreachable garbage or a
+    /// refused duplicate, so later mutations are admitted and a clean release
+    /// still holds. The same loss on a mutable key still poisons.
+    #[tokio::test]
+    async fn lost_ack_on_an_immutable_key_fails_without_poison_issue_1067() {
+        let immutable_puts = [
+            (
+                "g/node_Person/data/3f2c4d9e.lance",
+                object_store::PutMode::Overwrite,
+            ),
+            (
+                "g/node_Person/_transactions/12770445047132701458-0c41.txn",
+                object_store::PutMode::Overwrite,
+            ),
+            (
+                "g/node_Person/_versions/d12770445047132701458.manifest",
+                object_store::PutMode::Create,
+            ),
+            (
+                "g/__manifest/_versions/18446744073709551602.manifest",
+                object_store::PutMode::Create,
+            ),
+        ];
+        for (key, mode) in immutable_puts {
+            let (scope, store, _) = fixture(Point::Put, true).await;
+            let error = store
+                .put_opts(&Path::from(key), "bytes".into(), mode.into())
+                .await
+                .expect_err("the lost acknowledgement is still the caller's error");
+            assert!(error.to_string().contains("acknowledgement lost"), "{key}");
+            scope.wait_idle().await;
+            assert!(!scope.is_uncertain(), "{key} must not poison the scope");
+            // The fixture loses every put's acknowledgement; what matters is
+            // that the scope still admits the request instead of refusing it.
+            let later = store
+                .put(
+                    &Path::from("g/node_Person/data/later.lance"),
+                    "later".into(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                later.to_string().contains("acknowledgement lost"),
+                "{key}: later mutations stay admitted: {later}"
+            );
+            scope.close();
+            scope.wait_idle().await;
+            assert!(!scope.is_uncertain(), "{key}: clean release still holds");
+        }
+        for key in [
+            "g/node_Person/data/3f2c4d9e.lance",
+            "g/node_Person/_versions/d12770445047132701458.manifest",
+        ] {
+            let (scope, store, _) = fixture(Point::Delete, true).await;
+            store.put(&Path::from(key), "bytes".into()).await.unwrap();
+            assert!(store.delete(&Path::from(key)).await.is_err());
+            scope.wait_idle().await;
+            assert!(!scope.is_uncertain(), "a lost delete of {key} settles");
+        }
+        {
+            let (scope, store, _) = fixture(Point::Part, true).await;
+            let mut upload = store
+                .put_multipart(&Path::from("g/node_Person/data/3f2c4d9e.lance"))
+                .await
+                .unwrap();
+            assert!(upload.put_part("data".into()).await.is_err());
+            assert!(!scope.is_uncertain(), "a lost data-file part settles");
+            upload.abort().await.unwrap();
+            scope.wait_idle().await;
+            assert!(!scope.is_uncertain());
+        }
+        for (key, mode) in [
+            (
+                "g/__manifest/_versions/14.manifest",
+                object_store::PutMode::Overwrite,
+            ),
+            (
+                "g/__manifest/_versions/latest_version_hint.json",
+                object_store::PutMode::Overwrite,
+            ),
+            (
+                "g/__manifest/_refs/branches/main",
+                object_store::PutMode::Create,
+            ),
+            ("g/__cluster/lock.json", object_store::PutMode::Create),
+        ] {
+            let (scope, store, _) = fixture(Point::Put, true).await;
+            assert!(
+                store
+                    .put_opts(&Path::from(key), "bytes".into(), mode.into())
+                    .await
+                    .is_err()
+            );
+            scope.wait_idle().await;
+            assert!(
+                scope.is_uncertain(),
+                "a lost acknowledgement on {key} poisons"
+            );
+            let refused = store
+                .put(
+                    &Path::from("g/node_Person/data/later.lance"),
+                    "later".into(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("uncertain outcome"),
+                "{key}: the poisoned scope admits nothing: {refused}"
+            );
+        }
+        let (scope, store, _) = fixture(Point::Delete, true).await;
+        store
+            .put(&Path::from("g/__manifest/_refs/tags/t.json"), "tag".into())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .delete(&Path::from("g/__manifest/_refs/tags/t.json"))
+                .await
+                .is_err()
+        );
+        scope.wait_idle().await;
+        assert!(scope.is_uncertain(), "a lost ref delete poisons");
     }
 
     #[tokio::test]
