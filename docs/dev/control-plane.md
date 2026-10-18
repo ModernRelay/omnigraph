@@ -226,14 +226,21 @@ adapters and graph Lance sessions. The wrappers count actual mutating requests
 and multipart lifetimes. What an unacknowledged request can still do is a
 property of the key it names. Lance's table files are written once under fresh
 names (`data/`, its Blob sidecars, `_transactions/`, `_deletions/`,
-`_indices/<uuid>/`, detached `_versions/d*.manifest`) and its numbered
+`_indices/<uuid>/`, `_bt/`, detached `_versions/d*.manifest`) and its numbered
 manifest versions put-if-absent, so a request to one of those keys that lands
 late or twice is unreachable garbage or a refused duplicate: it fails with its
-definite error and settles. A cancelled or ambiguous request to any other key
-(a Lance ref, the version hint, a control object under `__cluster/`, an
-unknown path) sticks even if a higher layer consumes the error, and the scope
-logs that first request with its key and error. Single-attempt conditional
-conflicts remain settled refusals. Scoped clients disable both transport and
+definite error and settles, and so does a multipart upload to such a key
+whatever happens to its `complete`, its `abort` or the upload itself. A
+cancelled or ambiguous request to any other key (a Lance ref, the version
+hint, a control object under `__cluster/`, an unknown path) sticks even if a
+higher layer consumes the error, and the scope logs that first request with
+its key and error. One consequence of a manifest put the store did not
+acknowledge is handled by the scope itself: Lance reads the version back once,
+takes one "not found" as definitive and deletes the attempt's transaction
+file, which a manifest landing later would name, so the scope refuses every
+delete under that dataset's `_transactions/` for its own lifetime and the
+collector reclaims the file from another process. Single-attempt conditional
+conflicts and a delete answered "not found" remain settled refusals. Scoped clients disable both transport and
 Lance AIMD retries, and local Lance uses its object-store file provider so
 direct file writes cannot bypass the scope. Embedded defaults and Azure serving
 clients are unchanged; the automatic scoped shutdown path applies only to local
