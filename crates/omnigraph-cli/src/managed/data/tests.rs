@@ -413,7 +413,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
     let client = load(&data_store, &context, "knowledge").unwrap();
     let result = client
         .query(
-            ReadTarget::Branch("main".into()),
+            Some(ReadTarget::Branch("main".into())),
             "query q() { return { 42 as value } }",
             Some("q"),
             None,
@@ -431,6 +431,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
             None,
             Some("head-a"),
             &[],
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -573,6 +574,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
                         batch.to_str().unwrap(),
                         crate::cli::CliLoadMode::Append,
                         &[],
+                        &mut Vec::new(),
                     )
                     .await
                     .unwrap_err();
@@ -802,6 +804,51 @@ impl Store for NoCredentialAccess {
     }
     fn remove(&self, _: &str) -> Result<()> {
         panic!("routing preflight removed credentials")
+    }
+}
+
+#[tokio::test]
+async fn managed_operator_warning_delivery_failure_stops_before_credentials() {
+    use crate::managed::tests::{FailedOutput, OutputFault};
+    use crate::operator::InvocationConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    super::super::save_context(dir.path(), &context()).unwrap();
+    let operator = tempfile::tempdir().unwrap();
+    let config = operator.path().join("config.yaml");
+    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
+    for source in ["future_option: true\n", "operator: [malformed\n"] {
+        std::fs::write(&config, source).unwrap();
+        for profile in [None, Some("competing-profile".to_owned())] {
+            for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+                let input = InvocationConfig::at(Some(operator.path().to_owned()), profile.clone());
+                let mut stderr = FailedOutput::new(fault, 0);
+                let error = resolve_with_acquisition(
+                    &cli,
+                    dir.path(),
+                    &NoCredentialAccess,
+                    || has_ambient_target(&input, &mut stderr),
+                    async |_| panic!("routing failure consulted managed identity"),
+                    async |_| panic!("routing failure contacted the issuer"),
+                )
+                .await
+                .err()
+                .expect("routing preflight must refuse");
+                let expected = if profile.is_some() {
+                    ("managed_target_ambiguous", 2)
+                } else if source.starts_with("future_option") {
+                    ("output_delivery_failed", 1)
+                } else {
+                    ("operator_config_invalid", 2)
+                };
+                assert_eq!(error.body["type"], expected.0);
+                assert_eq!(error.exit, expected.1);
+                if profile.is_some() {
+                    assert!(stderr.bytes.is_empty(), "profile must precede config reads");
+                }
+                assert!(!error.body.to_string().contains("malformed"));
+            }
+        }
     }
 }
 
@@ -1136,6 +1183,7 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                         batch.path().to_str().unwrap(),
                         crate::cli::CliLoadMode::Append,
                         &[],
+                        &mut Vec::new(),
                     )
                     .await
                     .unwrap_err(),
@@ -1143,7 +1191,7 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                 "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
                 _ => client
                     .query(
-                        ReadTarget::Branch("main".into()),
+                        Some(ReadTarget::Branch("main".into())),
                         "query q() {}",
                         Some("q"),
                         None,
@@ -1206,6 +1254,7 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
                             batch.path().to_str().unwrap(),
                             crate::cli::CliLoadMode::Append,
                             &[],
+                            &mut Vec::new(),
                         )
                         .await
                         .unwrap_err(),
@@ -1219,6 +1268,7 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
                             None,
                             Some("head-a"),
                             &[],
+                            &mut Vec::new(),
                         )
                         .await
                         .unwrap_err(),
@@ -1311,6 +1361,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
             batch.to_str().unwrap(),
             crate::cli::CliLoadMode::Append,
             &[],
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -1353,6 +1404,7 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                 file.path().to_str().unwrap(),
                 crate::cli::CliLoadMode::Append,
                 &[],
+                &mut Vec::new(),
             )
             .await
             .unwrap_err()
@@ -1368,6 +1420,7 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                 file.path().to_str().unwrap(),
                 crate::cli::CliLoadMode::Append,
                 &[],
+                &mut Vec::new(),
             )
             .await
             .unwrap_err()
@@ -1397,6 +1450,7 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                     file.path().to_str().unwrap(),
                     crate::cli::CliLoadMode::Append,
                     &[],
+                    &mut Vec::new(),
                 )
                 .await
                 .is_err()

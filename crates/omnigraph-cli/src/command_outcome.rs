@@ -8,9 +8,9 @@ use omnigraph_api_types::{ErrorCode, ErrorOutput};
 use reqwest::StatusCode;
 use serde::Serialize;
 
-use crate::cli::{BlobCommand, BranchCommand, Cli, Command, SchemaCommand};
+use crate::cli::{BlobCommand, BranchCommand, Cli, Command, CommitCommand, SchemaCommand};
 use crate::graph_http::ApiContractError;
-use crate::helpers::{PreconditionFailedCli, RemoteErrorCli};
+use crate::helpers::{MissingCredential, PreconditionFailedCli, RemoteErrorCli};
 
 #[derive(Default, Debug, Clone)]
 pub(crate) struct Evidence {
@@ -28,12 +28,15 @@ tokio::task_local! {
 pub(crate) fn applies(cli: &Cli) -> bool {
     matches!(
         &cli.command,
-        Command::Load { .. }
-            | Command::Mutate { .. }
+        Command::Load(_)
+            | Command::Mutate(_)
             | Command::Branch {
                 command: BranchCommand::Create { .. }
                     | BranchCommand::Delete { .. }
                     | BranchCommand::Merge { .. }
+            }
+            | Command::Commit {
+                command: CommitCommand::Publish { .. } | CommitCommand::Drop { .. }
             }
             | Command::Schema {
                 command: SchemaCommand::Apply { .. }
@@ -157,6 +160,9 @@ pub(crate) struct Failure {
     pub(crate) retry_after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) request_dispatched: Option<bool>,
+    /// The CLI's account of a refused request that carried no credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) missing_credential: Option<MissingCredential>,
     #[serde(skip)]
     pub(crate) exit: i32,
 }
@@ -169,13 +175,12 @@ impl Failure {
             evidence.dispatched == 1 && evidence.last_request_effectful && !evidence.writable_open;
         let conditional =
             precondition.is_some_and(|value| value.http_status == Some(412)) && single;
-        let retry = remote.is_some_and(|remote| {
-            remote.status == StatusCode::TOO_MANY_REQUESTS
-                && matches!(remote.output.code, Some(ErrorCode::TooManyRequests))
-                && !remote.output.error.trim().is_empty()
-                && is_plain_refusal(&remote.output)
-                && single
-        });
+        let admission = remote
+            .filter(|remote| {
+                single && !remote.output.error.trim().is_empty() && is_plain_refusal(&remote.output)
+            })
+            .and_then(|remote| admission_refusal(remote.status, remote.output.code.as_ref()));
+        let retry = matches!(admission, Some(Action::Retry));
         let contract = error.downcast_ref::<ApiContractError>();
         let request_dispatched = contract.map(|value| value.request_dispatched);
         let http_status = remote
@@ -190,6 +195,7 @@ impl Failure {
         } else {
             evidence.retry_after
         };
+        let missing_credential = remote.and_then(|remote| remote.missing_credential.clone());
         let output = if let Some(remote) = remote {
             remote.output.clone()
         } else if let Some(precondition) = precondition {
@@ -205,8 +211,9 @@ impl Failure {
                     .unwrap_or_else(|| ErrorOutput::message(error.to_string())),
             }
         };
-        let not_started =
-            retry || conditional || (evidence.dispatched == 0 && !evidence.writable_open);
+        let not_started = admission.is_some()
+            || conditional
+            || (evidence.dispatched == 0 && !evidence.writable_open);
         let action = if retry {
             Action::Retry
         } else if output.recovery_required.is_some()
@@ -246,6 +253,7 @@ impl Failure {
             http_status,
             retry_after,
             request_dispatched,
+            missing_credential,
             exit: if retry {
                 75
             } else if conditional {
@@ -254,6 +262,20 @@ impl Failure {
                 1
             },
         }
+    }
+}
+
+/// The typed refusals the server sends before it admits a write, each code
+/// under its own status. A busy actor may retry the whole command; failed
+/// authentication, an unsupported contract or a policy denial needs a changed
+/// credential, client or grant first.
+fn admission_refusal(status: StatusCode, code: Option<&ErrorCode>) -> Option<Action> {
+    match (status, code?) {
+        (StatusCode::TOO_MANY_REQUESTS, ErrorCode::TooManyRequests) => Some(Action::Retry),
+        (StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized)
+        | (StatusCode::BAD_REQUEST, ErrorCode::ApiContractMismatch)
+        | (StatusCode::FORBIDDEN, ErrorCode::Forbidden) => Some(Action::Refresh),
+        _ => None,
     }
 }
 

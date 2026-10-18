@@ -18,7 +18,7 @@ pub(crate) async fn explain_document(
     query: &CompiledQuery,
     params: &ParamMap,
     catalog: &Arc<Catalog>,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     settings: &SessionSettings,
 ) -> Result<serde_json::Value> {
     let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
@@ -81,6 +81,7 @@ async fn lowered_tree(accepted: AcceptedPlan, source: &QuerySource<'_>) -> Resul
         snapshot: source.snapshot,
         catalog: source.catalog,
         graph_index: Arc::new(GraphIndexHandle::none()),
+        load: None,
     };
     let lowering = Lowering::new(bound.bound(), &context);
     let lowered = lowering.lower_query(&Pass::default())?;
@@ -91,7 +92,7 @@ async fn lowered_tree(accepted: AcceptedPlan, source: &QuerySource<'_>) -> Resul
 
 /// The four columns of an explain or profile result, one entry per row.
 #[derive(Default)]
-pub(super) struct ExplainRows {
+pub(crate) struct ExplainRows {
     tree: Vec<&'static str>,
     depth: Vec<Option<i64>>,
     node: Vec<String>,
@@ -99,7 +100,7 @@ pub(super) struct ExplainRows {
 }
 
 impl ExplainRows {
-    pub(super) fn push(
+    pub(crate) fn push(
         &mut self,
         tree: &'static str,
         depth: Option<i64>,
@@ -112,7 +113,7 @@ impl ExplainRows {
         self.detail.push(detail);
     }
 
-    fn push_field(&mut self, name: &str, value: &impl serde::Serialize) -> Result<()> {
+    pub(crate) fn push_field(&mut self, name: &str, value: &impl serde::Serialize) -> Result<()> {
         let value = serde_json::to_value(value).map_err(|error| {
             OmniError::manifest_internal(format!(
                 "explain field '{name}' cannot serialize: {error}"
@@ -176,7 +177,7 @@ impl ExplainRows {
         }
     }
 
-    pub(super) fn into_result(self) -> Result<QueryResult> {
+    pub(crate) fn into_result(self) -> Result<QueryResult> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("tree", DataType::Utf8, false),
             Field::new("depth", DataType::Int64, true),
@@ -215,7 +216,7 @@ fn explain_detail(value: &serde_json::Value) -> String {
 pub(crate) async fn explain_rows(
     query: &CompiledQuery,
     params: &ParamMap,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     catalog: &Arc<Catalog>,
     settings: &SessionSettings,
 ) -> Result<QueryResult> {
@@ -223,6 +224,27 @@ pub(crate) async fn explain_rows(
     let planned = explain_query(&source).await?;
     let assumptions = planned.accepted.plan().assumptions().clone();
     let lowered = lowered_tree(planned.accepted, &source).await?;
+    document_rows(&planned.explain, &lowered, Some(&assumptions))
+}
+
+/// The rows of a `load csv` statement's document: the planner's trees and
+/// fields; the DataFusion tree is lowered only at execution, under the
+/// statement's transaction, so its row says so.
+pub(crate) fn explain_load_rows(
+    explain: &omnigraph_planner::explain::Explain,
+) -> Result<QueryResult> {
+    let lowered = LoweredTree::Unavailable(
+        "a load's operators are lowered at execution, under the statement's transaction"
+            .to_string(),
+    );
+    document_rows(explain, &lowered, None::<&serde_json::Value>)
+}
+
+fn document_rows(
+    explain: &omnigraph_planner::explain::Explain,
+    lowered: &LoweredTree,
+    assumptions: Option<&impl serde::Serialize>,
+) -> Result<QueryResult> {
     let omnigraph_planner::explain::Explain {
         explain_version,
         route,
@@ -230,6 +252,7 @@ pub(crate) async fn explain_rows(
         reason,
         entry,
         operation,
+        logical_plan_initial,
         logical_plan,
         logical_hash,
         physical_plan,
@@ -237,15 +260,18 @@ pub(crate) async fn explain_rows(
         statistics,
         passes,
         validation,
-    } = &planned.explain;
+    } = explain;
     let mut rows = ExplainRows::default();
+    if let Some(root) = logical_plan_initial {
+        rows.push_tree("logical_initial", root, 0);
+    }
     if let Some(root) = logical_plan {
         rows.push_tree("logical", root, 0);
     }
     if let Some(root) = physical_plan {
         rows.push_tree("physical", root, 0);
     }
-    match &lowered {
+    match lowered {
         LoweredTree::Operators(operators) => rows.push_datafusion(operators),
         LoweredTree::Unavailable(reason) => rows.push(
             EXPLAIN_PLAN_ROWS,
@@ -277,7 +303,9 @@ pub(crate) async fn explain_rows(
     if let Some(validation) = validation {
         rows.push_field("validation", validation)?;
     }
-    rows.push_field("assumptions", &assumptions)?;
+    if let Some(assumptions) = assumptions {
+        rows.push_field("assumptions", assumptions)?;
+    }
     rows.into_result()
 }
 

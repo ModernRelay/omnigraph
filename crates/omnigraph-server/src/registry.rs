@@ -107,6 +107,12 @@ impl GraphEntry {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct DeploymentPolicies {
+    pub server: Option<Arc<PolicyEngine>>,
+    pub catalogue: Option<Arc<PolicyEngine>>,
+}
+
 /// One immutable inventory/availability snapshot. Its policy cache is derived
 /// on construction and remains valid while an epoch is transitioning.
 pub struct RegistrySnapshot {
@@ -114,6 +120,8 @@ pub struct RegistrySnapshot {
     pub any_per_graph_policy: bool,
     /// Management policy published in the same snapshot as graph bindings.
     pub server_policy: Option<Arc<PolicyEngine>>,
+    /// Catalogue policy published with the same deployment's graph bindings.
+    pub catalogue_policy: Option<Arc<PolicyEngine>>,
     pub(crate) deployment: Option<ActiveDeployment>,
 }
 
@@ -124,6 +132,7 @@ impl RegistrySnapshot {
             graphs,
             any_per_graph_policy,
             server_policy: None,
+            catalogue_policy: None,
             deployment: None,
         }
     }
@@ -133,6 +142,7 @@ impl RegistrySnapshot {
     fn with_graphs(&self, graphs: HashMap<GraphKey, GraphEntry>) -> Self {
         let mut snapshot = Self::new(graphs);
         snapshot.server_policy = self.server_policy.clone();
+        snapshot.catalogue_policy = self.catalogue_policy.clone();
         snapshot.deployment = self.deployment.clone();
         snapshot
     }
@@ -241,8 +251,15 @@ impl GraphRegistry {
 
     pub(crate) fn initialize_server_policy(&self, policy: Option<Arc<PolicyEngine>>) {
         let mut state = locked(&self.state);
-        let mut snapshot = RegistrySnapshot::new(state.snapshot.graphs.clone());
+        let mut snapshot = state.snapshot.with_graphs(state.snapshot.graphs.clone());
         snapshot.server_policy = policy;
+        state.snapshot = Arc::new(snapshot);
+    }
+
+    pub(crate) fn initialize_catalogue_policy(&self, policy: Option<Arc<PolicyEngine>>) {
+        let mut state = locked(&self.state);
+        let mut snapshot = state.snapshot.with_graphs(state.snapshot.graphs.clone());
+        snapshot.catalogue_policy = policy;
         state.snapshot = Arc::new(snapshot);
     }
 
@@ -620,7 +637,10 @@ impl GraphRegistry {
             views,
             Vec::new(),
             Vec::new(),
-            snapshot.server_policy.clone(),
+            DeploymentPolicies {
+                server: snapshot.server_policy.clone(),
+                catalogue: snapshot.catalogue_policy.clone(),
+            },
             snapshot.deployment.clone(),
         )
     }
@@ -667,7 +687,7 @@ impl GraphRegistry {
         views: Vec<Arc<ServingView>>,
         unavailable: Vec<Arc<BlockedGraph>>,
         deleted: Vec<(GraphKey, SchemaContractDigest)>,
-        server_policy: Option<Arc<PolicyEngine>>,
+        policies: DeploymentPolicies,
         deployment: Option<ActiveDeployment>,
     ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
         let mut state = locked(&self.state);
@@ -759,7 +779,8 @@ impl GraphRegistry {
             return Err(ServingTransitionError::InvalidBindings);
         }
         let mut snapshot = state.snapshot.with_graphs(graphs);
-        snapshot.server_policy = server_policy;
+        snapshot.server_policy = policies.server;
+        snapshot.catalogue_policy = policies.catalogue;
         snapshot.deployment = deployment;
         let snapshot = Arc::new(snapshot);
         if views.iter().any(|view| !view.contract_is_current()) {
@@ -1520,6 +1541,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(epochs.len(), 3);
@@ -1637,6 +1659,10 @@ mod tests {
         });
         let management = Arc::new(PolicyEngine::load_cluster_from_source(
             "version: 1\ngroups:\n  admins: [successor]\nrules:\n  - id: admin\n    allow:\n      actors: {group: admins}\n      actions: [config_manage]\n").unwrap());
+        let catalogue = Arc::new(PolicyEngine::load_graph_from_source(
+            "version: 1\ngroups:\n  readers: [successor]\nrules:\n  - id: read\n    allow:\n      actors: {group: readers}\n      actions: [read]\n",
+            omnigraph_compiler::CATALOGUE_SCOPE,
+        ).unwrap());
         let previous = registry.snapshot_ref();
         transition
             .activate_deployment(
@@ -1651,6 +1677,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Some(Arc::clone(&management)),
+                Some(Arc::clone(&catalogue)),
                 None,
             )
             .unwrap();
@@ -1659,6 +1686,11 @@ mod tests {
             activated.server_policy.as_ref().unwrap(),
             &management
         ));
+        assert!(Arc::ptr_eq(
+            activated.catalogue_policy.as_ref().unwrap(),
+            &catalogue
+        ));
+        assert!(previous.catalogue_policy.is_none());
         assert!(previous.server_policy.is_none());
         assert!(previous.graphs.contains_key(&alpha.key));
         assert!(activated.graphs.contains_key(&alpha.key));
@@ -1740,7 +1772,7 @@ mod tests {
                 _ => unreachable!(),
             }
             let error = transition
-                .activate_deployment(bindings, Vec::new(), deleted, None, None)
+                .activate_deployment(bindings, Vec::new(), deleted, None, None, None)
                 .unwrap_err();
             match refusal {
                 "queries" => assert!(matches!(error, ServingTransitionError::InvalidQueries(_))),
@@ -1784,6 +1816,7 @@ mod tests {
                     vec![(Arc::clone(&beta), beta.engine.schema_contract_digest())],
                     Vec::new(),
                     Vec::new(),
+                    None,
                     None,
                     None,
                 )
@@ -1836,6 +1869,7 @@ mod tests {
                 vec![(alpha.key.clone(), alpha.engine.schema_contract_digest())],
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(matches!(registry.get(&alpha.key), RegistryLookup::Gone));
@@ -1863,6 +1897,7 @@ mod tests {
                 vec![(Arc::clone(&beta), beta.engine.schema_contract_digest())],
                 Vec::new(),
                 Vec::new(),
+                None,
                 None,
                 None,
             ),
@@ -1920,6 +1955,10 @@ mod tests {
             }
             let management = Arc::new(PolicyEngine::load_cluster_from_source(
                 "version: 1\ngroups:\n  admins: [successor]\nrules:\n  - id: admin\n    allow:\n      actors: {group: admins}\n      actions: [config_manage]\n").unwrap());
+            let catalogue = Arc::new(PolicyEngine::load_graph_from_source(
+                "version: 1\ngroups:\n  readers: [successor]\nrules:\n  - id: read\n    allow:\n      actors: {group: readers}\n      actions: [read]\n",
+                omnigraph_compiler::CATALOGUE_SCOPE,
+            ).unwrap());
             if outcome == "shutdown" {
                 operations.close();
             }
@@ -1928,6 +1967,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Some(Arc::clone(&management)),
+                Some(Arc::clone(&catalogue)),
                 None,
             );
             if outcome == "shutdown" {
@@ -1937,6 +1977,7 @@ mod tests {
                     RegistryLookup::Transitioning(_)
                 ));
                 assert!(registry.snapshot_ref().server_policy.is_none());
+                assert!(registry.snapshot_ref().catalogue_policy.is_none());
             } else {
                 result.unwrap();
                 let request = captured(&registry, &operations, &alpha.key);
@@ -1947,6 +1988,10 @@ mod tests {
                 assert!(Arc::ptr_eq(
                     registry.snapshot_ref().server_policy.as_ref().unwrap(),
                     &management
+                ));
+                assert!(Arc::ptr_eq(
+                    registry.snapshot_ref().catalogue_policy.as_ref().unwrap(),
+                    &catalogue
                 ));
             }
         }
@@ -1990,7 +2035,7 @@ mod tests {
                     replacements,
                     Vec::new(),
                     Vec::new(),
-                    None,
+                    DeploymentPolicies::default(),
                     None
                 )),
                 Err(expected)

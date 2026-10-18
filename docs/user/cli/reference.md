@@ -15,7 +15,7 @@ Most graph commands accept one of these scopes:
 | Scope | Use |
 |---|---|
 | positional URI | Direct access for commands whose positional slot is not used by another value |
-| `--store <URI>` | Direct access to one `file://`, `s3://`, or `az://` graph |
+| `--store <URI>` | Direct access to one `file://`, `s3://`, or `az://` graph; the exact token `og_catalog` (also as `--graph og_catalog` on a server) is the [engine catalogue](../queries/catalogue.md), serving `query` and `schema show` with no store opened |
 | `--server <NAME\|URL> --graph <ID>` | A graph served by a multi-graph server at an `http://`, `https://` or [`unix://`](index.md#use-a-server-through-a-unix-socket) URL |
 | `--cluster <DIR\|URI> --graph <ID>` | Direct maintenance of a cluster-managed graph |
 | `--profile <NAME>` | A named scope from operator config |
@@ -46,7 +46,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
-| `commit list/show/changes/publish/drop` | Inspect history (`list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it) | direct or served |
+| `commit list/show/changes/publish/drop` | Inspect history (`list --limit`/`--page-token` for one page of it, `list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other and paging) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it); `publish` and `drop` take `--as` on a direct graph, the reads refuse it | direct or served |
 | `diff` | Net entity changes between two points: branches or commit ids (`--from`, `--to`) | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
@@ -70,6 +70,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `use` | Select a managed cluster for a config directory | managed API |
 | `profile list/show` | Inspect operator profiles | local |
 | `alias` | Invoke a personal stored-query alias | served |
+| `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
 | `version` | Print the package version, HTTP contract and storage formats; `--json` prints `version`, `http_contract` and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 `rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
@@ -185,8 +186,7 @@ reads `--file <PATH>` or stdin; `put` and `clear` accept `--branch`,
 
 ## Operator configuration
 
-The default path is `~/.omnigraph/config.yaml`. Set `OMNIGRAPH_HOME` to use a
-different directory.
+The default path is `~/.omnigraph/config.yaml`. Set `OMNIGRAPH_HOME` to use a different directory.
 
 ```yaml
 operator:
@@ -224,9 +224,9 @@ aliases:
 Each profile binds exactly one of `server`, `cluster`, or `store`. Select it with
 `--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled by a profile.
 
-Bearer tokens never belong in `config.yaml`. Store a token with
-`omnigraph login <server>` or provide `OMNIGRAPH_BEARER_TOKEN` for the current
-invocation.
+Bearer tokens never belong in `config.yaml`. Bind one to a declared server with
+`omnigraph login <server>` or `OMNIGRAPH_TOKEN_<NAME>`; the CLI sends it only to
+URLs under that server's `url` (see [server credentials](index.md#use-a-server)).
 
 ## Managed cluster commands
 
@@ -272,7 +272,7 @@ for origin validation, separate organization sessions, identity pins and renewal
 | `cluster history --managed [--limit N] [--since RFC3339]` | Read newest deliveries first, default and maximum 100; filter creation time inclusively before the limit |
 | `cluster cancel --managed DEPLOYMENT_ID` | Cancel your queued delivery before its first dispatch attempt |
 
-See [managed lifecycle](managed-lifecycle.md) for discovery, source checkout and lifecycle operations.
+See [managed lifecycle](managed-lifecycle.md) for cluster operations and [team administration](managed-team.md) for `organization --managed` (`org`), invitation commands and versioned member changes.
 All accept `--config DIR` and `--json`. Plan and apply also accept
 `--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. An omitted key is
 generated and printed before submission. Retain it and the exact request after
@@ -323,7 +323,7 @@ omnigraph cluster apply --managed --plan PREVIEW_ID --idempotency-key DEPLOYMENT
 
 The canonical `OMNIGRAPH_CONTROL_API` must match the selected context. A
 missing or mismatched pair refuses before any request. These credentials are
-separate from `OMNIGRAPH_BEARER_TOKEN`, named servers, and operator profiles.
+separate from [server credentials](index.md#use-a-server) and operator profiles.
 
 `--managed` requires context except `create`, `list` and explicit-origin operation
 lookup; `--direct` is rejected. Managed API failures never trigger local deployment.

@@ -31,8 +31,8 @@ setting_value = { integer | ident | string_lit }
 branch_stmt   = { kw_branch ~ (branch_create | branch_delete | branch_merge_base | branch_merge | branch_list | branch_diff) }
 // The two control writes on an unpublished commit, named by its full id.
 commit_stmt   = { kw_commit ~ (commit_publish | commit_drop) }
-// `explain` wraps the one read declaration whose plan is answered as rows.
-explain_stmt  = { kw_explain ~ query_decl }
+// `explain` wraps the one read declaration or load statement whose plan is answered as rows.
+explain_stmt  = { kw_explain ~ (query_decl | load_stmt) }
 // Anything the file holds after its one statement, matched so the parser
 // refuses it by name instead of leaving `EOI` to report the expected tokens.
 statement_trailer = { (setting_stmt | show_stmt | branch_stmt | commit_stmt | load_stmt | explain_stmt | query_decl)+ }
@@ -255,7 +255,9 @@ ident_chars = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 // falls through `traversal` to `filter` instead of naming an edge `and`.
 edge_ident = @{ !reserved ~ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
-type_name = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
+// A leading `@` names an engine catalogue type (`@Operator`), read-only and
+// engine-owned like the `@` meta-fields; a user schema cannot declare one.
+type_name = @{ "@"? ~ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
 ident = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 literal = { list_lit | datetime_lit | date_lit | string_lit | float_lit | integer | bool_lit }

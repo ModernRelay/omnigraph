@@ -70,11 +70,7 @@ impl Fixture {
             source = source.with_node_type(
                 name,
                 NodeTypeSpec {
-                    table: TableRef {
-                        type_key: format!("node:{name}"),
-                        dataset_path: format!("node/{name}"),
-                        native_branch: None,
-                    },
+                    table: TableRef::dataset(format!("node:{name}"), format!("node/{name}"), None),
                     version: Some(1),
                     columns: catalog.system_columns,
                     schema: Arc::clone(&node_type.arrow_schema),
@@ -103,7 +99,7 @@ impl Fixture {
     }
 
     fn traced(&self) -> crate::gate::Traced {
-        crate::gate::plan_traced(&self.ir, &self.source, &BOUNDS).expect("the query plans")
+        crate::gate::plan_traced(&self.ir, &self.source, &BOUNDS, false).expect("the query plans")
     }
 
     fn plan(&self) -> PhysicalPlan {
@@ -332,6 +328,73 @@ fn a_dropped_conjunct_fails_predicate_retention() {
     }
     let (check, detail) = fixture.refused(plan);
     assert_eq!(check, "predicate retention", "{detail}");
+}
+
+/// The strategy of every block of `plan` set to `strategy`.
+fn relabel_blocks(plan: &mut PhysicalPlan, strategy: crate::AntiJoinStrategy) {
+    for id in node_ids(plan, |node| matches!(node, PhysicalNode::AntiJoin { .. })) {
+        if let Some(PhysicalNode::AntiJoin {
+            strategy: declared, ..
+        }) = plan.node_mut(id)
+        {
+            *declared = strategy;
+        }
+    }
+}
+
+#[test]
+fn a_strategy_its_inner_tree_lacks_fails_block_strategy() {
+    use crate::AntiJoinStrategy::{Correlated, KeySet};
+    use crate::source::PlanSource;
+    use omnigraph_compiler::types::Direction;
+    let mut fixture = Fixture::new(
+        "query q($s: String) { match { $d: Doc not { $d cites $e $e: Doc { slug: $s } } } return { $d.slug } }",
+        &[("s", Literal::String("x".to_string()))],
+    );
+    let strategies = |plan: &PhysicalPlan| -> Vec<crate::AntiJoinStrategy> {
+        plan.live()
+            .filter_map(|(_, node)| match node {
+                PhysicalNode::AntiJoin { strategy, .. } => Some(*strategy),
+                _ => None,
+            })
+            .collect()
+    };
+    // No row counts: the block is correlated, its inner tree over the outer rows.
+    let correlated = fixture.plan();
+    assert_eq!(strategies(&correlated), [Correlated]);
+    fixture
+        .accept(correlated.clone())
+        .expect("the correlated plan is accepted");
+    let mut relabelled = correlated;
+    relabel_blocks(&mut relabelled, KeySet);
+    let (check, detail) = fixture.refused(relabelled);
+    assert_eq!(check, "block strategy", "{detail}");
+
+    // With row counts and edge statistics the bound `$e` makes the key set cheaper.
+    let mut doc = fixture.source.node_type("Doc").unwrap();
+    doc.row_count = Some(100);
+    let statistics = crate::ExpandStatistics {
+        edge_count: 1_000,
+        src_node_count: 100,
+        dst_node_count: 100,
+        max_frontier_cap: 1024,
+        max_hops_cap: 6,
+    };
+    fixture.source = fixture
+        .source
+        .clone()
+        .with_node_type("Doc", doc)
+        .with_expand_statistics("Cites", Direction::Out, statistics)
+        .with_expand_statistics("Cites", Direction::In, statistics);
+    let key_set = fixture.plan();
+    assert_eq!(strategies(&key_set), [KeySet]);
+    fixture
+        .accept(key_set.clone())
+        .expect("the key-set plan is accepted");
+    let mut relabelled = key_set;
+    relabel_blocks(&mut relabelled, Correlated);
+    let (check, detail) = fixture.refused(relabelled);
+    assert_eq!(check, "block strategy", "{detail}");
 }
 
 fn value_type(

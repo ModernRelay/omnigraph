@@ -117,7 +117,10 @@ pub(crate) struct QuerySource<'a> {
     /// it: acceptance derives the query's requirements from it.
     pub checked: CheckedRead,
     pub catalog: &'a Arc<Catalog>,
-    pub snapshot: &'a Snapshot,
+    /// The pinned snapshot of the user graph; `None` under the
+    /// catalogue-only scope, where every table the planner asks for is a
+    /// catalogue table and every storage statistic is absent.
+    pub snapshot: Option<&'a Snapshot>,
     pub params: ResolvedParams,
     pub settings: &'a SessionSettings,
     memory_limit: u64,
@@ -142,13 +145,16 @@ impl<'a> QuerySource<'a> {
     pub(crate) async fn gather(
         query: &CompiledQuery,
         catalog: &'a Arc<Catalog>,
-        snapshot: &'a Snapshot,
+        snapshot: Option<&'a Snapshot>,
         params: &ParamMap,
         settings: &'a SessionSettings,
     ) -> Result<QuerySource<'a>> {
         let params = resolve_params(&query.ir, params)?;
         let ir = super::constant::fold_query_constants(&query.ir, params.shared())?;
-        let table_stats = query_table_statistics(&ir, snapshot).await?;
+        let table_stats = match snapshot {
+            Some(snapshot) => query_table_statistics(&ir, snapshot).await?,
+            None => HashMap::new(),
+        };
         let mut source = QuerySource {
             ir,
             checked: query.checked.clone(),
@@ -173,33 +179,61 @@ impl<'a> QuerySource<'a> {
     /// values, so one explain document reads the same on every operation, and
     /// the memory limit `gather` captured, which sizes the run's pool.
     pub(crate) fn bounds(&self) -> Bounds {
-        Bounds {
-            hydration_chunk_hard_bytes: 2 * crate::storage_layer::KEYED_WRITE_MAX_BYTES,
-            key_width_bytes: KEY_WIDTH_BYTES,
-            ordered_scan_memory_bytes: crate::table_store::ORDERED_SCAN_MEMORY_BYTES,
-            ordered_scan_max_input_batch_bytes:
-                crate::table_store::ORDERED_SCAN_MAX_INPUT_BATCH_BYTES,
-            build_key_cap_rows: super::push::BUILD_KEY_CAP_ROWS as u64,
-            query_memory_pool_bytes: self.memory_limit,
-            late_materialization_only: false,
-        }
+        engine_bounds(
+            self.memory_limit,
+            crate::storage_layer::KEYED_WRITE_MAX_BYTES,
+        )
     }
 
     fn take_source_failure(&self) -> Option<OmniError> {
+        self.take_source_failure_inner()
+    }
+}
+
+/// The engine's bounds for one plan: the change-feed constants, the pool
+/// `memory_limit` sizes, and the bound on one staged load input (the session's
+/// `write_max_bytes` for a load, the keyed constant for a query's document).
+pub(crate) fn engine_bounds(memory_limit: u64, load_write_max_bytes: u64) -> Bounds {
+    Bounds {
+        hydration_chunk_hard_bytes: 2 * crate::storage_layer::KEYED_WRITE_MAX_BYTES,
+        key_width_bytes: KEY_WIDTH_BYTES,
+        ordered_scan_memory_bytes: crate::table_store::ORDERED_SCAN_MEMORY_BYTES,
+        ordered_scan_max_input_batch_bytes: crate::table_store::ORDERED_SCAN_MAX_INPUT_BATCH_BYTES,
+        build_key_cap_rows: super::push::BUILD_KEY_CAP_ROWS as u64,
+        query_memory_pool_bytes: memory_limit,
+        late_materialization_only: false,
+        load_workers_max: 1,
+        load_write_max_bytes,
+    }
+}
+
+impl<'a> QuerySource<'a> {
+    fn take_source_failure_inner(&self) -> Option<OmniError> {
         self.source_failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
 
+    /// The pinned snapshot, or the catalogue-only refusal naming `what`.
+    pub(super) fn snapshot(&self, what: &str) -> Result<&'a Snapshot> {
+        self.snapshot.ok_or_else(|| super::no_graph_storage(what))
+    }
+
     async fn load_column_statistics(&mut self, operation: &Operation) -> Result<()> {
+        let Some(snapshot) = self.snapshot else {
+            return Ok(());
+        };
         if self.table_stats.is_empty() {
             return Ok(());
         }
         let tables = omnigraph_planner::optimizer::column_statistics_needed(operation, self)
             .map_err(plan_error)?;
         for type_key in tables {
-            let dataset = Arc::new(self.snapshot.open_lance_dataset(&type_key).await?);
+            if !self.table_stats.contains_key(&type_key) {
+                continue;
+            }
+            let dataset = Arc::new(snapshot.open_lance_dataset(&type_key).await?);
             if dataset.manifest().data_storage_format.lance_file_format() == ConcreteFileVersion::V1
             {
                 continue;
@@ -334,36 +368,36 @@ impl PlanSource for QuerySource<'_> {
     fn node_type(&self, type_name: &str) -> std::result::Result<NodeTypeSpec, PlanError> {
         let node_type =
             self.catalog
-                .node_types
-                .get(type_name)
+                .query_node_type(type_name)
                 .ok_or_else(|| PlanError::Unresolved {
                     detail: format!("unknown node type `{type_name}`"),
                 })?;
         let type_key = format!("node:{type_name}");
-        let (table, version, row_count) = match self.snapshot.dataset(&type_key) {
-            Some(entry) => (
-                TableRef {
-                    type_key,
-                    dataset_path: entry.dataset_path.clone(),
-                    native_branch: entry.native_dataset_branch.clone(),
-                },
-                Some(
-                    entry
-                        .version_metadata
-                        .staged_version()
-                        .unwrap_or(entry.published_dataset_version),
+        let (table, version, row_count) = if let Some(table) = super::catalogue::table(type_name) {
+            (TableRef::catalogue(type_key), None, Some(table.row_count()))
+        } else {
+            let snapshot = self
+                .snapshot(&format!("the stored type `{type_name}`"))
+                .map_err(|error| PlanError::Unresolved {
+                    detail: error.to_string(),
+                })?;
+            match snapshot.dataset(&type_key) {
+                Some(entry) => (
+                    TableRef::dataset(
+                        type_key,
+                        entry.dataset_path.clone(),
+                        entry.native_dataset_branch.clone(),
+                    ),
+                    Some(
+                        entry
+                            .version_metadata
+                            .staged_version()
+                            .unwrap_or(entry.published_dataset_version),
+                    ),
+                    Some(entry.entity_count),
                 ),
-                Some(entry.entity_count),
-            ),
-            None => (
-                TableRef {
-                    type_key,
-                    dataset_path: String::new(),
-                    native_branch: None,
-                },
-                None,
-                None,
-            ),
+                None => (TableRef::dataset(type_key, String::new(), None), None, None),
+            }
         };
         Ok(NodeTypeSpec {
             table,
@@ -403,16 +437,14 @@ impl PlanSource for QuerySource<'_> {
     /// absent from it.
     fn expand_statistics(&self, edge_type: &str, direction: Direction) -> Option<ExpandStatistics> {
         let edge_def = self.catalog.edge_types.get(edge_type)?;
-        let edge_count = self
-            .snapshot
-            .dataset(&format!("edge:{edge_type}"))?
-            .entity_count;
+        let snapshot = self.snapshot?;
+        let edge_count = snapshot.dataset(&format!("edge:{edge_type}"))?.entity_count;
         let (src_type, dst_type) = match direction {
             Direction::Out | Direction::Both => (&edge_def.from_type, &edge_def.to_type),
             Direction::In => (&edge_def.to_type, &edge_def.from_type),
         };
         let node_count = |type_name: &str| {
-            self.snapshot
+            snapshot
                 .dataset(&format!("node:{type_name}"))
                 .map(|entry| entry.entity_count)
         };
@@ -426,9 +458,13 @@ impl PlanSource for QuerySource<'_> {
     }
 
     fn edge_dataset(&self, edge_type: &str) -> Option<DatasetPin> {
-        self.snapshot
+        self.snapshot?
             .dataset(&super::edge_table_key(edge_type))
             .map(super::dataset_pin)
+    }
+
+    fn catalogue_fingerprint(&self, type_key: &str) -> Option<String> {
+        super::catalogue::table_of_key(type_key).map(|table| table.fingerprint.clone())
     }
 
     fn traversal(&self) -> Traversal {
@@ -441,6 +477,12 @@ impl PlanSource for QuerySource<'_> {
 
     fn gate_policy(&self) -> GatePolicy {
         self.gate_policy
+    }
+
+    fn explain_dump_dir(&self) -> Option<std::path::PathBuf> {
+        self.settings
+            .explain_dump_dir()
+            .map(std::path::PathBuf::from)
     }
 }
 
@@ -498,7 +540,7 @@ fn canonical_key_id_of(
     use omnigraph_compiler::{ExprType, ScalarType};
     let Some(node) = type_key
         .strip_prefix("node:")
-        .and_then(|name| catalog.node_types.get(name))
+        .and_then(|name| catalog.query_node_type(name))
     else {
         return Ok(None);
     };
@@ -689,6 +731,15 @@ pub(crate) async fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQ
     Ok(ExplainedQuery { explain, accepted })
 }
 
+/// Index metadata from the accepted table version; no table payload is read.
+pub(crate) async fn load_index_facts(
+    snapshot: &Snapshot,
+    type_key: &str,
+) -> Result<Vec<IndexFact>> {
+    let dataset = snapshot.open_lance_dataset(type_key).await?;
+    indexes::gather(&dataset).await
+}
+
 async fn query_table_statistics(
     ir: &QueryIR,
     snapshot: &Snapshot,
@@ -735,7 +786,9 @@ async fn query_table_statistics(
     }
     let mut bytes = HashMap::new();
     for (type_key, destination) in types {
-        if snapshot.dataset(&type_key).is_none() {
+        if super::catalogue::table_of_key(&type_key).is_some()
+            || snapshot.dataset(&type_key).is_none()
+        {
             continue;
         }
         fail(&QUERY_INDEX_FACTS_PRE_LOAD)?;
@@ -860,10 +913,15 @@ query people() { match { $p: Person } return { count($p) as n } }
             ),
         ] {
             let ir = compile(&catalog, name);
-            let source =
-                QuerySource::gather(&ir, &catalog, &view.snapshot, &ParamMap::new(), &settings)
-                    .await
-                    .unwrap();
+            let source = QuerySource::gather(
+                &ir,
+                &catalog,
+                Some(&view.snapshot),
+                &ParamMap::new(),
+                &settings,
+            )
+            .await
+            .unwrap();
             let mut keys: Vec<_> = source.table_stats.keys().map(String::as_str).collect();
             keys.sort_unstable();
             assert_eq!(keys, expected, "{name}");
@@ -919,7 +977,7 @@ query people() { match { $p: Person } return { count($p) as n } }
             let source = QuerySource::gather(
                 &query,
                 &catalog,
-                &view.snapshot,
+                Some(&view.snapshot),
                 &ParamMap::new(),
                 &settings,
             )
@@ -958,7 +1016,7 @@ query people() { match { $p: Person } return { count($p) as n } }
             QuerySource::gather(
                 &query,
                 &catalog,
-                &view.snapshot,
+                Some(&view.snapshot),
                 &ParamMap::new(),
                 &settings,
             ),
@@ -976,9 +1034,10 @@ query people() { match { $p: Person } return { count($p) as n } }
                     .unwrap();
             let bound = accepted.bound();
             let context = EngineContext {
-                snapshot: &view.snapshot,
+                snapshot: Some(&view.snapshot),
                 catalog: &catalog,
                 graph_index: Arc::new(GraphIndexHandle::none()),
+                load: None,
             };
             let lowering = Lowering::new(bound, &context);
             assert_eq!(lowering.plan.assumptions().memory_limit, CAPTURED);

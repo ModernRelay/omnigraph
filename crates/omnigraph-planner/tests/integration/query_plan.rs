@@ -56,11 +56,11 @@ fn node_type(type_name: &str, row_count: Option<u64>) -> NodeTypeSpec {
     let mut object_columns = vec![SYSTEM_COLUMNS_V3.id.to_string()];
     object_columns.extend(PROPERTIES.iter().map(|name| name.to_string()));
     NodeTypeSpec {
-        table: TableRef {
-            type_key: format!("node:{type_name}"),
-            dataset_path: format!("node/{type_name}"),
-            native_branch: None,
-        },
+        table: TableRef::dataset(
+            format!("node:{type_name}"),
+            format!("node/{type_name}"),
+            None,
+        ),
         version: Some(7),
         columns: SYSTEM_COLUMNS_V3,
         schema: schema(),

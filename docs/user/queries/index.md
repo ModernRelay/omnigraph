@@ -128,11 +128,11 @@ skips null values.
 
 The block narrows the rows before `order` and `limit`, so a paged listing
 filtered by a relationship count is exact. A binding the block's traversal
-connects to the outer row is reached through that traversal, never scanned as
-a whole table, however many rows the outer pattern has; a binding correlated
-only through a filter, or read by a text search, is scanned. A
-single-hop, filter-free `count { ... }` over a directed, unbound edge is
-answered from the graph index's degree. A bare aggregate in `match`,
+connects to the outer row is reached through it, or the block runs once from a
+node it binds by key if that is cheaper (`strategy` in [explain](explain.md));
+a binding correlated only through a filter, or read by a text search, is
+scanned. A single-hop, filter-free `count { ... }` over a directed, unbound
+edge is answered from the graph index's degree. A bare aggregate in `match`,
 `count($d) > 2` without a block, is refused: it names no row to group by.
 
 ```
@@ -181,12 +181,12 @@ no binding, the bare form serves: `delete Person where @id = $who`,
 `delete Knows where @src = $who`. A bare `id` (`$p.id`, `where id = ...`)
 always names a user property called `id`; where none is declared it is the
 unknown-property error, which names the meta-field. Edge inserts keep
-addressing endpoints as `from` and `to`.
-
-`$e.@type` returns the bound edge's canonical schema type name as a non-null
-`String`, including on ordinary named traversals. It is synthesized query
-metadata and cannot be written. `@src` and `@dst` preserve stored orientation,
-including when the query traverses in reverse.
+addressing endpoints as `from` and `to`. `$e.@type` returns the bound edge's
+canonical schema type name as a non-null `String`, including on ordinary named
+traversals; it is synthesized query metadata and cannot be written. `@src` and
+`@dst` preserve stored orientation, including when the query traverses in
+reverse. In type position the same prefix names an engine-owned, read-only
+type: `$o: @Operator` binds the rows of the [engine catalogue](catalogue.md).
 
 ## Return, order, and limit
 

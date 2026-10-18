@@ -85,13 +85,18 @@ for a deployment whose policy was written with an LLM caller in mind.
 | `schema` | `graph` | `GET /graphs/{graph}/schema` | `read` |
 | `queries` | `graph` | `GET /graphs/{graph}/queries`, stored mutations removed | `read` |
 | `query` | `graph`, `name`, optional `params`, `branch` | `POST /graphs/{graph}/queries/{name}` as a read | `invoke_query`, then `read` |
-| `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph}/query` | `read` |
+| `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph}/query` | `read`; `change` for `explain load csv` |
 | `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph}/snapshot` | `read` |
 | `branches_list` | `graph` | `GET /graphs/{graph}/branches` | `read` |
-| `commits_list` | `graph`, optional `branch` | `GET /graphs/{graph}/commits` | `read` |
+| `commits_list` | `graph`, optional `branch`, `limit`, `page_token` | `GET /graphs/{graph}/commits` | `read` |
 | `commits_get` | `graph`, `commit_id` | `GET /graphs/{graph}/commits/{commit_id}` | `read` |
 | `commits_changes` | `graph`, `commit_id`, optional `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph}/commits/{commit_id}/changes` | `read` |
 | `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph}/changes` | `read` |
+
+`graph_list` is a server-scoped action, and a server without an applied cluster
+policy denies every server-scoped action. So with a static or other non-identity
+token, `graphs` returns 403 until the cluster policy permits `graph_list`; the
+other tools still work with a graph id the user supplies.
 
 The server's `initialize` instructions tell a model to call `graphs`, then
 `schema`, then a stored read with `query` or, when enabled, its own GQ read with
@@ -102,8 +107,11 @@ The server's `initialize` instructions tell a model to call `graphs`, then
 - `query` refuses stored mutations.
 - `read` takes GQ source with typed parameter declarations, the same body as
   `POST /query`. It also answers `branch list`, `branch diff`,
-  `branch merge-base`, `branch merge … dry run` and `explain query …`. It refuses
-  `insert`, `update`, `delete` and branch writes with the route's 400.
+  `branch merge-base`, `branch merge … dry run` and `explain query …`.
+  `explain load csv …` requires `change` on its target branch before probing
+  source metadata; it reads no payload byte and publishes nothing. It accepts
+  `branch`, while refusing `snapshot`, `name` and `params`.
+  The tool refuses `insert`, `update`, `delete` and branch writes with the route's 400.
 
 ### Write tools (opt-in)
 
@@ -121,10 +129,16 @@ Write tools follow one contract:
   `if_graph_commit`. If the branch has moved, the call fails with 412 and nothing
   is written.
 - **No retries.** The server never replays a tool call.
-- **Unknown outcomes are reported.** A write runs to completion even when the
-  caller stops waiting. A write still running after 60 seconds, a cancelled write,
-  or a write whose completion the server cannot confirm returns `isError` with
-  `"outcome_unknown": true`. Read the target and reconcile before replaying it.
+- **A lost response is an unknown outcome.** A write runs to completion even when
+  the caller stops waiting. A write still running after 30 seconds, or one whose
+  completion the server cannot confirm, returns `isError` with
+  `"outcome_unknown": true`. A write the client cancelled, timed out or lost the
+  connection for returns nothing, and means the same. Before replaying it, read
+  the target with `read` or `snapshot` and compare `graph_commit_id`, or list the
+  branch with `commits_list`; replay a `mutate` with `if_graph_commit`, so a write
+  that did land fails with 412 instead of applying twice. The 30 second wait is
+  below the MCP TypeScript SDK's default 60 second request timeout; a client with
+  a shorter timeout loses the answer.
 - **Size.** The whole call, including `load` data, fits in the 64 KiB request.
   Use `POST /load/ndjson` for larger loads.
 
@@ -138,6 +152,11 @@ Schema changes and cluster deployments are not MCP tools; operators run them wit
 | `omnigraph://graphs` | The `graphs` result, JSON, under the same rule |
 | `omnigraph://graphs/{graph}/schema` (template) | The graph's `.pg` source |
 | `omnigraph://graphs/{graph}/branches` (template) | The `branches_list` result, JSON |
+| `omnigraph://best-practices/index` | Which reference to read for which task, Markdown |
+| `omnigraph://best-practices/{topic}` for `queries`, `data`, `schema`, `search`, `changes` | The agent skill's reference of that name, Markdown |
+
+The best-practices references are the `omnigraph` agent skill's own files,
+compiled into the server, so they always match its version.
 
 A resource read runs the same handler and policy action as its tool. A refusal
 is a JSON-RPC error whose `data` carries the HTTP `status` and `error` body; an
@@ -166,7 +185,7 @@ A write adds `"outcome_unknown": true` to either shape when it may have happened
 | Request body | 64 KiB |
 | Complete tool result, including the text copy | 1 MiB |
 | Wait for one read | 30 seconds |
-| Wait for one write | 60 seconds; the write continues past it |
+| Wait for one write | 30 seconds; the write continues past it |
 | Concurrent tool executions | 16 |
 
 A cancelled or expired call stops the caller's wait. The execution keeps its

@@ -11,6 +11,10 @@ pub mod settings;
 pub mod traversal;
 pub mod types;
 
+pub use catalog::catalogue::{
+    CATALOGUE_SCOPE, CATALOGUE_TYPES, CatalogueProp, CatalogueType, SYSTEM_GRAPH_ID_PREFIX,
+    catalogue_declarations, catalogue_type, is_catalogue_type_name,
+};
 pub use catalog::schema_ir::{
     ConstraintIR, EdgeIR, EmbedSourceIR, FEATURE_EDGE_KEYS, FEATURE_SYSTEM_COLUMNS, FieldRefIR,
     InterfaceIR, NodeIR, PropertyIR, PropertyRefIR, SCHEMA_IR_VERSION, SCHEMA_IR_VERSION_EDGE_KEYS,

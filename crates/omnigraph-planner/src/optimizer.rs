@@ -8,27 +8,30 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::QueryDiagnostic;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR, is_fresh_variable};
-use omnigraph_compiler::query::ast::AggFunc;
+use omnigraph_compiler::query::ast::{AggFunc, LoadStmtMode};
 use omnigraph_compiler::query::codes::{P001, P002, P004, P005};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 
 use crate::cost::{
-    AccessPath, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
-    HASH_JOIN_POOL_DIVISOR, HYDRATE_ROW_RATIO, IndexCoverage, choose_access_path,
-    choose_expand_mode, direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes,
-    scan_row_estimate,
+    AccessPath, AntiJoinStrategy, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
+    HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
+    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, chain_rows, choose_access_path,
+    choose_anti_join_strategy, choose_expand_mode, choose_validate_access, direction_probe_factor,
+    estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
 };
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
+use crate::key_set::{KeySetTree, key_set_tree};
 use crate::logical::{
-    ColumnRef, EDGE_TYPE_MEMBER, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId,
-    LogicalNode, LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
-    tiebreak_text,
+    ColumnRef, ConsultedImage, CsvSourceSpec, EDGE_TYPE_MEMBER, FragmentWriteSpec, GqFilter,
+    IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId, LogicalNode, LogicalPlan, Predicate,
+    RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm, ValidateSpec, tiebreak_text,
 };
 use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
 use crate::output::{node_object_types, return_schema};
+use crate::passes::{PassId, PassStage};
 use crate::physical::{
     Assumptions, Eligibility, EmptyEligible, Estimate, Hop, HydratedBinding, HydratedColumn,
     NearestPolicy, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
@@ -60,18 +63,24 @@ pub struct Bounds {
     /// Set by the engine after a one-pass shape was refused at open: pass 6
     /// then hydrates by address whatever the manifest says.
     pub late_materialization_only: bool,
+    /// The most parsers, probe chunks or writers a load operator runs at
+    /// once; the phases are sequential, so the cap never multiplies.
+    pub load_workers_max: u32,
+    /// The bound every staged write input of a load is checked against.
+    pub load_write_max_bytes: u64,
 }
 
-pub const PASS_RESOLVE: &str = "resolve";
-pub const PASS_PREDICATE_PUSHDOWN: &str = "predicate_pushdown";
-pub const PASS_AGGREGATE_PUSHDOWN: &str = "aggregate_pushdown";
-pub const PASS_PROJECTION_PUSHDOWN: &str = "projection_pushdown";
-pub const PASS_FRAGMENT_SCOPE: &str = "fragment_scope";
-pub const PASS_ADDRESS_SHORT_CIRCUIT: &str = "address_short_circuit";
-pub const PASS_LATE_MATERIALIZATION: &str = "late_materialization";
-pub const PASS_JOIN_ALGORITHM: &str = "join_algorithm";
-pub const PASS_EXPAND_MODE: &str = "expand_mode";
-pub const PASS_ACCESS_PATH: &str = "access_path";
+pub const PASS_RESOLVE: &str = PassId::Resolve.name();
+pub const PASS_PREDICATE_PUSHDOWN: &str = PassId::PredicatePushdown.name();
+pub const PASS_AGGREGATE_PUSHDOWN: &str = PassId::AggregatePushdown.name();
+pub const PASS_PROJECTION_PUSHDOWN: &str = PassId::ProjectionPushdown.name();
+pub const PASS_FRAGMENT_SCOPE: &str = PassId::FragmentScope.name();
+pub const PASS_ADDRESS_SHORT_CIRCUIT: &str = PassId::AddressShortCircuit.name();
+pub const PASS_LATE_MATERIALIZATION: &str = PassId::LateMaterialization.name();
+pub const PASS_JOIN_ALGORITHM: &str = PassId::JoinAlgorithm.name();
+pub const PASS_EXPAND_MODE: &str = PassId::ExpandMode.name();
+pub const PASS_ACCESS_PATH: &str = PassId::AccessPath.name();
+pub const PASS_ANTI_JOIN_STRATEGY: &str = PassId::AntiJoinStrategy.name();
 
 /// The optimizer's output: the physical plan with every property declared,
 /// the passes that fired, and every statistic a pass read.
@@ -155,8 +164,90 @@ pub fn resolve(op: &Operation, source: &dyn PlanSource) -> Result<LogicalPlan, P
             plan.set_root(classify);
         }
         Operation::Query(ir) => resolve_query(&mut plan, ir, source)?,
+        Operation::Load {
+            ir,
+            tables,
+            source_bytes,
+        } => resolve_load(&mut plan, ir, tables, *source_bytes, source)?,
     }
     Ok(plan)
+}
+
+/// Stage 1, pass 1 for a load: the source leaf, one `Validate` carrying the
+/// IR's checks in its order, the write at the root; the source's schema is the
+/// target's typed delta, which the plan source answers for `SideId::Child`.
+fn resolve_load(
+    plan: &mut LogicalPlan,
+    ir: &omnigraph_compiler::ir::LoadIR,
+    tables: &[Side],
+    source_bytes: u64,
+    source: &dyn PlanSource,
+) -> Result<(), PlanError> {
+    let target = ir.target.table_key();
+    let version_of = |type_key: &str| {
+        tables
+            .iter()
+            .find(|side| side.table.type_key == type_key)
+            .map(|side| side.version)
+    };
+    let schema = source.schema(SideId::Child)?;
+    let source_node = plan.add(
+        LogicalNode::CsvSource {
+            spec: Box::new(CsvSourceSpec {
+                source: ir.source.clone(),
+                source_bytes,
+                estimated_rows: CsvSourceSpec::estimate_rows(source_bytes, ir.mapped_columns),
+                delimiter: ir.delimiter,
+                header: ir.header,
+                columns: ir.columns.clone(),
+                table: target.clone(),
+                version: version_of(&target),
+            }),
+        },
+        schema.clone(),
+    );
+    let checks = ir
+        .checks
+        .iter()
+        .map(|check| ValidateSpec {
+            check: check.check.clone(),
+            consults: check.consults.as_ref().map(|table| ConsultedImage {
+                table: table.clone(),
+                version: version_of(table),
+            }),
+            access: None,
+        })
+        .collect();
+    let validated = plan.add(
+        LogicalNode::Validate {
+            input: source_node,
+            table: target.clone(),
+            checks,
+        },
+        schema,
+    );
+    let write = plan.add(
+        LogicalNode::FragmentWrite {
+            input: validated,
+            spec: Box::new(FragmentWriteSpec {
+                table: target.clone(),
+                version: version_of(&target),
+                mode: ir.mode,
+            }),
+        },
+        write_count_schema(),
+    );
+    plan.set_root(write);
+    Ok(())
+}
+
+/// The one row a write leaves: `count`, the rows it wrote.
+pub fn write_count_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
 }
 
 /// Stage 1, pass 1 for a GQ query: the flat `IROp` pipeline folded into a
@@ -1221,21 +1312,33 @@ pub(crate) fn rewrite_with(
     source: &dyn PlanSource,
     tracer: &mut Tracer,
 ) -> Result<Vec<&'static str>, PlanError> {
-    let mut fired = vec![PASS_RESOLVE];
+    let mut fired = Vec::new();
     let query = is_query_plan(plan);
-    let pushed = if query {
-        place_query_filters(plan, source, tracer)
-    } else {
-        resume_pushdown(plan)
-    };
-    if pushed {
-        fired.push(PASS_PREDICATE_PUSHDOWN);
-    }
-    if query && aggregate_pushdown(plan)? {
-        fired.push(PASS_AGGREGATE_PUSHDOWN);
-    }
-    if query && projection_pushdown(plan, source, tracer)? {
-        fired.push(PASS_PROJECTION_PUSHDOWN);
+    for pass in PassId::of_stage(PassStage::Rewrite) {
+        let applied = match pass {
+            PassId::Resolve => true,
+            PassId::PredicatePushdown => {
+                if query {
+                    place_query_filters(plan, source, tracer)
+                } else {
+                    resume_pushdown(plan)
+                }
+            }
+            PassId::AggregatePushdown => query && aggregate_pushdown(plan)?,
+            PassId::ProjectionPushdown => query && projection_pushdown(plan, source, tracer)?,
+            PassId::FragmentScope
+            | PassId::AddressShortCircuit
+            | PassId::LateMaterialization
+            | PassId::JoinAlgorithm
+            | PassId::ExpandMode
+            | PassId::AccessPath
+            | PassId::AntiJoinStrategy
+            | PassId::KeyToId
+            | PassId::ScanAccess => continue,
+        };
+        if applied {
+            fired.push(pass.name());
+        }
     }
     Ok(fired)
 }
@@ -1275,21 +1378,38 @@ pub(crate) fn physical_plan_with(
         .schema(plan.root())
         .cloned()
         .ok_or_else(|| PlanError::Internal("resolved plan root has no schema".to_string()))?;
-    if fragment_scope(plan, source) {
-        fired.push(PASS_FRAGMENT_SCOPE);
+    for pass in PassId::of_stage(PassStage::Physical) {
+        let applied = match pass {
+            PassId::FragmentScope => fragment_scope(plan, source),
+            PassId::AddressShortCircuit => address_short_circuit(plan, source),
+            PassId::LateMaterialization
+            | PassId::JoinAlgorithm
+            | PassId::ExpandMode
+            | PassId::AccessPath
+            | PassId::AntiJoinStrategy => break,
+            PassId::Resolve
+            | PassId::PredicatePushdown
+            | PassId::AggregatePushdown
+            | PassId::ProjectionPushdown
+            | PassId::KeyToId
+            | PassId::ScanAccess => continue,
+        };
+        if applied {
+            fired.push(pass.name());
+        }
     }
-    if address_short_circuit(plan, source) {
-        fired.push(PASS_ADDRESS_SHORT_CIRCUIT);
-    }
+    let key_sets = key_set_trees(plan, source)?;
     let mut lowering = Lowering {
         logical: plan,
         source,
         bounds,
+        key_sets: &key_sets,
         physical: PhysicalPlan::new(),
         late_materialization: false,
         join_algorithm: false,
         expand_mode: false,
         access_path: false,
+        anti_join_strategy: false,
         csr_cached: false,
         decisions: Vec::new(),
         ranking: None,
@@ -1305,26 +1425,35 @@ pub(crate) fn physical_plan_with(
         join_algorithm,
         expand_mode,
         access_path,
+        anti_join_strategy,
         mut decisions,
         ..
     } = lowering;
     physical.set_root(root);
     let late_query =
         query && materialize_returns_late(&mut physical, plan, source, &mut decisions, tracer)?;
-    if late_materialization || late_query {
-        fired.push(PASS_LATE_MATERIALIZATION);
-    }
     let contains_join = physical
         .live()
         .any(|(_, node)| matches!(node, PhysicalNode::ContainsJoin { .. }));
-    if join_algorithm || contains_join {
-        fired.push(PASS_JOIN_ALGORITHM);
-    }
-    if expand_mode {
-        fired.push(PASS_EXPAND_MODE);
-    }
-    if access_path {
-        fired.push(PASS_ACCESS_PATH);
+    for pass in PassId::of_stage(PassStage::Physical) {
+        let applied = match pass {
+            PassId::LateMaterialization => late_materialization || late_query,
+            PassId::JoinAlgorithm => join_algorithm || contains_join,
+            PassId::ExpandMode => expand_mode,
+            PassId::AccessPath => access_path,
+            PassId::AntiJoinStrategy => anti_join_strategy,
+            PassId::FragmentScope
+            | PassId::AddressShortCircuit
+            | PassId::Resolve
+            | PassId::PredicatePushdown
+            | PassId::AggregatePushdown
+            | PassId::ProjectionPushdown
+            | PassId::KeyToId
+            | PassId::ScanAccess => continue,
+        };
+        if applied {
+            fired.push(pass.name());
+        }
     }
     let mut statistics = decisions;
     statistics.extend(derive_properties(&mut physical, source, bounds)?);
@@ -1340,6 +1469,29 @@ pub(crate) fn physical_plan_with(
         fired,
         statistics,
     })
+}
+
+/// The key-set tree of every `AntiJoin` whose block qualifies (`key_set.rs`),
+/// built before physical selection, which lowers it in place of the
+/// correlated tree when pass 10 prices it lower.
+fn key_set_trees(
+    plan: &LogicalPlan,
+    source: &dyn PlanSource,
+) -> Result<HashMap<LogicalId, KeySetTree>, PlanError> {
+    let mut trees = HashMap::new();
+    for (id, node) in plan.live() {
+        if let LogicalNode::AntiJoin {
+            inner,
+            outer_var,
+            predicate,
+            ..
+        } = node
+            && let Some(tree) = key_set_tree(plan, *inner, outer_var, predicate, source)?
+        {
+            trees.insert(id, tree);
+        }
+    }
+    Ok(trees)
 }
 
 /// The nodes of the pipeline under `root` that constrain its rows: every
@@ -1541,7 +1693,9 @@ fn place_query_filters(
                     stack.push(*input);
                 }
                 Some(LogicalNode::TableScan { input, spec }) => {
-                    if let Some(binding) = &spec.binding {
+                    if let Some(binding) = &spec.binding
+                        && !spec.table.is_catalogue()
+                    {
                         if input.is_some() {
                             dependent_scans.insert(binding.clone(), id);
                         } else {
@@ -1832,6 +1986,7 @@ fn aggregate_pushdown(plan: &mut LogicalPlan) -> Result<bool, PlanError> {
             };
             if spec.filter.is_some()
                 || spec.fragments.is_some()
+                || spec.table.is_catalogue()
                 || return_exprs.is_empty()
                 || plan.parent_of(*input) != Some(id)
             {
@@ -2103,7 +2258,14 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             base: _,
             source: _,
             target: _,
-        } => {}
+        }
+        | LogicalNode::CsvSource { spec: _ }
+        | LogicalNode::Validate {
+            input: _,
+            table: _,
+            checks: _,
+        }
+        | LogicalNode::FragmentWrite { input: _, spec: _ } => {}
     }
     out
 }
@@ -2273,6 +2435,9 @@ fn materialize_returns_late(
         let Some(projection) = spec.projection.as_ref() else {
             continue;
         };
+        if spec.table.is_catalogue() {
+            continue;
+        }
         let node_type = node_type_of(spec, source)?;
         let deferrable = |property: &str| {
             !kept.contains(&(binding.clone(), property.to_string()))
@@ -2432,9 +2597,15 @@ fn address_short_circuit(plan: &mut LogicalPlan, source: &dyn PlanSource) -> boo
 /// materialization (pass 6) at every `Join` and the join algorithm rule
 /// (pass 7): a fragment-scoped right input builds, everything else streams.
 struct Lowering<'a> {
+    /// The arena `lower` reads: the plan's, or a key-set tree's while one is
+    /// lowered in place of its block's correlated tree.
     logical: &'a LogicalPlan,
     source: &'a dyn PlanSource,
     bounds: &'a Bounds,
+    /// The key-set tree of each qualifying `AntiJoin`, by its id in the
+    /// plan's arena. A tree's own ids overlap these, so a tree must hold no
+    /// `AntiJoin` to look up while it is lowered (checked at the swap).
+    key_sets: &'a HashMap<LogicalId, KeySetTree>,
     physical: PhysicalPlan,
     late_materialization: bool,
     join_algorithm: bool,
@@ -2442,6 +2613,8 @@ struct Lowering<'a> {
     expand_mode: bool,
     /// Pass 9 fired: a dependent scan's access path came from the cost model.
     access_path: bool,
+    /// Pass 10 fired: a correlated block's strategy came from the cost model.
+    anti_join_strategy: bool,
     /// An earlier lowered node of this plan realizes the query's CSR (an
     /// `Expand` in `Csr` mode or an `AntiJoin`), so a later `Expand` reuses
     /// it for free. Lowering order is execution order (inputs first).
@@ -2760,7 +2933,7 @@ impl Lowering<'_> {
         else {
             return Ok(false);
         };
-        if haystack.binding.as_deref() != Some(shape.haystack.0) {
+        if haystack.binding.as_deref() != Some(shape.haystack.0) || haystack.table.is_catalogue() {
             return Ok(false);
         }
         let Some(needle) = self.scan_of_binding(left, shape.needle.0) else {
@@ -3002,14 +3175,40 @@ impl Lowering<'_> {
                 predicate,
             } => {
                 let lowered = self.lower(*input)?;
-                let inner_lowered = self.lower(*inner)?;
-                self.csr_cached = true;
+                let key_set = self.key_sets.get(&id);
+                let strategy = match key_set {
+                    Some(tree) => self.anti_join_strategy(*input, *inner, outer_var, tree),
+                    None => AntiJoinStrategy::Correlated,
+                };
+                let inner_lowered = match (strategy, key_set) {
+                    (AntiJoinStrategy::KeySet, Some(tree)) => {
+                        if tree
+                            .plan
+                            .live()
+                            .any(|(_, node)| matches!(node, LogicalNode::AntiJoin { .. }))
+                        {
+                            return Err(PlanError::Internal(format!(
+                                "the key-set tree of block `${outer_var}` holds a correlated block, whose id would name another arena's tree"
+                            )));
+                        }
+                        let logical = std::mem::replace(&mut self.logical, &tree.plan);
+                        let lowered = self.lower(tree.root);
+                        self.logical = logical;
+                        lowered?
+                    }
+                    _ => {
+                        let lowered = self.lower(*inner)?;
+                        self.csr_cached = true;
+                        lowered
+                    }
+                };
                 Ok(self.physical.add(PhysicalNode::AntiJoin {
                     input: lowered,
                     inner: inner_lowered,
                     outer_var: outer_var.clone(),
                     predicate: predicate.clone(),
                     aggregate: crate::plan_block_aggregate(&predicate.left)?,
+                    strategy,
                 }))
             }
             LogicalNode::OuterReference { outer_var } => {
@@ -3356,7 +3555,121 @@ impl Lowering<'_> {
                     .physical
                     .add(PhysicalNode::ClassifyThreeWay { input: hydrated }))
             }
+            LogicalNode::CsvSource { spec } => {
+                let max_workers = self.bounds.load_workers_max.max(1);
+                let partitions_by_size = spec.source_bytes.div_ceil(SOURCE_PARTITION_BYTES).max(1);
+                let max_partitions =
+                    u32::try_from(partitions_by_size.min(u64::from(max_workers))).unwrap_or(1);
+                Ok(self.physical.add(PhysicalNode::CsvSource {
+                    spec: spec.clone(),
+                    max_partitions,
+                    max_workers,
+                }))
+            }
+            LogicalNode::Validate {
+                input,
+                table,
+                checks,
+            } => {
+                let estimated_rows = estimate_rows(self.logical, *input, self.source);
+                let lowered = self.lower(*input)?;
+                let checks = checks
+                    .iter()
+                    .map(|spec| ValidateSpec {
+                        access: Some(self.validate_access(spec, estimated_rows)),
+                        ..spec.clone()
+                    })
+                    .collect();
+                Ok(self.physical.add(PhysicalNode::Validate {
+                    input: lowered,
+                    table: table.clone(),
+                    checks,
+                    max_workers: self.bounds.load_workers_max.max(1),
+                }))
+            }
+            LogicalNode::FragmentWrite { input, spec } => {
+                let lowered = self.lower(*input)?;
+                Ok(self.physical.add(PhysicalNode::FragmentWrite {
+                    input: lowered,
+                    spec: spec.clone(),
+                    max_input_bytes: self.bounds.load_write_max_bytes,
+                    max_workers: self.bounds.load_workers_max.max(1),
+                }))
+            }
         }
+    }
+
+    /// Pass 9 costs the committed lookup from the accepted node count and
+    /// index metadata. Append and merge retain their executor's Probe path.
+    fn validate_access(
+        &mut self,
+        spec: &ValidateSpec,
+        estimated_rows: Option<u64>,
+    ) -> ValidateAccess {
+        let Some(image) = &spec.consults else {
+            return ValidateAccess::Delta;
+        };
+        let overwrite = self
+            .logical
+            .live()
+            .any(|(_, node)| matches!(node, LogicalNode::FragmentWrite { spec, .. } if spec.mode == LoadStmtMode::Overwrite));
+        let node = image
+            .table
+            .strip_prefix("node:")
+            .and_then(|name| self.source.node_type(name).ok());
+        let columns: Vec<&str> = match &spec.check {
+            omnigraph_compiler::ir::ValidateCheck::Unique { columns, .. } => {
+                columns.iter().map(String::as_str).collect()
+            }
+            omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. } => node
+                .as_ref()
+                .map(|node| node.columns.id)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        };
+        let facts = self.source.index_facts(&image.table);
+        let indexed = !columns.is_empty()
+            && columns.iter().all(|column| {
+                let mut candidates = facts
+                    .iter()
+                    .filter(|fact| fact.column == *column)
+                    .peekable();
+                candidates.peek().is_some()
+                    && candidates.all(|fact| fact.fully_covers_btree(column))
+            });
+        let inputs = ValidateCostInputs {
+            input_rows: estimated_rows,
+            consulted_rows: node.as_ref().and_then(|node| node.row_count),
+            indexed,
+        };
+        let access = if overwrite {
+            choose_validate_access(&spec.check, inputs)
+        } else {
+            ValidateAccess::Probe
+        };
+        let costs = inputs.costs(&spec.check);
+        self.access_path = true;
+        self.decisions.push(StatisticSource {
+            statistic: format!("validate_access({})", spec.check.name()),
+            value: access.as_str().to_string(),
+            origin: serde_json::json!({
+                "check": spec.check,
+                "consulted_table": image.table,
+                "consulted_version": image.version,
+                "estimated_rows": estimated_rows,
+                "consulted_rows": inputs.consulted_rows,
+                "index_full_coverage": indexed,
+                "index_facts": facts,
+                "indexed_row_factor": HASH_JOIN_RATIO,
+                "probe_calls": costs.map(|(_, _, calls)| calls),
+                "probe_cost": costs.map(|(probe, _, _)| probe),
+                "scan_cost": costs.map(|(_, scan, _)| scan),
+                "overwrite": overwrite,
+            })
+            .to_string(),
+        });
+        access
     }
 
     fn scoped_scan(&self, id: NodeId) -> bool {
@@ -3474,6 +3787,33 @@ impl Lowering<'_> {
             origin: "projected widths and storage statistics".to_string(),
         });
         Ok(access)
+    }
+
+    /// Pass 10, the strategy of a correlated block with a key-set tree: the
+    /// cost model over the rows each inner tree produces, the correlated one
+    /// from the outer input's row-count estimate (`chain_rows`); `Correlated`
+    /// when an estimate is unknown.
+    fn anti_join_strategy(
+        &mut self,
+        input: LogicalId,
+        inner: LogicalId,
+        outer_var: &str,
+        tree: &KeySetTree,
+    ) -> AntiJoinStrategy {
+        let outer_rows = estimate_rows(self.logical, input, self.source);
+        let (Some(correlated), Some(key_set)) = (
+            chain_rows(self.logical, inner, self.source, outer_rows),
+            chain_rows(&tree.plan, tree.root, self.source, None),
+        ) else {
+            return AntiJoinStrategy::Correlated;
+        };
+        self.anti_join_strategy = true;
+        self.decisions.push(StatisticSource {
+            statistic: format!("anti_join_rows(${outer_var})"),
+            value: format!("correlated {correlated} estimated, key_set {key_set} estimated"),
+            origin: "row-count estimates of the block's two inner trees".to_string(),
+        });
+        choose_anti_join_strategy(correlated, key_set)
     }
 
     fn set_ordered(&mut self, id: NodeId, value: bool) {
@@ -3752,6 +4092,7 @@ pub fn node_order(
                 .chain(tiebreak.iter().cloned().map(OrderKey::Identity))
                 .collect(),
         ),
+        PhysicalNode::Validate { input: from, .. } => input(*from),
         PhysicalNode::MetadataCount { .. }
         | PhysicalNode::CrossJoin { .. }
         | PhysicalNode::ContainsJoin { .. }
@@ -3759,7 +4100,9 @@ pub fn node_order(
         | PhysicalNode::Expand { .. }
         | PhysicalNode::AntiJoin { .. }
         | PhysicalNode::RankFuse { .. }
-        | PhysicalNode::Aggregate { .. } => None,
+        | PhysicalNode::Aggregate { .. }
+        | PhysicalNode::CsvSource { .. }
+        | PhysicalNode::FragmentWrite { .. } => None,
     }
 }
 
@@ -4107,6 +4450,40 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
+            PhysicalNode::CsvSource { spec, .. } => Properties {
+                schema: source.schema(SideId::Child)?,
+                ordering: None,
+                rows: Estimate::Known(spec.estimated_rows),
+                work_bytes: Estimate::Known(spec.source_bytes),
+                retained_limit: None,
+                sources: vec![StatisticSource {
+                    statistic: "estimated_rows".to_string(),
+                    value: spec.estimated_rows.to_string(),
+                    origin: format!(
+                        "source_bytes {} over the narrowest row, an upper bound",
+                        spec.source_bytes
+                    ),
+                }],
+            },
+            PhysicalNode::Validate { input, .. } => {
+                let input = props(plan, *input)?;
+                Properties {
+                    schema: input.schema.clone(),
+                    ordering: None,
+                    rows: input.rows,
+                    work_bytes: Estimate::Unknown,
+                    retained_limit: None,
+                    sources: Vec::new(),
+                }
+            }
+            PhysicalNode::FragmentWrite { .. } => Properties {
+                schema: write_count_schema(),
+                ordering: None,
+                rows: Estimate::Known(1),
+                work_bytes: Estimate::Unknown,
+                retained_limit: None,
+                sources: Vec::new(),
+            },
         };
         read.extend(properties.sources.iter().cloned());
         plan.set_properties(id, properties);
@@ -4216,11 +4593,7 @@ mod tests {
 
     fn side(version: u64) -> Side {
         Side {
-            table: TableRef {
-                type_key: "node:Doc".to_string(),
-                dataset_path: "tables/node_Doc".to_string(),
-                native_branch: None,
-            },
+            table: TableRef::dataset("node:Doc", "tables/node_Doc", None),
             version,
             columns: COLUMNS,
         }
@@ -4376,18 +4749,37 @@ mod tests {
         );
         let pipelines = optimized.physical.pipelines_json();
         assert_eq!(pipelines.as_array().map(Vec::len), Some(2));
-        assert_eq!(pipelines[0]["sink"], "SortMergeJoin(build)");
-        assert_eq!(pipelines[1]["sink"], "consumer");
+        assert_eq!(pipelines[0]["id"], 0);
+        assert_eq!(pipelines[0]["sink"]["name"], "SortMergeJoin(build)");
+        assert_eq!(pipelines[1]["id"], 1);
+        assert_eq!(pipelines[1]["sink"]["name"], "consumer");
+        assert_eq!(pipelines[1]["depends_on"], serde_json::json!([0]));
+        let operators: Vec<&str> = pipelines[1]["operators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|operator| operator["name"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            pipelines[1]["operators"],
-            serde_json::json!([
+            operators,
+            [
                 "SortMergeJoin(probe)",
                 "HydrateByAddress(child)",
                 "HydrateByAddress(parent)",
                 "RowCompare",
                 "Page"
-            ])
+            ]
         );
+        assert_eq!(
+            pipelines[0]["sink"]["id"], pipelines[1]["operators"][0]["id"],
+            "the build sink and the probe operator are the same join node"
+        );
+        assert_eq!(pipelines[1]["source"]["node"], "Scan");
+        let scan_id = pipelines[1]["source"]["id"].as_u64().unwrap() as usize;
+        assert!(matches!(
+            optimized.physical.node(scan_id),
+            Some(PhysicalNode::Scan { .. })
+        ));
     }
 
     #[test]

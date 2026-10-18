@@ -13,7 +13,7 @@ Graph-scoped actions:
 |---|---|
 | `read` | Queries, snapshots, branches, and commits |
 | `export` | Snapshot export |
-| `change` | Mutations and loads |
+| `change` | Mutations, loads, and source metadata probes for `explain load csv` |
 | `schema_apply` | Schema changes |
 | `branch_create` | Branch creation |
 | `branch_delete` | Branch deletion |
@@ -55,7 +55,11 @@ policies:
 ```
 
 A bundle may target graph IDs or the `cluster` scope, but not both. Only one
-bundle may bind a given scope.
+bundle may bind a given scope. The target `og_catalog` binds the
+[engine catalogue](../queries/catalogue.md), which every server serves and no
+`graphs:` entry declares: its `read` rule decides catalogue reads with the
+resource `og_catalog` and no branch, and the bundle is applied and activated
+like a graph's.
 
 Example graph policy:
 

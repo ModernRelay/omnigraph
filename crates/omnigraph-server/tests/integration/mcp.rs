@@ -53,7 +53,8 @@ fn trust(root: &std::path::Path) -> Arc<OidcIdentityTrust> {
         "cluster_id":"A","cluster_incarnation":"one","canonical_root":canonical_root,
         "keys":[{"kid":"key-1","kty":"RSA","alg":"RS256","use":"sig",
             "n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())}],
-        "principals":[{"subject":"alice","principal_id":"stable_alice"},{"subject":"bob","principal_id":"stable_bob"}]});
+        "principals":[{"subject":"alice","principal_id":"stable_alice"},{"subject":"bob","principal_id":"stable_bob"},
+            {"subject":"read_only","principal_id":"stable_reader"},{"subject":"change_only","principal_id":"stable_changer"}]});
     let path = root.join("oidc-public.json");
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
     OidcIdentityTrust::read(&path, &canonical_root).unwrap()
@@ -75,7 +76,36 @@ async fn fixture_app_with(
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let policy = temp.path().join("policy.yaml");
-    std::fs::write(&policy,"version: 1\ngroups:\n  readers: [\"principal:stable_alice\"]\nrules:\n  - id: alice\n    allow:\n      actors: {group: readers}\n      actions: [read, change]\n      branch_scope: any\n  - id: invoke\n    allow:\n      actors: {group: readers}\n      actions: [invoke_query]\n").unwrap();
+    std::fs::write(
+        &policy,
+        r#"version: 1
+groups:
+  readers: ["principal:stable_alice"]
+  read_only: ["principal:stable_reader"]
+  change_only: ["principal:stable_changer"]
+rules:
+  - id: alice
+    allow:
+      actors: {group: readers}
+      actions: [read, change]
+      branch_scope: any
+  - id: read_only
+    allow:
+      actors: {group: read_only}
+      actions: [read]
+      branch_scope: any
+  - id: change_only
+    allow:
+      actors: {group: change_only}
+      actions: [change]
+      branch_scope: any
+  - id: invoke
+    allow:
+      actors: {group: readers}
+      actions: [invoke_query]
+"#,
+    )
+    .unwrap();
     let queries = stored_query_registry(&[
         (
             "people",
@@ -820,6 +850,41 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
         );
     }
 
+    let explain_load =
+        "explain load csv \"s3://imports/people.csv\" into node:Person mode overwrite header";
+    for (subject, expected) in [
+        ("read_only", StatusCode::FORBIDDEN),
+        ("change_only", StatusCode::BAD_REQUEST),
+    ] {
+        let bearer = token(subject, RESOURCE);
+        let arguments = json!({"graph":"default","query":explain_load});
+        let refused = call(&app, &bearer, "read", arguments).await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert_eq!(
+            refused["result"]["structuredContent"]["status"],
+            expected.as_u16(),
+            "{refused}"
+        );
+        let request = Request::post("/graphs/default/query")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::from(json!({"query":explain_load}).to_string()))
+            .unwrap();
+        let (status, native) = json_response(&app, request).await;
+        assert_eq!(status, expected, "{native}");
+        assert_eq!(refused["result"]["structuredContent"]["error"], native);
+        let message = native["error"].as_str().unwrap();
+        if subject == "read_only" {
+            assert!(message.contains("action 'change'"), "{native}");
+        } else {
+            assert!(
+                message.contains("ingress is denied for this graph"),
+                "{native}"
+            );
+        }
+    }
+
     // Writes never pass through `read`, and leave the graph unchanged.
     let before = manifest_dataset_version(&graph_path(temp.path())).await;
     for query in [
@@ -1012,6 +1077,11 @@ async fn mcp_read_parity_tools_equal_their_routes() {
             "/graphs/default/commits".to_string(),
         ),
         (
+            "commits_list",
+            json!({"graph":"default","branch":"main","limit":1}),
+            "/graphs/default/commits?branch=main&limit=1".to_string(),
+        ),
+        (
             "commits_get",
             json!({"graph":"default","commit_id":commit}),
             format!("/graphs/default/commits/{commit}"),
@@ -1061,7 +1131,47 @@ async fn mcp_resources_read_graphs_schema_and_branches_under_policy() {
         .iter()
         .map(|r| r["uri"].as_str().unwrap())
         .collect();
-    assert_eq!(uris, vec!["omnigraph://graphs"]);
+    assert_eq!(
+        uris,
+        vec![
+            "omnigraph://graphs",
+            "omnigraph://best-practices/index",
+            "omnigraph://best-practices/queries",
+            "omnigraph://best-practices/data",
+            "omnigraph://best-practices/schema",
+            "omnigraph://best-practices/search",
+            "omnigraph://best-practices/changes",
+        ]
+    );
+    // The references are the agent skill's own files, byte for byte.
+    let skill =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/omnigraph/references");
+    for topic in ["queries", "data", "schema", "search", "changes"] {
+        let uri = format!("omnigraph://best-practices/{topic}");
+        let (_, body) =
+            json_response(&app, rpc(Some(&bob), "resources/read", json!({"uri":uri}))).await;
+        assert_eq!(body["result"]["contents"][0]["mimeType"], "text/markdown");
+        assert_eq!(
+            body["result"]["contents"][0]["text"],
+            std::fs::read_to_string(skill.join(format!("{topic}.md"))).unwrap(),
+            "{topic}"
+        );
+    }
+    let (_, index) = json_response(
+        &app,
+        rpc(
+            Some(&bob),
+            "resources/read",
+            json!({"uri":"omnigraph://best-practices/index"}),
+        ),
+    )
+    .await;
+    assert!(
+        index["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("omnigraph://best-practices/search")
+    );
     let (_, templates) = json_response(
         &app,
         rpc(Some(&alice), "resources/templates/list", json!({})),

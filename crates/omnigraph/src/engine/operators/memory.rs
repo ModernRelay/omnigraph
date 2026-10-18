@@ -462,6 +462,15 @@ impl WorkMemory {
         self.resources.limit
     }
 
+    pub(in crate::engine) fn admit_read_reuse(
+        &self,
+    ) -> Option<crate::engine::LoadReuseReservation> {
+        crate::engine::LoadReuseReservation::admit(
+            Arc::clone(&self.resources.pool),
+            self.resources.limit,
+        )
+    }
+
     /// Target bytes per producer batch, leaving room for queued batches and consumers.
     pub(in crate::engine) fn batch_bytes(&self) -> usize {
         (self.resources.limit / 32).clamp(1, 1024 * 1024) as usize

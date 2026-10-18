@@ -19,6 +19,9 @@ use object_store::ObjectStore as RawObjectStore;
 use object_store::path::Path;
 use prost::Message;
 
+#[cfg(test)]
+pub(crate) use tests::fresh_dataset;
+
 tokio::task_local! {
     static CLONE_CONTEXT: CloneContext;
 }
@@ -575,7 +578,7 @@ mod tests {
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
     use lance_linalg::distance::MetricType;
     use object_store::ObjectStoreExt;
-    async fn fresh_dataset(uri: &str) -> Dataset {
+    pub(crate) async fn fresh_dataset(uri: &str) -> Dataset {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("value", DataType::Int32, false),

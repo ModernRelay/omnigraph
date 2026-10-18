@@ -1,0 +1,32 @@
+// The engine catalogue: the built-in `@` node types every omnigraph binary
+// answers from its own registries. Read-only, never stored, never declared
+// in a user schema; listed here for reference. `omnigraph schema show
+// og_catalog` prints the same declarations from the running binary.
+
+node @Operator {
+    name: String @key
+    inputs: [I64]
+}
+
+node @Pass {
+    name: String @key
+    position: I64
+}
+
+node @Setting {
+    name: String @key
+    kind: String
+    default: String
+    scope: String
+}
+
+node @Engine {
+    version: String @key
+    current_internal_schema_version: I64
+    min_supported_internal_schema_version: I64
+}
+
+node @LogicalKind {
+    name: String @key
+    coverage: String
+}

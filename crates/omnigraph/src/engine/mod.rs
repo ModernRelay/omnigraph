@@ -37,6 +37,7 @@ use crate::runtime_cache::CompiledQuery;
 
 mod adapters;
 mod bind;
+pub(crate) mod catalogue;
 mod constant;
 mod context;
 mod exact_aggregate;
@@ -68,11 +69,14 @@ pub(crate) use typed_value::{fill_declared_params, validate_params};
 use bind::bind;
 pub(crate) use constant::evaluate_constant;
 use context::QueryContext;
-pub(crate) use explain::{explain_document, explain_rows};
+pub(crate) use context::{LoadCharge, LoadMemory, LoadReuseReservation};
+pub(crate) use explain::{explain_document, explain_load_rows, explain_rows};
 pub(crate) use graph::{EmbeddingResolver, GraphIndexHandle};
 use lower::Lowering;
 use plan_source::{ExplainedQuery, QuerySource, accept_query, explain_query};
-pub(crate) use plan_source::{accept_replay, replay_refused, replayed_coverage_holds};
+pub(crate) use plan_source::{
+    accept_replay, engine_bounds, replay_refused, replayed_coverage_holds,
+};
 pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
@@ -82,11 +86,44 @@ pub(crate) use search::referenced_edge_types;
 /// What `execute` takes beside the bound plan, each member data and not a
 /// decision: the read-consistency unit, the type metadata the lowered
 /// operators read back, and the built index state. No session setting: every
-/// setting the run needs is a field of the plan.
+/// setting the run needs is a field of the plan. A catalogue-only query has
+/// no snapshot: every scan of it reads the engine catalogue, and a node that
+/// asks for storage fails its lowering.
 pub(crate) struct EngineContext<'a> {
-    pub(crate) snapshot: &'a Snapshot,
+    pub(crate) snapshot: Option<&'a Snapshot>,
     pub(crate) catalog: &'a Arc<Catalog>,
     pub(crate) graph_index: Arc<GraphIndexHandle>,
+    /// A load plan's facts; `None` under a read plan, whose lowering never
+    /// reaches a load node.
+    pub(crate) load: Option<&'a LoadFacts>,
+}
+
+/// What a load plan's operators need beside the snapshot: the statement as
+/// the loader resolved it, the one captured response its source parses, and
+/// the write verb's facts, `None` where no write runs (an explain).
+pub(crate) struct LoadFacts {
+    pub(crate) request: crate::loader::csv::CsvLoadRequest,
+    pub(crate) capture: Arc<crate::table_store::CapturedSource>,
+    pub(crate) write: Option<LoadWrite>,
+}
+
+/// The write verb's facts: the graph handle and the open transaction the
+/// sink stages under, the session's write allowance, and the slot the sink
+/// deposits its staged transaction in for the driver to commit.
+#[derive(Clone)]
+pub(crate) struct LoadWrite {
+    pub(crate) db: Arc<crate::db::Omnigraph>,
+    pub(crate) txn: Arc<crate::db::WriteTxn>,
+    pub(crate) write_budget: crate::storage_layer::WriteBudget,
+    pub(crate) staged: Arc<std::sync::Mutex<Option<crate::exec::staging::StagedMutation>>>,
+}
+
+/// The refusal every storage request of a catalogue-only query meets.
+pub(crate) fn no_graph_storage(what: &str) -> OmniError {
+    OmniError::manifest_internal(format!(
+        "{what} needs graph storage; a query under `{}` reads only the engine catalogue",
+        omnigraph_compiler::CATALOGUE_SCOPE
+    ))
 }
 
 /// The identity of a snapshot's dataset entry as a plan pins it.
@@ -104,9 +141,27 @@ pub(crate) fn dataset_pin(entry: &DatasetEntry) -> DatasetPin {
 /// Refuse a snapshot that is not the one `plan` was built on: the planner
 /// recorded every dataset it read in the plan's `Assumptions`, by path,
 /// branch and version, and a replay reads exactly those or nothing. A
-/// changed prerequisite is a conflict: replan against the current view.
-pub(crate) fn plan_pins_snapshot(plan: &PhysicalPlan, snapshot: &Snapshot) -> Result<()> {
+/// changed prerequisite is a conflict: replan against the current view. The
+/// catalogue tables the plan read are checked against this binary's
+/// fingerprints the same way; a plan that pinned a dataset cannot replay
+/// without a snapshot.
+pub(crate) fn plan_pins_snapshot(plan: &PhysicalPlan, snapshot: Option<&Snapshot>) -> Result<()> {
+    for (table, recorded) in &plan.assumptions().catalogue {
+        let current = catalogue::table_of_key(table).map(|table| table.fingerprint.as_str());
+        if current != Some(recorded.as_str()) {
+            return Err(OmniError::manifest_conflict(format!(
+                "`{table}` was planned against catalogue fingerprint {recorded}; this binary holds {}",
+                current.unwrap_or("no such catalogue table")
+            )));
+        }
+    }
     for (table, planned) in &plan.assumptions().datasets {
+        let snapshot = snapshot.ok_or_else(|| {
+            OmniError::manifest_conflict(format!(
+                "`{table}` was planned against a dataset; a query under `{}` pins none",
+                omnigraph_compiler::CATALOGUE_SCOPE
+            ))
+        })?;
         let pinned = snapshot.dataset(table).map(dataset_pin);
         if pinned != *planned {
             let spell = |pin: &Option<DatasetPin>| match pin {
@@ -271,7 +326,7 @@ impl ResolvedParams {
 pub(crate) async fn execute_query(
     query: &CompiledQuery,
     params: &ParamMap,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     graph_index: GraphIndexHandle,
     catalog: &Arc<Catalog>,
     embedding: &EmbeddingResolver<'_>,
@@ -284,6 +339,7 @@ pub(crate) async fn execute_query(
         snapshot,
         catalog,
         graph_index: Arc::new(graph_index),
+        load: None,
     };
     let run = Box::pin(execute(bound, &context)).await?;
     #[cfg(test)]
@@ -296,7 +352,7 @@ pub(crate) async fn execute_query(
 pub(crate) async fn execute_query_inspected(
     query: &CompiledQuery,
     params: &ParamMap,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     graph_index: GraphIndexHandle,
     catalog: &Arc<Catalog>,
     embedding: &EmbeddingResolver<'_>,
@@ -309,6 +365,7 @@ pub(crate) async fn execute_query_inspected(
         snapshot,
         catalog,
         graph_index: Arc::new(graph_index),
+        load: None,
     };
     let PlanRun {
         result,
@@ -418,6 +475,30 @@ pub(crate) async fn execute(
         QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
     ctx.run_owned(execute_with_context(bound, evidence, context, &ctx))
         .await
+}
+
+/// A load plan run under the statement's own pool: the sink's one `count`
+/// row read back, every owned producer settled before return.
+pub(crate) async fn execute_load(
+    bound: &BoundPlan,
+    context: &EngineContext<'_>,
+    memory: &LoadMemory,
+) -> Result<u64> {
+    let ctx = memory.context();
+    ctx.run_owned(async {
+        let lowering = Lowering::new(bound, context);
+        let lowered = lowering.lower_query(&Pass::default())?;
+        let batch = run_plan(&lowered, &bound.plan, ctx).await?;
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| {
+                OmniError::manifest_internal("the load plan's root is not a u64 count")
+            })?;
+        Ok(counts.iter().flatten().sum())
+    })
+    .await
 }
 
 async fn execute_with_context(
@@ -779,11 +860,7 @@ mod traversal_admission_tests {
             spec: Box::new(ScanSpec {
                 access: None,
                 side: SideId::Base,
-                table: TableRef {
-                    type_key: "node:Person".into(),
-                    dataset_path: "node_Person".into(),
-                    native_branch: None,
-                },
+                table: TableRef::dataset("node:Person", "node_Person", None),
                 version: None,
                 columns: SystemColumns {
                     id: "__id",

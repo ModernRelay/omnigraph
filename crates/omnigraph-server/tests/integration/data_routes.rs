@@ -4006,6 +4006,7 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "default",
                 "request"
             ),
+            show_row("explain_dump_dir", "", "", "default", "process"),
         ])
     );
 }
@@ -4402,6 +4403,112 @@ fn explain_plan_rows<'a>(body: &'a Value, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// `explain load csv` through `POST /query`: the planner's document as explain rows (`logical`,
+/// `physical`, then `plan` rows), no head moved, `branch` honored; `snapshot`, `name`, `params` meet
+/// the envelope refusals; `/mutate` refuses the read; a source no base admits is denied unprobed.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_answers_an_explain_load_statement_as_rows() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let external_dir = tempfile::tempdir().unwrap();
+    let csv_path = external_dir.path().join("people.csv");
+    fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+    let external_base = format!("file://{}/", external_dir.path().display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(external_base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
+    let head = main_head_commit_id(&app).await;
+    let statement = format!(
+        "explain load csv \"file://{}\" into node:Person mode overwrite header",
+        csv_path.display()
+    );
+
+    for request in [
+        json!({"query": statement}),
+        json!({"query": statement, "branch": "main"}),
+    ] {
+        let (status, body) = json_response(&app, json_post("/query", &request)).await;
+        assert_eq!(status, StatusCode::OK, "{request}: {body}");
+        assert_eq!(body["query_name"], "load csv", "{body}");
+        assert_eq!(body["columns"], json!(["tree", "depth", "node", "detail"]));
+        assert_eq!(body["graph_commit_id"], head, "{body}");
+        let physical = explain_tree(&body, "physical");
+        assert_eq!(physical["node"], "FragmentWrite", "{physical}");
+        assert_eq!(physical["mode"], "overwrite", "{physical}");
+        assert_eq!(physical["table"], "node:Person", "{physical}");
+        let validate = &physical["inputs"][0];
+        assert_eq!(validate["node"], "Validate", "{physical}");
+        assert_eq!(validate["inputs"][0]["node"], "CsvSource", "{physical}");
+        assert_eq!(explain_tree(&body, "logical")["node"], "FragmentWrite");
+        assert_eq!(explain_plan_rows(&body, "route"), ["engine"], "{body}");
+        assert_eq!(explain_plan_rows(&body, "explain_version"), ["6"], "{body}");
+    }
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "an explain publishes nothing"
+    );
+    assert!(csv_path.exists(), "the source is only probed");
+
+    let cases = [
+        (
+            "/query",
+            json!({"query": statement, "snapshot": head}),
+            "a branch statement names its branches itself; drop the request target",
+        ),
+        (
+            "/query",
+            json!({"query": statement, "name": "load csv"}),
+            "a branch statement takes no name and no parameters",
+        ),
+        (
+            "/query",
+            json!({"query": statement, "params": {}}),
+            "a branch statement takes no name and no parameters",
+        ),
+        (
+            "/mutate",
+            json!({"query": statement}),
+            "statement 'explain' is a read; use POST /query",
+        ),
+        (
+            "/mutate",
+            json!({"query": statement, "branch": "main"}),
+            "statement 'explain' is a read; use POST /query",
+        ),
+    ];
+    for (path, request, expected) in cases {
+        let (status, body) = json_response(&app, json_post(path, &request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {request}: {body}");
+        assert_eq!(body["error"], expected, "{path} {request}: {body}");
+    }
+
+    let (_denied_temp, denied_app) = app_for_loaded_graph().await;
+    let (status, body) = json_response(
+        &denied_app,
+        json_post(
+            "/query",
+            &json!({"query": format!("explain {LOAD_CSV_PEOPLE}")}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ingress is denied for this graph"),
+        "{body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn query_endpoint_answers_an_explain_statement_as_rows() {
     let (_temp, app) = app_for_loaded_graph().await;
@@ -4417,7 +4524,16 @@ async fn query_endpoint_answers_an_explain_statement_as_rows() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["query_name"], "adults");
     assert_eq!(body["columns"], json!(["tree", "depth", "node", "detail"]));
-    assert_eq!(body["rows"][0]["tree"], "logical", "{body}");
+    assert_eq!(body["rows"][0]["tree"], "logical_initial", "{body}");
+    let initial = explain_tree(&body, "logical_initial");
+    assert_eq!(
+        initial["inputs"][0]["node"], "Filter",
+        "before the passes ran the age filter is its own node: {initial}"
+    );
+    assert!(
+        initial["inputs"][0]["inputs"][0]["filter"].is_null(),
+        "the initial scan carries no pushed filter: {initial}"
+    );
     let logical = explain_tree(&body, "logical");
     assert!(logical["node"].is_string(), "{logical}");
     assert_eq!(
@@ -4505,8 +4621,14 @@ async fn query_endpoint_explain_lists_the_lowered_datafusion_tree() {
     }
     assert_eq!(
         trees,
-        vec!["logical", "physical", "datafusion", "plan"],
-        "the three trees then the plan rows: {body}"
+        vec![
+            "logical_initial",
+            "logical",
+            "physical",
+            "datafusion",
+            "plan"
+        ],
+        "the four trees then the plan rows: {body}"
     );
     let datafusion: Vec<&Value> = rows
         .iter()
@@ -7331,6 +7453,91 @@ async fn commit_changes_pages_are_ordered_with_cause_once() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(second["changes"][0]["id"], "Loaded C");
     assert!(second["next_page_token"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_list_pages_answer_for_the_head_their_first_page_named() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let person = |name: &str| format!(r#"{{"type":"Person","data":{{"name":"{name}","age":1}}}}"#);
+    for name in ["Page A", "Page B", "Page C"] {
+        load_commit(&app, &person(name)).await;
+    }
+    let (status, whole) = get_json(&app, g("/commits")).await;
+    assert_eq!(status, StatusCode::OK, "{whole}");
+    assert!(
+        whole.get("head_commit_id").is_none() && whole.get("next_page_token").is_none(),
+        "an unpaged listing keeps its shape: {whole}"
+    );
+    let whole = whole["commits"].as_array().unwrap().clone();
+    assert!(whole.len() > 4, "test setup: several pages of two");
+
+    let (status, first) = get_json(&app, g("/commits?branch=main&limit=2")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["head_commit_id"], whole[0]["graph_commit_id"]);
+    assert_eq!(first["commits"], json!(whole[..2]));
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("a first page of two continues")
+        .to_string();
+
+    load_commit(&app, &person("Page D")).await;
+    let mut paged = first["commits"].as_array().unwrap().clone();
+    let mut next = Some(token.clone());
+    while let Some(token) = next {
+        let (status, page) =
+            get_json(&app, g(&format!("/commits?limit=2&page_token={token}"))).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["head_commit_id"], first["head_commit_id"], "{page}");
+        paged.extend(page["commits"].as_array().unwrap().iter().cloned());
+        next = page["next_page_token"].as_str().map(str::to_string);
+    }
+    assert_eq!(
+        paged, whole,
+        "later pages answer for the head the first page named"
+    );
+    let (status, rest) = get_json(&app, g(&format!("/commits?page_token={token}"))).await;
+    assert_eq!(status, StatusCode::OK, "{rest}");
+    assert_eq!(
+        rest["commits"],
+        json!(whole[2..]),
+        "100 commits per page by default"
+    );
+    assert!(rest.get("next_page_token").is_none(), "{rest}");
+
+    for (uri, expected) in [
+        (
+            format!("/commits?branch=feature&page_token={token}"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/commits?page_token=not-a-token".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/commits?limit=0".to_string(), StatusCode::BAD_REQUEST),
+        (
+            "/commits?limit=2&unpublished=true".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/commits?page_token={token}&unattached=true"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/commits?limit=1001".to_string(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ] {
+        let (status, body) = get_json(&app, g(&uri)).await;
+        assert_eq!(status, expected, "{uri}: {body}");
+    }
+    let (_, body) = get_json(&app, g("/commits?page_token=not-a-token")).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("change cursor rejected: "),
+        "a rejected page token keeps the continuation prefix: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

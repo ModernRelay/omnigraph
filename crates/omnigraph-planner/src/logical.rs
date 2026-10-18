@@ -4,7 +4,8 @@ use std::hash::Hash;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
-use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate, ValidateCheck};
+use omnigraph_compiler::query::ast::LoadStmtMode;
 use omnigraph_compiler::traversal::EdgeSelection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -210,67 +211,71 @@ impl fmt::Display for ColumnRef {
     }
 }
 
-/// Every logical node kind, declared in the order the census sorts them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub enum LogicalKind {
-    Aggregate,
-    AntiJoin,
-    Expand,
-    Filter,
-    Join,
-    Limit,
-    MergeClassify,
-    MetadataCount,
-    Nearest,
-    OuterReference,
-    Projection,
-    RankFuse,
-    RowDiff,
-    Sort,
-    TableScan,
-    TextSearch,
+/// Whether a logical node kind may appear in a routed change-feed or merge
+/// plan at all. Read queries bypass this: a kind refused by name still
+/// plans and runs in a read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    Routable,
+    RefusedByName,
 }
 
-impl LogicalKind {
-    pub const ALL: [LogicalKind; 16] = [
-        LogicalKind::Aggregate,
-        LogicalKind::AntiJoin,
-        LogicalKind::Expand,
-        LogicalKind::Filter,
-        LogicalKind::Join,
-        LogicalKind::Limit,
-        LogicalKind::MergeClassify,
-        LogicalKind::MetadataCount,
-        LogicalKind::Nearest,
-        LogicalKind::OuterReference,
-        LogicalKind::Projection,
-        LogicalKind::RankFuse,
-        LogicalKind::RowDiff,
-        LogicalKind::Sort,
-        LogicalKind::TableScan,
-        LogicalKind::TextSearch,
-    ];
-
-    pub fn name(self) -> &'static str {
+impl Coverage {
+    /// The `@LogicalKind.coverage` spelling.
+    pub const fn name(self) -> &'static str {
         match self {
-            Self::Aggregate => "Aggregate",
-            Self::AntiJoin => "AntiJoin",
-            Self::Expand => "Expand",
-            Self::Filter => "Filter",
-            Self::Join => "Join",
-            Self::Limit => "Limit",
-            Self::MergeClassify => "MergeClassify",
-            Self::MetadataCount => "MetadataCount",
-            Self::Nearest => "Nearest",
-            Self::OuterReference => "OuterReference",
-            Self::Projection => "Projection",
-            Self::RankFuse => "RankFuse",
-            Self::RowDiff => "RowDiff",
-            Self::Sort => "Sort",
-            Self::TableScan => "TableScan",
-            Self::TextSearch => "TextSearch",
+            Self::Routable => "routable",
+            Self::RefusedByName => "refused_by_name",
         }
     }
+}
+
+/// Declares every logical node kind once, in census order, with its explain
+/// name and routing coverage: the enum, `ALL`, `name` and `coverage` come from
+/// the one list, so a kind cannot lack a coverage or be enumerated twice.
+macro_rules! logical_kinds {
+    ( $( $variant:ident => $name:literal, $coverage:ident; )* ) => {
+        /// Every logical node kind, declared in the order the census sorts them.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        pub enum LogicalKind {
+            $( $variant, )*
+        }
+
+        impl LogicalKind {
+            pub const ALL: &'static [LogicalKind] = &[ $( LogicalKind::$variant, )* ];
+
+            pub const fn name(self) -> &'static str {
+                match self { $( Self::$variant => $name, )* }
+            }
+
+            /// The kind's change-feed and merge routing coverage.
+            pub const fn coverage(self) -> Coverage {
+                match self { $( Self::$variant => Coverage::$coverage, )* }
+            }
+        }
+    };
+}
+
+logical_kinds! {
+    Aggregate => "Aggregate", RefusedByName;
+    AntiJoin => "AntiJoin", RefusedByName;
+    CsvSource => "CsvSource", RefusedByName;
+    Expand => "Expand", RefusedByName;
+    Filter => "Filter", Routable;
+    FragmentWrite => "FragmentWrite", RefusedByName;
+    Join => "Join", Routable;
+    Limit => "Limit", Routable;
+    MergeClassify => "MergeClassify", Routable;
+    MetadataCount => "MetadataCount", RefusedByName;
+    Nearest => "Nearest", RefusedByName;
+    OuterReference => "OuterReference", RefusedByName;
+    Projection => "Projection", Routable;
+    RankFuse => "RankFuse", RefusedByName;
+    RowDiff => "RowDiff", Routable;
+    Sort => "Sort", Routable;
+    TableScan => "TableScan", Routable;
+    TextSearch => "TextSearch", RefusedByName;
+    Validate => "Validate", RefusedByName;
 }
 
 /// The scalar-index query Lance's scanner built for a scan's pushed filter,
@@ -409,6 +414,77 @@ pub struct RuntimeFilterSpec {
 pub enum RuntimeFilterKind {
     /// The value holds at least one of the needles as a substring.
     TextContainsAny,
+}
+
+/// The CSV object a load reads and the typed delta it becomes: the target
+/// table at the version the transaction's base pins (`None` when the base
+/// predates the table), the source's size, and the row bound derived from
+/// it, an upper bound never a promised count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CsvSourceSpec {
+    pub source: String,
+    pub source_bytes: u64,
+    /// `source_bytes / (2 × mapped columns)`: every field holds at least one
+    /// byte and a delimiter follows all but the last.
+    pub estimated_rows: u64,
+    /// One ASCII byte.
+    pub delimiter: u8,
+    pub header: bool,
+    /// Property names by column position, `None` when the header names them.
+    pub columns: Option<Vec<String>>,
+    pub table: String,
+    pub version: Option<u64>,
+}
+
+impl CsvSourceSpec {
+    /// Every field holds at least one byte and a delimiter follows all but
+    /// the last, so the source cannot hold more rows than this.
+    pub fn estimate_rows(source_bytes: u64, mapped_columns: usize) -> u64 {
+        let narrowest_row = u64::try_from(mapped_columns)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2)
+            .max(1);
+        source_bytes / narrowest_row
+    }
+}
+
+/// A committed table a validation reads beside the delta, at the version
+/// the base pins; `None` when the base predates the table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsultedImage {
+    pub table: String,
+    pub version: Option<u64>,
+}
+
+/// One check of a load's validation: the committed image it consults (`None`
+/// when the delta alone decides it) and, once physical, how that image is
+/// read; `None` on a logical node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidateSpec {
+    pub check: ValidateCheck,
+    pub consults: Option<ConsultedImage>,
+    pub access: Option<crate::cost::ValidateAccess>,
+}
+
+/// The write of a load plan: the target table at the version the base pins
+/// and the mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FragmentWriteSpec {
+    pub table: String,
+    pub version: Option<u64>,
+    pub mode: LoadStmtMode,
+}
+
+impl FragmentWriteSpec {
+    /// The write adapter the mode runs on: fragments staged as one Lance
+    /// overwrite, or the executor's keyed adapters.
+    pub fn adapter(&self) -> &'static str {
+        match self.mode {
+            LoadStmtMode::Overwrite => "fragments",
+            LoadStmtMode::Append => "strict_insert",
+            LoadStmtMode::Merge => "upsert",
+        }
+    }
 }
 
 /// One `nearest(...)` or `bm25(...)` arm of an `rrf()`, as the query wrote it.
@@ -554,11 +630,33 @@ pub enum LogicalNode {
         reads: Vec<ColumnRef>,
         return_exprs: Vec<IRProjection>,
     },
+    /// A load's leaf: the CSV object parsed into the target table's typed
+    /// delta, in source order.
+    CsvSource {
+        spec: Box<CsvSourceSpec>,
+    },
+    /// Every constraint of the load judged over the whole delta in one pass,
+    /// in list order, which is the refusal precedence: the input passes
+    /// through unchanged or the statement is refused.
+    Validate {
+        input: LogicalId,
+        table: String,
+        checks: Vec<ValidateSpec>,
+    },
+    /// The validated delta written as fragments of the target; one row,
+    /// `count`. Publication is the driver's epilogue, never a node.
+    FragmentWrite {
+        input: LogicalId,
+        spec: Box<FragmentWriteSpec>,
+    },
 }
 
 impl LogicalNode {
     pub fn kind(&self) -> LogicalKind {
         match self {
+            Self::CsvSource { .. } => LogicalKind::CsvSource,
+            Self::Validate { .. } => LogicalKind::Validate,
+            Self::FragmentWrite { .. } => LogicalKind::FragmentWrite,
             Self::TableScan { .. } => LogicalKind::TableScan,
             Self::MetadataCount { .. } => LogicalKind::MetadataCount,
             Self::Filter { .. } => LogicalKind::Filter,
@@ -591,7 +689,9 @@ impl LogicalNode {
             | Self::Nearest { input, .. }
             | Self::TextSearch { input, .. }
             | Self::RankFuse { input, .. }
-            | Self::Aggregate { input, .. } => vec![*input],
+            | Self::Aggregate { input, .. }
+            | Self::Validate { input, .. }
+            | Self::FragmentWrite { input, .. } => vec![*input],
             Self::Join { left, right, .. } | Self::CrossJoin { left, right } => vec![*left, *right],
             Self::AntiJoin { input, inner, .. } => vec![*input, *inner],
             Self::MergeClassify {
@@ -600,7 +700,9 @@ impl LogicalNode {
                 target,
             } => vec![*base, *source, *target],
             Self::TableScan { input, .. } => input.iter().copied().collect(),
-            Self::MetadataCount { .. } | Self::OuterReference { .. } => Vec::new(),
+            Self::MetadataCount { .. } | Self::OuterReference { .. } | Self::CsvSource { .. } => {
+                Vec::new()
+            }
         }
     }
 
@@ -617,7 +719,9 @@ impl LogicalNode {
             | Self::Nearest { input, .. }
             | Self::TextSearch { input, .. }
             | Self::RankFuse { input, .. }
-            | Self::Aggregate { input, .. } => vec![input],
+            | Self::Aggregate { input, .. }
+            | Self::Validate { input, .. }
+            | Self::FragmentWrite { input, .. } => vec![input],
             Self::Join { left, right, .. } | Self::CrossJoin { left, right } => vec![left, right],
             Self::AntiJoin { input, inner, .. } => vec![input, inner],
             Self::MergeClassify {
@@ -626,7 +730,9 @@ impl LogicalNode {
                 target,
             } => vec![base, source, target],
             Self::TableScan { input, .. } => input.iter_mut().collect(),
-            Self::MetadataCount { .. } | Self::OuterReference { .. } => Vec::new(),
+            Self::MetadataCount { .. } | Self::OuterReference { .. } | Self::CsvSource { .. } => {
+                Vec::new()
+            }
         }
     }
 }
@@ -969,6 +1075,9 @@ impl LogicalPlan {
                 "reads": rendered(reads),
                 "typed_exprs": crate::typed::returns(return_exprs),
             }),
+            LogicalNode::CsvSource { spec } => csv_source_json(spec),
+            LogicalNode::Validate { table, checks, .. } => validate_json(table, checks),
+            LogicalNode::FragmentWrite { spec, .. } => fragment_write_json(spec),
         };
         let inputs: Vec<Value> = node
             .inputs()
@@ -991,6 +1100,7 @@ pub(crate) fn scan_json(name: &str, spec: &ScanSpec) -> Value {
             "node": name,
             "binding": binding,
             "table": spec.table.type_key,
+            "source": spec.table.source.name(),
             "version": spec.version,
             "projection": spec.projection,
             "filter": spec.filter,
@@ -1015,6 +1125,52 @@ pub(crate) fn scan_json(name: &str, spec: &ScanSpec) -> Value {
 
 pub(crate) fn filters_json(filters: &[IRExpr]) -> Vec<String> {
     filters.iter().map(ToString::to_string).collect()
+}
+
+pub(crate) fn csv_source_json(spec: &CsvSourceSpec) -> Value {
+    json!({
+        "node": "CsvSource",
+        "format": "csv",
+        "source": spec.source,
+        "source_bytes": spec.source_bytes,
+        "estimated_rows": spec.estimated_rows,
+        "delimiter": (spec.delimiter as char).to_string(),
+        "header": spec.header,
+        "columns": spec.columns,
+        "table": spec.table,
+        "version": spec.version,
+    })
+}
+
+/// The judged table, then every check in refusal order: its own fields under
+/// the `check` tag, the consulted image and, once physical, the access.
+pub(crate) fn validate_json(table: &str, checks: &[ValidateSpec]) -> Value {
+    let checks: Vec<Value> = checks
+        .iter()
+        .map(|spec| {
+            let mut value = json!(spec.check);
+            value["consults"] = json!(spec.consults);
+            if let Some(access) = spec.access {
+                value["access"] = json!(access);
+            }
+            value
+        })
+        .collect();
+    json!({
+        "node": "Validate",
+        "table": table,
+        "checks": checks,
+    })
+}
+
+pub(crate) fn fragment_write_json(spec: &FragmentWriteSpec) -> Value {
+    json!({
+        "node": "FragmentWrite",
+        "table": spec.table,
+        "version": spec.version,
+        "mode": spec.mode,
+        "adapter": spec.adapter(),
+    })
 }
 
 /// One `order` key as GQ text with its direction: `$p.name desc`.

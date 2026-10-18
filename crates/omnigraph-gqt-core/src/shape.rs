@@ -105,8 +105,10 @@ pub(crate) fn spell_shape_line(line: &ShapeLine) -> String {
     }
 }
 
+/// A node type name as the query grammar spells it: capitalised, with the
+/// `@` prefix of an engine catalogue type admitted.
 pub(crate) fn is_type_name(s: &str) -> bool {
-    let mut chars = s.chars();
+    let mut chars = s.strip_prefix('@').unwrap_or(s).chars();
     chars.next().is_some_and(|c| c.is_ascii_uppercase())
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -114,8 +116,7 @@ pub(crate) fn is_type_name(s: &str) -> bool {
 /// The field names of `type_name`'s node object, or why the catalog has none.
 fn node_object_names(catalog: &Catalog, type_name: &str) -> Result<Vec<String>, String> {
     let node_type = catalog
-        .node_types
-        .get(type_name)
+        .query_node_type(type_name)
         .ok_or_else(|| format!("`{type_name}` is not a node type of this schema"))?;
     Ok(node_type
         .node_object_members()
@@ -275,6 +276,7 @@ pub(crate) fn bless_shape_lines(
             let mut type_names: Vec<&String> = catalog
                 .node_types
                 .iter()
+                .chain(catalog.catalogue.iter())
                 .filter(|(_, node_type)| {
                     node_type
                         .node_object_members()

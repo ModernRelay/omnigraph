@@ -13,8 +13,8 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use crate::cli::{
-    BlobCommand, BranchCommand, ChangesCommand, Cli, ClusterCommand, Command, GraphsCommand,
-    QueriesCommand, SchemaCommand,
+    BlobCommand, BranchCommand, ChangesCommand, Cli, ClusterCommand, Command, CommitCommand,
+    GraphsCommand, QueriesCommand, SchemaCommand, SkillCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,12 +178,13 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // its target with a required positional URI and never reads it.
         ScopeFlag::Store => match capability {
             Any => true,
-            Direct => !matches!(cmd, Command::Init { .. }),
+            Direct => !matches!(cmd, Command::Init(_)),
             Served | Control | Local => false,
         },
         // The actor rides direct-engine writes (`any` via --store) and cluster
         // writes; Blob get/stat are reads and never consume it, while Blob
-        // put/clear are writes and do. Served writes
+        // put/clear are writes and do; commit list/show/changes and commit
+        // publish/drop split the same way. Served writes
         // resolve the actor from the bearer token
         // (rejected downstream with its own message). On `direct`, full-text
         // rebuild attributes its graph publication; other maintenance verbs
@@ -193,20 +194,30 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         ScopeFlag::As => match capability {
             // `--as` names an actor for a direct/`--store` WRITE; a served write
             // resolves the actor from its token. The read commands (`query`,
-            // `changes`, `commit`, `blob`) attribute no actor on either surface,
+            // `diff`, `changes`, `commit list/show/changes`, `blob get/stat`,
+            // `branch diff/merge-base`) attribute no actor on either surface,
             // so accepting `--as` there is a silent no-op — reject it instead.
-            Any => !matches!(
-                cmd,
-                Command::Blob {
-                    command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
-                } | Command::Changes { .. }
-                    | Command::Commit { .. }
-                    | Command::Diff { .. }
-                    | Command::Branch {
-                        command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
-                    }
-                    | Command::Query { .. }
-            ),
+            // `commit` mixes reads and writes; its match is exhaustive so a
+            // new subcommand is classified before it compiles.
+            Any => match cmd {
+                Command::Commit { command } => match command {
+                    CommitCommand::Publish { .. } | CommitCommand::Drop { .. } => true,
+                    CommitCommand::List { .. }
+                    | CommitCommand::Show { .. }
+                    | CommitCommand::Changes { .. } => false,
+                },
+                _ => !matches!(
+                    cmd,
+                    Command::Blob {
+                        command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
+                    } | Command::Changes { .. }
+                        | Command::Diff(_)
+                        | Command::Branch {
+                            command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
+                        }
+                        | Command::Query(_)
+                ),
+            },
             Control => matches!(
                 cmd,
                 Command::Cluster {
@@ -218,7 +229,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             ),
             Direct => matches!(
                 cmd,
-                Command::RebuildFullTextIndexes { .. }
+                Command::RebuildFullTextIndexes(_)
                     | Command::Schema {
                         command: SchemaCommand::Apply { .. }
                     }
@@ -236,7 +247,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // the registry path).
         ScopeFlag::Profile => match capability {
             Any | Served => true,
-            Direct => !matches!(cmd, Command::Init { .. }),
+            Direct => !matches!(cmd, Command::Init(_)),
             Control => !matches!(cmd, Command::Cluster { .. }),
             Local => false,
         },
@@ -267,15 +278,15 @@ pub(crate) fn command_capability(cmd: &Command) -> Capability {
 /// `schema show` is data; `queries`/`policy` read cluster applied state).
 pub(crate) fn command_plane(cmd: &Command) -> Plane {
     match cmd {
-        Command::Query { .. }
-        | Command::Mutate { .. }
-        | Command::Load { .. }
+        Command::Query(_)
+        | Command::Mutate(_)
+        | Command::Load(_)
         | Command::Branch { .. }
-        | Command::Snapshot { .. }
-        | Command::Export { .. }
+        | Command::Snapshot(_)
+        | Command::Export(_)
         | Command::Blob { .. }
         | Command::Commit { .. }
-        | Command::Diff { .. }
+        | Command::Diff(_)
         | Command::Changes { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
@@ -292,20 +303,21 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         // plane (RFC 0011 — omnigraph.yaml excised from the CLI).
         Command::Queries { .. } => Plane::Control,
         Command::Policy { .. } => Plane::Control,
-        Command::Init { .. }
-        | Command::Upgrade { .. }
-        | Command::Optimize { .. }
-        | Command::RebuildFullTextIndexes { .. }
-        | Command::Repair { .. }
-        | Command::Cleanup { .. }
-        | Command::Lint { .. } => Plane::Storage,
-        Command::Cluster { .. } => Plane::Control,
-        Command::Alias { .. }
+        Command::Init(_)
+        | Command::Upgrade(_)
+        | Command::Optimize(_)
+        | Command::RebuildFullTextIndexes(_)
+        | Command::Repair(_)
+        | Command::Cleanup(_)
+        | Command::Lint(_) => Plane::Storage,
+        Command::Cluster { .. } | Command::Organization { .. } => Plane::Control,
+        Command::Alias(_)
         | Command::Embed(_)
         | Command::Login { .. }
         | Command::Logout { .. }
         | Command::Use { .. }
         | Command::Profile { .. }
+        | Command::Skill { .. }
         | Command::Version { .. } => Plane::Session,
     }
 }
@@ -319,9 +331,13 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Logout { .. } => "logout",
         Command::Use { .. } => "use",
         Command::Profile { .. } => "profile",
+        Command::Skill { command } => match command {
+            SkillCommand::Export { .. } => "skill export",
+            SkillCommand::Show { .. } => "skill show",
+        },
         Command::Embed(_) => "embed",
-        Command::Init { .. } => "init",
-        Command::Load { .. } => "load",
+        Command::Init(_) => "init",
+        Command::Load(_) => "load",
         Command::Branch { .. } => "branch",
         Command::Schema { command } => match command {
             SchemaCommand::Plan { .. } => "schema plan",
@@ -329,35 +345,42 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             SchemaCommand::Show { .. } => "schema show",
             SchemaCommand::UpgradeSystemColumns { .. } => "schema upgrade-system-columns",
         },
-        Command::Lint { .. } => "lint",
+        Command::Lint(_) => "lint",
         Command::Queries { command } => match command {
             QueriesCommand::Validate { .. } => "queries validate",
             QueriesCommand::List { .. } => "queries list",
         },
-        Command::Snapshot { .. } => "snapshot",
-        Command::Export { .. } => "export",
+        Command::Snapshot(_) => "snapshot",
+        Command::Export(_) => "export",
         Command::Blob { command } => match command {
             BlobCommand::Get { .. } => "blob get",
             BlobCommand::Stat { .. } => "blob stat",
             BlobCommand::Put { .. } => "blob put",
             BlobCommand::Clear { .. } => "blob clear",
         },
-        Command::Commit { .. } => "commit",
-        Command::Diff { .. } => "diff",
+        Command::Commit { command } => match command {
+            CommitCommand::List { .. } => "commit list",
+            CommitCommand::Publish { .. } => "commit publish",
+            CommitCommand::Drop { .. } => "commit drop",
+            CommitCommand::Show { .. } => "commit show",
+            CommitCommand::Changes { .. } => "commit changes",
+        },
+        Command::Diff(_) => "diff",
         Command::Changes { command } => match command {
             ChangesCommand::Poll { .. } => "changes poll",
             ChangesCommand::Baseline { .. } => "changes baseline",
         },
-        Command::Query { .. } => "query",
-        Command::Mutate { .. } => "mutate",
-        Command::Alias { .. } => "alias",
+        Command::Query(_) => "query",
+        Command::Mutate(_) => "mutate",
+        Command::Alias(_) => "alias",
         Command::Policy { .. } => "policy",
-        Command::Upgrade { .. } => "upgrade",
-        Command::Optimize { .. } => "optimize",
-        Command::RebuildFullTextIndexes { .. } => "rebuild-full-text-indexes",
-        Command::Repair { .. } => "repair",
-        Command::Cleanup { .. } => "cleanup",
+        Command::Upgrade(_) => "upgrade",
+        Command::Optimize(_) => "optimize",
+        Command::RebuildFullTextIndexes(_) => "rebuild-full-text-indexes",
+        Command::Repair(_) => "repair",
+        Command::Cleanup(_) => "cleanup",
         Command::Cluster { .. } => "cluster",
+        Command::Organization { .. } => "organization",
         Command::Graphs { command } => match command {
             GraphsCommand::List { .. } => "graphs list",
         },
@@ -374,13 +397,13 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
 pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Optimize { .. }
-            | Command::RebuildFullTextIndexes { .. }
-            | Command::Repair { .. }
-            | Command::Cleanup { .. }
+        Command::Optimize(_)
+            | Command::RebuildFullTextIndexes(_)
+            | Command::Repair(_)
+            | Command::Cleanup(_)
             // `lint` can type-check a `.gq` against a cluster graph's schema
             // (RFC 0011): `--cluster <dir> --graph <id>`.
-            | Command::Lint { .. }
+            | Command::Lint(_)
             // The policy/queries tooling addresses a cluster's applied state
             // (RFC 0011): `--cluster <dir>` selects the cluster, `--graph <id>`
             // picks a graph's bundle/registry within it.
@@ -409,7 +432,7 @@ fn accepts_graph_selector(cmd: &Command) -> bool {
 ///
 /// RFC 0010 Slice 1, generalized for RFC 0011 cluster addressing.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
-    if let Command::Alias { .. } = &cli.command {
+    if let Command::Alias(_) = &cli.command {
         // The binding owns all addressing. The listing keeps its historical
         // flag order (error text is observable contract).
         let flags: Vec<&str> = [
@@ -455,16 +478,16 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 fn remediation(capability: Capability, cmd: &Command) -> &'static str {
     match capability {
         Capability::Direct => match cmd {
-            Command::Init { .. } => " Pass a storage URI.",
+            Command::Init(_) => " Pass a storage URI.",
             Command::Schema {
                 command: SchemaCommand::Apply { .. },
             } => {
                 " Pass a standalone storage URI, or deploy the schema with `cluster apply --server <SERVER> --config <CONFIG>`."
             }
-            Command::Optimize { .. }
-            | Command::RebuildFullTextIndexes { .. }
-            | Command::Repair { .. }
-            | Command::Cleanup { .. } => " Pass a storage URI, or --cluster <dir> --graph <id>.",
+            Command::Optimize(_)
+            | Command::RebuildFullTextIndexes(_)
+            | Command::Repair(_)
+            | Command::Cleanup(_) => " Pass a storage URI, or --cluster <dir> --graph <id>.",
             _ => " Pass a storage URI.",
         },
         Capability::Control => match cmd {
@@ -489,7 +512,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scope_flag_matrix_matches_capabilities() {
+    fn scope_flag_matrix_matches_capabilities_issue_1023() {
         // The full flag × capability contract in one place. Rows cover every
         // capability, and both cluster_ok refinements of `direct` (optimize vs
         // init) and of `control` (queries vs cluster). `graphs` is
@@ -524,6 +547,24 @@ mod tests {
             (
                 parse(&["omnigraph", "commit", "changes", "some-commit"]),
                 [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "commit", "list"]),
+                [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "commit", "show", "some-commit"]),
+                [true, false, true, true, false, true],
+            ),
+            // `commit publish` and `commit drop` write, so a direct target
+            // takes `--as` as every other direct write does.
+            (
+                parse(&["omnigraph", "commit", "publish", "some-commit"]),
+                [true, false, true, true, true, true],
+            ),
+            (
+                parse(&["omnigraph", "commit", "drop", "some-commit"]),
+                [true, false, true, true, true, true],
             ),
             (
                 parse(&["omnigraph", "changes", "poll"]),
@@ -610,6 +651,10 @@ mod tests {
                 parse(&["omnigraph", "version"]),
                 [false, false, false, false, false, false],
             ),
+            (
+                parse(&["omnigraph", "skill", "export", "skills/omnigraph"]),
+                [false, false, false, false, false, false],
+            ),
         ];
         for (cmd, expected) in &rows {
             let capability = command_capability(cmd);
@@ -648,10 +693,15 @@ mod tests {
             ];
             args.extend_from_slice(extra);
             let cli = Cli::try_parse_from(args).unwrap();
-            let error = crate::cluster_remote::dispatch(&cli)
-                .await
-                .unwrap_err()
-                .to_string();
+            let error = crate::cluster_remote::dispatch(
+                &crate::operator::InvocationConfig::at(None, None),
+                &cli,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
             assert!(error.contains(expected), "{error}");
         }
     }
@@ -698,6 +748,7 @@ mod tests {
             Capability::Control
         );
         assert_eq!(cap(&["omnigraph", "version"]), Capability::Local);
+        assert_eq!(cap(&["omnigraph", "skill", "show"]), Capability::Local);
         // `queries`/`policy` tooling reads cluster state now (control plane).
         assert_eq!(cap(&["omnigraph", "queries", "list"]), Capability::Control);
         assert_eq!(

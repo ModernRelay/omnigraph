@@ -491,6 +491,8 @@ fn validate_projection(state: &ClusterState) -> Result<(), Diagnostic> {
                         || bindings.len() > MAX_RESOURCES
                         || bindings.iter().any(|binding| {
                             binding != "cluster"
+                                && binding.strip_prefix("graph.")
+                                    != Some(omnigraph_compiler::CATALOGUE_SCOPE)
                                 && (!matches!(resource_kind(binding), ResourceKind::Graph(_))
                                     || !resources.contains_key(binding))
                         })

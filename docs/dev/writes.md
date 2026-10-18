@@ -518,12 +518,30 @@ callers must pass one when a policy checker is installed. Actor attribution
 travels with the pre-minted graph lineage and is published with the same
 manifest CAS.
 
+Bearer authentication (`401 unauthorized`), the HTTP contract check
+(`400 api_contract_mismatch`) and policy (`403 forbidden`) refuse a served
+write only before its first durable effect. The server runs
+the first two as middleware ahead of graph resolution, each write handler
+authorizes before admission, and each engine `_as` entry point calls `enforce`
+before it stages anything; a load's implicit fork checks `branch_create` before
+the fork, and nothing after it checks policy. A refusal that follows an effect
+answers a success with details instead, as the source deletion of
+`branch merge --delete-branch` does. The CLI relies on this order: it reports
+those three refusals as `not_started` with no effects. `ApiError::from_omni`
+cannot tell an early `OmniError::Policy` from a late one, so an `enforce` call
+after a durable effect would make that report wrong. The server's
+`auth_policy::signed_identities_obey_current_policy_and_attribute_writes` and
+the CLI's `system_remote::remote_policy_enforces_branch_first_cli_workflow`
+check that denied writes leave the graph unchanged.
+
 ## Maintenance of this protocol
 
 A new writer must:
 
 - declare its complete authority token and effect set;
 - use the shared gate order and publication primitive;
+- check policy before its first durable effect (see
+  [Policy and attribution](#policy-and-attribution));
 - stage every table effect as a detached commit of the pin, carrying the
   staged-against properties (and `omnigraph.deleted_ids` on a delete), and
   publish the pins in the one CAS; nothing follows the CAS;

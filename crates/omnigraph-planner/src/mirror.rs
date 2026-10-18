@@ -21,10 +21,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::aggregate::AggregateSpec;
 use crate::bound::{BoundPlan, ValueTable};
-use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
+use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy};
 use crate::error::PlanError;
 use crate::logical::{
-    ColumnRef, GqFilter, KeyJoinKind, Predicate, RuntimeFilterSpec, ScanAccess, ScanSpec,
+    ColumnRef, CsvSourceSpec, FragmentWriteSpec, GqFilter, KeyJoinKind, Predicate,
+    RuntimeFilterSpec, ScanAccess, ScanSpec, ValidateSpec,
 };
 use crate::operation::TableRef;
 use crate::physical::{
@@ -315,6 +316,7 @@ pub enum NodeMirror {
         outer_var: String,
         predicate: SubqueryPredicateMirror,
         aggregate: Option<AggregateSpec>,
+        strategy: AntiJoinStrategy,
     },
     OuterReference {
         outer_var: String,
@@ -343,6 +345,23 @@ pub enum NodeMirror {
         order_by: Vec<OrderingMirror>,
         fetch: Option<usize>,
         tiebreak: Vec<ColumnRef>,
+    },
+    CsvSource {
+        spec: CsvSourceSpec,
+        max_partitions: u32,
+        max_workers: u32,
+    },
+    Validate {
+        input: NodeId,
+        table: String,
+        checks: Vec<ValidateSpec>,
+        max_workers: u32,
+    },
+    FragmentWrite {
+        input: NodeId,
+        spec: FragmentWriteSpec,
+        max_input_bytes: u64,
+        max_workers: u32,
     },
 }
 
@@ -498,12 +517,14 @@ impl From<&PhysicalNode> for NodeMirror {
                 outer_var,
                 predicate,
                 aggregate,
+                strategy,
             } => Self::AntiJoin {
                 input: *input,
                 inner: *inner,
                 outer_var: outer_var.clone(),
                 predicate: SubqueryPredicateMirror::from(predicate),
                 aggregate: *aggregate,
+                strategy: *strategy,
             },
             PhysicalNode::OuterReference { outer_var } => Self::OuterReference {
                 outer_var: outer_var.clone(),
@@ -557,6 +578,37 @@ impl From<&PhysicalNode> for NodeMirror {
                 order_by: order_by.iter().map(OrderingMirror::from).collect(),
                 fetch: *fetch,
                 tiebreak: tiebreak.clone(),
+            },
+            PhysicalNode::CsvSource {
+                spec,
+                max_partitions,
+                max_workers,
+            } => Self::CsvSource {
+                spec: spec.as_ref().clone(),
+                max_partitions: *max_partitions,
+                max_workers: *max_workers,
+            },
+            PhysicalNode::Validate {
+                input,
+                table,
+                checks,
+                max_workers,
+            } => Self::Validate {
+                input: *input,
+                table: table.clone(),
+                checks: checks.clone(),
+                max_workers: *max_workers,
+            },
+            PhysicalNode::FragmentWrite {
+                input,
+                spec,
+                max_input_bytes,
+                max_workers,
+            } => Self::FragmentWrite {
+                input: *input,
+                spec: spec.as_ref().clone(),
+                max_input_bytes: *max_input_bytes,
+                max_workers: *max_workers,
             },
         }
     }
@@ -696,12 +748,14 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 outer_var,
                 predicate,
                 aggregate,
+                strategy,
             } => Self::AntiJoin {
                 input,
                 inner,
                 outer_var,
                 predicate: SubqueryPredicate::from(predicate),
                 aggregate,
+                strategy,
             },
             NodeMirror::OuterReference { outer_var } => Self::OuterReference { outer_var },
             NodeMirror::RankFuse {
@@ -753,6 +807,37 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 order_by: order_by.into_iter().map(IROrdering::from).collect(),
                 fetch,
                 tiebreak,
+            },
+            NodeMirror::CsvSource {
+                spec,
+                max_partitions,
+                max_workers,
+            } => Self::CsvSource {
+                spec: Box::new(spec),
+                max_partitions,
+                max_workers,
+            },
+            NodeMirror::Validate {
+                input,
+                table,
+                checks,
+                max_workers,
+            } => Self::Validate {
+                input,
+                table,
+                checks,
+                max_workers,
+            },
+            NodeMirror::FragmentWrite {
+                input,
+                spec,
+                max_input_bytes,
+                max_workers,
+            } => Self::FragmentWrite {
+                input,
+                spec: Box::new(spec),
+                max_input_bytes,
+                max_workers,
             },
         })
     }

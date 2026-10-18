@@ -2,18 +2,11 @@
 //! remote HTTP, env/token handling, scaffolding (moved verbatim from
 //! main.rs in the modularization).
 
-use std::io::IsTerminal;
-
-use omnigraph_api_types::{
-    ChangeRequest, QueryRequest, branch_statement_refusals, query_file_refusals,
-};
-use omnigraph_compiler::query::ast::{
-    BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
-};
-use omnigraph_compiler::settings::SettingId;
+use omnigraph_api_types::{ChangeRequest, QueryRequest, query_file_refusals};
+use omnigraph_compiler::query::ast::QueryFile;
 
 use super::*;
-use crate::operator;
+use crate::operator::{self, InvocationConfig, OperatorConfig};
 
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
@@ -42,9 +35,15 @@ pub(crate) fn uri_is_local(uri: &str) -> bool {
 /// unless `--quiet`. One line, e.g. `omnigraph load → file://g.omni (direct,
 /// local)`. stderr so `--json` consumers reading stdout are unaffected; the line
 /// legitimately differs embedded-vs-served (that visibility is the point).
-pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: bool) {
+pub(crate) fn write_target(
+    quiet: bool,
+    label: &str,
+    uri: &str,
+    served: bool,
+    stderr: &mut dyn Write,
+) -> Result<()> {
     if quiet {
-        return;
+        return Ok(());
     }
     let access = if served {
         "served"
@@ -53,29 +52,37 @@ pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: boo
     } else {
         "direct, remote"
     };
-    eprintln!("omnigraph {label} → {uri} ({access})");
+    writeln!(stderr, "omnigraph {label} → {uri} ({access})")?;
+    Ok(())
 }
 
 /// Gate a destructive write (`cleanup`, overwrite `load`, `branch delete`)
 /// against a non-local scope (RFC-011 Decision 9). A local target needs no
 /// confirmation; otherwise `--yes` consents, an interactive TTY is prompted, and
 /// a non-TTY / `--json` run refuses rather than silently proceeding.
-pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool) -> Result<()> {
+pub(crate) fn confirm_destructive(
+    label: &str,
+    uri: &str,
+    yes: bool,
+    json: bool,
+    input: &mut crate::input::Input<'_>,
+    stderr: &mut dyn Write,
+) -> Result<()> {
     if uri_is_local(uri) || yes {
         return Ok(());
     }
-    if json || !std::io::stdin().is_terminal() {
+    if json || !input.is_terminal {
         bail!(
             "refusing destructive `{label}` against non-local target {uri} without confirmation; \
              pass --yes to confirm (an interactive TTY would be prompted instead)"
         );
     }
-    eprint!(
+    write!(
+        stderr,
         "About to run a destructive `{label}` against {uri} (not local). Type 'yes' to continue: "
-    );
-    io::stderr().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
+    )?;
+    stderr.flush()?;
+    let answer = crate::input::read_line(input.reader)?;
     match answer.trim().to_ascii_lowercase().as_str() {
         "yes" | "y" => Ok(()),
         _ => bail!("aborted: destructive `{label}` not confirmed"),
@@ -122,10 +129,6 @@ pub(crate) fn normalize_bearer_token(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn bearer_token_from_env(var_name: &str) -> Option<String> {
-    normalize_bearer_token(std::env::var(var_name).ok())
-}
-
 /// The Cedar resource id for a graph selection: the explicit graph name when one
 /// is given, else the normalized URI (the anonymous fallback). Used by the
 /// `policy` tooling to address a graph's bundle.
@@ -142,170 +145,178 @@ pub(crate) struct ResolvedCliGraph {
     pub(crate) is_remote: bool,
 }
 
-/// Resolve the cluster for a control-plane tooling command (`policy`,
-/// `queries`) from `--cluster`. A configured name (`clusters:` in operator
-/// config) is rewritten to its root; a literal dir / `s3://`/`az://`/`file://` root is
-/// passed through. A `--profile`/`OMNIGRAPH_PROFILE` cluster binding also
-/// resolves here when `--cluster` is absent. No omnigraph.yaml.
-pub(crate) fn require_cluster_scope(
-    cluster: Option<&str>,
-    profile: Option<&str>,
-    command: &str,
-) -> Result<String> {
-    let op = operator::load_operator_config()?;
-    let resolve_name = |name: &str| {
-        op.cluster_root(name)
-            .map(str::to_string)
-            .unwrap_or_else(|| name.to_string())
-    };
-    if let Some(cluster) = cluster {
-        return Ok(resolve_name(cluster));
-    }
-    // A cluster profile (flag, else OMNIGRAPH_PROFILE) binds the cluster too.
-    let profile_name = profile.map(str::to_string).or_else(|| {
-        std::env::var(scope::PROFILE_ENV)
-            .ok()
-            .filter(|s| !s.is_empty())
-    });
-    if let Some(name) = profile_name {
-        let profile = op.profile(&name).ok_or_else(|| {
-            color_eyre::eyre::eyre!("unknown profile '{name}' (not defined under `profiles:`)")
-        })?;
-        if let crate::operator::ScopeBinding::Cluster(cluster) = profile.binding(&name)? {
-            return Ok(resolve_name(&cluster));
-        }
-    }
-    bail!(
-        "`{command}` needs a cluster — pass --cluster <dir|uri> (or a name from `clusters:` \
-         in ~/.omnigraph/config.yaml), or select a cluster profile"
-    )
-}
-
-/// Read a cluster's serving snapshot for a control-plane tooling command,
-/// flattening the readiness `Diagnostic` list into one loud error. The single
-/// snapshot entry point for `policy`/`queries` so the not-servable message stays
-/// identical across them.
-async fn read_serving_snapshot_or_report(
-    cluster: &str,
-) -> Result<omnigraph_cluster::ServingSnapshot> {
-    let diagnostic_cluster = omnigraph::storage::redacted_storage_uri(cluster);
-    let snapshot = if cluster.contains("://") {
-        omnigraph_cluster::read_serving_snapshot_from_storage(cluster).await
-    } else {
-        omnigraph_cluster::read_serving_snapshot(cluster).await
-    };
-    snapshot.map_err(|diagnostics| {
-        color_eyre::eyre::eyre!(
-            "cluster `{diagnostic_cluster}` is not servable:\n  {}",
-            diagnostics
-                .iter()
-                .map(|d| d.message.clone())
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        )
-    })
-}
-
-/// Resolve the Cedar policy bundle(s) for a `--cluster` policy-tooling command
-/// (RFC-011). Sources the applied policies from the cluster's serving snapshot;
-/// each `ServingPolicy` carries its `source` (digest-verified content) and the
-/// scopes it `applies_to` (`cluster` | `graph.<id>`). The optional `graph`
-/// selects a graph's bundle when several apply.
-pub(crate) async fn read_cluster_policies(
-    cluster: &str,
-) -> Result<Vec<omnigraph_cluster::ServingPolicy>> {
-    Ok(read_serving_snapshot_or_report(cluster).await?.policies)
-}
-
-/// Pick the single policy bundle that applies to the selection. With `--graph`,
-/// the bundle bound to `graph.<id>` (or the cluster-wide one); without it, the
-/// sole bundle if there's exactly one. Ambiguity or absence is a loud error.
-pub(crate) fn select_cluster_policy<'p>(
-    cluster: &str,
-    policies: &'p [omnigraph_cluster::ServingPolicy],
-    graph: Option<&str>,
-) -> Result<&'p omnigraph_cluster::ServingPolicy> {
-    if let Some(graph_id) = graph {
-        let graph_ref = format!("graph.{graph_id}");
-        let matching: Vec<&omnigraph_cluster::ServingPolicy> = policies
-            .iter()
-            .filter(|p| {
-                p.applies_to
-                    .iter()
-                    .any(|s| s == &graph_ref || s == "cluster")
-            })
-            .collect();
-        return match matching.as_slice() {
-            [only] => Ok(only),
-            [] => bail!(
-                "cluster `{cluster}` has no policy bundle bound to graph `{graph_id}` \
-                 (or to the cluster scope)"
-            ),
-            many => bail!(
-                "graph `{graph_id}` in cluster `{cluster}` matches {} policy bundles ([{}]); \
-                 the cluster model expects one bundle per graph scope",
-                many.len(),
-                many.iter()
-                    .map(|p| p.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
-    }
-    match policies {
-        [only] => Ok(only),
-        [] => bail!("cluster `{cluster}` has no applied policy bundles"),
-        many => bail!(
-            "cluster `{cluster}` has {} policy bundles ([{}]); pass --graph <id> to select one",
-            many.len(),
-            many.iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
-}
-
 /// THE actor chain (RFC-011) — every command that needs an identity
 /// resolves through this one function (one path per concern):
 /// `--as` > `operator.actor` in ~/.omnigraph/config.yaml > none.
-pub(crate) fn resolve_actor(cli_as: Option<&str>) -> Result<Option<String>> {
+pub(crate) fn resolve_actor(
+    input: &InvocationConfig,
+    cli_as: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<Option<String>> {
     if let Some(actor) = cli_as {
         return Ok(Some(actor.to_string()));
     }
-    Ok(operator::load_operator_config()?
-        .actor()
-        .map(str::to_string))
+    Ok(resolve_actor_with_config(input.get(stderr)?, cli_as))
 }
 
-pub(crate) fn resolve_cluster_actor(cli_as: Option<&str>) -> Result<Option<String>> {
-    resolve_actor(cli_as)
+pub(crate) fn resolve_actor_with_config(
+    operator_config: &OperatorConfig,
+    cli_as: Option<&str>,
+) -> Option<String> {
+    cli_as
+        .or_else(|| operator_config.actor())
+        .map(str::to_string)
 }
 
-pub(crate) fn resolve_cli_actor(cli_as: Option<&str>) -> Result<Option<String>> {
-    resolve_actor(cli_as)
+pub(crate) fn resolve_cluster_actor(
+    input: &InvocationConfig,
+    cli_as: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<Option<String>> {
+    resolve_actor(input, cli_as, stderr)
 }
 
-/// The bearer token for a remote request (RFC-011): the operator keyed chain
-/// for the matching server (`OMNIGRAPH_TOKEN_<NAME>` env → 0600 credentials
-/// file), then the default `OMNIGRAPH_BEARER_TOKEN` env. No omnigraph.yaml
-/// chain.
-pub(crate) fn resolve_remote_bearer_token(explicit_uri: Option<&str>) -> Result<Option<String>> {
-    // The keyed hop (RFC-007 §D4, gh-host model): when the effective remote
-    // URL belongs to an operator-defined server, that server's keyed chain
-    // applies first — OMNIGRAPH_TOKEN_<NAME> env, then the 0600 credentials
-    // file. The keyed token is structurally scoped to its own server: a URL
-    // matching no operator server never sees it.
-    if let Some(remote_url) = explicit_uri.filter(|uri| is_remote_uri(uri)) {
-        let operator_config = operator::load_operator_config()?;
-        if let Some(server) = operator_config.find_server_for_url(remote_url) {
-            if let Some(token) = operator::resolve_keyed_token(server)? {
-                return Ok(Some(token));
-            }
+pub(crate) fn resolve_cli_actor(
+    input: &InvocationConfig,
+    cli_as: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<Option<String>> {
+    resolve_actor(input, cli_as, stderr)
+}
+
+/// The credential a served request carries (RFC-007 §D4–§D5, gh-host
+/// model): the token keyed to the operator server whose `url` the request
+/// URL falls under, from `OMNIGRAPH_TOKEN_<NAME>` env, then the 0600
+/// credentials file. A token is sent only to the server it is keyed to, and
+/// no unkeyed token is read, so every other request carries none.
+pub(crate) enum RemoteCredential {
+    Keyed(String),
+    Missing(MissingCredential),
+}
+
+/// Why a served request carries no credential. A 401 to that request names
+/// it, so the refusal says how to bind one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MissingCredential {
+    /// The URL falls under this operator server, which has no keyed token.
+    Server(String),
+    /// The URL falls under no operator server. `server_root` is the address
+    /// as written, without URL userinfo; `config` is the operator config path.
+    Unbound {
+        server_root: String,
+        config: Option<std::path::PathBuf>,
+    },
+}
+
+/// `{"server": NAME, "hint": …}` for a declared server without a token,
+/// `{"unbound": ADDRESS, "hint": …}` for an address under no declared server.
+impl Serialize for MissingCredential {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("MissingCredential", 2)?;
+        match self {
+            Self::Server(name) => state.serialize_field("server", name)?,
+            Self::Unbound { server_root, .. } => state.serialize_field("unbound", server_root)?,
+        }
+        state.serialize_field("hint", &self.to_string())?;
+        state.end()
+    }
+}
+
+impl std::fmt::Display for MissingCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Server(name) => write!(
+                f,
+                "no credential is stored for server `{name}`: run `omnigraph login {name}` \
+                 or set {}",
+                operator::token_env_name(name)
+            ),
+            Self::Unbound {
+                server_root,
+                config,
+            } => write!(
+                f,
+                "no credential is bound to {server_root}: declare it under `servers:` in {}, \
+                 then run `omnigraph login <name>` or set OMNIGRAPH_TOKEN_<NAME>",
+                config.as_deref().map_or_else(
+                    || "~/.omnigraph/config.yaml".to_string(),
+                    |path| path.display().to_string()
+                )
+            ),
         }
     }
+}
 
-    Ok(bearer_token_from_env(DEFAULT_BEARER_TOKEN_ENV))
+/// Resolve the credential for `url`, a URL under `server_root`, by where the
+/// transport sends it. Routing and credential-file location come from the
+/// invocation's captured inputs; secrets are acquired only for the matched server.
+pub(crate) fn resolve_remote_credential_with_input(
+    input: &InvocationConfig,
+    operator_config: &OperatorConfig,
+    server_root: &str,
+    url: &str,
+) -> Result<RemoteCredential> {
+    let target = crate::graph_http::RequestTarget::of(server_root, url)?;
+    let Some(server) = operator_config.find_server_for_target(&target) else {
+        return Ok(RemoteCredential::Missing(MissingCredential::Unbound {
+            server_root: without_userinfo(server_root),
+            config: input.config_path(),
+        }));
+    };
+    Ok(
+        match operator::resolve_keyed_token_at(server, input.credentials_path().as_deref())? {
+            Some(token) => RemoteCredential::Keyed(token),
+            None => RemoteCredential::Missing(MissingCredential::Server(server.to_string())),
+        },
+    )
+}
+
+/// A server address for display: URL-embedded credentials never leave the
+/// request they were written for.
+fn without_userinfo(server_root: &str) -> String {
+    match reqwest::Url::parse(server_root) {
+        Ok(mut url) if !url.username().is_empty() || url.password().is_some() => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        _ => server_root.to_string(),
+    }
+}
+
+/// The HTTP client for `server_root` and the token its requests to `url`
+/// carry. A client without one keeps the reason, which a 401 reports.
+pub(crate) fn served_client_with_config(
+    input: &InvocationConfig,
+    operator_config: &OperatorConfig,
+    server_root: &str,
+    url: &str,
+) -> Result<(crate::graph_http::GraphHttpClient, Option<String>)> {
+    let http = crate::graph_http::GraphHttpClient::new(server_root)?;
+    Ok(
+        match resolve_remote_credential_with_input(input, operator_config, server_root, url)? {
+            RemoteCredential::Keyed(token) => (http, Some(token)),
+            RemoteCredential::Missing(missing) => (http.with_missing_credential(missing), None),
+        },
+    )
+}
+
+/// The reason a 401 response's request carried no credential.
+pub(crate) fn missing_credential(response: &reqwest::Response) -> Option<&MissingCredential> {
+    response.extensions().get::<MissingCredential>()
+}
+
+/// A refusal message followed by the reason its request carried no
+/// credential, when it had one.
+pub(crate) fn with_missing_credential(
+    message: String,
+    missing: Option<&MissingCredential>,
+) -> String {
+    match missing {
+        Some(missing) => format!("{message}\n{missing}"),
+        None => message,
+    }
 }
 
 /// `--server <name>` (RFC-007 PR 3): resolve an operator-defined server
@@ -314,7 +325,8 @@ pub(crate) fn resolve_remote_bearer_token(explicit_uri: Option<&str>) -> Result<
 /// resolution and the keyed-token URL match work unchanged — the flag is
 /// sugar for a URI the operator already owns. Unknown names fail loudly,
 /// listing what IS defined.
-pub(crate) fn resolve_server_flag(
+pub(crate) fn resolve_server_flag_with_config(
+    operator_config: &OperatorConfig,
     server: Option<&str>,
     graph: Option<&str>,
 ) -> Result<Option<String>> {
@@ -329,7 +341,6 @@ pub(crate) fn resolve_server_flag(
         crate::graph_http::ServerTransport::parse(server)?;
         server.to_string()
     } else {
-        let operator_config = operator::load_operator_config()?;
         let Some(entry) = operator_config.servers.get(server) else {
             let known = operator_config
                 .servers
@@ -348,69 +359,36 @@ pub(crate) fn resolve_server_flag(
     };
     let base = base_url.trim_end_matches('/');
     Ok(Some(match graph {
-        Some(graph) => format!("{base}/graphs/{graph}"),
+        Some(graph) => {
+            require_graph_segment(graph)?;
+            format!("{base}/graphs/{graph}")
+        }
         None => base.to_string(),
     }))
 }
 
-/// Execute an OPERATOR alias (RFC-007 PR 3): a pure binding invoking a
-/// stored query by name on a named server — POST {base}/queries/{name}.
-/// Param precedence: --params > positional args > the alias's fixed
-/// params. The keyed token applies via the ordinary URL match.
-pub(crate) async fn execute_operator_alias(
-    alias_name: &str,
-    alias: &crate::operator::OperatorAlias,
-    alias_args: &[String],
-    explicit_params: Option<Value>,
-) -> Result<ReadOutput> {
-    let root = resolve_server_flag(Some(&alias.server), None)?.expect("server name is present");
-    let uri =
-        resolve_server_flag(Some(&root), alias.graph.as_deref())?.expect("server name is present");
-    let client = crate::graph_http::GraphHttpClient::new(&root)?;
-    let bearer_token = resolve_remote_bearer_token(Some(&uri))?;
-
-    let mut params = serde_json::Map::new();
-    for (key, value) in &alias.params {
-        let Some(key) = key.as_str() else {
-            bail!("alias '{alias_name}': params keys must be strings");
-        };
-        params.insert(key.to_string(), serde_json::to_value(value)?);
-    }
-    if alias_args.len() > alias.args.len() {
-        bail!(
-            "alias '{alias_name}' takes {} positional arg(s) ({}), got {}",
-            alias.args.len(),
-            alias.args.join(", "),
-            alias_args.len()
+/// A graph name is one path segment of the graph's served route, in the
+/// graph-id alphabet. Any other character could move the request off that
+/// route once the URL parser reads it: a dot segment in any spelling
+/// (`%2e`, a tab or newline it strips), `/`, `\` or `%2F`.
+fn require_graph_segment(graph: &str) -> Result<()> {
+    if graph.is_empty()
+        || !graph
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        color_eyre::eyre::bail!(
+            "invalid graph `{graph}`: a graph name is one path segment of ASCII letters, \
+             digits, `-` or `_`"
         );
     }
-    for (name, value) in alias.args.iter().zip(alias_args) {
-        params.insert(name.clone(), parse_alias_value(value));
-    }
-    if let Some(Value::Object(explicit)) = explicit_params {
-        for (key, value) in explicit {
-            params.insert(key, value);
-        }
-    }
-
-    let mut body = serde_json::Map::new();
-    body.insert("expect_mutation".to_string(), Value::Bool(false));
-    if !params.is_empty() {
-        body.insert("params".to_string(), Value::Object(params));
-    }
-    remote_json(
-        &client,
-        Method::POST,
-        remote_url(&uri, &["queries", &alias.query], &[])?,
-        Some(Value::Object(body)),
-        bearer_token.as_deref(),
-    )
-    .await
+    Ok(())
 }
 
 /// Apply `--server`/`--graph` to a command's uri/target slots: exclusive
 /// with both (loud error, not silent precedence), no-op when absent.
 pub(crate) fn apply_server_flag(
+    operator_config: &OperatorConfig,
     server: Option<&str>,
     graph: Option<&str>,
     uri: Option<String>,
@@ -423,7 +401,7 @@ pub(crate) fn apply_server_flag(
             "--server is exclusive with a positional URI — pick one way to address the graph"
         );
     }
-    resolve_server_flag(server, graph)
+    resolve_server_flag_with_config(operator_config, server, graph)
 }
 
 pub(crate) fn apply_bearer_token(
@@ -456,17 +434,33 @@ impl std::error::Error for PreconditionFailedCli {}
 
 /// Preserve a typed server refusal through the command dispatch so JSON
 /// callers retain its code and detail fields instead of parsing a message.
+/// `output` is the server's body as sent; `missing_credential` is the CLI's
+/// own account of a request that carried no credential.
 #[derive(Debug)]
 pub(crate) struct RemoteErrorCli {
     pub(crate) output: ErrorOutput,
     pub(crate) status: reqwest::StatusCode,
     pub(crate) retry_after: Option<String>,
+    pub(crate) missing_credential: Option<MissingCredential>,
 }
 
 impl std::fmt::Display for RemoteErrorCli {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.output.error)
+        f.write_str(&with_missing_credential(
+            self.output.error.clone(),
+            self.missing_credential.as_ref(),
+        ))
     }
+}
+
+/// A served refusal as `--json` prints it: the server's body unchanged,
+/// beside the CLI's account of a request that carried no credential.
+#[derive(Serialize)]
+pub(crate) struct RemoteRefusalOutput<'a> {
+    #[serde(flatten)]
+    pub(crate) output: &'a ErrorOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) missing_credential: Option<&'a MissingCredential>,
 }
 
 impl std::error::Error for RemoteErrorCli {}
@@ -575,6 +569,7 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
     let status = response.status();
     let retry_after = crate::command_outcome::retry_after(response.headers())
         .map(|value| crate::command_outcome::scrub_backoff(value, bearer_token));
+    let missing = missing_credential(&response).cloned();
     let text = if let Some(limit) = response_limit {
         if status.is_redirection() {
             bail!("managed data redirects are not followed");
@@ -600,7 +595,13 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
             }
             _ => text,
         };
-        return Err(remote_refusal(status, text, retry_after, expected_commit));
+        return Err(remote_refusal(
+            status,
+            text,
+            retry_after,
+            expected_commit,
+            missing.as_ref(),
+        ));
     }
     if response_limit.is_some() {
         // Serde errors can include rejected field values, including a reflected secret.
@@ -613,12 +614,15 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
 
 /// A non-success response as the typed refusal every remote call raises: a
 /// verified 412 as [`PreconditionFailedCli`], any other `ErrorOutput` body as
-/// [`RemoteErrorCli`], a body that is not one as the status and text.
+/// [`RemoteErrorCli`], a body that is not one as the status and text. A
+/// request that carried no credential keeps the reason: beside the typed
+/// body, or after the plain text.
 fn remote_refusal(
     status: reqwest::StatusCode,
     text: String,
     retry_after: Option<String>,
     expected_commit: Option<&str>,
+    missing: Option<&MissingCredential>,
 ) -> color_eyre::eyre::Report {
     if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
         let verified_precondition = status == reqwest::StatusCode::PRECONDITION_FAILED
@@ -645,10 +649,14 @@ fn remote_refusal(
             output: error,
             status,
             retry_after,
+            missing_credential: missing.cloned(),
         }
         .into();
     }
-    color_eyre::eyre::eyre!("server returned {}: {}", status, text)
+    color_eyre::eyre::eyre!(
+        "{}",
+        with_missing_credential(format!("server returned {status}: {text}"), missing)
+    )
 }
 
 /// [`remote_json`] for a route whose success carries no body
@@ -668,14 +676,24 @@ pub(crate) async fn remote_no_content(
     }
     let retry_after = crate::command_outcome::retry_after(response.headers())
         .map(|value| crate::command_outcome::scrub_backoff(value, bearer_token));
+    let missing = missing_credential(&response).cloned();
     let text = response.text().await?;
-    Err(remote_refusal(status, text, retry_after, None))
+    Err(remote_refusal(
+        status,
+        text,
+        retry_after,
+        None,
+        missing.as_ref(),
+    ))
 }
 
 /// The graph URI a command addresses (RFC-011): the scope-resolved URI string
 /// (positional URI / `--store` / `--profile` / `defaults.store`). No
 /// omnigraph.yaml `cli.graph` fallback — an absent address is a loud error.
 pub(crate) fn resolve_uri(cli_uri: Option<String>) -> Result<String> {
+    if crate::client::is_catalogue_scope(cli_uri.as_deref()) {
+        return Err(crate::client::catalogue_scope_refusal("this command"));
+    }
     cli_uri.ok_or_else(|| {
         color_eyre::eyre::eyre!(
             "no graph addressed — pass a positional URI, --store <uri>, --server <name>, \
@@ -751,16 +769,20 @@ pub(crate) fn resolve_local_uri(cli_uri: Option<String>, operation: &str) -> Res
 /// capability (so a server scope is rejected, a cluster scope is allowed when the
 /// verb opts into cluster addressing), then mapped to a storage URI by
 /// `resolve_storage_uri`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_maintenance_uri(
+    input: &InvocationConfig,
     profile: Option<&str>,
     store: Option<&str>,
     cluster: Option<&str>,
     graph: Option<&str>,
     cli_uri: Option<String>,
     operation: &str,
+    stderr: &mut dyn Write,
 ) -> Result<String> {
     let scope = scope::resolve_scope(
-        &operator::load_operator_config()?,
+        input.get(stderr)?,
+        input.profile(),
         planes::Capability::Direct,
         scope::ScopeFlags {
             profile,
@@ -844,20 +866,6 @@ pub(crate) fn resolve_branch(
         .unwrap_or_else(|| default_branch.to_string())
 }
 
-pub(crate) fn resolve_read_target(
-    cli_branch: Option<String>,
-    cli_snapshot: Option<String>,
-    alias_branch: Option<String>,
-) -> Result<ReadTarget> {
-    if cli_branch.is_some() && cli_snapshot.is_some() {
-        bail!("read target may specify branch or snapshot, not both");
-    }
-    Ok(read_target_from_cli(
-        cli_branch.or(alias_branch),
-        cli_snapshot,
-    ))
-}
-
 pub(crate) fn resolve_query_path(
     explicit_query: Option<&PathBuf>,
     alias_query: Option<&str>,
@@ -872,64 +880,6 @@ pub(crate) fn resolve_query_path(
                 "exactly one of --query, --query-string, or --alias must be provided"
             )
         })
-}
-
-pub(crate) fn resolve_query_source(
-    explicit_query: Option<&PathBuf>,
-    inline_query: Option<&str>,
-    alias_query: Option<&str>,
-) -> Result<String> {
-    if let Some(inline) = inline_query {
-        if inline.trim().is_empty() {
-            bail!("--query-string must not be empty");
-        }
-        return Ok(inline.to_string());
-    }
-    Ok(fs::read_to_string(resolve_query_path(
-        explicit_query,
-        alias_query,
-    )?)?)
-}
-
-pub(crate) fn parse_alias_value(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
-}
-
-/// The format cascade (RFC-011): `--json` > `--format` > alias format >
-/// operator `defaults.output` > table.
-pub(crate) fn resolve_read_format(
-    cli_format: Option<ReadOutputFormat>,
-    json: bool,
-    alias_format: Option<ReadOutputFormat>,
-) -> ReadOutputFormat {
-    if json {
-        return ReadOutputFormat::Json;
-    }
-    cli_format
-        .or(alias_format)
-        .or_else(|| {
-            operator::load_operator_config()
-                .ok()
-                .and_then(|operator| operator.output())
-        })
-        .unwrap_or_default()
-}
-
-pub(crate) fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
-    if let Some(snapshot) = snapshot {
-        ReadTarget::snapshot(SnapshotId::new(snapshot))
-    } else {
-        ReadTarget::branch(branch.unwrap_or_else(|| "main".to_string()))
-    }
-}
-
-pub(crate) fn load_params_json(params: &ParamsArgs) -> Result<Option<Value>> {
-    match (&params.params, &params.params_file) {
-        (Some(inline), None) => Ok(Some(serde_json::from_str(inline)?)),
-        (None, Some(path)) => Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?)),
-        (None, None) => Ok(None),
-        (Some(_), Some(_)) => bail!("only one of --params or --params-file may be provided"),
-    }
 }
 
 /// Pick the query the caller named out of an already-parsed source. An
@@ -968,79 +918,6 @@ pub(crate) fn query_params_from_json(
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
 }
 
-/// The server's refusal for a control write sent through `query`. The door
-/// rule and its rationale live on `refuse_wrong_door` in
-/// `crates/omnigraph-server/src/handlers/dispatch.rs`; this side only restates it.
-pub(crate) fn control_write_at_read_door(write: &BranchWrite) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
-        write.statement_name(),
-    )
-}
-
-/// The server's refusal for `commit publish` or `commit drop` sent through
-/// `query`: a control write, under the statement's own name.
-pub(crate) fn commit_write_at_read_door(write: &CommitWrite) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
-        write.statement_name(),
-    )
-}
-
-/// The server's refusal for `load csv` sent through `query`: a control
-/// write, under the statement's own name.
-pub(crate) fn load_at_read_door(stmt: &omnigraph_compiler::query::ast::LoadStmt) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
-        stmt.statement_name(),
-    )
-}
-
-/// The server's refusal for a branch read (`branch list`, `branch diff`, …)
-/// sent through `mutate`.
-pub(crate) fn read_at_write_door(statement_name: &str) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::READ_AT_WRITE_DOOR,
-        statement_name,
-    )
-}
-
-/// `show` is a read: the same refusal `branch list` meets at the write door.
-pub(crate) fn show_at_write_door(id: Option<SettingId>) -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::READ_AT_WRITE_DOOR,
-        &show_statement_name(id),
-    )
-}
-
-/// The server's refusal for an `explain` statement sent through `mutate`.
-pub(crate) fn explain_at_write_door() -> String {
-    branch_statement_refusals::with_statement(
-        branch_statement_refusals::READ_AT_WRITE_DOOR,
-        EXPLAIN_STATEMENT_NAME,
-    )
-}
-
-/// The server's envelope refusals for a branch statement, checked in its
-/// order: a request target, then a query name or parameters, then a commit
-/// precondition. Runs before any round trip or engine open.
-pub(crate) fn refuse_statement_envelope(
-    has_target: bool,
-    has_name_or_params: bool,
-    has_expected_head: bool,
-) -> Result<()> {
-    if has_target {
-        bail!(branch_statement_refusals::REQUEST_TARGET);
-    }
-    if has_name_or_params {
-        bail!(branch_statement_refusals::NAME_OR_PARAMS);
-    }
-    if has_expected_head {
-        bail!(branch_statement_refusals::COMMIT_PRECONDITION);
-    }
-    Ok(())
-}
-
 /// The `POST /query` body for `branch list` or `show`: the source alone; the
 /// caller fills `settings` from its `--set` values.
 pub(crate) fn branch_statement_query_request(query_source: &str) -> QueryRequest {
@@ -1066,310 +943,10 @@ pub(crate) fn branch_statement_change_request(query_source: &str) -> ChangeReque
     }
 }
 
-pub(crate) async fn execute_query_lint(
-    cli_uri: Option<String>,
-    schema_path: Option<&PathBuf>,
-    query_path: &PathBuf,
-) -> Result<QueryLintOutput> {
-    let resolved_query_path = resolve_query_path(Some(query_path), None)?;
-    let query_source = fs::read_to_string(&resolved_query_path)?;
-    let query_path = resolved_query_path.to_string_lossy().into_owned();
-
-    if let Some(schema_path) = schema_path {
-        let schema_source = fs::read_to_string(schema_path)?;
-        let schema =
-            parse_schema(&schema_source).map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
-        let catalog =
-            build_catalog(&schema).map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
-        return Ok(lint_query_file(
-            &catalog,
-            &query_source,
-            query_path,
-            QueryLintSchemaSource::file(schema_path.to_string_lossy().into_owned()),
-        ));
-    }
-
-    if cli_uri.is_none() {
-        bail!(
-            "lint requires --schema <schema.pg> (offline) or a graph target \
-             (--store <uri> / --cluster <dir> --graph <id>)"
-        );
-    }
-
-    let uri = resolve_local_uri(cli_uri, "lint")?;
-    let db = crate::admission::open_read_only(&uri, None).await?;
-    Ok(lint_query_file(
-        &db.catalog(),
-        &query_source,
-        query_path,
-        QueryLintSchemaSource::graph(uri),
-    ))
-}
-
-/// Build a `QueryRegistry` from a cluster serving snapshot's stored queries,
-/// optionally scoped to one graph. The `ServingQuery.source` is the
-/// digest-verified `.gq` content, so no file I/O or omnigraph.yaml is involved.
-fn registry_from_serving_queries(
-    queries: &[omnigraph_cluster::ServingQuery],
-    graph: Option<&str>,
-) -> std::result::Result<QueryRegistry, Vec<omnigraph_server::queries::LoadError>> {
-    let specs: Vec<omnigraph_server::queries::RegistrySpec> = queries
-        .iter()
-        .filter(|q| graph.is_none_or(|g| q.graph_id == g))
-        .map(|q| omnigraph_server::queries::RegistrySpec {
-            name: q.name.clone(),
-            source: q.source.clone(),
-            expose: false,
-            tool_name: None,
-        })
-        .collect();
-    QueryRegistry::from_specs(specs)
-}
-
-fn registry_load_issues(errors: Vec<omnigraph_server::queries::LoadError>) -> Vec<QueriesIssue> {
-    errors
-        .into_iter()
-        .map(|error| QueriesIssue {
-            query: error.query.unwrap_or_else(|| "<registry>".to_string()),
-            message: error.message,
-            diagnostic: error
-                .diagnostic
-                .as_deref()
-                .map(omnigraph_api_types::DiagnosticOutput::from),
-        })
-        .collect()
-}
-
-/// `queries validate --cluster <dir>` (RFC-011): type-check every stored query
-/// in the cluster catalog against its graph's applied schema. Both the registry
-/// and the schemas come from the cluster serving snapshot — no omnigraph.yaml.
-/// With `--graph`, scope to a single graph.
-pub(crate) async fn execute_queries_validate(
-    cluster: &str,
-    graph: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    let snapshot = read_serving_snapshot_or_report(cluster).await?;
-
-    // Type-check per graph: each graph's stored queries against its own schema
-    // (read from the graph's applied storage root). A `--graph` filter scopes to
-    // exactly one graph; an unknown id is a loud error.
-    let mut breakages = Vec::new();
-    let mut warnings = Vec::new();
-    let mut total = 0usize;
-    let mut matched_any = false;
-    for serving_graph in &snapshot.graphs {
-        if graph.is_some_and(|g| g != serving_graph.graph_id) {
-            continue;
-        }
-        matched_any = true;
-        let registry =
-            match registry_from_serving_queries(&snapshot.queries, Some(&serving_graph.graph_id)) {
-                Ok(registry) => registry,
-                Err(errors) => {
-                    breakages.extend(registry_load_issues(errors));
-                    continue;
-                }
-            };
-        let db = crate::admission::open_read_only(
-            &serving_graph.root.to_string_lossy(),
-            snapshot.state_cas.as_deref(),
-        )
-        .await?;
-        let report = check(&registry, &db.catalog());
-        total += registry.len();
-        for b in &report.breakages {
-            breakages.push(QueriesIssue {
-                query: b.query.clone(),
-                message: b.message.clone(),
-                diagnostic: b
-                    .diagnostic
-                    .as_ref()
-                    .map(omnigraph_api_types::DiagnosticOutput::from),
-            });
-        }
-        for w in &report.warnings {
-            warnings.push(QueriesIssue {
-                query: w.query.clone(),
-                message: w.message.clone(),
-                diagnostic: None,
-            });
-        }
-    }
-    if let Some(graph_id) = graph {
-        if !matched_any {
-            bail!("graph `{graph_id}` is not applied in cluster `{cluster}`");
-        }
-    }
-
-    let has_breakages = !breakages.is_empty();
-    let output = QueriesValidateOutput {
-        ok: !has_breakages,
-        breakages,
-        warnings,
-    };
-
-    if json {
-        print_json(&output)?;
-    } else {
-        if output.breakages.is_empty() {
-            println!(
-                "OK  {} stored quer{} type-check against the schema",
-                total,
-                if total == 1 { "y" } else { "ies" }
-            );
-        }
-        for issue in &output.breakages {
-            println!("ERROR  query '{}': {}", issue.query, issue.message);
-            if let Some(diagnostic) = &issue.diagnostic {
-                for line in crate::output::diagnostic_detail_lines(diagnostic) {
-                    println!("{line}");
-                }
-            }
-        }
-        for issue in &output.warnings {
-            println!("WARN   query '{}': {}", issue.query, issue.message);
-        }
-    }
-
-    if has_breakages {
-        io::stdout().flush()?;
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-/// Print a stored-query annotation under its `queries list` entry. A
-/// `@description`/`@instruction` value may be multiline (GQ string literals
-/// admit newlines); continuation lines are indented to align under the first
-/// so the catalog stays readable instead of breaking the left margin.
-fn print_query_annotation(label: &str, value: &str) {
-    let prefix = format!("    {label}: ");
-    let continuation = " ".repeat(prefix.len());
-    let mut lines = value.split('\n');
-    match lines.next() {
-        Some(first) => {
-            println!("{prefix}{first}");
-            for line in lines {
-                println!("{continuation}{line}");
-            }
-        }
-        None => println!("{prefix}"),
-    }
-}
-
-/// `queries list --cluster <dir>` (RFC-011): list the catalog's stored queries.
-/// With `--graph`, scope to one graph.
-pub(crate) async fn execute_queries_list(
-    cluster: &str,
-    graph: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    let snapshot = read_serving_snapshot_or_report(cluster).await?;
-    let registry = registry_from_serving_queries(&snapshot.queries, graph).map_err(|errors| {
-        color_eyre::eyre::eyre!(
-            "stored-query registry failed to load:\n  {}",
-            errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        )
-    })?;
-
-    let output = QueriesListOutput {
-        queries: registry
-            .iter()
-            .map(|q| QueriesListItem {
-                name: q.name.clone(),
-                mcp_expose: q.expose,
-                tool_name: q.tool_name.clone(),
-                mutation: q.is_mutation(),
-                description: q.decl.description.clone(),
-                instruction: q.decl.instruction.clone(),
-                params: q
-                    .decl
-                    .params
-                    .iter()
-                    .map(|p| QueriesParam {
-                        name: p.name.clone(),
-                        type_name: p.type_name.clone(),
-                        nullable: p.nullable,
-                    })
-                    .collect(),
-            })
-            .collect(),
-    };
-
-    if json {
-        print_json(&output)?;
-    } else if output.queries.is_empty() {
-        println!("(no stored queries registered)");
-    } else {
-        for q in &output.queries {
-            let kind = if q.mutation { "mutation" } else { "read" };
-            let params = q
-                .params
-                .iter()
-                .map(|p| {
-                    format!(
-                        "${}: {}{}",
-                        p.name,
-                        p.type_name,
-                        if p.nullable { "?" } else { "" }
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mcp = if q.mcp_expose {
-                format!(" [mcp: {}]", q.tool_name.as_deref().unwrap_or(&q.name))
-            } else {
-                String::new()
-            };
-            println!("{kind}  {}({params}){mcp}", q.name);
-            if let Some(description) = &q.description {
-                print_query_annotation("description", description);
-            }
-            if let Some(instruction) = &q.instruction {
-                print_query_annotation("instruction", instruction);
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stored_query_parse_failures_keep_diagnostics_in_validation_output() {
-        let queries = vec![omnigraph_cluster::ServingQuery {
-            graph_id: "g".to_string(),
-            name: "broken".to_string(),
-            source: "query broken { match { $p: Person } return { $p.name } }".to_string(),
-        }];
-        let failures = registry_from_serving_queries(&queries, Some("g")).unwrap_err();
-        let output = QueriesValidateOutput {
-            ok: false,
-            breakages: registry_load_issues(failures),
-            warnings: Vec::new(),
-        };
-        let json = serde_json::to_value(output).unwrap();
-        let error = &json["breakages"][0];
-        assert_eq!(error["query"], "broken");
-        assert_eq!(error["diagnostic"]["code"], "Q002");
-        assert_eq!(error["diagnostic"]["position"]["byte"], 12);
-        assert_eq!(
-            error["diagnostic"]["suggestion"]["edits"][0]["replacement"],
-            "()"
-        );
-        assert!(
-            registry_from_serving_queries(&queries, Some("other"))
-                .unwrap()
-                .is_empty()
-        );
-    }
+    use omnigraph_compiler::query::parser::parse_query;
 
     #[test]
     fn graph_resource_id_for_selection_uses_name_or_anonymous_uri() {
@@ -1407,37 +984,141 @@ mod tests {
         assert!(!uri_is_local("gs://bucket/graph.omni"));
     }
 
-    #[tokio::test]
-    async fn cluster_storage_errors_redact_uri_credentials() {
-        let secret = "TOPSECRET-CLI-SAS";
-        let cluster = format!("az://omnigraph/clusters/company-brain?sv=2026-01-01&sig={secret}");
-        let error = read_serving_snapshot_or_report(&cluster)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(!error.contains(secret));
-        assert!(error.contains("az://omnigraph/clusters/company-brain"));
-        assert!(error.contains("query redacted"));
-    }
-
-    // RFC-011 Decision 9: a non-local destructive write with `--json` (the CI
-    // shape — also covers the no-TTY case, since tests run without a terminal)
-    // refuses rather than proceeding; a local one and an explicit `--yes` pass.
     #[test]
     fn confirm_destructive_refuses_non_local_without_consent() {
-        let err = confirm_destructive("cleanup", "s3://b/g.omni", false, true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--yes"), "{err}");
+        for (terminal, json) in [(false, false), (false, true), (true, true)] {
+            let mut reader = std::io::Cursor::new(b"yes\n");
+            let mut stderr = Vec::new();
+            let error = confirm_destructive(
+                "cleanup",
+                "s3://b/g.omni",
+                false,
+                json,
+                &mut crate::input::Input {
+                    reader: &mut reader,
+                    is_terminal: terminal,
+                },
+                &mut stderr,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("--yes"), "{error}");
+            assert_eq!(reader.position(), 0);
+            assert!(stderr.is_empty());
+        }
     }
 
     #[test]
     fn confirm_destructive_allows_local_and_explicit_yes() {
-        // Local needs no confirmation, even with --json.
-        assert!(confirm_destructive("cleanup", "file:///tmp/g.omni", false, true).is_ok());
-        assert!(confirm_destructive("branch delete", "graph.omni", false, true).is_ok());
-        // --yes consents to a non-local target.
-        assert!(confirm_destructive("cleanup", "s3://b/g.omni", true, true).is_ok());
+        for (uri, yes) in [
+            ("file:///tmp/g.omni", false),
+            ("graph.omni", false),
+            ("s3://b/g.omni", true),
+        ] {
+            let mut reader = std::io::Cursor::new(b"no\n");
+            let mut stderr = Vec::new();
+            confirm_destructive(
+                "cleanup",
+                uri,
+                yes,
+                true,
+                &mut crate::input::Input {
+                    reader: &mut reader,
+                    is_terminal: false,
+                },
+                &mut stderr,
+            )
+            .unwrap();
+            assert_eq!(reader.position(), 0);
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn confirmation_uses_supplied_io_and_consumes_only_the_answer() {
+        use std::io::{self, Read, Write};
+        for (answer, accepted) in [(" YES ", true), ("y", true), ("no", false), ("", false)] {
+            let bytes = format!("{answer}\nnext payload");
+            let mut reader = io::Cursor::new(bytes);
+            let mut stderr = Vec::new();
+            let result = confirm_destructive(
+                "cleanup",
+                "s3://b/g.omni",
+                false,
+                false,
+                &mut crate::input::Input {
+                    reader: &mut reader,
+                    is_terminal: true,
+                },
+                &mut stderr,
+            );
+            assert_eq!(result.is_ok(), accepted);
+            assert_eq!(reader.position(), (answer.len() + 1) as u64);
+            assert_eq!(
+                String::from_utf8(stderr).unwrap(),
+                "About to run a destructive `cleanup` against s3://b/g.omni (not local). Type 'yes' to continue: "
+            );
+        }
+        struct FailedPrompt {
+            flush: bool,
+        }
+        impl Write for FailedPrompt {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        for flush in [false, true] {
+            let mut reader = io::Cursor::new(b"yes\n");
+            let error = confirm_destructive(
+                "cleanup",
+                "s3://b/g.omni",
+                false,
+                false,
+                &mut crate::input::Input {
+                    reader: &mut reader,
+                    is_terminal: true,
+                },
+                &mut FailedPrompt { flush },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(
+                reader.position(),
+                0,
+                "a failed prompt must not consume consent"
+            );
+        }
+        struct FailedInput;
+        impl Read for FailedInput {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::UnexpectedEof.into())
+            }
+        }
+        let error = confirm_destructive(
+            "cleanup",
+            "s3://b/g.omni",
+            false,
+            false,
+            &mut crate::input::Input {
+                reader: &mut FailedInput,
+                is_terminal: true,
+            },
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     // RFC-011 Decision 2: `--server` accepts a literal URL (value with `://`),
@@ -1446,13 +1127,55 @@ mod tests {
     #[test]
     fn server_flag_accepts_a_literal_url() {
         assert_eq!(
-            resolve_server_flag(Some("https://graph.example.com"), None).unwrap(),
+            resolve_server_flag_with_config(
+                &OperatorConfig::default(),
+                Some("https://graph.example.com"),
+                None
+            )
+            .unwrap(),
             Some("https://graph.example.com".to_string())
         );
         // trailing slash trimmed; `--graph` appends the multi-graph path.
         assert_eq!(
-            resolve_server_flag(Some("https://graph.example.com/"), Some("knowledge")).unwrap(),
+            resolve_server_flag_with_config(
+                &OperatorConfig::default(),
+                Some("https://graph.example.com/"),
+                Some("knowledge")
+            )
+            .unwrap(),
             Some("https://graph.example.com/graphs/knowledge".to_string())
+        );
+
+        let config: OperatorConfig = yaml_serde::from_str(
+            "servers:\n  captured:\n    url: https://captured.example.com/proxy/\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_server_flag_with_config(&config, Some("captured"), Some("knowledge")).unwrap(),
+            Some("https://captured.example.com/proxy/graphs/knowledge".to_string())
+        );
+        assert_eq!(
+            apply_server_flag(&config, Some("captured"), Some("knowledge"), None).unwrap(),
+            Some("https://captured.example.com/proxy/graphs/knowledge".to_string())
+        );
+        let error = resolve_server_flag_with_config(&config, Some("missing"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown server 'missing'"), "{error}");
+        assert!(error.contains("[captured]"), "{error}");
+    }
+
+    #[test]
+    fn actor_resolution_uses_supplied_config_and_explicit_override() {
+        let config: OperatorConfig =
+            yaml_serde::from_str("operator:\n  actor: configured-actor\n").unwrap();
+        assert_eq!(
+            resolve_actor_with_config(&config, None).as_deref(),
+            Some("configured-actor")
+        );
+        assert_eq!(
+            resolve_actor_with_config(&config, Some("explicit-actor")).as_deref(),
+            Some("explicit-actor")
         );
     }
 
@@ -1463,9 +1186,13 @@ mod tests {
     #[test]
     fn server_flag_resolves_unix_sockets_and_refuses_other_schemes_issue_979() {
         let refusal = |root: &str| {
-            let error = resolve_server_flag(Some(root), Some("knowledge"))
-                .unwrap_err()
-                .to_string();
+            let error = resolve_server_flag_with_config(
+                &OperatorConfig::default(),
+                Some(root),
+                Some("knowledge"),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(
                 error.starts_with("invalid server address: "),
                 "{root}: {error}"
@@ -1495,7 +1222,12 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(
-                resolve_server_flag(Some("unix:///tmp/og.sock/"), Some("knowledge")).unwrap(),
+                resolve_server_flag_with_config(
+                    &OperatorConfig::default(),
+                    Some("unix:///tmp/og.sock/"),
+                    Some("knowledge")
+                )
+                .unwrap(),
                 Some("unix:///tmp/og.sock/graphs/knowledge".to_string())
             );
             for root in [
@@ -1504,7 +1236,11 @@ mod tests {
                 "unix:///tmp/gate way/og.sock",
                 "unix:///tmp/gate%20way/og.sock",
             ] {
-                assert!(resolve_server_flag(Some(root), None).is_ok(), "{root}");
+                assert!(
+                    resolve_server_flag_with_config(&OperatorConfig::default(), Some(root), None)
+                        .is_ok(),
+                    "{root}"
+                );
             }
             for (root, expected) in [
                 ("unix://host/tmp/og.sock", "unix:///ABSOLUTE/PATH.sock"),

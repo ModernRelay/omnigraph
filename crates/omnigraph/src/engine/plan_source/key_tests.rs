@@ -51,6 +51,7 @@ async fn run_with_access(
     snapshot.set_read_caches(omnigraph_catalog::SnapshotReadCaches {
         session: Arc::new(lance::session::Session::default()),
         handles: Arc::new(TableHandleCache::default()),
+        table_wrapper: None,
     });
     let probes = QueryIoProbes {
         table_wrapper: Some(Arc::new(IOTracker::default())),
@@ -66,7 +67,7 @@ async fn run_with_access(
             checked,
         };
         let settings = SessionSettings::default();
-        let source = QuerySource::gather(&query, catalog, &snapshot, params, &settings)
+        let source = QuerySource::gather(&query, catalog, Some(&snapshot), params, &settings)
             .await
             .unwrap();
         assert!(
@@ -107,9 +108,10 @@ async fn run_with_access(
         );
         let planning = drain(&stores);
         let context = EngineContext {
-            snapshot: &snapshot,
+            snapshot: Some(&snapshot),
             catalog,
             graph_index: Arc::new(GraphIndexHandle::none()),
+            load: None,
         };
         // The edited access is a cost choice acceptance admits: the plan
         // reaches execution through the replay door, like any saved plan.

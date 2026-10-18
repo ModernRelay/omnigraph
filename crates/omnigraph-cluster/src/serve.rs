@@ -754,7 +754,8 @@ async fn read_snapshot_impl(
                     .into_iter()
                     .filter(|binding| {
                         binding.strip_prefix("graph.").is_none_or(|graph| {
-                            selected(graph) && !quarantined_graphs.contains(graph)
+                            graph == omnigraph_compiler::CATALOGUE_SCOPE
+                                || (selected(graph) && !quarantined_graphs.contains(graph))
                         })
                     })
                     .collect();

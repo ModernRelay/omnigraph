@@ -118,6 +118,7 @@ pub(crate) async fn admit(
     let route = matched
         .as_str()
         .strip_prefix("/graphs/{graph_id}")
+        .or_else(|| matched.as_str().strip_prefix(crate::CATALOGUE_ROUTE_PREFIX))
         .unwrap_or(matched.as_str());
     let class = classify(&mut parts, route).await?;
     let graph = parts.extensions.get::<GraphRequest>().cloned();

@@ -1953,6 +1953,7 @@ mod result_contract {
                     op: CompOp::Gt,
                     right,
                 },
+                strategy: omnigraph_planner::AntiJoinStrategy::Correlated,
             });
             bound.plan.set_root(id);
             assert_eq!(check_bound_plan_round_trip(&bound), Ok(()));
@@ -3336,4 +3337,34 @@ async fn traversal_pin_preserves_the_hosts_query_io_probes() {
     })
     .await;
     assert_eq!(inherited.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_load_plan_section_follows_a_load_steps_expect_ok_only() {
+    const CSV: &str = "--- csv people.csv\nname\ncarol\n";
+    const LOAD: &str =
+        "--- mutate\nload csv \"people.csv\" into node:Person mode overwrite header\n";
+    const PLAN: &str = "--- expect plan\nload route: plan\nload write: overwrite fragments\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{CSV}{LOAD}{EXPECT_OK}{PLAN}");
+    let case = parse_case("load_plan", &text).unwrap();
+    let [
+        Item::Step(Step::Control(ControlStep {
+            write: ControlWrite::Load {
+                plan: Some(plan), ..
+            },
+            ..
+        })),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected one load step carrying a plan expect");
+    };
+    assert_eq!(plan.lines.len(), 2);
+    let after_error = text.replace("--- expect ok\n", "--- expect error: anything\n");
+    assert!(parse_case("load_plan", &after_error).is_err());
+    let after_a_query = format!("{HDR}{SCHEMA}{SEED}{CSV}{LOAD}{EXPECT_OK}{QUERY}{EXPECT}{PLAN}");
+    assert!(parse_case("load_plan", &after_a_query).is_err());
+    let malformed = text.replace("load route: plan", "load route: express");
+    assert!(parse_case("load_plan", &malformed).is_err());
+    let on_a_mutation = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{PLAN}");
+    assert!(parse_case("load_plan", &on_a_mutation).is_err());
 }

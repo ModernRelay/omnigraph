@@ -261,7 +261,7 @@ pub struct Snapshot {
     /// version (see `ManifestState::schema_contract`).
     schema_contract: Option<SchemaContractHead>,
     contract_source: ContractSource,
-    manifest_dataset: Option<Dataset>,
+    manifest_dataset: Option<Arc<Dataset>>,
     captured_contract: Option<Arc<SchemaContractRow>>,
     /// Logical graph branch used to capture this snapshot, including historical reads.
     graph_branch: Option<String>,
@@ -284,6 +284,9 @@ pub struct Snapshot {
 pub struct SnapshotReadCaches {
     pub session: Arc<lance::session::Session>,
     pub handles: Arc<TableHandleCache>,
+    /// A statement-scoped store wrapper (the load read memo); `None` on the
+    /// graph-lifetime caches live Branch reads attach.
+    pub table_wrapper: Option<Arc<omnigraph_core::read_memo::RangeMemoWrapper>>,
 }
 
 impl std::fmt::Debug for SnapshotReadCaches {
@@ -564,6 +567,51 @@ impl SnapshotDataset {
 }
 
 impl Snapshot {
+    /// Conservative allocation of `clone`, excluding immutable state shared by Arc.
+    /// Includes collection growth and owned strings without allocating to measure them.
+    pub fn clone_allocation_bytes(&self) -> usize {
+        fn text(value: &str) -> usize {
+            value.len().saturating_mul(2).saturating_add(32)
+        }
+        fn slots<T>(capacity: usize) -> usize {
+            capacity
+                .saturating_mul(std::mem::size_of::<T>().saturating_add(1))
+                .saturating_mul(4)
+        }
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(text(&self.root_uri))
+            .saturating_add(slots::<(String, DatasetEntry)>(self.entries.capacity()))
+            .saturating_add(slots::<(String, String)>(self.graph_heads.capacity()))
+            .saturating_add(slots::<String>(self.uncovered_tables.capacity()));
+        for (key, entry) in &self.entries {
+            bytes = bytes
+                .saturating_add(text(key))
+                .saturating_add(text(&entry.type_key))
+                .saturating_add(text(&entry.dataset_path))
+                .saturating_add(entry.native_dataset_branch.as_deref().map_or(0, text))
+                .saturating_add(entry.version_metadata.clone_allocation_bytes());
+        }
+        for (branch, head) in &self.graph_heads {
+            bytes = bytes
+                .saturating_add(text(branch))
+                .saturating_add(text(head));
+        }
+        for table in &self.uncovered_tables {
+            bytes = bytes.saturating_add(text(table));
+        }
+        if let Some(contract) = &self.schema_contract {
+            bytes = bytes
+                .saturating_add(text(&contract.schema_ir_hash))
+                .saturating_add(text(&contract.schema_identity_domain));
+        }
+        if let ContractSource::Archive(Some(hash)) = &self.contract_source {
+            bytes = bytes.saturating_add(text(hash));
+        }
+        bytes
+            .saturating_add(self.graph_branch.as_deref().map_or(0, text))
+            .saturating_add(self.native_branch.as_deref().map_or(0, text))
+    }
+
     pub fn graph_branch(&self) -> Option<&str> {
         self.graph_branch.as_deref()
     }
@@ -732,6 +780,7 @@ impl Snapshot {
                         entry.version_metadata.last_linear_version(),
                         &location,
                         Some(&caches.session),
+                        caches.table_wrapper.clone(),
                     )
                     .await
             }
@@ -1492,7 +1541,7 @@ impl ManifestCoordinator {
         purpose: &str,
     ) -> Result<Dataset> {
         if let Some(dataset) = &snapshot.manifest_dataset {
-            return Ok(dataset.clone());
+            return Ok(dataset.as_ref().clone());
         }
         if snapshot.graph_branch().is_some() && snapshot.native_branch().is_none() {
             return Err(OmniError::manifest(format!(
@@ -1781,7 +1830,7 @@ impl ManifestCoordinator {
             }
         };
         snapshot.native_branch = native;
-        snapshot.manifest_dataset = Some(dataset);
+        snapshot.manifest_dataset = Some(Arc::new(dataset));
         snapshot.graph_branch = branch
             .filter(|branch| *branch != "main")
             .map(str::to_string);
@@ -1823,7 +1872,7 @@ impl ManifestCoordinator {
         let mut snapshot = Self::snapshot_from_state(&self.root_uri, self.known_state.clone());
         snapshot.native_branch = self.native_branch.clone();
         snapshot.graph_branch = self.active_branch.clone();
-        snapshot.manifest_dataset = Some(self.dataset.clone());
+        snapshot.manifest_dataset = Some(Arc::new(self.dataset.clone()));
         snapshot.captured_contract = self.captured_contract.clone();
         snapshot
     }

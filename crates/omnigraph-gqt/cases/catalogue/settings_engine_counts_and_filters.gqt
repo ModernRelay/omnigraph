@@ -1,0 +1,128 @@
+# issue: none
+# notes: `@Setting` rows come from the settings definition table; `@Engine` is the one row
+# notes: of binary format constants; a count over a catalogue type stays an ordinary
+# notes: aggregate (no metadata count), a limited non-key projection is not hydrated, a
+# notes: scalar filter stays in the in-memory filter, and the key-derived identities are
+# notes: distinct.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"ann"}}
+
+--- query
+set engine = v2;
+query settings_with_defaults() {
+    match { $s: @Setting }
+    return { $s.name, $s.kind, $s.default, $s.scope }
+}
+
+--- expect unordered
+{"s.name":"engine","s.kind":"enum(v2)","s.default":"v2","s.scope":"request"}
+{"s.name":"rrf_plan","s.kind":"enum(auto, force_prefilter, force_postfilter)","s.default":"auto","s.scope":"process"}
+{"s.name":"merge_lineage","s.kind":"enum(off, on, verify)","s.default":"on","s.scope":"request"}
+{"s.name":"ann_nprobes","s.kind":"integer(0..)","s.default":"20","s.scope":"request"}
+{"s.name":"stage_write_concurrency","s.kind":"integer(1..=64)","s.default":"8","s.scope":"process"}
+{"s.name":"traversal_work_limit","s.kind":"integer(1..=9223372036854775807)","s.default":"1000000","s.scope":"request"}
+{"s.name":"write_max_bytes","s.kind":"integer(1..)","s.default":"33554432","s.scope":"request"}
+{"s.name":"load_source_max_bytes","s.kind":"integer(1..)","s.default":"33554432","s.scope":"request"}
+{"s.name":"query_memory_bytes","s.kind":"integer(1..)","s.default":"157286400","s.scope":"request"}
+{"s.name":"history_release_bytes","s.kind":"integer(1024..=262144)","s.default":"262144","s.scope":"request"}
+{"s.name":"explain_dump_dir","s.kind":"text","s.default":"","s.scope":"process"}
+
+--- expect shape
+s.name: String
+s.kind: String
+s.default: String
+s.scope: String
+
+--- query
+set engine = v2;
+query engine_formats() {
+    match { $e: @Engine }
+    return { $e.current_internal_schema_version, $e.min_supported_internal_schema_version }
+}
+
+--- expect unordered
+{"e.current_internal_schema_version":16,"e.min_supported_internal_schema_version":14}
+
+--- expect shape
+e.current_internal_schema_version: I64
+e.min_supported_internal_schema_version: I64
+
+--- query
+set engine = v2;
+query operator_count() {
+    match { $o: @Operator }
+    return { count($o) as n }
+}
+
+--- expect unordered
+{"n":22}
+
+--- expect shape
+n: I64
+
+--- expect plan
+not pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query first_operator_inputs() {
+    match { $o: @Operator }
+    return { $o.inputs }
+    order { $o.name }
+    limit 1
+}
+
+--- expect ordered
+{"o.inputs":[1]}
+
+--- expect shape
+o.inputs: [I64]
+
+--- expect plan
+not pass late_materialization
+
+--- query
+set engine = v2;
+query process_settings() {
+    match { $s: @Setting $s.scope = "process" }
+    return { $s.name }
+    order { $s.name }
+}
+
+--- expect ordered
+{"s.name":"explain_dump_dir"}
+{"s.name":"rrf_plan"}
+{"s.name":"stage_write_concurrency"}
+
+--- expect shape
+s.name: String
+
+--- expect plan
+not pass predicate_pushdown
+filter reads [s.scope]
+
+--- query
+set engine = v2;
+query distinct_identities() {
+    match { $o: @Operator }
+    return { count(distinct $o.@id) as ids, count($o) as rows }
+}
+
+--- expect unordered
+{"ids":22,"rows":22}
+
+--- expect shape
+ids: I64
+rows: I64

@@ -5601,6 +5601,7 @@ dependencies = [
  "omnigraph-engine",
  "omnigraph-policy",
  "omnigraph-server",
+ "omnigraph-skill",
  "percent-encoding",
  "predicates",
  "reqwest 0.12.28",
@@ -5739,6 +5740,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "csv-core",
  "datafusion",
  "futures",
  "lance",
@@ -5848,6 +5850,7 @@ dependencies = [
  "omnigraph-compiler",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
@@ -5924,6 +5927,7 @@ dependencies = [
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-policy",
+ "omnigraph-skill",
  "p256",
  "regex",
  "reqwest 0.12.28",
@@ -5945,6 +5949,10 @@ dependencies = [
  "utoipa",
  "yaml_serde",
 ]
+
+[[package]]
+name = "omnigraph-skill"
+version = "0.14.0"
 
 [[package]]
 name = "omnigraph-storage"

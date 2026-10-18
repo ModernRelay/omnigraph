@@ -1317,6 +1317,7 @@ graphs:
         graphs,
         config_path,
         server_policy,
+        ..
     } = settings.mode;
     assert_eq!(graphs.len(), 1, "the one graph is served, none quarantined");
     let state = omnigraph_server::open_multi_graph_state(
