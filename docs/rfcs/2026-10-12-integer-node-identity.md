@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - azimafroozeh
 created: 2026-10-12
-updated: 2026-10-17
+updated: 2026-10-18
 discussion: null
 supersedes: []
 superseded_by: []
@@ -192,9 +192,12 @@ the type against the captured schema; row existence remains an integrity
 check. Endpoint-type range bounds use the masked maximum above, including
 for type 65535, without shifting 65536 into a `u64`. Every filter over a
 packed column (cascade, referential integrity, endpoint-type ranges,
-traversal probes) is built from `u64` literals. A value that passes through
-`i64` loses the index silently, because Lance then compares through a cast
-instead of probing. Traversal
+traversal probes) is built from `u64` literals. Lance coerces a literal to
+the column type only when the value fits (`lance-datafusion`
+`safe_coerce_scalar`): a non-negative `i64` still coerces, but a literal it
+cannot coerce, such as a wrapped negative `i64` or a `Decimal128` above
+`i64::MAX`, silently loses the index. Packed values above `i64::MAX` are
+ordinary: every type id from 32768 up produces them. Traversal
 frontiers, visited sets, the graph index interner, dedup, cycle closing,
 anti-join keys, rank-fusion identity, hydration lookups, cascade filters, the
 change feed's endpoint images and export all take a `NodeRef`. A bare `u64` or
