@@ -8,7 +8,7 @@ authors:
   - ragnorc
   - azimafroozeh
 created: 2026-10-07
-updated: 2026-10-12
+updated: 2026-10-17
 discussion: null
 supersedes: []
 superseded_by: []
@@ -215,11 +215,20 @@ closure instead would break this: the first implementor added to an interface
 inside a union could turn a column nullable or widen an enum to `String`.
 
 Ordering ties break on the packed reference, so an abstract binding's total
-order is its `order` keys, then `@type_id`, then the row id. That makes keyset
-paging by filters exact across members, because each arm evaluates the filter
-on its own table. A paging surface for stored queries (a cursor carrying the
-snapshot and the last row's order tuple) is a separate RFC; it needs this
-total order and a `limit` that can be a parameter, which GQ lacks today.
+order is its `order` keys, then `@type_id`, then the row id. The row id is
+internal, so this order alone does not make paging by public filters exact. A
+keyed node's `@id` is its natural key: two rows tied on the `order` keys can
+hold row ids 1 and 2 and keys `zeta` and `alpha`, and after `zeta` a resume
+filter `@id > "zeta"` skips `alpha`. Keyset paging by filters is exact only
+when the query orders by a unique public tuple and the resume filter repeats
+its comparisons; for keyed members that tuple is the `order` keys, then
+`@type_id`, then the interface's key property. Each arm evaluates that filter
+on its own table, so the result is exact across members. A paging surface for
+stored queries is a separate RFC: its opaque cursor carries the snapshot and
+the last row's internal order tuple, so it needs no public row id. It also
+needs a `limit` that can be a parameter, which GQ lacks today. When it ships,
+a two-row GQT whose key order is opposite to its allocation order checks both
+pages for loss and duplication.
 
 Traversal endpoints use the same sets. A traversal's destination set is the
 edge's endpoint set, intersected with any declared type of the destination
@@ -242,11 +251,11 @@ recurses across Person and Organization with one shortest-distance search.
 
 Refusals:
 
-- `bm25` on a binding whose set has more than one member is refused in
-  phases 1 and 2. By default Lance builds BM25 statistics from one dataset's
-  inverted index, so scores from two member tables are not comparable. Phase 3
-  admits it with a shared corpus scorer (see Search under Planning and
-  execution).
+- `bm25` on a binding whose set has more than one member is refused. Lance
+  scores each dataset from its own corpus statistics, so scores from two
+  member tables are not comparable. Phase 3 admits it under one corpus
+  contract, once Lance's scanner accepts corpus statistics (see Search across
+  members under Planning and execution); until then it stays refused.
 - `search`, `fuzzy` and `match_text` produce no score; they are membership
   filters. They run per arm when every member has an inverted index on the
   property, and are refused, naming the member, otherwise.
@@ -291,7 +300,10 @@ query touch($slug: String) {
   parameterised type predicates too. A component that edits a row by its type
   and address (`where @type_id = $t and slug = $s`) touches one table instead
   of opening every member. A bound type that is not a member of `I` is a typed
-  refusal, not zero rows. A member whose predicate matches nothing stages
+  refusal, not zero rows. A bound `$t` or `@type` value that names a type
+  hidden from the actor gets the refusal of a value absent from the actor's
+  catalog, byte for byte, so a component cannot probe ids to learn which
+  hidden members exist. A member whose predicate matches nothing stages
   nothing (on main a zero-match update already stages and publishes nothing),
   so an N-member update costs one staged table commit per matching member and
   one manifest publication.
@@ -317,10 +329,18 @@ query touch($slug: String) {
   accepted catalog. Today it holds 64, so a 75-member interface evicts its own
   handles: in the prototype a warm repeat of a 75-member keyed lookup reopened
   55 to 61 tables, against none at 60 members. Each reopen costs at least one
-  object-store HEAD on S3: OmniGraph opens a pinned version without passing
-  the manifest size, so Lance resolves it before consulting its manifest
-  cache (`lance` `dataset/builder.rs` `resolve_version_location`). Passing
-  the size recorded in `__manifest` would make a warm reopen free as well.
+  object-store HEAD on S3: Lance 11's `load_by_uri` resolves a pinned
+  version's manifest location through the commit handler, and the default
+  resolver sends a HEAD (`lance` `dataset/builder.rs`, `lance-table`
+  `io/commit.rs` `default_resolve_version`). `DatasetBuilder` takes no
+  manifest location or size. The hook is OmniGraph's own commit handler,
+  whose `resolve_version_location` already answers from the clone context
+  (`omnigraph-core` `lance_clone.rs`): it answers from the manifest location
+  recorded in the pin, so a warm reopen sends no request. Lance consults its
+  manifest cache only when the location carries a size (`Dataset::get_manifest`),
+  and a pin's `manifest_size` and `e_tag` are optional
+  (`TableVersionMetadata`), so a pin without them falls back to the default
+  resolver and its HEAD.
 - Every schema migration in this RFC is a schema apply, and schema apply
   refuses while any branch other than `main` exists. A graph that keeps
   long-lived branches lands them before widening an endpoint.
@@ -489,7 +509,9 @@ upgraded current format, and historical abstract bindings remain refused.
   expression containing type tests or `@type` comparisons removes an arm only
   when simplifying the complete filter proves that the arm cannot contribute
   a row. Parameters are bound by then, so `@type = $type` and
-  `@type_id = $t` prune too. Pruned members are never opened.
+  `@type_id = $t` prune too. Pruned members are never opened, except that a
+  pruned member of a `bm25` binding still contributes its corpus statistics
+  (see Search across members).
 - **Cost.** Estimates and statistics are per arm and sum across arms. Key
   equality bounds each member to one row through its own index. `count($x)`
   over an unfiltered abstract binding sums one `MetadataCount` per member.
@@ -518,17 +540,62 @@ upgraded current format, and historical abstract bindings remain refused.
 - **Hydration.** `id_lookup` groups each slice's references by type and probes
   each member table. `hash_join` builds per member type, or on the packed
   key.
-- **Search across members (phase 3).** `bm25` over an abstract binding builds
-  one corpus scorer from every member's inverted index with Lance's
-  `build_global_bm25_scorer`, which sums document counts, token totals and
-  per-term document frequencies over any list of index handles. Each arm's
-  full-text plan takes that scorer through `with_base_scorer`, so every arm
-  scores against the same statistics and scores merge like distances. The
-  full-text index is declared on the interface property, so every member
-  shares its analyzer. The scorer must cover every query token, including
-  fuzzy expansions. Lance's scanner does not expose the hook, so the engine
-  builds those plans itself. This replaces a derived projection for
-  cross-type full-text ranking; the API is verified in source, not yet run.
+- **Search across members (phase 3).** Scores from several tables merge only
+  when every arm scores against one corpus. The corpus is a contract:
+  - It is the binding's resolved type set, after resolution against the
+    actor's schema view and after rebinding intersections, never the declared
+    closure. Filters, type tests and `@type_id` comparisons included, never
+    change it. Pruning removes an arm's rows, not its statistics, so
+    `@type_id = $t` and an equivalent filter that proves no pruning give a row
+    the same score.
+  - Every row of every member counts, indexed or not. The engine first
+    collects each member's statistics (its index statistics, plus document and
+    token counts over its unindexed rows with no filter), sums them, and every
+    arm then scores against that total. Lance 11 does not do this even inside
+    one table. For row-level documents the scanner shares no scorer between
+    the indexed branch and the flat branch over unindexed fragments; it shares
+    one only for list elements (`lance` `dataset/scanner.rs`, unchanged in
+    13.0.0). The flat branch adds its own rows to any scorer it is given
+    (`lance-index` `flat_search.rs` `initialize_scorer`). A review probe gave
+    two arms one shared scorer and scored the same text at 2.91 on the indexed
+    path, 2.75 in an arm with one unindexed row and 1.00 in an arm with fifty.
+    OmniGraph commits untrained segments and reconciles postings explicitly,
+    so unindexed rows are normal after a write. A member with a write backlog
+    would rank its own matches lower, which invariant 7 forbids. One table
+    has the same dependence today, between its own indexed and unindexed
+    rows, and the upstream option below removes it there too.
+  - The statistics source follows the actor, as the full-text statistics
+    section of
+    [Actor views and subgraph sharing](https://github.com/ModernRelay/omnigraph/pull/951)
+    selects it: index-wide for bypass actors, view-independent (public or
+    uniform) for restricted actors on placed types. One query uses one source
+    for every arm. When any arm needs view-independent statistics, every arm
+    uses them; bypass actors keep the summed index-wide statistics. Summed
+    index-wide statistics would carry, for a restricted actor, the term
+    frequencies of rows and member types that [Policy](#policy) hides.
+  - The full-text index is declared on the interface property, so every
+    member shares its analyzer, and the statistics cover every query token,
+    including fuzzy expansions.
+  - Every score computed across tables uses this corpus: `bm25` across members
+    now, and `rrf` or compound full-text queries over several arms later.
+
+  This RFC does not build the per-arm plans. `Scanner::full_text_search` also
+  selects segments, adds the flat branch for unindexed fragments, blocks
+  overlay-stale rows and falls back to a full scan for legacy segments
+  (`lance` `dataset/scanner.rs`), and the overlay step,
+  `MatchQueryExec::with_overlay_block`, is `pub(crate)` in 11.0.0 and 13.0.0.
+  An engine-built plan would copy those rules, could not block overlay-stale
+  rows, and would need rechecking at every Lance upgrade. Phase 3 instead
+  depends on two upstream Lance additions: a scanner option that takes a
+  corpus scorer and uses it unchanged in both branches, and a call that
+  returns one dataset's corpus statistics for a query's tokens over its
+  indexed and unindexed rows. Lance 13's `combined_fields` planner already
+  shares one corpus between its two branches. With those additions the
+  engine supplies statistics and Lance keeps planning. Actor views needs the
+  same option for restricted actors, so the two RFCs share one engine module,
+  the only code that chooses or sums statistics, whose input is the resolved
+  type set and the actor's statistics source. Until the option ships,
+  multi-member `bm25` stays refused.
 - **Search.** `nearest` runs per arm with `k` and merges by `_distance`. The
   merge preserves each arm's accuracy, because the global top k is a subset
   of the union of per-arm top-k results. The overfetch ladder runs per arm.
@@ -777,8 +844,9 @@ sub-pipelines), no cost-blind plan choice, and no maintained parallel truth.
 | Join a union's property types over its concrete closure | Matches the alternation rule literally, but adding an implementor to an interface inside a union could change a stored query's result schema. Joining declared member types keeps result schemas independent of membership. |
 | Refuse a type set that includes a member hidden from the actor (`policy_denied_member`) | Keeps results whole, but discloses that the hidden member exists, and the only escape names the hidden type. Filtering over the actor's schema view with `view.restricted` gives the same completeness signal without disclosure. |
 | Expand an interface feed filter once, when the cursor is created | Needs no new refusal, but freezes membership: a live view misses every member added later. |
-| Normalize BM25 scores across arms, or fuse arms with `rrf` | Normalization is unstable across `k`, filters and pages. Rank fusion ignores absolute relevance, and today's `rrf` takes exactly two arms and fuses by bare id, which would merge colliding keys. A shared corpus scorer gives comparable scores directly. |
-| A derived interface projection for cross-type full-text search | True global BM25, but a maintained copy of every member's text. Lance 11 already accepts injected corpus statistics, so the same scores come from the members' own indexes. |
+| Normalize BM25 scores across arms, or fuse arms with `rrf` | Normalization is unstable across `k`, filters and pages. Rank fusion ignores absolute relevance, and today's `rrf` takes exactly two arms and fuses by bare id, which would merge colliding keys. One corpus gives comparable scores directly. |
+| A derived interface projection for cross-type full-text search | True global BM25, but a maintained copy of every member's text. Statistics summed from the members' own indexes give the same scores once Lance's scanner accepts a corpus scorer. |
+| Build each arm's full-text plan in the engine with `with_base_scorer` | Works below the scanner on Lance 11, but copies the scanner's segment, flat-branch and legacy rules, cannot block overlay-stale rows (`with_overlay_block` is `pub(crate)`), and would be a second planner beside the one Actor views needs. An upstream scanner option keeps one owner. |
 
 Prior art. Gel (EdgeDB) keeps a table per concrete type and compiles abstract
 reads to a per-query `UNION ALL`, with `__type__` as a per-table constant.
@@ -835,6 +903,18 @@ the pinned source:
   ids exceed `max_field_id`, and fragments without the field read null.
 - `merge_insert` probes a key-column index with `IsIn` when one exists, which
   matches the one data read measured for a keyed insert today.
+
+A review on 2026-10-17 rechecked the full-text and reopen paths in the pinned
+11.0.0 source, and in 13.0.0 where noted:
+
+- For row-level documents the scanner shares a scorer between the indexed and
+  flat branches only for list elements, and the flat branch adds its own rows
+  to a supplied scorer (`initialize_scorer`). The `match` path is unchanged
+  in 13.0.0; its `combined_fields` path shares one corpus.
+- `MatchQueryExec::with_overlay_block` is `pub(crate)` in both versions.
+- `DatasetBuilder` has no manifest-location input. `load_by_uri` resolves a
+  pinned version through the commit handler, and `Dataset::get_manifest`
+  consults the manifest cache only when the location carries a size.
 
 ### Prototype
 
@@ -970,8 +1050,15 @@ extended:
 - **Reference engine:** refuses the new IR.
 - **Server:** catalog-route fields and `ETag`; schema hash on reads; feed
   `ChangeScopeMembershipChanged`; once actor views exist, member sets from the
-  schema view, identical errors for hidden and undeclared type names, and
-  `view.restricted`.
+  schema view, identical errors for hidden and undeclared type names,
+  identical error bodies for `$t` bound to a hidden member's id and to an
+  unused id, and `view.restricted`. With phase 3, a restricted actor's `bm25`
+  scores over an interface do not change when a hidden row, or a hidden
+  member type with matching rows, is added.
+- **Search (phase 3):** `bm25_distinct_scores_rank_descending.gqt` on an
+  interface fixture, with scores unchanged when a type-test filter is added;
+  in `tests/search.rs`, scores unchanged while one member's postings are
+  unreconciled.
 - **Tower:** catalog-route parity and grammar capability gating.
 
 Acceptance thresholds:
@@ -1042,7 +1129,9 @@ graph.
    - Interface-scope `@unique` behind `interface-unique`, including full
      prospective-universe validation on schema changes. Earlier phases refuse
      its declarations and feature rather than accept unenforced constraints.
-   - `bm25` across members with a shared corpus scorer.
+   - `bm25` across members under the corpus contract, once Lance's scanner
+     accepts a corpus scorer (an upstream dependency), through the statistics
+     module shared with Actor views.
 5. **Phase 4, extensions.**
    - Covariant interface properties (enum refining String, non-null refining
      nullable; physically identical).
@@ -1115,3 +1204,11 @@ for per-type visibility. Abstract type sets resolve against the actor's schema v
 disclosed hidden members. An inherited placement cannot be dropped or added
 per member. This resolves the question of interface-named policy rules: access
 is defined by facts on securables, never by rules naming types.
+
+2026-10-17: multi-member `bm25` is admitted only under one corpus contract:
+the resolved type set after the actor's view, unindexed rows counted for
+every arm, the statistics source Actor views selects, and filters and pruning
+changing no score. It depends on an upstream Lance scanner option rather than
+engine-built plans, and stays refused until that ships. Hidden type ids are
+refused like unknown ones; paging by filters needs a unique public ordering
+tuple; a warm reopen is answered by the commit handler from the pin.
