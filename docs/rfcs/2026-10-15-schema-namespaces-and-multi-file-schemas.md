@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-15
-updated: 2026-10-16
+updated: 2026-10-18
 discussion: null
 supersedes: []
 superseded_by: []
@@ -248,16 +248,24 @@ query open_deals() {
 - **Parsers to fix.**
   - The CLI `embed --select Type:field=value` selector, which splits on the
     first `:` (`crates/omnigraph-cli/src/embed.rs`).
-  - The GQT `expect plan` claim parser, which does the same
-    (`crates/omnigraph-gqt-core/src/plan.rs`).
+  - The GQT `expect plan` scan and expand selectors, which do the same, and its
+    `type` and `cast` claims, which split at the last `:` and so cut
+    `crm::Contact` in two (`crates/omnigraph-gqt-core/src/plan.rs`).
   - The GQT `expect shape` type-name check (`crates/omnigraph-gqt-core/src/shape.rs`).
+  - The GQT load-plan table keys, whose `type_name` check accepts only letters,
+    digits and `_` (`crates/omnigraph-gqt-core/src/load_plan.rs`).
+  - Under [Integer node identity](https://github.com/ModernRelay/omnigraph/pull/884),
+    the `Type:number` handle parser, which must split at the last `:`.
 - **Policy.**
   - A namespace confers no permission, as `implements` confers none under
     Polymorphic types. Otherwise a `schema_apply` holder could widen an
     actor's view by moving a type into a namespace.
   - Per-type visibility
     ([Actor views and subgraph sharing](https://github.com/ModernRelay/omnigraph/pull/951))
-    stays decided per concrete type. A rule written over a namespace pattern
+    stays decided per concrete type.
+  - Name resolution for a restricted actor runs on its view catalog, as Actor
+    views specifies: an ambiguous name's candidate list and the
+    unknown-namespace error never name a hidden type or namespace. A rule written over a namespace pattern
     (`crm::*`) would be sugar, expanded to `StableTypeId`s when the policy is
     applied, and schema plan would report any move that changes the set.
   - Type names stay Cedar entity ids (strings) and never become Cedar entity
@@ -408,7 +416,8 @@ Where they meet, this is how they compose.
 - **One rule for type references.** Every place that RFC accepts a type name
   takes a qualified one, resolved by the rules above:
   - edge endpoints and unions (`edge HeldBy: Holding -> crm::Contact | hr::Employee`);
-  - `implements` lists and interface inheritance (`interface crm::Party implements core::Entity`);
+  - `implements` lists and interface inheritance
+    (`namespace crm { interface Party implements core::Entity { … } }`);
   - abstract bindings and unions in queries (`$x: core::Entity`, `$x: crm::Contact | Note`);
   - type tests (`$x is crm::Contact`);
   - typed endpoints (`to: crm::Contact($id)`);
@@ -428,15 +437,24 @@ Where they meet, this is how they compose.
   - `$x.@type`, `$e.@src_type` and `$e.@dst_type` return the new qualified
     name, while `$x.@type_id` stays the same. Clients that cache or route by
     type should key on `@type_id`, as that RFC advises.
+  - A move also respells integer-identity handles. The `@id` of every unkeyed
+    node and every edge of the moved type, and `@src` and `@dst` where they
+    render an unkeyed endpoint, change from `Note:10` to `crm::Note:10`, and
+    the old spelling is not an alias. A client that keeps handles re-reads
+    them after a move.
   - Ordering ties break on the packed reference, not on the name, so a move
     does not reorder results.
 - **Interface moves wait for interface renames.** Moving an existing
   interface into a namespace needs interface `@rename_from`, which that RFC
   adds. New interfaces may be declared in namespaces from the start.
 - **Registry pinning covers re-resolution.** That RFC records, for each stored
-  query, every binding name's kind and `StableTypeId`, and refuses when a name
-  later resolves to a different kind or id. Together with the
-  exactly-one-match rule:
+  query, the kind and `StableTypeId` of every type and edge name it resolves
+  (bindings, traversal edges, type tests, typed endpoints, and mutation and
+  load targets), and refuses when one later resolves to a different kind or
+  id. Its migration table refuses reusing a released name in one apply only
+  as a different kind, so a same-kind re-add, such as moving `OwnedBy` into
+  `crm` and adding a new root `OwnedBy`, is caught by pinning alone. Together
+  with the exactly-one-match rule:
   - A move keeps every stored query that still resolves the name, for example
     through `use crm;`, because the id is unchanged.
   - A query that named the old unqualified `Contact` without `use crm;` fails
@@ -445,7 +463,9 @@ Where they meet, this is how they compose.
     ambiguous, and registry pinning refuses queries whose `Contact` would now
     bind a different id.
 
-  No path changes a stored query's meaning silently.
+  No path changes a stored query's meaning silently. Ad-hoc query text is
+  resolved again on every run, so the same-kind re-add above retargets it;
+  only stored queries are protected.
 - **Released names.** That RFC refuses reusing a name released by a rename or
   drop as a different kind in the same apply. A move into a namespace releases
   the root name, so the same rule applies to it.
@@ -638,3 +658,11 @@ endpoints; interfaces spanning namespaces; moves keeping `StableTypeId` and
 `@type_id`; registry pinning as the guard against re-resolution; namespaces
 conferring no visibility. Also stated that `use` and `namespace` are positional
 keywords, not reserved words, so existing names keep parsing.
+
+2026-10-18: aligned with Polymorphic types and Integer node identity (PR
+#884): registry pinning covers every resolved type and edge name, and a
+same-kind re-add in one apply is caught by pinning alone; ad-hoc text is not
+protected. A move respells integer-identity handles, which parse at their
+last `:`. Added the GQT load-plan and `type`/`cast` parsers to the fix list,
+view-catalog name resolution from Actor views, and the block form of a
+namespaced interface declaration.
