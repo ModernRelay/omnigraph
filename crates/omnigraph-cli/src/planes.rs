@@ -86,18 +86,20 @@ pub(crate) enum ScopeFlag {
     Store,
     As,
     Profile,
+    Target,
 }
 
 impl ScopeFlag {
     /// Guard evaluation order: first offending flag wins, preserving the
     /// pre-matrix reporting precedence server → cluster → graph.
-    pub(crate) const ALL: [ScopeFlag; 6] = [
+    pub(crate) const ALL: [ScopeFlag; 7] = [
         ScopeFlag::Server,
         ScopeFlag::Cluster,
         ScopeFlag::Graph,
         ScopeFlag::Store,
         ScopeFlag::As,
         ScopeFlag::Profile,
+        ScopeFlag::Target,
     ];
 
     fn flag_name(self) -> &'static str {
@@ -108,6 +110,7 @@ impl ScopeFlag {
             ScopeFlag::Store => "--store",
             ScopeFlag::As => "--as",
             ScopeFlag::Profile => "--profile",
+            ScopeFlag::Target => "--target",
         }
     }
 
@@ -123,6 +126,7 @@ impl ScopeFlag {
                 "--as sets the actor for a direct-engine or actor-bound cluster operation"
             }
             ScopeFlag::Profile => "--profile selects a scope bundle",
+            ScopeFlag::Target => "--target selects a named target",
         }
     }
 
@@ -134,6 +138,7 @@ impl ScopeFlag {
             ScopeFlag::Store => cli.store.is_some(),
             ScopeFlag::As => cli.as_actor.is_some(),
             ScopeFlag::Profile => cli.profile.is_some(),
+            ScopeFlag::Target => cli.target.is_some(),
         }
     }
 }
@@ -251,6 +256,17 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Control => !matches!(cmd, Command::Cluster { .. }),
             Local => false,
         },
+        // A target is consumed where scope resolution runs, as a profile is,
+        // and by the local commands that act on a server target's credential.
+        ScopeFlag::Target => match capability {
+            Any | Served => true,
+            Direct => !matches!(cmd, Command::Init(_)),
+            Control => !matches!(cmd, Command::Cluster { .. }),
+            Local => matches!(
+                cmd,
+                Command::Login { .. } | Command::Logout { .. } | Command::Credential { .. }
+            ),
+        },
     }
 }
 
@@ -315,6 +331,8 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Embed(_)
         | Command::Login { .. }
         | Command::Logout { .. }
+        | Command::Target { .. }
+        | Command::Credential { .. }
         | Command::Use { .. }
         | Command::Profile { .. }
         | Command::Skill { .. }
@@ -331,6 +349,13 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Logout { .. } => "logout",
         Command::Use { .. } => "use",
         Command::Profile { .. } => "profile",
+        Command::Target { command } => match command {
+            crate::cli::TargetCommand::List { .. } => "target list",
+            crate::cli::TargetCommand::Show { .. } => "target show",
+            crate::cli::TargetCommand::Add { .. } => "target add",
+            crate::cli::TargetCommand::Remove { .. } => "target remove",
+        },
+        Command::Credential { .. } => "credential get",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",

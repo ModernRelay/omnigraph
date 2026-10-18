@@ -54,6 +54,8 @@ prints the exact flags of the installed binary.
 | `login` | — | Store a server's bearer token, or open a managed session |
 | `logout` | — | Remove a stored token or a managed session |
 | `use` | — | Select a managed cluster for a config folder |
+| `target` | `list` `show` `add` `remove` | List and edit the named targets in the operator config |
+| `credential` | `get` | Hand a server target's stored token to a pipe, never a terminal |
 | `profile` | `list` `show` | Inspect operator profiles |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
@@ -346,7 +348,11 @@ Distinct from `lint`, which validates authoring source. See
 
 ```bash
 echo "$TOKEN" | omnigraph login <server>   # store a bearer token in ~/.omnigraph/credentials (0600)
+echo "$TOKEN" | omnigraph login --target <name>  # store it for a server target's credential owner
 omnigraph logout <server>                  # remove it (idempotent)
+omnigraph target list --json               # named targets and aliases, no secrets, no network
+echo '{"kind":"server","endpoint":"https://g.example","credential":"g"}' | omnigraph target add g --json
+omnigraph credential get --target g --json # the target's token, to a pipe only
 omnigraph login --api <origin>             # managed Intent API session (OS keychain)
 omnigraph logout --api <origin>            # revoke that session and remove its keychain entry
 ```
@@ -359,6 +365,7 @@ How the CLI resolves which graph a data command (`query`, `mutate`, `load`, `bra
 
 Precedence (highest first):
 
+0. **`--target <name>`** — one named binding from `targets:` (a direct graph, a cluster root, or a server with its credential owner); exclusive with every other address and `--profile`. `defaults.target` applies after `--profile` when nothing is named. See [targets](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md).
 1. **`--store <uri>`** or a **positional `file://`/`s3://`/`az://` URI** — direct storage access (bypasses any server; no catalog, so stored-query *names* don't resolve). `--store` is exclusive with a positional URI and with `--server`. Azure is a qualification preview and writes require `omnigraph-azure-admission`.
 2. **`--server <name|url>`** (+ `--graph <id>` for a multi-graph server) — served/remote. A name resolves from `servers:` in `~/.omnigraph/config.yaml`; a literal `http(s)://` URL also works.
 3. **`--profile <name>`** (or `$OMNIGRAPH_PROFILE`) — a named scope bundle from `profiles:` in the operator config (binds one of server/cluster/store + a default graph).

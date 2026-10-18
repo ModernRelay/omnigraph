@@ -1950,6 +1950,26 @@ pub enum ErrorCode {
     /// 503: a known graph is unavailable. Does not authorize replay.
     GraphUnavailable,
     Internal,
+    /// CLI only: no target of that name is in the operator configuration.
+    TargetUnknown,
+    /// CLI only: a target entry, or the configuration that holds it, is not
+    /// a complete and consistent binding.
+    TargetInvalid,
+    /// CLI only: `target add` names a target that already exists.
+    TargetExists,
+    /// CLI only: `target remove` names the default target.
+    TargetIsDefault,
+    /// CLI only: the operator configuration cannot be edited while keeping
+    /// the rest of its text.
+    ConfigNotEditable,
+    /// CLI only: the command does not serve the selected target's kind.
+    TargetKindUnsupported,
+    /// CLI only: `credential get` refuses to write a token to a terminal.
+    CredentialTerminal,
+    /// CLI only: the server target uses anonymous access, so it has no token.
+    CredentialAnonymous,
+    /// CLI only: no token is stored for the target's credential owner.
+    CredentialMissing,
 }
 
 /// Structured details for a publisher-level OCC failure. Surfaces alongside

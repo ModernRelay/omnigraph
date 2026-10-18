@@ -17,7 +17,7 @@ use crate::cli::{
     SchemaCommand,
 };
 use crate::graph_http::ApiContractError;
-use crate::helpers::{MissingCredential, PreconditionFailedCli, RemoteErrorCli};
+use crate::helpers::{CliRefusal, MissingCredential, PreconditionFailedCli, RemoteErrorCli};
 
 /// What a command can change, which decides how its failure reads.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +81,10 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
             | Command::Blob {
                 command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
             }
+            // A target edit replaces the operator config by one rename, so a
+            // failure leaves nothing changed.
+            | Command::Target { .. }
+            | Command::Credential { .. }
     )
     .then_some(CommandKind::Read)
 }
@@ -311,6 +315,10 @@ impl Failure {
         } else if let Some(contract) = contract {
             let mut output = ErrorOutput::message(contract.error.clone());
             output.code = Some(contract.code);
+            output
+        } else if let Some(refusal) = error.downcast_ref::<CliRefusal>() {
+            let mut output = ErrorOutput::message(refusal.message.clone());
+            output.code = Some(refusal.code);
             output
         } else if engine_write {
             let EngineWriteError(engine) = error

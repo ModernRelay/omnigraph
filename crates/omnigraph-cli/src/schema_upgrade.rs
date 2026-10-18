@@ -18,6 +18,7 @@ pub(crate) async fn run(
         input.profile(),
         planes::Capability::Direct,
         scope::ScopeFlags {
+            target: input.target(),
             profile: profile.as_deref(),
             store: store.as_deref(),
             server: None,

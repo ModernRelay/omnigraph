@@ -23,7 +23,6 @@ use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use serde::Deserialize;
 
-use crate::graph_http::RequestTarget;
 use crate::read_format::{ReadOutputFormat, TableCellLayout};
 
 pub(crate) const OPERATOR_HOME_ENV: &str = "OMNIGRAPH_HOME";
@@ -32,6 +31,14 @@ pub(crate) const OPERATOR_CONFIG_FILE: &str = "config.yaml";
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct OperatorConfig {
+    /// The targets format version; required once `targets:` or
+    /// `defaults.target` is present.
+    #[serde(default)]
+    pub(crate) target_config_version: Option<u32>,
+    /// Named targets: each one complete destination binding, selected by
+    /// `--target` or `defaults.target`. No tokens in this file, ever.
+    #[serde(default)]
+    pub(crate) targets: BTreeMap<String, crate::targets::TargetEntry>,
     #[serde(default)]
     pub(crate) operator: OperatorIdentity,
     #[serde(default)]
@@ -120,6 +127,10 @@ pub(crate) struct OperatorDefaults {
     /// Default graph selected within a server/cluster scope when no
     /// `--graph` is passed (RFC-011).
     pub(crate) default_graph: Option<String>,
+    /// Default target: names an entry under `targets:`, used when a command
+    /// names no address. Exclusive with `server`, `store` and
+    /// `default_graph`.
+    pub(crate) target: Option<String>,
     #[serde(flatten)]
     unknown: yaml_serde::Mapping,
 }
@@ -172,26 +183,6 @@ impl OperatorConfig {
 
     pub(crate) fn output(&self) -> Option<ReadOutputFormat> {
         self.defaults.output
-    }
-
-    /// The gh-host model: which operator server (if any) does a request
-    /// sent to `target` belong to? The server whose own target has the same
-    /// endpoint and whose path segments lead the request's, deepest first, so
-    /// `url: http://h:8080` covers `http://h:8080/graphs/spike` but never
-    /// `http://h:8080-evil`, a `..` that climbs out of a path-prefixed `url`,
-    /// or another socket. An entry the transport cannot address matches
-    /// nothing.
-    pub(crate) fn find_server_for_target(&self, target: &RequestTarget) -> Option<&str> {
-        let mut best: Option<(&str, usize)> = None;
-        for (name, server) in &self.servers {
-            let Ok(base) = RequestTarget::of(&server.url, &server.url) else {
-                continue;
-            };
-            if target.is_under(&base) && best.is_none_or(|(_, depth)| base.depth() > depth) {
-                best = Some((name, base.depth()));
-            }
-        }
-        best.map(|(name, _)| name)
     }
 
     /// A named profile, if defined (RFC-011).
@@ -307,6 +298,8 @@ pub(crate) fn operator_dir() -> Option<PathBuf> {
 #[derive(Debug)]
 pub(crate) struct InvocationConfig {
     directory: Option<PathBuf>,
+    /// `--target`, captured with the command line.
+    target: Option<String>,
     profile: Option<String>,
     profile_present: bool,
     captured: OnceLock<CapturedOperator>,
@@ -339,11 +332,22 @@ impl InvocationConfig {
     pub(crate) fn at(directory: Option<PathBuf>, profile: Option<String>) -> Self {
         Self {
             directory,
+            target: None,
             profile_present: profile.as_ref().is_some_and(|value| !value.is_empty()),
             profile,
             captured: OnceLock::new(),
             warnings: OnceLock::new(),
         }
+    }
+
+    /// Select `--target` for this invocation.
+    pub(crate) fn with_target(mut self, target: Option<String>) -> Self {
+        self.target = target;
+        self
+    }
+
+    pub(crate) fn target(&self) -> Option<&str> {
+        self.target.as_deref()
     }
 
     pub(crate) fn has_profile(&self) -> bool {
@@ -445,12 +449,29 @@ fn load_operator_config_at_with_writer(
             path.display()
         )?;
     }
-    config.validate_defaults()?;
-    config.validate_server_token_names()?;
+    config.validate()?;
+    Ok(config)
+}
+
+/// Parse and check operator config text, as loading the file does, without
+/// its unknown-key warnings.
+pub(crate) fn parse_operator_config(text: &str) -> Result<OperatorConfig> {
+    let config: OperatorConfig = if text.trim().is_empty() {
+        OperatorConfig::default()
+    } else {
+        yaml_serde::from_str(text)?
+    };
+    config.validate()?;
     Ok(config)
 }
 
 impl OperatorConfig {
+    fn validate(&self) -> Result<()> {
+        self.validate_defaults()?;
+        self.validate_server_token_names()?;
+        crate::targets::validate_config(self)
+    }
+
     fn unknown_key_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         let mut collect = |mapping: &yaml_serde::Mapping, prefix: &str| {
@@ -676,6 +697,7 @@ pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph_http::RequestTarget;
     use std::fs;
 
     #[test]
@@ -959,6 +981,13 @@ profiles:
         load_operator_config_at(&path).unwrap();
     }
 
+    fn keyed(owner: crate::targets::CredentialOwner<'_>) -> Option<&str> {
+        match owner {
+            crate::targets::CredentialOwner::Keyed(name) => Some(name),
+            crate::targets::CredentialOwner::Anonymous { .. } => None,
+        }
+    }
+
     #[test]
     fn find_server_for_target_matches_where_the_request_is_sent() {
         let dir = tempfile::tempdir().unwrap();
@@ -972,7 +1001,7 @@ profiles:
         let config = load_operator_config_at(&path).unwrap();
         let server = |url: &str| {
             let target = RequestTarget::of(url, url).unwrap();
-            config.find_server_for_target(&target)
+            config.credential_owner_for(&target).and_then(keyed)
         };
         assert_eq!(server("http://h:8080"), Some("dev"));
         assert_eq!(server("http://H:8080/graphs/other"), Some("dev"));
@@ -1005,7 +1034,7 @@ profiles:
         {
             let socket = |root: &str| {
                 let target = RequestTarget::of(root, &format!("{root}/graphs/g")).unwrap();
-                config.find_server_for_target(&target)
+                config.credential_owner_for(&target).and_then(keyed)
             };
             assert_eq!(socket("unix:///tmp/og/og.sock"), Some("og"));
             assert_eq!(socket("unix:///tmp/og/./og.sock"), Some("og"));

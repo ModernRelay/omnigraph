@@ -11565,7 +11565,16 @@
           "too_many_requests",
           "service_unavailable",
           "graph_unavailable",
-          "internal"
+          "internal",
+          "target_unknown",
+          "target_invalid",
+          "target_exists",
+          "target_is_default",
+          "config_not_editable",
+          "target_kind_unsupported",
+          "credential_terminal",
+          "credential_anonymous",
+          "credential_missing"
         ]
       },
       "ErrorOutput": {

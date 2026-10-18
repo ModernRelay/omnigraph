@@ -206,6 +206,8 @@ pub(crate) enum MissingCredential {
         server_root: String,
         config: Option<std::path::PathBuf>,
     },
+    /// The URL falls under a server target configured for anonymous access.
+    Anonymous(String),
 }
 
 /// `{"server": NAME, "hint": …}` for a declared server without a token,
@@ -217,6 +219,7 @@ impl Serialize for MissingCredential {
         match self {
             Self::Server(name) => state.serialize_field("server", name)?,
             Self::Unbound { server_root, .. } => state.serialize_field("unbound", server_root)?,
+            Self::Anonymous(target) => state.serialize_field("anonymous", target)?,
         }
         state.serialize_field("hint", &self.to_string())?;
         state.end()
@@ -244,6 +247,11 @@ impl std::fmt::Display for MissingCredential {
                     |path| path.display().to_string()
                 )
             ),
+            Self::Anonymous(target) => write!(
+                f,
+                "target `{target}` uses anonymous access: name a `credential` owner on it, \
+                 then run `omnigraph login --target {target}`"
+            ),
         }
     }
 }
@@ -258,11 +266,19 @@ pub(crate) fn resolve_remote_credential_with_input(
     url: &str,
 ) -> Result<RemoteCredential> {
     let target = crate::graph_http::RequestTarget::of(server_root, url)?;
-    let Some(server) = operator_config.find_server_for_target(&target) else {
-        return Ok(RemoteCredential::Missing(MissingCredential::Unbound {
-            server_root: without_userinfo(server_root),
-            config: input.config_path(),
-        }));
+    let server = match operator_config.credential_owner_for(&target) {
+        Some(crate::targets::CredentialOwner::Keyed(owner)) => owner,
+        Some(crate::targets::CredentialOwner::Anonymous { target }) => {
+            return Ok(RemoteCredential::Missing(MissingCredential::Anonymous(
+                target.to_string(),
+            )));
+        }
+        None => {
+            return Ok(RemoteCredential::Missing(MissingCredential::Unbound {
+                server_root: without_userinfo(server_root),
+                config: input.config_path(),
+            }));
+        }
     };
     Ok(
         match operator::resolve_keyed_token_at(server, input.credentials_path().as_deref())? {
@@ -371,7 +387,7 @@ pub(crate) fn resolve_server_flag_with_config(
 /// graph-id alphabet. Any other character could move the request off that
 /// route once the URL parser reads it: a dot segment in any spelling
 /// (`%2e`, a tab or newline it strips), `/`, `\` or `%2F`.
-fn require_graph_segment(graph: &str) -> Result<()> {
+pub(crate) fn require_graph_segment(graph: &str) -> Result<()> {
     if graph.is_empty()
         || !graph
             .bytes()
@@ -414,6 +430,35 @@ pub(crate) fn apply_bearer_token(
         request
     }
 }
+
+/// A refusal the CLI decides itself, before any request or storage access,
+/// with its code from the one registry.
+#[derive(Debug)]
+pub(crate) struct CliRefusal {
+    pub(crate) code: omnigraph_api_types::ErrorCode,
+    pub(crate) message: String,
+}
+
+impl CliRefusal {
+    pub(crate) fn report(
+        code: omnigraph_api_types::ErrorCode,
+        message: impl Into<String>,
+    ) -> color_eyre::Report {
+        Self {
+            code,
+            message: message.into(),
+        }
+        .into()
+    }
+}
+
+impl std::fmt::Display for CliRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliRefusal {}
 
 /// A verified request precondition refusal. The command boundary decides
 /// whether earlier effects prevent promoting it to whole-command exit 4.
@@ -788,6 +833,7 @@ pub(crate) async fn resolve_maintenance_uri(
         input.profile(),
         planes::Capability::Direct,
         scope::ScopeFlags {
+            target: input.target(),
             profile,
             store,
             server: None,

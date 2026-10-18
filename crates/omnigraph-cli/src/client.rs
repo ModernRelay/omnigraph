@@ -373,6 +373,7 @@ impl GraphClient {
             input.profile(),
             crate::planes::Capability::Served,
             crate::scope::ScopeFlags {
+                target: input.target(),
                 profile,
                 store: None,
                 server,
@@ -439,6 +440,7 @@ impl GraphClient {
             input.profile(),
             capability,
             crate::scope::ScopeFlags {
+                target: input.target(),
                 profile,
                 store,
                 server,
@@ -515,6 +517,7 @@ impl GraphClient {
             input.profile(),
             capability,
             crate::scope::ScopeFlags {
+                target: input.target(),
                 profile,
                 store,
                 server,

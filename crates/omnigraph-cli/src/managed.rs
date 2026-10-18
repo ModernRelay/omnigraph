@@ -772,12 +772,13 @@ fn reject_scope(cli: &Cli) -> Result<()> {
         || cli.server.is_some()
         || cli.graph.is_some()
         || cli.profile.is_some()
+        || cli.target.is_some()
         || cli.store.is_some()
         || cli.cluster.is_some()
     {
         return Err(Failure::refused(
             "managed_scope_conflict",
-            "cluster --managed uses folder context and authenticated identity; --as, --server, --graph, --profile, --store, and --cluster do not apply",
+            "cluster --managed uses folder context and authenticated identity; --as, --server, --graph, --profile, --target, --store, and --cluster do not apply",
         ));
     }
     Ok(())

@@ -174,6 +174,7 @@ pub(crate) fn parse_ttl(input: &str) -> std::result::Result<u64, String> {
 
 fn scope(cli: &Cli) -> Result<()> {
     if cli.server.is_some()
+        || cli.target.is_some()
         || cli.profile.is_some()
         || cli.store.is_some()
         || cli.cluster.is_some()
@@ -339,6 +340,7 @@ fn skips_context(cli: &Cli) -> bool {
                 }
         )
         || cli.server.is_some()
+        || cli.target.is_some()
         || cli.profile.is_some()
         || cli.store.is_some()
         || cli.cluster.is_some()
@@ -365,7 +367,9 @@ fn has_ambient_target(
             )
         }
     })?;
-    Ok(operator.default_server().is_some() || operator.default_store().is_some())
+    Ok(operator.default_server().is_some()
+        || operator.default_store().is_some()
+        || operator.default_target().is_some())
 }
 
 #[cfg(test)]

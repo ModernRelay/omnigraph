@@ -5539,3 +5539,292 @@ fn remote_catalogue_reads_preserve_optional_targets() {
         }
     }
 }
+
+/// A named target addresses a command as one complete binding: a direct graph
+/// opens its storage, a server target sends its credential owner's token only
+/// to its own endpoint, an anonymous one sends none, and `defaults.target`
+/// applies when nothing is named.
+#[test]
+fn targets_address_commands_and_carry_only_their_owners_token() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let rows = || {
+        IntentReply::json(
+            200,
+            json!({
+                "query_name":"q", "target":{"branch":"main"}, "row_count":0,
+                "columns":["value"], "rows":[], "graph_commit_id":"head"
+            }),
+        )
+    };
+    let served = IntentApiFixture::graph(vec![rows()]);
+    let open = IntentApiFixture::graph(vec![rows()]);
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "target_config_version: 1\ndefaults:\n  target: local\ntargets:\n  \
+             local:\n    kind: direct\n    scope: graph\n    uri: '{}'\n  \
+             served:\n    kind: server\n    endpoint: '{}'\n    credential: served-owner\n    default_graph: knowledge\n  \
+             open:\n    kind: server\n    endpoint: '{}'\n    auth: anonymous\n    default_graph: knowledge\n",
+            graph.to_string_lossy(),
+            served.origin,
+            open.origin
+        ),
+    )
+    .unwrap();
+    let cli_home = || {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_TOKEN_SERVED_OWNER", "served-token");
+        command
+    };
+
+    // The default target is the local graph.
+    let read = parse_stdout_json(&output_success(
+        cli_home()
+            .arg("query")
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(read["rows"][0]["p.name"], "Alice", "{read}");
+
+    // A server target carries its owner's token to its own endpoint.
+    output_success(cli_home().args(["query", "q", "--target", "served", "--json"]));
+    let requests = served.workflow_requests();
+    let data = requests.last().unwrap();
+    assert_eq!(data.path, "/graphs/knowledge/queries/q");
+    assert_eq!(
+        data.headers.get("authorization").map(String::as_str),
+        Some("Bearer served-token")
+    );
+    served.assert_complete();
+    // An anonymous one carries none.
+    output_success(cli_home().args(["query", "q", "--target", "open", "--json"]));
+    let requests = open.workflow_requests();
+    assert!(
+        !requests
+            .last()
+            .unwrap()
+            .headers
+            .contains_key("authorization")
+    );
+    open.assert_complete();
+
+    // A target is a complete address, and an unknown one refuses by code.
+    let refused = output_failure(cli_home().args([
+        "query", "q", "--target", "served", "--store", "/x", "--json",
+    ]));
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("mutually exclusive"),
+        "{refused:?}"
+    );
+    let refused = output_failure(cli_home().args(["query", "q", "--target", "nope", "--json"]));
+    assert_eq!(refused.status.code(), Some(1));
+    let body = parse_stdout_json(&refused);
+    assert_eq!(body["code"], "target_unknown", "{body}");
+    assert_eq!(body["outcome"]["execution"], "not_started", "{body}");
+    // Commands that do not take a target refuse it rather than ignore it.
+    let refused = output_failure(cli_home().args(["version", "--target", "local"]));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--target"),
+        "{refused:?}"
+    );
+}
+
+/// `target add` and `remove` change one entry's lines, keep the rest of the
+/// file's text, and refuse by code what they cannot do.
+#[test]
+fn target_commands_edit_one_entry_and_keep_the_rest_of_the_file() {
+    let home = tempdir().unwrap();
+    let path = home.path().join("config.yaml");
+    let original = "# my operator config\noperator:\n  actor: act-me  # me\nservers:\n  dev:\n    url: http://localhost:1\n";
+    fs::write(&path, original).unwrap();
+    let target = |args: &[&str], stdin: Option<&str>| {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("target")
+            .args(args);
+        if let Some(stdin) = stdin {
+            command.write_stdin(stdin.to_string());
+        }
+        command.output().unwrap()
+    };
+    let json = |output: &std::process::Output| -> Value {
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| panic!("{error}: {output:?}"))
+    };
+
+    let added = target(
+        &["add", "staging", "--json"],
+        Some(r#"{"kind":"server","endpoint":"https://staging.example","credential":"staging"}"#),
+    );
+    assert!(added.status.success(), "{added:?}");
+    assert_eq!(json(&added)["added"]["auth"], "token");
+    let local = target(
+        &["add", "local", "--json"],
+        Some(r#"{"kind":"direct","scope":"graph","uri":"/data/company.omni"}"#),
+    );
+    assert!(local.status.success(), "{local:?}");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with(original), "{text}");
+    assert!(text.contains("target_config_version: 1"), "{text}");
+
+    let listing = json(&target(&["list", "--json"], None));
+    assert_eq!(listing["protocol"], 1);
+    assert!(listing["default_target"].is_null());
+    let names: Vec<&str> = listing["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["local", "staging"]);
+    assert_eq!(listing["targets"][0]["local_servers"], json!([]));
+    assert!(
+        listing["targets"][1]["binding"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    let shown = json(&target(&["show", "staging", "--json"], None));
+    assert_eq!(shown["name"], "staging");
+    assert_eq!(shown["default"], false);
+
+    for (args, stdin, code) in [
+        (
+            &["add", "staging", "--json"][..],
+            Some(r#"{"kind":"server","endpoint":"https://other.example","auth":"anonymous"}"#),
+            "target_exists",
+        ),
+        (
+            &["add", "half", "--json"][..],
+            Some(r#"{"kind":"server"}"#),
+            "target_invalid",
+        ),
+        (
+            &["add", "typo", "--json"][..],
+            Some(r#"{"kind":"server","endpoints":"https://x"}"#),
+            "target_invalid",
+        ),
+        (&["remove", "missing", "--json"][..], None, "target_unknown"),
+    ] {
+        let refused = target(args, stdin);
+        assert_eq!(refused.status.code(), Some(1), "{args:?}: {refused:?}");
+        assert_eq!(json(&refused)["code"], code, "{args:?}: {refused:?}");
+    }
+
+    // The default target cannot be removed.
+    let with_default = format!(
+        "{}defaults:\n  target: staging\n",
+        fs::read_to_string(&path).unwrap()
+    );
+    fs::write(&path, &with_default).unwrap();
+    let refused = target(&["remove", "staging", "--json"], None);
+    assert_eq!(json(&refused)["code"], "target_is_default", "{refused:?}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), with_default);
+
+    let removed = target(&["remove", "local", "--json"], None);
+    assert!(removed.status.success(), "{removed:?}");
+    assert_eq!(json(&removed)["removed"], "local");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with(original), "{text}");
+    assert!(!text.contains("local:"), "{text}");
+    assert!(text.contains("  staging:"), "{text}");
+}
+
+/// `login --target` stores a token under the target's credential owner, and
+/// `credential get` hands it out only for a server target that has one.
+#[test]
+fn login_and_credential_get_follow_the_target_credential_owner() {
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        "target_config_version: 1\ntargets:\n  \
+         staging:\n    kind: server\n    endpoint: https://staging.example\n    credential: staging-owner\n  \
+         open:\n    kind: server\n    endpoint: https://open.example\n    auth: anonymous\n  \
+         local:\n    kind: direct\n    scope: graph\n    uri: /data/company.omni\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_HOME", home.path())
+            .env_remove("OMNIGRAPH_TOKEN_STAGING_OWNER")
+            .args(args);
+        command
+    };
+
+    output_success(run(&["login", "--target", "staging", "--json"]).write_stdin("stored-token\n"));
+    let credentials = fs::read_to_string(home.path().join("credentials")).unwrap();
+    assert!(credentials.contains("[staging-owner]"), "{credentials}");
+
+    let got = parse_stdout_json(&output_success(&mut run(&[
+        "credential",
+        "get",
+        "--target",
+        "staging",
+        "--json",
+    ])));
+    assert_eq!(
+        got,
+        json!({
+            "protocol": 1, "target": "staging", "owner": "staging-owner",
+            "endpoint": "https://staging.example", "scheme": "bearer",
+            "token": "stored-token", "source": "credentials_file",
+        })
+    );
+    let bare = output_success(&mut run(&["credential", "get", "--target", "staging"]));
+    assert_eq!(stdout_string(&bare), "stored-token\n");
+    let from_env = parse_stdout_json(&output_success(
+        run(&["credential", "get", "--target", "staging", "--json"])
+            .env("OMNIGRAPH_TOKEN_STAGING_OWNER", "env-token"),
+    ));
+    assert_eq!(from_env["token"], "env-token");
+    assert_eq!(from_env["source"], "environment");
+
+    for (target, code) in [
+        ("open", "credential_anonymous"),
+        ("local", "target_kind_unsupported"),
+        ("nope", "target_unknown"),
+    ] {
+        let refused = output_failure(&mut run(&[
+            "credential",
+            "get",
+            "--target",
+            target,
+            "--json",
+        ]));
+        assert_eq!(
+            parse_stdout_json(&refused)["code"],
+            code,
+            "{target}: {refused:?}"
+        );
+    }
+    let refused = output_failure(&mut run(&["credential", "get", "--json"]));
+    assert_eq!(parse_stdout_json(&refused)["code"], "target_unknown");
+
+    output_success(&mut run(&["logout", "--target", "staging", "--json"]));
+    let refused = output_failure(&mut run(&[
+        "credential",
+        "get",
+        "--target",
+        "staging",
+        "--json",
+    ]));
+    assert_eq!(parse_stdout_json(&refused)["code"], "credential_missing");
+    let refused = output_failure(run(&["login", "--target", "open"]).write_stdin("t\n"));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("anonymous"),
+        "{refused:?}"
+    );
+}

@@ -18,7 +18,7 @@ Most graph commands accept one of these scopes:
 | `--store <URI>` | Direct access to one `file://`, `s3://`, or `az://` graph; the exact token `og_catalog` (also as `--graph og_catalog` on a server) is the [engine catalogue](../queries/catalogue.md), serving `query` and `schema show` with no store opened |
 | `--server <NAME\|URL> --graph <ID>` | A graph served by a multi-graph server at an `http://`, `https://` or [`unix://`](index.md#use-a-server-through-a-unix-socket) URL |
 | `--cluster <DIR\|URI> --graph <ID>` | Direct maintenance of a cluster-managed graph |
-| `--profile <NAME>` | A named scope from operator config |
+| `--target <NAME>`, `--profile <NAME>` | A named [target](targets.md) (else `defaults.target`), or a named scope from operator config |
 
 A bare local path is accepted where a graph URI is expected. `--server` and
 `--store` are mutually exclusive. A store already identifies one graph, so it
@@ -222,7 +222,7 @@ aliases:
 ```
 
 Each profile binds exactly one of `server`, `cluster`, or `store`. Select it with
-`--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled by a profile.
+`--profile` or `OMNIGRAPH_PROFILE`; explicit flags override values it fills. [Named targets](targets.md) bind one complete address each.
 
 Bearer tokens never belong in `config.yaml`. Bind one to a declared server with
 `omnigraph login <server>` or `OMNIGRAPH_TOKEN_<NAME>`; the CLI sends it only to

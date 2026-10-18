@@ -1,0 +1,3 @@
+- The operator configuration can name targets: each one a complete binding, a direct graph or cluster root, or a server with its credential owner. `--target NAME`, else `defaults.target`, addresses a command, `target list|show|add|remove` lists and edits them one entry at a time while keeping the rest of the file, `login --target` stores a target's token, and `credential get --target` hands it to another program through a pipe. `version --json` reports their output versions under `protocols`. Existing `servers:`, `profiles:` and their flags keep working. See [named targets][cli-named-targets].
+
+[cli-named-targets]: ../docs/user/cli/targets.md

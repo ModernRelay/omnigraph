@@ -163,6 +163,17 @@ pub(crate) struct VersionOutput {
     pub(crate) commit: Option<&'static str>,
     pub(crate) http_contract: &'static str,
     pub(crate) internal_schema: InternalSchemaOutput,
+    /// The version of each machine-readable command contract this binary
+    /// speaks; a client requires the versions it understands.
+    pub(crate) protocols: ProtocolsOutput,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProtocolsOutput {
+    /// `target list|show|add|remove --json`.
+    pub(crate) target: u32,
+    /// `credential get --json`.
+    pub(crate) credential: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,6 +211,10 @@ impl VersionOutput {
                     MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
                     INTERNAL_MANIFEST_SCHEMA_VERSION,
                 ],
+            },
+            protocols: ProtocolsOutput {
+                target: crate::targets::TARGET_PROTOCOL,
+                credential: crate::targets::TARGET_PROTOCOL,
             },
         }
     }

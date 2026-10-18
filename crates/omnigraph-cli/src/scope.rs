@@ -37,6 +37,9 @@ pub(crate) struct ResolvedScope {
 /// The raw addressing inputs for one command: the global scope flags plus the
 /// command's own positional URI.
 pub(crate) struct ScopeFlags<'a> {
+    /// `--target`: one complete named binding, exclusive with every other
+    /// address and with `--profile`.
+    pub(crate) target: Option<&'a str>,
     pub(crate) profile: Option<&'a str>,
     pub(crate) store: Option<&'a str>,
     pub(crate) server: Option<&'a str>,
@@ -46,11 +49,13 @@ pub(crate) struct ScopeFlags<'a> {
 }
 
 /// Resolve only from supplied values, without environment or I/O access.
-/// Precedence (RFC-011):
-/// 1. explicit primitive address (`uri`/`--server`/`--store`) → passthrough;
-/// 2. `--profile` / `OMNIGRAPH_PROFILE`;
-/// 3. flat `defaults.server` + `defaults.default_graph`;
-/// 4. nothing — downstream behaves as today.
+/// Precedence:
+/// 1. `--target`, alone;
+/// 2. explicit primitive address (`uri`/`--server`/`--store`) → passthrough;
+/// 3. `--profile` / `OMNIGRAPH_PROFILE`;
+/// 4. `defaults.target`;
+/// 5. flat `defaults.server` + `defaults.default_graph`, or `defaults.store`;
+/// 6. nothing — downstream behaves as today.
 pub(crate) fn resolve_scope(
     op: &OperatorConfig,
     ambient_profile: Option<&str>,
@@ -74,6 +79,18 @@ pub(crate) fn resolve_scope(
             "{} are mutually exclusive — pick one way to address the graph",
             primitives.join(" and ")
         );
+    }
+
+    // 1. A target is a complete address; nothing else may add to it.
+    if let Some(name) = flags.target {
+        if let Some(other) = primitives
+            .first()
+            .copied()
+            .or(flags.profile.map(|_| "--profile"))
+        {
+            bail!("--target and {other} are mutually exclusive — a target is a complete address");
+        }
+        return scope_from_target(op, capability, name, flags.graph);
     }
 
     // 1a. `--cluster` is the cluster scope primitive (maintenance): resolve its
@@ -110,6 +127,12 @@ pub(crate) fn resolve_scope(
 
     // 2. A named profile (flag, else the captured environment value).
     let profile_name = flags.profile.or(ambient_profile.filter(|s| !s.is_empty()));
+    if let (None, Some(name), Some(target)) = (flags.profile, profile_name, op.default_target()) {
+        bail!(
+            "OMNIGRAPH_PROFILE selects profile '{name}' and `defaults.target` selects target \
+             '{target}'; unset one, or name the address with --target or --profile"
+        );
+    }
     if let Some(name) = profile_name {
         let profile = op.profile(name).ok_or_else(|| {
             eyre!("unknown profile '{name}' (not defined under `profiles:` in operator config)")
@@ -122,7 +145,12 @@ pub(crate) fn resolve_scope(
         return scope_from_binding(op, capability, binding, graph, &format!("profile '{name}'"));
     }
 
-    // 3. Flat default server scope.
+    // 3. The default target.
+    if let Some(name) = op.default_target() {
+        return scope_from_target(op, capability, name, flags.graph);
+    }
+
+    // 4. Flat default server scope.
     if let Some(server) = op.default_server() {
         let graph = flags
             .graph
@@ -152,6 +180,35 @@ pub(crate) fn resolve_scope(
     // 4. Nothing resolved — leave the tuple empty; downstream falls through to
     //    today's behavior (legacy `cli.graph` default or a no-address error).
     Ok(ResolvedScope::default())
+}
+
+/// A named target as the binding it names, with its default graph.
+fn scope_from_target(
+    op: &OperatorConfig,
+    capability: Capability,
+    name: &str,
+    graph: Option<&str>,
+) -> Result<ResolvedScope> {
+    use crate::targets::TargetBinding;
+    let binding = op.target(name)?.binding(name)?;
+    let (binding, default_graph) = match binding {
+        TargetBinding::DirectGraph { uri } => (ScopeBinding::Store(uri), None),
+        TargetBinding::DirectRoot { uri, default_graph } => {
+            (ScopeBinding::Cluster(uri), default_graph)
+        }
+        TargetBinding::Server {
+            endpoint,
+            default_graph,
+            ..
+        } => (ScopeBinding::Server(endpoint), default_graph),
+    };
+    scope_from_binding(
+        op,
+        capability,
+        binding,
+        graph.map(str::to_string).or(default_graph),
+        &format!("target '{name}'"),
+    )
 }
 
 /// Map a resolved binding to the effective tuple, enforcing scope × capability
@@ -247,6 +304,7 @@ mod tests {
 
     fn flags<'a>() -> ScopeFlags<'a> {
         ScopeFlags {
+            target: None,
             profile: None,
             store: None,
             server: None,

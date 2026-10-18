@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
 pub(crate) use crate::commands::local::{ProfileCommand, SkillCommand};
+pub(crate) use crate::commands::targets::{CredentialCommand, TargetCommand};
 pub(crate) use crate::managed::args::{
     OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
     OrganizationMembersCommand,
@@ -72,6 +73,13 @@ pub(crate) struct Cli {
     /// `--store`). Required for managed queries, mutations, loads, and commit reads.
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
+
+    /// Address the named target from `targets:` in ~/.omnigraph/config.yaml: one
+    /// complete binding (a direct graph or cluster root, or a server with its
+    /// credential), else `defaults.target`. Exclusive with every other
+    /// address and with --profile. See `omnigraph target list`.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub(crate) target: Option<String>,
 
     /// Select a named scope bundle from `profiles:` in
     /// ~/.omnigraph/config.yaml: fills in this command's omitted addressing
@@ -233,12 +241,13 @@ pub(crate) enum Command {
     },
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
-    /// Store a bearer token for a named server (0600 credentials file). Token
-    /// via --token or piped on stdin; see the CLI reference for token resolution.
+    /// Store a bearer token for a named server, or with --target for a server
+    /// target's credential owner (0600 credentials file). Token via --token or
+    /// piped on stdin; see the CLI reference for token resolution.
     Login {
         /// Server name (keys the credential; declare its url under
         /// `servers:` in ~/.omnigraph/config.yaml)
-        #[arg(required_unless_present = "api", conflicts_with = "api")]
+        #[arg(required_unless_present_any = ["api", "target"], conflicts_with_all = ["api", "target"])]
         name: Option<String>,
         /// Reuse or renew a managed session; use browser device authorization when needed.
         #[arg(long, conflicts_with = "token")]
@@ -253,9 +262,10 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a named server's stored credential. Idempotent.
+    /// Remove a named server's stored credential, or with --target a server
+    /// target's. Idempotent.
     Logout {
-        #[arg(required_unless_present = "api", conflicts_with = "api")]
+        #[arg(required_unless_present_any = ["api", "target"], conflicts_with_all = ["api", "target"])]
         name: Option<String>,
         /// Revoke the managed session and remove its OS keychain entry.
         #[arg(long)]
@@ -278,6 +288,17 @@ pub(crate) enum Command {
         config: PathBuf,
         #[arg(long)]
         json: bool,
+    },
+    /// List, show, add and remove the named targets in
+    /// ~/.omnigraph/config.yaml.
+    Target {
+        #[command(subcommand)]
+        command: TargetCommand,
+    },
+    /// Hand a server target's stored static token to another program.
+    Credential {
+        #[command(subcommand)]
+        command: CredentialCommand,
     },
     /// Inspect the scope profiles in ~/.omnigraph/config.yaml (read-only).
     Profile {

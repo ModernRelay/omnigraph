@@ -260,6 +260,11 @@ pub(crate) fn error_output_of(error: &color_eyre::Report) -> Option<ErrorOutput>
     if let Some(remote) = error.downcast_ref::<RemoteErrorCli>() {
         return Some(remote.output.clone());
     }
+    if let Some(refusal) = error.downcast_ref::<crate::helpers::CliRefusal>() {
+        let mut output = ErrorOutput::message(refusal.message.clone());
+        output.code = Some(refusal.code);
+        return Some(output);
+    }
     let diagnostic = if let Some(engine) = error.downcast_ref::<omnigraph::error::OmniError>() {
         engine.diagnostic()
     } else if let Some(compiler) = error.downcast_ref::<omnigraph_compiler::error::CompilerError>()
@@ -292,7 +297,7 @@ async fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let operator = operator::InvocationConfig::capture();
+    let operator = operator::InvocationConfig::capture().with_target(cli.target.clone());
     let mut input = crate::input::Input {
         reader: stdin,
         is_terminal: stdin_is_terminal,
@@ -332,24 +337,23 @@ async fn run(
         Command::Login {
             name, token, json, ..
         } => {
-            commands::local::run_login(
-                &operator,
-                name.expect("clap requires a server name without --api"),
-                token,
-                json,
-                input.reader,
-                stdout,
-                stderr,
-            )?;
+            let name = commands::targets::login_owner(&operator, name, stderr)?;
+            commands::local::run_login(&operator, name, token, json, input.reader, stdout, stderr)?;
         }
         Command::Logout { name, json, .. } => {
-            commands::local::run_logout(
-                &operator,
-                name.expect("clap requires a server name without --api"),
-                json,
-                stdout,
-            )?;
+            let name = commands::targets::login_owner(&operator, name, stderr)?;
+            commands::local::run_logout(&operator, name, json, stdout)?;
         }
+        Command::Target { command } => {
+            commands::targets::run_target(&operator, command, input.reader, stdout, stderr)?
+        }
+        Command::Credential { command } => commands::targets::run_credential(
+            &operator,
+            command,
+            std::io::stdout().is_terminal(),
+            stdout,
+            stderr,
+        )?,
         Command::Profile { command } => {
             commands::local::run_profile(&operator, command, stdout, stderr)?
         }
