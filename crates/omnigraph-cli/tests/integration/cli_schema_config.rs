@@ -101,6 +101,51 @@ fn clap_exit_status_survives_closed_output() {
     }
 }
 
+/// A failure the CLI cannot deliver keeps the exit its outcome chose: a write
+/// whose receipt meets a closed stdout may have committed, so it exits 2,
+/// never the 1 that says nothing changed; a read still exits 1.
+#[test]
+fn an_undelivered_failure_keeps_its_exit() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let graph = graph.to_str().unwrap();
+    for (args, expected) in [
+        (
+            vec![
+                "mutate",
+                "--store",
+                graph,
+                "-e",
+                "query add() { insert Person { name: \"Undelivered\", age: 1 } }",
+                "--json",
+            ],
+            2,
+        ),
+        (vec!["snapshot", "--store", graph, "--json"], 1),
+    ] {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let output = cli_process()
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(writer))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("could not deliver CLI diagnostic"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
 /// `skills/omnigraph`, the one copy of the skill the binary embeds.
 fn source_skill_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/omnigraph")

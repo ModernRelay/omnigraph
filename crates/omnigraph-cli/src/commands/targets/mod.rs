@@ -419,6 +419,51 @@ struct AccessReport<'a> {
     access: omnigraph_api_types::AccessOutput,
 }
 
+/// Check that the cluster serves `graph` before its policy is read. A
+/// quarantined graph's bundle is withheld from the snapshot and an unknown
+/// graph has none, so an absent bundle means "no policy" only for a served
+/// graph; the others refuse as a server refuses them.
+fn served_graph(snapshot: &omnigraph_cluster::ServingSnapshot, graph: &str) -> Result<()> {
+    if snapshot
+        .quarantined_graphs
+        .iter()
+        .any(|blocked| blocked.graph_id == graph)
+    {
+        let path = format!("graph.{graph}");
+        let reasons: Vec<&str> = snapshot
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.path == path)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        return Err(CliRefusal::report(
+            ErrorCode::GraphUnavailable,
+            format!(
+                "graph `{graph}` is not served: {}",
+                if reasons.is_empty() {
+                    "the cluster quarantined it".to_string()
+                } else {
+                    reasons.join("; ")
+                }
+            ),
+        ));
+    }
+    if !snapshot
+        .graphs
+        .iter()
+        .any(|served| served.graph_id == graph)
+    {
+        return Err(CliRefusal::report(
+            ErrorCode::NotFound,
+            format!(
+                "graph `{graph}` is not applied (applied graphs: [{}])",
+                snapshot.applied_graphs.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// `access`: who the caller is at a target and what it may do there. A
 /// server decides through its access route; for direct storage the CLI
 /// evaluates the graph's installed policy for the declared actor, and a
@@ -502,6 +547,7 @@ pub(crate) async fn run_access(
             )
         })?;
         let snapshot = crate::commands::control::read_serving_snapshot_or_report(cluster).await?;
+        served_graph(&snapshot, graph)?;
         let binding = format!("graph.{graph}");
         let bundles: Vec<_> = snapshot
             .policies
@@ -607,5 +653,52 @@ mod tests {
         let refusal = refused.downcast_ref::<CliRefusal>().unwrap();
         assert_eq!(refusal.code, ErrorCode::CredentialTerminal);
         refuse_terminal(false).unwrap();
+    }
+
+    #[test]
+    fn access_reads_policy_only_for_a_graph_the_cluster_serves() {
+        let snapshot = omnigraph_cluster::ServingSnapshot {
+            graphs: vec![omnigraph_cluster::ServingGraph {
+                graph_id: "knowledge".into(),
+                root: std::path::PathBuf::new(),
+                embedding: None,
+                external_blob_policy: Default::default(),
+            }],
+            queries: Vec::new(),
+            policies: Vec::new(),
+            diagnostics: vec![omnigraph_cluster::Diagnostic {
+                code: "recovery_pending".into(),
+                severity: omnigraph_cluster::DiagnosticSeverity::Error,
+                path: "graph.archive".into(),
+                message: "a recovery is pending".into(),
+                detail: None,
+            }],
+            config_digest: None,
+            state_revision: 1,
+            state_cas: None,
+            applied_graphs: vec!["archive".into(), "knowledge".into()],
+            quarantined_graphs: vec![omnigraph_cluster::ServingBlockedGraph {
+                graph_id: "archive".into(),
+                root: std::path::PathBuf::new(),
+            }],
+        };
+        served_graph(&snapshot, "knowledge").unwrap();
+        for (graph, code, says) in [
+            (
+                "archive",
+                ErrorCode::GraphUnavailable,
+                "a recovery is pending",
+            ),
+            ("missing", ErrorCode::NotFound, "archive, knowledge"),
+        ] {
+            let refused = served_graph(&snapshot, graph).unwrap_err();
+            let refusal = refused.downcast_ref::<CliRefusal>().unwrap();
+            assert_eq!(refusal.code, code, "{graph}");
+            assert!(
+                refusal.message.contains(says),
+                "{graph}: {}",
+                refusal.message
+            );
+        }
     }
 }

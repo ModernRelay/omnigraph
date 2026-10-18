@@ -79,7 +79,33 @@ where
         explicit_config,
     };
     validate_cluster_arguments(&parsed.cli, parsed.explicit_config)?;
+    validate_credential_arguments(&parsed.cli)?;
     Ok(parsed)
+}
+
+/// `login` and `logout` name exactly one credential: a server, `--api` or
+/// `--target`. `--target` is global, so subcommand validation cannot see it
+/// when it precedes `login`.
+fn validate_credential_arguments(cli: &Cli) -> std::result::Result<(), clap::Error> {
+    let (Command::Login { name, api, .. } | Command::Logout { name, api, .. }) = &cli.command
+    else {
+        return Ok(());
+    };
+    match [name.is_some(), api.is_some(), cli.target.is_some()]
+        .into_iter()
+        .filter(|named| *named)
+        .count()
+    {
+        1 => Ok(()),
+        0 => Err(Cli::command().error(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "name a server, or pass --api <ORIGIN> or --target <NAME>",
+        )),
+        _ => Err(Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "pass one of a server name, --api and --target",
+        )),
+    }
 }
 
 /// Cross-level argument relations must be checked after Clap propagates global
@@ -246,6 +272,45 @@ mod tests {
                 panic!("expected cluster plan");
             };
             assert_eq!(config, PathBuf::from(expected_path));
+        }
+    }
+
+    #[test]
+    fn login_and_logout_name_one_credential_wherever_target_appears() {
+        for verb in ["login", "logout"] {
+            for args in [
+                vec!["omnigraph", "--target", "staging", verb],
+                vec!["omnigraph", verb, "--target", "staging"],
+                vec!["omnigraph", verb, "dev"],
+                vec!["omnigraph", verb, "--api", "https://control.example"],
+            ] {
+                assert!(parse_from(args.clone()).is_ok(), "{args:?}");
+            }
+            for (args, kind) in [
+                (vec!["omnigraph", verb], ErrorKind::MissingRequiredArgument),
+                (
+                    vec!["omnigraph", "--target", "staging", verb, "dev"],
+                    ErrorKind::ArgumentConflict,
+                ),
+                (
+                    vec!["omnigraph", verb, "dev", "--target", "staging"],
+                    ErrorKind::ArgumentConflict,
+                ),
+                (
+                    vec![
+                        "omnigraph",
+                        "--target",
+                        "staging",
+                        verb,
+                        "--api",
+                        "https://c.example",
+                    ],
+                    ErrorKind::ArgumentConflict,
+                ),
+            ] {
+                let error = parse_from(args.clone()).unwrap_err();
+                assert_eq!(error.kind(), kind, "{args:?}");
+            }
         }
     }
 

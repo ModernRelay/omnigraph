@@ -5740,6 +5740,50 @@ fn target_commands_edit_one_entry_and_keep_the_rest_of_the_file() {
     assert!(text.starts_with(original), "{text}");
     assert!(!text.contains("local:"), "{text}");
     assert!(text.contains("  staging:"), "{text}");
+
+    // An edit whose result meets a closed stdout took effect, so it exits
+    // unknown (2), never the 1 that says nothing changed.
+    {
+        use std::io::Write as _;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let mut child = cli_process()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["target", "add", "late", "--json"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(writer))
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"kind":"direct","scope":"graph","uri":"/data/late.omni"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(r#""execution":"unknown""#),
+            "{output:?}"
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains("  late:"));
+    }
+
+    // A file every command refuses reports its code through every reader,
+    // listings and graph commands alike.
+    fs::write(&path, "target_config_version: 2\ntargets: {}\n").unwrap();
+    let refused = target(&["list", "--json"], None);
+    assert_eq!(json(&refused)["code"], "target_invalid", "{refused:?}");
+    let refused = cli()
+        .env("OMNIGRAPH_HOME", home.path())
+        .args(["snapshot", "--server", "http://127.0.0.1:1", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json(&refused)["code"], "target_invalid", "{refused:?}");
 }
 
 /// `login --target` stores a token under the target's credential owner, and
@@ -5880,6 +5924,21 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
     let nobody = decide(None, "feature");
     assert!(actions(&nobody, "graph_wide").is_empty(), "{nobody}");
     assert!(actions(&nobody, "actions").is_empty(), "{nobody}");
+    // A graph the cluster does not serve has no policy to read, so access
+    // refuses rather than report every action allowed.
+    let unknown = output_failure(
+        cli()
+            .arg("access")
+            .arg("--cluster")
+            .arg(cluster.path())
+            .args(["--graph", "missing", "--json"]),
+    );
+    let refusal = parse_stdout_json(&unknown);
+    assert_eq!(refusal["code"], "not_found", "{refusal}");
+    assert!(
+        refusal["error"].as_str().unwrap().contains("knowledge"),
+        "{refusal}"
+    );
 
     // A standalone graph without a policy allows every action.
     let temp = tempdir().unwrap();

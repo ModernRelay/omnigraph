@@ -113,7 +113,9 @@ with the target's token. For direct storage the CLI decides itself
 (`source: direct`) for the actor `--as` or `operator.actor` names: a cluster
 graph by its applied policy, which allows nothing without an actor, and a
 standalone graph, which carries no policy, allows every action, as direct writes
-do. It also accepts `--server`, `--store`, `--cluster` and `--profile`.
+do. A cluster graph the cluster does not apply refuses with `not_found`, and
+one it quarantined with `graph_unavailable`, as a server refuses them. It also
+accepts `--server`, `--store`, `--cluster` and `--profile`.
 
 ## Listing and editing targets
 
@@ -147,7 +149,8 @@ by rename. A file it cannot edit that way, such as one whose `targets` is a flow
 mapping or indented with tabs, refuses with `config_not_editable`; edit it by hand.
 
 Each refusal carries its `code`, and the `target` and `credential` commands
-report an `outcome` of `not_started`; see
+report an `outcome` of `not_started`, except an edit that fails after it
+replaced the file, which reports `unknown`; see
 [failed commands](../operations/troubleshooting.md#failed-data-write-commands).
 `omnigraph version --json` reports the output versions as `protocols.target`,
 `protocols.credential` and `protocols.access`. `target list` and `target show`

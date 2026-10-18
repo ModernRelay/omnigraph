@@ -363,7 +363,7 @@ fn legacy_login_and_managed_login_are_exclusive() {
         ],
         vec!["logout", "prod", "--api", "https://control.example"],
     ] {
-        assert!(Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).is_err());
+        assert!(crate::invocation::parse_from(std::iter::once("omnigraph").chain(args)).is_err());
     }
     for value in ["0", "3601"] {
         assert!(

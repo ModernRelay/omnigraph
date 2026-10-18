@@ -35,19 +35,23 @@ pub(crate) async fn run_queries(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let cluster = require_cluster_scope(
+    let ClusterScope {
+        root: cluster,
+        default_graph,
+    } = require_cluster_scope(
         scope.operator,
         scope.cluster,
         scope.profile,
         "queries",
         stderr,
     )?;
+    let graph = scope.graph.or(default_graph.as_deref());
     match command {
         QueriesCommand::Validate { json } => {
-            return execute_queries_validate(&cluster, scope.graph, json, stdout).await;
+            return execute_queries_validate(&cluster, graph, json, stdout).await;
         }
         QueriesCommand::List { json } => {
-            execute_queries_list(&cluster, scope.graph, json, stdout).await?;
+            execute_queries_list(&cluster, graph, json, stdout).await?;
         }
     }
     Ok(Completion::success())
@@ -62,14 +66,17 @@ pub(crate) async fn run_policy(
     // Policy tooling sources the Cedar bundle(s) from the cluster's
     // applied policies (RFC-011): --cluster <dir>, + the global --graph
     // to pick a graph's bundle when several apply.
-    let cluster = require_cluster_scope(
+    let ClusterScope {
+        root: cluster,
+        default_graph,
+    } = require_cluster_scope(
         scope.operator,
         scope.cluster,
         scope.profile,
         "policy",
         stderr,
     )?;
-    let graph = scope.graph;
+    let graph = scope.graph.or(default_graph.as_deref());
     let graph_id = match graph {
         Some(id) => graph_resource_id_for_selection(Some(id), ""),
         None => graph_resource_id_for_selection(None, "default"),
@@ -150,23 +157,43 @@ pub(crate) async fn run_graphs(
     Ok(Completion::success())
 }
 
+/// The cluster a control-plane tooling command (`policy`, `queries`) reads,
+/// and the graph its target names by default.
+struct ClusterScope {
+    root: String,
+    default_graph: Option<String>,
+}
+
 /// Resolve the cluster for a control-plane tooling command (`policy`,
-/// `queries`) from `--cluster`. A configured name (`clusters:` in operator
-/// config) is rewritten to its root; a literal dir / `s3://`/`az://`/`file://` root is
-/// passed through. A `--profile`/`OMNIGRAPH_PROFILE` cluster binding also
-/// resolves here when `--cluster` is absent. No omnigraph.yaml.
+/// `queries`), in the order every command resolves its address: `--target`,
+/// a complete address no other flag may add to; `--cluster`, where a
+/// configured name (`clusters:` in operator config) is rewritten to its root
+/// and a literal dir / `s3://`/`az://`/`file://` root is passed through; a
+/// `--profile`/`OMNIGRAPH_PROFILE` cluster binding; then `defaults.target`.
+/// No omnigraph.yaml.
 fn require_cluster_scope(
     input: &operator::InvocationConfig,
     cluster: Option<&str>,
     profile: Option<&str>,
     command: &str,
     stderr: &mut dyn Write,
-) -> Result<String> {
+) -> Result<ClusterScope> {
     let op = input.get(stderr)?;
-    let resolve_name = |name: &str| {
-        op.cluster_root(name)
+    if let Some(name) = input.target() {
+        if let Some(other) = cluster
+            .map(|_| "--cluster")
+            .or(profile.map(|_| "--profile"))
+        {
+            bail!("--target and {other} are mutually exclusive — a target is a complete address");
+        }
+        return cluster_of_target(op, name, command);
+    }
+    let resolve_name = |name: &str| ClusterScope {
+        root: op
+            .cluster_root(name)
             .map(str::to_string)
-            .unwrap_or_else(|| name.to_string())
+            .unwrap_or_else(|| name.to_string()),
+        default_graph: None,
     };
     if let Some(cluster) = cluster {
         return Ok(resolve_name(cluster));
@@ -181,10 +208,33 @@ fn require_cluster_scope(
             return Ok(resolve_name(&cluster));
         }
     }
+    if let Some(name) = op.default_target() {
+        return cluster_of_target(op, name, command);
+    }
     bail!(
         "`{command}` needs a cluster — pass --cluster <dir|uri> (or a name from `clusters:` \
-         in ~/.omnigraph/config.yaml), or select a cluster profile"
+         in ~/.omnigraph/config.yaml), select a cluster profile, or name a cluster-root target"
     )
+}
+
+/// A named target's cluster, which only a direct cluster-root target names.
+fn cluster_of_target(
+    op: &operator::OperatorConfig,
+    name: &str,
+    command: &str,
+) -> Result<ClusterScope> {
+    match op.target(name)?.binding(name)? {
+        crate::targets::TargetBinding::DirectRoot { uri, default_graph } => Ok(ClusterScope {
+            root: uri,
+            default_graph,
+        }),
+        _ => Err(crate::helpers::CliRefusal::report(
+            omnigraph_api_types::ErrorCode::TargetKindUnsupported,
+            format!(
+                "`{command}` reads a cluster's applied state; target '{name}' is not a cluster root (`kind: direct`, `scope: root`)"
+            ),
+        )),
+    }
 }
 
 /// Read a cluster's serving snapshot for a control-plane tooling command,

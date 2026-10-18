@@ -1014,7 +1014,23 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
                     "{output:?}"
                 );
             } else {
-                assert_eq!(parse_stdout_json(&output), refusal, "{output:?}");
+                // An alias is a read: its refusal reports the outcome a
+                // `query` does, with nothing started.
+                let mut reported = parse_stdout_json(&output);
+                assert_eq!(
+                    reported["outcome"],
+                    serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
+                    "{output:?}"
+                );
+                assert_eq!(reported["http_status"], 403, "{output:?}");
+                let reported = reported.as_object_mut().unwrap();
+                reported.remove("outcome");
+                reported.remove("http_status");
+                assert_eq!(
+                    serde_json::Value::Object(reported.clone()),
+                    refusal,
+                    "{output:?}"
+                );
                 assert!(
                     !stderr_string(&output).contains("captured alias denied"),
                     "{output:?}"
@@ -1281,6 +1297,47 @@ fn queries_list_prints_registered_query() {
     assert!(
         stdout.contains("$name: String"),
         "list should show typed params; stdout:\n{stdout}"
+    );
+
+    // A cluster-root target addresses it too, named or as `defaults.target`,
+    // and as a complete address it excludes `--cluster`.
+    let home = tempfile::tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "target_config_version: 1\ndefaults:\n  target: ops\ntargets:\n  ops:\n    kind: direct\n    scope: root\n    uri: '{}'\n  \
+             remote:\n    kind: server\n    endpoint: https://graphs.example\n    auth: anonymous\n",
+            cluster.path().display()
+        ),
+    )
+    .unwrap();
+    for args in [&["--target", "ops"][..], &[][..]] {
+        let output = output_success(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["queries", "list"])
+                .args(args),
+        );
+        assert!(stdout_string(&output).contains("find_person"), "{args:?}");
+    }
+    let refused = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["queries", "list", "--target", "ops", "--cluster"])
+            .arg(cluster.path()),
+    );
+    assert!(
+        stderr_string(&refused).contains("mutually exclusive"),
+        "{refused:?}"
+    );
+    let refused = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["queries", "list", "--target", "remote"]),
+    );
+    assert!(
+        stderr_string(&refused).contains("not a cluster root"),
+        "{refused:?}"
     );
 }
 

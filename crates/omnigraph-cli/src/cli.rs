@@ -247,8 +247,9 @@ pub(crate) enum Command {
     /// piped on stdin; see the CLI reference for token resolution.
     Login {
         /// Server name (keys the credential; declare its url under
-        /// `servers:` in ~/.omnigraph/config.yaml)
-        #[arg(required_unless_present_any = ["api", "target"], conflicts_with_all = ["api", "target"])]
+        /// `servers:` in ~/.omnigraph/config.yaml). Exactly one of it, `--api`
+        /// and `--target` is required, checked after parsing.
+        #[arg(conflicts_with = "api")]
         name: Option<String>,
         /// Reuse or renew a managed session; use browser device authorization when needed.
         #[arg(long, conflicts_with = "token")]
@@ -266,7 +267,8 @@ pub(crate) enum Command {
     /// Remove a named server's stored credential, or with --target a server
     /// target's. Idempotent.
     Logout {
-        #[arg(required_unless_present_any = ["api", "target"], conflicts_with_all = ["api", "target"])]
+        /// Server name; exactly one of it, `--api` and `--target`.
+        #[arg(conflicts_with = "api")]
         name: Option<String>,
         /// Revoke the managed session and remove its OS keychain entry.
         #[arg(long)]
