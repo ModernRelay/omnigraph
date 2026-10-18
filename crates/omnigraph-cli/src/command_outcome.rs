@@ -47,6 +47,28 @@ pub(crate) fn applies(cli: &Cli) -> bool {
     )
 }
 
+/// Commands whose requests are observed without a classified outcome: a
+/// served cluster command reports its own failures, but a refused `--as`
+/// assertion still exits as the condition it is.
+pub(crate) fn observes(cli: &Cli) -> bool {
+    applies(cli) || matches!(&cli.command, Command::Cluster { .. })
+}
+
+/// Whether `error` is a refused `--as` assertion and nothing the command sent
+/// before it could have had effects. The server refuses the assertion before
+/// any effect whatever the method, so the refused request ran nothing.
+pub(crate) fn actor_assertion_refused(error: &Report, evidence: &Evidence) -> bool {
+    error
+        .downcast_ref::<RemoteErrorCli>()
+        .is_some_and(|remote| {
+            remote.status == StatusCode::PRECONDITION_FAILED
+                && remote.output.code == Some(ErrorCode::ActorMismatch)
+        })
+        && !evidence.writable_open
+        && (evidence.dispatched == 0
+            || (evidence.dispatched == 1 && evidence.last_request_effectful))
+}
+
 pub(crate) async fn observe<F: std::future::Future>(future: F) -> (F::Output, Evidence) {
     let evidence = Arc::new(Mutex::new(Evidence::default()));
     let output = COMMAND.scope(evidence.clone(), future).await;
@@ -175,10 +197,7 @@ impl Failure {
             evidence.dispatched == 1 && evidence.last_request_effectful && !evidence.writable_open;
         // A refused `--as` assertion is a condition the caller set, like a
         // graph-commit precondition: nothing ran.
-        let actor_mismatch = remote.is_some_and(|remote| {
-            remote.status == StatusCode::PRECONDITION_FAILED
-                && remote.output.code == Some(ErrorCode::ActorMismatch)
-        }) && single;
+        let actor_mismatch = actor_assertion_refused(&error, &evidence);
         let conditional = (precondition.is_some_and(|value| value.http_status == Some(412))
             && single)
             || actor_mismatch;

@@ -114,13 +114,13 @@ A client that means to act as a particular actor sends
 `Omnigraph-Expect-Actor: <actor>` with any protected request, `/mcp` included.
 The server compares it with the actor the credential resolved to, after
 authentication and the contract check and before graph lookup, body decoding
-or any effect:
-
-a match changes nothing, a mismatch is `412 actor_mismatch` with nothing run (a
-server without authentication resolves no actor), and a repeated or padded
-header is `400 bad_request`. The header only narrows a request; it never
-supplies the actor. The CLI sends it for `--as` on served writes and `cluster
---server` commands.
+or any effect: a match changes nothing, a mismatch is `412 actor_mismatch` with
+nothing run (a server without authentication resolves no actor), and a repeated
+or padded header is `400 bad_request`. The header only narrows a request; it
+never supplies the actor. Every response lists `expect-actor` in
+`Omnigraph-Http-Api-Assertions`, since a server that does not would ignore the
+header: the CLI sends it for `--as` on served writes and `cluster --server`
+commands only to a server that lists it, and otherwise refuses before sending.
 
 ### Signed data credentials
 

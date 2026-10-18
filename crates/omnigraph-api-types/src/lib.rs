@@ -37,6 +37,13 @@ pub const HTTP_API_CONTRACT: &str = "0.13";
 /// [`ErrorCode::ActorMismatch`] before graph lookup or effects; a matching
 /// value changes nothing, so the header can only narrow a request.
 pub const EXPECT_ACTOR_HEADER: &str = "omnigraph-expect-actor";
+/// The response header naming, comma-separated, the request assertions a
+/// server enforces. The contract identifier does not attest them: a server
+/// built before an assertion existed ignores its header and omits it here, so
+/// a client sends an assertion only to a server that lists it.
+pub const HTTP_API_ASSERTIONS_HEADER: &str = "omnigraph-http-api-assertions";
+/// The [`HTTP_API_ASSERTIONS_HEADER`] entry for [`EXPECT_ACTOR_HEADER`].
+pub const EXPECT_ACTOR_ASSERTION: &str = "expect-actor";
 
 /// How a binary identifies its build: the one derivation the CLI's
 /// `omnigraph version`, the server's `/healthz` and its MCP server info all

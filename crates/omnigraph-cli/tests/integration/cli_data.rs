@@ -3609,7 +3609,8 @@ fn server_scope_refuses_a_non_server_scheme_issue_979() {
 fn as_on_a_served_write_asserts_the_actor() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
     use omnigraph_api_types::{
-        EXPECT_ACTOR_HEADER, HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
+        EXPECT_ACTOR_ASSERTION, EXPECT_ACTOR_HEADER, HTTP_API_ASSERTIONS_HEADER as ASSERTIONS,
+        HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
     };
 
     // A served write resolves its actor from the bearer token. `--as` rides
@@ -3630,7 +3631,10 @@ fn as_on_a_served_write_asserts_the_actor() {
         let server = IntentApiFixture::new(vec![
             IntentReply {
                 status: 200,
-                headers: vec![(HEADER.into(), CONTRACT.into())],
+                headers: vec![
+                    (HEADER.into(), CONTRACT.into()),
+                    (ASSERTIONS.into(), EXPECT_ACTOR_ASSERTION.into()),
+                ],
                 body: vec![],
             },
             IntentReply {
@@ -3664,6 +3668,31 @@ fn as_on_a_served_write_asserts_the_actor() {
             "{write:?}: {write_request:?}"
         );
         server.assert_complete();
+
+        // A server that does not list the assertion would ignore the header
+        // and run the write as the credential's actor, so nothing is sent.
+        let older = IntentApiFixture::new(vec![IntentReply {
+            status: 200,
+            headers: vec![(HEADER.into(), CONTRACT.into())],
+            body: vec![],
+        }]);
+        let output = cli()
+            .args(write)
+            .args(["--server", &older.origin, "--graph", "knowledge"])
+            .args(["--as", "act-nope", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{write:?}: {output:?}");
+        let error = parse_stdout_json(&output);
+        assert_eq!(error["code"], "api_contract_mismatch", "{write:?}: {error}");
+        assert_eq!(error["request_dispatched"], false, "{write:?}: {error}");
+        assert!(
+            error["error"].as_str().unwrap().contains("--as"),
+            "{write:?}: {error}"
+        );
+        let requests = older.requests();
+        assert_eq!(requests.len(), 1, "{write:?}: only discovery: {requests:?}");
+        older.assert_complete();
     }
 }
 

@@ -3655,6 +3655,21 @@ async fn expected_actor_header_narrows_a_request_and_never_supplies_an_actor() {
         "branch": "feature",
     });
 
+    // Public discovery attests the assertion, so a client sends it only to a
+    // server that enforces it.
+    let discovery = app
+        .clone()
+        .oneshot(Request::head("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        discovery
+            .headers()
+            .get(omnigraph_server::api::HTTP_API_ASSERTIONS_HEADER)
+            .unwrap(),
+        omnigraph_server::api::EXPECT_ACTOR_ASSERTION
+    );
+
     // A matching assertion changes nothing.
     let (status, body) = json_response(
         &app,
