@@ -211,9 +211,9 @@ acceptance before completion, activation-in-progress observation and exact recei
 access after management handoff. It also holds a merge across served schema
 planning to prove preview does not wait for the graph gate, and its
 `owned_shutdown` journeys own process containment: a panic or an uncertain
-owned write exits 2 and retains the lock, while a served write whose storage
-request fails on one of Lance's write-once table files is a 500 the server
-keeps serving through, with a clean SIGTERM still releasing the lock. In-source
+owned write exits 2 and retains the lock, while a proven unpublished staging
+failure with settled storage I/O is a 500 the server keeps serving through,
+with a clean SIGTERM still releasing the lock. In-source
 `deployment` tests suspend observer read futures across owner start, finish and complete
 turnover, exercising bounded re-observation for aggregate and exact status.
 CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
