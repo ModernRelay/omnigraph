@@ -1014,7 +1014,23 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
                     "{output:?}"
                 );
             } else {
-                assert_eq!(parse_stdout_json(&output), refusal, "{output:?}");
+                // An alias is a read: its refusal reports the outcome a
+                // `query` does, with nothing started.
+                let mut reported = parse_stdout_json(&output);
+                assert_eq!(
+                    reported["outcome"],
+                    serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
+                    "{output:?}"
+                );
+                assert_eq!(reported["http_status"], 403, "{output:?}");
+                let reported = reported.as_object_mut().unwrap();
+                reported.remove("outcome");
+                reported.remove("http_status");
+                assert_eq!(
+                    serde_json::Value::Object(reported.clone()),
+                    refusal,
+                    "{output:?}"
+                );
                 assert!(
                     !stderr_string(&output).contains("captured alias denied"),
                     "{output:?}"

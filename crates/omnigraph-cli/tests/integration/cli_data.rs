@@ -5741,6 +5741,38 @@ fn target_commands_edit_one_entry_and_keep_the_rest_of_the_file() {
     assert!(!text.contains("local:"), "{text}");
     assert!(text.contains("  staging:"), "{text}");
 
+    // An edit whose result meets a closed stdout took effect, so it exits
+    // unknown (2), never the 1 that says nothing changed.
+    {
+        use std::io::Write as _;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let mut child = cli_process()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["target", "add", "late", "--json"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(writer))
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"kind":"direct","scope":"graph","uri":"/data/late.omni"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(r#""execution":"unknown""#),
+            "{output:?}"
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains("  late:"));
+    }
+
     // A file every command refuses reports its code through every reader,
     // listings and graph commands alike.
     fs::write(&path, "target_config_version: 2\ntargets: {}\n").unwrap();

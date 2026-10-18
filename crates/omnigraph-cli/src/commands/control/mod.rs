@@ -186,7 +186,7 @@ fn require_cluster_scope(
         {
             bail!("--target and {other} are mutually exclusive — a target is a complete address");
         }
-        return cluster_of_target(&op, name, command);
+        return cluster_of_target(op, name, command);
     }
     let resolve_name = |name: &str| ClusterScope {
         root: op
@@ -209,7 +209,7 @@ fn require_cluster_scope(
         }
     }
     if let Some(name) = op.default_target() {
-        return cluster_of_target(&op, name, command);
+        return cluster_of_target(op, name, command);
     }
     bail!(
         "`{command}` needs a cluster — pass --cluster <dir|uri> (or a name from `clusters:` \

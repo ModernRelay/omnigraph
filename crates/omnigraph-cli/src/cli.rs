@@ -248,6 +248,7 @@ pub(crate) enum Command {
         /// Server name (keys the credential; declare its url under
         /// `servers:` in ~/.omnigraph/config.yaml). Exactly one of it, `--api`
         /// and `--target` is required, checked after parsing.
+        #[arg(conflicts_with = "api")]
         name: Option<String>,
         /// Reuse or renew a managed session; use browser device authorization when needed.
         #[arg(long, conflicts_with = "token")]
@@ -266,6 +267,7 @@ pub(crate) enum Command {
     /// target's. Idempotent.
     Logout {
         /// Server name; exactly one of it, `--api` and `--target`.
+        #[arg(conflicts_with = "api")]
         name: Option<String>,
         /// Revoke the managed session and remove its OS keychain entry.
         #[arg(long)]
