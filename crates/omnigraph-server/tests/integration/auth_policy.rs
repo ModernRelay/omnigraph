@@ -3752,8 +3752,12 @@ async fn expected_actor_header_narrows_a_request_and_never_supplies_an_actor() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_code(body, ErrorCode::ApiContractMismatch, "contract first");
 
-    // A repeated or padded assertion is malformed.
-    for expected in [&["act-bruno", "act-bruno"][..], &[" act-bruno"][..]] {
+    // A repeated, padded or empty assertion is malformed.
+    for expected in [
+        &["act-bruno", "act-bruno"][..],
+        &[" act-bruno"][..],
+        &[""][..],
+    ] {
         let (status, body) = json_response(
             &app,
             expecting(

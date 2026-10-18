@@ -3700,7 +3700,7 @@ fn as_on_a_served_write_asserts_the_actor() {
 /// `--as` for them as it does for `mutate -e 'commit publish "<id>"'`. A
 /// publication records no publisher: the published commit keeps the actor
 /// and timestamp of the write that created it. The `commit` reads refuse
-/// `--as`; `as_on_a_served_write_is_rejected` owns the served refusal.
+/// `--as`; `as_on_a_served_write_asserts_the_actor` owns the served assertion.
 #[test]
 fn commit_publish_and_drop_take_as_on_a_direct_graph_issue_1023() {
     let temp = tempdir().unwrap();

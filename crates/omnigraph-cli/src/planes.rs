@@ -185,8 +185,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // writes; Blob get/stat are reads and never consume it, while Blob
         // put/clear are writes and do; commit list/show/changes and commit
         // publish/drop split the same way. Served writes
-        // resolve the actor from the bearer token
-        // (rejected downstream with its own message). On `direct`, full-text
+        // resolve the actor from the bearer token and send `--as` as the
+        // `omnigraph-expect-actor` assertion. On `direct`, full-text
         // rebuild attributes its graph publication; other maintenance verbs
         // record no actor. `control` refines per command:
         // Apply/upgrade attribute an actor; plan checks the intended actor

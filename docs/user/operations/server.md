@@ -113,8 +113,8 @@ actions remain denied.
 A client that means to act as a particular actor sends
 `Omnigraph-Expect-Actor: <actor>` with any protected request, `/mcp` included.
 The server compares it with the actor the credential resolved to, after
-authentication and the contract check and before graph lookup, body decoding
-or any effect: a match changes nothing, a mismatch is `412 actor_mismatch` with
+authentication and the contract check (`/mcp` has none) and before graph
+lookup, body decoding or any effect: a match changes nothing, a mismatch is `412 actor_mismatch` with
 nothing run (a server without authentication resolves no actor), and a repeated
 or padded header is `400 bad_request`. The header only narrows a request; it
 never supplies the actor. Every response lists `expect-actor` in
