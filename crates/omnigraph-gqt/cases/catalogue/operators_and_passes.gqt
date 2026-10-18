@@ -45,6 +45,9 @@ query operators() {
 {"o.name":"Projection","o.inputs":[1]}
 {"o.name":"Aggregate","o.inputs":[1]}
 {"o.name":"Sort","o.inputs":[1]}
+{"o.name":"CsvSource","o.inputs":[0]}
+{"o.name":"Validate","o.inputs":[1]}
+{"o.name":"FragmentWrite","o.inputs":[1]}
 
 --- expect shape
 o.name: String
@@ -92,8 +95,10 @@ query logical_kinds() {
 --- expect unordered
 {"k.name":"Aggregate","k.coverage":"refused_by_name"}
 {"k.name":"AntiJoin","k.coverage":"refused_by_name"}
+{"k.name":"CsvSource","k.coverage":"refused_by_name"}
 {"k.name":"Expand","k.coverage":"refused_by_name"}
 {"k.name":"Filter","k.coverage":"routable"}
+{"k.name":"FragmentWrite","k.coverage":"refused_by_name"}
 {"k.name":"Join","k.coverage":"routable"}
 {"k.name":"Limit","k.coverage":"routable"}
 {"k.name":"MergeClassify","k.coverage":"routable"}
@@ -106,6 +111,7 @@ query logical_kinds() {
 {"k.name":"Sort","k.coverage":"routable"}
 {"k.name":"TableScan","k.coverage":"routable"}
 {"k.name":"TextSearch","k.coverage":"refused_by_name"}
+{"k.name":"Validate","k.coverage":"refused_by_name"}
 
 --- expect shape
 k.name: String

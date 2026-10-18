@@ -8,10 +8,20 @@ const STORAGE_MESSAGE_PREFIX: &str = "storage: ";
 
 /// Evidence supplied by the operation that owns its effect boundary, independent
 /// of the error's cause. This does not authorize replay or prove native I/O drain.
+///
+/// `BeforeEffect` and `Unpublished` are definite: a caller deciding whether the
+/// write may have become graph-visible can treat either as "it did not".
+/// `Uncertain` is sticky through every composition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionEvidence {
     /// The owning operation has not attempted any durable effect.
     BeforeEffect,
+    /// The owning operation attempted no publication. Every durable effect it
+    /// may have left (a staged data file, a detached table version, its
+    /// transaction file) is one no `__manifest` version names, so the graph
+    /// did not move and the collector reclaims the effect once its recorded
+    /// authority is gone.
+    Unpublished,
     /// The owning operation cannot establish settled completion.
     Uncertain,
 }
@@ -216,6 +226,15 @@ pub enum OmniError {
         "full-text index '{index}' requires rebuild: {reason}; run omnigraph rebuild-full-text-indexes <URI> --branch <branch> on the live branch (historical snapshots are unchanged)"
     )]
     FullTextIndexRebuildRequired { index: String, reason: String },
+    /// A full-text call reads a declared full-text index that has no segment
+    /// at the query's snapshot, so no segment carries the index's analyzer
+    /// and Lance would match with a bare, case-sensitive tokenizer. Refused
+    /// before any scan rather than answered differently; `index` is
+    /// `Type.property`.
+    #[error(
+        "full-text index '{index}' has no segment at this snapshot; build it with omnigraph optimize <URI> on main or omnigraph rebuild-full-text-indexes <URI> --branch <branch> (historical snapshots are unchanged)"
+    )]
+    FullTextIndexRequired { index: String },
     /// The exact staged-commit adapter proved that Lance contention was
     /// effect-free. This operation-local signal lets RFC-023 distinguish a
     /// safe key-fence re-evaluation from an arbitrary storage failure; generic
@@ -560,8 +579,43 @@ impl OmniError {
         self.with_completion_evidence(CompletionEvidence::BeforeEffect)
     }
 
-    /// Remove only a sub-operation's no-effect proof when composing it after
-    /// earlier work. Never erase explicit uncertainty or recovery evidence.
+    /// Mark a failure between the first durable effect and the publisher
+    /// call: nothing is graph-visible. Only an opaque failure needs the
+    /// mark, one whose type alone leaves open whether the graph moved
+    /// (storage, I/O, DataFusion, an internal manifest or Blob integrity
+    /// error); a typed outcome (a conflict, a precondition, a validation or
+    /// policy refusal, not found, bad request) already states what happened
+    /// and stays as it is, so callers matching on it see the same shape.
+    /// An error that already carries evidence keeps it: `BeforeEffect` is
+    /// the stronger definite claim, and a composer that knows effects
+    /// happened since removes it with [`Self::without_pre_effect_evidence`]
+    /// first; explicit uncertainty is never touched.
+    pub fn unpublished(self) -> Self {
+        if self.completion_evidence().is_some() || !self.outcome_opaque() {
+            return self;
+        }
+        self.with_completion_evidence(CompletionEvidence::Unpublished)
+    }
+
+    /// Whether the type of this failure leaves open what happened to the
+    /// graph. These are the failures a transport can only call internal.
+    fn outcome_opaque(&self) -> bool {
+        matches!(
+            self.without_evidence(),
+            Self::Storage(_)
+                | Self::Io(_)
+                | Self::DataFusion(_)
+                | Self::BlobIntegrity { .. }
+                | Self::Manifest(ManifestError {
+                    kind: ManifestErrorKind::Internal,
+                    ..
+                })
+        )
+    }
+
+    /// Remove a sub-operation's definite proof (no effect, or no
+    /// publication) when composing it after earlier durable work that may
+    /// have published. Never erase explicit uncertainty or recovery evidence.
     pub fn without_pre_effect_evidence(self) -> Self {
         let (source, evidence) = self.into_completion_evidence();
         match evidence {
@@ -1268,6 +1322,128 @@ mod tests {
         }
         let changed = OmniError::manifest_read_set_changed("head", None, None).before_effect();
         assert!(changed.is_read_set_changed());
+    }
+
+    /// A failure between the first durable effect and the publisher call is
+    /// definite: the outer composer's `Unpublished` wins over an inner
+    /// `BeforeEffect`, uncertainty wins over both, and composition after
+    /// earlier published work strips it like a no-effect proof.
+    #[test]
+    fn unpublished_evidence_is_definite_and_never_hides_uncertainty_issue_1067() {
+        let staged = OmniError::Storage(StorageFailure::new(
+            StorageFailureKind::Transient,
+            "storage: detached manifest put failed",
+        ))
+        .unpublished();
+        assert_eq!(
+            staged.completion_evidence(),
+            Some(CompletionEvidence::Unpublished)
+        );
+        assert_eq!(
+            staged.to_string(),
+            "storage: detached manifest put failed",
+            "the wrapper is transparent in the message"
+        );
+        let (cause, evidence) = staged.into_completion_evidence();
+        assert_eq!(evidence, Some(CompletionEvidence::Unpublished));
+        assert!(matches!(cause, OmniError::Storage(_)));
+
+        // A sub-operation's own no-effect proof is the stronger definite
+        // claim and survives; a composer that staged effects since strips
+        // it first, and then the no-publication mark applies.
+        let refused = OmniError::manifest_internal("table reached commit without a transaction")
+            .before_effect();
+        assert_eq!(
+            refused.to_string(),
+            OmniError::manifest_internal("table reached commit without a transaction").to_string()
+        );
+        assert_eq!(
+            OmniError::manifest_internal("refused before any effect")
+                .before_effect()
+                .unpublished()
+                .completion_evidence(),
+            Some(CompletionEvidence::BeforeEffect)
+        );
+        assert_eq!(
+            OmniError::manifest_internal("refused before any effect")
+                .before_effect()
+                .without_pre_effect_evidence()
+                .unpublished()
+                .completion_evidence(),
+            Some(CompletionEvidence::Unpublished)
+        );
+        assert_eq!(
+            OmniError::Io(std::io::Error::other("marked twice"))
+                .unpublished()
+                .unpublished()
+                .completion_evidence(),
+            Some(CompletionEvidence::Unpublished),
+            "a repeated mark adds nothing"
+        );
+        for opaque in [
+            OmniError::Io(std::io::Error::other("data file put failed")),
+            OmniError::DataFusion("execution failure".into()),
+            OmniError::blob_integrity("descriptor mismatch"),
+            OmniError::manifest_internal("coordinator view is stale"),
+        ] {
+            let message = opaque.to_string();
+            assert_eq!(
+                opaque.unpublished().completion_evidence(),
+                Some(CompletionEvidence::Unpublished),
+                "{message}"
+            );
+        }
+
+        // A typed outcome already says what happened: it keeps its shape, so
+        // a caller matching on the variant sees the same error.
+        for typed in [
+            OmniError::manifest("bad request"),
+            OmniError::manifest_conflict("authority conflict"),
+            OmniError::manifest_read_set_changed("graph_head:main", None, None),
+            OmniError::KeyConflict {
+                type_key: "node:Person".into(),
+                entity_id: Some("alice".into()),
+            },
+            OmniError::PreconditionFailed {
+                branch: "main".into(),
+                expected: "old".into(),
+                actual: Some("current".into()),
+            },
+            OmniError::Policy("denied".into()),
+        ] {
+            let message = typed.to_string();
+            let marked = typed.unpublished();
+            assert_eq!(marked.completion_evidence(), None, "{message}");
+            assert!(!matches!(marked, OmniError::Completion { .. }), "{message}");
+        }
+
+        for uncertain in [
+            OmniError::manifest_publish_in_doubt("publish acknowledgement lost"),
+            OmniError::recovery_required("commit", "contract pending"),
+            OmniError::manifest("returned after effects")
+                .with_completion_evidence(CompletionEvidence::Uncertain),
+        ] {
+            let message = uncertain.to_string();
+            let marked = uncertain.unpublished();
+            assert_eq!(
+                marked.completion_evidence(),
+                Some(CompletionEvidence::Uncertain),
+                "{message}"
+            );
+            assert_eq!(
+                marked.to_string(),
+                message,
+                "explicit uncertainty is returned as it was"
+            );
+        }
+        assert_eq!(
+            OmniError::Io(std::io::Error::other("no publication"))
+                .unpublished()
+                .without_pre_effect_evidence()
+                .completion_evidence(),
+            None,
+            "composition after earlier published work drops the definite proof"
+        );
     }
 
     fn supported_stream_failures() -> Vec<OmniError> {

@@ -1,0 +1,116 @@
+# issue: 789
+# red_on: 2026-10-17, main 9575b044: step 1 is refused at planning with `P001: bm25() orders $d, a traversal destination` instead of answering `d1`.
+# notes: A bm25 order ranks the binding it names whatever the match block declares first: the ranked binding roots its traversal component, and the other bindings are reached from it in either direction (forward, reverse, undirected, two hops).
+# notes: A ranked binding only a traversal introduces gets a scan of its checked type; d0, the best match, is reachable only from p2, so a ranking that ignored the traversal would return it. Two paths to one document keep both rows.
+# notes: The nearest and rrf forms are in issue_789_nearest_and_rrf_rank_a_reached_binding.gqt, over the same fixture.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+node Doc {
+    slug: String @key
+    body: String @index
+    embedding: Vector(2) @index
+}
+edge Knows: Person -> Doc
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Person","data":{"name":"p1"}}
+{"type":"Person","data":{"name":"p2"}}
+{"type":"Person","data":{"name":"p3"}}
+{"type":"Doc","data":{"slug":"d0","body":"needle needle needle","embedding":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","body":"needle","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2","body":"filler","embedding":[2.0,0.0]}}
+{"type":"Doc","data":{"slug":"d3","body":"needle needle","embedding":[3.0,0.0]}}
+{"type":"Doc","data":{"slug":"d4","body":"filler filler","embedding":[4.0,0.0]}}
+{"edge":"Knows","from":"p1","to":"d1"}
+{"edge":"Knows","from":"p1","to":"d2"}
+{"edge":"Knows","from":"p2","to":"d0"}
+{"edge":"Cites","from":"d1","to":"d3"}
+{"edge":"Cites","from":"d2","to":"d3"}
+{"edge":"Cites","from":"d1","to":"d4"}
+{"edge":"Cites","from":"d3","to":"d0"}
+
+--- query
+query bm25_on_an_undeclared_destination() {
+    match {
+        $p: Person { name: "p1" }
+        $p knows $d
+    }
+    return { $d.slug }
+    order { bm25($d.body, "needle") }
+    limit 3
+}
+--- expect ordered
+{"d.slug":"d1"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked bm25
+--- expect same as v1
+
+--- query
+query bm25_two_hops_from_the_source() {
+    match {
+        $p: Person { name: "p1" }
+        $p knows $x
+        $x cites $d
+    }
+    return { $x.slug, $d.slug }
+    order { bm25($d.body, "needle") }
+    limit 3
+}
+--- expect unordered
+{"x.slug":"d1","d.slug":"d3"}
+{"x.slug":"d2","d.slug":"d3"}
+--- expect shape
+x.slug: String
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked bm25
+--- expect same as v1
+
+--- query
+query bm25_on_a_traversal_source() {
+    match {
+        $t: Doc { slug: "d3" }
+        $d cites $t
+    }
+    return { $d.slug }
+    order { bm25($d.body, "needle") }
+    limit 3
+}
+--- expect ordered
+{"d.slug":"d1"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked bm25
+--- expect same as v1
+
+--- query
+query bm25_over_an_undirected_traversal() {
+    match {
+        $a: Doc { slug: "d3" }
+        $a <cites> $d
+    }
+    return { $d.slug }
+    order { bm25($d.body, "needle") }
+    limit 3
+}
+--- expect ordered
+{"d.slug":"d0"}
+{"d.slug":"d1"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked bm25
+--- expect same as v1

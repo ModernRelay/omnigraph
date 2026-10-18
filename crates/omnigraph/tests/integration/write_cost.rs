@@ -871,3 +871,65 @@ async fn named_write_capture_reuses_the_exact_local_publication() {
     })
     .await;
 }
+
+/// A deterministic cross-run I/O assertion; GQT --measure reports counts,
+/// but baseline differences do not fail a case.
+#[tokio::test]
+async fn load_csv_reuses_endpoint_reads_and_falls_back_under_a_small_pool() {
+    use omnigraph::db::Omnigraph;
+    use omnigraph::loader::{CsvLoadRequest, LoadMode};
+    use omnigraph::settings::{SettingId, SettingValue, Source};
+    use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+    use omnigraph_compiler::query::ast::LoadTarget;
+
+    const SCHEMA: &str = "node Person { name: String @key }\nedge Knows: Person -> Person\n";
+    const PEOPLE: &str = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}"#;
+    cost_harness(async {
+        let source_dir = tempfile::tempdir().unwrap();
+        let csv_path = source_dir.path().join("knows.csv");
+        std::fs::write(&csv_path, "from,to\nAlice,Bob\nBob,Alice\n").unwrap();
+        for mode in [LoadMode::Overwrite, LoadMode::Append, LoadMode::Merge] {
+            let mut counts = Vec::new();
+            for budget in [3 * 1024 * 1024, 150 * 1024 * 1024] {
+                let policy = ExternalBlobPolicy::allow(vec![
+                    ExternalBlobBase::new(
+                        url::Url::from_directory_path(source_dir.path()).unwrap(),
+                        ExternalBlobExecutionScope::EmbeddedOnly,
+                    )
+                    .unwrap(),
+                ])
+                .unwrap();
+                let graph_dir = tempfile::tempdir().unwrap();
+                let mut db = helpers::session(
+                    Omnigraph::init(graph_dir.path().to_str().unwrap(), SCHEMA)
+                        .await
+                        .unwrap()
+                        .with_external_blob_policy(policy)
+                        .unwrap(),
+                );
+                db.load_jsonl(PEOPLE, LoadMode::Overwrite).await.unwrap();
+                db.set(SettingId::QueryMemoryBytes, &SettingValue::Integer(budget), Source::File).unwrap();
+                let request = CsvLoadRequest {
+                    source: format!("file://{}", csv_path.display()),
+                    target: LoadTarget::Edge("Knows".into()),
+                    mode,
+                    delimiter: b',',
+                    header: true,
+                    columns: None,
+                };
+                let (receipt, io) = measure(db.load_csv_as_with_receipt("main", &request, None)).await;
+                let receipt = receipt.unwrap_or_else(|error| panic!("{mode:?}, {budget}: {error}"));
+                assert_eq!(receipt.result.edges_loaded.values().sum::<usize>(), 2);
+                assert_eq!(helpers::count_rows_branch(&db, "main", "edge:Knows").await, 2);
+                assert_eq!(helpers::count_rows_branch(&db, "main", "node:Person").await, 2);
+                counts.push(io);
+            }
+            let [uncached, cached] = counts.as_slice() else { unreachable!() };
+            assert!(cached.data_open_count < uncached.data_open_count,
+                "{mode:?}: repeated endpoints must reuse a pinned table handle; uncached={uncached:?}, cached={cached:?}");
+            assert!(cached.data_reads < uncached.data_reads,
+                "{mode:?}: reuse must reduce total data-table reads; uncached={uncached:?}, cached={cached:?}");
+        }
+    }).await;
+}

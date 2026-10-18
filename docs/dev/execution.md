@@ -87,9 +87,10 @@ an input row's columns into every output row that row produces. What bounds
 multi-hop fan-out is:
 
 - deferred bindings: the compiler's IR lowering gives at most one binding of
-  each connected pattern a `NodeScan`, normally the first declared
-  (`scan_root`), and `Expand` introduces the rest, so connected bindings never
-  become a cross join closed by a filter;
+  each connected pattern a `NodeScan`: the binding the leading search order
+  ranks, else the first declared (`scan_root`). `Expand` introduces the rest,
+  in either direction, so connected bindings never become a cross join closed
+  by a filter;
 - bounded streaming: every `Expand` emits chunks of at most
   `EXPAND_OUTPUT_ROWS` (256) rows through a two-batch producer channel, and a
   downstream `Limit` that stops reading cancels the producer (the `Expand` row
@@ -574,6 +575,9 @@ over a string query, whose embedding needs the embedding client, gets a
 `plan` row `datafusion` naming the reason in place of that tree.
 `Session::explain_query` returns the same document itself. A `.gqt` case's
 `--- expect plan` compares it; case settings and query prefixes apply.
+A load statement's explain (`explain load csv …`) answers the same document
+under the same `explain_version`, its `datafusion` row saying the operators
+are lowered only at execution ([explain.md](../user/queries/explain.md#explaining-a-load-statement)).
 Destination hydration uses the planned projection; edge-property attach
 retains its complete property projection.
 
@@ -876,9 +880,17 @@ recorded fact the snapshot contradicts, or a plan that fails a check
 (well-formedness included), is invalid evidence, a bad request.
 
 Full-text coverage is derived from the index facts the planner reads for the
-pinned dataset (`FullTextCoverage::of_facts`): `absent` without an inverted
+pinned dataset (`FullTextCoverage::of_table`): `absent` without an inverted
 index on the column, `full` only when every inverted segment there reports a
-known coverage of every fragment, `partial` otherwise.
+known coverage of every fragment, `partial` otherwise; a table version with no
+fragment, and a type the snapshot does not hold, are `full`. Resolution reads
+the coverage of every property a full-text call names
+(`optimizer::full_text_targets`: `search`, `fuzzy` and `match_text` in any
+filter, `bm25` in the leading order key or an `rrf()` arm) and refuses
+`absent` with `FullTextIndexRequired`, the typed 409; an untrained segment is
+`partial`, since it carries the analyzer. Acceptance refuses a plan that
+records no coverage, or `absent`, for a call it makes, and replay derives
+every recorded coverage again from the pinned dataset.
 
 ## Search and rank
 
@@ -887,6 +899,14 @@ execution concepts. Rank and score remain columns through downstream
 operations; traversal or projection must not silently discard them. RRF
 executes its sources independently against the same graph snapshot and fuses
 their ordered results.
+
+A ranking is always a root scan. Lowering roots the traversal component that
+holds the ranked binding (both arms' binding for an `rrf()`) at that binding,
+whatever the declaration order; a ranked binding only a traversal introduces
+gets a `NodeScan` of its checked type. The type checker refuses an `rrf()`
+whose arms rank two bindings one traversal connects (`T59`). The planner's
+`rank` therefore treats a ranked dependent scan, a hash join's build side, or
+fusion arms one traversal connects as a lowering defect, an internal error.
 
 BM25 scans have no candidate cap. The final ordering applies the score,
 secondary keys and every binding's identity before the query limit; a full
@@ -968,6 +988,18 @@ All load modes share the mutation publisher and recovery protocol:
 | `Overwrite` | One staged replacement per touched table. |
 | `Append` | Strict insert by exact physical `id`; an existing ID is a typed conflict. The public mode name does not mean a bare Lance Append transaction. |
 | `Merge` | Upsert by exact physical `id`; the last input occurrence wins. |
+
+A `load csv` overwrite is the first write plan: the planner routes
+`Operation::Load` to the engine, which lowers `CsvSource → Validate →
+FragmentWrite` to `CsvSourceExec` (one reader over the captured source),
+`ValidateExec` (a pipeline breaker: one pass over the held delta extracts what
+every check needs, then the checks are judged in refusal order against the
+committed image under each check's access) and DataFusion's `DataSinkExec`
+over `LanceFragmentSink`, which stages the fragments through the mutation
+staging and never commits. The attempt then commits the staged transaction
+detached and publishes once, the epilogue every write shares. Append, merge
+and JSONL loads keep the keyed path below; every load operator runs one
+worker until the parallel source lands.
 
 Mutation insert/update and keyed Load retain the per-table limit of 8,192 rows.
 An immutable `WriteBudget` captures the session's `write_max_bytes` (default

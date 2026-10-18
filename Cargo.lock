@@ -5740,6 +5740,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "csv-core",
  "datafusion",
  "futures",
  "lance",
@@ -5965,6 +5966,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "url",
 ]
 

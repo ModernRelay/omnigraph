@@ -1,0 +1,118 @@
+# issue: 789
+# red_on: 2026-10-17, main 9575b044: step 1 is refused at planning with `P001: nearest() orders $d, a traversal destination` instead of answering `d1`.
+# notes: A nearest or rrf order ranks the binding it names whatever the match block declares first, declared or not: the ranked binding roots its traversal component. d0, the global nearest, is reachable only from p2, so the nearest scan must rank the reached documents, not cut a global top-k.
+# notes: An rrf() over one reached binding answers; its arm windows are the documented rrf populations, so the nearest arm's corpus-wide top two (d0, d1) leave d1 alone after the traversal. A source with no edges returns no rows.
+# notes: The bm25 forms are in issue_789_ranked_binding_roots_its_component.gqt, over the same fixture.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+node Doc {
+    slug: String @key
+    body: String @index
+    embedding: Vector(2) @index
+}
+edge Knows: Person -> Doc
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Person","data":{"name":"p1"}}
+{"type":"Person","data":{"name":"p2"}}
+{"type":"Person","data":{"name":"p3"}}
+{"type":"Doc","data":{"slug":"d0","body":"needle needle needle","embedding":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","body":"needle","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2","body":"filler","embedding":[2.0,0.0]}}
+{"type":"Doc","data":{"slug":"d3","body":"needle needle","embedding":[3.0,0.0]}}
+{"type":"Doc","data":{"slug":"d4","body":"filler filler","embedding":[4.0,0.0]}}
+{"edge":"Knows","from":"p1","to":"d1"}
+{"edge":"Knows","from":"p1","to":"d2"}
+{"edge":"Knows","from":"p2","to":"d0"}
+{"edge":"Cites","from":"d1","to":"d3"}
+{"edge":"Cites","from":"d2","to":"d3"}
+{"edge":"Cites","from":"d1","to":"d4"}
+{"edge":"Cites","from":"d3","to":"d0"}
+
+--- query
+query nearest_on_an_undeclared_destination($q: Vector(2)) {
+    match {
+        $p: Person { name: "p1" }
+        $p knows $d
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 1
+}
+--- params
+{"q": [0.0, 0.0]}
+--- expect ordered
+{"d.slug":"d1"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked nearest fetch 1
+--- expect same as v1
+
+--- query
+query nearest_on_a_destination_declared_second($q: Vector(2)) {
+    match {
+        $p: Person { name: "p1" }
+        $d: Doc
+        $p knows $d
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+--- params
+{"q": [0.0, 0.0]}
+--- expect ordered
+{"d.slug":"d1"}
+{"d.slug":"d2"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked nearest fetch 2
+--- expect same as v1
+
+--- query
+query rrf_over_one_destination($q: Vector(2)) {
+    match {
+        $p: Person { name: "p1" }
+        $p knows $d
+    }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), bm25($d.body, "needle")) }
+    limit 2
+}
+--- params
+{"q": [0.0, 0.0]}
+--- expect ordered
+{"d.slug":"d1"}
+--- expect shape
+d.slug: String
+--- expect same as v1
+
+--- query
+query nearest_from_a_source_with_no_edges($q: Vector(2)) {
+    match {
+        $p: Person { name: "p3" }
+        $p knows $d
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+--- params
+{"q": [0.0, 0.0]}
+--- expect ordered
+
+--- expect shape
+d.slug: String
+--- expect same as v1

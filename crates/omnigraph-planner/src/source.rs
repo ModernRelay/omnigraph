@@ -274,10 +274,11 @@ pub trait PlanSource {
     }
 
     /// How far the full-text index of `property` covers the pinned table
-    /// `type_key` names. The default claims no coverage, the answer under
-    /// which every plan stays correct.
+    /// `type_key` names. The default claims an index of unproven coverage:
+    /// nothing is refused and every bm25 scan filters after scoring, the
+    /// placement under which every plan stays correct.
     fn full_text_coverage(&self, _type_key: &str, _property: &str) -> FullTextCoverage {
-        FullTextCoverage::Absent
+        FullTextCoverage::Partial
     }
 
     /// The fingerprint of the catalogue table `type_key` names at this source:
@@ -291,15 +292,20 @@ pub trait PlanSource {
 /// How far a property's full-text index covers the pinned dataset's
 /// fragments. Only full coverage makes a BM25 score independent of a filter
 /// applied before scoring: Lance scores the unindexed fragments flat, from
-/// statistics over the rows the filter admits.
+/// statistics over the rows the filter admits. A segment of any coverage,
+/// even the untrained declaration every write records, carries the index's
+/// analyzer to the rows it does not cover; an absent index refuses every
+/// full-text call on the property (`PlanError::FullTextIndexRequired`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FullTextCoverage {
-    /// Every fragment of the pinned version is in a full-text segment.
+    /// Every fragment of the pinned version is in a full-text segment, which
+    /// a table with no fragment has vacuously.
     Full,
     /// A full-text index exists; some fragment is not in it.
     Partial,
-    /// The property has no full-text index.
+    /// No segment on the property records a full-text index, and the table
+    /// has rows.
     Absent,
 }
 
@@ -328,6 +334,16 @@ impl FullTextCoverage {
                         .is_some_and(|coverage| coverage.covered == coverage.total)
                 });
         if full { Self::Full } else { Self::Partial }
+    }
+
+    /// [`Self::of_facts`] for a table version holding `fragments` current
+    /// fragments: one with none has no row a full-text call could answer
+    /// differently, so it is covered whatever its indexes.
+    pub fn of_table(facts: &[IndexFact], column: &str, fragments: usize) -> Self {
+        if fragments == 0 {
+            return Self::Full;
+        }
+        Self::of_facts(facts, column)
     }
 }
 
@@ -590,7 +606,7 @@ impl PlanSource for MemorySource {
         self.full_text
             .get(&(type_key.to_string(), property.to_string()))
             .copied()
-            .unwrap_or(FullTextCoverage::Absent)
+            .unwrap_or(FullTextCoverage::Partial)
     }
 
     fn explain_dump_dir(&self) -> Option<std::path::PathBuf> {

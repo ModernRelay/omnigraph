@@ -174,8 +174,27 @@ jobs:
       - name: Test release-note composition
         run: python3 scripts/test_release_notes.py
 
+      - name: Test edge release decisions and text
+        run: python3 scripts/test_edge_release.py
+
       - name: Render release-note preview
         run: python3 scripts/release_notes.py preview --target HEAD > "$RUNNER_TEMP/release-notes-preview.md"
+
+      # The edge publisher composes its release text from this preview
+      # (`scripts/edge_release.py body`), so a renderer change that breaks
+      # the composer fails here, in its own pull request.
+      - name: Compose edge release text from the preview
+        run: |
+          set -euo pipefail
+          commit=0000000000000000000000000000000000000000
+          printf '%s\n' "{\"version\":\"0.0.1-edge+0000000\",\"channel\":\"edge\",\"commit\":\"${commit}\",\"http_contract\":\"0.0\",\"internal_schema\":{\"writes\":1,\"serves\":[1,1]}}" \
+            > "$RUNNER_TEMP/edge-version.json"
+          python3 scripts/edge_release.py body --repository "$GITHUB_REPOSITORY" --commit "$commit" \
+            --build-tag edge-20260101-0000000 --build-version "$RUNNER_TEMP/edge-version.json" \
+            --notes "$RUNNER_TEMP/release-notes-preview.md" > /dev/null
+          python3 scripts/edge_release.py body --repository "$GITHUB_REPOSITORY" --commit "$commit" \
+            --build-tag edge-20260101-0000000 --build-version "$RUNNER_TEMP/edge-version.json" \
+            --notes "$RUNNER_TEMP/release-notes-preview.md" --rolling > /dev/null
 
       - name: Upload release-note preview
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -417,25 +436,16 @@ jobs:
             --cargo-public-api "$tool" \
             --public-api-target-dir target/vocabulary-public-api
 
-  release_edge_after_vocabulary:
-    name: Release edge after vocabulary audit
-    needs: [classify_changes, graph_vocabulary_guard]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify_changes.outputs.run_full_ci == 'true'
-    permissions:
-      actions: read
-      contents: write
-    uses: ./.github/workflows/release-edge.yml
-    with:
-      source_ref: ${{ github.sha }}
-      ci_run_id: ${{ format('{0}', github.run_id) }}
-
   release_tag_after_vocabulary:
     name: Release tag after vocabulary audit
     needs: graph_vocabulary_guard
     if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    # The called publisher attests its archives' build provenance.
     permissions:
       actions: read
       contents: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ github.ref_name }}
@@ -447,10 +457,13 @@ jobs:
     name: Publish tag image after vocabulary audit
     needs: graph_vocabulary_guard
     if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    # The called publisher attests the pushed image's build provenance.
     permissions:
       actions: read
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/publish-image.yml
     with:
       tag: ${{ github.ref_name }}
@@ -1334,8 +1347,9 @@ jobs:
       - name: Run RustFS detached publication retention
         if: matrix.shard == 'failpoints'
         # Exercise detached write and compaction pins through S3 after a lost
-        # publication acknowledgement, then prove another write succeeds.
-        # Require both owners and reject unconfigured early returns.
+        # publication acknowledgement, then prove another write succeeds, and
+        # retry cleanup after a pass stopped in each window of its sweep.
+        # Require every owner and reject unconfigured early returns.
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/rustfs-failpoints.log"
@@ -1347,7 +1361,8 @@ jobs:
           fi
           for test_name in \
             s3_write_detached_pin_survives_next_write \
-            s3_optimize_detached_pin_survives_next_write
+            s3_optimize_detached_pin_survives_next_write \
+            s3_collector_retry_converges_after_every_sweep_window
           do
             grep -Fq "test ${test_name} ... ok" "$test_log" \
               || { echo "::error::required RustFS failpoint cell did not pass: $test_name"; exit 1; }
@@ -1548,6 +1563,7 @@ jobs:
           run_cell azure_write_detached_pin_survives_next_write --test failpoints
           run_cell azure_optimize_detached_pin_survives_next_write --test failpoints
           run_cell azure_schema_apply_post_commit_failure_leaves_readable_contract --test failpoints
+          run_cell azure_collector_retry_converges_after_every_sweep_window --test failpoints
           run_cell azure_cluster_full_lifecycle_import_apply_serve_evolve_delete --test s3_cluster
           run_cell s3::server_opens_azure_graph_directly_and_serves_snapshot_and_read --test integration
           run_cell s3::server_boots_azure_cluster_from_bare_storage_uri_and_serves_query --test integration

@@ -2264,6 +2264,150 @@ mod owned_shutdown {
     async fn disconnected_write_and_shutdown_share_ownership_v2_swallowed_error() {
         disconnected_write_and_shutdown_share_ownership("v2-swallowed-error").await;
     }
+
+    /// A raw request to the cluster fixture's `knowledge` graph, whose
+    /// schema is `node Person { name: String @key }`.
+    fn send_knowledge_request(address: &str, route: &str, body: &Value) -> TcpStream {
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let body = body.to_string();
+        write!(socket,
+            "POST /graphs/knowledge/{route} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\n{HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT}\r\nContent-Length: {}\r\n\r\n{body}", body.len()
+        ).unwrap();
+        socket.flush().unwrap();
+        socket
+    }
+
+    fn knowledge_response(address: &str, route: &str, body: &Value) -> String {
+        let mut response = String::new();
+        send_knowledge_request(address, route, body)
+            .read_to_string(&mut response)
+            .unwrap();
+        response
+    }
+
+    /// A served write whose storage request fails on one of Lance's
+    /// write-once table files is a definite failure: the caller gets its
+    /// 500, the next write on the same server publishes, reads keep serving,
+    /// readiness stays `serving`, and a clean SIGTERM still releases the
+    /// native lock. Nothing contains the process and nothing poisons the
+    /// storage scope. The fault is real backend I/O: a file planted where
+    /// the Person table's `data/` directory goes makes its first data-file
+    /// write fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn definite_write_failure_keeps_serving_and_releases_the_lock_issue_1067() {
+        let temp = converged_cluster_dir("").await;
+        omnigraph_cluster::upgrade_deployment_ledger(
+            &format!("file://{}", temp.path().display()),
+            true,
+            &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+        )
+        .await
+        .unwrap();
+        let root = temp.path();
+        let graph = root.join("graphs/knowledge.omni");
+        let (commits_before, person_table) = {
+            let db = Omnigraph::open_read_only(graph.to_str().unwrap())
+                .await
+                .unwrap();
+            let commits = db.list_commits(None).await.unwrap().len();
+            let snapshot = db
+                .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+                .await
+                .unwrap();
+            let table = snapshot
+                .dataset("node:Person")
+                .unwrap()
+                .dataset_path
+                .clone();
+            (commits, graph.join(table.trim_start_matches('/')))
+        };
+        let data_blocker = person_table.join("data");
+        assert!(
+            !data_blocker.exists(),
+            "the empty Person table has no data directory yet: {}",
+            data_blocker.display()
+        );
+        let (mut child, address, output_thread) = spawn_owned_child(root, "v2-definite-failure");
+        wait_ready(&address, &mut child.0, "serving").await;
+        let held_lock = fs::read(root.join("__cluster/lock.json")).unwrap();
+
+        let insert = |name: &str| {
+            serde_json::json!({
+                "query": "query insert_person($name: String) { insert Person { name: $name } }",
+                "name": "insert_person",
+                "params": {"name": name}
+            })
+        };
+        fs::write(&data_blocker, b"not a directory").unwrap();
+        let failed = knowledge_response(&address, "mutate", &insert("stranded"));
+        assert!(failed.starts_with("HTTP/1.1 500"), "{failed}");
+        assert!(
+            failed.contains("\"code\":\"internal\""),
+            "a storage failure is the caller's 500: {failed}"
+        );
+        fs::remove_file(&data_blocker).unwrap();
+
+        let published = knowledge_response(&address, "mutate", &insert("after"));
+        assert!(
+            published.starts_with("HTTP/1.1 200"),
+            "the next write on the same server must publish: {published}"
+        );
+        let names = knowledge_response(
+            &address,
+            "query",
+            &serde_json::json!({
+                "query": "query names() { match { $p: Person } return { $p.name } }",
+                "name": "names",
+                "params": {}
+            }),
+        );
+        assert!(names.starts_with("HTTP/1.1 200"), "{names}");
+        assert!(names.contains("after"), "{names}");
+        assert!(
+            !names.contains("stranded"),
+            "the failed write published: {names}"
+        );
+        wait_ready(&address, &mut child.0, "serving").await;
+
+        assert_eq!(
+            unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "clean shutdown timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "a definite failure never contains the process"
+        );
+        assert!(root.join("serve-returned").exists());
+        output_thread.join().unwrap();
+        assert!(
+            !root.join("__cluster/lock.json").exists(),
+            "clean shutdown releases the lock {}",
+            String::from_utf8_lossy(&held_lock)
+        );
+        let commits_after = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .list_commits(None)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(commits_after, commits_before + 1);
+    }
 }
 
 /// HTTP ownership and retry safety need request/body scheduling and cannot be
@@ -2351,12 +2495,13 @@ async fn live_deployment_fixture(mode: &str) {
         .await
         .expect("accepted deployment must finish under its server owner")
     }
-    async fn status(app: &Router, id: Option<&str>) -> (DeploymentStatus, bool) {
+    async fn status(app: &Router, id: Option<&str>) -> (DeploymentStatus, bool, bool) {
         let (code, body) =
             json_response(app, get_request("/cluster/deployments", "operator-token")).await;
         assert_eq!(code, StatusCode::OK, "{body}");
         let mut status: DeploymentStatus = serde_json::from_value(body["status"].clone()).unwrap();
         let mut active = body["active"].as_bool().unwrap();
+        let mut in_progress = body["in_progress"].as_bool().unwrap();
         if let Some(id) = id {
             let (code, receipt) = json_response(
                 app,
@@ -2370,8 +2515,9 @@ async fn live_deployment_fixture(mode: &str) {
             );
             status.lookup = Some(serde_json::from_value(receipt["deployment"].clone()).unwrap());
             active = receipt["active"].as_bool().unwrap();
+            in_progress = receipt["in_progress"].as_bool().unwrap();
         }
-        (status, active)
+        (status, active, in_progress)
     }
 
     let temp = tempfile::tempdir().unwrap();
@@ -2455,7 +2601,7 @@ async fn live_deployment_fixture(mode: &str) {
     );
     let (code, _) = json_response(&app, get_request("/cluster/deployments", "reader-token")).await;
     assert_eq!(code, StatusCode::FORBIDDEN);
-    let (initial_status, _) = status(&app, None).await;
+    let (initial_status, _, _) = status(&app, None).await;
     let id = initial_status.next_deployment_id();
 
     if mode == "catalogue" {
@@ -2490,7 +2636,7 @@ async fn live_deployment_fixture(mode: &str) {
                 _ => unreachable!(),
             }
             let deployment = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-            let (current, _) = status(&app, None).await;
+            let (current, _, _) = status(&app, None).await;
             let id = current.next_deployment_id();
             let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
             let (code, refusal) =
@@ -3159,8 +3305,8 @@ async fn live_deployment_fixture(mode: &str) {
     assert_eq!(code, StatusCode::OK, "{old_result}");
     let completed = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let (observed, active) = status(&app, Some(&id)).await;
-            if active {
+            let (observed, active, in_progress) = status(&app, Some(&id)).await;
+            if active && !in_progress {
                 break observed;
             }
             assert!(
@@ -3243,7 +3389,7 @@ async fn live_deployment_fixture(mode: &str) {
     )
     .unwrap();
     let independent = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let (code, changed) = json_response(
         &app,
         submit(&next.next_deployment_id(), &independent, "operator-token"),
@@ -3270,7 +3416,7 @@ async fn live_deployment_fixture(mode: &str) {
     )
     .unwrap();
     let denied_candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     let (code, _) = json_response(
         &app,
@@ -3329,7 +3475,7 @@ async fn live_deployment_fixture(mode: &str) {
         .unwrap();
     fs::write(temp.path().join("policy.yaml"), &old_policy).unwrap();
     let revoke = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let revoke_request = submit(&next.next_deployment_id(), &revoke, "operator-token");
     let request_app = app.clone();
     let revoker = tokio::spawn(async move { json_response(&request_app, revoke_request).await });
@@ -3381,7 +3527,7 @@ async fn live_deployment_fixture(mode: &str) {
         let bound = base_config.replace("    schema: ./people.pg\n", "    schema: ./people.pg\n    embedding_provider: selected\n    external_blobs:\n      allow:\n        - base: s3://lifecycle-assets/allowed\n          scope: server_safe\n");
         fs::write(temp.path().join("cluster.yaml"), format!("{bound}providers:\n  embedding:\n    selected:\n      kind: mock\n      model: {model}\n")).unwrap();
         let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-        let (next, _) = status(&app, None).await;
+        let (next, _, _) = status(&app, None).await;
         let (code, body) = json_response(
             &app,
             submit(&next.next_deployment_id(), &candidate, "operator-token"),
@@ -3402,7 +3548,7 @@ async fn live_deployment_fixture(mode: &str) {
     );
     fs::write(temp.path().join("cluster.yaml"), broken).unwrap();
     let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     let RegistryLookup::Ready(before) = state.routing().registry.get(&key) else {
         panic!("ready")
@@ -3447,7 +3593,7 @@ async fn live_deployment_fixture(mode: &str) {
         .replace("[knowledge, peer]", "[knowledge]");
     fs::write(temp.path().join("cluster.yaml"), &removed).unwrap();
     let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let delete_id = next.next_deployment_id();
     let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     let (code, _) = json_response(&app, submit(&delete_id, &candidate, "reader-token")).await;
@@ -3518,8 +3664,8 @@ async fn live_deployment_fixture(mode: &str) {
     assert_eq!(code, StatusCode::OK, "{body}");
     let deleted = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let (observed, active) = status(&app, Some(&delete_id)).await;
-            if active {
+            let (observed, active, in_progress) = status(&app, Some(&delete_id)).await;
+            if active && !in_progress {
                 break observed;
             }
             assert!(!state.operation_runtime().snapshot().closed);
@@ -3599,7 +3745,7 @@ async fn live_deployment_fixture(mode: &str) {
     )
     .unwrap();
     let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let handoff_id = next.next_deployment_id();
     let (code, body) = json_response(&app, submit(&handoff_id, &candidate, "operator-token")).await;
     assert_eq!(code, StatusCode::OK, "{body}");

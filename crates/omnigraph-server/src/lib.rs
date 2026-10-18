@@ -190,7 +190,6 @@ impl utoipa::Modify for SecurityAddon {
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 const INGEST_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
 /// The maximum internal-schema (storage-format) version this binary supports.
 const SERVER_INTERNAL_SCHEMA_VERSION: u32 =
     omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
@@ -494,6 +493,7 @@ enum ApiErrorDetails {
     ChangeFeedGap(api::ChangeFeedGapOutput),
     ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
+    FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
 }
 
@@ -1524,6 +1524,16 @@ impl ApiError {
                 )));
                 response
             }
+            error @ OmniError::FullTextIndexRequired { .. } => {
+                let mut response = Self::conflict(error.to_string());
+                let OmniError::FullTextIndexRequired { index } = error else {
+                    unreachable!()
+                };
+                response.details = Some(Box::new(ApiErrorDetails::FullTextIndexRequired(
+                    api::FullTextIndexRequiredOutput { index },
+                )));
+                response
+            }
             // Caller-side continuation fault (decode, checksum, or scope). The
             // "change cursor rejected: " prefix is a stable contract so raw
             // HTTP clients can tell it from a genuine retention gap.
@@ -1628,8 +1638,15 @@ impl ApiError {
             OmniError::Completion { .. } => unreachable!("completion evidence was unwrapped"),
         };
         response.completion_uncertain |= uncertain;
+        // The engine's evidence is the authority: a definite failure, before
+        // any effect or after detached effects no manifest names, keeps the
+        // process serving whatever status it maps to. Without evidence the
+        // status-class default above stands, which fails closed for a 500.
         match evidence {
-            Some(omnigraph::error::CompletionEvidence::BeforeEffect) => {
+            Some(
+                omnigraph::error::CompletionEvidence::BeforeEffect
+                | omnigraph::error::CompletionEvidence::Unpublished,
+            ) => {
                 response.completion_uncertain = false;
             }
             Some(omnigraph::error::CompletionEvidence::Uncertain) => {
@@ -1747,6 +1764,9 @@ impl ApiError {
                 ApiErrorDetails::FullTextIndexRebuildRequired(value) => {
                     output.full_text_index_rebuild_required = Some(value)
                 }
+                ApiErrorDetails::FullTextIndexRequired(value) => {
+                    output.full_text_index_required = Some(value)
+                }
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
             }
         }
@@ -1802,6 +1822,28 @@ mod api_error_tests {
         let ordinary: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(ordinary.code, Some(ErrorCode::Conflict));
         assert!(ordinary.full_text_index_rebuild_required.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_full_text_index_with_no_segment_returns_required_conflict() {
+        let response = ApiError::from_omni(OmniError::FullTextIndexRequired {
+            index: "Doc.title".into(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
+        assert!(error.error.contains("has no segment"), "{}", error.error);
+        assert!(
+            error.error.contains("rebuild-full-text-indexes"),
+            "{}",
+            error.error
+        );
+        assert_eq!(error.full_text_index_required.unwrap().index, "Doc.title");
+        assert!(error.full_text_index_rebuild_required.is_none());
     }
 
     #[tokio::test]

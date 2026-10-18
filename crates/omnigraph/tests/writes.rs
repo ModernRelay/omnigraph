@@ -161,6 +161,62 @@ async fn failed_mutation_leaves_target_unchanged() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
+/// A storage failure while a mutation stages its files is a definite
+/// failure: the error keeps its storage cause and carries `Unpublished`, the
+/// graph is unchanged, and the next write on the same handle publishes. The
+/// fault is real backend I/O, a file planted where the table's `data/`
+/// directory goes.
+#[tokio::test]
+async fn storage_failure_while_staging_is_definite_issue_1067() {
+    use omnigraph::error::CompletionEvidence;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = session(Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap());
+    let person = snapshot_main(&db)
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .dataset_path
+        .clone();
+    let data_blocker = dir.path().join(person.trim_start_matches('/')).join("data");
+    if data_blocker.is_dir() {
+        std::fs::remove_dir(&data_blocker).expect("an empty table has no data files yet");
+    }
+    std::fs::write(&data_blocker, b"not a directory").unwrap();
+
+    let error = mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "stranded")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.storage_failure().is_some(),
+        "the staged data-file write fails in storage: {error:?}"
+    );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Unpublished),
+        "a storage failure before publication is definite: {error:?}"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, 0);
+
+    std::fs::remove_file(&data_blocker).unwrap();
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after")], &[("$age", 31)]),
+    )
+    .await
+    .expect("the next write on the same handle publishes");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
 /// Mutation text the parser refuses keeps its diagnostic through the engine
 /// door, as read text does: the code and the position survive, and nothing
 /// is published.
@@ -1067,6 +1123,348 @@ async fn load_csv_source_read_is_bounded_by_the_deadline() {
         .await
         .expect("the same source loads once the read is not stalled");
     assert_eq!(receipt.result.nodes_loaded.values().sum::<usize>(), 1);
+}
+
+/// A `load csv` source replaced between its metadata probe and its payload
+/// read is refused as an external-source error naming the change, nothing
+/// staged or published: the read is bound to the probed version (`If-Match`).
+#[tokio::test]
+async fn load_csv_refuses_a_source_replaced_between_probe_and_read() {
+    use omnigraph::instrumentation::{ExternalPayloadReadHold, with_external_payload_read_held};
+    use omnigraph::loader::{CsvLoadRequest, LoadMode};
+    use omnigraph_compiler::query::ast::LoadTarget;
+    const SCHEMA: &str = "node Person { id: I64 @key name: String }";
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n1,alice\n").unwrap();
+    let source = format!("file://{}", csv_path.display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let files = files_under(&graph_path);
+    let request = CsvLoadRequest {
+        source: source.clone(),
+        target: LoadTarget::Node("Person".to_string()),
+        mode: LoadMode::Overwrite,
+        delimiter: b',',
+        header: true,
+        columns: None,
+    };
+    let stage_probes = StageWriteProbes::rendezvous(1);
+    let hold = ExternalPayloadReadHold::default();
+    let (error, ()) = tokio::join!(
+        with_stage_write_probes(
+            stage_probes.clone(),
+            with_external_payload_read_held(
+                hold.clone(),
+                db.load_csv_as_with_receipt("main", &request, None),
+            ),
+        ),
+        async {
+            hold.reached().await;
+            std::fs::write(&csv_path, "id,name\n1,alice\n2,bob\n").unwrap();
+            hold.release();
+        }
+    );
+    let error = error.unwrap_err();
+    assert!(
+        matches!(error, OmniError::ExternalBlobSource { ref uri, ref reason }
+            if uri.ends_with("/people.csv") && reason.contains("changed")),
+        "{error}"
+    );
+    assert_eq!(
+        stage_probes.entered(),
+        0,
+        "nothing is staged after a changed source"
+    );
+    assert_eq!(files_under(&graph_path), files);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before
+    );
+
+    let receipt = db
+        .load_csv_as_with_receipt("main", &request, None)
+        .await
+        .expect("a fresh statement captures the replaced source");
+    assert_eq!(receipt.result.nodes_loaded.values().sum::<usize>(), 2);
+}
+
+/// `explain load csv` answers the accepted plan from the source's metadata alone: one probe, no
+/// payload read, rows untouched; overwrite explains on `plan`, append on `pipeline`; a source over
+/// `load_source_max_bytes` refuses as the load would. Rust: the probe counters are process instrumentation.
+#[tokio::test]
+async fn explain_load_answers_the_plan_without_reading_the_source() {
+    use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+    use omnigraph::settings::{SettingId, SettingValue, Source};
+    use omnigraph_compiler::query::ast::{FileBody, LoadStmt};
+    use omnigraph_compiler::query::parser::parse_query;
+    const SCHEMA: &str = "node Person { id: I64 @key name: String }";
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n2,bob\n3,carol\n").unwrap();
+    let source = format!("file://{}", csv_path.display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
+    let mut db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"id":1,"name":"ann"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let parse_explain = |mode: &str| -> LoadStmt {
+        let text = format!("explain load csv \"{source}\" into node:Person mode {mode} header");
+        match parse_query(&text).unwrap().body {
+            FileBody::ExplainLoad(stmt) => stmt,
+            other => panic!("expected an explain load statement, got {other:?}"),
+        }
+    };
+    let nodes = |rows: &serde_json::Value| -> Vec<String> {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["tree"] == "physical")
+            .map(|row| row["node"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let route = |rows: &serde_json::Value| -> String {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["tree"] == "plan" && row["node"] == "route")
+            .map(|row| row["detail"].as_str().unwrap().to_string())
+            .unwrap_or_else(|| panic!("no route row: {rows}"))
+    };
+
+    let probes = MergeWriteProbes::default();
+    let (result, head) = with_merge_write_probes(
+        probes.clone(),
+        db.explain_load("main", &parse_explain("overwrite")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(probes.external_blob_probe_calls(), 1, "one metadata probe");
+    assert_eq!(
+        probes.external_blob_payload_read_calls(),
+        0,
+        "no payload read"
+    );
+    assert!(head.is_some(), "the pinned head's commit id is answered");
+    let rows = result.to_rust_json().unwrap();
+    let columns: Vec<&str> = result
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect();
+    assert_eq!(columns, ["tree", "depth", "node", "detail"]);
+    let load_nodes = nodes(&rows);
+    assert_eq!(
+        load_nodes,
+        ["FragmentWrite", "Validate", "CsvSource"],
+        "{rows}"
+    );
+    assert_eq!(route(&rows), "engine", "{rows}");
+    assert_eq!(
+        helpers::count_rows_branch(&db, "main", "node:Person").await,
+        1,
+        "an explain stages nothing"
+    );
+
+    let (result, _) = db
+        .explain_load("main", &parse_explain("append"))
+        .await
+        .unwrap();
+    assert_eq!(route(&result.to_rust_json().unwrap()), "executor");
+
+    db.set(
+        SettingId::LoadSourceMaxBytes,
+        &SettingValue::Integer(4),
+        Source::File,
+    )
+    .unwrap();
+    let error = db
+        .explain_load("main", &parse_explain("overwrite"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            OmniError::ResourceLimitExceeded { resource, limit: 4, actual } if resource == "csv_source_bytes" && *actual > 4
+        ),
+        "{error}"
+    );
+
+    let snapshot = ReadTarget::snapshot(omnigraph::db::SnapshotId::new(head.unwrap()));
+    let error = db
+        .explain_load(snapshot, &parse_explain("overwrite"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("a load targets a branch head"),
+        "{error}"
+    );
+}
+
+/// One `load csv` statement issues exactly one metadata probe and one payload
+/// read, in every mode: the capture is taken before the first attempt and
+/// every attempt parses it, so no attempt of the statement fetches again.
+#[tokio::test]
+async fn load_csv_statement_probes_and_reads_its_source_once() {
+    use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+    use omnigraph::loader::{CsvLoadRequest, LoadMode};
+    use omnigraph_compiler::query::ast::LoadTarget;
+    const SCHEMA: &str = "node Person { id: I64 @key name: String }";
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n2,bob\n3,carol\n").unwrap();
+    let source = format!("file://{}", csv_path.display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+
+    for (mode, expected_rows) in [
+        (LoadMode::Append, 2),
+        (LoadMode::Merge, 2),
+        (LoadMode::Overwrite, 2),
+    ] {
+        let request = CsvLoadRequest {
+            source: source.clone(),
+            target: LoadTarget::Node("Person".to_string()),
+            mode,
+            delimiter: b',',
+            header: true,
+            columns: None,
+        };
+        let write_probes = MergeWriteProbes::default();
+        let receipt = with_merge_write_probes(
+            write_probes.clone(),
+            db.load_csv_as_with_receipt("main", &request, None),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{mode:?}: {error}"));
+        assert_eq!(receipt.result.nodes_loaded.values().sum::<usize>(), 2);
+        assert_eq!(
+            write_probes.external_blob_probe_calls(),
+            1,
+            "{mode:?}: one statement probes its source once"
+        );
+        assert_eq!(
+            write_probes.external_blob_payload_read_calls(),
+            1,
+            "{mode:?}: one statement reads its source once"
+        );
+        assert_eq!(
+            helpers::count_rows_branch(&db, "main", "node:Person").await,
+            expected_rows
+        );
+    }
+}
+
+/// Generated scale belongs here: GQT fixtures cannot cover the default pool's
+/// row-capacity regression without checking in a large CSV payload.
+#[tokio::test]
+async fn load_csv_overwrite_admits_compact_keys_under_default_memory() {
+    use omnigraph::loader::CsvLoadRequest;
+    use omnigraph_compiler::query::ast::LoadTarget;
+    use std::io::Write;
+
+    const ROWS: usize = 400_000;
+    let source_dir = tempfile::tempdir().unwrap();
+    let csv_path = source_dir.path().join("people.csv");
+    let mut csv = std::io::BufWriter::new(std::fs::File::create(&csv_path).unwrap());
+    writeln!(csv, "id").unwrap();
+    for row in 0..ROWS {
+        writeln!(csv, "p{row:07}").unwrap();
+    }
+    csv.flush().unwrap();
+    drop(csv);
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(source_dir.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            graph_dir.path().to_str().unwrap(),
+            "node Person { id: String @key }",
+        )
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"id":"old"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let request = CsvLoadRequest {
+        source: format!("file://{}", csv_path.display()),
+        target: LoadTarget::Node("Person".to_string()),
+        mode: LoadMode::Overwrite,
+        delimiter: b',',
+        header: true,
+        columns: None,
+    };
+    let receipt = db
+        .load_csv_as_with_receipt("main", &request, None)
+        .await
+        .unwrap();
+    assert_eq!(receipt.result.nodes_loaded.values().sum::<usize>(), ROWS);
+    assert_eq!(
+        helpers::count_rows_branch(&db, "main", "node:Person").await,
+        ROWS
+    );
 }
 
 /// Update predicate matching is itself a bounded allocation. The committed

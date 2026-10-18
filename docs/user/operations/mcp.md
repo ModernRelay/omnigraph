@@ -85,10 +85,10 @@ for a deployment whose policy was written with an LLM caller in mind.
 | `schema` | `graph` | `GET /graphs/{graph}/schema` | `read` |
 | `queries` | `graph` | `GET /graphs/{graph}/queries`, stored mutations removed | `read` |
 | `query` | `graph`, `name`, optional `params`, `branch` | `POST /graphs/{graph}/queries/{name}` as a read | `invoke_query`, then `read` |
-| `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph}/query` | `read` |
+| `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph}/query` | `read`; `change` for `explain load csv` |
 | `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph}/snapshot` | `read` |
 | `branches_list` | `graph` | `GET /graphs/{graph}/branches` | `read` |
-| `commits_list` | `graph`, optional `branch` | `GET /graphs/{graph}/commits` | `read` |
+| `commits_list` | `graph`, optional `branch`, `limit`, `page_token` | `GET /graphs/{graph}/commits` | `read` |
 | `commits_get` | `graph`, `commit_id` | `GET /graphs/{graph}/commits/{commit_id}` | `read` |
 | `commits_changes` | `graph`, `commit_id`, optional `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph}/commits/{commit_id}/changes` | `read` |
 | `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph}/changes` | `read` |
@@ -107,8 +107,11 @@ The server's `initialize` instructions tell a model to call `graphs`, then
 - `query` refuses stored mutations.
 - `read` takes GQ source with typed parameter declarations, the same body as
   `POST /query`. It also answers `branch list`, `branch diff`,
-  `branch merge-base`, `branch merge … dry run` and `explain query …`. It refuses
-  `insert`, `update`, `delete` and branch writes with the route's 400.
+  `branch merge-base`, `branch merge … dry run` and `explain query …`.
+  `explain load csv …` requires `change` on its target branch before probing
+  source metadata; it reads no payload byte and publishes nothing. It accepts
+  `branch`, while refusing `snapshot`, `name` and `params`.
+  The tool refuses `insert`, `update`, `delete` and branch writes with the route's 400.
 
 ### Write tools (opt-in)
 

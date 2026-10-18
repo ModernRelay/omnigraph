@@ -58,6 +58,12 @@ decide_seam! {
     pub static CLEANUP_SWEEP_PRE_FILE_DELETE = ("cleanup.sweep_pre_file_delete", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// After the files only a table's dead stagings reference are deleted and
+    /// before the first of their manifests is.
+    pub static CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE = ("cleanup.sweep_pre_dead_manifest_delete", Unreachable, [Fail]);
+}
+
 /// Requests the run made, for the two ceilings in `maintenance.rs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CollectorCost {
@@ -319,6 +325,7 @@ pub(crate) async fn sweep_table(
     let dead = plan.dead_stagings();
     if !dead.is_empty() {
         stats.bytes_removed += delete_paths(&store, &base, &plan.dead_paths).await?;
+        fail(&CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE)?;
     }
     for version in dead {
         let manifest = naming.manifest_path(&base, version);
@@ -341,7 +348,10 @@ fn location_base(dataset: &lance::Dataset) -> object_store::path::Path {
 
 /// Delete the location-relative `paths` (never an inherited `base:` file),
 /// an `_indices/<uuid>` entry as a directory; returns the bytes freed,
-/// with a file an earlier pass already removed counting nothing.
+/// with a file an earlier pass already removed counting nothing. A pass
+/// that stops between these files and their manifest plans the manifest
+/// again, so an absent index directory is already deleted, not an error
+/// (the local store reports one as `NotFound`; object stores list it empty).
 async fn delete_paths(
     store: &lance::io::ObjectStore,
     base: &object_store::path::Path,
@@ -357,10 +367,10 @@ async fn delete_paths(
             .chain(object_store::path::Path::from(path.as_str()).parts())
             .collect();
         if path.starts_with("_indices/") {
-            store
-                .remove_dir_all(full)
-                .await
-                .map_err(OmniError::storage)?;
+            match store.remove_dir_all(full).await {
+                Ok(()) | Err(lance::Error::NotFound { .. }) => {}
+                Err(error) => return Err(OmniError::storage(error)),
+            }
             continue;
         }
         bytes += delete_object(store, &full, None).await?;

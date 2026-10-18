@@ -244,6 +244,13 @@ impl ScanTuning<'_> {
         self
     }
 
+    pub(crate) fn limit(&mut self, rows: i64) -> Result<&mut Self> {
+        self.scanner
+            .limit(Some(rows), None)
+            .map_err(OmniError::storage)?;
+        Ok(self)
+    }
+
     pub(crate) fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.scanner.batch_size(batch_size);
         self
@@ -819,10 +826,12 @@ async fn commit_detached(
     if let Some(affected_rows) = affected_rows {
         builder = builder.with_affected_rows(affected_rows);
     }
+    // A detached commit is unreachable until a manifest names it, so its
+    // failure is definite for the graph whatever its storage cause.
     builder
         .execute(transaction)
         .await
-        .map_err(OmniError::storage)
+        .map_err(|error| OmniError::storage(error).unpublished())
 }
 
 /// The columns of `columns` that hold no full-text segment once `effect`
@@ -1003,6 +1012,27 @@ struct PreflightedExternalBlob {
     store: Arc<lance::io::ObjectStore>,
     path: object_store::path::Path,
     object_size: u64,
+    e_tag: Option<String>,
+    version: Option<String>,
+}
+
+/// One external object as a `load csv` statement captured it: the bytes of
+/// one response, with the size and the validators its metadata probe
+/// reported and the read was bound to.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedSource {
+    pub(crate) bytes: Arc<[u8]>,
+    pub(crate) admission: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
+    pub(crate) size: u64,
+    pub(crate) e_tag: Option<String>,
+    pub(crate) version: Option<String>,
+}
+
+fn external_object_changed(uri: &str) -> OmniError {
+    OmniError::external_blob_source(
+        uri,
+        "the external object changed between its metadata probe and its read",
+    )
 }
 
 impl PreflightedExternalBlob {
@@ -1037,7 +1067,12 @@ impl PreflightedExternalBlob {
         Ok(payload_size)
     }
 
-    async fn read_full_bounded(&self, max_bytes: u64, resource: &str) -> Result<Arc<[u8]>> {
+    async fn read_full_bounded(
+        &self,
+        max_bytes: u64,
+        resource: &str,
+        admit: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<CapturedSource> {
         if self.object_size > max_bytes {
             return Err(OmniError::resource_limit(
                 resource,
@@ -1045,17 +1080,29 @@ impl PreflightedExternalBlob {
                 self.object_size,
             ));
         }
+        admit(self.object_size)?;
         let uri = self.normalized_uri.as_str();
         crate::instrumentation::external_payload_read_stall().await;
+        let options = object_store::GetOptions {
+            if_match: self.e_tag.clone(),
+            version: self.version.clone(),
+            ..Default::default()
+        };
         let response = self
             .store
             .inner
-            .get_opts(&self.path, object_store::GetOptions::default())
+            .get_opts(&self.path, options)
             .await
-            .map_err(|error| OmniError::external_blob_source(uri, error.to_string()))?;
+            .map_err(|error| match error {
+                object_store::Error::Precondition { .. }
+                | object_store::Error::NotModified { .. } => external_object_changed(uri),
+                other => OmniError::external_blob_source(uri, other.to_string()),
+            })?;
         let object_size = response.meta.size;
-        if object_size > max_bytes {
-            return Err(OmniError::resource_limit(resource, max_bytes, object_size));
+        if object_size != self.object_size
+            || (self.e_tag.is_some() && response.meta.e_tag != self.e_tag)
+        {
+            return Err(external_object_changed(uri));
         }
         if response.range != (0..object_size) {
             return Err(OmniError::external_blob_source(
@@ -1092,7 +1139,13 @@ impl PreflightedExternalBlob {
         }
         crate::instrumentation::record_blob_payload_read();
         crate::instrumentation::record_external_blob_payload_read();
-        Ok(bytes.into())
+        Ok(CapturedSource {
+            bytes: bytes.into(),
+            admission: None,
+            size: object_size,
+            e_tag: self.e_tag.clone(),
+            version: self.version.clone(),
+        })
     }
 
     async fn read_full(&self) -> Result<Arc<[u8]>> {
@@ -1549,8 +1602,7 @@ impl TableStore {
                 .await
                 .map_err(|error| OmniError::external_blob_source(&uri, error.to_string()))?;
                 crate::instrumentation::record_external_blob_probe();
-                let object_size = store
-                    .size(&path)
+                let meta = object_store::ObjectStoreExt::head(store.inner.as_ref(), &path)
                     .await
                     .map_err(|error| OmniError::external_blob_source(&uri, error.to_string()))?;
                 Ok::<_, OmniError>((
@@ -1559,7 +1611,9 @@ impl TableStore {
                         normalized_uri: normalized,
                         store,
                         path,
-                        object_size,
+                        object_size: meta.size,
+                        e_tag: meta.e_tag,
+                        version: meta.version,
                     }),
                 ))
             }
@@ -1581,21 +1635,47 @@ impl TableStore {
 
     /// One whole external object for a `load csv` statement: authorized by
     /// the graph's external Blob policy, its size checked against `max_bytes`
-    /// before any payload byte is read, then read in full. Shares the
-    /// preflight the Blob ingress path runs, so every refusal the policy
-    /// knows (`Deny`, a URI outside every base, a `file://` target escaping
-    /// its base) is the same refusal here.
+    /// before any payload byte is read, then read in full as one response
+    /// bound to the version the probe reported (`If-Match` on its validator);
+    /// an object that changed in between refuses as an external-source error.
+    /// Shares the preflight the Blob ingress path runs, so every refusal the
+    /// policy knows (`Deny`, a URI outside every base, a `file://` target
+    /// escaping its base) is the same refusal here.
     pub(crate) async fn read_external_object(
         &self,
         uri: &str,
         max_bytes: u64,
         resource: &'static str,
-    ) -> Result<Arc<[u8]>> {
+        admit: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<CapturedSource> {
         let preflight = self.preflight_external_blob_uri_iter(1, [uri]).await?;
         let entry = preflight.by_input.get(uri).ok_or_else(|| {
             OmniError::manifest_internal("external object preflight dropped its one input")
         })?;
-        entry.read_full_bounded(max_bytes, resource).await
+        entry.read_full_bounded(max_bytes, resource, admit).await
+    }
+
+    /// The size of one external object from its metadata probe alone, for
+    /// `explain load csv`: the policy authorization, `HEAD` and `max_bytes`
+    /// refusal of [`Self::read_external_object`], and no payload byte read.
+    pub(crate) async fn external_object_size(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+        resource: &'static str,
+    ) -> Result<u64> {
+        let preflight = self.preflight_external_blob_uri_iter(1, [uri]).await?;
+        let entry = preflight.by_input.get(uri).ok_or_else(|| {
+            OmniError::manifest_internal("external object preflight dropped its one input")
+        })?;
+        if entry.object_size > max_bytes {
+            return Err(OmniError::resource_limit(
+                resource,
+                max_bytes,
+                entry.object_size,
+            ));
+        }
+        Ok(entry.object_size)
     }
 
     // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
@@ -2880,7 +2960,7 @@ impl TableStore {
         let uncommitted = DeleteBuilder::from_expr(Arc::new(ds.clone()), filter)
             .execute_uncommitted()
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
 
         if uncommitted.num_deleted_rows == 0 {
             return Ok(None);
@@ -2989,7 +3069,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
         // After the write succeeds, so a failed write never inflates the probe.
         crate::instrumentation::record_stage_append(appended_rows);
         let mut new_fragments = match &transaction.operation {
@@ -3292,7 +3372,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
         if transaction.read_version != expected_read_version {
             return Err(OmniError::manifest_internal(format!(
                 "{context} wrote against version {}, expected {expected_read_version}",
@@ -3879,7 +3959,7 @@ impl TableStore {
         let uncommitted = job
             .execute_uncommitted(stream)
             .await
-            .map_err(OmniError::lance_stream)?;
+            .map_err(|error| OmniError::lance_stream(error).unpublished())?;
         // After the write succeeds, so a failed write never inflates the probe.
         crate::instrumentation::record_stage_merge_insert(merged_rows);
         // Operation::Update { removed_fragment_ids, updated_fragments, new_fragments, .. } —
@@ -4395,7 +4475,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
         if transaction.read_version != 0 {
             return Err(OmniError::manifest_internal(format!(
                 "stage_create resolved '{}' at existing version {}; expected an absent dataset",
@@ -4681,25 +4761,44 @@ impl TableStore {
         Ok(Some(StagedWrite::new(transaction, Vec::new(), Vec::new())))
     }
 
-    /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments }).
-    /// Returns a StagedWrite carrying the replacement fragments. HEAD does
-    /// NOT advance.
+    /// Stage an overwrite from one batch; see [`Self::stage_overwrite_batches`].
+    pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
+        self.stage_overwrite_batches(ds, vec![batch]).await
+    }
+
+    /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments })
+    /// from the batches as they were produced, never concatenated. Returns a
+    /// StagedWrite carrying the replacement fragments. HEAD does NOT advance.
     ///
     /// Lance shape: `InsertBuilder::with_params(WriteParams { mode: Overwrite, .. })
-    /// .execute_uncommitted(vec![batch])` produces a `Transaction` whose
-    /// `Operation::Overwrite` carries the new schema + fragments. The
+    /// .execute_uncommitted(batches)` produces a `Transaction` whose
+    /// `Operation::Overwrite` carries the new schema + fragments, sized by
+    /// Lance's own fragment target. Zero-row batches contribute nothing; with
+    /// no row at all the transaction carries no fragment and the first batch's
+    /// schema, or the dataset's own schema when no batch was given. The
     /// transaction is committed via `commit_staged` (same call as
     /// `stage_append`).
-    ///
-    /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
-    pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
+    pub async fn stage_overwrite_batches(
+        &self,
+        ds: &Dataset,
+        batches: Vec<RecordBatch>,
+    ) -> Result<StagedWrite> {
         // Existing graph datasets retain stable row IDs through Overwrite;
         // keep the flag explicit at this write site too. This is not the
         // separate Lance migration API for legacy datasets without stable IDs.
         // See `stage_overwrite_preserves_stable_row_ids` and docs/dev/lance.md.
-        let (transaction, mut new_fragments) = if batch.num_rows() == 0 {
-            let schema = LanceSchema::try_from(batch.schema().as_ref())
-                .map_err(OmniError::lance_internal)?;
+        let schema = batches.first().map(RecordBatch::schema);
+        let batches: Vec<RecordBatch> = batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .collect();
+        let (transaction, mut new_fragments) = if batches.is_empty() {
+            let schema = match schema {
+                Some(schema) => {
+                    LanceSchema::try_from(schema.as_ref()).map_err(OmniError::lance_internal)?
+                }
+                None => ds.schema().clone(),
+            };
             let transaction = TransactionBuilder::new(
                 ds.manifest.version,
                 Operation::Overwrite {
@@ -4722,14 +4821,14 @@ impl TableStore {
             };
             let transaction = InsertBuilder::new(Arc::new(ds.clone()))
                 .with_params(&params)
-                .execute_uncommitted(vec![batch])
+                .execute_uncommitted(batches)
                 .await
-                .map_err(OmniError::storage)?;
+                .map_err(|error| OmniError::storage(error).unpublished())?;
             let new_fragments = match &transaction.operation {
                 Operation::Overwrite { fragments, .. } => fragments.clone(),
                 other => {
                     return Err(OmniError::manifest_internal(format!(
-                        "stage_overwrite: unexpected Lance operation {:?}",
+                        "stage_overwrite_batches: unexpected Lance operation {:?}",
                         std::mem::discriminant(other)
                     )));
                 }
@@ -7646,23 +7745,62 @@ mod tests {
         let second = preflight.entry(&uris[1]).unwrap();
         assert!(Arc::ptr_eq(first, second));
 
+        let refused = crate::instrumentation::with_external_payload_read_stalled(
+            first.read_full_bounded(15, "csv_source_bytes", |size| {
+                assert_eq!(size, 7);
+                Err(OmniError::resource_limit("query_memory_bytes", 8, 14))
+            }),
+        );
+        let error = futures::FutureExt::now_or_never(refused)
+            .expect("admission must finish before the payload boundary")
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::ResourceLimitExceeded { ref resource, limit: 8, actual: 14 }
+            if resource == "query_memory_bytes")
+        );
+
+        let captured = first
+            .read_full_bounded(15, "csv_source_bytes", |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(captured.bytes.as_ref(), b"payload");
+        assert_eq!(captured.size, 7);
+        assert!(
+            captured.e_tag.is_some(),
+            "file:// objects carry a validator"
+        );
+
         let replacement = directory.path().join("replacement");
         std::fs::write(&replacement, b"payload changed").unwrap();
         std::fs::rename(&replacement, &object).unwrap();
-        assert_eq!(
-            first
-                .read_full_bounded(15, "csv_source_bytes")
-                .await
-                .unwrap()
-                .as_ref(),
-            b"payload changed",
-            "the complete replacement must be read, never the prefix at the preflight size"
+        let error = first
+            .read_full_bounded(15, "csv_source_bytes", |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::ExternalBlobSource { ref reason, .. } if reason.contains("changed")),
+            "a replacement after the probe refuses the read instead of serving another version: {error}"
         );
+
+        let reprobed = store.preflight_external_blob_uris(&uris).await.unwrap();
+        let captured = reprobed
+            .entry(&uris[0])
+            .unwrap()
+            .read_full_bounded(15, "csv_source_bytes", |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(captured.bytes.as_ref(), b"payload changed");
 
         std::fs::write(&replacement, b"payload changed!").unwrap();
         std::fs::rename(&replacement, &object).unwrap();
+        let reprobed = store.preflight_external_blob_uris(&uris).await.unwrap();
         assert!(matches!(
-            first.read_full_bounded(15, "csv_source_bytes").await.unwrap_err(),
+            reprobed
+                .entry(&uris[0])
+                .unwrap()
+                .read_full_bounded(15, "csv_source_bytes", |_| Ok(()))
+                .await
+                .unwrap_err(),
             OmniError::ResourceLimitExceeded { ref resource, limit: 15, actual: 16 }
                 if resource == "csv_source_bytes"
         ));

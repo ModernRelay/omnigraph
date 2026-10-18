@@ -1,0 +1,41 @@
+# issue: none
+# notes: family D: one-call append of 1024 FRESH Person keys (start 100000) over 16384 committed rows (4 fragments); what cross-version uniqueness reads on re-append.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    id: String @key
+    v: I64
+}
+edge Knows: Person -> Person {
+    w: I64
+}
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 16384
+    commits: 4
+    columns:
+      id: {kind: key, prefix: person-, width: 4}
+      v: {kind: ordinal, start: 0, step: 1}
+
+--- load generate: v1 seed: 7 mode: append
+tables:
+  - kind: node
+    name: Person
+    rows: 1024
+    commits: 1
+    start: 100000
+    columns:
+      id: {kind: key, prefix: person-, width: 4}
+      v: {kind: ordinal, start: 0, step: 1}
+
+--- expect ok

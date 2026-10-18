@@ -7,6 +7,7 @@ use std::sync::Arc;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::ir::{IROp, ParamMap, QueryIR};
+use omnigraph_compiler::query::ast::LoadStmt;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_compiler::{CheckedRead, lower_query};
@@ -14,8 +15,10 @@ use omnigraph_compiler::{CheckedRead, lower_query};
 use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::engine;
 use crate::error::{OmniError, Result};
+use crate::loader::{CsvLoadRequest, csv, plan_load};
 use crate::runtime_cache::{CompiledQuery, CompiledRead};
 use crate::session::Session;
+use crate::storage_layer::WriteBudget;
 
 /// Where a route builds its CSR graph index when the query traverses:
 /// the cross-query `RuntimeCache` entry of a live target, or a build against
@@ -159,6 +162,55 @@ impl Session {
         .await
     }
 
+    /// Answer `explain load csv …` on `target`: the plan the statement would
+    /// be accepted under, as explain rows, with the graph head commit id of
+    /// the pinned snapshot. The source is authorized by the graph's external
+    /// Blob policy and probed for its size under the session's
+    /// `load_source_max_bytes`; no payload byte is read, nothing is staged.
+    ///
+    /// # Errors
+    ///
+    /// A historical snapshot target is refused: a load targets a branch head.
+    /// Otherwise the refusals of the probe (policy, deadline, the
+    /// `csv_source_bytes` limit) and of the target's resolution.
+    pub async fn explain_load(
+        &self,
+        target: impl Into<ReadTarget>,
+        stmt: &LoadStmt,
+    ) -> Result<(QueryResult, Option<String>)> {
+        let target = target.into();
+        if let ReadTarget::Snapshot(snapshot) = &target {
+            return Err(OmniError::manifest(format!(
+                "explain load csv: a load targets a branch head, not snapshot '{}'",
+                snapshot.as_str()
+            )));
+        }
+        let (resolved, catalog) = self.capture_read_view(target).await?;
+        let request = CsvLoadRequest::from_statement(stmt);
+        let source_bytes = csv::probe_csv_source_size(
+            self.db(),
+            &request,
+            self.settings().load_source_max_bytes(),
+        )
+        .await?;
+        let decision = plan_load(
+            &catalog,
+            &resolved.snapshot,
+            &request,
+            source_bytes,
+            self.settings().query_memory_bytes(),
+            WriteBudget::from_settings(self.settings()).bytes(),
+        )
+        .await?;
+        let explain = decision.explain().ok_or_else(|| {
+            OmniError::manifest_internal("explain load csv: the planner answered no document")
+        })?;
+        Ok((
+            engine::explain_load_rows(explain)?,
+            resolved.graph_commit_id.clone(),
+        ))
+    }
+
     /// The v2 inspection door of the GQT runner: [`Self::query`] answered as an
     /// `Executed`, the run with its own plan, explain and report.
     ///
@@ -279,6 +331,7 @@ impl Session {
             snapshot: Some(&resolved.snapshot),
             catalog: &catalog,
             graph_index: Arc::new(graph_index),
+            load: None,
         };
         engine::execute(accepted, &context).await
     }

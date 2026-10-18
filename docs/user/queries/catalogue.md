@@ -93,7 +93,7 @@ serves. A graph's own stored stamp is in `omnigraph snapshot`, not here.
 
 **`@LogicalKind`**: one row per logical plan node kind with its routing
 `coverage`: `routable` or `refused_by_name`. Coverage governs change-feed
-and merge routing only; every kind plans and runs in an ordinary read.
+and merge routing only. Read and load plans have their own admission checks.
 
 ## Inventories
 
@@ -110,8 +110,10 @@ binary's rows.
 | ClassifyThreeWay | [1] |
 | ContainsJoin | [2] |
 | CrossJoin | [2] |
+| CsvSource | [0] |
 | Expand | [1] |
 | Filter | [1] |
+| FragmentWrite | [1] |
 | HashJoin | [2] |
 | HydrateByAddress | [1] |
 | HydrateColumns | [1] |
@@ -124,6 +126,7 @@ binary's rows.
 | Scan | [0, 1] |
 | Sort | [1] |
 | SortMergeJoin | [2] |
+| Validate | [1] |
 <!-- /catalogue:operators -->
 
 <!-- catalogue:passes -->
@@ -165,8 +168,10 @@ binary's rows.
 |---|---|
 | Aggregate | refused_by_name |
 | AntiJoin | refused_by_name |
+| CsvSource | refused_by_name |
 | Expand | refused_by_name |
 | Filter | routable |
+| FragmentWrite | refused_by_name |
 | Join | routable |
 | Limit | routable |
 | MergeClassify | routable |
@@ -179,4 +184,5 @@ binary's rows.
 | Sort | routable |
 | TableScan | routable |
 | TextSearch | refused_by_name |
+| Validate | refused_by_name |
 <!-- /catalogue:logical_kinds -->

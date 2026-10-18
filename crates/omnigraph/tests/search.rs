@@ -2733,3 +2733,90 @@ async fn full_text_analyzer_holds_after_first_rows_and_overwrites_issue_904() {
         "a type's first rows on a branch"
     );
 }
+
+/// A full-text call refuses a declared index that has no segment at the
+/// query's snapshot, rather than answering with Lance's bare, case-sensitive
+/// tokenizer: a table version written before writers declared the analyzer
+/// is this case, built here with a raw Lance append to the table's creation
+/// version, published without index work. Planning and explain refuse alike
+/// (`FullTextIndexRequired`, before any scan); building the declared index
+/// lifts the refusal, and the call then folds case.
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
+    use lance::index::DatasetIndexExt;
+    use omnigraph::db::ReadTarget;
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, ANALYZER_SCHEMA).await.unwrap());
+    let entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .clone();
+    let mut raw = lance::Dataset::open(&format!("{uri}/{}", entry.dataset_path))
+        .await
+        .unwrap();
+    assert_eq!(raw.version().version, entry.published_dataset_version);
+    let body = raw.schema().field("body").unwrap().id;
+    assert!(
+        !raw.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.fields.contains(&body)),
+        "the creation version declares no segment on `body`"
+    );
+    let schema = std::sync::Arc::new(arrow_schema::Schema::from(raw.schema()));
+    let column = |values: [&str; 2]| {
+        std::sync::Arc::new(StringArray::from(values.to_vec())) as arrow_array::ArrayRef
+    };
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "__id" | "slug" => column(["d1", "d2"]),
+            "body" => column(["Deep Learning", "deep dive"]),
+            other => panic!("unexpected `Doc` field {other}"),
+        })
+        .collect::<Vec<_>>();
+    lance_append_inline(
+        &mut raw,
+        arrow_array::RecordBatch::try_new(schema, columns).unwrap(),
+    )
+    .await;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
+        .await
+        .unwrap();
+
+    let deep = params(&[("q", "deep")]);
+    let refused = |error: OmniError| match error {
+        OmniError::FullTextIndexRequired { index } => assert_eq!(index, "Doc.body"),
+        other => panic!("an index with no segment answered or failed otherwise: {other}"),
+    };
+    refused(
+        query_branch(&db, "main", ANALYZER_QUERIES, "docs", &deep)
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        db.explain_query(ReadTarget::branch("main"), ANALYZER_QUERIES, "docs", &deep)
+            .await
+            .unwrap_err(),
+    );
+
+    db.ensure_indices().await.unwrap();
+    assert_eq!(
+        first_column_sorted(
+            &query_branch(&db, "main", ANALYZER_QUERIES, "docs", &deep)
+                .await
+                .unwrap()
+        ),
+        ["d1", "d2"],
+        "the built index folds case"
+    );
+}
