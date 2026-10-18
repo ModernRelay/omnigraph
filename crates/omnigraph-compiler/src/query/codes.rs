@@ -73,13 +73,13 @@ codes! {
     T56 = "distinct does not apply to an aggregated return";
     T57 = "distinct applies only to count";
     T58 = "a Boolean return item compares aggregates with constants only";
+    T59 = "an rrf() ranks two bindings one traversal connects";
 
-    // Planner.
-    P001 = "a ranking orders a binding a traversal reaches";
+    // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
+    // the binding it ranks, and `rrf()` arms one traversal connects are T59.
     P002 = "an edge alternation or wildcard traversal needs a finite traversal work limit";
     P003 = "the traversal work limit is out of range or recorded twice";
     P004 = "an edge alternation or wildcard traversal cannot run in CSR traversal mode";
-    P005 = "an rrf() ranks two bindings one traversal connects";
 }
 
 #[cfg(test)]

@@ -6,10 +6,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::QueryDiagnostic;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR, is_fresh_variable};
 use omnigraph_compiler::query::ast::{AggFunc, LoadStmtMode};
-use omnigraph_compiler::query::codes::{P001, P002, P004, P005};
+use omnigraph_compiler::query::codes::{P002, P004};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::Direction;
@@ -2657,26 +2656,10 @@ impl Lowering<'_> {
             matches!(self.physical.node(id), Some(PhysicalNode::HashJoin { build, .. }) if *build == scan)
         });
         if destination {
-            let function = match access.kind {
-                RankKind::Nearest => "nearest",
-                RankKind::Bm25 => "bm25",
-            };
-            // Declaring the binding first makes it the component's scan root,
-            // which is ranked; the compiler picks the first-declared binding.
-            return Err(PlanError::Unsupported(Box::new(
-                QueryDiagnostic::plan(
-                    P001,
-                    format!(
-                        "`{function}()` orders `${binding}`, a traversal destination; engine v2 ranks only the binding a traversal starts from"
-                    ),
-                )
-                .with_expression(format!(
-                    "{function}(${binding}.{}, {})",
-                    access.property, access.query
-                ))
-                .with_fix(format!(
-                    "declare `${binding}` first in `match`, so the ranking starts the traversal"
-                )),
+            // Lowering roots the component holding the ranked binding at that
+            // binding, so a ranked scan a traversal reaches is its defect.
+            return Err(PlanError::Internal(format!(
+                "the ranked binding `${binding}` is a traversal destination; lowering roots a ranked binding's component at it"
             )));
         }
         self.unmark(scan);
@@ -3322,33 +3305,11 @@ impl Lowering<'_> {
                         &secondary_arm.binding,
                     )
                 {
-                    // One of two bindings a traversal connects always starts
-                    // it and the other is reached, and engine v2 ranks only the
-                    // binding a traversal starts from: no declaration order
-                    // serves both arms, so the refusal offers none.
-                    let call = |arm: &SearchArm| {
-                        let function = match arm.kind {
-                            RankKind::Nearest => "nearest",
-                            RankKind::Bm25 => "bm25",
-                        };
-                        format!(
-                            "{function}(${}.{}, {})",
-                            arm.binding, arm.property, arm.query
-                        )
-                    };
-                    return Err(PlanError::Unsupported(Box::new(
-                        QueryDiagnostic::plan(
-                            P005,
-                            format!(
-                                "`rrf()` ranks `${}` and `${}`, which one traversal connects; engine v2 ranks only the binding a traversal starts from, so one arm always ranks a traversal destination and no declaration order serves both",
-                                primary_arm.binding, secondary_arm.binding
-                            ),
-                        )
-                        .with_expression(format!(
-                            "rrf({}, {})",
-                            call(primary_arm),
-                            call(secondary_arm)
-                        )),
+                    // The type checker refuses these arms (`T59`): one
+                    // traversal cannot start at both ranked bindings.
+                    return Err(PlanError::Internal(format!(
+                        "`rrf()` ranks `${}` and `${}`, which one traversal connects; the type checker refuses those arms",
+                        primary_arm.binding, secondary_arm.binding
                     )));
                 }
                 let mut lowered_arms = Vec::with_capacity(2);

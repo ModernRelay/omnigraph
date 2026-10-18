@@ -436,6 +436,31 @@ impl TypedExpr {
         }
     }
 
+    /// The bindings a leading ranking key ranks: the variable of `nearest`
+    /// or `bm25`, and both arms' variables (once each) for `rrf()`. Empty for
+    /// any other key.
+    pub(crate) fn ranked_variables(&self) -> Vec<&str> {
+        match self {
+            Self::Nearest { variable, .. } => vec![variable.as_str()],
+            Self::Bm25 { field, .. } => match field.as_ref() {
+                Self::PropAccess { variable, .. } => vec![variable.as_str()],
+                _ => Vec::new(),
+            },
+            Self::Rrf {
+                primary, secondary, ..
+            } => {
+                let mut variables = primary.ranked_variables();
+                for variable in secondary.ranked_variables() {
+                    if !variables.contains(&variable) {
+                        variables.push(variable);
+                    }
+                }
+                variables
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// The variable a `search`, `fuzzy` or `match_text` call reads, anywhere
     /// in the expression.
     pub(crate) fn text_search_subject(&self) -> Option<&str> {
@@ -912,6 +937,10 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
         });
     }
 
+    if let (Some(leading), Some(source)) = (orders.first(), query.order_clause.first()) {
+        refuse_rrf_over_one_component(&leading.expr, &source.expr, &clauses)?;
+    }
+
     let has_standalone_nearest = query
         .order_clause
         .iter()
@@ -976,6 +1005,53 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
         orders,
         limit: query.limit,
     })
+}
+
+/// T59: a leading `rrf()` whose arms rank two bindings one traversal
+/// connects. The ranked binding roots its component's scan, and one scan
+/// cannot start at both.
+fn refuse_rrf_over_one_component(
+    leading: &TypedExpr,
+    source: &Expr,
+    clauses: &[CheckedClause],
+) -> Result<()> {
+    let TypedExpr::Rrf { .. } = leading else {
+        return Ok(());
+    };
+    let [first, second] = leading.ranked_variables()[..] else {
+        return Ok(());
+    };
+    let mut adjacent: HashMap<&str, Vec<&str>> = HashMap::new();
+    for clause in clauses {
+        if let CheckedClause::Traversal(traversal) = clause {
+            let (src, dst) = (traversal.src.as_str(), traversal.dst.as_str());
+            if src != "_" && dst != "_" {
+                adjacent.entry(src).or_default().push(dst);
+                adjacent.entry(dst).or_default().push(src);
+            }
+        }
+    }
+    let mut reached = HashSet::from([first]);
+    let mut frontier = vec![first];
+    while let Some(var) = frontier.pop() {
+        for &next in adjacent.get(var).into_iter().flatten() {
+            if reached.insert(next) {
+                frontier.push(next);
+            }
+        }
+    }
+    if !reached.contains(second) {
+        return Ok(());
+    }
+    Err(CompilerError::query(
+        QueryDiagnostic::typecheck(
+            T59,
+            format!(
+                "`rrf()` ranks `${first}` and `${second}`, which one traversal connects; a ranking starts the traversal at the binding it ranks, and one traversal cannot start at both"
+            ),
+        )
+        .with_expression(source.to_string()),
+    ))
 }
 
 /// T42 (RFC 2026-09-24-shared-expression-model, "Order keys bind against the

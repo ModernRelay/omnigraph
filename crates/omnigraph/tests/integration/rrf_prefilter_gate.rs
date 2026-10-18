@@ -239,7 +239,7 @@ query different_var_arms($q1: String, $q2: String) {
     limit 5
 }
 
-query ranked_var_is_expand_dst($q1: String, $q2: String) {
+query undeclared_ranked_destination($q1: String, $q2: String) {
     match {
         $d: Chunk
         $d chunkCites $c
@@ -386,10 +386,22 @@ async fn oracle_admission_sweep_prefilter_equals_postfilter() {
         "dst_filtered",
         "direction_both",
         "direction_in",
+        // The ranked binding roots its component whatever the declaration
+        // order: `$c`, reached from the declared `$d`, is `direction_in`.
+        "undeclared_ranked_destination",
         "several_expands",
     ] {
         assert_plans_equivalent(&db, query_name, &text_params).await;
     }
+    let (declared, _, _) = run_forced(&db, "force_prefilter", "direction_in", &text_params).await;
+    let (undeclared, _, _) = run_forced(
+        &db,
+        "force_prefilter",
+        "undeclared_ranked_destination",
+        &text_params,
+    )
+    .await;
+    assert_eq!(undeclared, declared, "declaration order changed the answer");
 
     let hybrid_params = vector_and_string_params("$v", &[0.0, 0.0, 0.0, 0.0], "$q", "needle");
     assert_plans_equivalent(&db, "bm25_secondary_position", &hybrid_params).await;
@@ -557,35 +569,14 @@ async fn antijoin_only_shape_falls_back() {
 }
 
 /// The Shape fence's remaining rows: arms on different variables and a
-/// traversal-free rrf scan record the Shape reason under force_prefilter; a
-/// ranked Expand dst is a user-error refusal of v2's planner.
+/// traversal-free rrf scan record the Shape reason under force_prefilter. A
+/// ranked traversal destination is no longer one: it roots its component.
 #[tokio::test]
 #[serial]
 async fn shape_fence_covers_all_fallback_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_gate_db(&dir).await;
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
-
-    let prefilter_db = with_setting(&db, "rrf_plan", "force_prefilter");
-    let refused = query_main(
-        &prefilter_db,
-        GATE_QUERIES,
-        "ranked_var_is_expand_dst",
-        &text_params,
-    )
-    .await
-    .expect_err("engine v2 refuses a ranked order on a traversal destination");
-    assert_eq!(
-        refused
-            .diagnostic()
-            .map(|diagnostic| diagnostic.code.as_str()),
-        Some("P001"),
-        "ranked_var_is_expand_dst: the refusal is a user error: {refused:?}"
-    );
-    assert!(
-        refused.to_string().contains("a traversal destination"),
-        "{refused}"
-    );
 
     for query_name in ["different_var_arms", "no_traversal"] {
         let (_, verdicts, _) = run_forced(&db, "force_prefilter", query_name, &text_params).await;

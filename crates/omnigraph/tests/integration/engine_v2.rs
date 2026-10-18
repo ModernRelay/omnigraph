@@ -1166,6 +1166,10 @@ edge Likes: Person -> Doc
     return { $d.slug }
     order { bm25($d.title, $q) }
 }";
+    const WILDCARD: &str = "query wildcard() {
+    match { $p: Person $d: Doc $p * $d }
+    return { $d.slug }
+}";
     let dir = tempfile::tempdir().unwrap();
     let db = session(
         Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
@@ -1188,6 +1192,11 @@ edge Likes: Person -> Doc
         (ADULTS, "adults", int_params(&[("min", 18)])),
         (RANKED, "ranked", params(&[("q", "graph")])),
         (LIKED, "liked", params(&[])),
+        (
+            RANKED_DESTINATION,
+            "ranked_destination",
+            params(&[("q", "graph")]),
+        ),
     ] {
         let main = || ReadTarget::branch("main");
         let document = db
@@ -1239,32 +1248,28 @@ edge Likes: Person -> Doc
                 .unwrap();
         assert_eq!(validation, document["validation"], "{name}");
     }
-    let params = params(&[("q", "graph")]);
+    // An edge wildcard refuses CSR traversal mode, which only a session pin
+    // selects: a planner refusal by design.
+    let csr = with_traversal(&db, omnigraph_compiler::settings::Traversal::Csr);
+    let params = params(&[]);
     let main = || ReadTarget::branch("main");
     let refusals = [
-        db.explain_query(main(), RANKED_DESTINATION, "ranked_destination", &params)
+        csr.explain_query(main(), WILDCARD, "wildcard", &params)
             .await
             .err(),
-        db.query_inspected(main(), RANKED_DESTINATION, "ranked_destination", &params)
+        csr.query_inspected(main(), WILDCARD, "wildcard", &params)
             .await
             .err(),
-        db.query(main(), RANKED_DESTINATION, "ranked_destination", &params)
+        csr.query(main(), WILDCARD, "wildcard", &params).await.err(),
+        csr.query(main(), &format!("explain {WILDCARD}"), "wildcard", &params)
             .await
             .err(),
-        db.query(
-            main(),
-            &format!("explain {RANKED_DESTINATION}"),
-            "ranked_destination",
-            &params,
-        )
-        .await
-        .err(),
     ];
     for refusal in refusals {
-        let refusal = refusal.expect("ranking a destination is refused at every door");
+        let refusal = refusal.expect("the wildcard is refused at every door");
         let diagnostic = refusal
             .diagnostic()
             .expect("a refusal by design carries its diagnostic");
-        assert_eq!(diagnostic.code.as_str(), "P001", "{refusal}");
+        assert_eq!(diagnostic.code.as_str(), "P004", "{refusal}");
     }
 }

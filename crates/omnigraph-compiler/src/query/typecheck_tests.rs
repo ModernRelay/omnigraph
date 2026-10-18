@@ -954,6 +954,64 @@ limit 5
     assert!(parse.is_err());
 }
 
+/// T59: the ranked binding roots its component's scan, so `rrf()` arms that
+/// rank two bindings one traversal connects, directly or over several hops,
+/// are refused; arms on one binding, or on bindings no top-level traversal
+/// joins (an anonymous endpoint and a negation join nothing), are admitted.
+#[test]
+fn rrf_arms_on_two_bindings_one_traversal_connects_issue_789() {
+    let catalog = build_catalog(
+        &parse_schema(
+            "node Doc { text: String @index  embedding: Vector(2) @index }\nedge Cites: Doc -> Doc",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let check = |pattern: &str, first: &str, second: &str| {
+        let parsed = parse_query(&format!(
+            "query q($q: String, $v: Vector(2)) {{ match {{ {pattern} }} return {{ ${first}.text }} order {{ rrf(nearest(${first}.embedding, $v), bm25(${second}.text, $q)) }} limit 5 }}"
+        ))
+        .unwrap();
+        typecheck_query(&catalog, parsed.single_decl())
+    };
+    for pattern in [
+        "$a: Doc  $a cites $b",
+        "$b: Doc  $a cites $b",
+        "$a: Doc  $a cites $x  $x cites $b",
+        "$a: Doc  $b cites{1,3} $a",
+    ] {
+        let err = check(pattern, "a", "b").unwrap_err();
+        let diagnostic = err.diagnostic().expect("a typecheck diagnostic");
+        assert_eq!(diagnostic.code.as_str(), "T59", "{pattern}: {err}");
+        assert!(
+            diagnostic
+                .message
+                .contains("`rrf()` ranks `$a` and `$b`, which one traversal connects"),
+            "{pattern}: {err}"
+        );
+        assert_eq!(
+            diagnostic
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.expression.as_deref()),
+            Some("rrf(nearest($a.embedding, $v), bm25($b.text, $q))"),
+            "{pattern}"
+        );
+        assert_eq!(
+            diagnostic.fix, None,
+            "{pattern}: no pattern serves both arms"
+        );
+    }
+    for (pattern, first, second) in [
+        ("$a: Doc  $a cites $b", "b", "b"),
+        ("$a: Doc  $b: Doc", "a", "b"),
+        ("$a: Doc  $b: Doc  $a cites $_  $_ cites $b", "a", "b"),
+        ("$a: Doc  $b: Doc  not { $a cites $b }", "a", "b"),
+    ] {
+        check(pattern, first, second).unwrap_or_else(|err| panic!("{pattern}: {err}"));
+    }
+}
+
 #[test]
 fn test_rrf_rejects_non_positive_k_literal() {
     let catalog = setup_vector();
