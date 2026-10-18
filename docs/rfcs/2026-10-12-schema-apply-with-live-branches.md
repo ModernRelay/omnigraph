@@ -7,12 +7,12 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-12
-updated: 2026-10-15
+updated: 2026-10-17
 discussion: null
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "Measure the apply-time branch check and cross-contract merge preparation (requests, bytes, time) at 1, 16 and 256 live branches and across growing released history, cold and warm, with a checked-in cost instrument, and fix the check's work budget from that measurement."
+  - "Measure the apply-time branch check (requests, bytes, time) at 1, 16 and 256 live branches and across growing released history, cold and warm, with a checked-in cost instrument, and fix the check's work budget from that measurement."
 ---
 
 # RFC: Schema apply with live branches
@@ -30,19 +30,20 @@ write on main increments and that merges carry forward. It orders contracts.
 Content identity cannot, because a change and its reversal reproduce an
 earlier identity.
 
-A merge between branches with different contracts brings every version it
-compares, the merge base included, to the newer contract with the same
-metadata-only Lance commits schema apply uses. It then runs today's merge
-unchanged. Added nullable properties, renames and full-text index
-declarations are reconciled this way; conflicts are today's row-level
-conflicts. The one refusal is a drop: a merge, and a schema apply on main, is
-refused when it would drop a property or type that a branch changed since its
-merge base, because the branch's changes would be lost.
+This RFC takes the narrowest rule that never combines data written under two
+schemas. A merge between branches with different contracts takes the newer
+side's version of every table whose stored columns or full-text declarations
+differ, and refuses when the older side changed such a table since the merge
+base. Schema apply refuses when a live branch changed a table the apply would
+change. "Changed" means changed rows: index maintenance and compaction do not
+count. No merge or check rewrites, converts or prepares a version, so reads,
+dry runs and previews stay free of effects and the merge keeps its fast paths.
 
-The counter needs storage stamp 17, written by each branch's first
-publication. Older binaries refuse the graph once main carries it. The design
-does not add schema apply on named branches, conversion of rows outside
-Lance's own schema evolution, or a way to apply one change to every branch.
+Each later relaxation in Future work only turns refusals into merges and needs
+no format change. The counter needs storage stamp 17, written by each branch's
+first publication. Older binaries refuse the graph once main carries it. The
+design does not add schema apply on named branches or a way to apply one
+change to every branch.
 
 ## Motivation
 
@@ -77,24 +78,29 @@ three failures when main was merged into a branch on the older contract:
   without applying the migration, so a commit with a newer-contract parent
   carried the older contract.
 
-Under this RFC the common migrations no longer wait for branches. Adding a
-nullable property to a type that agent branches write, renaming a property,
-and declaring a full-text index all apply while those branches are live, and
-the branches merge afterwards with ordinary row-level conflicts. Dropping a
-property or type that a live branch changed still refuses until that branch is
-merged or deleted.
+Under this RFC a migration no longer waits for branches that did not change
+the tables it touches, and those branches merge with main afterwards in
+either direction. A migration still waits for a branch that changed one of
+those tables. A branch that changes such a table after the migration cannot
+merge that table until it is redone on a branch created from main; merging
+main into lagging branches promptly after a migration avoids this.
 
 ## User and operational behavior
 
 ### Applying while branches are live
 
-`omnigraph schema apply` on main succeeds while other branches exist. It
-refuses only when it would drop a property or type that a live branch changed
-since its merge base with main. The refusal names each such branch and table
-and gives two remedies: merge the branch into main first, or delete it. Schema
-preview and plan report the same list without refusing. A preview's list is
-advisory, including a stored deployment preview; the check at apply is
-authoritative.
+`omnigraph schema apply` on main succeeds while other branches exist, unless a
+live branch changed, since its merge base with main, a table the apply
+changes. The refusal names each such branch and table and gives two remedies:
+merge the branch into main first, or delete it. Schema preview and plan report
+the same list without refusing. A preview's list is advisory, including a
+stored deployment preview; the check at apply is authoritative.
+
+An apply ***changes a table*** when it adds, renames or drops one of the
+type's properties, declares a full-text `@index` on it, or drops the type.
+Renaming a type, extending an enum, adding a non-full-text `@index`, and
+editing descriptions or instructions change no table; those applies never
+refuse because of a branch.
 
 A branch ***changed*** a table when its rows differ from the merge base's
 rows. Index maintenance, compaction and other physical work that leaves the
@@ -110,8 +116,8 @@ Reads, queries, mutations, loads, Blob writes, exports and index maintenance on
 a branch use that branch's contract, as today. `schema show --branch <name>`
 and `GET /schema?branch=<name>` show it and require read access to that
 branch. `branch show` reports the branch's contract identity, its schema
-sequence and whether it is behind main's; `branch list` does not, so listing
-stays one ref read per branch.
+sequence, whether it is behind main's, and the tables it can no longer merge;
+`branch list` does not, so listing stays one ref read per branch.
 
 Stored queries are validated against main's contract at deployment. Running
 one on a branch whose contract lacks a name it uses, through the CLI, HTTP or
@@ -129,17 +135,28 @@ data under that branch's own contract, read the branch.
 A merge between any two branches, main included:
 
 - publishes the contract with the larger schema sequence;
-- brings the base, source and target versions of each table whose stored
-  columns or full-text declarations differ to that contract, without
-  rewriting data files;
-- then merges rows as today, with today's conflict kinds;
-- is refused with HTTP 409 and reason `schema_diverged` when the newer
-  contract drops a property or type that one side changed since the merge
-  base. The error names each table and side.
+- takes, for each table whose stored columns or full-text declarations differ
+  among the merge base, source and target contracts, the newer side's version
+  whole;
+- is refused with HTTP 409 and reason `schema_diverged` when the older side
+  changed such a table since the merge base. The error names each table and
+  side;
+- merges every other table as today.
 
-`branch merge --dry-run` runs the same capture and classification and reports
-the same outcome, including `schema_diverged` and the contract the merge would
-publish, without effects.
+In the common cases this means:
+
+- **Main into a branch behind it** brings main's contract and changes, unless
+  the branch changed a table that main's newer contract changed.
+- **A branch behind main into main** is allowed under the same condition;
+  main's contract does not change.
+- A merge whose base predates the older side's contract, which a criss-cross
+  history can produce, is refused for every table whose columns differ
+  between that base and the older side. Merging main into each side first
+  resolves it.
+
+`branch merge --dry-run` reports the same outcome, including `schema_diverged`
+and the contract the merge would publish. It stays a read: the rule needs no
+write.
 
 A merge requested `as commit` is refused before any effect when it would
 change the target's contract; unpublished commits carry no schema change. A
@@ -148,8 +165,8 @@ unattached snapshots rooted at the earlier head expire as they do after any
 other publication. A catch-up merge can tombstone a type on its target when
 the newer contract dropped it.
 
-A branch that changed a type or property that main later drops cannot merge
-that table in either direction. Its rows stay readable and exportable on the
+A branch that changed a table that a newer contract changed cannot merge that
+table in either direction. Its rows stay readable and exportable on the
 branch; the work is redone on a branch created from main.
 
 ### Dropped data
@@ -180,8 +197,8 @@ contract head rather than inside it. The archived schema object serializes the
 head with the source and IR, so keeping the sequence outside it leaves
 `schema_content_hash` and every archived object a function of schema content
 alone. Graph lineage rows and `__history` extents do not carry the sequence:
-the merge orders the two sides by their live contract rows and compares the
-base by content, so no historical sequence is read.
+the merge orders the two sides by their live contract rows and reads the base
+by content, so no historical sequence is read.
 
 - Every operation that writes a contract on main publishes it with main's
   sequence plus one. Today those are schema apply and the system-column
@@ -198,9 +215,13 @@ base by content, so no historical sequence is read.
 Sequence 0 is sound because no two live branches' contract rows that both read
 0 differ. Every contract write before this release required a graph with only
 main, so all live branches shared one contract until the first stamped write.
-A merge base may still hold a sequence-0 contract with different content, for
-example from main's history before an earlier apply. That is expected: the
-base is compared by content, never by sequence.
+Branch creation at a commit ([ModernRelay/omnigraph#1016](https://github.com/ModernRelay/omnigraph/pull/1016))
+keeps this true by refusing a commit whose contract differs from the source's
+current one. Relaxing that refusal under this RFC must still refuse a commit
+whose differing contract has no sequence. A merge base may hold a sequence-0
+contract with different content, for example from main's history before an
+earlier apply. That is expected: the base is read by content, never by
+sequence.
 
 The sequence is part of the contract's identity for comparison:
 `same_graph_state`, the authority token and the accepted-catalog cache key
@@ -223,7 +244,7 @@ Ordering by "the base equals one side" then misorders a history in which a
 branch catches up to the intermediate contract while main returns to the
 original one.
 
-### Stored signature and evolution steps
+### Stored signature
 
 The ***stored signature*** of a table in a contract is derived from that
 contract's physical catalog schema for the table:
@@ -240,111 +261,95 @@ not part of it either. The signature is a superset of the change feed's
 schema fingerprint (name, Arrow type, nullability, stable property id and Blob
 marker).
 
-For each table, the merge compares each version's signature with the merged
-contract's and derives the ***evolution*** between them, matched by stable
-property id. A step is ***lossless*** when it adds a nullable column, renames
-a column, or adds a full-text declaration. It is ***lossy*** when it drops a
-column or the merged contract drops the type. A version that does not register
-a table the merged contract registers, such as the base of a type added since,
-is an empty version of it. Every step schema apply supports is one of these
-five. `plan_schema_migration` is not used to derive them. Two
-accepted IRs that differ only by a property added and later dropped produce an
+A table is ***uniform*** in a merge when the source and target contracts
+either both register it or both do not, and every one of the three contracts
+that registers it gives it the same signature. A table the base lacks but both
+sides register with one signature is therefore uniform: its base image is
+empty, and today's merge treats its rows as inserts. Otherwise the table is
+***migrated*** in that merge.
+
+`plan_schema_migration` is not used to compute this. Two accepted IRs that
+differ only by a property added and later dropped produce an
 unclassified-change step there, while the signature comparison correctly
-reports no difference.
+reports no difference. The same comparison of main's current and desired
+contracts gives the tables an apply changes.
 
 ### Merge rule
 
-1. The merged contract is the side's contract with the larger sequence.
-2. For each table, a lossy step on the source's or target's version is
-   allowed only when that side did not change the table since the merge base
-   (Logical change). Otherwise the merge is refused with `schema_diverged`
-   before any effect. A lossy step on the base's version alone is always
-   allowed: neither side holds the dropped data.
-3. Every version whose signature differs from the merged contract's is brought
-   to it (Merge preparation).
-4. The merge runs today's classification, staging, validation and
-   publication against the merged catalog, matching tables across the three
-   versions by stable identity.
+The merged contract is the side's contract with the larger sequence; call the
+other side the ***older side***. Route selection is today's: for each table,
+merge compares the registrations of the base, source and target versions and
+chooses to skip it, adopt one side's version, or walk its rows. A uniform table
+merges by that route unchanged; all three versions have the same stored
+columns, so the by-name row comparison stays sound.
 
-Because every version has the same stored columns after step 3, the merge's
-by-name row comparison is sound. A criss-cross base that predates both sides'
-contracts is handled the same way. For example, a property dropped and
-re-added under the same name gets a new property id. The base's old column is
-dropped and the new one added as null in the base's prepared version, so two
-sides that each wrote the new property conflict as a `DivergentUpdate` instead
-of one value silently winning.
+A migrated table merges only if:
+
+1. the source and target registrations are equal, in which case the shared
+   version stays; or
+2. the base and the older side give the table the same signature, and the
+   older side did not change the table since the base (Logical change). The
+   result is the newer side's version, whole: kept when the newer side is the
+   target, adopted when it is the source, or tombstoned when the merged
+   contract drops the type.
+
+Otherwise the merge is refused with `schema_diverged` before any effect. The
+newer side's version already carries the merged contract's signature,
+including its full-text declarations and index metadata, so no version is
+evolved, prepared or converted. When the older side's registration equals the
+base's, condition 2 is today's adopt or skip route, and the catch-up of an
+untouched table costs a pointer change.
+
+Condition 2's signature test is what keeps every comparison within one shape.
+In the normal case the merge base descends from the main commit that wrote the
+older side's contract. The base and the older side then share a contract,
+because sequences never decrease along ancestry, and the test holds for every
+table. Only a criss-cross base can predate the older side's contract. For
+example, a property dropped and re-added under the same name gets a new
+property id; a base from before the drop fails the test for that table, and
+the merge refuses instead of comparing old and new values by name.
+
+Equal sequences with a migrated table occur only with such a base, since the
+two sides then share a contract. Condition 2 then fails for both sides, so the
+table merges only when its registrations are equal.
 
 ### Logical change
 
-Whether a side changed a table since the base depends only on rows. The
-existing cheap paths answer first: equal registrations, then the merge's
-lineage candidate discovery, which compares the base's and the side's data,
-overlay and deletion files by identity and reports no candidates when they
-match. Index-only commits and schema evolution keep those files, so they cost
-nothing here.
+Whether the older side changed a table since the base depends only on rows,
+and condition 2 guarantees the two versions have the same shape. The existing
+cheap paths answer first:
 
-Only when candidates remain does the merge compare them. It brings the base's
-version to the side's signature with the same preparation and runs the ordered
-comparison over the candidates. Compaction therefore changes cost, not the
-answer. The comparison runs under the merge's existing memory and spill
-bounds, and only for a table where a lossy step meets a side whose files
-differ from the base's.
+1. Equal registrations: unchanged.
+2. The merge's lineage candidate discovery compares the two versions' data,
+   overlay and deletion files by identity. No candidates means unchanged.
+   Index-only commits keep those files, so an index rebuild costs nothing
+   here.
+3. Otherwise the merge compares the candidate rows, or, where lineage
+   discovery does not apply, the two versions' rows in order. This covers Blob
+   tables, tables on pre-v11 forks and pins without stable row ids or the
+   exact-id key. Compaction therefore changes cost, not the answer.
 
-### Merge preparation
-
-Bringing a version to the merged contract uses `TableStore::stage_schema_evolution`
-on that version, exactly as schema apply evolves main's tables:
-
-- renamed and dropped columns commit as a detached `Project`;
-- added nullable columns commit as a detached `Merge` over the unchanged
-  fragments;
-- a full-text declaration is staged as schema apply stages it.
-
-No data file is written and no row is read. Lance reads an added column as
-null in fragments that lack it. A version prepared only for comparison, such
-as the base's, is never published: it is a detached commit that no
-`__manifest` version names, and `cleanup` reclaims it under the existing
-staging-witness rules. A version that becomes a result is published by the
-merge's one manifest commit:
-
-- When the result stages rows onto the target, the target's prepared version
-  is the base of that chain.
-- When the result adopts the source's version, the target registers the
-  source's prepared version.
-- An adopted version keeps its own full-text declarations and index metadata,
-  and its validation delta is computed between the prepared base and the
-  prepared source, which share a schema.
-
-Every supported migration keeps existing rows valid: added properties must be
-nullable, only `@index` can be added as a constraint, enums only widen, and
-type, nullability, key and other constraint changes are refused by the planner.
-Validation therefore checks only the merge's selected delta under the merged
-catalog, as today. A future migration that tightens validation without
-changing stored columns must either enter the stored signature as a lossy step
-or refuse while a live branch has changed an affected table. Adding a required
-or unique property is one such migration. So are several steps proposed in the
-polymorphic types draft
-([ModernRelay/omnigraph#884](https://github.com/ModernRelay/omnigraph/pull/884)):
-narrowing an edge endpoint, removing `implements`, and adding an interface
-uniqueness constraint.
+Only the older side is checked: the newer side's version is taken whole
+whether or not it changed. Every step is a read of committed versions under
+the merge's existing memory and spill bounds.
 
 ### Merge publication
 
 When the merged contract differs from the target's, the merge's one manifest
 commit contains:
 
-- the merged contract row, copied byte for byte from the side that holds it,
-  with its sequence;
+- the merged contract row, copied byte for byte from the source, with its
+  sequence;
 - `RenameTable` for every type the merged contract renames;
 - `RegisterTable` and the source's pin for every type only the source
   registers;
 - `Tombstone` for every type the merged contract drops;
-- the merge's ordinary table updates, whose pins name prepared versions where
-  a table needed preparation.
+- the merge's ordinary table updates.
 
-Today merge publishes only table updates, and the publisher carries the
-target's contract row forward. The fast-forward test compares contracts,
-sequence included, so a catch-up fast forward publishes the contract too.
+The publisher already applies these changes in one batch, registrations first.
+Today merge emits only table updates, and the publisher carries the target's
+contract row forward. The fast-forward test compares contracts, sequence
+included, so a catch-up fast forward publishes the contract too.
 
 Before publishing, the merge checks that the contract it publishes has the
 larger of the two sides' sequences. This turns the prototype's third failure,
@@ -357,17 +362,22 @@ sequence. Ordinary writers detect a contract change twice: write revalidation
 compares the captured contract identity, and the exact graph-head
 precondition fails because every contract change advances the head. Catalog
 and engine tests that commit a contract-only change without lineage through
-`commit_changes` move to the new rule.
+`commit_changes` move to the new rule. A future batching publisher, such as
+group commit ([ModernRelay/omnigraph#785](https://github.com/ModernRelay/omnigraph/pull/785)),
+composes entries onto a later pin and loses the head precondition per entry.
+It must refuse an entry captured under another contract identity, sequence
+included.
 
 ### Apply-time check
 
-The check is the merge rule's step 2, evaluated for each live branch against
-main's planned contract. It shares the merge's implementation, so an apply
-refusal and a later merge refusal cannot disagree. After planning, under the
-exclusive schema permit and before any table effect:
+The check is the merge rule evaluated, for each live branch, against main's
+planned contract, as if main were merged into that branch right after the
+apply. It shares the merge's implementation, so an apply refusal and a later
+merge refusal cannot disagree. Like the merge rule, it only reads committed
+versions. After planning, under the exclusive schema permit and before any
+table effect:
 
-1. Compute the tables the apply drops or drops columns from. Only these can
-   refuse.
+1. Compute the tables the apply changes. Only these can refuse.
 2. List live branches once. For each branch that registers such a table, open
    its `__manifest` and scan its hot rows once, build its commit graph over the
    handle's shared history cache, and compute its merge base with main.
@@ -375,12 +385,11 @@ exclusive schema permit and before any table effect:
    buffered, else from one history record read. The merge capture path and
    `pinned_graph_commit` are not reused: the first replaces a one-entry
    authority cache per branch and builds a full write capture, and the second
-   opens a full snapshot. `Omnigraph::merge_base` and the merge dry run are
-   built on the merge capture, so they inherit the merge's rule but cost more
-   per branch. A base written by a since-deleted branch is accepted here.
-4. Apply Logical change to each such table. Refuse when the branch changed
-   one. Tables a branch can already not merge because of an earlier apply are
-   reported, not refused.
+   opens a full snapshot. A base written by a since-deleted branch is accepted
+   here.
+4. Apply condition 2 to each such table. Refuse when the branch changed one,
+   or when its base gives the table another signature. Tables a branch can
+   already not merge because of an earlier apply are reported, not refused.
 5. Re-list the branch inventory and compare each branch's incarnation and head
    with the first listing; a difference repeats the check for that branch.
 
@@ -389,7 +398,10 @@ its bounded walk (100,000 visits or 32 MiB). Those limits do not cover that
 loading. The check therefore runs under its own per-branch budget on registry
 bytes, index size, history reads and comparison work, fixed by the cost gate
 in `blocked_on`. A branch that exceeds it, or the walk limits, refuses the
-apply with a "cannot prove" message naming the branch.
+apply with a "cannot prove" message naming the branch. This budget refusal is
+the one outcome that can depend on physical state: a table whose rows need an
+ordered comparison costs more after an index rebuild or compaction moved its
+registration. The answer, whenever it is reached, depends only on rows.
 
 Cheaper predicates were examined and rejected. Registration equality alone
 lets index maintenance flip the outcome. The registration clock and the
@@ -432,10 +444,13 @@ the table after the branch forked.
   deployment authority and drift check.
 - `GET /schema` and `schema show` gain an optional branch. It is authorized as
   a read of that branch; today the route has no branch scope.
-- `branch show` gains the contract identity, the schema sequence and a
-  behind-main flag.
+- `branch show` gains the contract identity, the schema sequence, a
+  behind-main flag and the tables the branch can no longer merge. A detailed
+  branch listing, such as the one proposed in
+  [ModernRelay/omnigraph#1012](https://github.com/ModernRelay/omnigraph/pull/1012),
+  may add the same fields at its own measured cost.
 - Merge errors gain `schema_diverged`; apply errors gain
-  `branch_changed_dropped_table`.
+  `branch_changed_table`.
 - `omnigraph upgrade` gains the stamp-only route to 17.
 - `openapi.json` is regenerated for the new parameter, fields and reasons.
 
@@ -459,54 +474,58 @@ Reviewed against unmodified Lance 11.0.0 source and the table schema,
 transaction, branch and tag, versioning and data evolution pages.
 
 - A detached commit writes a new, randomly numbered manifest and never changes
-  an existing version, so main's table effects and a merge's preparation
-  cannot alter another version.
+  an existing version, so main's table effects cannot alter a branch's pin.
 - `Project` (rename, drop) and `Merge` (nullable add over unchanged fragments)
-  write no data file. A field that no data file of a fragment holds reads as
-  null, and a field id the schema no longer lists is not read.
+  write no data file, so schema apply's own evolution keeps the base's data
+  files, which lineage discovery compares by identity.
 - Field ids are unique only within one line of versions. Two detached commits
   from the same version allocate the same next id, and Lance's schema page says
   a future branch merge "must not … match the fields by name." OmniGraph never
   combines data files from two lines of versions: a merge restages rows
-  through keyed writes or adopts one whole version, and preparation evolves
-  each version along its own line. Reads bind columns by field id and ignore
-  type, and `fix_schema` silently renumbers duplicate ids, so fragment
+  through keyed writes or adopts one whole version, and this RFC compares rows
+  only between versions of one shape. Reads bind columns by field id and
+  ignore type, and `fix_schema` silently renumbers duplicate ids, so fragment
   grafting such as [RFC 0001](0001-fragment-adopt-branch-merge.md) would need a
   shared id allocator first.
 - When a table version has no full-text segment, Lance searches it with its
   default simple tokenizer. OmniGraph's analyzer declaration, an untrained
-  segment written by schema apply, is what carries the configured analyzer,
-  as the guards from
-  [ModernRelay/omnigraph#905](https://github.com/ModernRelay/omnigraph/pull/905)
-  pin. This is why a full-text `@index` enters the stored signature.
+  segment written by schema apply, carries the configured analyzer, as the
+  guard `fts_untrained_segment_applies_its_analyzer_to_rows_it_does_not_cover`
+  pins. This is why a full-text `@index` enters the stored signature, and why
+  the merge takes the newer side's version with its declaration whole.
+- Lance 11 has no public surface that reads a version through an uncommitted
+  schema change. This RFC needs none, because it never compares versions of
+  different shapes.
 
 ## Invariants
 
 - **2, one publication door:** schema apply still publishes once on main. A
   cross-contract merge publishes the contract, table lifecycle changes and
-  prepared pins in its one manifest commit.
+  pins in its one manifest commit.
 - **3, coherent view:** the merge captures each side's contract with its
   snapshot and the base's with the base, and revalidates both sides' contract
   identities, sequence included, before effects.
-- **4, publishes once:** unchanged; preparation adds detached commits, not a
+- **4, publishes once:** unchanged; the catch-up adds manifest changes, not a
   publication.
-- **5, crash convergence:** prepared versions are detached commits that no
-  `__manifest` version names until the merge publishes. A failed merge leaves
-  them unreachable, and `cleanup` reclaims them under the existing staging
-  witness.
+- **5, crash convergence:** a migrated table stages nothing; the newer side's
+  version is kept or adopted. Other tables keep today's detached staging,
+  which a failed merge leaves unreachable. Checks, dry runs and previews write
+  nothing.
 - **6, stable identity:** tables and columns are matched by stable identity,
   aliases are only names, snapshot reads never infer identity from a branch
   name, and no branch mints an identity.
 - **7, derived state:** whether a merge or apply refuses depends only on rows.
-  Index maintenance, compaction and fragment layout change its cost.
-  Full-text declarations travel with the version that carries them.
-- **8, loud integrity failures:** the only cross-contract refusal is typed,
-  and the prototype's silent outcomes become ordinary merges or refusals.
+  Index maintenance, compaction and fragment layout change cost; the apply
+  check's budget refusal is the one outcome they can reach, and it is a
+  bounded-work outcome under invariant 11, not a logical answer. Full-text
+  declarations travel with the version that carries them.
+- **8, loud integrity failures:** every cross-contract refusal is typed, and
+  the prototype's silent outcomes become ordinary merges or refusals.
 - **10, trust:** the branch-scoped schema read is authorized per branch;
   access-restricting contract changes reach every branch at once.
 - **11, bounded work:** the apply check runs under an explicit per-branch
   budget covering registry loading, index construction, history reads and
-  comparison work; merge preparation is metadata-only per table.
+  comparison work.
 - **12, one source of truth:** the contract row stays the authority. The
   schema sequence is part of that row, written only by the operations that
   write the row, not a parallel record.
@@ -516,8 +535,8 @@ apply retains its main-only, single-live-branch restriction" to "Schema apply
 is main-only; other branches keep their contract until a merge brings a newer
 one into them". The apply check is a process-local precondition, not
 distributed fencing; the merge rule is the authority. No deny-list shape is
-added: refusals never depend on index coverage, fragment layout or staged
-state.
+added: a refusal never rests on index coverage, fragment layout or staged
+state, and the budget refusal is a stated resource bound.
 
 ## Compatibility and reversibility
 
@@ -536,9 +555,9 @@ also needs a stamp; whichever lands first takes 17.
 A binary that serves stamps up to 16 refuses a stamped `__manifest` on every
 scan and before every publication. This is the fence divergent contracts
 need: such a binary assumes every branch shares main's contract and knows
-neither the sequence nor prepared versions. Any publication on main stamps it
-17, so a graph cannot hold a divergent contract while an older binary can
-still read or write main.
+nothing of the sequence. Any publication on main stamps it 17, so a graph
+cannot hold a divergent contract while an older binary can still read or
+write main.
 
 The wire changes are a new 409 reason, a new apply refusal, an optional branch
 parameter and new fields on `branch show`.
@@ -550,24 +569,29 @@ backup. Reverting only the code that allows divergence, while keeping stamp
 writable but cannot merge across contracts; an operator merges what still can
 merge, then deletes or exports the rest.
 
+The relaxations in Future work need no format change: each uses the sequence
+and signatures this RFC stores, and each only turns a refusal into a merge.
+
 ## Alternatives
 
 - **Keep the main-only rule.** No liability, but branches keep blocking every
   schema change.
-- **Take one side's version whole and refuse otherwise.** The first revision
-  of this RFC refused whenever both sides changed a table whose columns
-  differed, and decided "changed" by registration. Index maintenance on a
-  branch then flipped outcomes, which invariant 7 and the deny-list forbid,
-  and the most common migration, a nullable add on a type branches write,
-  stayed blocked. Preparing every version removes both problems with less
-  merge-specific code.
-- **Convert rows inside the merge's cursors.** Mapping columns by property id
-  and filling added ones with null in the cursors reproduces what Lance's own
-  schema evolution already does at read, and adds a second conversion path
-  that every route must use. Preparation reuses schema apply's evolution.
-- **Decide "changed" by data-file identity.** Compaction rewrites files
-  without changing rows, so outcomes would still depend on layout. File
-  identity stays the cheap path, with a row comparison behind it.
+- **Bring every version to the newer contract before merging.** The 10-15
+  revision of this RFC committed a metadata-only evolution of the base and
+  both sides, then ran today's merge, so only drops refused. Those commits are
+  writes on shared datasets, which turned dry runs, previews and the apply
+  check into writes. Preparing before route selection also made every
+  prepared table miss the skip and adopt routes, so a catch-up restaged main's
+  delta instead of adopting main's version.
+- **Map rows to the newer shape at read time.** Renaming columns by stable
+  property id and filling added ones with null lets both sides change a table
+  whose columns differ, without writes. It adds a mapping that every
+  cross-shape read in merge must use. It is deferred to Future work rather
+  than rejected.
+- **Decide "changed" by registration or data-file identity alone.**
+  Registration equality lets an index rebuild flip an outcome, and file
+  identity lets compaction flip it. Both stay as cheap paths in front of a
+  row comparison.
 - **Order contracts by content identity.** Equal identity does not mean the
   same point in history: a reversed change reproduces an earlier identity, and
   the order then undoes a later change.
@@ -598,12 +622,14 @@ merge, then deletes or exports the rest.
 ### Code survey
 
 Each assumption above was checked in code at commit `a3af0c85`; the facts
-quoted in Motivation and Design were rechecked at `f53bf4fb`, and the stamp,
-the refusals, merge capture and the publisher again at `fe69c039`:
+quoted in Motivation and Design were rechecked at `f53bf4fb` and
+`fe69c039`, and the stamp, the refusals, merge capture and route selection,
+the publisher and the dry run at `9575b044`:
 
 - Contract rows: only schema apply and the system-column upgrade produce
   `ManifestChange::SchemaContract` outside tests; the publisher carries the
-  branch's row forward otherwise and refuses contract changes in unpublished
+  branch's row forward otherwise, applies registrations, renames, tombstones
+  and updates in one batch, and refuses contract changes in unpublished
   commits and unattached snapshots. The archived schema object embeds the
   head; `SchemaContractDigest` is `deny_unknown_fields` and persisted in the
   cluster ledger.
@@ -621,13 +647,18 @@ the refusals, merge capture and the publisher again at `fe69c039`:
   Type renames, enum widening, non-full-text indexes and metadata changes have
   no table effect; a full-text `@index` declares its analyzer on the table.
 - Merge: equal-contract capture, one catalog for all images, alias matching,
-  a row comparator that matches columns by name, lineage candidates by file
-  identity, publication of `Update` only, publisher identity matching with an
-  alias check, and a deterministic merge base with a smallest-id tie break.
-  `ensure_indices_on` and the full-text rebuild publish new branch pins
-  without changing rows.
+  route selection by registration equality, a row comparator that matches
+  columns by name, lineage candidates by file identity that require one Lance
+  schema across the pins and exclude Blob tables, differing paths and pins
+  without stable row ids, publication of `Update` only, publisher identity
+  matching with an alias check, and a deterministic merge base with a
+  smallest-id tie break. The dry run takes no schema permit and commits
+  nothing. `ensure_indices_on` and the full-text rebuild publish new branch
+  pins without changing rows.
 - Stamps: every manifest scan and every publish refuses an unsupported stamp;
-  stamps 15 and 16 were written by first publication.
+  stamps 15 and 16 were written by first publication; main is at 16.
+- Branch creation at a commit (#1016, open) refuses a commit whose contract
+  differs from the source's current one.
 
 ### Prototype (2026-10-12)
 
@@ -636,17 +667,13 @@ merge's equal-contract refusal and gave each merge side its own contract
 identity. The standard test graph applied a migration on main while `feature`
 existed, then merged:
 
-| Case | Observed |
-|---|---|
-| Drop `Person.age`, merge main into untouched `feature` | `FastForward`; `feature` pins main's Person version, keeps `age` in its contract, opens cleanly, and fails `stored node:Person has no declared field 'age'` on query |
-| Add `nickname`, same merge | Error before effects: missing column `nickname` |
-| Rename `age` to `years`, same merge | Error before effects: missing column `years` |
-| `feature` edits Alice, main drops `age`, merge main into `feature` | `Merged`; migration not applied; commit carries the older contract |
-| `feature` adds a company, main drops `age`, merge `feature` into main | `Merged`; main keeps its contract and Person version; three companies |
-
-The second and third rows are the by-name comparison across differing
-columns that preparation removes. Under this RFC the first three cases merge,
-the fourth refuses with `schema_diverged`, and the fifth merges as observed.
+| Case | Observed | Under this RFC |
+|---|---|---|
+| Drop `Person.age`, merge main into untouched `feature` | `FastForward`; `feature` pins main's Person version, keeps `age` in its contract, opens cleanly, and fails `stored node:Person has no declared field 'age'` on query | Adopts main's Person version and publishes main's contract |
+| Add `nickname`, same merge | Error before effects: missing column `nickname` | Same adoption |
+| Rename `age` to `years`, same merge | Error before effects: missing column `years` | Same adoption |
+| `feature` edits Alice, main drops `age`, merge main into `feature` | `Merged`; migration not applied; commit carries the older contract | Refused with `schema_diverged` |
+| `feature` adds a company, main drops `age`, merge `feature` into main | `Merged`; main keeps its contract and Person version; three companies | Merges as observed |
 
 A unit test ran the real `merge_base_search` and its bounded variant over three
 hand-built histories, labeling each commit with an apply counter. Across all
@@ -659,11 +686,11 @@ prototype is not committed; the tests below replace it.
 
 | Owner | Proof |
 |---|---|
-| `tests/schema_apply.rs` | Apply with live branches leaves their pins and contracts; an add, rename or full-text `@index` never refuses; a drop refuses only for a branch that changed the table, naming it; an index rebuild or compaction on the branch, before or after the apply, never changes the outcome; preview lists affected branches; budget and walk-limit refusals; incarnation recheck |
-| `tests/integration/merge_truth_table.rs` | Each schema change in both directions between main and a branch and between two named branches, with and without either side changing the table; type add, rename and drop; the base prepared to the newer contract; `Person → Human → Person` with a branch caught up to the middle contract; a property dropped and re-added under the same name with an older base reports `DivergentUpdate`; criss-cross bases; the published contract has the larger sequence; the dry run reports the same outcome |
-| `tests/merge_fast_forward.rs` | Catch-up fast forward publishes the contract; preparation writes no data file and reads no rows of untouched tables |
+| `tests/schema_apply.rs` | Apply with live untouched branches leaves their pins and contracts; a change to a table a branch changed refuses, naming branch and table; non-table changes never refuse; an index rebuild or compaction on the branch, before or after the apply, never changes the outcome; a Blob table with an index build on the branch, then a drop on main; preview lists affected branches and writes nothing; budget and walk-limit refusals; incarnation recheck |
+| `tests/integration/merge_truth_table.rs` | Each schema change in both directions between main and a branch and between two named branches, with and without the older side changing the table; type add, rename and drop; `Person → Human → Person` with a branch caught up to the middle contract; a property dropped and re-added under the same name with a criss-cross base refuses; the published contract has the larger sequence; the dry run reports the same outcome and writes nothing |
+| `tests/integration/merge_fast_forward.rs` | A catch-up adopts main's version of each migrated table and skips untouched ones: route assertions and `ordered_cursor_scan_calls`; a fast forward publishes the contract |
 | `omnigraph-catalog` tests | The ordering property over every pair of commits, including content-equal contracts with different sequences; sequence 0 for pre-17 rows; the publisher refuses a lower sequence or a contract change without lineage |
-| `tests/failpoints.rs`, `tests/detached_commit_matrix.rs`, collector tests | A cross-contract merge interrupted before publication leaves the branch's contract and pins; prepared versions stay unreachable and are reclaimed; after publication both are complete |
+| `tests/failpoints.rs`, `tests/detached_commit_matrix.rs` | A cross-contract merge interrupted before publication leaves the branch's contract and pins; after publication both are complete |
 | `tests/integration/point_in_time.rs`, `tests/integration/changes.rs` | Snapshot reads of a lagging branch's commits under main's contract, including after the branch is deleted or recreated, and of unpublished commits and unattached snapshots; change-feed baselines of a lagging branch use its contract and end when its incarnation changes |
 | `tests/integration/search.rs` | Full-text search on a branch after catch-up uses the declared analyzer before any index rebuild |
 | Unpublished and unattached owners | `as commit` catch-up refused before effects; unpublished commits and unattached snapshots rooted at a target expire on catch-up; candidates on unaffected branches are untouched |
@@ -689,9 +716,9 @@ proposes the statement such a step would use; that format change is separate.
 2. Bind change-feed baselines, `optimize`, `repair` and write staging to the
    right contract, make snapshot reads bind main explicitly, and key the
    accepted-catalog cache by contract identity.
-3. Teach merge preparation, logical change, identity matching and contract
-   publication. Production cannot reach it yet; tests create divergent
-   contracts through a test-only path.
+3. Teach merge the signature classification, the logical-change check,
+   identity matching and contract publication. Production cannot reach it
+   yet; tests create divergent contracts through a test-only path.
 4. Lift the apply, reconcile, settlement and cluster refusals, and add the
    apply check, the surfaces, the user and developer docs, the operator guides
    and skills that state the main-only rule, the invariants support boundary
@@ -699,17 +726,36 @@ proposes the statement such a step would use; that format change is separate.
 
 `implementation` becomes `in-progress` with step 1 and `complete` after step 4.
 
-## Future work: drops that do not discard changes
+## Future work: relaxations
 
-A drop refuses whenever the side holding the dropped property changed the
-table, even if none of its changes touched that property. A follow-up can
-compare only the dropped columns between the base and that side, and refuse
-only when a dropped value changed. Type drops stay as specified.
+Each relaxation only turns a `schema_diverged` refusal into a merge, keeps
+every outcome that succeeds today, and needs no format change. They are listed
+in order of increasing machinery.
+
+1. **Upgrade the older side's version when the newer side's change was schema
+   only.** When the older side changed a migrated table but the newer side's
+   version has the base's data files, the result is the older side's rows in
+   the newer shape. The merge can stage the same metadata-only evolution
+   schema apply uses on the older side's version, inside its own effects
+   after every refusal, and publish it. Drops stay refused, since they would
+   discard the older side's values. This unblocks a branch that wrote a table
+   after main changed only its schema.
+2. **Map rows to the newer shape at read time.** When both sides changed a
+   migrated table, read the base and the older side through a mapping by
+   stable property id that renames columns, fills added ones with null and
+   omits dropped ones, then run today's three-way comparison and conflict
+   kinds. Physical evolution stays for the version a merge publishes, and a
+   guard proves the mapping reads what the committed evolution reads. Lineage
+   discovery then compares stored signatures, not Lance field ids. This
+   unblocks tables both sides write after a migration.
+3. **Drops that do not discard changes.** Compare only the dropped columns
+   between the base and the side that still holds them, and refuse only when
+   a dropped value changed.
 
 ## Unresolved questions
 
-1. Should schema apply offer an override that drops a property or type despite
-   branches that changed it, leaving them unable to merge that table? The
+1. Should schema apply offer an override that applies despite branches that
+   changed a table it changes, leaving them unable to merge that table? The
    draft refuses with no override.
 2. Is `BranchMerge` on the target enough for a catch-up merge that changes the
    target's contract, including a tombstone of a type main dropped? The draft
@@ -734,16 +780,24 @@ only when a dropped value changed. Type drops stay as specified.
   feed contract (#964, which landed in RFC 0030 through #966).
   Historical-property binding (#959) now governs snapshot reads. Contract
   writers proposed in #884 increment the sequence, and its
-  validation-tightening steps must become lossy steps or refuse with live
+  validation-tightening steps must enter the signature or refuse with live
   branches. Access-restricting contract changes from #951 take effect on every
   branch at once. Restore in #677 must not lower a branch's sequence.
-- 2026-10-15: Revised after PR review. Registration equality decided
-  refusals, so index maintenance could flip outcomes (invariant 7, deny-list);
-  "changed" now means changed rows, with file identity as the cheap path.
-  Preparing every version to the newer contract replaced whole-version
-  selection, so lossless steps merge with ordinary conflicts and only drops
-  refuse. Snapshot reads keep main's contract because the writing-branch rule
-  was not total. The sequence moved out of lineage rows, and the ledger digest
-  stays content-only. The stamp fence holds on every scan and publication, and
-  stamping at first contract write is recorded as rejected. `branch list`
-  stays cheap.
+- 2026-10-15: Revised after PR review. Registration equality had decided
+  refusals, so index maintenance could flip outcomes; "changed" became changed
+  rows, with file identity as the cheap path. Every merge version was brought
+  to the newer contract before merging, so only drops refused. Snapshot reads
+  kept main's contract because a writing-branch rule was not total. The
+  sequence moved out of lineage rows, the ledger digest stayed content-only,
+  the stamp fence was corrected and `branch list` stayed cheap.
+- 2026-10-17: Narrowed after a second PR review and a maintainer decision to
+  take the lower-liability rule first. Preparing versions wrote to shared
+  datasets inside reads and defeated the skip and adopt routes. The merge now
+  takes the newer side's version of each migrated table whole, refuses when
+  the older side changed it, and compares rows only between versions of one
+  shape, so checks, dry runs and previews stay reads and catch-up keeps its
+  pointer adoption. Upgrading the older side, read-time mapping and narrower
+  drops moved to Future work as relaxations. The budget refusal is stated as
+  the one physical dependence. Group commit (#785), branch creation at a
+  commit (#1016) and branch details (#1012) were aligned, and a test owner
+  path was corrected.
