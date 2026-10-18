@@ -2351,12 +2351,13 @@ async fn live_deployment_fixture(mode: &str) {
         .await
         .expect("accepted deployment must finish under its server owner")
     }
-    async fn status(app: &Router, id: Option<&str>) -> (DeploymentStatus, bool) {
+    async fn status(app: &Router, id: Option<&str>) -> (DeploymentStatus, bool, bool) {
         let (code, body) =
             json_response(app, get_request("/cluster/deployments", "operator-token")).await;
         assert_eq!(code, StatusCode::OK, "{body}");
         let mut status: DeploymentStatus = serde_json::from_value(body["status"].clone()).unwrap();
         let mut active = body["active"].as_bool().unwrap();
+        let mut in_progress = body["in_progress"].as_bool().unwrap();
         if let Some(id) = id {
             let (code, receipt) = json_response(
                 app,
@@ -2370,8 +2371,9 @@ async fn live_deployment_fixture(mode: &str) {
             );
             status.lookup = Some(serde_json::from_value(receipt["deployment"].clone()).unwrap());
             active = receipt["active"].as_bool().unwrap();
+            in_progress = receipt["in_progress"].as_bool().unwrap();
         }
-        (status, active)
+        (status, active, in_progress)
     }
 
     let temp = tempfile::tempdir().unwrap();
@@ -2455,7 +2457,7 @@ async fn live_deployment_fixture(mode: &str) {
     );
     let (code, _) = json_response(&app, get_request("/cluster/deployments", "reader-token")).await;
     assert_eq!(code, StatusCode::FORBIDDEN);
-    let (initial_status, _) = status(&app, None).await;
+    let (initial_status, _, _) = status(&app, None).await;
     let id = initial_status.next_deployment_id();
 
     if mode == "catalogue" {
@@ -2490,7 +2492,7 @@ async fn live_deployment_fixture(mode: &str) {
                 _ => unreachable!(),
             }
             let deployment = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-            let (current, _) = status(&app, None).await;
+            let (current, _, _) = status(&app, None).await;
             let id = current.next_deployment_id();
             let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
             let (code, refusal) =
@@ -3159,8 +3161,8 @@ async fn live_deployment_fixture(mode: &str) {
     assert_eq!(code, StatusCode::OK, "{old_result}");
     let completed = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let (observed, active) = status(&app, Some(&id)).await;
-            if active {
+            let (observed, active, in_progress) = status(&app, Some(&id)).await;
+            if active && !in_progress {
                 break observed;
             }
             assert!(
@@ -3243,7 +3245,7 @@ async fn live_deployment_fixture(mode: &str) {
     )
     .unwrap();
     let independent = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let (code, changed) = json_response(
         &app,
         submit(&next.next_deployment_id(), &independent, "operator-token"),
@@ -3270,7 +3272,7 @@ async fn live_deployment_fixture(mode: &str) {
     )
     .unwrap();
     let denied_candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     let (code, _) = json_response(
         &app,
@@ -3329,7 +3331,7 @@ async fn live_deployment_fixture(mode: &str) {
         .unwrap();
     fs::write(temp.path().join("policy.yaml"), &old_policy).unwrap();
     let revoke = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let revoke_request = submit(&next.next_deployment_id(), &revoke, "operator-token");
     let request_app = app.clone();
     let revoker = tokio::spawn(async move { json_response(&request_app, revoke_request).await });
@@ -3381,7 +3383,7 @@ async fn live_deployment_fixture(mode: &str) {
         let bound = base_config.replace("    schema: ./people.pg\n", "    schema: ./people.pg\n    embedding_provider: selected\n    external_blobs:\n      allow:\n        - base: s3://lifecycle-assets/allowed\n          scope: server_safe\n");
         fs::write(temp.path().join("cluster.yaml"), format!("{bound}providers:\n  embedding:\n    selected:\n      kind: mock\n      model: {model}\n")).unwrap();
         let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-        let (next, _) = status(&app, None).await;
+        let (next, _, _) = status(&app, None).await;
         let (code, body) = json_response(
             &app,
             submit(&next.next_deployment_id(), &candidate, "operator-token"),
@@ -3402,7 +3404,7 @@ async fn live_deployment_fixture(mode: &str) {
     );
     fs::write(temp.path().join("cluster.yaml"), broken).unwrap();
     let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     let RegistryLookup::Ready(before) = state.routing().registry.get(&key) else {
         panic!("ready")
@@ -3447,7 +3449,7 @@ async fn live_deployment_fixture(mode: &str) {
         .replace("[knowledge, peer]", "[knowledge]");
     fs::write(temp.path().join("cluster.yaml"), &removed).unwrap();
     let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let delete_id = next.next_deployment_id();
     let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     let (code, _) = json_response(&app, submit(&delete_id, &candidate, "reader-token")).await;
@@ -3518,8 +3520,8 @@ async fn live_deployment_fixture(mode: &str) {
     assert_eq!(code, StatusCode::OK, "{body}");
     let deleted = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let (observed, active) = status(&app, Some(&delete_id)).await;
-            if active {
+            let (observed, active, in_progress) = status(&app, Some(&delete_id)).await;
+            if active && !in_progress {
                 break observed;
             }
             assert!(!state.operation_runtime().snapshot().closed);
@@ -3599,7 +3601,7 @@ async fn live_deployment_fixture(mode: &str) {
     )
     .unwrap();
     let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-    let (next, _) = status(&app, None).await;
+    let (next, _, _) = status(&app, None).await;
     let handoff_id = next.next_deployment_id();
     let (code, body) = json_response(&app, submit(&handoff_id, &candidate, "operator-token")).await;
     assert_eq!(code, StatusCode::OK, "{body}");

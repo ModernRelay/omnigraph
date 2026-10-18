@@ -134,7 +134,7 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         default: "157286400",
         scope: SettingScope::Request,
         env: "OMNIGRAPH_QUERY_MEMORY_BYTES",
-        doc: "the memory pool one read query runs under; tracked work past it is refused, and a raised value is memory one query may hold",
+        doc: "the memory pool one read query runs under, and the allowance one load statement's retained read-reuse buffers are admitted against; tracked work past it is refused, and a raised value is memory one query or load may hold",
     },
     SettingSpec {
         name: "history_release_bytes",

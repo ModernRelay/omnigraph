@@ -179,19 +179,36 @@ impl<'a> QuerySource<'a> {
     /// values, so one explain document reads the same on every operation, and
     /// the memory limit `gather` captured, which sizes the run's pool.
     pub(crate) fn bounds(&self) -> Bounds {
-        Bounds {
-            hydration_chunk_hard_bytes: 2 * crate::storage_layer::KEYED_WRITE_MAX_BYTES,
-            key_width_bytes: KEY_WIDTH_BYTES,
-            ordered_scan_memory_bytes: crate::table_store::ORDERED_SCAN_MEMORY_BYTES,
-            ordered_scan_max_input_batch_bytes:
-                crate::table_store::ORDERED_SCAN_MAX_INPUT_BATCH_BYTES,
-            build_key_cap_rows: super::push::BUILD_KEY_CAP_ROWS as u64,
-            query_memory_pool_bytes: self.memory_limit,
-            late_materialization_only: false,
-        }
+        engine_bounds(
+            self.memory_limit,
+            crate::storage_layer::KEYED_WRITE_MAX_BYTES,
+        )
     }
 
     fn take_source_failure(&self) -> Option<OmniError> {
+        self.take_source_failure_inner()
+    }
+}
+
+/// The engine's bounds for one plan: the change-feed constants, the pool
+/// `memory_limit` sizes, and the bound on one staged load input (the session's
+/// `write_max_bytes` for a load, the keyed constant for a query's document).
+pub(crate) fn engine_bounds(memory_limit: u64, load_write_max_bytes: u64) -> Bounds {
+    Bounds {
+        hydration_chunk_hard_bytes: 2 * crate::storage_layer::KEYED_WRITE_MAX_BYTES,
+        key_width_bytes: KEY_WIDTH_BYTES,
+        ordered_scan_memory_bytes: crate::table_store::ORDERED_SCAN_MEMORY_BYTES,
+        ordered_scan_max_input_batch_bytes: crate::table_store::ORDERED_SCAN_MAX_INPUT_BATCH_BYTES,
+        build_key_cap_rows: super::push::BUILD_KEY_CAP_ROWS as u64,
+        query_memory_pool_bytes: memory_limit,
+        late_materialization_only: false,
+        load_workers_max: 1,
+        load_write_max_bytes,
+    }
+}
+
+impl<'a> QuerySource<'a> {
+    fn take_source_failure_inner(&self) -> Option<OmniError> {
         self.source_failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -714,6 +731,15 @@ pub(crate) async fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQ
     Ok(ExplainedQuery { explain, accepted })
 }
 
+/// Index metadata from the accepted table version; no table payload is read.
+pub(crate) async fn load_index_facts(
+    snapshot: &Snapshot,
+    type_key: &str,
+) -> Result<Vec<IndexFact>> {
+    let dataset = snapshot.open_lance_dataset(type_key).await?;
+    indexes::gather(&dataset).await
+}
+
 async fn query_table_statistics(
     ir: &QueryIR,
     snapshot: &Snapshot,
@@ -1011,6 +1037,7 @@ query people() { match { $p: Person } return { count($p) as n } }
                 snapshot: Some(&view.snapshot),
                 catalog: &catalog,
                 graph_index: Arc::new(GraphIndexHandle::none()),
+                load: None,
             };
             let lowering = Lowering::new(bound, &context);
             assert_eq!(lowering.plan.assumptions().memory_limit, CAPTURED);

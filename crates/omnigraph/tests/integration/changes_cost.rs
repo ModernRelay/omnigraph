@@ -729,13 +729,18 @@ async fn change_feed_caught_up_poll_manifest_reads_are_flat_in_history() {
 /// side spelled as a branch name cannot be a commit id, so it skips the
 /// commit lookup, whose miss path checks out every live branch's
 /// `__manifest`. Both sides here are branch names; the sweep adds idle
-/// branches, which neither side reads.
+/// branches, which neither side reads. A continuation resolves its sides
+/// again to check the token's commits against them, the branch form through
+/// one more merge-base capture, so it costs what its first page costs, and
+/// neither grows with idle branches either.
 #[tokio::test]
 async fn graph_diff_side_resolution_is_flat_in_live_branches() {
     use omnigraph::changes::{GraphDiffRequest, GraphDiffSides};
 
     cost_harness(async {
-        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        // (idle branches, first page, continuation) per diff form.
+        let mut between: Vec<(u64, IoCounts, IoCounts)> = Vec::new();
+        let mut branch: Vec<(u64, IoCounts, IoCounts)> = Vec::new();
         for idle in [1u64, 9] {
             let dir = tempfile::tempdir().unwrap();
             let db = Omnigraph::init(
@@ -755,7 +760,11 @@ async fn graph_diff_side_resolution_is_flat_in_live_branches() {
             db.branch_create("feature").await.unwrap();
             db.load_with_receipt(
                 "feature",
-                r#"{"type":"Person","data":{"name":"feature","age":2}}"#,
+                concat!(
+                    r#"{"type":"Person","data":{"name":"feature","age":2}}"#,
+                    "\n",
+                    r#"{"type":"Person","data":{"name":"feature-two","age":3}}"#,
+                ),
                 LoadMode::Merge,
             )
             .await
@@ -764,30 +773,70 @@ async fn graph_diff_side_resolution_is_flat_in_live_branches() {
                 db.branch_create(&format!("idle{i}")).await.unwrap();
             }
 
-            let (page, io) = measure(db.diff_page(&GraphDiffRequest {
-                sides: GraphDiffSides::Between {
-                    from: "main".to_string(),
-                    to: "feature".to_string(),
-                },
-                scope: ChangeFeedScope::default(),
-                page_token: None,
-                max_changes: None,
-                max_bytes: None,
-            }))
-            .await;
-            assert_eq!(page.unwrap().changes.len(), 1);
-            eprintln!(
-                "DIFF idle_branches={idle}: manifest_reads={} data_open_count={}",
-                io.manifest_reads, io.data_open_count,
-            );
-            curve.push((idle, io));
+            for (sides, curve) in [
+                (
+                    GraphDiffSides::Between {
+                        from: "main".to_string(),
+                        to: "feature".to_string(),
+                    },
+                    &mut between,
+                ),
+                (
+                    GraphDiffSides::Branch {
+                        source: "feature".to_string(),
+                        target: "main".to_string(),
+                    },
+                    &mut branch,
+                ),
+            ] {
+                let request = |page_token: Option<String>| GraphDiffRequest {
+                    sides: sides.clone(),
+                    scope: ChangeFeedScope::default(),
+                    page_token,
+                    max_changes: Some(1),
+                    max_bytes: None,
+                };
+                let (first, first_io) = measure(db.diff_page(&request(None))).await;
+                let first = first.unwrap();
+                assert_eq!(first.changes.len(), 1);
+                let token = first.next_page_token.expect("two changes, pages of one");
+                let (next, next_io) = measure(db.diff_page(&request(Some(token)))).await;
+                let next = next.unwrap();
+                assert_eq!(next.changes.len(), 1);
+                assert_eq!(next.to_commit_id, first.to_commit_id);
+                eprintln!(
+                    "DIFF {sides:?} idle_branches={idle}: first manifest_reads={} \
+                     continuation manifest_reads={}",
+                    first_io.manifest_reads, next_io.manifest_reads,
+                );
+                curve.push((idle, first_io, next_io));
+            }
         }
-        assert_flat(
-            &curve,
-            |io| io.manifest_reads,
-            1,
-            "a diff between two branch names must not read a __manifest per live branch",
-        );
+        for (form, curve) in [("two-point", &between), ("branch", &branch)] {
+            let first: Vec<(u64, IoCounts)> = curve.iter().map(|(n, f, _)| (*n, *f)).collect();
+            let next: Vec<(u64, IoCounts)> = curve.iter().map(|(n, _, c)| (*n, *c)).collect();
+            assert_flat(
+                &first,
+                |io| io.manifest_reads,
+                1,
+                &format!("a {form} diff must not read a __manifest per live branch"),
+            );
+            assert_flat(
+                &next,
+                |io| io.manifest_reads,
+                1,
+                &format!("a {form} diff continuation must not read a __manifest per live branch"),
+            );
+            for (idle, first, next) in curve {
+                assert!(
+                    next.manifest_reads <= first.manifest_reads,
+                    "a {form} diff continuation re-resolves the first page's sides and reads no \
+                     more: {idle} idle branches, first {} continuation {}",
+                    first.manifest_reads,
+                    next.manifest_reads,
+                );
+            }
+        }
     })
     .await;
 }

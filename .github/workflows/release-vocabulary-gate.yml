@@ -12,10 +12,34 @@ on:
         required: false
         default: ""
         type: string
+      wait_minutes:
+        description: >-
+          Without ci_run_id, wait up to this many minutes for a CI run of the
+          exact commit that has not finished yet; 0 decides from the runs
+          already finished.
+        required: false
+        default: 0
+        type: number
+      require_ci_gate:
+        description: Also require the same run's `CI Gate` job, so the commit's whole CI passed.
+        required: false
+        default: false
+        type: boolean
+      superseded_ok:
+        description: >-
+          Succeed without authorizing anything when every CI run of the
+          commit was cancelled and main has moved past it; `superseded` is
+          then true and the caller publishes nothing.
+        required: false
+        default: false
+        type: boolean
     outputs:
       source_sha:
         description: Immutable audited commit used by every release checkout.
         value: ${{ jobs.verify.outputs.source_sha }}
+      superseded:
+        description: True when superseded_ok ended the gate without an audit.
+        value: ${{ jobs.verify.outputs.superseded }}
 
 jobs:
   verify:
@@ -26,6 +50,7 @@ jobs:
       contents: read
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}
+      superseded: ${{ steps.audit.outputs.superseded }}
     steps:
       - name: Resolve release source once
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -43,10 +68,14 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Require successful vocabulary audit
+        id: audit
         env:
           CI_RUN_ID: ${{ inputs.ci_run_id }}
           GH_TOKEN: ${{ github.token }}
+          REQUIRE_CI_GATE: ${{ inputs.require_ci_gate }}
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          SUPERSEDED_OK: ${{ inputs.superseded_ok }}
+          WAIT_MINUTES: ${{ inputs.wait_minutes }}
         run: |
           set -euo pipefail
 
@@ -55,14 +84,16 @@ jobs:
             local jobs
             jobs="$(gh api \
               "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?filter=latest&per_page=100")"
-            jq -e --arg sha "$SOURCE_SHA" '
-              .jobs
-              | any(
-                  .name == "Graph Vocabulary Guard"
+            jq -e --arg sha "$SOURCE_SHA" --argjson gate "$REQUIRE_CI_GATE" '
+              def passed($name):
+                any(
+                  .jobs[];
+                  .name == $name
                   and .head_sha == $sha
                   and .status == "completed"
                   and .conclusion == "success"
-                )
+                );
+              passed("Graph Vocabulary Guard") and (($gate | not) or passed("CI Gate"))
             ' <<<"$jobs" >/dev/null
           }
 
@@ -88,19 +119,46 @@ jobs:
             exit 1
           fi
 
-          # Manual backfills may reuse an earlier audit of the exact commit,
-          # but a skipped pull-request context never qualifies.
-          mapfile -t run_ids < <(
-            gh api \
+          # Manual backfills and scheduled builds may reuse an earlier audit of
+          # the exact commit, but a skipped pull-request context never
+          # qualifies. A scheduled build may wait, bounded, for the run of a
+          # commit that is still queued behind earlier CI runs on main.
+          [[ "$WAIT_MINUTES" =~ ^[0-9]+$ ]]
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          while :; do
+            runs="$(gh api \
               "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SOURCE_SHA}&per_page=100" \
-              --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | .id'
-          )
-          for run_id in "${run_ids[@]}"; do
-            if audit_succeeded_in_run "$run_id"; then
-              exit 0
+              --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | {id, status, conclusion}]')"
+            mapfile -t run_ids < <(jq -r '.[].id' <<<"$runs")
+            for run_id in "${run_ids[@]}"; do
+              if audit_succeeded_in_run "$run_id"; then
+                exit 0
+              fi
+            done
+            unfinished="$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")"
+            if [[ ( "${#run_ids[@]}" -gt 0 && "$unfinished" -eq 0 ) || "$(date +%s)" -ge "$deadline" ]]; then
+              break
             fi
+            sleep 60
           done
 
+          # A run cancelled while pending was replaced by a newer push to main
+          # (ci.yml's concurrency group): nothing to fix, and a later run
+          # builds the newer commit.
+          if [[ "$SUPERSEDED_OK" == true ]] \
+            && jq -e 'length > 0 and all(.status == "completed" and .conclusion == "cancelled")' <<<"$runs" >/dev/null; then
+            current_main="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | awk '{print $1}')"
+            if [[ -n "$current_main" && "$current_main" != "$SOURCE_SHA" ]]; then
+              echo "::notice::every CI run of ${SOURCE_SHA} was cancelled and main moved to ${current_main}; nothing to publish"
+              echo "superseded=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          if [[ "$REQUIRE_CI_GATE" == true ]]; then
+            echo "::error::source ${SOURCE_SHA} has no non-PR CI run whose Graph Vocabulary Guard and CI Gate both succeeded"
+            exit 1
+          fi
           echo "::error::source ${SOURCE_SHA} has no successful non-PR Graph Vocabulary Guard"
           echo "Audit the exact ref first, then retry the manual release. Historical pre-guard tags require an explicit policy decision."
           exit 1

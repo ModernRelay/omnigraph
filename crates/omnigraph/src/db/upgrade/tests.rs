@@ -2840,6 +2840,46 @@ async fn commit_list_and_change_feed_cross_the_upgrade() {
     insert(&graph, "main", "d").await;
     let commits = graph.list_commits(None).await.unwrap();
     assert_eq!(commit_ids(&commits[1..]), [id(4), id(2), id(1)]);
+    // Pages walk from the new head into the commits the upgrade converted,
+    // which are read by their pre-upgrade ids, through both doors.
+    for branch in [None, Some("feature")] {
+        let listed = graph.list_commits(branch).await.unwrap();
+        for limit in [1, 2] {
+            for on_branch in [false, true] {
+                let mut paged = Vec::new();
+                let mut token: Option<String> = None;
+                loop {
+                    let page = match on_branch {
+                        true => {
+                            graph
+                                .list_commits_page_readable(
+                                    branch,
+                                    token.as_deref(),
+                                    Some(limit),
+                                    &mut |_| false,
+                                )
+                                .await
+                        }
+                        false => {
+                            graph
+                                .list_commits_page(branch, token.as_deref(), Some(limit))
+                                .await
+                        }
+                    }
+                    .unwrap();
+                    paged.extend(page.commits);
+                    match page.next_page_token {
+                        Some(next) => token = Some(next),
+                        None => break,
+                    }
+                }
+                assert_eq!(
+                    paged, listed,
+                    "{branch:?} by {limit}, on branch {on_branch}"
+                );
+            }
+        }
+    }
     let newest = commits[0].graph_commit_id.clone();
     let second = graph.get_commit(&id(2)).await.unwrap();
     assert_eq!(

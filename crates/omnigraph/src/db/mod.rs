@@ -16,8 +16,9 @@ pub use commit_graph::{GraphCommit, GraphCommitKind};
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{DatasetEntry, DatasetUpdate};
 pub use omnigraph::{
-    BranchDetail, BranchListing, CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot,
-    CollectorReport, CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats,
+    BranchDetail, BranchListing, COMMIT_LIST_DEFAULT_PAGE_COMMITS, COMMIT_LIST_MAX_PAGE_COMMITS,
+    CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot, CollectorReport,
+    CollectorRowSummary, CommitListPage, DatasetCleanupStats, DatasetOptimizeStats,
     DatasetRepairStats, EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult,
     GraphCreateReconciliation, InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode,
     PendingIndex, PreparedGraphCreate, PreparedSchemaApply, PreparedSchemaSettlement, ReadCheck,

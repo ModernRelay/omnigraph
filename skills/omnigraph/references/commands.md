@@ -158,6 +158,11 @@ omnigraph commit show <commit-id> --store "$REPO"
 omnigraph commit changes <commit-id> --store "$REPO" --json
 ```
 
+`commit list --limit N --json` returns the newest N commits, the
+`head_commit_id` it resolved and a `next_page_token`; pass the token back as
+`--page-token` with the same `--branch` for older commits. Later pages keep
+that head even after the branch moves.
+
 `commit changes` compares one commit with its first parent and can filter with
 repeatable `--kind`, `--type`, and `--op`. For a durable branch feed and
 baseline recovery, see [`changes.md`](changes.md).

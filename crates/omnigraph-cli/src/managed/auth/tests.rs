@@ -310,9 +310,16 @@ async fn cached_login_does_not_restart_provider_authorization() {
     let store = MemoryStore::default();
     renewal::save(&store, &saved).unwrap();
     let provider = MockTransport::with(vec![]);
-    let output = login_with(&store, &api.origin, config(), &provider.provider(), None)
-        .await
-        .unwrap();
+    let output = login_with(
+        &store,
+        &api.origin,
+        config(),
+        &provider.provider(),
+        None,
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(output["data"]["principal_id"], "principal_one");
     assert!(output["data"]["refresh_expires_at"].is_string());
     assert!(provider.requests.lock().unwrap().is_empty());
@@ -333,9 +340,16 @@ async fn device_login_polls_the_provider_and_never_the_old_broker() {
         (200, tokens(120, "user_one")),
     ]);
     let store = MemoryStore::default();
-    let output = login_with(&store, &api.origin, config(), &transport.provider(), None)
-        .await
-        .unwrap();
+    let output = login_with(
+        &store,
+        &api.origin,
+        config(),
+        &transport.provider(),
+        None,
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(output["data"]["principal_id"], "principal_one");
     assert_eq!(transport.requests.lock().unwrap().len(), 4);
     assert_eq!(api.requests()[0].path, "/v1/auth/session");
@@ -359,19 +373,54 @@ async fn rejected_resource_identity_never_becomes_a_cached_session() {
 
 #[tokio::test]
 async fn device_deadline_prevents_a_poll_or_resource_request_after_expiry() {
-    let api = IntentApiFixture::new(vec![]);
-    let transport = MockTransport::with(vec![(
-        200,
-        json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":1,"interval":5}),
-    )]);
-    let store = MemoryStore::default();
-    let error = login_with(&store, &api.origin, config(), &transport.provider(), None)
+    use crate::managed::tests::{FailedOutput, OutputFault};
+    for fault in [
+        None,
+        Some(OutputFault::PartialWrite),
+        Some(OutputFault::Flush),
+    ] {
+        let api = IntentApiFixture::new(vec![]);
+        let transport = MockTransport::with(vec![(
+            200,
+            json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":if fault.is_some() {30} else {1},"interval":5}),
+        )]);
+        let store = MemoryStore::default();
+        let mut delivered = Vec::new();
+        let mut failed = FailedOutput::new(fault.unwrap_or(OutputFault::Flush), 0);
+        let stderr: &mut dyn Write = if fault.is_some() {
+            &mut failed
+        } else {
+            &mut delivered
+        };
+        let error = login_with(
+            &store,
+            &api.origin,
+            config(),
+            &transport.provider(),
+            None,
+            stderr,
+        )
         .await
         .unwrap_err();
-    assert_eq!(error.body["type"], "device_expired");
-    assert_eq!(transport.requests.lock().unwrap().len(), 1);
-    assert!(store.0.borrow().is_empty());
-    assert!(api.requests().is_empty());
+        assert_eq!(
+            error.body["type"],
+            if fault.is_some() {
+                "output_delivery_failed"
+            } else {
+                "device_expired"
+            }
+        );
+        if fault.is_none() {
+            assert_eq!(
+                delivered,
+                b"Open https://auth.example/device\nEnter code: ABCD\n"
+            );
+        }
+        assert!(!error.body.to_string().contains("device-secret"));
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+        assert!(store.0.borrow().is_empty());
+        assert!(api.requests().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -406,6 +455,7 @@ async fn failed_login_custody_attempts_to_revoke_the_new_provider_session() {
         config(),
         &transport.provider(),
         None,
+        &mut Vec::new(),
     )
     .await
     .unwrap_err();
@@ -439,6 +489,7 @@ async fn signing_into_another_organization_starts_its_own_device_flow() {
         config(),
         &transport.provider(),
         Some("org_other"),
+        &mut Vec::new(),
     )
     .await
     .unwrap_err();
@@ -505,6 +556,7 @@ async fn device_login_refuses_another_organization_before_saving_credentials() {
         config(),
         &transport.provider(),
         Some("org_other"),
+        &mut Vec::new(),
     )
     .await
     .unwrap_err();
