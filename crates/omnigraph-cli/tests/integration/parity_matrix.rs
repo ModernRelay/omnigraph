@@ -222,12 +222,24 @@ fn assert_blob_stat_parity(
     local_json
 }
 
-fn normalized_blob_error(output: &std::process::Output) -> &str {
+/// A failure's message: the `error` of its JSON envelope on stdout, or the
+/// first line of its human report, before its status lines.
+fn normalized_blob_error(output: &std::process::Output) -> String {
+    if !output.stdout.is_empty() {
+        let failure = parse_stdout_json(output);
+        return failure["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Blob failure omitted its error: {failure}"))
+            .to_string();
+    }
     let stderr = std::str::from_utf8(&output.stderr).unwrap();
     stderr
         .lines()
-        .find_map(|line| line.trim().strip_prefix("0: "))
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
         .unwrap_or_else(|| panic!("Blob failure omitted its primary diagnostic: {stderr}"))
+        .to_string()
 }
 
 #[test]
@@ -799,7 +811,7 @@ fn parity_load() {
         "--json",
     ]);
     for (arm, output) in [("local", &l), ("remote", &r)] {
-        assert_eq!(output.status.code(), Some(1), "{arm}: {output:?}");
+        assert_eq!(output.status.code(), Some(2), "{arm}: {output:?}");
         let output = parse_stdout_json(output);
         assert_eq!(output["outcome"]["execution"], "unknown", "{arm}");
         assert_eq!(output["outcome"]["effects"], "unknown", "{arm}");
@@ -1354,15 +1366,15 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
     }
 
     // A stale validator: the same Blob precondition detail on both arms. As
-    // for a graph-commit precondition, the served arm's verified 412 exits 4
-    // and the embedded arm, which opened storage for writing, exits 1.
+    // for a graph-commit precondition, both arms exit 4: the served arm's
+    // verified 412 and the embedded engine's own refusal both precede effects.
     let (local, remote) = p.run(&with(
         "put",
         &["--file", payload, "--if-match", "\"stale\""],
     ));
     assert_eq!(
         (local.status.code(), remote.status.code()),
-        (Some(1), Some(4))
+        (Some(4), Some(4))
     );
     let (local, remote) = (parse_stdout_json(&local), parse_stdout_json(&remote));
     for (arm, refused) in [("local", &local), ("remote", &remote)] {

@@ -571,18 +571,24 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
                 .arg("--json"),
         );
         let mut actual = parse_stdout_json(&output);
-        if verb == "mutate" {
-            assert_eq!(actual["http_status"], 400);
-            assert_eq!(
-                actual["outcome"],
+        // A read changes nothing; an untyped refusal of a write leaves its
+        // effects unknown.
+        assert_eq!(actual["http_status"], 400);
+        assert_eq!(
+            actual["outcome"],
+            if verb == "mutate" {
                 serde_json::json!({
                     "execution":"unknown", "effects":"unknown", "action":"reconcile"
                 })
-            );
-            let fields = actual.as_object_mut().unwrap();
-            fields.remove("http_status");
-            fields.remove("outcome");
-        }
+            } else {
+                serde_json::json!({
+                    "execution":"not_started", "effects":"none", "action":"refresh"
+                })
+            }
+        );
+        let fields = actual.as_object_mut().unwrap();
+        fields.remove("http_status");
+        fields.remove("outcome");
         assert_eq!(
             actual, refusal,
             "{verb} must preserve every original server field"

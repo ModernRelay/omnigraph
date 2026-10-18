@@ -2847,7 +2847,18 @@ fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
             .arg("--json")
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        // Clap refuses a command line with 64; a managed refusal keeps its
+        // own exit 2 and problem body.
+        match output.status.code() {
+            Some(64) => assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}"),
+            Some(2) => {
+                assert!(expected_clap_error.is_none(), "{arguments:?}: {output:?}");
+                let problem: Value = serde_json::from_slice(&output.stdout)
+                    .unwrap_or_else(|error| panic!("{arguments:?}: {error}: {output:?}"));
+                assert!(problem["type"].is_string(), "{arguments:?}: {problem}");
+            }
+            _ => panic!("{arguments:?}: {output:?}"),
+        }
         if let Some(expected) = expected_clap_error {
             assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}");
             assert!(
@@ -4816,7 +4827,7 @@ fn managed_organization_requires_explicit_mode_and_write_keys() {
             .args(arguments)
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
         let text = String::from_utf8_lossy(&output.stderr);
         assert!(
             text.contains("--managed") || text.contains("--idempotency-key"),

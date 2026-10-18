@@ -594,10 +594,16 @@ fn blob_stat_fails_loudly_for_null_missing_and_non_blob_cells() {
                 .arg("--store")
                 .arg(&graph),
         );
-        assert!(
-            output.stdout.is_empty(),
-            "{case}: failure must not masquerade as Blob metadata"
+        // The failure is the failure envelope, never Blob metadata.
+        let failure = parse_stdout_json(&output);
+        assert!(failure["error"].is_string(), "{case}: {failure}");
+        assert_eq!(
+            failure["outcome"]["execution"], "not_started",
+            "{case}: {failure}"
         );
+        for metadata in ["kind", "size", "etag"] {
+            assert!(failure.get(metadata).is_none(), "{case}: {failure}");
+        }
     }
 }
 
@@ -731,7 +737,8 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             .arg(&original)
             .arg("--json"),
     );
-    assert_eq!(stale.status.code(), Some(1), "an embedded mismatch exits 1");
+    // The engine refused the write before it published, as a server does.
+    assert_eq!(stale.status.code(), Some(4), "an embedded mismatch exits 4");
     let refused = parse_stdout_json(&stale);
     assert_eq!(
         refused["blob_precondition_failure"]["current_etag"],
@@ -1321,7 +1328,7 @@ fn repair_reports_foreign_drift_and_refuses_removed_flags() {
     assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
     for flag in ["--confirm", "--force"] {
         let refused = output_failure(cli().arg("repair").arg(flag).arg(&graph));
-        assert_eq!(refused.status.code(), Some(2));
+        assert_eq!(refused.status.code(), Some(64));
         assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
     }
 }
@@ -1478,7 +1485,7 @@ fn removed_cli_spellings_refuse_and_canonical_commands_remain_available() {
         vec!["export", "--jsonl"],
     ] {
         let output = output_failure(cli().args(&args));
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert_eq!(output.status.code(), Some(64), "{args:?}: {output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
@@ -2440,8 +2447,8 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
         .unwrap();
     assert_eq!(
         lost.status.code(),
-        Some(1),
-        "embedded writable open prevents whole-command no-effect proof; stderr: {}",
+        Some(4),
+        "the engine refused before it published, as a server does; stderr: {}",
         String::from_utf8_lossy(&lost.stderr)
     );
     let body: Value = serde_json::from_slice(&lost.stdout)
@@ -2452,7 +2459,7 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
     );
     assert_eq!(
         body["outcome"],
-        serde_json::json!({"execution":"unknown","effects":"unknown","action":"refresh"})
+        serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"})
     );
 
     let verify = output_success(
@@ -2710,7 +2717,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"request exceeds the write budget",
                 "resource_limit":{"resource":"entities","limit":100,"actual":101}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted", "--if-commit", "head-before"],
@@ -2728,7 +2735,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"wrong status cannot establish a conditional refusal",
                 "precondition_failure":{"expected":"head-before","actual":"head-after"}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted", "--if-commit", "head-before"],
@@ -2737,7 +2744,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"wrong condition cannot establish this request's refusal",
                 "precondition_failure":{"expected":"another-condition","actual":"head-after"}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted"],
@@ -2746,7 +2753,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"unsolicited condition cannot establish a refusal",
                 "precondition_failure":{"expected":"head-before","actual":"head-after"}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted", "--if-commit", "head-before"],
@@ -2756,7 +2763,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "precondition_failure":{"expected":"head-before","actual":"head-after"},
                 "recovery_required":{"operation_id":"published"}
             }),
-            1,
+            2,
         ),
     ] {
         let formats: &[&[&str]] = if arguments[0] == "query" {
@@ -2787,27 +2794,27 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             let mut actual = serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
                 panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
             });
-            if arguments[0] == "mutate" {
-                // A verified precondition and a typed policy denial both refuse
-                // before effects; every other row leaves the outcome unknown.
-                let (execution, effects) = if exit == 4 || body["code"] == "forbidden" {
+            // A read changes nothing, and a verified precondition and a typed
+            // policy denial both refuse before effects; every other row
+            // leaves the outcome unknown.
+            let (execution, effects) =
+                if arguments[0] != "mutate" || exit == 4 || body["code"] == "forbidden" {
                     ("not_started", "none")
                 } else {
                     ("unknown", "unknown")
                 };
-                assert_eq!(actual["http_status"], status);
-                assert_eq!(
-                    actual["outcome"]["execution"], execution,
-                    "{arguments:?}: {actual}"
-                );
-                assert_eq!(
-                    actual["outcome"]["effects"], effects,
-                    "{arguments:?}: {actual}"
-                );
-                let fields = actual.as_object_mut().unwrap();
-                fields.remove("http_status");
-                fields.remove("outcome");
-            }
+            assert_eq!(actual["http_status"], status);
+            assert_eq!(
+                actual["outcome"]["execution"], execution,
+                "{arguments:?}: {actual}"
+            );
+            assert_eq!(
+                actual["outcome"]["effects"], effects,
+                "{arguments:?}: {actual}"
+            );
+            let fields = actual.as_object_mut().unwrap();
+            fields.remove("http_status");
+            fields.remove("outcome");
             assert_eq!(
                 actual, body,
                 "{arguments:?} {format:?} must preserve the server's complete error contract"
@@ -2863,31 +2870,31 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         (
             429,
             serde_json::json!({"error":"unqualified proxy throttle"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             409,
             serde_json::json!({"error":"conflict","code":"conflict"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             503,
             serde_json::json!({"error":"unavailable"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             409,
             serde_json::json!({"error":"authority changed","read_set_conflict":{"member":"graph_head","expected":"before","actual":"after"}}),
-            1,
+            2,
             unknown("refresh"),
         ),
         (
             409,
             serde_json::json!({"error":"input too large","resource_limit":{"resource":"entities","limit":10,"actual":11}}),
-            1,
+            2,
             unknown("refresh"),
         ),
         // Admission probes an external Blob source before any effect; the
@@ -2895,25 +2902,25 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         (
             424,
             serde_json::json!({"error":"source unavailable","external_blob_source":{"uri":"s3://bucket/object","reason":"not found"}}),
-            1,
+            2,
             unknown("refresh"),
         ),
         (
             424,
             serde_json::json!({"error":"source unavailable"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             503,
             serde_json::json!({"error":"schema completion required","recovery_required":{"operation_id":"published-commit"}}),
-            1,
+            2,
             unknown("recover"),
         ),
         (
             429,
             serde_json::json!({"error":"contradictory refusal","code":"too_many_requests","recovery_required":{"operation_id":"published-commit"}}),
-            1,
+            2,
             unknown("recover"),
         ),
         // The server answers these before admission: bearer authentication,
@@ -2941,19 +2948,19 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         (
             403,
             serde_json::json!({"error":"denied by an intermediary"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             400,
             serde_json::json!({"error":"misplaced denial","code":"forbidden"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             403,
             serde_json::json!({"error":"contradictory denial","code":"forbidden","recovery_required":{"operation_id":"published-commit"}}),
-            1,
+            2,
             unknown("recover"),
         ),
     ];
@@ -3045,7 +3052,7 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             ])
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(2));
         let actual = parse_stdout_json(&output);
         assert_eq!(
             actual["outcome"],
@@ -3104,10 +3111,17 @@ fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
             .args(["--server", &server.origin, "--graph", "knowledge"])
             .args(&arguments);
         let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        // A write's response lost its contract, so its effects are unknown;
+        // a read has none.
+        let write = arguments[0] == "mutate";
+        assert_eq!(output.status.code(), Some(if write { 2 } else { 1 }));
         if arguments.len() > 2 {
             let error = parse_stdout_json(&output);
             assert_eq!(error["code"], "api_contract_mismatch");
+            assert_eq!(
+                error["outcome"]["execution"],
+                if write { "unknown" } else { "not_started" }
+            );
             assert_eq!(error["http_status"], status);
             assert_eq!(error["request_dispatched"], true);
             assert!(
@@ -3180,11 +3194,25 @@ fn remote_human_and_invalid_json_errors_remain_diagnostics() {
         }
         let output = command.output().unwrap();
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty(), "{output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(expected),
-            "{output:?}"
-        );
+        if json {
+            // An untrusted body is never structure: its status and text
+            // become the CLI's own failure, which a read cannot leave with
+            // effects.
+            let failure = parse_stdout_json(&output);
+            assert!(
+                failure["error"].as_str().unwrap().contains(expected),
+                "{failure}"
+            );
+            assert_eq!(failure["http_status"], 403);
+            assert_eq!(failure["outcome"]["execution"], "not_started");
+            assert!(output.stderr.is_empty(), "{output:?}");
+        } else {
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected),
+                "{output:?}"
+            );
+        }
         server.assert_complete();
     }
 }
@@ -4470,7 +4498,8 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             let output = command.output().unwrap();
             assert_eq!(
                 output.status.code(),
-                Some(if valid { 0 } else { 1 }),
+                // A receipt that contradicts the request leaves effects unknown.
+                Some(if valid { 0 } else { 2 }),
                 "{body}: {output:?}"
             );
             if valid {
@@ -4556,7 +4585,8 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
                 .unwrap();
             assert_eq!(
                 output.status.code(),
-                Some(if valid { 0 } else { 1 }),
+                // A receipt that contradicts the request leaves effects unknown.
+                Some(if valid { 0 } else { 2 }),
                 "{body}: {output:?}"
             );
             if valid {
@@ -4955,8 +4985,8 @@ fn cli_fails_for_missing_schema_or_data_file() {
     );
     assert_eq!(
         refused["outcome"],
-        json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"}),
-        "embedded load opens writable storage before reading --data"
+        json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
+        "embedded load reads --data before it opens storage"
     );
     let after = parse_stdout_json(&output_success(
         cli().args(["commit", "list"]).arg(&graph).arg("--json"),

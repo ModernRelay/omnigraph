@@ -1,5 +1,6 @@
-//! Conservative evidence for one CLI data-write invocation. This is caller
-//! bookkeeping, never engine settlement or durable operation authority.
+//! Conservative evidence for one CLI invocation, and the outcome and exit its
+//! failure reports. This is caller bookkeeping, never engine settlement or
+//! durable operation authority.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,14 +12,30 @@ use omnigraph_api_types::{
 use reqwest::StatusCode;
 use serde::Serialize;
 
-use crate::cli::{BlobCommand, BranchCommand, Cli, Command, CommitCommand, SchemaCommand};
+use crate::cli::{
+    BlobCommand, BranchCommand, Cli, Command, CommitCommand, GraphsCommand, QueriesCommand,
+    SchemaCommand,
+};
 use crate::graph_http::ApiContractError;
 use crate::helpers::{MissingCredential, PreconditionFailedCli, RemoteErrorCli};
 
+/// What a command can change, which decides how its failure reads.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandKind {
+    /// A data write: its own requests and opens decide whether it may have
+    /// had effects.
+    #[default]
+    Write,
+    /// A read, which changes nothing: its failure never leaves effects.
+    Read,
+}
+
 #[derive(Default, Debug, Clone)]
 pub(crate) struct Evidence {
+    kind: CommandKind,
     dispatched: usize,
     writable_open: bool,
+    compound: bool,
     last_request_effectful: bool,
     http_status: Option<u16>,
     retry_after: Option<String>,
@@ -28,7 +45,47 @@ tokio::task_local! {
     static COMMAND: Arc<Mutex<Evidence>>;
 }
 
-pub(crate) fn applies(cli: &Cli) -> bool {
+/// The kind of a command whose failure reports an outcome. Commands with
+/// their own failure reports (`lint`, `queries validate`, cluster and managed
+/// commands) and maintenance report none yet.
+pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
+    if writes(cli) {
+        return Some(CommandKind::Write);
+    }
+    matches!(
+        &cli.command,
+        Command::Query(_)
+            | Command::Snapshot(_)
+            | Command::Export(_)
+            | Command::Diff(_)
+            | Command::Changes { .. }
+            | Command::Queries {
+                command: QueriesCommand::List { .. }
+            }
+            | Command::Graphs {
+                command: GraphsCommand::List { .. }
+            }
+            | Command::Branch {
+                command: BranchCommand::List { .. }
+                    | BranchCommand::Diff { .. }
+                    | BranchCommand::MergeBase { .. }
+            }
+            | Command::Commit {
+                command: CommitCommand::List { .. }
+                    | CommitCommand::Show { .. }
+                    | CommitCommand::Changes { .. }
+            }
+            | Command::Schema {
+                command: SchemaCommand::Plan { .. } | SchemaCommand::Show { .. }
+            }
+            | Command::Blob {
+                command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
+            }
+    )
+    .then_some(CommandKind::Read)
+}
+
+fn writes(cli: &Cli) -> bool {
     matches!(
         &cli.command,
         Command::Load(_)
@@ -50,8 +107,14 @@ pub(crate) fn applies(cli: &Cli) -> bool {
     )
 }
 
-pub(crate) async fn observe<F: std::future::Future>(future: F) -> (F::Output, Evidence) {
-    let evidence = Arc::new(Mutex::new(Evidence::default()));
+pub(crate) async fn observe<F: std::future::Future>(
+    kind: CommandKind,
+    future: F,
+) -> (F::Output, Evidence) {
+    let evidence = Arc::new(Mutex::new(Evidence {
+        kind,
+        ..Evidence::default()
+    }));
     let output = COMMAND.scope(evidence.clone(), future).await;
     let evidence = evidence
         .lock()
@@ -116,13 +179,46 @@ pub(crate) fn single_request() -> bool {
         .unwrap_or(true)
 }
 
-/// Opening writable storage may complete earlier schema work before the
-/// requested write even begins; a later error must not claim no effects.
+/// An embedded write session opened. Only the engine write's own error
+/// ([`EngineWriteError`]) can then say that nothing ran; any other later
+/// error, such as one rendering a committed receipt, must not claim it.
 pub(crate) fn writable_open() {
     update(|state| state.writable_open = true);
 }
 
-/// The failure the CLI prints for a data write: the server's error body, its
+/// The command runs an engine write that may publish more than once, as a
+/// load that forks its branch does, so its refusal may follow an earlier
+/// publication.
+pub(crate) fn compound() {
+    update(|state| state.compound = true);
+}
+
+/// An embedded engine write's own error. The engine refuses with a typed,
+/// settled error before it publishes and marks a publication in doubt, so
+/// this error carries what the write did, unlike any error after it.
+#[derive(Debug)]
+pub(crate) struct EngineWriteError(pub(crate) omnigraph::error::OmniError);
+
+impl std::fmt::Display for EngineWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for EngineWriteError {}
+
+/// Mark an embedded engine write's result as that write's own.
+pub(crate) trait EngineWrite<T> {
+    fn engine_write(self) -> color_eyre::Result<T>;
+}
+
+impl<T> EngineWrite<T> for std::result::Result<T, omnigraph::error::OmniError> {
+    fn engine_write(self) -> color_eyre::Result<T> {
+        self.map_err(|error| EngineWriteError(error).into())
+    }
+}
+
+/// The failure the CLI prints for a command: the server's error body, its
 /// `outcome` reconciled with what this command's own requests show, and the
 /// transport facts beside it.
 #[derive(Debug, Serialize)]
@@ -153,8 +249,19 @@ impl Failure {
     pub(crate) fn classify(error: Report, evidence: Evidence) -> Self {
         let remote = error.downcast_ref::<RemoteErrorCli>();
         let precondition = error.downcast_ref::<PreconditionFailedCli>();
-        let single =
-            evidence.dispatched == 1 && evidence.last_request_effectful && !evidence.writable_open;
+        let read = evidence.kind == CommandKind::Read;
+        let engine_write = error.downcast_ref::<EngineWriteError>().is_some();
+        // An embedded write's own refusal, before any request and outside a
+        // compound write, says what the engine did.
+        let embedded = evidence.dispatched == 0 && !evidence.compound;
+        let embedded_precondition =
+            precondition.is_some_and(|value| value.http_status.is_none()) && embedded;
+        // A refusal answers the whole command when its request was the
+        // command's only effectful one, or when the command is a read.
+        let single = read
+            || (evidence.dispatched == 1
+                && evidence.last_request_effectful
+                && !evidence.writable_open);
         // A refused `--as` assertion is a condition the caller set, like a
         // graph-commit precondition: nothing ran.
         let actor_mismatch = remote.is_some_and(|remote| {
@@ -163,6 +270,7 @@ impl Failure {
         }) && single;
         let conditional = (precondition.is_some_and(|value| value.http_status == Some(412))
             && single)
+            || embedded_precondition
             || actor_mismatch;
         let admission = remote
             .filter(|remote| {
@@ -204,14 +312,22 @@ impl Failure {
             let mut output = ErrorOutput::message(contract.error.clone());
             output.code = Some(contract.code);
             output
+        } else if engine_write {
+            let EngineWriteError(engine) = error
+                .downcast::<EngineWriteError>()
+                .expect("checked engine write error");
+            omnigraph_server::engine_error_output(engine)
         } else {
             match error.downcast::<omnigraph::error::OmniError>() {
                 Ok(engine) => omnigraph_server::engine_error_output(engine),
+                // Keep the cause chain the stderr report used to print.
                 Err(error) => crate::error_output_of(&error)
-                    .unwrap_or_else(|| ErrorOutput::message(error.to_string())),
+                    .unwrap_or_else(|| ErrorOutput::message(format!("{error:#}"))),
             }
         };
-        let not_started = admission.is_some()
+        let served = served.or_else(|| output.outcome.filter(|_| engine_write && embedded));
+        let not_started = read
+            || admission.is_some()
             || conditional
             || (evidence.dispatched == 0 && !evidence.writable_open);
         let action = if retry {
@@ -249,6 +365,7 @@ impl Failure {
             },
             action,
         });
+        let exit = exit_for(&outcome, conditional);
         let mut output = output;
         output.outcome = Some(outcome);
         Self {
@@ -257,14 +374,22 @@ impl Failure {
             retry_after,
             request_dispatched,
             missing_credential,
-            exit: if retry {
-                75
-            } else if conditional {
-                crate::EXIT_PRECONDITION_FAILED
-            } else {
-                1
-            },
+            exit,
         }
+    }
+}
+
+/// The exit a failure's outcome selects: busy and safe to retry (75), a
+/// condition the caller set (4), effects unknown (2), or not started (1).
+fn exit_for(outcome: &OutcomeOutput, conditional: bool) -> i32 {
+    if outcome.execution == Execution::NotStarted && outcome.action == Action::Retry {
+        crate::EXIT_RETRY
+    } else if conditional {
+        crate::EXIT_PRECONDITION_FAILED
+    } else if outcome.execution == Execution::Unknown {
+        crate::EXIT_OUTCOME_UNKNOWN
+    } else {
+        1
     }
 }
 

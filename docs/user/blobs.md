@@ -143,8 +143,8 @@ The CLI refuses input over 32 MiB and a malformed `--if-match` before it
 addresses the graph. The value must also fit `write_max_bytes`: the process's
 `OMNIGRAPH_WRITE_MAX_BYTES` for a `--store` write, the server's for a served
 one. `--as` names the actor of a `--store` write; a served
-write takes its actor from the bearer token, and `--as` there only asserts it. A served Blob `412` exits 4, as a
-graph-commit precondition does; an embedded one exits 1. Each write is sent
+write takes its actor from the bearer token, and `--as` there only asserts it. A Blob precondition failure exits 4,
+embedded or served, as a graph-commit precondition does. Each write is sent
 once: after an unknown outcome, read the cell before writing again.
 
 ## Query behavior

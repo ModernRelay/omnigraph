@@ -110,9 +110,9 @@ that attempt. It contains `graph_commit_id`, optional `graph_branch`,
 `actor_id`, and `created_at` in Unix microseconds. A successful mutation
 that changes no entities returns `"commit": null`.
 
-`--json` and read `--format json` preserve structured errors on stdout. Data-write failures
-report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands).
-Verified HTTP conditional mismatches exit 4; embedded mismatches exit 1 because writable open can complete earlier work.
+`--json` and read `--format json` preserve structured errors on stdout. Data-write and read failures
+report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands); a refused command line exits 64.
+Verified conditional mismatches exit 4, embedded or served, when nothing else in the command ran.
 
 ### Conditional mutations
 

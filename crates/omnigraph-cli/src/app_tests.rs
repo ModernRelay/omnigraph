@@ -10,7 +10,7 @@ use crate::{command_outcome, invocation::MachineErrors};
 #[tokio::test]
 async fn argument_refusal_help_and_success_return_without_terminating_the_caller() {
     for (args, expected) in [
-        (vec!["omnigraph", "--unknown-option"], 2),
+        (vec!["omnigraph", "--unknown-option"], 64),
         (vec!["omnigraph", "query", "--help"], 0),
         (vec!["omnigraph", "version", "--json"], 0),
         (vec!["omnigraph", "version", "--json"], 0),
@@ -125,12 +125,13 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
             fault,
             bytes: Vec::new(),
         };
-        let (result, evidence) = command_outcome::observe(async {
-            command_outcome::dispatched(&Method::POST);
-            stdout.write_all(b"committed\n")?;
-            Ok::<_, color_eyre::Report>(Completion::success())
-        })
-        .await;
+        let (result, evidence) =
+            command_outcome::observe(command_outcome::CommandKind::Write, async {
+                command_outcome::dispatched(&Method::POST);
+                stdout.write_all(b"committed\n")?;
+                Ok::<_, color_eyre::Report>(Completion::success())
+            })
+            .await;
         match fault {
             OutputFault::AfterPrefix => {
                 assert!(result.is_err());
@@ -157,7 +158,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
             json!({"execution": "unknown", "effects": "unknown", "action": "reconcile"}),
             "{fault:?}: {failure}"
         );
-        assert_eq!(undelivered.failure.exit, 1);
+        assert_eq!(undelivered.failure.exit, 2);
         assert_eq!(
             undelivered
                 .delivery
@@ -168,10 +169,11 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         );
         assert!(stderr.is_empty());
 
-        let (result, evidence) = command_outcome::observe(async {
-            Err::<Completion, _>(eyre!("input refused before dispatch"))
-        })
-        .await;
+        let (result, evidence) =
+            command_outcome::observe(command_outcome::CommandKind::Write, async {
+                Err::<Completion, _>(eyre!("input refused before dispatch"))
+            })
+            .await;
         let mut stdout = Vec::new();
         let completion = finish(
             result,
@@ -194,11 +196,12 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
     // A failed stderr flush must retain write evidence without appending a
     // failure document to a receipt already delivered on healthy stdout.
     for machine in [None, Some(MachineErrors::Json)] {
-        let (result, evidence) = command_outcome::observe(async {
-            command_outcome::dispatched(&Method::POST);
-            Ok::<_, color_eyre::Report>(Completion::success())
-        })
-        .await;
+        let (result, evidence) =
+            command_outcome::observe(command_outcome::CommandKind::Write, async {
+                command_outcome::dispatched(&Method::POST);
+                Ok::<_, color_eyre::Report>(Completion::success())
+            })
+            .await;
         let receipt = b"{\"receipt\":\"committed\"}\n";
         let mut stdout = receipt.to_vec();
         let mut stderr = FailingOutput {
@@ -215,7 +218,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         assert_eq!(stdout, receipt);
     }
 
-    let (result, evidence) = command_outcome::observe(async {
+    let (result, evidence) = command_outcome::observe(command_outcome::CommandKind::Write, async {
         command_outcome::dispatched(&Method::POST);
         Err::<Completion, _>(eyre!("response lost after dispatch"))
     })
@@ -277,11 +280,12 @@ async fn delivered_refusals_keep_their_exit_status_when_unused_stdout_cannot_flu
         ),
     ];
     for (error, expected, message) in refusals {
-        let (result, evidence) = command_outcome::observe(async {
-            command_outcome::dispatched(&Method::POST);
-            Err::<Completion, color_eyre::Report>(error)
-        })
-        .await;
+        let (result, evidence) =
+            command_outcome::observe(command_outcome::CommandKind::Write, async {
+                command_outcome::dispatched(&Method::POST);
+                Err::<Completion, color_eyre::Report>(error)
+            })
+            .await;
         let mut stdout = FailingOutput {
             fault: OutputFault::Flush,
             bytes: Vec::new(),
@@ -531,53 +535,54 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                     bytes: Vec::new(),
                 };
                 let mut stderr = Vec::new();
-                let (result, evidence) = command_outcome::observe(async {
-                    if command == "load" {
-                        execute_load(
-                            &client,
-                            LoadOperation {
-                                branch: "main".into(),
-                                from: None,
-                                data: data.clone(),
-                                mode: CliLoadMode::Append,
-                                settings: Vec::new(),
-                                json,
-                            },
-                            false,
-                            true,
-                            &mut crate::input::Input {
-                                reader: &mut io::empty(),
-                                is_terminal: false,
-                            },
-                            &mut stdout,
-                            &mut stderr,
-                        )
-                        .await?;
-                    } else {
-                        execute_blob(
-                            &client,
-                            BlobOperation::Write {
-                                query: BlobWriteQuery {
-                                    entity: BlobEntityKind::Node,
-                                    r#type: "Document".into(),
-                                    id: "manual".into(),
-                                    property: "content".into(),
-                                    branch: None,
+                let (result, evidence) =
+                    command_outcome::observe(command_outcome::CommandKind::Write, async {
+                        if command == "load" {
+                            execute_load(
+                                &client,
+                                LoadOperation {
+                                    branch: "main".into(),
+                                    from: None,
+                                    data: data.clone(),
+                                    mode: CliLoadMode::Append,
+                                    settings: Vec::new(),
+                                    json,
                                 },
-                                bytes: (command == "put")
-                                    .then(|| bytes::Bytes::from_static(b"\x00\xff\n")),
-                                if_match: None,
-                                precondition: None,
-                                json,
-                            },
-                            &mut stdout,
-                            &mut Vec::new(),
-                        )
-                        .await?;
-                    }
-                    Ok::<_, color_eyre::Report>(Completion::success())
-                })
-                .await;
+                                false,
+                                true,
+                                &mut crate::input::Input {
+                                    reader: &mut io::empty(),
+                                    is_terminal: false,
+                                },
+                                &mut stdout,
+                                &mut stderr,
+                            )
+                            .await?;
+                        } else {
+                            execute_blob(
+                                &client,
+                                BlobOperation::Write {
+                                    query: BlobWriteQuery {
+                                        entity: BlobEntityKind::Node,
+                                        r#type: "Document".into(),
+                                        id: "manual".into(),
+                                        property: "content".into(),
+                                        branch: None,
+                                    },
+                                    bytes: (command == "put")
+                                        .then(|| bytes::Bytes::from_static(b"\x00\xff\n")),
+                                    if_match: None,
+                                    precondition: None,
+                                    json,
+                                },
+                                &mut stdout,
+                                &mut Vec::new(),
+                            )
+                            .await?;
+                        }
+                        Ok::<_, color_eyre::Report>(Completion::success())
+                    })
+                    .await;
                 assert_eq!(result.is_ok(), matches!(fault, OutputFault::Flush));
                 let completed = finish(
                     result,
@@ -603,7 +608,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                         io::ErrorKind::BrokenPipe
                     );
                 } else {
-                    assert_eq!(completed.unwrap().code(), 1);
+                    assert_eq!(completed.unwrap().code(), 2);
                 }
                 if json || matches!(fault, OutputFault::Flush) {
                     assert!(stderr.is_empty());
@@ -648,7 +653,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
         fault: OutputFault::AfterPrefix,
         bytes: Vec::new(),
     };
-    let (result, evidence) = command_outcome::observe(async {
+    let (result, evidence) = command_outcome::observe(command_outcome::CommandKind::Write, async {
         execute_load(
             &client,
             LoadOperation {
@@ -854,11 +859,12 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
                 bytes: Vec::new(),
             };
             let mut stderr = Vec::new();
-            let (result, evidence) = command_outcome::observe(async {
-                apply_schema(&client, &source, json, true, &mut stdout, &mut stderr).await?;
-                Ok::<_, color_eyre::Report>(Completion::success())
-            })
-            .await;
+            let (result, evidence) =
+                command_outcome::observe(command_outcome::CommandKind::Write, async {
+                    apply_schema(&client, &source, json, true, &mut stdout, &mut stderr).await?;
+                    Ok::<_, color_eyre::Report>(Completion::success())
+                })
+                .await;
             assert_eq!(result.is_ok(), matches!(fault, OutputFault::Flush));
             let completed = finish(
                 result,
@@ -884,7 +890,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
                     io::ErrorKind::BrokenPipe
                 );
             } else {
-                assert_eq!(completed.unwrap().code(), 1);
+                assert_eq!(completed.unwrap().code(), 2);
             }
             if json || matches!(fault, OutputFault::Flush) {
                 assert!(stderr.is_empty());
@@ -938,7 +944,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
         fault: OutputFault::AfterPrefix,
         bytes: Vec::new(),
     };
-    let (result, evidence) = command_outcome::observe(async {
+    let (result, evidence) = command_outcome::observe(command_outcome::CommandKind::Write, async {
         apply_schema(&client, &source, true, false, &mut stdout, &mut stderr).await?;
         Ok::<_, color_eyre::Report>(Completion::success())
     })
@@ -1109,7 +1115,7 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
                 "search",
             ])
             .unwrap();
-            assert!(!command_outcome::applies(&parsed.cli));
+            assert!(command_outcome::kind(&parsed.cli).is_none());
 
             let mut stdout = FailingOutput {
                 fault,

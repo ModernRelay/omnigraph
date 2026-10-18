@@ -78,7 +78,7 @@ fn clap_exit_status_survives_closed_output() {
         (vec!["--help"], 0, false),
         (vec!["--version"], 0, false),
         (vec!["query", "--help"], 0, false),
-        (vec!["--unknown-option"], 2, true),
+        (vec!["--unknown-option"], 64, true),
     ] {
         // Close the reader before spawning, avoiding the race in `| head -n0`.
         let (reader, writer) = UnixStream::pair().unwrap();

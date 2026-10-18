@@ -72,10 +72,11 @@ do not mean there is no possible fix.
 ## Where the fields appear
 
 - **CLI, human formats** (`table`, `kv`, `csv`): the form above on stderr,
-  exit status 1, with no colour codes and no backtrace footer.
+  then `HTTP 400` when served and the `outcome` line, exit status 1, with no
+  colour codes and no backtrace footer.
 - **CLI, machine formats**: `--json` and `--format json` print the API's error
-  body pretty, `--format jsonl` prints it as one line, both on stdout with
-  exit status 1. A served refusal keeps the server's `code` field
+  body pretty with its `outcome`, `--format jsonl` prints it as one line, both
+  on stdout with exit status 1. A served refusal keeps the server's `code` field
   (`bad_request`); an embedded one has none.
 - **HTTP**: a `400` that refuses a query carries the additive `diagnostic`
   object in its error body. See

@@ -66,16 +66,19 @@ the same way. See [Diagnostics](../queries/diagnostics.md).
 
 ## Failed data-write commands
 
-Every server error body, and every CLI data-write failure, carries an `outcome`:
+Every server error body, and every CLI data-write and read failure, carries an `outcome`:
 `execution` is `not_started` or `unknown`, `effects` is `none` or `unknown`, and
 `action` is `retry`, `refresh`, `recover` or `reconcile`. The server states it
 for the request it answered: only a write whose completion it could not settle
 is `unknown`, with `code: outcome_unknown`; a refusal, a lost conflict or a read
-failure is `not_started`. The CLI reports the server's outcome when that request
+failure is `not_started`, except a refusal after a load forked its branch, which
+is `unknown` with `refresh`. The CLI reports the server's outcome when that request
 was the command's only effectful one, and otherwise its own account of the whole
-command, so a lost response is `unknown` with `reconcile`. JSON mode writes the
-failure to stdout; human mode prints the `outcome` line on stderr. HTTP failures
-also retain `http_status` and, when present, the original `retry_after` string.
+command, so a lost response is `unknown` with `reconcile`. A read command changes
+nothing, so its failure is always `not_started` with `effects: none`. JSON mode
+writes the failure to stdout; human mode prints the `outcome` line on stderr.
+HTTP failures also retain `http_status` and, when present, the original
+`retry_after` string.
 
 This includes `commit publish` and `commit drop`, as well as their `mutate`
 statement forms. If a response or result output is lost, inspect the commit's
@@ -85,12 +88,16 @@ output pipe or failed result flush can follow a successful write. The CLI exits 
 and does not repeat the operation. If stdout cannot carry a JSON failure, stderr
 reports the undelivered diagnostic and its outcome.
 
+The exit follows from the outcome:
+
 | CLI exit | What to do |
 |---:|---|
 | 0 | The operation succeeded or was a no-op. A merge can separately report a source-deletion failure without losing its successful result. |
-| 4 | The server verified the requested write precondition failed with no earlier command effects. Re-read the branch and choose a new precondition deliberately. |
-| 75 | The server's typed admission refusal proves this whole command did not start. Honor `Retry-After` and bound any caller retry. |
-| 1 | Inspect the action and details. A conflict, resource limit, unavailable server, incomplete response or lost connection does not by itself permit repeating the write. |
+| 1 | `not_started`: the command changed nothing. Inspect the action and details, correct the cause and run it again. |
+| 2 | `unknown`: the command may have had effects. Reconcile or recover as `action` says before another attempt; a conflict, resource limit, incomplete response or lost connection does not by itself permit repeating the write. |
+| 4 | A condition you set did not hold, with no earlier command effects: a verified write precondition or an `--as` assertion. Re-read the branch and choose a new precondition deliberately. |
+| 75 | `not_started` with `retry`: the server refused before starting, as when the actor is busy. Honor `Retry-After` and bound any caller retry. |
+| 64 | The command line was refused before anything ran (`EX_USAGE`). |
 
 A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
 `api_contract_mismatch` exits 1 with `execution: not_started`, `effects: none`
@@ -112,8 +119,10 @@ attempt. Only `retry` with exit 75 grants the bounded retry described above; the
 CLI performs no automatic retry.
 
 The outcome covers the entire command. A later refused subrequest cannot undo
-an earlier branch creation, load or publication. Embedded load conflicts and
-conditional mismatches remain exit 1: writable open can complete earlier work.
+an earlier branch creation, load or publication. An embedded write's own
+refusal says what the engine did, as a server's does, so embedded and served
+commands exit alike; any later failure, such as rendering a committed receipt,
+stays `unknown`.
 Disconnecting an admitted HTTP write does not cancel it: the server keeps
 running the original operation, and a lost response can leave the caller's
 outcome unknown. There is no durable request-result lookup in this release.

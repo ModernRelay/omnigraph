@@ -668,7 +668,8 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
             "{statement}/{fault:?}: lost delivery must not report success"
         );
         if !matches!(fault, MergeDeliveryFault::CallerWait) {
-            assert_eq!(output.status.code(), Some(1), "{statement}/{fault:?}");
+            // A lost delivery leaves effects unknown.
+            assert_eq!(output.status.code(), Some(2), "{statement}/{fault:?}");
         }
         if !output.stdout.is_empty() {
             let error = parse_stdout_json(&output);
@@ -865,7 +866,8 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
             };
             assert!(!output.status.success(), "{operation}/{fault:?}");
             if !matches!(fault, MergeDeliveryFault::CallerWait) {
-                assert_eq!(output.status.code(), Some(1), "{operation}/{fault:?}");
+                // A lost delivery leaves effects unknown.
+                assert_eq!(output.status.code(), Some(2), "{operation}/{fault:?}");
                 let error = parse_stdout_json(&output);
                 assert!(
                     error.get("error").is_some(),
@@ -1090,7 +1092,8 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
                 "{put}/{fault:?}: lost delivery must not report success"
             );
             if !matches!(fault, MergeDeliveryFault::CallerWait) {
-                assert_eq!(output.status.code(), Some(1), "{put}/{fault:?}");
+                // A lost delivery leaves effects unknown.
+                assert_eq!(output.status.code(), Some(2), "{put}/{fault:?}");
             }
             if !output.stdout.is_empty() {
                 let error = parse_stdout_json(&output);

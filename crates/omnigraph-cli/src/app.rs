@@ -52,9 +52,14 @@ where
     let parsed = match invocation::parse_from(args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            // Match Clap's exit contract even when its selected stream is closed.
+            // Help and version succeed; every refused command line is a
+            // usage error, even when Clap's selected stream is closed.
             let _ = error.print();
-            return Ok(Completion::exit(error.exit_code()));
+            return Ok(Completion::exit(if error.exit_code() == 0 {
+                0
+            } else {
+                crate::EXIT_USAGE
+            }));
         }
     };
     let mut stdin = io::stdin();
@@ -79,7 +84,7 @@ async fn execute(
     let ParsedInvocation {
         cli, mut machine, ..
     } = parsed;
-    let observe = command_outcome::applies(&cli);
+    let observe = command_outcome::kind(&cli);
     // Rendering runs inside observation. The completion path retains that
     // same evidence when flushing, including after a dispatched write.
     // The legacy dispatch future contains every command variant. Keep that
@@ -92,8 +97,8 @@ async fn execute(
         stdout,
         stderr,
     ));
-    let (result, evidence) = if observe {
-        let (result, evidence) = admission::scope(command_outcome::observe(invocation)).await;
+    let (result, evidence) = if let Some(kind) = observe {
+        let (result, evidence) = admission::scope(command_outcome::observe(kind, invocation)).await;
         (result, Some(evidence))
     } else {
         (admission::scope(invocation).await, None)
