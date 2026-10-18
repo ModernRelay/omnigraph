@@ -506,6 +506,10 @@ that safe, and the fifth arrives with Polymorphic types:
 A later schema change can produce a loud plan-time error, but not a silent
 rebinding of a stored query. Carrying ids in the query IR would change the
 planner and engine as well as the compiler; it is outside this RFC.
+[Issue #1079](https://github.com/ModernRelay/omnigraph/issues/1079) tracks it,
+as phase 0 of Polymorphic types. Namespaces do not depend on it, but it makes a
+move cheaper: derived state keyed by id, such as the graph-index topology
+cache, no longer rebuilds after a rename.
 
 **Files and namespaces stay independent.** Protobuf made packages independent of
 files and the ecosystem pushed them back together with lint (Buf
