@@ -551,6 +551,20 @@ refuses every write-class route in ingress before reading the body. No local
 server mounts a `/cluster/*` route; each enables MCP ad-hoc reads and lists MCP
 write tools only when it writes.
 
+`LocalScope::Cluster(binding)` serves a cluster's storage root from its applied
+state, and needs an actor whatever its access. The cluster's own policies,
+stored queries, embedding-provider bindings and external-Blob rules apply, and
+the generated token resolves to the actor, so the cluster's policy decides for
+it as a deployment's would. A read-only one captures one ledger revision
+without admission, opens every graph read-only through `GraphReadAuthority`,
+which refuses a changed revision or an outstanding deployment, and adds a Cedar
+`forbid` for every write action to each policy it loads, so a policy answer
+reports the refusal (rule `local-read-only`). A read-write one acquires the
+cluster's serving admission and refuses while another owner holds it
+(`LocalOpenError::Cluster` with `state_lock_held`); `serve_local` releases it
+after a clean drain, through the release `serve` runs, and keeps it when a
+completion is uncertain.
+
 `serve_local(state, listener, extend)` serves such a state on a loopback
 listener the caller bound, through the lifecycle `serve` runs: the signal and
 uncertain-owner listener, the shutdown watchdog, graceful HTTP shutdown and the

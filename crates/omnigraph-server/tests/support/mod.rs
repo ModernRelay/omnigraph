@@ -1235,6 +1235,39 @@ graphs:
     temp
 }
 
+/// A converged one-graph cluster whose policies let `act-local` read, export,
+/// change and call stored queries on `knowledge`, and list the graphs.
+pub async fn local_cluster_dir() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("people.pg"),
+        "node Person { name: String @key }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("people.gq"),
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("policy.yaml"),
+        "version: 1\ngroups:\n  local: [act-local]\nrules:\n  - id: local-data\n    allow:\n      actors: { group: local }\n      actions: [read, export, change, invoke_query]\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("cluster-policy.yaml"),
+        "version: 1\ngroups:\n  local: [act-local]\nrules:\n  - id: local-list\n    allow:\n      actors: { group: local }\n      actions: [graph_list]\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      find_person:\n        file: ./people.gq\npolicies:\n  access:\n    file: ./policy.yaml\n    applies_to: [knowledge]\n  management:\n    file: ./cluster-policy.yaml\n    applies_to: [cluster]\n",
+    )
+    .unwrap();
+    apply_cluster_fixture(temp.path()).await;
+    temp
+}
+
 pub async fn cluster_settings(
     dir: &Path,
 ) -> color_eyre::eyre::Result<omnigraph_server::ServerConfig> {

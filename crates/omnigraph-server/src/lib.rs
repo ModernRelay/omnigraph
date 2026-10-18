@@ -2393,7 +2393,7 @@ mod external_blob_startup_tests {
                 policy: None,
             }),
             expected: None,
-            io_scope: None,
+            access: GraphOpenAccess::Writable(None),
         };
         let error = match open_prepared_graph(prepared).await {
             Ok(_) => panic!("a missing root must not open"),
@@ -2471,7 +2471,7 @@ mod external_blob_startup_tests {
         fs::write(&policy_path, "version: 1\ngroups:\n  readers: [alice]\nrules:\n  - id: read\n    allow:\n      actors: {group: readers}\n      actions: [read]\n").unwrap();
         let mut valid = cfg;
         valid.policy = Some(PolicySource::File(policy_path.clone()));
-        let prepared = prepare_single_graph(valid, None).unwrap();
+        let prepared = prepare_single_graph(valid, None, GraphOpenAccess::Writable(None)).unwrap();
         let captured_policy = prepared.pending.policy.clone().unwrap();
         fs::write(policy_path, "invalid policy after preparation").unwrap();
         let opened = open_prepared_graph(prepared).await.unwrap();
@@ -3006,10 +3006,17 @@ pub async fn serve_local(
         Arc::clone(&state.draining),
         state.shutdown_grace,
     );
+    let retained_admission = state.cluster_admission.clone();
     let app = extend(build_app(state));
     let served = lifecycle.serve(listener, app).await;
-    let outcome = lifecycle.drain().await;
+    let mut outcome = lifecycle.drain().await;
+    let released = match retained_admission {
+        // An uncertain completion keeps the admission, as a deployment does.
+        Some(owner) if outcome == ServeOutcome::Clean => release_serving_admission(owner).await,
+        _ => Ok(outcome),
+    };
     lifecycle.disarm();
+    outcome = released?;
     if outcome == ServeOutcome::Clean {
         served?;
     }
@@ -3177,32 +3184,43 @@ async fn serve_config(
     served?;
     startup_result.wrap_err("graph startup owner failed")??;
     if let Some(owner) = retained_admission {
-        if owner.canonical_root().starts_with("az://") {
-            // Azure keeps its existing stopped-process boundary until its
-            // native clean-release path has independent qualification.
-            warn!("Azure cluster admission retained after logical shutdown");
-            return Ok(());
-        }
-        let scope = owner.io_scope().ok_or_else(|| {
-            eyre!("cluster storage lifetime is untracked; retaining its admission")
-        })?;
-        scope.close();
-        scope.wait_idle().await;
-        if scope.is_uncertain() {
+        if release_serving_admission(owner).await? == ServeOutcome::Uncertain {
             return Err(eyre!(
                 "storage completion uncertain; retaining cluster admission"
             ));
         }
-        // Axum's connection completion notification can precede destruction
-        // of its Hyper service and AppState. Drain those actual owners too;
-        // the original process watchdog still bounds this wait.
-        owner.wait_for_exclusive_owner().await;
-        owner
-            .release_after_settlement()
-            .await
-            .map_err(|error| eyre!("clean cluster release refused: {error:?}"))?;
     }
     Ok(())
+}
+
+/// Release a serving owner's cluster admission once its logical owners have
+/// drained. Storage whose completion is uncertain keeps the admission and is
+/// reported as uncertain. The caller's process watchdog bounds the wait.
+async fn release_serving_admission(
+    owner: omnigraph_cluster::ClusterAdmission,
+) -> Result<ServeOutcome> {
+    if owner.canonical_root().starts_with("az://") {
+        // Azure keeps its existing stopped-process boundary until its
+        // native clean-release path has independent qualification.
+        warn!("Azure cluster admission retained after logical shutdown");
+        return Ok(ServeOutcome::Clean);
+    }
+    let scope = owner
+        .io_scope()
+        .ok_or_else(|| eyre!("cluster storage lifetime is untracked; retaining its admission"))?;
+    scope.close();
+    scope.wait_idle().await;
+    if scope.is_uncertain() {
+        return Ok(ServeOutcome::Uncertain);
+    }
+    // Axum's connection completion notification can precede destruction
+    // of its Hyper service and AppState. Drain those actual owners too.
+    owner.wait_for_exclusive_owner().await;
+    owner
+        .release_after_settlement()
+        .await
+        .map_err(|error| eyre!("clean cluster release refused: {error:?}"))?;
+    Ok(ServeOutcome::Clean)
 }
 
 /// Load a graph-scoped policy bundle from either source kind.
@@ -3390,11 +3408,11 @@ async fn prepare_multi_graph_state(
             GraphId::try_from(cfg.graph_id.clone()).expect("validated startup graph id"),
         );
         let uri = cfg.uri.clone();
-        match prepare_single_graph(cfg, expected) {
-            Ok(mut graph) => {
-                graph.io_scope = admission
-                    .as_ref()
-                    .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
+        let scope = admission
+            .as_ref()
+            .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
+        match prepare_single_graph(cfg, expected, GraphOpenAccess::Writable(scope)) {
+            Ok(graph) => {
                 entries.push(GraphEntry::Loading(Arc::clone(&graph.pending)));
                 prepared.push(graph);
             }
@@ -3533,7 +3551,16 @@ struct PreparedGraphOpen {
     cfg: GraphStartupConfig,
     pending: Arc<LoadingGraph>,
     expected: Option<omnigraph::db::SchemaContractDigest>,
-    io_scope: Option<omnigraph::storage::StorageIoScope>,
+    access: GraphOpenAccess,
+}
+
+/// How a prepared graph opens.
+enum GraphOpenAccess {
+    /// Writable, inside the serving owner's storage scope when it has one.
+    Writable(Option<omnigraph::storage::StorageIoScope>),
+    /// Read-only, validated against the cluster ledger revision captured
+    /// before the open; its policy forbids every write.
+    ReadOnly(omnigraph_cluster::GraphReadAuthority),
 }
 
 #[cfg(test)]
@@ -3541,13 +3568,19 @@ async fn open_single_graph(
     cfg: GraphStartupConfig,
     expected: Option<omnigraph::db::SchemaContractDigest>,
 ) -> std::result::Result<OpenedGraph, GraphOpenFailure> {
-    open_prepared_graph(prepare_single_graph(cfg, expected)?).await
+    open_prepared_graph(prepare_single_graph(
+        cfg,
+        expected,
+        GraphOpenAccess::Writable(None),
+    )?)
+    .await
 }
 
 /// Validate and capture policy before the listener or any engine open.
 fn prepare_single_graph(
     mut cfg: GraphStartupConfig,
     expected: Option<omnigraph::db::SchemaContractDigest>,
+    access: GraphOpenAccess,
 ) -> std::result::Result<PreparedGraphOpen, GraphOpenFailure> {
     let initial_failure = |cause| GraphOpenFailure {
         failure: StartupFailure::OpenFailed,
@@ -3568,10 +3601,19 @@ fn prepare_single_graph(
             cause: eyre!("graph configuration was refused before graph open"),
         });
     }
+    let read_only = matches!(access, GraphOpenAccess::ReadOnly(_));
     let policy = cfg
         .policy
         .as_ref()
-        .map(|source| load_graph_policy(source, graph_id.as_str()).map(Arc::new))
+        .map(|source| {
+            let policy = load_graph_policy(source, graph_id.as_str())?;
+            if read_only {
+                local::forbid_writes(policy)
+            } else {
+                Ok(policy)
+            }
+            .map(Arc::new)
+        })
         .transpose()
         .map_err(|cause| GraphOpenFailure {
             failure: StartupFailure::InvalidPolicy,
@@ -3612,7 +3654,7 @@ fn prepare_single_graph(
             policy,
         }),
         expected,
-        io_scope: None,
+        access,
     })
 }
 
@@ -3623,7 +3665,7 @@ async fn open_prepared_graph(
         cfg,
         pending,
         expected,
-        io_scope,
+        access,
     } = prepared;
     let graph_id = &pending.key.graph_id;
     let uri = pending.uri.clone();
@@ -3633,9 +3675,14 @@ async fn open_prepared_graph(
         policy: policy.clone(),
         cause,
     };
-    let opened = match io_scope {
-        Some(scope) => Omnigraph::open_with_io_scope(&uri, scope).await,
-        None => Omnigraph::open(&uri).await,
+    let (opened, read_authority) = match access {
+        GraphOpenAccess::Writable(Some(scope)) => {
+            (Omnigraph::open_with_io_scope(&uri, scope).await, None)
+        }
+        GraphOpenAccess::Writable(None) => (Omnigraph::open(&uri).await, None),
+        GraphOpenAccess::ReadOnly(authority) => {
+            (Omnigraph::open_read_only(&uri).await, Some(authority))
+        }
     };
     let db = opened.map_err(|err| {
         failure(
@@ -3647,6 +3694,14 @@ async fn open_prepared_graph(
             ),
         )
     })?;
+    if let Some(authority) = read_authority {
+        authority.validate_opened(&db).await.map_err(|diagnostic| {
+            failure(
+                StartupFailure::OpenFailed,
+                eyre!("[{}] {}", diagnostic.code, diagnostic.message),
+            )
+        })?;
+    }
     verify_server_schema_contract(&db, expected.as_ref())
         .map_err(|cause| failure(StartupFailure::OpenFailed, cause))?;
     let db = db

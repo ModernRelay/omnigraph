@@ -3825,9 +3825,21 @@ mod local_serving {
         graph: &Path,
         access: omnigraph_server::LocalAccess,
     ) -> (AppState, String) {
-        let binding = omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap();
+        local_state_of(graph, access, false).await
+    }
+
+    async fn local_state_of(
+        root: &Path,
+        access: omnigraph_server::LocalAccess,
+        cluster: bool,
+    ) -> (AppState, String) {
+        let binding = omnigraph_server::LocalBinding::from_root(root.to_str().unwrap()).unwrap();
         let (state, credential) = AppState::local(
-            omnigraph_server::LocalScope::Graph(binding),
+            if cluster {
+                omnigraph_server::LocalScope::Cluster(binding)
+            } else {
+                omnigraph_server::LocalScope::Graph(binding)
+            },
             omnigraph_server::LocalOptions {
                 access,
                 actor: Some("act-local".into()),
@@ -3868,8 +3880,11 @@ mod local_serving {
         };
         let mode = std::env::var(MODE).unwrap();
         omnigraph_server::install_log_subscriber(std::io::stderr);
-        let (state, token) =
-            local_state(&graph_path(&root), omnigraph_server::LocalAccess::ReadWrite).await;
+        let (state, token) = if mode == "cluster" {
+            local_state_of(&root, omnigraph_server::LocalAccess::ReadWrite, true).await
+        } else {
+            local_state(&graph_path(&root), omnigraph_server::LocalAccess::ReadWrite).await
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let _guard = (mode == "uncertain").then(|| {
@@ -3914,18 +3929,25 @@ mod local_serving {
         }
     }
 
-    fn mutation(address: &str, token: &str, name: &str) -> String {
+    fn mutation(address: &str, token: &str, graph: &str, name: &str) -> String {
         let mut socket = TcpStream::connect(address).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let body = serde_json::json!({
-            "query": MUTATION_QUERIES, "name": "insert_person", "params": {"name": name, "age": 17}
-        })
+        let body = if graph == "default" {
+            serde_json::json!({
+                "query": MUTATION_QUERIES, "name": "insert_person", "params": {"name": name, "age": 17}
+            })
+        } else {
+            serde_json::json!({
+                "query": "query add($name: String) { insert Person { name: $name } }",
+                "params": {"name": name}
+            })
+        }
         .to_string();
         write!(
             socket,
-            "POST /graphs/default/mutate HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT}\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST /graphs/{graph}/mutate HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT}\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
@@ -3936,9 +3958,18 @@ mod local_serving {
     }
 
     async fn serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller(mode: &str) {
-        let temp = init_loaded_graph().await;
+        let cluster = mode == "cluster";
+        let temp = if cluster {
+            local_cluster_dir().await
+        } else {
+            init_loaded_graph().await
+        };
         let root = temp.path();
-        let graph = graph_path(root);
+        let (graph_id, graph) = if cluster {
+            ("knowledge", root.join("graphs/knowledge.omni"))
+        } else {
+            ("default", graph_path(root))
+        };
         let commits = || async {
             Omnigraph::open_read_only(graph.to_str().unwrap())
                 .await
@@ -3981,6 +4012,8 @@ mod local_serving {
         wait_for(&root.join("listening"), &mut child.0);
         let listening = fs::read_to_string(root.join("listening")).unwrap();
         let (address, token) = listening.split_once('\n').unwrap();
+        // A read-write local server of a cluster is its serving owner.
+        assert_eq!(root.join("__cluster/lock.json").exists(), cluster);
 
         let client = reqwest::Client::new();
         let ready: Value = client
@@ -4001,10 +4034,10 @@ mod local_serving {
 
         if mode == "uncertain" {
             // The publish lands and its owner panics: the outcome is unknown.
-            let _lost = mutation(address, token, "Uncertain");
+            let _lost = mutation(address, token, graph_id, "Uncertain");
             wait_for(&root.join("fault-reached"), &mut child.0);
         } else {
-            let response = mutation(address, token, "Settled");
+            let response = mutation(address, token, graph_id, "Settled");
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");
             assert_eq!(
                 unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
@@ -4035,6 +4068,8 @@ mod local_serving {
             assert!(stderr.contains("shutdown signal received"), "{stderr}");
         }
         assert_eq!(commits().await, before + 1, "{stderr}");
+        // A clean shutdown releases the admission, as a deployment's does.
+        assert!(!root.join("__cluster/lock.json").exists());
         // Nothing the server says reaches stdout, which belongs to its caller.
         let begin = stdout.iter().position(|line| line == BEGIN).unwrap();
         assert_eq!(
@@ -4047,6 +4082,11 @@ mod local_serving {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller_clean() {
         serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller("clean").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller_cluster() {
+        serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller("cluster").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
