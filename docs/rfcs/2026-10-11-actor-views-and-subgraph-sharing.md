@@ -7,21 +7,21 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-11
-updated: 2026-10-12
+updated: 2026-10-17
 discussion: null
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "Measure full-text ranking quality under view-independent statistics (public and uniform) against index-wide statistics on a checked-in fixture, and choose the restricted-actor statistics source."
-  - "Measure readable-set construction and incremental maintenance at the target scale (10^5 principals, 10^6 securables, membership depth 16, connector access churn) on main, warm and cold; confirm the limits in Bounds and that maintenance work after an access change scales with the actors it affects."
+  - "Measure exact restricted search at the target sizes (view-statistics bm25 over the visible text, exact nearest over the visible vectors; local disk and S3) and set the admission budgets in Bounds."
+  - "Measure readable-set construction at the target scale (10^5 principals, 10^6 securables, membership depth 16) on main, warm and cold, and confirm the limits in Bounds."
 ---
 
 # RFC: Actor views and subgraph sharing
 
 > A term set in ***bold italics*** is defined at that spot; it is plain text
-> afterwards. Every `file:line` anchor into OmniGraph is at commit `6e31d0ab`;
-> every anchor into Lance is at crate `lance` 11.0.0 and its sibling crates, the
-> versions in `Cargo.lock`, written as `lance-11.0.0/<path>`.
+> afterwards. OmniGraph code is cited by file and symbol at commit `9575b044`.
+> Lance is cited as `lance-11.0.0/<path>:<line>` and its sibling crates, the
+> versions in `Cargo.lock`.
 
 ## Summary
 
@@ -34,22 +34,35 @@ of actors, defined by membership. A ***securable*** is a node that data is
 placed in, such as a channel, a folder, a deal room or a sensitivity class; who
 can read it is defined by edges into it. Grants and inheritance add readers,
 `@requires` intersects audiences, and denial removes readers. Annotations in the
-schema say which types and edges play which part and place each row, column,
-type or edge in securables. An actor sees a piece of data when it can read every
+schema say which types and edges play which part and place each row, column or
+type in securables. An actor sees a piece of data when it can read every
 securable the data is placed in. Memberships, grants and placements are graph
 data; users write facts, never rules.
 
-The observable contract is ***non-interference***: an actor's answer to any
-query equals the answer the same query would give on a graph that physically
-contained only that actor's view. Counts, aggregates, traversals, search ranks
-and errors are computed on the view, never filtered afterwards. The contract is
-enforced at one place per mechanism, the ***visibility door***, and a
-differential test proves it for every operator.
+The observable contract is ***non-interference***: two graphs that give an
+actor the same view give that actor the same answer to every query. Counts,
+aggregates, traversals, search scores and ranks, and errors therefore depend
+only on what the actor may see. The contract is enforced at one place per
+mechanism, the ***visibility door***: plan acceptance for reads, attempt
+validation and the publication compare-and-swap for writes. A differential test
+over pairs of graphs that differ only in hidden data proves it for every
+operator.
+
+Restricted search is exact and scored from the view: `bm25` uses statistics
+over the actor's visible rows, and `nearest` scans the visible vectors. Actor
+ids, securable keys and the internal group are protected ***identity
+bindings*** with one lifecycle.
 
 External sharing needs no further access concept. A ***recipient*** is a
 principal that stands for an outside party. A share is the recipient's view,
 served live or materialized into a separate graph kept current from the
 source's change feed.
+
+This RFC asks acceptance for the contract, the model and Phases 0–3: reads and
+writes under a view. Later phases (delegated agents, incremental maintenance,
+packed placement references, data-derived and edge placement, search
+acceleration, view-filtered history and feeds, sharing) are designed here to show
+that the model extends; each is accepted by amendment when its evidence exists.
 
 What does not change: Cedar remains the gate on operations; a graph that
 declares no securables behaves exactly as today; anyone holding storage
@@ -60,14 +73,14 @@ credentials still sees everything, as today.
 ### The current boundary
 
 The policy model has graph-scoped actions with an optional branch class.
-`ResourceScope` is "branch-grained on purpose", and per-type and per-row scope
-were reserved for a later `predicate_for` hook
-(`crates/omnigraph-policy/src/lib.rs:964-990`). The user guide states the limit:
-"Per-entity and per-property authorization is not currently supported"
+`ResourceScope` in `crates/omnigraph-policy/src/lib.rs` is "Branch-grained on
+purpose", and per-type and per-row scope were reserved for a later
+`predicate_for` hook in the query layer. The user guide states the limit: "Per-entity and
+per-property authorization is not currently supported"
 (`docs/user/operations/policy.md`). Rules are allow-only, grouped by static actor
-lists in YAML, and compiled to Cedar text (`crates/omnigraph-policy/src/lib.rs:825-866`).
-Reads are authorized only in HTTP handlers; the engine's read doors take no
-actor (`crates/omnigraph/src/exec/query_doors.rs:41-170`).
+lists in YAML, and compiled to Cedar text (`compile_policy_source`). Reads are
+authorized only in HTTP handlers; the engine's read doors in
+`crates/omnigraph/src/exec/query_doors.rs` take no actor.
 
 ### A company brain
 
@@ -106,17 +119,32 @@ be fixed together.
 
 ### Non-interference
 
-For an actor `a` with view `V(a)` and any read `q`:
+Let `V_G(a)` be the view actor `a` has in graph `G`: the visible types,
+properties, rows and edges with their values. For any read `q` and any two
+graphs `G` and `G′`:
+
+```text
+V_G(a) = V_G′(a)   ⟹   answer(q, G, a) = answer(q, G′, a)
+```
+
+The equality covers rows, order where the query orders, counts, aggregates,
+search scores and ranks, errors, refusals and the result schema. It holds for a
+read at the request's captured authorization state and data snapshot
+([Capturing a view](#capturing-a-view)). Timing and resource use are excluded
+([What is not promised](#what-is-not-promised)).
+
+A stronger form is the test oracle:
 
 ```text
 answer(q, G, a) = answer(q, materialize(V(a)), bypass)
 ```
 
-`materialize(V(a))` is a graph containing exactly the types, properties, rows
-and edges `V(a)` admits. The equality covers rows, order where the query orders,
-counts, aggregates, search ranks, errors and the result schema. It holds at the
-snapshot the read targets, under the authorization state captured for the
-request.
+`materialize(V(a))` contains exactly what `V(a)` admits, and the bypass actor
+evaluates it with the same evaluators a restricted read uses. Both forms hold
+for every operator in the first scope because restricted search is exact and
+scored only from the view ([D10](#d10-restricted-search-is-exact-and-scored-from-the-view)).
+Approximate operators satisfy neither form, so they are not offered to
+restricted actors on placed types.
 
 Writes obey the dual rule: a write by `a` succeeds only if every row it creates,
 changes or removes is writable in `V(a)`, and its outcome reveals nothing
@@ -141,22 +169,32 @@ that must be whole for an actor who cannot see the rows behind it comes from a
 stored query that runs with its definer's view
 ([Answer capabilities](#answer-capabilities)).
 
-A name the view hides (a type, an edge type or a property) does not exist for
-the actor. A query naming it fails with the same error, byte for byte, as a
-query naming something never declared.
+A name the view hides (a type, an edge type, a property, or a namespace that
+holds only hidden types) does not exist for the actor. A query naming it fails
+with the same error, byte for byte, as a query naming something never declared.
 
 ### What is not promised
 
-- **Storage holders.** Lance files contain every row. Anyone who can read the
-  graph's objects sees everything. A recipient who needs storage-level access
-  gets a materialized share with its own storage.
+- **Storage holders, direct and local access.** Lance files contain every row.
+  Anyone who can read the graph's objects sees everything, and direct access and
+  a local server you run for yourself are storage-holder access
+  ([Direct and served access](#direct-and-served-access)). A recipient who needs
+  storage-level access gets a materialized share with its own storage.
 - **Timing.** Execution time can depend on hidden rows. Timing channels are out
   of scope for live access; they are one reason external parties get
   materialized shares.
-- **Key existence for writers.** A writer of a keyed type can learn whether a
-  key exists in that type ([D4](#d4-writes-that-collide-with-hidden-rows)).
-- **Edge existence on delete.** Deleting a node that has an edge the actor
-  cannot see is refused, which reveals that such an edge exists.
+- **Write disclosures.** A writer of a placed type can learn, from whether its
+  write succeeds, exactly these facts and nothing more
+  ([Constraint disclosures](#constraint-disclosures)): whether a key exists in
+  that type; whether a value tuple of a `@unique` constraint on that type exists
+  in it; whether an edge's source has reached its `@card` bound; and, when it
+  deletes a node, whether the node has an edge the writer cannot see.
+- **Retraction on existing branches.** Moving a row to a more restricted
+  securable on `main` does not change the row on branches forked before the
+  move; readers of those branches keep the old placement until
+  [Phase 9](#rollout). Restricted actors cannot create a branch at a past commit
+  or restore an old state of a placed type, so only branches that already
+  existed are affected.
 
 Every other channel in [Surfaces](#surfaces) is closed or refused.
 
@@ -173,8 +211,8 @@ meaning, and each corresponds to a step of the derivation in
 | `@principal` | a `String` property | The node stands for the authenticated actor whose id equals this value. | Identity |
 | `@group` | node type | Rows are sets of actors. | Actor side |
 | `@member` | edge type, principal or group → group | The subject belongs to the group. Membership chains. | Closure |
-| `@securable` | node type | Rows hold data. Securable keys share one namespace across every securable type. | Data side |
-| `@in(p)`, `@in("key")` | node type, edge type or property | Places each row in the securable named by its property `p`, or a whole type, edge type or column in a fixed securable. | Placement |
+| `@securable` | node type | Rows hold data. Securable keys are unique across securable types. | Data side |
+| `@in(p)`, `@in("key")` | node type or property | Places each row in the securable named by its property `p`, or a whole type or one column in a fixed securable. | Placement |
 | `@grant` | edge type, principal or group → securable, with a `role` | The subject's members get `viewer`, `editor` or `owner` on the securable. One hop. | Union |
 | `@inherits` | edge type, securable → securable | Readers of the target get their role on the source, at most the edge's optional `role` (default `viewer`). | Union |
 | `@requires` | edge type, securable → securable | The source is readable only if every target is readable too. | Intersection |
@@ -241,28 +279,33 @@ node Salary @in("compensation") {
 }
 ```
 
-With polymorphic endpoints ([Polymorphic types](#polymorphic-types)) the access
-edges collapse into one edge type per relation.
+`Team` here is a user schema type, unrelated to the managed control plane's
+organization members. With polymorphic endpoints
+([Polymorphic types](#polymorphic-types)) the access edges collapse into one edge
+type per relation.
 
 ### Rules that complete the model
 
-- **One key namespace.** Securable keys are unique across every `@securable`
-  type, checked when a securable row is written. A placement value therefore
-  needs no type, and connectors use namespaced keys such as `slack:C123`,
-  `folder:q3-board` or a person's email.
-- **Actor ids are unique** across every `@principal` property. A graph may have
+- **Unique securable keys.** Securable keys are unique across every
+  `@securable` type, checked when a securable row is written. A placement value
+  therefore needs no type, and connectors use prefixed keys such as
+  `slack:C123`, `folder:q3-board` or a person's email.
+- **Unique actor ids** across every `@principal` property. A graph may have
   several principal types: people, agents, recipients.
-- **The organization group.** A `@group` row keyed `organization` is the
-  ***organization group***. Its members are implicit: every actor in the cluster
-  policy groups listed under `views.organization`. A grant from it is a
-  company-wide grant. Recipients and other outside principals are never in
-  those policy groups, so no company-wide grant reaches them.
+- **The internal group.** The ***internal group*** is the `@group` row keyed
+  `internal`. Its members are implicit: every actor in the cluster policy groups
+  listed under `views.internal`. A grant from it reaches everyone inside the
+  company and no recipient. It is structural:
+  - its key is reserved across every `@group` type, and at most one row holds
+    it;
+  - write validation refuses an explicit `@member` edge into it and a `@deny`
+    edge onto it;
+  - only bypass actors create or delete it.
 - **Placement.** `@in(p)` on a type places each row in the securable whose key
   is the row's `p`. `@in("key")` on a type places the whole type; on a property,
   that column. A type may carry several `@in`; data is visible only when every
   one of its securables is readable. A null `p` places the row in no securable,
-  so only `bypass` actors see it. Edge types take `@in` the same way; an edge is
-  visible when both endpoints are visible and its own placements are readable.
+  so only bypass actors see it.
 - **Fixed placements are checked references.** Schema apply refuses an
   `@in("key")` whose key is not a securable on `main`, and deleting a securable
   row that a fixed `@in` names is refused. A misspelling fails loudly instead of
@@ -271,7 +314,8 @@ edges collapse into one edge type per relation.
   @in(slug)` places each channel in itself, so only those who can read it know
   it exists. `Person` is a securable but unplaced, so people stay visible while
   each person's personal securable holds their private data.
-- **Unplaced types** stay visible to every actor with `read`, as today.
+- **Unplaced types**, the engine catalogue's built-in types among them, stay
+  visible to every actor with `read`, as today.
 
 Schema apply validates the declarations:
 
@@ -289,9 +333,34 @@ Schema apply validates the declarations:
 These declarations set the schema feature `actor-views`, which builds that do
 not implement this RFC refuse to open
 ([Compatibility](#compatibility-and-reversibility)). Each `@in(p)` property gets
-a BTREE index. A schema lint warns when a type with a per-row `@in` is keyed on
-a property that looks human-meaningful, such as an email or a name, because
-writers can probe keys.
+a BTREE index. A schema lint warns when a type with a per-row `@in` is keyed on,
+or declares `@unique` over, a property that looks human-meaningful, such as an
+email or a name, because writers can probe it
+([Constraint disclosures](#constraint-disclosures)).
+
+### Identity bindings
+
+Three kinds of value decide who a request is and which data belongs to which
+audience: the actor id on a `@principal` property, the key of a securable, and
+the internal group row. They are ***identity bindings***, and they change only
+through one protected lifecycle, enforced in the shared validation of mutation,
+load and merge ([Writes](#writes)):
+
+| Operation | Rule in the first scope |
+|---|---|
+| Assign, change or clear a `@principal` value | Bypass actors only, typically the connector that mirrors the identity provider. |
+| Create a securable | Bypass actors only. |
+| Change a securable's key | Refused for everyone; a key is identity, not data. |
+| Delete a securable | Refused for everyone while a per-row or fixed placement names it; bypass actors move or delete the rows first. |
+| Create, delete or re-key the internal group row | Bypass actors only. |
+
+Refusals carry `identity_binding_denied` or, for a named securable,
+`securable_in_use`. With these rules a restricted writer cannot take over
+another person's identity by moving an actor id, cannot squat a securable key
+before a connector mirrors it, and cannot inherit rows by re-creating a deleted
+key. Creation by restricted actors returns once placements store packed
+references ([Phase 6](#rollout)): a new securable then gets a fresh id that no
+placement can already name, and an id is never reused.
 
 ### Computing access
 
@@ -300,7 +369,7 @@ An edge is ***live*** when its `@starts` is null or at most `t` and its
 `@expires` is null or after `t`.
 
 ```text
-1. Membership:    C0 = {p}, plus organization if a is in views.organization,
+1. Membership:    C0 = {p}, plus internal if a is in views.internal,
                        plus every group reached from them over live @member edges
 2. Denial:        D  = every securable with a live @deny edge from a subject in C0
 3. Membership:    C  = as C0, but never entering a group that is in D
@@ -327,7 +396,7 @@ alice ─member→ team:eng ─editor→ channel:eng
 bob   ─member→ team:legal ─viewer→ channel:deal-acme
 bob   ─member→ team:acme-wall ─deny→ channel:deal-acme
 carol ─editor→ channel:deal-acme
-organization ─viewer→ channel:general          (alice, bob, carol are staff)
+internal ─viewer→ channel:general              (alice, bob, carol are staff)
 team:hr ─viewer→ pii, compensation
 digest:acme ─inherits→ channel:deal-acme
             ─requires→ channel:deal-acme, channel:general
@@ -336,7 +405,7 @@ client:globex ─viewer→ folder:globex-shared    (a recipient, not staff)
 
 | | alice | bob | carol | client:globex |
 |---|---|---|---|---|
-| Memberships | team:eng, organization | team:legal, team:acme-wall, organization | organization | — |
+| Memberships | team:eng, internal | team:legal, team:acme-wall, internal | internal | — |
 | Granted | channel:general, channel:eng (editor) | channel:general, channel:deal-acme | channel:general, channel:deal-acme (editor) | folder:globex-shared |
 | Denied | — | channel:deal-acme | — | — |
 | `digest:acme` | ✗ cannot read channel:deal-acme | ✗ channel:deal-acme denied | ✓ | ✗ |
@@ -344,8 +413,8 @@ client:globex ─viewer→ folder:globex-shared    (a recipient, not staff)
 `digest:acme` holds summaries drawn from both channels: it inherits its readers
 from the deal room and requires both sources, so exactly those who can read both
 see it. Bob is granted the deal room through legal, but the wall's deny wins.
-The client never sees `channel:general`, because it is not in the organization
-group.
+The client never sees `channel:general`, because it is not in the internal
+group and no edge can put it there.
 
 ### Placement in practice
 
@@ -356,7 +425,7 @@ group.
   absent, and naming it is an unknown-name error.
 - `Salary` exists only for actors who can read `compensation`.
 
-Fixed securables are created and granted as data:
+Fixed securables are created and granted as data by a bypass actor:
 
 ```gq
 query create_pii() {
@@ -398,29 +467,53 @@ rules:
   - id: connectors-write
     allow: { actors: { group: connectors }, actions: [change] }
 views:
-  organization: [staff]
-  bypass: [platform-admins]
+  internal: [staff]
+  bypass: [platform-admins, connectors]
   limits:
     max_memberships: 4096
     max_securables: 100000
+    max_exact_search_rows: 200000
 ```
 
-- `organization` lists the cluster groups whose actors are implicit members of
-  the organization group.
-- `bypass` lists cluster groups whose view is the whole graph: the break-glass
-  and maintenance path, named after Postgres's `BYPASSRLS`. Every bypass read is
-  audited. Only a bypass actor may remove a placement from the schema.
-- `limits` bound one actor's view ([Bounds](#bounds)).
+- `internal` lists the cluster groups whose actors are implicit members of the
+  internal group. Membership of the managed control plane's organization grants
+  nothing here: invited outside collaborators are organization members too. The
+  control plane may maintain the cluster group this key lists.
+- `bypass` lists cluster groups whose view is the whole graph: the break-glass,
+  connector and maintenance path, named after Postgres's `BYPASSRLS`. Served
+  bypass reads are recorded through the existing policy decision log. Only a
+  bypass actor manages identity bindings or removes a placement from the schema.
+- `limits` bound one actor's view and its exact searches ([Bounds](#bounds)).
 
 No new Cedar action is needed. Who may change access to a securable is the
 `owner` role on it; who may move a row between securables is the `editor` role
 on both.
 
 Cluster apply validates `views` where it already validates stored queries
-against the catalog (`crates/omnigraph-cluster/src/deployment/execution.rs:782-800`,
-`crates/omnigraph-server/src/deployment.rs:676`,
-`crates/omnigraph-server/src/registry.rs:644`). Binding a version-1 bundle to a
-graph with `actor-views` declarations fails the apply.
+against the catalog. Binding a version-1 bundle to a graph with `actor-views`
+declarations fails the apply, and a `views` block on a bundle bound to the
+engine catalogue target `og_catalog` is refused. Branch names, where version 2
+mentions any, follow the canonical branch-name rule.
+
+### Direct and served access
+
+How the actor's view applies follows the access path, in the terms of the draft
+graph access RFC
+([ModernRelay/omnigraph#1017](https://github.com/ModernRelay/omnigraph/pull/1017)):
+
+| Path | Actor | View |
+|---|---|---|
+| Served to others (a cluster deployment, `serve --listen`) | Resolved from the credential; `--as` becomes an assertion the server checks | The actor's view |
+| A local server you run for yourself | Declared with `--as` | Bypass: you already hold the storage credentials |
+| Direct access from the CLI or an embedding | Declared | Bypass, unless the embedding installs a policy, in which case the engine applies the declared actor's view as a convenience, not as confidentiality |
+
+A graph with `actor-views` declarations is served to others only by a cluster,
+whose version-2 policy defines `internal` and `bypass`. The server refuses to
+serve such a graph in unauthenticated mode, which today allows every graph
+action, and with static tokens but no policy, which today allows every read
+(`handlers.rs`, the no-policy branch of the authorization check). A local server
+that serves an `actor-views` graph read-write applies the bypass view and records
+the declared actor, as the graph access draft specifies.
 
 ### Reading under a view
 
@@ -440,10 +533,20 @@ query recent($topic: String) {
 
 For a restricted actor this returns at most 20 visible messages. Aggregates run
 over the same rows. A traversal never passes through a node the actor cannot
-see, including intermediate nodes of a multi-hop pattern. `nearest`, `bm25` and
-`rrf` rank only visible rows and return `min(k, visible)` results. Restricted
-actors get full-text scores computed from view-independent corpus statistics
-([Full-text statistics](#full-text-statistics)).
+see, including intermediate nodes of a multi-hop pattern.
+
+Search is exact and scored from the view
+([Restricted search](#restricted-search)):
+
+- `bm25` ranks the visible rows using statistics over the visible rows only:
+  document count, document frequencies and average length. Hidden rows and the
+  state of the full-text index never change a restricted score.
+- `nearest` compares the query with every visible vector.
+- `rrf` fuses those ranks.
+- All three return `min(k, visible)` results. A search whose visible input
+  exceeds `max_exact_search_rows` is refused with `view_limit_exceeded`.
+
+Bypass actors and unrestricted reads keep today's search.
 
 ### Writing under a view
 
@@ -457,47 +560,71 @@ For an actor whose view of a placed type is restricted:
 | Insert of a keyed row whose id exists but is not writable | Refused with `key_conflict`, without an entity id or any value the actor did not send. Otherwise it upserts as today. |
 | Update or delete statement | Matches only rows in the view. A matched row that is visible but not writable refuses the statement with `view_write_denied`. |
 | Delete that would cascade to an edge the actor cannot see | Refused with `delete_blocked`. |
-| Edge insert | Both endpoints must be visible, and the edge's own placements writable; a hidden endpoint fails exactly as a missing one. |
-| `load --mode overwrite` | Refused when the actor's view of any type in the batch is restricted. |
-| Branch merge | Refused unless every row in the merge diff is writable by the actor. Conflicts are reported without entity ids. |
-| Constraint violations | Reported by constraint and property name only. `@unique` omits the other holder's id; `@card` omits the count. |
+| Edge insert | Both endpoints must be visible, and the edge type's fixed placement writable; a hidden endpoint fails exactly as a missing one. |
+| `load --mode overwrite` and `load csv … overwrite` | Refused when the actor's view of any type in the batch is restricted. |
+| Branch merge, including a dry run | Refused unless every row in the merge diff is writable by the actor. Conflicts are reported without entity ids. |
+| Writes to identity bindings | As in [Identity bindings](#identity-bindings). |
 
-Access edges and principals have their own rules, for every actor that is not
-bypass:
+Access edges have their own rules, for every actor that is not bypass:
 
 - Writing a `@grant`, `@deny`, `@inherits` or `@requires` edge into or from a
   securable needs `owner` on that securable (the target of a grant or deny, the
   source of an inherits or requires edge).
 - Writing a `@member` edge into a group needs `owner` on it. A group type that
-  is not also a securable has no owners, so only bypass actors manage it,
-  typically the connector that mirrors it.
+  is not also a securable has no owners, so only bypass actors manage it.
 - Access edges and `@principal` properties are written only on `main`. A branch
-  write or a merge that touches them is refused. Without that rule a branch
-  forked before a revocation would bring the revoked access back when merged.
-- A new securable row must be written together with an `owner` grant into it
-  from a subject in the writer's membership closure; otherwise the write is
-  refused with `securable_owner_required`.
+  write, a merge, a branch promotion or a restore that touches them is refused.
+  Without that rule a branch forked before a revocation would bring the revoked
+  access back.
 
-A connector that mirrors source ACLs either owns the securables it creates or
-runs as a bypass principal. Bypass actors keep today's messages and rules.
+#### Constraint disclosures
+
+Constraints hold over the whole type, hidden rows included, so a constraint
+check's outcome can depend on hidden rows. Every system surveyed enforces
+constraints globally and documents the resulting channel; Postgres says
+constraint checks "always bypass row security". This RFC states exactly what a
+restricted writer of a placed type may learn, and refuses every other outcome
+that would say more:
+
+| Constraint | What the outcome may reveal | What is withheld |
+|---|---|---|
+| `@key` | Whether the key exists in the type | The row's id, values and placement |
+| `@unique` (including an interface-wide one) | Whether the written value tuple exists in the type | The other holder's id, values and placement |
+| `@card` on an edge type | Whether the source has reached the bound | The count and the hidden edges |
+| Cascade on delete | Whether the node has an edge the writer cannot see | Which edges, how many |
+| Securable keys | Nothing: only bypass actors create securables in the first scope | — |
+
+Errors for restricted actors carry the constraint and property names only. The
+lint above flags placed types whose keys or `@unique` properties are
+human-meaningful; opaque keys make probing impractical. Uniqueness scoped to a
+placement, which would close the `@unique` channel, is an open question
+([Unresolved questions](#unresolved-questions)).
 
 ### Agents and delegated credentials
 
-An agent acting for a user presents a ***delegated credential***: the user's
-principal as subject, the agent's principal as actor (the RFC 8693 `act`
-claim), an audience bound to this server, and optional ***caveats*** that only
-narrow: a list of securables, a list of types, an action subset and an expiry.
-A caveat's securable list covers the listed securables and every securable that
-inherits from them. The effective readable set is
+An agent acting for a user presents a ***delegated credential***, whose issuance
+belongs to the delegated-credential work tracked in
+ModernRelay/omnigraph#978. It names the user's principal as ***subject*** and
+the agent's principal as ***actor*** (the RFC 8693 `act` claim). It may carry
+***caveats*** that only narrow: a list of securables, a list of types, an action
+subset, a list of branches and an expiry. The effective readable set is
 
 ```text
-R(user) ∩ R(agent) ∩ covered(caveats)
+R(subject) ∩ R(actor) ∩ covered(caveats)
 ```
 
-and the schema view is narrowed by the caveat types. Keeping content away from
-agents needs no special tier: put agent principals in a team and `@deny` that
-team the securables in question. The MCP surface accepts only tokens whose
-audience is this server and never passes a token upstream.
+and the schema view is narrowed by the caveat types. A caveat's securable list
+covers each listed securable, and each securable that inherits from a covered
+one when every one of its `@requires` targets is covered too. A summary that
+also derives from a source outside the caveat therefore stays outside it.
+
+The `omnigraph-expect-actor` assertion of the graph access draft names the
+actor. Cedar evaluates each action for both the subject and the actor, and both
+must be allowed. Commit receipts record both. `omnigraph access` reports the
+effective view.
+
+Keeping content away from agents needs no special tier: put agent principals in
+a team and `@deny` that team the securables in question.
 
 ### Derived content
 
@@ -517,59 +644,76 @@ in a way that keeps every read a column test
 - **Attributes that name an audience** become placement on the attribute: deals
   visible to their region's team are `node Deal @in(region)` with regions as
   securables.
-- **Rules over the row's own columns** become ***computed placement***: a
-  placement property whose value the engine sets on every insert and update from
-  an expression over that row's own columns and constants, in the same write.
-  Writers cannot set it directly. For example, deals of $1M or more are placed in
-  `deals:board` and others in `deals:standard`; the syntax is open
-  ([Unresolved questions](#unresolved-questions)).
 - **Access that starts at a time** uses `@starts`: an embargoed release is
-  placed in a securable granted to the organization with `starts` at the release
-  time.
+  placed in a securable granted to the internal group with `starts` at the
+  release time.
 - **Relationships that should confer access** become access edges by explicit
   opt-in, for example a `CompChain: CompFile -> CompFile @inherits` edge mirrored
   from the org chart so that each manager chain reads its reports' compensation
   files. Such edges take on the access-edge rules: written only on `main` and by
   owners. They belong on purpose-specific securables: an `@inherits` edge between
   personal securables would also hand a manager the report's private notes.
+- **Rules over the row's own columns** become ***computed placement*** in
+  [Phase 7](#rollout): a placement property whose value the engine sets on every
+  insert and update from an expression over that row's own columns.
 - **Rules over other rows, counts and negation over other rows** (notes that
   mention my accounts, records visible after three approvals) are served by
   stored queries that run with their definer's view: the caller gets answers,
   not a view to query freely ([Answer capabilities](#answer-capabilities)).
 
-### History, change feed and export
+### History, branches and feeds
 
 Authorization always comes from current authority: rules from the applied
-policy, access edges from `main`'s current head. Revocation therefore covers
-history, and joining a team shows that team's history. Relaxing access exposes
-history too; BigQuery documents the same consequence.
+policy, access edges and placement annotations from `main`. Revocation
+therefore covers history, and joining a team shows that team's history. Relaxing
+access exposes history too; BigQuery documents the same consequence.
 
-In the first releases a restricted actor cannot read a historical snapshot, the
-change feed, a commit's changes, an export or a baseline of any placed type its
-view restricts. These refuse with `view_restricted`. Bypass actors and share
-reconcilers are unaffected. A later phase serves view-filtered history
-([Rollout](#rollout), Phase 8).
+In the first scope, for any placed type the actor's view restricts:
+
+- reading a historical snapshot, a commit's changes, the change feed, an export
+  or a baseline is refused with `view_restricted`;
+- graph diff, branch diff and merge-base, which compare states and show row
+  images, are refused with `view_restricted`;
+- creating a branch at a past commit, promoting a branch or restoring an old
+  state is refused with `view_restricted`;
+- reading or inspecting an unpublished commit or an unattached snapshot is a
+  snapshot read and is refused with `view_restricted`;
+- ordinary branch reads follow the branch's placements, with the retraction
+  limit in [What is not promised](#what-is-not-promised).
+
+Bypass actors and share reconcilers are unaffected. A restricted writer settles
+an uncertain write through its own attempt ([Server surfaces](#server-surfaces)).
+[Phase 9](#rollout) serves view-filtered history, diffs and feeds, and applies
+the dual-placement rule to branches.
 
 ### Surfaces
 
-| Surface | Under a restricted view |
+Each operation has one name, request and result across CLI, HTTP and MCP, as the
+graph access draft requires. Under a restricted view:
+
+| Operation (CLI, HTTP, MCP tool or resource) | Under a restricted view |
 |---|---|
-| `POST /query`, `POST /queries/{name}`, MCP `query` | Answered over the view. |
-| `explain` | Omits row estimates, statistics, dataset paths, versions and index facts for restricted types. |
-| `profile` | Bypass actors only. |
-| `GET /schema` | The schema view: hidden types and properties are absent. |
-| Structured catalog route and schema hash on reads ([Polymorphic types](#polymorphic-types)) | The schema view, and the view's digest in place of the schema hash. |
-| `GET /queries`, MCP `queries` | Only queries that typecheck against the schema view. |
-| `GET /snapshot` | Omits `entity_count` and dataset paths for restricted types. |
-| `GET /commits`, `/commits/{id}`, `/commits/{id}/changes`, `GET /changes`, `POST /changes/baseline`, `POST /export` | `view_restricted` until Phase 8. |
-| `GET`/`HEAD /blob` | Only for a visible row; a hidden row answers exactly as a missing one. |
-| Write responses | As in [Writing under a view](#writing-under-a-view). |
-| Denial messages | Do not echo the actor or branch. |
+| `query`, stored queries, `read` and MCP `query`, `queries` | Answered over the view; the catalog of stored queries lists only queries that typecheck against the schema view. |
+| Writes: `mutate`, `load`, `load csv`, branch writes, MCP opt-in write tools | As in [Writing under a view](#writing-under-a-view). |
+| `explain`, `explain load csv` | Omits row estimates, statistics, dataset paths, versions, index facts, full-text coverage and eligibility, pipeline and cost inputs for restricted types. |
+| `profile` | Local only today, so storage-holder access; served profiles would be bypass only. |
+| `as commit`, `as unattached branch`, `commit publish`, `commit drop`, `commit list --unpublished`, `--unattached` | Creating a proposal or snapshot follows the write rules. Reading or inspecting one is a snapshot read: `view_restricted` until Phase 9. Publishing re-checks the commit's changes for the publishing actor ([Writes](#writes)). Drop changes no data and is gated by Cedar alone. |
+| `schema`, MCP `schema` and the schema resource | The schema view, regenerated as `.pg` text with hidden types, properties and namespaces absent. |
+| The structured type catalog of the polymorphic types draft | The schema view; reads carry the schema view's digest in place of `schema_ir_hash`. |
+| The engine catalogue (`og_catalog`, built-in types) | Unchanged; it describes the binary, not the graph. |
+| `snapshot`, MCP `snapshot` | Omits `entity_count` and dataset paths for restricted types. |
+| `branch list`, MCP `branches_list` and the branches resource | Branch names and heads, as today; branches hold no access facts. |
+| `commit list` (paged), `commit show`, `commit changes`, `changes`, `changes baseline`, `export`, MCP `commits_*`, `changes_poll` | `view_restricted` for restricted placed types until Phase 9; a page token binds the view digest. |
+| `branch diff`, `graph diff`, `branch merge-base`, `branch merge … dry run` | Diffs and merge-base: `view_restricted` until Phase 9. Dry run: the merge rule. |
+| `blob get`, `blob stat` | Only for a visible row; a hidden row answers exactly as a missing one. |
+| `access` (`GET /graphs/{id}/access`) | Reports the caller's effective view ([Operator tools](#operator-tools)). |
+| Replay of a saved plan | Refused for another actor's plan or a changed view; refusals are redacted ([Plan acceptance](#plan-acceptance)). |
+| Error and denial messages | Carry no other row's ids, values, counts, ETags or versions, and no schema hash; the error code and outcome object stay as defined. |
 
 ### Sharing
 
 A recipient is a principal of a principal type whose actor id the outside party
-authenticates as. It is never in the organization group. A share's content is
+authenticates as. It is never in the internal group. A share's content is
 whatever the recipient can read. Three delivery modes use that one definition:
 
 | Mode | Recipient reads | Revocation | Retention and audit |
@@ -619,25 +763,35 @@ share deletes its proposal branches.
 A ***vault*** is a compartment kept in its own graph or cluster instead of
 placed by securables. Use securables for the long tail of channels, folders,
 deals and matters. Use a separate graph when a defect in view enforcement would
-be unacceptable, retention differs, or full-text statistics must be isolated.
-Use a separate cluster when the threat includes holders of storage credentials,
-when compliance requires key separation, or when a recipient gets storage
-access: every graph in one cluster shares one storage root and one set of
-credentials today ([Appendix A](#appendix-a-validated-assumptions)).
+be unacceptable, retention differs, or search must not depend on rows other
+compartments hold. Use a separate cluster when the threat includes holders of
+storage credentials, when compliance requires key separation, or when a
+recipient gets storage access: every graph in one cluster shares one storage
+root and one set of credentials today
+([Appendix A](#appendix-a-validated-assumptions)).
 
 ### Operator tools
 
+The graph access draft's `omnigraph access` command and
+`GET /graphs/{graph_id}/access` route report the caller's own effective access.
+This RFC fills their `view` field with facts about the caller's own view only,
+none of which changes with hidden rows: whether the view is restricted or
+bypass, its digest and access version, the counts of readable, writable and
+owned securables (bounded), and the caveats of a delegated credential.
+
+Three operator operations explain other actors' views. They require bypass, are
+addressed with `--target`, and are routes as well as commands:
+
 ```bash
-omnigraph policy explain-view --graph knowledge --actor principal:alice
-omnigraph policy who-can-see --graph knowledge --type Message --id <id>
-omnigraph policy diff-view --graph knowledge --branch proposed-access
+omnigraph access --target knowledge --actor principal:alice --explain
+omnigraph access who-can-see --target knowledge --type Message --id <id>
+omnigraph access diff --target knowledge --branch proposed-access
 ```
 
-`explain-view` prints the actor's effective access: memberships, readable
-securables (bounded), denials and the edges that produced them. `who-can-see`
-inverts it for one row. `diff-view` reports how many securables change
-visibility for how many actors between `main` and a branch carrying proposed
-access edges, before they merge.
+`--explain` prints the actor's memberships, readable securables (bounded),
+denials and the edges that produced them. `who-can-see` inverts it for one row.
+`diff` reports how many securables change visibility for how many actors if a
+bypass actor's branch of proposed access edges were merged.
 
 ## Design
 
@@ -675,13 +829,14 @@ The constructs are derived, not collected.
    inheritance passes them capped; write without read would allow blind writes.
    Temporary access is common, and an edge window is exact at its instant where a
    deleting job would be a queue and a lag. The actor must be located in the
-   subject graph (`@principal`), and the organization root is defined by policy
+   subject graph (`@principal`), and the internal root is defined by policy
    because it is the root of trust. Several placements on one item are
    intersection evaluated at the item, which avoids a label for every combination
-   of orthogonal dimensions. Access facts are data, so they are placed too.
+   of orthogonal dimensions. Access facts are data, so they are placed too, and
+   the values that bind identity to data are protected.
 6. **The physical design follows the workload.** Reads dominate and each belongs
    to one actor, so the relation is inverted once per actor into `R(a)` and items
-   are filtered by `label IN R(a)` on an index ([Scans and search](#scans-and-search)).
+   are filtered by `label IN R(a)` on an index ([Scans](#scans)).
 
 Each construct is required by a step above and none can be built from the
 others, so the set is minimal for these requirements.
@@ -700,18 +855,22 @@ Names follow the field where its meaning matches:
 | `@deny` | AWS explicit deny, Windows deny entries, Databricks DENY; deny-overrides in XACML |
 | `@expires` | SpiceDB expiring relationships, Drive access expiry |
 | `bypass` | Postgres `BYPASSRLS` |
-| organization group | Google "anyone in the organization" |
+| internal group | GitHub's internal visibility: every member of the enterprise, no outside collaborators |
 | recipient | Delta Sharing, Snowflake |
 
 Names chosen against the field, and why:
 
-- **Not "scope".** It already means OAuth token scopes (MCP authorization),
-  `ResourceScope` and `ChangeFeedScope` in OmniGraph.
+- **Not "scope".** It already means OAuth token scopes, `ResourceScope` and
+  `ChangeFeedScope`.
 - **Not "label".** It means node type in a property graph.
 - **Not "compartment".** It is exact but known mainly from classified systems and
   Oracle.
+- **Not "organization".** The managed control plane's organization is a
+  WorkOS/AuthKit tenant whose members include invited outside collaborators.
 - **Not "everyone" or `*`.** OpenFGA and SpiceDB use `user:*` for all users, the
-  public included; the organization group deliberately excludes recipients.
+  public included; the internal group deliberately excludes recipients.
+- **Not "namespace" for securable keys.** The schema namespaces draft uses the
+  word for type names.
 - **`@requires` rather than "within".** "Within" reads as containment and invites
   modeling folders with intersection instead of inheritance.
 - **`@in`** names set membership, as GQ's `in` operator does.
@@ -720,40 +879,57 @@ Names chosen against the field, and why:
 
 | Fact | Owner | Changes | Versioned by |
 |---|---|---|---|
-| Which types and edges take part, and how data is placed | Accepted schema contract | Rarely; schema apply | The contract in `__manifest` |
-| Organization groups, bypass groups, limits | Applied cluster policy | Reviewed; cluster apply | Policy digest |
-| Principals, groups, securables, access edges, placement values | Graph rows on `main` | Daily | `main`'s manifest pins of the access tables |
+| Which types and edges take part, and how data is placed | Accepted schema contract on `main` | Rarely; schema apply | The contract in `main`'s `__manifest` |
+| Internal groups, bypass groups, limits | Applied cluster policy | Reviewed; cluster apply | Policy digest |
+| Principals, groups, securables, access edges, placement values | Graph rows on `main` (placement values also on branches) | Daily | `main`'s manifest pins of the access tables |
 
 Cluster policy groups gate operations and define the two roots; groups and
-securables in the graph gate data. Neither mirrors the other.
+securables in the graph gate data. Neither mirrors the other. Placement
+annotations are read from `main`'s accepted contract by stable identity for every
+target, so a schema apply that adds or removes a placement takes effect on every
+branch at once, whatever the branch's own contract says.
 
 ### Capturing a view
 
 A request resolves its actor at the server as today. The engine gains read
-doors that take the actor; invariant 10 extends from writes to reads, so
-embedded and CLI-direct readers obey the same view when a policy is installed.
+doors that take the actor; invariant 10 extends from writes to reads where a
+policy is installed ([Direct and served access](#direct-and-served-access)).
 
-A read captures two things under one schema permit, in this order:
-
-1. ***Authorization state***: the applied policy digest and the `__manifest`
-   pins on `main` of every ***access table*** (each group and securable type,
-   each principal type, each access edge type), each pin being the table's
-   identity, published dataset version, staged version and transaction id.
-2. ***Data snapshot***: the read target, as today.
-
-Snapshot-target reads already load `main`'s live contract under the schema
-permit and then discard that `main` snapshot
-(`crates/omnigraph/src/db/omnigraph.rs:1009-1024`); this design keeps it. A
-branch read probes `main`'s version once more. The capture is one new function,
-because the schema gate is not reentrant
-(`crates/omnigraph/src/db/write_queue.rs:455-458`).
-
-The ***access version*** is the policy digest plus the access pins. It is
+The ***authorization state*** of a request is the applied policy digest and the
+`__manifest` pins on `main` of every ***access table*** (each group and
+securable type, each principal type, each access edge type), each pin being the
+table's identity, published dataset version, staged version and transaction id.
+Its ***access version*** is that policy digest plus those pins. It is
 deliberately not `main`'s head commit: every unrelated write and every
 maintenance run advances the head, while the pins move only when an access table
-is written. Because authorization comes from the freshest `main`, it is never
-older than the data it filters, so Zanzibar's "new enemy" problems (content added
-after a revocation, or a revocation ordered after a move) cannot occur.
+is written.
+
+The capture must never apply authorization older than the data it protects, the
+ordering Zanzibar's §2.2 requires. Otherwise a request could capture access,
+then a revocation and new content could both commit, and the request could
+capture the new content under the old access.
+
+- **Reads on `main`** take the authorization state and the data from one
+  `__manifest` image, captured once under the schema permit. They cannot
+  disagree.
+- **Reads on another branch or a historical target** capture the data snapshot
+  first and `main`'s authorization state after it, as one function under one
+  schema permit. Any revocation published on `main` before the data cut is then
+  in the captured authorization state. Snapshot-target reads already load
+  `main`'s live contract under the schema permit
+  (`load_accepted_view_with_schema_gate_held` in `crates/omnigraph/src/db/omnigraph.rs`);
+  this design keeps that snapshot instead of discarding it.
+- **Writes on `main`** capture the authorization state with their baselines. The
+  access pins become expected versions of the publication's `__manifest`
+  compare-and-swap, so a concurrent access change by any process makes the
+  publication fail and the attempt retry with fresh authority. The schema,
+  branch and table gates are contention control, not the guarantee.
+- **Writes on another branch** publish on that branch's chain, which `main`'s
+  access tables are not part of, so the compare-and-swap cannot fence a
+  revocation on `main`. Such a write is authorized against the authorization
+  state captured in its attempt; a revocation published on `main` during that
+  attempt can miss at most that attempt. Every later read applies the current
+  state.
 
 Edge windows are evaluated at the request's admission time on the server, one
 clock for the whole request, as SpiceDB evaluates expiry in its datastore to
@@ -762,55 +938,40 @@ avoid clock skew. A cached view is valid until its earliest `@starts` or
 
 ### Computing the readable set
 
-The computation has two layers, following Zanzibar's Leopard index:
+The engine evaluates the definitions in [Computing access](#computing-access) as
+an internal plan on `main`'s snapshot:
 
-- A ***shared closure*** per access version, used by every actor: the
-  group-to-group membership closure and, for each securable, its grant, inherits,
-  requires and deny inputs. Building it is the recursive, expensive part. It is
-  derived state keyed by the access version.
-- A ***per-actor view***: the actor's direct memberships joined with the shared
-  closure give `C0` and `C`; denial, grants, inheritance and requirements then
-  give `R`, `W` and `O` as set operations, not traversals. The result is an
-  immutable ***view spec*** (the schema view, the sets, the earliest window
-  boundary and a digest), cached by access version, actor and caveats.
+1. Resolve the principal by its `@principal` property. If absent, the closure
+   holds only the internal group, and only if the actor is in `views.internal`.
+2. Compute the membership closure over all `@member` edge types with GQ's
+   bounded multi-hop traversal. Multi-hop requires equal endpoint types today
+   (`crates/omnigraph/src/engine/operators/expand.rs`), so the closure runs as a
+   principal-to-group hop followed by a group-to-group recursion; with
+   polymorphic endpoints it is one traversal.
+3. Read `@grant` and `@deny` edges whose source is in the closure, by an
+   indexed scan on the edge tables' source column.
+4. Subtract denials, then evaluate inheritance and requirements to the least
+   fixed point.
+5. Intersect with the actor's set and the caveats for a delegated credential.
 
-The first build of the shared closure reads the access tables on `main` with
-indexed scans on their source and destination columns. Readable sets are stored
-as compressed bitmaps over dense securable ordinals assigned by the shared
-closure: a few kilobytes for an actor that reads a thousand securables.
-
-### Incremental maintenance
-
-Access tables change whenever a connector syncs. Keyed only by access version, a
-single membership change anywhere would invalidate every actor's view; with
-10^4 active actors and a sync every few minutes, the engine would rebuild 10^4
-views per sync. Maintenance is therefore incremental:
-
-- The shared closure moves from one access version to the next by applying the
-  changed access rows between the two pins, read through the change feed of the
-  access tables. If the change history is gone (after cleanup), the closure is
-  rebuilt from scratch.
-- A cached per-actor view is carried forward to the new access version without
-  recomputation when no changed row touches the actor's membership closure or a
-  securable whose audience it depends on. Otherwise it is rebuilt from the
-  shared closure.
-- Connectors publish access changes in batches, so access versions move in
-  steps.
-
-Maintenance work after an access change is proportional to the changed rows and
-the actors they affect, not to all actors. Derived state that lags is never
-used: a stale closure or view is rebuilt before it serves a request.
+The result is an immutable ***view spec***: the schema view, `R`, `W`, `O`, the
+earliest window boundary and a digest. It is cached by access version, actor and
+caveats, in a byte-bounded cache that lives outside `invalidate_read_caches`,
+whose flush on every observed advance of `main` would otherwise discard views
+keyed by immutable state. Readable sets are stored as compressed bitmaps over
+dense securable ordinals.
 
 ### Bounds
 
-The membership closure is bounded by `max_memberships`, `R` by
-`max_securables`, membership depth by 16. Exceeding a bound refuses the request
-with `view_limit_exceeded`; the engine never truncates a view. The view cache is
-an LRU bounded in bytes and lives outside `invalidate_read_caches`
-(`crates/omnigraph/src/db/omnigraph.rs:2026-2034`), whose flush on every observed
-advance of `main` would otherwise discard views keyed by immutable state. Reads
-by external principals get per-actor read admission, extending the existing
-per-actor write caps (`crates/omnigraph-server/src/workload.rs:15-19`).
+- The membership closure is bounded by `max_memberships`, `R` by
+  `max_securables`, membership depth by 16.
+- A restricted exact search reads at most `max_exact_search_rows` visible rows.
+  The budget comes from the measurements in `blocked_on`.
+- Exceeding a bound refuses with `view_limit_exceeded`; the engine never
+  truncates a view or a search.
+- Reads by external principals get per-actor read admission, extending the
+  existing per-actor write caps (`DEFAULT_PER_ACTOR_INFLIGHT_MAX` in
+  `crates/omnigraph-server/src/workload.rs`).
 
 `|R(a)|` equals the number of distinct audiences an actor belongs to. It is
 small for channels and folders, and can reach 10^5 for a heavy email user when
@@ -819,167 +980,192 @@ encoding stores each item's reader groups on the item and filters by overlap
 with the actor's membership closure, as Elasticsearch and Azure AI Search trim
 results. That changes the physical encoding only; this RFC does not implement it.
 
-### The visibility door in the plan
+### Identity bindings in validation
 
-The view enters the plan in three places.
+Identity-binding rules are checked in the shared attempt validation of mutation,
+load and merge ([Writes](#writes)), against the committed state and the staged
+rows:
 
-**Schema view.** The query typechecks against a catalog without the types,
-edge types and properties whose fixed securables are not in `R`. The catalog is
-memoized per (contract, schema-view digest), because the compiled-query cache
-matches catalogs by `Arc` identity (`crates/omnigraph/src/exec/query_doors.rs:318-341`)
-and the accepted-catalog memo holds one slot (`crates/omnigraph/src/runtime_cache.rs:288-333`).
-The engine context receives the same view catalog as the planner, since the
-output-schema checks reject a mix. Whole-node returns build their struct from
-the catalog's node-object members (`crates/omnigraph/src/engine/expr.rs:79-90`),
-so hidden properties never appear. A hidden property that is part of a key is
-still read for identity but never projected.
+- a staged change to a `@principal` value, a new securable, a changed securable
+  key, or a write to the internal group row by a non-bypass actor is refused;
+- a deleted securable is checked against every per-row placement property with
+  one `IsIn` count on its BTREE, and against every fixed `@in`;
+- uniqueness of securable keys and actor ids across types, and the internal
+  group's reserved key, are checked against the committed state; a concurrent
+  duplicate makes the publication's compare-and-swap fail.
 
-**Row predicate.** Every scan of a type with a per-row `@in` whose `R` is not
-everything gets a view conjunct per placement property, a new typed IR leaf
-`ViewSet { type_id, property_id }`, resolved at lowering from the engine
-context's view spec to an `IN` list. It is not a GQ parameter: a replayed plan
-could carry swapped parameter values, while the leaf is always resolved from
-the replaying request's own view. The conjunct is placed into the scan spec at
-plan construction, inside `Predicate::Gq`, because `Predicate::gq_filters()`
-drops every other variant (`crates/omnigraph-planner/src/logical.rs:125-140`).
+Under the integer node identity draft (carried with the polymorphic types draft)
+a per-row placement would store the securable's packed node reference instead of
+its key. Ids are never reused, so a re-created securable never inherits rows,
+and restricted creation becomes safe. That switch is [Phase 6](#rollout) and
+needs four things: placement properties join merge's remapping of coalesced ids
+and its correspondence table; securable types are excluded from natural-key
+coalescing; a reference to a deleted securable is unreadable rather than an
+error; and writers name a securable by key, typed when keys are not unique
+across types.
 
-**Coverage validator.** A new check runs in `engine::execute`, beside
-`validate_aggregate_specs` and `validate_output_schemas`, so every door including
-replay passes it (`crates/omnigraph/src/engine/mod.rs:409-418`). It refuses a
-plan that:
+### Plan acceptance
 
-- scans a restricted placed type without its view conjuncts;
-- uses `MetadataCount` on a restricted type (its lowering ignores the scan filter,
-  `crates/omnigraph/src/engine/lower.rs:473-487`);
-- uses the CSR, the `count`/`not` degree shortcut
-  (`crates/omnigraph/src/engine/lower.rs:230-277`) or the CSR-derived search gates on
-  a restricted type;
-- expands into a restricted type, or over a placed edge type, without a mask.
+RFC 0047's plan acceptance (`crates/omnigraph-planner/src/validate/`) is the one
+door from a plan to execution: `accept` and `check` for a fresh plan,
+`accept_replay` for a saved one. The view enters there, not in a second check:
 
-The bound plan's assumptions gain the view digest. Replay recomputes the view
-for the replaying actor and refuses if the digest differs, so a saved plan
-cannot be replayed by another actor or after a revocation.
+- **Input.** `AcceptInput` gains the request's view spec. Acceptance compiles
+  against the ***view catalog***, the accepted catalog without the types, edge
+  types and properties whose fixed securables are not in `R`. The engine
+  catalogue's built-in types, reached through `Catalog::query_node_type`, stay
+  in it. View catalogs are memoized per (contract, schema-view digest), because
+  the compiled-query cache matches catalogs by `Arc` identity and the
+  accepted-catalog memo holds one slot today.
+- **Requirements.** `Requirements` gain view requirements, checked in
+  `Requirements::check`:
+  - every scan of a restricted placed type carries its view conjuncts, a typed
+    IR leaf `ViewSet { type_id, property_id }`, with their own eligibility,
+    always before scoring, independent of the user's filter eligibility;
+  - no `MetadataCount`, no degree shortcut and no graph-index-derived search gate
+    reads a restricted type;
+  - every expansion into a restricted type is masked;
+  - a restricted `bm25` uses the view-statistics evaluator and a restricted
+    `nearest` the exact route ([Restricted search](#restricted-search)).
+- **Identity.** The view digest is part of the catalog identity, so
+  `catalog_digest` hashes the schema view together with the view digest. The
+  existing comparison in `accept_replay` then refuses another actor's plan, and
+  a plan whose view changed, with no new mechanism. The digest is recomputed at
+  the replay target from the replaying request's own view, as
+  `replayed_coverage_holds` recomputes coverage.
+- **Redaction.** For a restricted actor, refusals from `accept_replay`,
+  `plan_pins_snapshot` and `replayed_coverage_holds` omit schema hashes, dataset
+  paths, versions, branches and coverage states.
 
-### Scans and search
+The `ViewSet` leaf is resolved at lowering from the engine context's view spec to
+an `IN` list. It is not a GQ parameter: a replayed plan could carry swapped
+parameter values, while the leaf is always resolved from the replaying request's
+own view. The conjunct lives in `Predicate::Gq`, because
+`Predicate::gq_filters()` drops every other variant.
 
-The view conjunct lowers to `col IN (...)` through `ir_expr_to_df_expr`
-(`crates/omnigraph/src/engine/scan.rs:1093-1119`) and reaches Lance through
-`Scanner::filter_expr`, which takes a DataFusion expression without SQL parsing
-(`lance-11.0.0/src/dataset/scanner.rs:1585`). With a BTREE on the placement
-column, Lance evaluates the list as an exact `SargableQuery::IsIn` with no
-length limit, and the filtered read skips fragments without candidates
+### Scans
+
+The view conjunct lowers to `col IN (...)` through `ir_expr_to_df_expr` and
+reaches Lance through `Scanner::filter_expr`, which takes a DataFusion
+expression without SQL parsing (`lance-11.0.0/src/dataset/scanner.rs:1585`).
+With a BTREE on the placement column, Lance evaluates the list as an exact
+`SargableQuery::IsIn` with no length limit, and the filtered read skips
+fragments without candidates
 (`lance-index-11.0.0/src/scalar/expression.rs:348-352`;
-`lance-11.0.0/src/io/exec/filtered_read.rs:163-206`). The engine already sets
-`prefilter(true)` on every scan with a filter
-(`crates/omnigraph/src/engine/scan.rs:248-251`), so vector and full-text search
-rank only rows that pass the view conjunct.
+`lance-11.0.0/src/io/exec/filtered_read.rs:163-206`).
+
+The scan applies the view conjunct as a prefilter in every case. Today the scan
+sets `prefilter(!(filter_after_scoring && fts_query.is_some()))`: for `bm25` on a
+property whose full-text coverage is partial or absent, the planner chooses
+`Eligibility::AfterScoring`, and every pushed filter moves after scoring. A view
+conjunct riding on that eligibility would let hidden rows compete for result
+slots. The view conjunct therefore has its own placement, and restricted `bm25`
+never reaches that code path ([Restricted search](#restricted-search)).
 
 Today a `@index` on a `String` builds a full-text index, not a BTREE
-(`crates/omnigraph/src/db/omnigraph/table_ops.rs:582-605`). A per-row `@in`
-maps its property to a BTREE.
+(`node_prop_index_kind` in `crates/omnigraph/src/db/omnigraph/table_ops.rs`). A
+per-row `@in` maps its property to a BTREE.
 
-The engine does not use Lance's row-address prefilter for views in this RFC. On
-a plain scan the mask demotes the filter so it loses its scalar index
+The engine does not use Lance's row-address prefilter for views. On a plain scan
+the mask demotes the filter so it loses its scalar index
 (`lance-11.0.0/src/dataset/scanner.rs:3298-3306`), and the mask is in stable
-row-id space for one exact table version. A per-view mask cache is a later
-optimization behind its own surface guard ([Rollout](#rollout), Phase 7).
+row-id space for one exact table version.
 
-**Vector search.** Lance has no automatic switch to flat search for a selective
-prefilter; its late search widens up to every partition, and when the prefilter
-admits at most `k` rows the unreached ones come back at distance `+inf`
-(`lance-11.0.0/src/io/exec/knn.rs:1710-1782`). The planner instead chooses from
-the visible row count `V`, obtained by an index-answered count:
+### Restricted search
 
-- **Exact**: when `V × dimensions ≤ 8·10^6` (about 10,000 rows at 768
-  dimensions, tunable), scan the visible rows with the index bypassed. Lance
-  honors the filter on that path only with `prefilter(true)`
-  (`lance-11.0.0/src/dataset/scanner.rs:5015-5019`), which the engine sets.
-- **Indexed**: otherwise use the IVF index with probes set up front to about
-  `k · partitions / (s · N) × 2`, where `s` is the visible fraction.
-- **Fallback**: if that probe count exceeds half the partitions, use exact.
+Restricted search on a placed type is exact and scored only from the view
+([D10](#d10-restricted-search-is-exact-and-scored-from-the-view)).
 
-The existing overfetch and exact-pass loop
-(`crates/omnigraph/src/engine/mod.rs:473-555`) remains the safety net. Whole-table
-counts such as `nearest_dataset_rows` (`crates/omnigraph/src/engine/scan.rs:338-346`)
-never leave the engine for a restricted actor.
+**`bm25`.** The engine builds the plan itself:
 
-### Full-text statistics
+1. A filtered read of exactly the visible rows: the view conjuncts, prefiltered,
+   and nothing else.
+2. Lance's `FlatMatchQueryExec::new` over that input
+   (`lance-11.0.0/src/io/exec/fts.rs:2949`), with
+   `with_base_scorer(MemBM25Scorer::new(0, 0, {}))`
+   (`lance-11.0.0/src/io/exec/fts.rs:3058`).
+3. The user's eligibility (filters, gate set) after scoring, then the top `k`.
 
-Lance's BM25 scorer takes its corpus statistics from the whole index, including
-rows the prefilter removed and deleted rows
-(`lance-index-11.0.0/src/scalar/inverted/index/search.rs:53-63`;
-`lance-index-11.0.0/src/scalar/inverted/scorer.rs:197`). With stable row ids,
-compaction does not remap the index, so deleted postings stay until the index is
-optimized or rebuilt (`lance-11.0.0/src/dataset/optimize.rs:2580`). A restricted
-actor's scores therefore encode term frequencies of hidden documents. Hiding the
-score is not enough: the STRESS attack recovered document frequencies from rank
-order alone. Its precondition, write access to the same index for calibration,
-is common in a company brain.
+Lance's flat path adds every counted input row to the supplied scorer
+(`initialize_scorer`, `lance-index-11.0.0/src/scalar/inverted/index/flat_search.rs:539-588`).
+With a zero base the statistics are exactly the visible rows': document count,
+document frequencies and total length over the rows the operator counts, all of
+them visible. Every visible row is scored from its text and no postings are
+read, so neither hidden rows, nor index coverage, nor stale index entries left
+by updates (the overlay-stale rows Lance's indexed path blocks) can change a
+restricted score. The tokenizer comes from the column's full-text segment, which
+every committed version holds for a declared column (the full-text analyzer
+fence in `docs/dev/lance.md`).
 
-Restricted actors' full-text search on a placed type uses view-independent
-statistics. Lance accepts external statistics below the scanner:
-`MatchQueryExec`, `PhraseQueryExec`, `CompoundQueryExec` and
-`FlatMatchQueryExec` take a `MemBM25Scorer` through `with_base_scorer`
-(`lance-11.0.0/src/io/exec/fts.rs:624, 2175, 3058, 3485`). The engine builds
-that plan itself for restricted actors. Two sources are candidates:
+This is the statistics population of the analyzed lexical search draft
+(ModernRelay/omnigraph#792), "policy-visible entities", with policy-visible
+defined as the actor's view. Once that draft's exact evaluator lands, restricted
+`bm25` uses it with the same population.
 
-- ***Public statistics***: corpus statistics over rows placed in securables
-  granted to the organization group, built by explicit index reconciliation and
-  stored as derived state keyed by index identity and that group's grants.
-- ***Uniform statistics***: a fixed document count, average length and document
-  frequency. They leak nothing and rank by term frequency and length only.
+A restricted `bm25` across several member types of an abstract binding needs one
+scorer over the union of the visible members' rows. Lance 11's flat operator
+counts only its own input, and its shared-scorer hook (`with_shared_scorer`) is
+`pub(crate)`, so it stays refused for restricted actors on placed members until
+each arm can receive the other arms' view statistics as its base scorer
+([Polymorphic types](#polymorphic-types)).
 
-Public statistics are the proposal and uniform statistics the fail-closed
-fallback when the artifact is missing or stale. The choice is gated on ranking
-measurements (`blocked_on`). The flat path adds its own filtered input rows to a
-supplied scorer (`lance-index-11.0.0/src/scalar/inverted/flat_search.rs:548-559`);
-because the engine filters by expression, those rows are visible rows, which
-adds no leak. For OR queries, Lance's WAND switches to a flat search when the
-allow-list is at most 10% of the index
-(`lance-index-11.0.0/src/scalar/inverted/wand.rs:201-206`), so small views are
-cheap. Bypass actors keep index-wide statistics.
+The cost is one pass over the visible rows' text per query; the counted batch is
+charged to the query's work memory. `max_exact_search_rows` bounds it.
+
+**`nearest`.** Restricted `nearest` on a placed type uses the exact route of the
+search contracts draft (ModernRelay/omnigraph#793, RFC 0048): `use_index(false)`
+with the view conjunct prefiltered, ties broken by id. An IVF index chooses
+partitions from the query alone (`find_partitions`,
+`lance-11.0.0/src/index/vector/ivf/v2.rs:1459-1469`) and its late search stops
+once it has `k` results (`lance-11.0.0/src/io/exec/knn.rs:1725-1728`), so hidden
+vectors can change which visible neighbours an approximate search finds. The cost
+is `V × dimensions`, bounded by `max_exact_search_rows`.
+
+**`rrf`** fuses the ranks of restricted arms and inherits both properties.
+
+**No public or uniform statistics.** An earlier draft scored restricted `bm25`
+from statistics over rows granted company-wide, or from fixed constants. The
+first leaked: those rows include rows recipients may not read and embargoed rows
+before their release. The second gives different ranks from the materialized
+oracle, and Lance's flat path adds a table's unindexed rows to any supplied
+constants, so scores would still depend on index coverage.
+
+Bypass actors and reads that no view restricts keep today's search.
 
 ### Traversal
 
 Traversal reads edge tables by key and never reads intermediate node tables
-(`crates/omnigraph/src/engine/graph.rs:1132-1472`). Edge reads carry no filter
-(`crates/omnigraph/src/engine/graph.rs:1647-1662`). Under a view each hop is
-masked:
+(`execute_expand_bfs` in `crates/omnigraph/src/engine/graph.rs`). Edge reads carry
+no filter. Under a view each hop is masked:
 
 - **Indexed mode**: after each hop, the frontier's ids of a restricted placed
   type are intersected with the view by one indexed read of that node table
-  (`__id IN frontier AND placement IN R`). The final destination scan already
-  carries the view conjunct through `hydrate_nodes`, which refuses unsupported
-  predicates (`crates/omnigraph/src/engine/operators/scan/input.rs:270-284`).
-  An edge type with its own placement adds its view conjunct to the edge read.
-- **CSR mode**: refused for restricted placed types until a per-view mask
-  exists. The CSR assigns dense ordinals per node type from edge endpoints only,
-  per index instance, and is cached by edge-table versions with no actor
-  (`crates/omnigraph/src/graph_index/mod.rs:168-245`;
-  `crates/omnigraph/src/runtime_cache.rs:24-57`).
+  (`__id IN frontier AND placement IN R`). The final destination scan carries the
+  view conjunct through `hydrate_nodes`, which refuses unsupported predicates.
+- **Graph-index (CSR) mode**: refused for restricted placed types until a per-view
+  mask exists ([Phase 8](#rollout)). The graph index assigns dense ordinals per
+  node type from edge endpoints only, per index instance, and is cached by
+  edge-table versions with no actor (`GraphIndex` and `TypeIndex` in
+  `crates/omnigraph/src/graph_index/mod.rs`).
 
-Wildcard traversal expands only over edge types whose declared endpoints match
-(`crates/omnigraph-compiler/src/query/typecheck.rs:1981-1989`), so the schema
-view prunes hidden edge types. Query bindings are concrete node types today
-(`crates/omnigraph-compiler/src/query/typecheck.rs:1785-1790`);
-[Polymorphic types](#polymorphic-types) covers abstract bindings.
-
-`Omnigraph::graph_index()` returns the whole topology
-(`crates/omnigraph/src/db/omnigraph.rs:2681`) and becomes crate-private.
+Wildcard traversal expands only over edge types whose declared endpoints match,
+so the view catalog prunes hidden edge types. Query bindings are concrete node
+types today; [Polymorphic types](#polymorphic-types) covers abstract bindings.
+`Omnigraph::graph_index()` returns the whole topology and becomes crate-private.
 
 ### Writes
 
 The write check runs in end-of-attempt validation, where the engine has the
 staged after rows, the deleted ids (cascades and overwrite removals included),
-and a committed state pinned to the transaction base with a batched lookup by
-id (`crates/omnigraph/src/validate.rs:391-433`). The validation points are
-`validate_staged_mutation` (`crates/omnigraph/src/exec/mutation.rs:886-904`),
-`validate_changeset` (`crates/omnigraph/src/loader/mod.rs:958-959`) and merge
-evaluation (`crates/omnigraph/src/exec/merge.rs:3433-3436`). `commit_all`
-revalidates the whole transaction under the schema, branch and table locks
-before any effect (`crates/omnigraph/src/exec/staging.rs:920-984`), so the
-checked state is exactly the state publication replaces. Effects staged before a
-refusal are detached and unreachable.
+and a committed state pinned to the transaction base with a batched lookup by id
+(`CommittedState` in `crates/omnigraph/src/validate.rs`). The validation points
+are `validate_staged_mutation` in `crates/omnigraph/src/exec/mutation.rs`, the
+loader's `validate_changeset_with_access`, and merge evaluation over
+`CommittedState::merge`. `commit_all` in `crates/omnigraph/src/exec/staging.rs`
+revalidates the whole transaction before any effect, and the publication's
+compare-and-swap expects the access pins captured by the attempt
+([Capturing a view](#capturing-a-view)). Effects staged before a refusal are
+detached and unreachable.
 
 The committed state gains a lookup of committed placement values by id, which
 supplies the before image for upserts, deletes and overwrite removals. Lance's
@@ -987,69 +1173,102 @@ merge-insert cannot express "update if writable, else fail" atomically:
 `WhenMatched::UpdateIf` turns a false condition into a no-op
 (`lance-11.0.0/src/dataset/write/merge_insert.rs:425-449`;
 `lance-11.0.0/src/dataset/write/merge_insert/assign_action.rs:107-139`). The check
-therefore belongs to OmniGraph's validation, not to Lance.
-
-Computed placement is evaluated in the same validation: the engine computes the
-placement value from the staged row's own columns, refuses a writer-supplied
-value that differs, and checks `editor` on the result as for any placement.
+therefore belongs to OmniGraph's validation, not to Lance. An interface-wide
+mutation under the polymorphic types draft is checked at the same points, so a
+refusal leaves every staged arm detached and the mutation is never partly
+applied.
 
 Today an upsert reports `affected_nodes: 1` whether it inserted or updated, and
-delete counts include rows matched by id regardless of visibility
-(`crates/omnigraph/src/exec/mutation.rs:1645-1661, 1717-1741`). Under a view the
-statement's match runs over the view, so counts are view counts.
+delete counts include rows matched by id regardless of visibility. Under a view
+the statement's match runs over the view, so counts are view counts.
 
 Errors carry their foreign facts (another row's id, a count, an ETag, another
 type's version) as structured fields, and the server strips them for a
-restricted actor. Today they are formatted into messages
-(`crates/omnigraph/src/validate.rs:1259, 1295-1296`) and returned verbatim
-(`crates/omnigraph-server/src/lib.rs:1357`).
+restricted actor. Today they are formatted into messages, for example the
+`@unique` and `@card` messages in `crates/omnigraph/src/validate/kernels.rs`, and
+returned verbatim.
 
-The same validation enforces the access-edge rules: owner roles, `main` only, an
-owner grant with every new securable, and global uniqueness of securable keys
-and actor ids. Cross-table uniqueness rests on read-set validation and the exact
-graph-head precondition, not a fence; a concurrent duplicate fails publication.
+The same validation enforces the access-edge rules (owner roles, `main` only)
+and the identity-binding lifecycle.
 
-### History
+An unpublished commit (`as commit`) is checked when it is written, for its
+author. Publishing it (`commit publish`) runs the write check again over the
+commit's changes, for the publishing actor and against the authorization state
+the publication captures. On `main` publication already requires the head to
+equal the proposal's captured parent (`ExactGraphHead`), so an access change
+published in between expires the proposal rather than slipping past it. A
+merge with `--as-commit` is a merge and follows the merge rule.
 
-A read of a snapshot target captures authorization from `main` and data from the
-snapshot, as above. Historical queries already use the live contract with tables
-rebound by stable identity (`crates/omnigraph-catalog/src/lib.rs:608-656`), so
+### History and branches
+
+A read of a snapshot target captures data and then authorization from `main`, as
+above. Historical queries use the live contract with tables rebound by stable
+identity (`bind_catalog_aliases` in `crates/omnigraph-catalog/src/lib.rs`), so
 annotations bound to stable identity apply to history without new mechanism.
-The first releases refuse historical reads of restricted placed types. A later
-phase admits a historical row only when its placement is readable both at the
-snapshot and, if the row still exists, at `main`'s head, so a row moved from a
-public to a private channel stays hidden in old snapshots.
+Property binding on historical reads is by name today (`check_stored_fields` in
+`crates/omnigraph/src/engine/typed_value.rs`), unlike Blob reads, which compare
+stable property ids. A column with a fixed `@in`, dropped and re-added under the
+same name, must not expose its old values; historical reads must bind
+properties by stable identity before column views serve history.
 
-Property binding on historical reads is by name today
-(`crates/omnigraph/src/engine/typed_value.rs:383-420`), unlike Blob reads, which
-compare stable property ids (`crates/omnigraph/src/blob.rs:1541-1550`). A column
-with a fixed `@in`, dropped and re-added under the same name, must not expose its
-old values; historical reads must bind properties by stable identity before
-column views serve history.
+The first scope refuses historical reads, branch creation at a past commit,
+promotion and restore of restricted placed types
+([History, branches and feeds](#history-branches-and-feeds)). [Phase 9](#rollout)
+admits a historical or branch row only when its placement is readable both at
+the target and, if the row exists at `main`'s head, there too, so a row moved
+from a public to a private channel stays hidden in old snapshots and on old
+branches.
 
-### Change feed and export
+### Change feed, diffs and export
 
-A view-filtered change feed filters where rows are emitted
-(`crates/omnigraph/src/changes/enumerate.rs:132, 179`). Three requirements: the
-view digest joins the cursor and page-token digest
-(`crates/omnigraph/src/changes/token.rs:283`); an update across a visibility
-boundary is emitted as an insert or a delete; equality across vintages compares
-projected rows, so a change to a hidden column emits nothing.
+[Phase 9](#rollout) filters where rows are emitted
+(`next_emit` and `emitted_image` in `crates/omnigraph/src/changes/enumerate.rs`).
+Three requirements: the view digest joins every cursor, page token and diff
+token digest (`crates/omnigraph/src/changes/token.rs`); an update across a
+visibility boundary is emitted as an insert or a delete; equality across
+vintages compares projected rows, so a change to a hidden column emits nothing.
+Graph diff and branch diff follow the same rules.
 
 ### Server surfaces
 
-Every route in [Surfaces](#surfaces) passes the actor to an engine door that
-applies the view, or refuses with `view_restricted`. MCP tools call the same
-handlers (`crates/omnigraph-server/src/mcp.rs:272-310`). Explain redaction strips
-statistics and assumptions (`crates/omnigraph/src/engine/explain.rs:236, 272`),
-per-node row estimates (`crates/omnigraph-planner/src/physical.rs:363-370`) and
-index facts (`crates/omnigraph-planner/src/gate.rs:58-71`).
+Every operation in [Surfaces](#surfaces) passes the actor to an engine door that
+applies the view, or refuses with `view_restricted`.
 
-A graph with `actor-views` declarations requires an applied version-2 policy.
-The server refuses to serve it in unauthenticated mode, which today allows every
-graph action (`crates/omnigraph-server/src/handlers.rs:651-668`), and with
-static tokens and no policy, which today allows every read
-(`crates/omnigraph-server/src/handlers.rs:661`).
+- **MCP.** `/mcp` is mounted whenever the server has a credential source (static
+  tokens, signed data tokens or OIDC). Every tool calls its HTTP route's handler
+  with the request's actor (RFC 0003, One handler), so tools need no separate
+  enforcement. Resources serve the schema view; the schema resource regenerates
+  `.pg` text instead of serving the stored source. OIDC tokens are bound to their
+  audience and organization, signed data tokens to the cluster; no tool forwards
+  a credential.
+- **Errors.** Every new refusal is a code in the graph access draft's shared
+  error registry, with its HTTP status and outcome:
+
+  | Code | HTTP | Outcome |
+  |---|---|---|
+  | `view_restricted` | 403 | not started, no effects |
+  | `view_write_denied` | 403 | not started, no effects |
+  | `placement_required` | 400 | not started, no effects |
+  | `delete_blocked` | 409 | not started, no effects |
+  | `identity_binding_denied` | 403 | not started, no effects |
+  | `securable_in_use` | 409 | not started, no effects |
+  | `view_limit_exceeded` | 422 | not started, no effects |
+
+  `key_conflict` becomes a code too, and a restricted actor's response omits its
+  entity id. Stripping foreign facts never changes the code or the outcome
+  object, and a hidden name produces the same error, outcome included, as an
+  undeclared one.
+- **Settling uncertain writes.** Today a client settles an unknown outcome by
+  comparing the branch head and listing commits, then replays with
+  `if-graph-commit`. Branch heads stay visible under a view, but commit listings
+  are refused in the first scope. A restricted writer therefore settles with the
+  `outcome.check` of the graph access draft (branch, head before the write,
+  attempt id): the server answers whether that attempt published and returns
+  that actor's own commit receipt, never the commit's other effects, and a
+  conditional replay works as today.
+- **Serving modes** follow [Direct and served access](#direct-and-served-access):
+  `serve --listen` refuses an `actor-views` graph without a version-2 cluster
+  policy, and cluster apply reports the refusal before activation.
 
 ### Polymorphic types
 
@@ -1060,36 +1279,31 @@ and lets an edge endpoint be an interface or a union. It builds on the integer
 node identity draft stacked with it (`2026-10-12-integer-node-identity.md`),
 under which every edge endpoint is a ***packed node reference***: the endpoint
 type's `StableTypeId` in the high 16 bits and the node's `__id` in the low 48.
-That RFC defers per-type visibility to this one; its Policy section adopts the
-rules below. The two designs compose as follows.
+That RFC adopts this one's rules for per-type visibility. The two designs compose
+as follows.
 
-**Member sets come from the schema view.** An abstract binding resolves its
+**Member sets come from the view catalog.** An abstract binding resolves its
 member set against the actor's view catalog, so a member type placed in a
 securable the actor cannot read is absent, exactly as in `materialize(V(a))`.
 Visibility is decided per concrete type; `implements` neither grants nor removes
 it. `$x is T`, `@type` and `@type_id` comparisons naming a hidden type fail with
-the unknown-name error. Result schemas still never depend on the member set.
+the unknown-name error, and a type id bound to a hidden member is refused like an
+absent id. Result schemas still never depend on the member set. `view.restricted`
+replaces that RFC's withdrawn `policy_denied_member` refusal and
+`policy_filtered` marker.
 
-This replaces that RFC's `policy_denied_member` refusal and its
-`policy_filtered` marker with `view.restricted`. Refusing a query because an
-interface includes a hidden member leaks the member's existence, and the
-refusal's only escape, a type test that removes the member, requires the caller
-to name a type it is not allowed to know. A stored query shared by actors with
-different views could never be written that way.
+**Placement on interfaces.** A fixed `@in("key")` on an interface property
+applies to every implementor that inherits it. That RFC refuses a redeclaration
+that drops it and a member that adds a fixed `@in` to an inherited property, so
+the property's visibility is the same for every member. Type-level `@in` belongs
+to concrete types and is not inherited through `implements`.
 
-**Placement on interfaces.** Under that RFC, property annotations on an
-interface property apply to every implementor that inherits it. A fixed
-`@in("key")` on an interface property follows that rule with two additions: a
-member that redeclares the property may not drop it (a refusal, not that RFC's
-lint warning, because dropping it would expose the column), and a member may not
-add a fixed `@in` to an inherited property, so the property's visibility is the
-same for every member. Type-level `@in` belongs to concrete types and is not
-inherited through `implements`.
-
-**Removing a placement** from any concrete type, edge type or property, by any
-route, is refused unless the applying actor is in `bypass`. The routes are
-deleting the annotation, removing an interface property, removing `implements`,
-and narrowing an endpoint so a member stops inheriting a placed property.
+**Removing a placement** from any concrete type or property, by any route, is
+refused unless the applying actor is bypass. The routes are deleting the
+annotation, dropping the placement property (which the constraint-dropping rule
+of ModernRelay/omnigraph#1062 would otherwise do silently), removing an
+interface property, removing `implements`, and narrowing an endpoint so a member
+stops inheriting a placed property.
 
 **Access edges.** With polymorphic endpoints one edge type covers every kind of
 subject and securable:
@@ -1104,47 +1318,79 @@ edge Access: Person | Team -> Team | Channel | Folder | Class @grant {
 ```
 
 The membership closure is then one bounded multi-hop traversal, which that
-RFC's set-based multi-hop rule admits.
-
-**Placement values under integer identity.** A placement stores a securable's
-key, so securable keys share one namespace across securable types. Under
-integer node identity a placement could instead store the securable's packed
-reference, resolved from the key the writer supplies, as an edge endpoint is.
-The type half would identify the securable type, removing the shared key
-namespace, and the view conjunct would become an `IN` over integers. Whether to
-switch is open ([Unresolved questions](#unresolved-questions)).
+RFC's set-based multi-hop rule admits, and the readable set comes straight from
+the grant edges' packed destinations.
 
 **Union scans and polymorphic expansion.** Every arm of a union scan whose member
-is a restricted placed type carries its own view conjunct, placed during that
-RFC's per-arm resolution. The coverage validator inspects arms. A `count` over
-an abstract binding may sum per-member metadata counts only for members the
-actor's view does not restrict. A polymorphic expansion groups each hop's
-frontier by the type half of its packed references, as that RFC's interner
-already keys by packed reference, and masks each restricted member type.
+is a restricted placed type carries its own view conjunct, required at plan
+acceptance. A `count` over an abstract binding may sum per-member metadata counts
+only for members the actor's view does not restrict. A polymorphic expansion
+groups each hop's frontier by the type half of its packed references and masks
+each restricted member type.
+
+**Search across members.** That RFC admits `bm25` across members only under one
+corpus contract, with the statistics source this RFC selects, through one engine
+module shared by both RFCs, and refuses it until an upstream Lance scanner
+option ships. This revision changes the source it names for restricted actors
+from public or uniform statistics to view statistics
+([D10](#d10-restricted-search-is-exact-and-scored-from-the-view)). For a
+restricted actor the corpus is the visible rows of the visible members. A single
+member needs no upstream change: the flat operator reads no postings, so the
+overlay-stale rows that make that RFC reject engine-built plans do not arise.
+Several members need each arm's base scorer to be the other arms' view
+statistics; that RFC's proposed upstream call for a dataset's corpus statistics
+provides them if it accepts a filtered input. Until then multi-member `bm25`
+stays refused for restricted actors, as it is for everyone under that RFC today.
 
 **Graph index.** That RFC's phase 3 moves the graph index to one global ordinal
-space. Per-view masks ([Rollout](#rollout), Phase 7) target that space: one
-bitmap per view and index instance.
+space. Per-view masks ([Phase 8](#rollout)) target that space: one bitmap per
+view and index instance.
 
-**Search.** That RFC refuses `bm25` on a multi-member binding because each
-table's statistics differ. Uniform statistics are identical across tables, so
-for restricted actors that reason disappears. This RFC does not admit
-multi-member `bm25`; a later change may.
+**Write enforcement point.** An interface-wide mutation is checked in attempt
+validation and again in the commit revalidation, as every write is
+([Writes](#writes)); a check before staging could not see staged placement
+values. That RFC's Policy text should name the same point.
 
-**Catalog route, schema hash, descriptors and feeds.** The structured catalog
-route that RFC adds serves the schema view. Reads by a restricted actor carry
-the digest of the schema view where they would carry `schema_ir_hash`, so
-clients cache type names per view and a change to a hidden type is not
-observable. Operation descriptors list visible members. In Phase 8, interface
-filters on the change feed expand over the view, and a
-`ChangeScopeMembershipChanged` refusal names only visible members.
+**Catalog route, schema hash, descriptors and feeds.** The structured type
+catalog route that RFC adds serves the view catalog. Reads by a restricted actor
+carry the schema view's digest where they would carry `schema_ir_hash`.
+Operation descriptors list visible members. In Phase 9, interface filters on the
+change feed expand over the view, and a `ChangeScopeMembershipChanged` refusal
+names only visible members.
 
 **History.** Both RFCs refuse abstract bindings on historical targets for now.
 
-**Order of implementation.** Whichever lands second carries the integration: if
-union scans land first, Phase 2 extends the coverage validator to arms and
-expansions; if views land first, that RFC's union scan adds the per-arm view
-conjunct when it resolves arms.
+**Order of implementation.** Whichever lands second carries the integration.
+
+### Other open work
+
+- **Schema apply with live branches** (ModernRelay/omnigraph#963) keeps schema
+  apply on `main` and lets it run while branches exist. Adding a placement adds
+  an annotation and a BTREE, and that draft classifies a non-full-text index as
+  changing no table. Placement
+  annotations are access facts read from `main` for every target
+  ([Authority](#authority)), so such an apply needs no refusal and takes effect on
+  every branch at once.
+- **Schema namespaces** (ModernRelay/omnigraph#1015): an ambiguous unqualified
+  name's candidate list, and the unknown-namespace error, are computed on the view
+  catalog, so neither reveals a hidden type or namespace. Namespace-pattern policy
+  rules would contradict [D8](#d8-access-rules-are-facts-not-queries): access is
+  never granted by rules naming types.
+- **Graph access** (ModernRelay/omnigraph#1017): direct and served access, the
+  `access` route, the shared error registry and cross-process writes, as used
+  above.
+- **Branch at a graph commit** (ModernRelay/omnigraph#1016) and **branch
+  operations v2** (ModernRelay/omnigraph#677): creating a branch at a past commit,
+  promotion and restore are history operations under the first scope's refusal;
+  restore and promotion never bring back access edges on `main` except by a bypass
+  actor.
+- **Request-aware plan cost** (ModernRelay/omnigraph#996): its fragment
+  statistics and cost inputs join explain redaction, and the planner's choice
+  between graph-index and indexed traversal for a restricted type is already
+  forced by the view requirements.
+- **One language for every graph operation** (RFC 0056,
+  ModernRelay/omnigraph#670): control reads authorized as their route are
+  filtered as their route is.
 
 ### Shares
 
@@ -1154,28 +1400,49 @@ A ***share reconciler*** maintains a copy. It reads the source's view-filtered
 change feed as the recipient, applies inserts and updates with
 `load --mode merge` and deletions with a mutation, and records the source cursor
 in a row of the target graph in the same publication as the data, so a restart
-resumes exactly. Because a mutation cannot mix constructive and destructive
-changes (`crates/omnigraph/src/exec/mutation.rs:666-683`) and load has no delete
-mode, one source commit becomes a branch on the target, written in two steps and
-merged once. A `409 schema_boundary` or `410 change_feed_gap` triggers a new
-baseline. The reconciler is an idempotent function of the source's accepted
-state, not a queue. Before each sync it re-checks the share's terms and stops
-when the share is revoked or the terms lapse, as the Eclipse Dataspace
-Components policy monitor does.
+resumes exactly. A mutation cannot mix constructive and destructive changes
+(`enforce_no_mixed_destructive_constructive` in
+`crates/omnigraph/src/exec/mutation.rs`) and load has no delete mode, so one
+source commit becomes a branch on the target, written in two steps and merged
+once; a restart that finds the branch already present resumes it. A
+`409 schema_boundary` or `410 change_feed_gap` triggers a new baseline. The
+reconciler is an idempotent function of the source's accepted state, not a queue.
+Before each sync it re-checks the share's terms and stops when the share is
+revoked or the terms lapse, as the Eclipse Dataspace Components policy monitor
+does.
 
 Hosted copies live in a graph of the same cluster. Delivered copies need a
 cluster the recipient controls, because graphs in one cluster share storage and
 credentials.
 
+### Incremental maintenance
+
+Access tables change whenever a connector syncs. Keyed only by access version, a
+single membership change anywhere invalidates every actor's view. In the first
+scope connectors publish access changes in batches, and views are rebuilt per
+access version. [Phase 5](#rollout) makes maintenance incremental, following
+Zanzibar's Leopard index:
+
+- A ***shared closure*** per access version holds the group-to-group membership
+  closure and each securable's inputs, and moves to the next version by applying
+  the changed access rows between the two pins, read through the change feed of
+  the access tables. When that history is gone it is rebuilt from scratch.
+- A cached per-actor view is carried forward unchanged when no changed row
+  touches the actor's membership closure or a securable it depends on, and is
+  otherwise rebuilt from the shared closure.
+
+Derived state that lags is never used: a stale closure or view is rebuilt before
+it serves a request.
+
 ### Lance surfaces relied on
 
 | Surface | Use | Guard |
 |---|---|---|
-| `Scanner::filter_expr` with `prefilter(true)` | View conjunct on every scan, vector and full-text search | New guard: a `String` BTREE `IsIn` is exact and prefilters KNN and WAND |
+| `Scanner::filter_expr` with `prefilter(true)` | View conjunct on every scan and on exact `nearest` | New guard: a `String` BTREE `IsIn` is exact and prefilters KNN |
 | BTREE `SargableQuery::IsIn` | `placement IN R` | Same guard; list sizes 1 to 10^5 |
-| `MatchQueryExec::with_base_scorer` and siblings | View-independent BM25 statistics | New guard: supplied statistics change scores; masked rows never enter the heap |
-| KNN late search and `+inf` placeholders | Exact-pass safety net | Existing KNN fence in `lance_surface_guards.rs` |
-| `count_rows` through `CountPushdown` | Visible count `V` for vector planning | New guard: an exact BTREE count equals a filtered scan count |
+| `FlatMatchQueryExec::new` with `with_base_scorer` of a zero `MemBM25Scorer` | Restricted `bm25` over the visible rows | New guard: identical scores before and after optimize and after an index rebuild, and identical scores for two graphs that differ only in hidden rows |
+| `use_index(false)` with `prefilter(true)` | Exact restricted `nearest` | New guard: identical results for two graphs that differ only in hidden vectors |
+| `count_rows` through `CountPushdown` | Visible count for the search budget | New guard: an exact BTREE count equals a filtered scan count |
 
 ## Decisions
 
@@ -1201,8 +1468,8 @@ enum can grow (a `commenter` role, say) without changing the set operations.
 ### D2. Where access facts live
 
 In the graph, on `main`. Sensitivity classes are securable rows like any other,
-not a list in policy. One mechanism governs rows, columns, types and edges, and
-one kind of group governs data. The trade-off is that the owner of a fixed
+not a list in policy. One mechanism governs rows, columns and types, and one
+kind of group governs data. The trade-off is that the owner of a fixed
 securable can expose a column by granting it, where a policy list would have
 needed a reviewed change. Every grant is an audited commit, owners are already
 trusted with their securable's rows, and removing a placement from the schema
@@ -1210,45 +1477,46 @@ still needs a bypass actor.
 
 ### D3. Placement is a property
 
-Each placement is a single-valued `String` property, filtered by an indexed
-`IN`. An edge would make every read a join through the edge table, and keeping
-an edge as well as the property would be a second source of truth. The cost is
-that "messages in channels Alice owns" is a join on property equality rather than
-a traversal; a GQ form that traverses a key-valued property would close that
-gap for all modeling, not only access.
+Each placement is a single-valued property, filtered by an indexed `IN`. An edge
+would make every read a join through the edge table, and keeping an edge as well
+as the property would be a second source of truth. In the first scope the
+property holds the securable's key; under integer node identity it holds the
+securable's packed reference, which removes key squatting and reuse by
+construction ([Phase 6](#rollout)). The cost is that "messages in channels Alice
+owns" is a join rather than a traversal until GQ can traverse a reference-valued
+property.
 
 ### D4. Writes that collide with hidden rows
 
-Refuse, with contentless errors, and accept key-existence disclosure to writers
-of a keyed type. Systems either keep a separate copy per label (Accumulo,
-Oracle RDF), which breaks key identity; refuse (Stardog, Memgraph, Dgraph,
-Oracle Label Security), which discloses existence; or exempt the write
-(TigerGraph upserts), which overwrites hidden rows. Postgres documents that
-constraint checks "always bypass row security". Opaque keys on placed types make
-probing impractical; the lint enforces the guidance.
+Refuse, with contentless errors, and state the disclosures exactly
+([Constraint disclosures](#constraint-disclosures)). Systems either keep a
+separate copy per label (Accumulo, Oracle RDF), which breaks key identity;
+refuse (Stardog, Memgraph, Dgraph, Oracle Label Security), which discloses
+existence; or exempt the write (TigerGraph upserts), which overwrites hidden
+rows. Postgres documents that constraint checks "always bypass row security".
 
 ### D5. Silent filtering versus refusal
 
 Silent filtering with `view.restricted`, definer-rights stored queries for
-whole answers, and the closing of every whole-table channel, including
-full-text statistics.
+whole answers, and the closing of every whole-table channel.
 
-### D6. Historical snapshots
+### D6. Historical snapshots and branches
 
-Current rules and access edges always. Historical reads of restricted placed
-types are refused at first; the dual-placement rule follows. Snowflake applies
-current membership to time travel; Databricks applies current ABAC policies to
-history and fails closed when a policy column is missing; BigQuery refuses
-history to all but administrators on tables that ever had row policies. None
-evaluates past policy.
+Current rules, access edges and placement annotations always. Historical reads
+and history operations on restricted placed types are refused at first; the
+dual-placement rule for history and branches follows. Snowflake applies current
+membership to time travel; Databricks applies current ABAC policies to history
+and fails closed when a policy column is missing; BigQuery refuses history to all
+but administrators on tables that ever had row policies. None evaluates past
+policy.
 
 ### D7. Vaults
 
 Securables for the long tail; separate graphs where a defect would be
-unacceptable or statistics must be isolated; separate clusters where storage
-holders, key separation or delivered copies are involved. Per-graph storage
-roots, credentials and keys inside one cluster are a gap this RFC names and does
-not fill.
+unacceptable or search must not depend on rows other compartments hold; separate
+clusters where storage holders, key separation or delivered copies are involved.
+Per-graph storage roots, credentials and keys inside one cluster are a gap this
+RFC names and does not fill.
 
 ### D8. Access rules are facts, not queries
 
@@ -1266,38 +1534,67 @@ efficient and safe:
 - the row test is a total equality, so it cannot leak hidden rows through errors;
 - "who can see this row?" is a reverse traversal, not an evaluation per actor.
 
-Data-derived rules enter through computed placement, `@starts`, opt-in access
-edges, or definer-rights stored queries ([Access derived from data](#access-derived-from-data)).
+Data-derived rules enter through `@starts`, opt-in access edges, computed
+placement in a later phase, or definer-rights stored queries
+([Access derived from data](#access-derived-from-data)).
+
+### D9. Identity bindings are protected
+
+Actor ids, securable keys and the internal group decide who a request is and
+which data belongs to which audience, so they are not free text that any writer
+with `change` may set. One lifecycle, enforced in shared write validation,
+covers all three, instead of an exception per construct. The first scope
+reserves their changes to bypass actors, which are typically the connectors that
+mirror identity providers and source ACLs. Packed references later remove
+reuse by construction.
+
+### D10. Restricted search is exact and scored from the view
+
+A restricted actor's `bm25` is scored from statistics over its visible rows, and
+its `nearest` scans its visible vectors. That is the only design among those
+considered that satisfies the pair contract on Lance 11 without upstream
+changes, and it matches the analyzed lexical search draft's population and the
+search contracts draft's exact route. Public statistics leaked rows recipients
+and embargoes must not reach; uniform constants diverged from the oracle and
+still depended on index coverage; approximate vector search depends on hidden
+vectors. The cost is CPU and I/O proportional to the visible set, which the
+`blocked_on` measurements bound. Acceleration returns only with a proof under
+the same contract ([Phase 8](#rollout)).
 
 ## Invariants
 
-1. **Respect the substrate.** Views use Lance's scalar indexes, prefilter, KNN
-   and FTS execution and the public base-scorer hook. No storage primitive is
-   added. Index state stays derived.
+1. **Respect the substrate.** Views use Lance's scalar indexes, prefilter, exact
+   KNN and the public flat full-text operator with a supplied scorer. No storage
+   primitive is added. Index state stays derived.
 2. **One publication door.** Principals, groups, securables and access edges are
    graph rows published through `__manifest`. Share copies publish through load
    and mutate. No side table holds access facts.
-3. **One coherent view.** A request captures its authorization state and its
-   data snapshot once; a retry captures both again. The plan pins the view
-   digest. Authorization is never older than the data it filters.
+3. **One coherent view.** A read takes authorization no older than its data: one
+   image on `main`, data then authorization elsewhere. A write's access pins are
+   expected versions of its publication. A retry captures both again. The plan's
+   catalog identity includes the view digest.
 4. **Publish once.** Write checks run inside attempt validation and the commit
    revalidation; a refused write publishes nothing.
 5. **Crash convergence.** No new durable pre-publication effect. The share
    cursor publishes with the data it describes.
-6. **Stable identity.** Annotations bind to stable type and property identity.
+6. **Stable identity.** Annotations bind to stable type and property identity,
+   and identity bindings in data change only through one protected lifecycle.
    Historical property binding must move to stable identity before column views
    serve history.
-7. **Derived acceleration.** The shared closure, view specs, public statistics,
-   graph-index masks and row masks are derived state keyed by immutable versions.
-   Missing or stale derived state is rebuilt or refuses; it never widens a view.
-8. **Loud integrity.** Every refusal is typed. A view is never truncated
-   silently. A fixed placement naming a missing securable is refused, not hidden.
-9. **Typed semantics.** The view is a typed IR leaf resolved from the engine
-   context. Caveats and computed placements compile to typed structures. No
-   filter is built as a string.
-10. **Boundary and engine.** Actors resolve at the server. The engine enforces
-    views on reads as well as writes when a policy is installed.
-11. **Bounded.** Memberships, securables, depth, caches, maintenance work and
+7. **Derived acceleration.** View specs, the shared closure, graph-index masks and
+   any future search cache are derived state keyed by immutable versions. Missing
+   or stale derived state is rebuilt or refuses; it never widens a view. Index
+   coverage never changes a restricted search result.
+8. **Loud integrity.** Every refusal is a typed code with an outcome. A view or a
+   search is never truncated silently. A fixed placement naming a missing
+   securable is refused, not hidden.
+9. **Typed semantics.** The view is a typed IR leaf with its own eligibility,
+   required at plan acceptance. Caveats compile to the same structure. No filter
+   is built as a string.
+10. **Boundary and engine.** Actors resolve at the server. When a policy is
+    installed, the engine applies views on reads as it already enforces writes;
+    direct and local access are storage-holder access.
+11. **Bounded.** Memberships, securables, depth, exact searches, caches and
     external reads are bounded; exceeding a bound refuses.
 12. **One source of truth.** Access facts exist only in the graph; the roots of
     trust only in policy. Connectors mirror source ACLs into the graph, which is
@@ -1305,30 +1602,31 @@ edges, or definer-rights stored queries ([Access derived from data](#access-deri
 13. **Evidence.** See [Evidence and tests](#evidence-and-tests).
 
 Deny-list: incremental maintenance and the share reconciler are idempotent
-reconcilers from accepted state, not job queues. Public statistics are built by
-explicit reconciliation, not inline on content writes. No process-local lock
-fences anything new.
+reconcilers from accepted state, not job queues. No logical precondition depends
+on index coverage: restricted search is coverage-independent instead. No
+process-local lock fences anything new: writes rest on the `__manifest`
+compare-and-swap.
 
 ## Compatibility and reversibility
 
 - **Opt-in.** Graphs without the new annotations and version-1 policies behave
   as today.
 - **Schema feature.** The annotations set `actor-views` in the contract's
-  required features. Builds refuse unknown features
-  (`crates/omnigraph-compiler/src/catalog/schema_ir.rs:99-123, 1402-1406`).
-  Without that, an older build would treat the annotations as metadata
-  (`crates/omnigraph-compiler/src/schema/parser.rs:1074`) and serve the graph
-  unfiltered.
+  required features. Builds refuse unknown features (`is_known_feature` and
+  `required_features` in `crates/omnigraph-compiler/src/catalog/schema_ir.rs`).
+  Without that, an older build would treat the annotations as metadata and serve
+  the graph unfiltered.
 - **Schema apply.** Adding these annotations is a new plan step; today any
   annotation change other than `@description` and `@instruction` is refused
-  (`crates/omnigraph-compiler/src/catalog/schema_plan.rs:985-1001`). Removing a
-  placement requires a bypass actor.
+  (`crates/omnigraph-compiler/src/catalog/schema_plan.rs`). Removing a placement
+  requires a bypass actor.
 - **Policy.** Version-2 bundles are refused by older builds, which refuse
   unknown versions and fields.
 - **Wire.** The `view` response object, the new error codes and the redacted
   explain fields are additive; `openapi.json` is regenerated.
 - **Storage.** No format change beyond contract content and a BTREE on each
-  per-row placement property, which is derived.
+  per-row placement property, which is derived. Packed placement references in
+  Phase 6 depend on the integer node identity draft's format change.
 - **Reversal.** Removing the declarations returns a graph to graph-wide
   authorization. Views are derived, so nothing else needs migration.
 
@@ -1346,28 +1644,33 @@ fences anything new.
 - **One role for groups and securables.** Conflates "member of X" with "can read
   X": making a team's page readable company-wide would hand the team's grants to
   everyone.
-- **One access edge with a multi-valued relation.** Mixes chaining membership,
-  one-hop grants and subtractive denial in one enum.
-- **A public `*` subject.** Every authenticated actor, recipients included,
-  would receive company-wide grants.
+- **A public `*` subject, or the managed organization as the company-wide
+  group.** Recipients and invited outside collaborators would receive company-wide
+  grants.
 - **Denial that does not cut membership.** Denying a group would leave its
   grants flowing to its members.
 - **Sensitivity classes in policy.** A second group system beside graph
   membership, and two mechanisms for one idea.
 - **Placement as an edge.** A join on every read and, alongside a property, a
   second source of truth (D3).
-- **Typed securable references.** Before integer node identity, a typed
-  reference would need a type tag beside every placement; a shared key
-  namespace needs none. Packed references remove that cost, which is why the
-  switch is an open question rather than rejected.
+- **Free-text identity bindings with per-construct exceptions.** Lets any writer
+  take over identities, squat keys and inherit rows by key reuse (D9).
+- **Public or uniform statistics for restricted `bm25`.** Leak or diverge (D10).
+- **Approximate restricted `nearest`.** Hidden vectors change the answer (D10).
+- **The view filter riding the user's eligibility.** Moves after scoring on a
+  partly indexed table and lets hidden rows compete for results.
+- **A separate view validator in `engine::execute`.** Two acceptance doors that
+  can drift; plan acceptance is the one door.
+- **Authorization captured before data.** Lets a revocation and new content slip
+  between the two captures.
 - **An external Zanzibar service** (SpiceDB with Materialize, OpenFGA). A second
   store with its own consistency tokens and a dual-write problem; list APIs are
   bounded (OpenFGA ListObjects defaults to 1,000 results in 3 s).
 - **Per-row ACL lists** (Accumulo, LabelList). Every row carries principals;
   Lance's LabelList index looks labels up one at a time
   (`lance-index-11.0.0/src/scalar/label_list.rs:140-144`), and access changes
-  rewrite rows. A securable makes an access change one edge. Kept as the
-  physical encoding for very large per-item audiences ([Bounds](#bounds)).
+  rewrite rows. Kept as the physical encoding for very large per-item audiences
+  ([Bounds](#bounds)).
 - **One dataset per securable.** Hard isolation, but table count would follow
   securable count into the hundreds of thousands.
 - **Encryption per securable.** Breaks indexes and search; deferred to vault
@@ -1389,33 +1692,43 @@ fences anything new.
 | Annotation parsing, validation, IR, features, lint | In-source compiler tests; `schema_plan` tests |
 | Policy version 2 | `omnigraph-policy` in-source tests |
 | Access semantics | In-source engine tests over the worked example, plus generated access graphs checked against a direct set-semantics evaluator |
-| Incremental maintenance | In-source engine tests: after random sequences of access changes, incrementally maintained closures and views equal those built from scratch |
-| Engine read and write enforcement | `crates/omnigraph/tests/policy_engine_chassis.rs` |
-| Non-interference across operators | `crates/omnigraph/tests/proptest_equivalence.rs`: for generated graphs and access edges, a restricted actor's result equals a bypass result on the materialized view |
+| Plan acceptance with views | Planner `validate` tests: requirements, view eligibility, catalog identity, replay refusal redaction |
+| Engine read and write enforcement, identity bindings | `crates/omnigraph/tests/policy_engine_chassis.rs` |
+| Non-interference across operators | `crates/omnigraph/tests/integration/proptest_equivalence.rs`: pairs of generated graphs that differ only in hidden rows, edges, vectors and text give a restricted actor identical answers, and each equals a bypass answer on the materialized view |
 | Restricted vector and full-text search | `crates/omnigraph/tests/search.rs` |
 | Traversal masks | `crates/omnigraph/tests/integration/traversal_indexed.rs` |
-| Write rules, computed placement | `crates/omnigraph/tests/writes.rs` |
-| History refusal and dual placement | `crates/omnigraph/tests/integration/point_in_time.rs` |
-| View-filtered change feed | `crates/omnigraph/tests/integration/changes.rs` |
+| Write rules, constraint disclosures | `crates/omnigraph/tests/writes.rs` |
+| History and branch refusals | `crates/omnigraph/tests/integration/point_in_time.rs` |
 | Replay refusal on view change | `crates/omnigraph/tests/integration/engine_v2_plan_replay.rs` |
-| Lance facts in the table above | `crates/omnigraph/tests/lance_surface_guards.rs` |
-| HTTP surfaces and redaction | `crates/omnigraph-server/tests` `auth_policy` suite; OpenAPI |
+| Lance facts in the table above | `crates/omnigraph/tests/lance_surface_guards.rs`, beside `fts_prefilter_changes_unindexed_scores_and_postfilter_keeps_them` |
+| HTTP, MCP tools and resources, redaction | `crates/omnigraph-server/tests` `auth_policy` and `mcp` suites; OpenAPI |
 | Embedded and remote parity | `crates/omnigraph-cli/tests` parity matrix |
-| Access writes concurrent with reads | `omnigraph-dst` scenario |
+| Capture order and access writes concurrent with reads | `omnigraph-dst` scenario |
 
 GQT gains an actor section so view semantics become logic tests; until then the
 Rust owners above carry them.
 
-Prior-art lessons shape the generated cases:
+Cases the generators and fixtures must include:
 
-- OpenFGA shipped authorization bypasses in models combining exclusion and
-  intersection (CVE-2024-31452) and, with a public wildcard, in ListUsers
-  (CVE-2026-61709). The generators favor graphs combining the organization
-  group, `@requires`, `@inherits` and `@deny`, including denial of groups that
-  carry grants.
-- SpiceDB evaluates expiry in its datastore to avoid clock skew. Tests cross
-  `@starts` and `@expires` boundaries inside a cached view's lifetime.
-- Recipients must never read data granted to the organization group.
+- **Identity:** a restricted writer moving its actor id onto a privileged
+  principal; squatting a securable key before a connector mirrors it; deleting
+  and re-creating a securable key that placements name; an explicit `@member`
+  edge into the internal group; a `@deny` onto it.
+- **Capture order:** a DST schedule that commits a revocation and new content
+  between the two captures of a branch read, and a write racing an access change
+  in another process.
+- **Search:** paired graphs that differ only in hidden rows for `bm25`, `nearest`
+  and `rrf`; the same graph before and after optimize and after a full-text
+  rebuild, giving identical restricted scores.
+- **Set semantics:** graphs combining the internal group, `@requires`,
+  `@inherits` and `@deny`, including denial of groups that carry grants. OpenFGA
+  shipped authorization bypasses in exactly these combinations
+  (CVE-2024-31452, CVE-2026-61709).
+- **Windows:** `@starts` and `@expires` boundaries crossed inside a cached view's
+  lifetime.
+- **Constraints:** paired visible and hidden rows for each row of the disclosure
+  table, asserting that nothing beyond the stated fact differs.
+- **Caveats:** an inheritor whose `@requires` target lies outside the caveat.
 
 ### Acceptance thresholds
 
@@ -1425,96 +1738,92 @@ Prior-art lessons shape the generated cases:
   `main` and one version probe on another branch.
 - A restricted scan of a placed type with a covered BTREE adds at most the index
   reads of one `IsIn` evaluation per placement property.
-- Restricted vector search: recall@10 ≥ 0.95 against view ground truth at
-  visible fractions 100%, 10%, 1%, 0.1% and 0.01%, and with views negatively
-  correlated with the query; latency within 2× of a bypass actor's at ≥ 10%, and within
-  the exact-scan cost at ≤ 1%.
-- Restricted full-text search: nDCG@10 with the chosen statistics source within
-  10% of index-wide statistics on the fixture.
-- An access change is one edge write and governs the next request; the
-  maintenance work it causes is proportional to the changed rows and the actors
-  they affect.
+- Restricted search returns identical results for paired graphs, and identical
+  scores across optimize and index rebuilds; its latency at
+  `max_exact_search_rows` is recorded by the `blocked_on` measurement.
+- An access change is one edge write and governs the next request.
 
 ### Upstream surfaces surveyed
 
 Lance 11.0.0: `dataset/scanner.rs`, `io/exec/knn.rs`, `io/exec/fts.rs`,
 `io/exec/filtered_read.rs`, `io/exec/count_pushdown.rs`, `dataset/optimize.rs`,
-`dataset/write/merge_insert.rs`, `lance-index` `scalar/expression.rs`,
-`scalar/btree.rs`, `scalar/bitmap.rs`, `scalar/label_list.rs`,
-`scalar/zonemap.rs`, `scalar/inverted/*`, `lance-select` `mask.rs`. Pages read
-in full: the BTREE, Bitmap, LabelList and full-text index formats, and the
-performance guide.
+`dataset/write/merge_insert.rs`, `index/vector/ivf/v2.rs`, `lance-index`
+`scalar/expression.rs`, `scalar/btree.rs`, `scalar/bitmap.rs`,
+`scalar/label_list.rs`, `scalar/zonemap.rs`, `scalar/inverted/*` including
+`index/flat_search.rs`, `lance-select` `mask.rs`. Pages read in full: the BTREE,
+Bitmap, LabelList and full-text index formats, and the performance guide.
 
 ## Rollout
 
 Each phase ships independently and leaves the system safe. Every phase lands
 with its user-guide changes, a `changelog.d` note when it is user-visible, and
-the regenerated `openapi.json` when the wire changes.
+the regenerated `openapi.json` when the wire changes. This RFC asks acceptance
+for Phases 0–3; each later phase is accepted by amendment when its evidence
+exists.
 
 | Phase | Ships | Still unavailable |
 |---|---|---|
-| 0. Hardening | Engine read doors take an actor; refusal of shapes that would drop a filter. | No new contract. |
-| 1. Access model and schema placement | Every construct, readable sets, fixed `@in` on types and columns, policy version 2. | Per-row placement. |
-| 2. Row reads | Per-row `@in`, the visibility door, masked traversal, restricted search. | Restricted actors cannot write placed types. |
-| 3. Row writes | Write checks and access-edge rules. | — |
-| 4. Incremental maintenance | Shared closure, targeted view revalidation. | — |
-| 5. Agents | Delegated credentials and caveats. | — |
-| 6. Data-derived and edge placement | Computed placement; `@in` on edge types. | — |
-| 7. Search quality and performance | Public statistics; graph-index masks; row-mask cache. | — |
-| 8. History and feeds | Dual-placement history; view-filtered feeds, commits and export. | — |
-| 9. Sharing | Recipients, copies, answer capabilities, write-back. | Privacy budgets. |
-| 10. Vault infrastructure | Separate RFC. | — |
+| 0. Hardening | Engine read doors take an actor; acceptance input carries a view slot; refusal of shapes that would drop a filter; registered error codes and redaction framework. | No new contract. |
+| 1. Access model and schema placement | Every construct, identity bindings, the internal group, capture order, readable sets, fixed `@in` on types and columns, policy version 2, the `access` route's `view` field. | Per-row placement. |
+| 2. Row reads | Per-row `@in`, the visibility door at plan acceptance, masked traversal, exact restricted search, every read surface. | Restricted actors cannot write placed types. |
+| 3. Row writes | Write checks, constraint disclosures, access-edge rules, compare-and-swap access pins, own-attempt settling. | — |
+| 4. Agents | Delegated credentials and caveats. | — |
+| 5. Incremental maintenance | Shared closure, targeted view revalidation. | — |
+| 6. Packed placement references | Placements by packed reference; restricted securable creation. Needs integer node identity. | — |
+| 7. Data-derived and edge placement | Computed placement; `@in` on edge types. | — |
+| 8. Search acceleration | Cached view statistics, accelerated restricted `nearest` with a proof under the pair contract, graph-index masks, row-mask cache. | — |
+| 9. History, branches and feeds | Dual placement for history and branches; view-filtered history, feeds, commits, diffs and export. | — |
+| 10. Sharing | Recipients, copies, answer capabilities, write-back. | Privacy budgets. |
+| 11. Vault infrastructure | Separate RFC. | — |
 
 `implementation` moves to `in-progress` with Phase 0 and to `partial` when
 Phase 2 ships.
 
-### Phase 0: read-path hardening
+### Phase 0: hardening
 
 No contract changes.
 
-- Add actor-taking variants of every read door: `query`, `run_query_at`,
-  `explain_query`, `query_inspected`, `replay_bound_plan`
-  (`crates/omnigraph/src/exec/query_doors.rs`), `snapshot_of`,
-  `commit_changes_page`, `poll_change_feed`, `get_commit`, `list_commits`
-  (`crates/omnigraph/src/db/omnigraph.rs`), the export and baseline cuts
-  (`crates/omnigraph/src/db/omnigraph/export.rs`) and `read_blob_at`
-  (`crates/omnigraph/src/blob.rs`). Handlers pass the resolved actor. When a
-  policy is installed, the engine applies the `read` and `export` gates itself.
+- Add actor-taking variants of every read door in
+  `crates/omnigraph/src/exec/query_doors.rs` and of the snapshot, commit, change
+  feed, export and Blob reads. Handlers pass the resolved actor. When a policy is
+  installed, the engine applies the `read` and `export` gates itself.
+- Give `AcceptInput` a view slot, empty for now.
 - Make `Predicate::gq_filters()` match exhaustively.
 - Make the `MetadataCount` lowering refuse a scan spec that carries a filter.
-- Carry foreign facts in errors as structured fields.
+- Carry foreign facts in errors as structured fields, and register the new codes
+  in the shared error registry.
 - Make `Omnigraph::graph_index()` crate-private.
 
 Exit: the canonical workspace gates pass; `policy_engine_chassis.rs` covers an
 embedded read denied by policy.
 
-### Phase 1: access model and schema placement
+### Phase 1: access model, identity and schema placement
 
 Ships type- and column-level confidentiality on the full access model.
 
 - Compiler: validate the annotations; store them in typed IR bound to stable
   ids; derive `actor-views`; add schema-apply steps; check fixed `@in` keys
   against securables on `main`.
-- Engine: authorization capture; the readable-set computation with membership,
+- Engine: the capture order; the readable-set computation with membership,
   denial cutting membership, grants, inheritance, requirements, edge windows and
-  the organization group; the byte-bounded view cache; the schema view and
-  memoized view catalogs; global uniqueness of securable keys and actor ids;
-  refusal to delete a securable a fixed `@in` names.
-- Policy: version 2 `views.organization`, `views.bypass` and `views.limits`,
+  the internal group; the byte-bounded view cache; the view catalog at plan
+  acceptance; identity-binding validation; the internal group's structural
+  rules.
+- Policy: version 2 `views.internal`, `views.bypass` and `views.limits`,
   validated at cluster apply.
 - Until Phase 2: access edges are readable only by bypass actors; group and
   securable rows follow their type's placement, which can only be a fixed
   `@in("key")`; schema apply refuses a per-row `@in`.
-- Server: schema view on `/schema`; filtered `/queries`; explain redaction; the
-  `view` response object; `view_restricted` on history, feeds and export for any
-  actor whose view hides something; the operator tools.
+- Server: the schema view on every schema surface; filtered stored-query
+  catalogs; explain redaction; the `view` response object and the `access`
+  route's `view` field; `view_restricted` on history, diffs, feeds and export for
+  any actor whose view hides something; the operator operations.
 - GQT: an actor section in the case format.
 
-Exit: the non-interference property holds for schema views; a hidden name and
-an undeclared name produce identical errors; the readable-set computation agrees
-with the set-semantics evaluator over generated access graphs, including denial
-of granting groups, cycles and window boundaries; recipients never read
-organization grants.
+Exit: the non-interference property holds for schema views; a hidden name and an
+undeclared name produce identical errors and outcomes; the readable-set
+computation agrees with the set-semantics evaluator over generated access
+graphs; every identity case in Evidence is refused.
 
 ### Phase 2: row reads
 
@@ -1522,131 +1831,92 @@ Restricted actors cannot yet write placed types; they are refused with
 `view_write_denied`.
 
 - Per-row `@in` on node types with a BTREE on each placement property.
-- The `ViewSet` IR leaf, view conjuncts in scan specs, the coverage validator,
-  the view digest in plan assumptions.
-- Per-hop frontier masks in indexed traversal; refusal of CSR, degree shortcuts
-  and CSR-derived search gates for restricted types.
-- Vector planning from the visible count; full-text search for restricted
-  actors with uniform statistics; Blob reads checked against row visibility.
+- The `ViewSet` IR leaf with its own eligibility; view requirements in
+  `Requirements::check`; the view digest in the catalog identity; redacted replay
+  refusals.
+- Per-hop frontier masks in indexed traversal; refusal of graph-index mode,
+  degree shortcuts and graph-index search gates for restricted types.
+- Restricted `bm25` over the visible rows with a zero base scorer; exact
+  restricted `nearest`; the search budget; Blob reads checked against row
+  visibility.
 - Visibility of access data: rows by their own placement, access edges by their
   endpoints, deny edges to owners only.
-- Server refusal of unauthenticated and policy-less modes for `actor-views`
-  graphs.
-- Polymorphic types, if union scans have landed: per-arm conjuncts, validator
-  coverage of arms and expansions, member sets from the schema view.
-- Lance guards for `IsIn` prefiltering, the base scorer and `CountPushdown`.
+- Every read surface in [Surfaces](#surfaces), MCP tools and resources included;
+  the direct-and-served rule; serving refusals.
+- Polymorphic types, if union scans have landed: per-arm conjuncts and member
+  sets from the view catalog; multi-member `bm25` stays refused for restricted
+  actors until each arm can take the other arms' view statistics.
+- Lance guards for `IsIn` prefiltering, the flat scorer and `CountPushdown`.
 
-Exit: the non-interference property holds over scans, aggregates, single- and
-multi-hop traversal, `count` and `not` blocks, anti-joins, and vector, full-text
-and fused search at visible fractions from 100% to 0.01%; the cost and recall
-thresholds hold; a DST scenario interleaving access writes with reads never
-returns a row its request's authorization state hides.
+Exit: the paired-graph property holds over scans, aggregates, single- and
+multi-hop traversal, `count` and `not` blocks, anti-joins, `bm25`, `nearest` and
+`rrf`; restricted scores are identical across optimize and index rebuilds; the
+cost thresholds hold; the DST capture-order schedule never returns a row its
+request's authorization state hides.
 
 ### Phase 3: row writes
 
 - Committed-state lookup of placement values; checks in
-  `validate_staged_mutation`, `validate_changeset` and merge evaluation.
+  `validate_staged_mutation`, the loader's validation and merge evaluation.
 - Personal-securable default, `placement_required`, `view_write_denied`,
   `key_conflict` without ids, `delete_blocked`, overwrite refusal, edge endpoint
   visibility, view-scoped matching and counts.
-- Access-edge rules: owner roles, `main` only, `securable_owner_required`.
+- Constraint disclosures exactly as tabled.
+- Access-edge rules: owner roles, `main` only.
+- Access pins as compare-and-swap expectations; the own-attempt settle lookup.
 - Server stripping of foreign facts for restricted actors.
 
-Exit: `writes.rs` and `policy_engine_chassis.rs` cover every row of the write
-table; each refusal leaves the manifest head, table pins and lineage unchanged.
+Exit: `writes.rs` and `policy_engine_chassis.rs` cover every row of the write and
+disclosure tables; each refusal leaves the manifest head, table pins and lineage
+unchanged; a write racing an access change in another process retries or
+refuses.
 
-### Phase 4: incremental maintenance
+### Later phases
 
-- The shared closure keyed by access version, moved forward from the access
-  tables' changes and rebuilt from scratch when their history is gone.
-- Targeted revalidation that carries unaffected views forward.
-- Compressed bitmaps over securable ordinals for readable sets.
+Phases 4–11 are designed in the sections above. Each lands with an amendment
+that states its evidence:
 
-Exit: incrementally maintained closures and views equal from-scratch ones over
-generated change sequences; the maintenance threshold holds at connector churn.
-
-### Phase 5: agents
-
-- Delegated credentials with subject, actor and audience; caveats compiled into
-  the view spec and closed under inheritance; acceptance of the RFC 8693 `act`
-  claim only for credentials of this form.
-- MCP audience check; no token passthrough.
-
-Exit: the server identity suites cover delegated credentials and caveats.
-
-### Phase 6: data-derived and edge placement
-
-- Computed placement: the expression subset (the row's own columns and
-  constants), evaluation in write validation, and the schema-apply step for a
-  changed expression.
-- `@in` on edge types, with view conjuncts on edge reads.
-
-Exit: the non-interference property holds with computed and edge placements;
-writers cannot set a computed placement.
-
-### Phase 7: search quality and performance
-
-- Public statistics built by explicit index reconciliation, with uniform
-  statistics as the fallback; a recall sampling instrument.
-- Per-view masks over a graph-index instance, keyed by the instance and the
-  node-table versions; CSR re-enabled for restricted types. With the polymorphic
-  types RFC's global ordinal index, one bitmap per view covers every node type.
-- An optional per-view row-mask cache, after a guard covers Lance's
-  `CountPushdown` with a row mask.
-
-Exit: the ranking threshold holds on the fixture; traversal and search cost
-instruments show no regression against Phase 2 at equal results.
-
-### Phase 8: history and feeds
-
-- Historical reads bind properties by stable identity (prerequisite).
-- Dual-placement historical reads; view-filtered change feed (digest in cursors,
-  visibility transitions as inserts and deletes, projected equality);
-  view-filtered commits, commit changes, export and baseline.
-
-Exit: `point_in_time.rs` and `changes.rs` cover moved rows, revoked members and
-hidden-column changes; cursors refuse a changed view.
-
-### Phase 9: sharing
-
-- `shares` in cluster configuration; live shares; the share reconciler for
-  hosted and delivered copies, with the cursor row, baselines and terms checks.
-- Definer-rights stored queries with parameter domains and invocation logs.
-- Write-back proposals; per-actor read admission.
-
-Exit: a hosted copy equals the materialized view of its recipient after every
-reconciled commit; revocation deletes the copy and its proposals.
-
-### Phase 10: vault infrastructure
-
-A separate RFC: per-graph storage roots, credentials and keys in one cluster;
-non-discoverable graphs; a cache budget shared across graphs; read-many,
-write-one queries across graphs.
+- **Phase 4, agents**: delegated credentials from
+  ModernRelay/omnigraph#978, caveats including branches, subject and actor in
+  Cedar, receipts and the `access` route.
+- **Phase 5, incremental maintenance**: the shared closure and targeted
+  revalidation, proved equal to from-scratch builds over generated change
+  sequences.
+- **Phase 6, packed placement references**: after integer node identity, with
+  the four conditions in [Identity bindings in validation](#identity-bindings-in-validation).
+- **Phase 7, data-derived and edge placement**: computed placement and `@in` on
+  edge types, with view conjuncts on edge reads.
+- **Phase 8, search acceleration**: only mechanisms proved under the pair
+  contract.
+- **Phase 9, history, branches and feeds**: stable-identity property binding,
+  dual placement, view-filtered feeds, commits, diffs and export.
+- **Phase 10, sharing**: shares, the reconciler, definer-rights stored queries,
+  write-back, per-actor read admission.
+- **Phase 11, vault infrastructure**: a separate RFC.
 
 ## Unresolved questions
 
-1. Which full-text statistics restricted actors get: public or uniform
-   (`blocked_on`).
-2. The syntax of computed placement, and how a changed expression rewrites
-   existing rows within one publication.
-3. Whether a GQ form that traverses a key-valued property should accompany
-   Phase 2, so placement can be traversed like an edge.
-4. Whether denied principals should see the deny edges that bar them, as some
+For the first scope:
+
+1. Whether design partners accept the write disclosures in
+   [Constraint disclosures](#constraint-disclosures), or need `@unique` scoped to
+   a placement before Phase 3.
+2. Whether denied principals should see the deny edges that bar them, as some
    ethical-wall practice expects, or only owners.
-5. In Phase 8, whether commits with no visible change are listed to restricted
-   actors.
-6. Whether design partners accept key-existence disclosure to writers, or need
-   uniqueness scoped to a placement.
-7. At what audience size the item-side reader encoding replaces `IN` for a type,
+3. Whether restricted reads on branches forked before a move need the
+   dual-placement rule in Phase 2 rather than Phase 9.
+4. At what audience size the item-side reader encoding replaces `IN` for a type,
    and whether that choice is declared or measured.
-8. Whether placements store packed securable references once integer node
-   identity lands, replacing the shared securable-key namespace.
+
+For later phases: the syntax of computed placement and how a changed expression
+rewrites existing rows; whether commits with no visible change are listed to
+restricted actors in Phase 9; and a GQ form that traverses a reference-valued
+placement.
 
 ## Decision log
 
 - 2026-10-11: Drafted. The design was checked against the code at `6e31d0ab` and
-  Lance 11.0.0; [Appendix A](#appendix-a-validated-assumptions) records every
-  assumption with its verdict.
+  Lance 11.0.0.
 - 2026-10-11: Aligned with the polymorphic types draft
   (ModernRelay/omnigraph#884): member sets from the schema view, placements on
   interface properties fixed across members, removal of a placement restricted,
@@ -1654,31 +1924,48 @@ write-one queries across graphs.
 - 2026-10-11: Rewrote the declaration layer to a single scope concept, replacing
   thirteen annotations, four policy keys, four new actions, visibility tiers,
   integrity labels and compound securables.
-- 2026-10-12: Revised from a first-principles review. The scope concept split
-  into the `@group` and `@securable` roles, because conflating membership with
-  readership let a visible team page hand out the team's grants. `@inherits` was
-  added: without union over securables the expressions are not closed, and
-  hierarchies, multiple parents and clearance ladders needed workarounds.
-  Denial now cuts membership through a denied group. The public `*` subject
-  became the organization group defined by policy, so recipients never receive
-  company-wide grants, and derived content uses `@inherits` with `@requires`
-  instead of a `*` grant. `@in` extends to edge types; caveats cover inherited
-  securables; edge windows gained `@starts`. The semantics are stated as a
-  least fixed point with one negation layer, with a derivation of every
-  construct. Names follow the field: `@securable`, `@requires` (was `@within`),
-  `role` (was `level`), `bypass` (was `unrestricted`), recipient. Added computed
-  placement, incremental maintenance of readable sets (Phase 4), the item-side
-  encoding boundary for per-item audiences, D8 and
-  [Appendix C](#appendix-c-query-based-access-compared).
-- 2026-10-12: The polymorphic types draft (ModernRelay/omnigraph#884) adopted
-  this RFC's rules for abstract types and withdrew `policy_denied_member` and
-  `policy_filtered`, closing the cross-RFC question. [Polymorphic types](#polymorphic-types)
-  now follows that draft's current design: packed node references from integer
-  node identity instead of tag columns, which reopens typed placement values as
-  a question.
+- 2026-10-12: Revised from a first-principles review: `@group` and `@securable`
+  roles, `@inherits`, denial cutting membership, a policy-defined company-wide
+  group, `@starts`, edge placement, computed placement, incremental maintenance,
+  field names, D8 and [Appendix C](#appendix-c-query-based-access-compared).
+- 2026-10-17: Revised against the reviews of 2026-10-12 and 2026-10-17, against
+  `main` at `9575b044`, and against the open drafts that touch access:
+  - The contract is stated over pairs of graphs with equal views; the
+    materialized equation is the oracle under identical evaluators.
+  - Restricted search is exact and scored from the view (D10). Public and uniform
+    statistics are withdrawn; restricted `bm25` uses Lance's flat operator over
+    the visible rows with a zero base scorer, matching the analyzed lexical
+    search draft's population; restricted `nearest` is exact. The polymorphic
+    types draft's corpus contract takes its statistics source from this RFC,
+    so it now names view statistics; restricted multi-member `bm25` stays
+    refused until each arm can take the other arms' view statistics.
+  - The view conjunct has its own eligibility, always before scoring, because
+    `main`'s eligibility rule moves filters after scoring on partly indexed
+    properties.
+  - View requirements and the view digest moved into RFC 0047's plan acceptance;
+    replay refusals are redacted.
+  - Authorization is never older than the data: one image on `main`, data then
+    authorization elsewhere, access pins as compare-and-swap expectations for
+    writes, stated staleness for writes on other branches.
+  - Identity bindings (actor ids, securable keys, the internal group) have one
+    protected lifecycle (D9); packed placement references are a phase.
+  - The company-wide group is the structural internal group, renamed from
+    "organization", which already names the managed control plane's tenant.
+  - Constraint disclosures are stated exhaustively.
+  - Caveats cover an inheritor only when every `@requires` target is covered.
+  - Direct and served access, the `access` route, the shared error registry and
+    MCP's current surface follow the graph access draft and RFC 0003.
+  - History operations of ModernRelay/omnigraph#1016 and #677 fall under the
+    history rule; dropping a placement property is a placement removal; schema
+    namespace errors are computed on the view catalog.
+  - Acceptance is asked for Phases 0–3; incremental maintenance, packed
+    references, computed and edge placement, acceleration, history and feeds,
+    and sharing are later phases.
+  - Code citations moved to file and symbol at `9575b044`.
 
 ## Appendix A: validated assumptions
 
+The assumptions were validated at `6e31d0ab` and rechecked at `9575b044`.
 Verdicts: ✓ confirmed, ◐ partly true (the design uses the corrected form),
 ✗ false (the design does not rely on it).
 
@@ -1690,67 +1977,65 @@ Verdicts: ✓ confirmed, ◐ partly true (the design uses the corrected form),
 | Row-address prefilter honored by KNN, indexed FTS, flat FTS, plain scan | ◐ | Mask is in `_rowid` space; applied after scoring on flat FTS; demotes the filter on plain scans (`scanner.rs:1466-1470, 4995, 3298-3306`) |
 | BTREE and Bitmap `IsIn` exact, unbounded, NULL disables index | ✓ | `lance-index` `scalar/expression.rs:348-352`; `btree.rs:3347`; `bitmap.rs:1848` |
 | LabelList looks labels up sequentially | ✓ | `scalar/label_list.rs:140-144` |
-| Indexed FTS masks before the top-k heap | ✓ | `scalar/inverted/wand.rs:2299` |
 | BM25 statistics are index-wide, including filtered and deleted rows | ✓ | `scalar/inverted/index/search.rs:53-63`; `scorer.rs:197` |
-| External BM25 statistics can be supplied | ◐ | Only below the scanner, `with_base_scorer` (`io/exec/fts.rs:624, 2175, 3058, 3485`) |
-| No automatic flat switch for selective KNN; `+inf` placeholders | ✓ | `io/exec/knn.rs:1710-1782` |
+| The flat full-text path adds its counted input to any supplied scorer | ✓ | `initialize_scorer`, `scalar/inverted/index/flat_search.rs:539-588` |
+| `FlatMatchQueryExec::new` and `with_base_scorer` are public; `with_shared_scorer` is not | ✓ | `io/exec/fts.rs:2949, 3058`; `with_shared_scorer` is `pub(crate)` at `fts.rs:2180, 3063, 3490` |
+| IVF partition choice ignores the prefilter; late search stops at `k` | ✓ | `index/vector/ivf/v2.rs:1459-1469`; `io/exec/knn.rs:1725-1728` |
 | `count_rows(None)` is manifest-only | ✓ | `dataset/fragment.rs:1366-1392` |
 | Mask plus `count_rows` | ◐ | `CountPushdown` expects a `ScalarIndexExec` (`io/exec/count_pushdown.rs:228-235`); untested, guarded before use |
 | Compaction materializes deletions above 10%; stable ids skip index remap | ✓ | `dataset/optimize.rs:322, 2580` |
 | Merge-insert cannot fail on a conditional match | ✓ | `merge_insert.rs:425-449`; `assign_action.rs:107-139` |
-| WAND switches to flat at ≤ 10% allow-list for OR queries | ✓ | `wand.rs:201-206` |
 
 ### Engine read path
 
 | Claim | Verdict | Evidence |
 |---|---|---|
-| Non-pushable conjuncts become an in-memory filter after `nearest` top-k | ✓ | `crates/omnigraph-planner/src/optimizer.rs:1426-1461` |
-| Lowering silently skips conjuncts | ◐ | Guarded by `validate_plan_values` (`crates/omnigraph/src/engine/typed_value.rs:826-833`), except `MetadataCount` (`engine/lower.rs:473-487`) |
-| `prefilter(true)` on every filtered scan | ✓ | `crates/omnigraph/src/engine/scan.rs:248-251` |
-| List parameters lower to `in_list` | ✓ | `scan.rs:1093-1119` |
-| BFS never reads intermediate nodes; edge reads unfiltered | ✓ | `crates/omnigraph/src/engine/graph.rs:1132-1472, 1647-1662` |
-| CSR is a whole-graph cache with no actor | ✓ | `crates/omnigraph/src/graph_index/mod.rs:168-245`; `runtime_cache.rs:24-57` |
-| Degree shortcut and `MetadataCount` require an unfiltered spec | ✓ | `engine/lower.rs:230-277`; `optimizer.rs:1603-1647` |
-| Interfaces cause polymorphic scans | ✗ | Bindings are concrete (`typecheck.rs:1785-1790`) |
-| `Predicate::gq_filters()` keeps every variant | ✗ | Drops non-`Gq` variants (`crates/omnigraph-planner/src/logical.rs:125-140`) |
-| Multi-hop traversal accepts different endpoint types | ✗ | Requires equal endpoint types (`crates/omnigraph/src/engine/operators/expand.rs:177-183`) |
-| Multi-hop traversal accepts a zero minimum or an unbounded maximum | ✗ | Requires `{1,n}` with `n` given (`crates/omnigraph-compiler/src/query/typecheck.rs:2045-2066`) |
-| Engine read doors take no actor | ✓ | `crates/omnigraph/src/exec/query_doors.rs:41-170` |
-| Explain exposes whole-table facts | ✓ | `engine/explain.rs:236, 272`; `physical.rs:363-370`; `gate.rs:58-71` |
+| Every filtered scan prefilters | ✗ on `9575b044` | A `bm25` scan with `Eligibility::AfterScoring` (partial or absent coverage) sets `prefilter(false)`: `NodeRead` in `crates/omnigraph/src/engine/scan.rs`, the eligibility choice in `crates/omnigraph-planner/src/optimizer.rs` |
+| Plan validation runs in `engine::execute` | ✗ on `9575b044` | `execute` takes an `AcceptedBoundPlan`; acceptance is `accept`, `check` and `accept_replay` in `crates/omnigraph-planner/src/validate/` |
+| `AcceptInput` carries an actor or view | ✗ | `AcceptInput` in `validate/mod.rs` |
+| Replay compares a catalog digest and prints both hashes on mismatch | ✓ | `accept_replay` and `catalog_digest` in `validate/replay.rs` |
+| `MetadataCount` ignores the scan filter at lowering | ✓ | `crates/omnigraph/src/engine/lower.rs` |
+| `Predicate::gq_filters()` keeps every variant | ✗ | Drops non-`Gq` variants (`crates/omnigraph-planner/src/logical.rs`) |
+| BFS never reads intermediate nodes; edge reads unfiltered | ✓ | `execute_expand_bfs` in `crates/omnigraph/src/engine/graph.rs` |
+| The graph index is a whole-graph cache with no actor | ✓ | `GraphIndex` in `crates/omnigraph/src/graph_index/mod.rs`; `GraphIndexCacheKey` in `runtime_cache.rs` |
+| Interfaces cause polymorphic scans | ✗ | Bindings are concrete; lookups go through `Catalog::query_node_type` |
+| Multi-hop traversal accepts different endpoint types | ✗ | "a multi-hop traversal requires the same endpoint type" (`crates/omnigraph/src/engine/operators/expand.rs`) |
+| Engine read doors take no actor | ✓ | `crates/omnigraph/src/exec/query_doors.rs` |
+| Explain exposes whole-table facts | ✓ | `crates/omnigraph/src/engine/explain.rs`; dataset pins in `crates/omnigraph-planner/src/physical.rs`; index statistics in `crates/omnigraph-planner/src/gate.rs` |
 
 ### Writes and schema
 
 | Claim | Verdict | Evidence |
 |---|---|---|
-| Keyed insert is a full-row upsert | ✓ | `crates/omnigraph/src/exec/mutation.rs:425-426, 1314-1318`; `table_store.rs:3442-3443` |
-| Overwrite replaces all rows of a type | ✓ | `crates/omnigraph/src/loader/mod.rs:765-772, 939-957` |
-| Delete cascades and counts hidden edges | ✓ | `mutation.rs:1717-1741` |
-| Constraint messages name other rows | ✓ | `crates/omnigraph/src/validate.rs:1259, 1295-1296` |
-| A before image exists at validation | ◐ | Not held; obtainable from the committed state (`validate.rs:391-433`) |
-| `@index` on a `String` builds a BTREE | ✗ | Builds full-text (`table_ops.rs:582-605`) |
-| Unknown annotations are refused | ✗ | Kept as metadata (`parser.rs:1074`); unknown features are refused (`schema_ir.rs:1402-1406`) |
+| Keyed insert is a full-row upsert | ✓ | `PendingMode::Upsert` in `exec/mutation.rs`; `WhenMatched::UpdateAll` in `table_store.rs` |
+| Overwrite replaces all rows of a type | ✓ | `PendingMode::Overwrite` and `overwrite_removed_ids` in the loader |
+| Delete cascades and counts hidden edges | ✓ | Cascade in `exec/mutation.rs` |
+| Constraint messages name other rows or counts | ✓ | `@unique` and `@card` messages in `crates/omnigraph/src/validate/kernels.rs` |
+| A before image exists at validation | ◐ | Not held; obtainable from `CommittedState` in `validate.rs` |
+| `@index` on a `String` builds a BTREE | ✗ | Builds full-text (`node_prop_index_kind` in `table_ops.rs`) |
+| Unknown annotations are refused | ✗ | Kept as metadata by the schema parser; unknown features are refused (`is_known_feature`) |
 | Edge properties may be named `from` | ✗ | `from` and `to` are reserved insert parameters on edges (`docs/user/schema/index.md`) |
-| Schema apply is main-only | ✓ | `crates/omnigraph/src/db/omnigraph/schema_apply.rs:153-162` |
-| Edge endpoints have BTREEs | ✓ | `table_ops.rs:874-890` |
+| Schema apply is main-only with a single live branch | ✓ | `schema_apply.rs`; ModernRelay/omnigraph#963 would lift the single-branch part |
+| Edge endpoints have BTREEs | ✓ | `table_ops.rs` builds BTREEs on id, src and dst |
 
 ### Server, policy and cluster
 
 | Claim | Verdict | Evidence |
 |---|---|---|
-| Reads authorized only in handlers; MCP shares them | ✓ | `crates/omnigraph-server/src/handlers.rs`; `mcp.rs:272-310` |
-| Static tokens without policy allow reads; open mode allows all graph actions | ✓ | `handlers.rs:651-668` |
-| Signed and OIDC actors without policy are denied | ✓ | `handlers.rs:622-626` |
-| Delegation claims accepted | ✗ | OIDC rejects `act` and `impersonator` (`oidc_identity.rs:346-347`) |
-| Principal kind exists | ✓ | `data_tokens.rs:26-29` |
-| Policy is allow-only, compiled with `format!` | ✓ | `crates/omnigraph-policy/src/lib.rs:236-240, 825-866` |
-| Per-actor limits exist | ◐ | Writes only (`workload.rs:15-19`) |
-| Durable read audit exists | ✗ | Decision logs only when a policy is installed (`handlers.rs:575-589`) |
-| Snapshot reads use current policy | ✓ | `handlers.rs:1764-1784` |
-| Historical reads rebind tables by stable identity | ✓ | `crates/omnigraph-catalog/src/lib.rs:608-656` |
-| One snapshot per query | ✓ | `crates/omnigraph/src/db/graph_coordinator.rs:52` |
-| Graphs in a cluster share storage and credentials | ✓ | `crates/omnigraph-cluster/src/store.rs:240-242`; `crates/omnigraph-storage/src/lib.rs:1247` |
-| Per-graph Lance caches have no shared budget | ✓ | `crates/omnigraph-core/src/lance_access.rs:38-42` |
-| Read caches flush on every observed advance of `main` | ✓ | `crates/omnigraph/src/db/omnigraph.rs:2026-2034` |
+| Reads authorized only in handlers; MCP shares them | ✓ | `crates/omnigraph-server/src/handlers.rs`; MCP `call_tool` in `mcp.rs` |
+| `/mcp` is mounted only with OIDC | ✗ | Mounted whenever the server has a credential source (`has_credential_source` in `lib.rs`) |
+| Static tokens without policy allow reads; open mode allows all graph actions | ✓ | The no-policy branch of the authorization check in `handlers.rs` |
+| Signed and OIDC actors without policy are denied | ✓ | "signed data credentials require an applied Cedar policy permit" (`handlers.rs`) |
+| Delegation claims accepted | ✗ | OIDC rejects `act` and `impersonator` (`oidc_identity.rs`) |
+| Signed data tokens are bound to this server | ✗ | Bound to the cluster: `urn:omnigraph:data:{cluster_id}` (`data_tokens.rs`) |
+| Direct CLI access installs a policy | ✗ | "Direct-store access carries no Cedar policy" (`crates/omnigraph-cli/src/client.rs`) |
+| Per-actor limits exist | ◐ | Writes only (`workload.rs`) |
+| Durable read audit exists | ✗ | Decision logs only when a policy is installed (`log_policy_decision` in `handlers.rs`) |
+| Snapshot reads use current policy | ✓ | `resolved_branch_of` in the snapshot-target authorization in `handlers.rs` |
+| Historical reads rebind tables by stable identity | ✓ | `bind_catalog_aliases` in `crates/omnigraph-catalog/src/lib.rs` |
+| Graphs in a cluster share storage and credentials | ✓ | `crates/omnigraph-cluster/src/store.rs`; `crates/omnigraph-storage/src/lib.rs` |
+| Read caches flush on every observed advance of `main` | ✓ | `invalidate_read_caches` in `crates/omnigraph/src/db/omnigraph.rs` |
+| A commit holds the schema gate exclusively | ✗ | `commit_all` takes the shared side (`acquire_schema_shared`), so the gates order but do not exclude a concurrent access write |
 
 ## Appendix B: prior art
 
@@ -1762,7 +2047,7 @@ How each part of the model maps to prior art:
 | Securables that hold data and receive grants | SQL Server securables; Databricks Unity Catalog securable objects; SharePoint `SecurableObject`; OCI compartments | Same |
 | Membership chains, grants are one hop | Zanzibar's Leopard index (group-to-group closure, then member-to-group); AD groups and ACL entries | Same shape |
 | `@grant`, `@inherits`, `@requires`, `@deny` | Zanzibar userset rewrites (union, intersection, exclusion; `tuple_to_userset` for inheritance); SpiceDB `+ & -`; OpenFGA `or`, `and`, `but not` | Same set operations, fixed vocabulary |
-| Organization group | Google "anyone in the organization"; AD Domain Users | Same; differs from the public `user:*` of OpenFGA and SpiceDB |
+| Internal group | GitHub internal visibility; AD Domain Users | Same; differs from the public `user:*` of OpenFGA and SpiceDB |
 | Deny-overrides | XACML; Windows deny entries; Purview Information Barriers; Ranger tag denies; Databricks DENY | Same; avoids GraphDB first-match ordering, Neo4j denies that fail open on null, and Drive limited access overridden by a group grant |
 | `@starts`, `@expires` | SpiceDB expiring relationships; OpenFGA conditions; Azure PIM | Same |
 | Per-row placement with `IN` | Snowflake row access policies with mapping tables, Postgres row security, Elasticsearch document-level security, Glean and Azure AI Search security trimming | Same |
@@ -1770,10 +2055,11 @@ How each part of the model maps to prior art:
 | Fixed placement of a column or type | BigQuery policy tags; Unity Catalog tags driving row filters and column masks | Close |
 | Derived content | FIDES and CaMeL reader-set intersection | Same; Purview takes the highest label instead |
 | Delegation as intersection | Microsoft delegated permissions; RFC 8693; Macaroon and Biscuit attenuation | Same |
-| Access facts in the data graph | Fong's relationship-based access control; Snowflake mapping tables | Variant: one versioned graph, consistency by snapshot instead of Zanzibar zookies |
+| Access facts in the data graph | Fong's relationship-based access control; Snowflake mapping tables | Variant: one versioned graph; ordering by capture and compare-and-swap instead of Zanzibar zookies |
 | Shared closure with incremental maintenance | Leopard (offline index plus incremental layer); AuthZed Materialize | Same shape, keyed by access version |
 | Fixed rule set, facts from users | Biscuit and Oso use Datalog with user rules | Same logic fragment, no user rules |
 | Bypass | Postgres `BYPASSRLS`; Oracle `EXEMPT ACCESS POLICY`; Databricks exempt principals | Same |
+| Search statistics per user view | Büttcher and Clarke's query integration (FAST 2005); STRESS (IEEE S&P 2017) shows that global statistics and even ranks leak | Same remedy |
 
 Sources consulted:
 
@@ -1827,7 +2113,8 @@ Sources consulted:
   differential privacy, Snowflake aggregation policies, Solid WAC and ACP, ODRL
   2.2, Eclipse Dataspace Components policy monitor, DoltHub forks, lakeFS hooks.
 - RFC 8693 token exchange; MCP authorization 2026-07-28; Biscuit; Macaroons;
-  UCAN; XACML combining algorithms; GCP basic roles; Azure RBAC.
+  UCAN; XACML combining algorithms; GCP basic roles; Azure RBAC; GitHub internal
+  repository visibility.
 
 ## Appendix C: query-based access compared
 
@@ -1856,7 +2143,7 @@ per row.
 | Exception across all types | Ethical wall | Repeated in every policy | ✓ once |
 | Access that expires or starts | Contractor until December; embargo | ✓ | ✓ `@expires`, `@starts` |
 | Row attribute equals an actor attribute | Deal region = rep's region | ✓ | ✓ when regions are securables |
-| Row attribute threshold | Deals ≥ $1M board-only | ✓ | Computed placement |
+| Row attribute threshold | Deals ≥ $1M board-only | ✓ | Computed placement (Phase 7) |
 | Row value against an actor value | Amount ≤ my approval limit | ✓ | Partial: bucket into tiers |
 | Ordered clearances | Secret readers read confidential | ✓ | ✓ `@inherits` chain |
 | Content of other rows | Notes mentioning my accounts | ✓ | Opt-in access edge, or definer query |
@@ -1879,12 +2166,12 @@ it may depend on any data.
 
 | Operation | This model | Query-based |
 |---|---|---|
-| Preparing an actor's access | Once per access version, incrementally maintained | None |
+| Preparing an actor's access | Once per access version | None |
 | Each read, per placed type | One BTREE `IN` | The policy's joins and hops, every query |
 | Recursive and composed rules | Paid once, building the view | Paid on every read |
-| Vector and full-text top-k | Prefilter from the cached set | Allowed set built inside each query |
+| Restricted `bm25` and `nearest` | Exact over the visible set, scored from it | The allowed set built inside each query, and the same statistics problem |
 | Data write | One batched lookup of placements | The write predicate per written row |
-| Access change | One edge write and targeted revalidation | Free, but any data write may change access |
+| Access change | One edge write; views rebuilt per access version (incrementally in Phase 5) | Free, but any data write may change access |
 | Who can see this row | Reverse traversal | Evaluation per actor |
 
 Query-based access is cheaper for rules over the row's own columns (no
