@@ -3693,6 +3693,15 @@ mod blob_error_tests {
     struct CatalogReadFault;
 
     impl lance::io::WrappingObjectStore for CatalogReadFault {
+        fn wrap_paginated(
+            &self,
+            _: &str,
+            original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            // This wrapper does not observe or change listings.
+            Some(original)
+        }
+
         fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
             Arc::new(CatalogReadFaultStore { target })
         }

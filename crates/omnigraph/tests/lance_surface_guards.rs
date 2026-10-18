@@ -124,7 +124,7 @@ impl Drop for NativeBlockingGate {
 }
 
 /// Negative qualification guard: cancelling the future and dropping its writer
-/// is not an I/O-settlement receipt. Lance 11's queued native persist still
+/// is not an I/O-settlement receipt. Lance 13's queued native persist still
 /// publishes the final file. See the server runtime RFC's full-B gate.
 #[test]
 fn dropped_local_writer_can_persist_after_its_owner_returns() {
@@ -1566,7 +1566,7 @@ async fn public_physical_ref_incarnation(dataset: &Dataset) -> PublicPhysicalRef
 /// A fragment reader reads a data file in the dataset's own base through the
 /// scan scheduler `FragReadConfig` passes, and a file the dataset reaches
 /// through a `base_id` (the files a branch inherits) through a
-/// maximum-bandwidth scheduler Lance 11 opens for it, ignoring the one
+/// maximum-bandwidth scheduler Lance 13 opens for it, ignoring the one
 /// passed: the passed scheduler reads that file's rows without a byte.
 /// `HydrateExec` bounds Lance's read-ahead with the scheduler it passes, and
 /// for this reason reads a fragment holding an inherited file (a table fork
@@ -2524,7 +2524,7 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 //   5. a live slash-name path-child makes force delete remove an ancestor's
 //      BranchContents but intentionally retain its dataset files. OmniGraph's
 //      prefix-disjoint live-name invariant prevents this false-success shape.
-//   6. Lance 11 refuses even force deletion while a tag targets the branch.
+//   6. Lance 13 refuses even force deletion while a tag targets the branch.
 //      The ref, tree, and tagged snapshot remain readable until the tag is
 //      explicitly removed. Graph-level retention authority remains separate.
 
@@ -4619,7 +4619,7 @@ async fn nearest_scan_stats_report_partitions_searched_and_ranked() {
 
 // --- Guard: an explicit projection may name `_distance` before `nearest` ---
 //
-// Lance 11 resolves the scoring columns (`_distance`, `_score`) in
+// Lance 13 resolves the scoring columns (`_distance`, `_score`) in
 // `ProjectionPlan` independently of the dataset schema (lance-datafusion
 // `projection.rs`, `SCORING_COLUMNS`), so `project` before `nearest` is legal.
 
@@ -4763,7 +4763,7 @@ async fn fts_scan_accepts_score_in_a_projection_set_before_full_text_search() {
     );
 }
 
-/// The two Lance 11 facts BM25 eligibility placement rests on. Lance scores
+/// The two Lance 13 facts BM25 eligibility placement rests on. Lance scores
 /// the fragments no full-text segment covers flat, counting documents and
 /// tokens over the rows its prefilter admits, so a prefilter changes an
 /// uncovered row's score; with `prefilter(false)` the full-text search
@@ -4903,11 +4903,11 @@ async fn fts_prefilter_changes_unindexed_scores_and_postfilter_keeps_them() {
     );
 }
 
-// --- Lance 10 compatibility: fence late-hydrated KNN ordering --------------
+// --- Guard: fence late-hydrated KNN ordering -----------------------------
 //
 // lance#7868 makes execute_plan preserve order when the plan still advertises
 // its sorted KNN candidate stream. An ordinary projected payload adds a late
-// `LanceRead` that drops that metadata in Lance 10, so the parallel final
+// `LanceRead` that still drops that metadata in Lance 13, so the parallel final
 // coalesce can still scramble large-k results. OmniGraph temporarily requests
 // one output partition for nearest scans. This full-payload stable-row-ID guard
 // pins both the residual and the fence's exact globally ordered result.
@@ -6071,13 +6071,12 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
 
 // --- Guard: merge-insert refuses an external Blob reference outside the bases ---
 //
-// Lance 11's merge-insert writer stages its files with `WriteParams::default()`,
-// whose `allow_external_blob_outside_bases` is false, and a merge-insert takes
-// no other write params. A keyed write therefore cannot carry a stored external
-// reference as a reference: the engine reads it and stores managed bytes, or
-// refuses it under a denying policy (RFC 0033 §4.3). When this goes red,
-// merge-insert stores such a reference, and carrying a sibling's reference
-// without reading it is open again (RFC 0033, Phase 4).
+// Lance 13 validates source-provided Blob references against the dataset's
+// registered external bases before writing. Its writer permits references
+// already carried from target columns, but a source supplying an outside URI
+// still refuses. The engine reads supplied references and stores managed bytes,
+// or refuses them under a denying policy (RFC 0033 §4.3). When this goes red,
+// reconsider the supplied-reference restriction (RFC 0033, Phase 4).
 #[tokio::test]
 async fn merge_insert_refuses_an_external_blob_outside_the_dataset_bases() {
     let dir = tempfile::tempdir().unwrap();
@@ -6364,7 +6363,7 @@ async fn contains_filter_routes_to_ngram_index_and_rechecks_exactly() {
 
 // --- Guard 23: index kinds get distinct default names; replacement is by name --
 //
-// Lance 11 derives `{column}_idx`, then `_2`, `_3`, ... when an existing name
+// Lance 13 derives `{column}_idx`, then `_2`, `_3`, ... when an existing name
 // belongs to another field or index kind. A same-kind rebuild reuses its
 // default name, and `.replace(true)` still removes indexes BY NAME. The
 // engine retains explicit companion names: independent uncommitted builders
@@ -6511,7 +6510,7 @@ async fn index_default_names_distinguish_kinds_and_replacement_is_by_name() {
 
 /// GQT cannot inspect native index base IDs or bypass the engine adapter.
 #[tokio::test]
-async fn stock_lance_nested_clone_overwrites_inherited_index_base_issue_7840() {
+async fn stock_lance_nested_clone_preserves_inherited_index_base_issue_7840() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("nested-index.lance");
     let uri = uri.to_str().unwrap();
@@ -6525,9 +6524,12 @@ async fn stock_lance_nested_clone_overwrites_inherited_index_base_issue_7840() {
     let inherited = first.load_indices().await.unwrap()[0].clone();
     let version = first.version().version;
     let second = first.create_branch("second", version, None).await.unwrap();
-    let rewritten = second.load_indices().await.unwrap()[0].clone();
-    assert_eq!(rewritten.uuid, inherited.uuid);
-    assert_ne!(rewritten.base_id, inherited.base_id);
+    let preserved = second.load_indices().await.unwrap()[0].clone();
+    assert_eq!(preserved, inherited);
+    assert_eq!(
+        second.manifest().base_paths[&preserved.base_id.unwrap()].path,
+        root.uri()
+    );
     let mut scanner = second.scan();
     scanner.filter("value = 1").unwrap();
     assert!(
@@ -6537,14 +6539,7 @@ async fn stock_lance_nested_clone_overwrites_inherited_index_base_issue_7840() {
             .unwrap()
             .contains("ScalarIndexQuery")
     );
-    let result = match scanner.try_into_stream().await {
-        Ok(stream) => stream.try_collect::<Vec<RecordBatch>>().await.map(|_| ()),
-        Err(error) => Err(error),
-    };
-    assert!(
-        result.is_err(),
-        "remove the engine index-origin adapter when stock Lance preserves inherited bases"
-    );
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 1);
 }
 
 /// Runtime guard — the rrf prefilter gate's linchpin (PR #587): BM25 scores
@@ -7026,11 +7021,11 @@ async fn index_delta_segment_serves_stale_entries_of_an_updated_row() {
 }
 
 /// A branch ref read racing `replace_metadata` on the same ref must succeed:
-/// the ref is never deleted, so any error is a torn read (Lance 11.0.0 read refs
+/// the ref is never deleted, so any error is a torn read (Lance 13.0.0 reads refs
 /// as `head` then `get_range`, and a rewrite between the two calls yields a prefix).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "lance-one-get-ref-read: needs a Lance whose `from_path` reads a ref in one `get` \
-            (the 0179 Lance PR); red on 11.0.0, which reads `head` then `get_range`. Un-ignore \
+            (the 0179 Lance PR); still red on 13.0.0, which reads `head` then `get_range`. Un-ignore \
             at that bump, where the `branch_control` stale-head tests go red and the retry arm leaves"]
 async fn branch_ref_read_survives_concurrent_metadata_rewrite() {
     let unique = std::time::SystemTime::now()
@@ -8383,7 +8378,7 @@ async fn native_ref_unlink_keeps_descendant_head_and_fork_point_readable() {
     assert_eq!(rfc_detached_only_values(&fork).await, fork_rows);
 }
 
-/// Lance 11 refuses a null VALUE inside a packed struct child (the children may be declared
+/// Lance 13 refuses a null VALUE inside a packed struct child (the children may be declared
 /// nullable) and cannot project a fixed-width child alone, so the stamp-12 `__manifest` keeps its
 /// nulls in `record`'s `present` child and scans `record` whole; red at the bump lifting either.
 #[tokio::test]
@@ -8427,7 +8422,7 @@ async fn packed_struct_refuses_null_values_and_lone_child_projection_lance_11() 
         UInt64Array::from(vec![Some(1u64), Some(2)]),
     )
     .await;
-    let error = refused.expect_err("Lance 11 refuses a null inside a packed struct child");
+    let error = refused.expect_err("Lance 13 refuses a null inside a packed struct child");
     assert!(
         error
             .to_string()
@@ -8456,7 +8451,7 @@ async fn packed_struct_refuses_null_values_and_lone_child_projection_lance_11() 
         Err(error) => Err(error),
     };
     let error = child_alone
-        .expect_err("Lance 11 cannot decode a fixed-width child of a packed struct on its own");
+        .expect_err("Lance 13 cannot decode a fixed-width child of a packed struct on its own");
     assert!(
         error
             .to_string()
@@ -8467,7 +8462,7 @@ async fn packed_struct_refuses_null_values_and_lone_child_projection_lance_11() 
     filtered.project(&["id", "record"]).unwrap();
     filtered.filter("id = 'b'").unwrap();
     let error = filtered.try_into_batch().await.expect_err(
-        "Lance 11's default materialization splits the fixed child out of a packed struct",
+        "Lance 13's default materialization splits the fixed child out of a packed struct",
     );
     assert!(
         error

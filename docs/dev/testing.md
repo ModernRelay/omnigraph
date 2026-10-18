@@ -140,7 +140,23 @@ Run this first for every Lance change:
 cargo test -p omnigraph-engine --test lance_surface_guards
 ```
 
-The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, index coverage and segment ownership, stable row IDs, vector ordering fences, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and its guard together.
+The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, index coverage and segment ownership, stable row IDs, vector ordering fences, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and replace its negative guard with the native behavior the caller now requires. A persisted layout still needs its own format decision.
+
+Qualify a dependency bump in both debug and release profiles: upstream unstable
+capabilities can have different gates under `debug_assertions`. Run the native
+surface guards in each profile, then the affected write, schema, branch,
+search, maintenance, Blob and bounded-memory owners listed in
+[the compatibility table](lance.md#current-compatibility-fences). Keep the
+canonical workspace, GQT, Clippy and configured object-store gates as separate
+evidence; a local file pass does not qualify S3 or Azure.
+
+Cross-version evidence must begin with bytes written by the genuine predecessor,
+not a current fixture with a changed writer version. Check indexed and uncovered
+search, nullable vectors, managed Blob payloads, branches and historical reads
+before and after candidate writes, compaction and cleanup. Restore a whole-root
+backup and read the candidate-written root with the predecessor before claiming
+a qualified rollback. This is independent of graph-stamp conversion; unchanged
+V2_2 files and format 16 do not establish reader compatibility on their own.
 
 ## Server and CLI ownership
 
@@ -275,7 +291,8 @@ The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0
 
 The separate `Storage Upgrade Compatibility` CI job requires the
 `storage_upgrade` cases of `integration/crossversion_upgrade.rs` (the report on a fresh
-graph, the cluster-path refusal and the five genuine journeys:
+graph, the cluster-path refusal and the six genuine journeys:
+`genuine_lance11_storage_upgrade_round_trip`,
 `genuine_v13_storage_upgrade_preserves_history`,
 `genuine_v0_11_0_storage_upgrade_preserves_history`,
 `genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`,
@@ -283,6 +300,20 @@ graph, the cluster-path refusal and the five genuine journeys:
 `genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`), the engine
 `db::upgrade::tests`, `lance_version_columns` and `forbidden_apis`. Missing
 cases, empty runs and skipped required cases fail the job.
+
+The Lance dependency journey uses `OMNIGRAPH_LANCE11_BIN`. CI builds the exact
+main commit `0a62bb7b2aa5b99b012f413807c216277f7f9596`, pinned as
+`LANCE11_SOURCE_COMMIT`, and the test checks its actual manifest writer version
+is Lance 11.0.0. Both writers use graph format 16; this journey calls no
+`upgrade`. The predecessor builds full-text and vector indexes, managed Blobs,
+nullable outer vectors, an uncovered search tail, branches and history. Cold
+candidate reads must leave its whole root unchanged, including index UUIDs and
+analyzer certificates. Candidate writes, an explicit full-text rebuild, optimize and cleanup are followed by
+predecessor reads of the new state and retained snapshots, including an old
+untrained analyzer declaration and newly built candidate postings. Finally the test
+restores its offline whole-root byte-copy backup at the original path and reads
+it with both binaries. This qualifies those exercised shapes, not arbitrary
+external Lance datasets or every possible downgrade.
 
 The stamp-13 journey needs the stamp-13 CLI: the job builds it from the commit
 `ci.yml` pins as `STAMP_13_SOURCE_COMMIT` and exports `OMNIGRAPH_V13_BIN`. It
@@ -323,14 +354,14 @@ print `0.11.0`, so these journeys prove their source by the stamp
 `snapshot --json` reports, not by `--version`.
 
 Each journey resolver reads its variable, else the binary under
-`target/storage-upgrade-binaries/` (`stamp-13/`, `v0.11.0/`, `v0.10.0/`).
+`target/storage-upgrade-binaries/` (`lance-11/`, `stamp-13/`, `v0.11.0/`, `v0.10.0/`).
 Without a binary the journey prints a skip line locally and panics when
 `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1`, as CI sets. The v6 format fence
 reads `OMNIGRAPH_V6_BIN` alone and skips when it is unset, whatever that
 variable says. To run the
-crossversion scope locally, build the stamp-13 predecessor as for the v5 fence
-above, install the two releases with `scripts/install.sh` (`VERSION=v0.11.0`
-and `VERSION=v0.10.0`, each with its `INSTALL_DIR`), place the three binaries
+crossversion scope locally, build the pinned Lance 11 and stamp-13 predecessors
+as for the v5 fence above, install the two releases with `scripts/install.sh` (`VERSION=v0.11.0`
+and `VERSION=v0.10.0`, each with its `INSTALL_DIR`), place the four binaries
 in those directories and run the job's sequence (bash: the cases live in the
 CLI's `integration` binary, where a bare `crossversion_upgrade::` filter would
 add the module's other journeys, so the exact names come from the compiled
@@ -382,7 +413,7 @@ The system tests start workspace binaries on ephemeral localhost ports. Set `OMN
 Unix-only release qualification test. It creates genuine 0.12 receipts, stops
 the old server, converts the ledger, checks data/history/schema identity and
 historical reads, then applies live schema and policy changes. Storage is
-served at format 14 until the candidate's first publish stamps a branch 15.
+served at format 14 until the candidate's first publish stamps a branch 16.
 Ordinary CI keeps current-version live-deployment coverage; it does
 not download 0.12 or run this journey.
 

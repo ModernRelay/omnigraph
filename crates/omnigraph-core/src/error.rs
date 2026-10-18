@@ -1119,7 +1119,9 @@ fn classify_engine_storage_source<'a>(
             return Break(StorageFailureKind::Unknown);
         }
         return match error {
-            lance::Error::Timeout { .. } => Break(StorageFailureKind::Transient),
+            lance::Error::Timeout { .. } | lance::Error::Backpressure { .. } => {
+                Break(StorageFailureKind::Transient)
+            }
             lance::Error::DiskCapExceeded { .. }
             | lance::Error::InvalidInput { .. }
             | lance::Error::InvalidTableLocation { .. }
@@ -1569,6 +1571,13 @@ mod tests {
         use lance::Error;
 
         assert_lance_kind(Error::timeout("timeout"), StorageFailureKind::Transient);
+        assert_lance_kind(Error::backpressure("busy"), StorageFailureKind::Transient);
+        // A refused substrate write does not prove that the whole graph
+        // operation had no earlier effects, and does not authorize replay.
+        assert_eq!(
+            OmniError::storage(Error::backpressure("busy")).completion_evidence(),
+            None
+        );
 
         for error in [
             Error::disk_cap_exceeded(1, 2),
@@ -1677,6 +1686,7 @@ mod tests {
             for source in [
                 lance::Error::not_found("manifest probe"),
                 lance::Error::timeout("manifest probe"),
+                lance::Error::backpressure("manifest probe"),
                 lance::Error::version_conflict("manifest probe", 43, 42),
             ] {
                 let error = lance::Error::commit_status_unknown_source(42, Box::new(source));

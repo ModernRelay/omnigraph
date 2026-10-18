@@ -9527,6 +9527,15 @@ async fn state_scan_projection_leaves_the_content_columns_unread() {
 pub(super) struct SmallScanProbeMarker;
 
 impl lance::io::WrappingObjectStore for SmallScanProbeMarker {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // This wrapper does not observe or change listings.
+        Some(original)
+    }
+
     fn wrap(
         &self,
         _: &str,
@@ -9574,6 +9583,15 @@ impl HistoryGets {
 }
 
 impl lance::io::WrappingObjectStore for HistoryGets {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // Keep listings on the wrapped path so faults and request accounting apply.
+        None
+    }
+
     fn wrap(
         &self,
         _: &str,
@@ -10384,6 +10402,15 @@ struct HistoryPutFault {
 }
 
 impl lance::io::WrappingObjectStore for HistoryPutFault {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // This wrapper does not observe or change listings.
+        Some(original)
+    }
+
     fn wrap(
         &self,
         _: &str,

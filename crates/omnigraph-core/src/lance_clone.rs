@@ -1,4 +1,4 @@
-//! Index-origin preservation at Lance's public shallow-clone commit boundary.
+//! Source validation at Lance's public shallow-clone commit boundary.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use lance_table::format::pb::{FragmentReuseIndexDetails, transaction};
 use lance_table::format::{BasePath, IndexMetadata, Manifest, Transaction};
 use lance_table::io::commit::{
     CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
+    PredecessorIdentity,
 };
 use lance_table::io::manifest::read_manifest_indexes;
 use object_store::ObjectStore as RawObjectStore;
@@ -32,7 +33,6 @@ struct CloneContext {
     source: Path,
     source_location: ManifestLocation,
     source_indices: Vec<IndexMetadata>,
-    inline_fragment_reuse_details: HashMap<usize, Vec<u8>>,
     expected_bases: HashMap<u32, BasePath>,
     new_base_id: u32,
 }
@@ -52,11 +52,8 @@ impl CloneContext {
         } else {
             Vec::new()
         };
-        let mut inline_fragment_reuse_details = HashMap::new();
-        for (ordinal, index) in source_indices.iter().enumerate() {
-            if let Some(details) = normalize_fragment_reuse(source, index).await? {
-                inline_fragment_reuse_details.insert(ordinal, details);
-            }
+        for index in &source_indices {
+            validate_fragment_reuse(source, index).await?;
         }
         let new_base_id = match source.manifest().base_paths.keys().max() {
             Some(id) => id
@@ -87,7 +84,6 @@ impl CloneContext {
             source: source.branch_location().path,
             source_location: source.manifest_location().clone(),
             source_indices,
-            inline_fragment_reuse_details,
             expected_bases,
             new_base_id,
         })
@@ -109,13 +105,13 @@ impl CloneContext {
         .then(|| location.clone())
     }
 
-    fn correct(
+    fn validate(
         &self,
         manifest: &Manifest,
-        indices: Option<Vec<IndexMetadata>>,
+        indices: Option<&[IndexMetadata]>,
         base_path: &Path,
         transaction: &Transaction,
-    ) -> Result<Option<Vec<IndexMetadata>>> {
+    ) -> Result<()> {
         let transaction = transaction.as_pb();
         if base_path != &self.target
             || transaction.read_version != self.operation.ref_version
@@ -128,9 +124,9 @@ impl CloneContext {
                 "shallow clone does not match its captured source and target",
             ));
         }
-        let Some(mut indices) = indices else {
+        let Some(indices) = indices else {
             return if self.source_indices.is_empty() {
-                Ok(None)
+                Ok(())
             } else {
                 Err(Error::invalid_input(
                     "shallow clone lost its captured index metadata",
@@ -142,9 +138,9 @@ impl CloneContext {
                 "shallow clone index inventory changed",
             ));
         }
-        for (ordinal, (index, source)) in indices.iter_mut().zip(&self.source_indices).enumerate() {
+        for (index, source) in indices.iter().zip(&self.source_indices) {
             let expected_base = source.base_id.or(Some(self.new_base_id));
-            if index.base_id != Some(self.new_base_id) && index.base_id != expected_base {
+            if index.base_id != expected_base {
                 return Err(Error::invalid_input(format!(
                     "shallow clone index {} has an unexpected base ID",
                     index.uuid
@@ -158,33 +154,25 @@ impl CloneContext {
                     index.uuid
                 )));
             }
-            index.base_id = expected_base;
-            if let Some(inline) = self.inline_fragment_reuse_details.get(&ordinal) {
-                let details = index
-                    .index_details
-                    .as_mut()
-                    .ok_or_else(|| Error::index("captured fragment-reuse details disappeared"))?;
-                Arc::make_mut(details).value = inline.clone();
-            }
         }
-        Ok(Some(indices))
+        Ok(())
     }
 }
 
-async fn normalize_fragment_reuse(
-    source: &Dataset,
-    index: &IndexMetadata,
-) -> Result<Option<Vec<u8>>> {
+// Native Lance preserves inherited index origins, including external FRI details.
+// It does not validate a legacy external payload before publishing a clone, so
+// check its actual range and decoded content here without rewriting the artifact.
+async fn validate_fragment_reuse(source: &Dataset, index: &IndexMetadata) -> Result<()> {
     let Some(details) = index
         .index_details
         .as_ref()
         .filter(|details| details.type_url.ends_with("FragmentReuseIndexDetails"))
     else {
-        return Ok(None);
+        return Ok(());
     };
     let details = details.to_msg::<FragmentReuseIndexDetails>()?;
     match details.content {
-        Some(Content::Inline(_)) => Ok(None),
+        Some(Content::Inline(_)) => Ok(()),
         Some(Content::External(external)) => {
             let directory = match index.base_id {
                 None => source.indices_dir(),
@@ -209,13 +197,8 @@ async fn normalize_fragment_reuse(
             let range = fragment_reuse_range(external.offset, external.size, reader.size().await?)?;
             let bytes = reader.get_range(range).await?;
             let inline = InlineContent::decode(bytes)?;
-            lance_table::system_index::frag_reuse::FragReuseIndexDetails::try_from(inline.clone())?;
-            Ok(Some(
-                FragmentReuseIndexDetails {
-                    content: Some(Content::Inline(inline)),
-                }
-                .encode_to_vec(),
-            ))
+            lance_table::system_index::frag_reuse::FragReuseIndexDetails::try_from(inline)?;
+            Ok(())
         }
         None => Err(Error::index("fragment-reuse index details have no content")),
     }
@@ -242,13 +225,44 @@ fn fragment_reuse_range(
 }
 
 #[derive(Debug)]
-struct IndexOriginCommitHandler {
+struct ClonePreflightCommitHandler {
     inner: Arc<dyn CommitHandler>,
     reuse_main_source_location: bool,
 }
 
+impl ClonePreflightCommitHandler {
+    fn validate_clone(
+        &self,
+        manifest: &Manifest,
+        indices: Option<&[IndexMetadata]>,
+        base_path: &Path,
+        transaction: Option<&Transaction>,
+    ) -> Result<()> {
+        match transaction {
+            Some(transaction) if matches!(transaction.as_pb().operation.as_ref(), Some(transaction::Operation::Clone(operation)) if operation.is_shallow) => {
+                CLONE_CONTEXT
+                    .try_with(|context| context.validate(manifest, indices, base_path, transaction))
+                    .map_err(|_| {
+                        Error::invalid_input("shallow clone has no scoped source-index context")
+                    })?
+            }
+            _ => {
+                if CLONE_CONTEXT
+                    .try_with(|context| context.target == *base_path)
+                    .unwrap_or(false)
+                {
+                    return Err(Error::invalid_input(
+                        "scoped shallow clone has no matching inline transaction",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 pub fn wrap_commit_handler(inner: Arc<dyn CommitHandler>) -> Arc<dyn CommitHandler> {
-    Arc::new(IndexOriginCommitHandler {
+    Arc::new(ClonePreflightCommitHandler {
         inner,
         reuse_main_source_location: false,
     })
@@ -278,7 +292,7 @@ pub async fn configured_commit_handler(
                 | "goosefs"
         )
     });
-    Ok(Arc::new(IndexOriginCommitHandler {
+    Ok(Arc::new(ClonePreflightCommitHandler {
         inner: lance_table::io::commit::commit_handler_from_url(uri, params).await?,
         reuse_main_source_location,
     }))
@@ -306,7 +320,7 @@ pub async fn create_branch(
 }
 
 #[async_trait]
-impl CommitHandler for IndexOriginCommitHandler {
+impl CommitHandler for ClonePreflightCommitHandler {
     fn is_version_not_found_definitive(&self) -> bool {
         self.inner.is_version_not_found_definitive()
     }
@@ -393,27 +407,12 @@ impl CommitHandler for IndexOriginCommitHandler {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
-        let indices = match transaction.as_ref() {
-            Some(transaction) if matches!(transaction.as_pb().operation.as_ref(), Some(transaction::Operation::Clone(operation)) if operation.is_shallow) => {
-                CLONE_CONTEXT
-                    .try_with(|context| context.correct(manifest, indices, base_path, transaction))
-                    .map_err(|_| {
-                        Error::invalid_input("shallow clone has no scoped source-index context")
-                    })??
-            }
-            _ => {
-                if CLONE_CONTEXT
-                    .try_with(|context| context.target == *base_path)
-                    .unwrap_or(false)
-                {
-                    return Err(Error::invalid_input(
-                        "scoped shallow clone has no matching inline transaction",
-                    )
-                    .into());
-                }
-                indices
-            }
-        };
+        self.validate_clone(
+            manifest,
+            indices.as_deref(),
+            base_path,
+            transaction.as_ref(),
+        )?;
         self.inner
             .commit(
                 manifest,
@@ -424,6 +423,68 @@ impl CommitHandler for IndexOriginCommitHandler {
                 naming_scheme,
                 transaction,
             )
+            .await
+    }
+
+    fn supports_predecessor_condition(&self) -> bool {
+        self.inner.supports_predecessor_condition()
+    }
+
+    async fn resolve_latest_identity(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> Result<Option<PredecessorIdentity>> {
+        self.inner
+            .resolve_latest_identity(base_path, object_store)
+            .await
+    }
+
+    async fn resolve_identity(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+        version: u64,
+    ) -> Result<Option<PredecessorIdentity>> {
+        self.inner
+            .resolve_identity(base_path, object_store, version)
+            .await
+    }
+
+    async fn commit_after(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &Path,
+        object_store: &ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<Transaction>,
+        predecessor: &PredecessorIdentity,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        self.validate_clone(
+            manifest,
+            indices.as_deref(),
+            base_path,
+            transaction.as_ref(),
+        )?;
+        self.inner
+            .commit_after(
+                manifest,
+                indices,
+                base_path,
+                object_store,
+                manifest_writer,
+                naming_scheme,
+                transaction,
+                predecessor,
+            )
+            .await
+    }
+
+    async fn forget_version(&self, base_path: &Path, version: u64, identity: &str) -> Result<()> {
+        self.inner
+            .forget_version(base_path, version, identity)
             .await
     }
 
@@ -444,6 +505,60 @@ mod tests {
         }
         fn propagate_commit_error_after_success(&self) -> bool {
             false
+        }
+
+        fn supports_predecessor_condition(&self) -> bool {
+            true
+        }
+
+        async fn resolve_latest_identity(
+            &self,
+            _base_path: &Path,
+            _object_store: &ObjectStore,
+        ) -> Result<Option<PredecessorIdentity>> {
+            Ok(Some(PredecessorIdentity {
+                version: 7,
+                identity: "configured latest".to_owned(),
+            }))
+        }
+
+        async fn resolve_identity(
+            &self,
+            _base_path: &Path,
+            _object_store: &ObjectStore,
+            version: u64,
+        ) -> Result<Option<PredecessorIdentity>> {
+            Ok(Some(PredecessorIdentity {
+                version,
+                identity: "configured version".to_owned(),
+            }))
+        }
+
+        async fn commit_after(
+            &self,
+            _manifest: &mut Manifest,
+            _indices: Option<Vec<IndexMetadata>>,
+            _base_path: &Path,
+            _object_store: &ObjectStore,
+            _writer: ManifestWriter,
+            _scheme: ManifestNamingScheme,
+            _transaction: Option<Transaction>,
+            predecessor: &PredecessorIdentity,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            assert_eq!(predecessor.version, 7);
+            assert_eq!(predecessor.identity, "configured latest");
+            Err(Error::io("configured conditional commit").into())
+        }
+
+        async fn forget_version(
+            &self,
+            _base_path: &Path,
+            version: u64,
+            identity: &str,
+        ) -> Result<()> {
+            assert_eq!(version, 3);
+            assert_eq!(identity, "configured version");
+            Err(Error::io("configured retirement"))
         }
 
         async fn resolve_version_location(
@@ -486,6 +601,41 @@ mod tests {
         let handler = params.commit_handler.unwrap();
         assert!(handler.is_version_not_found_definitive());
         assert!(!handler.propagate_commit_error_after_success());
+        assert!(handler.supports_predecessor_condition());
+        let path = Path::from("dataset");
+        let store = ObjectStore::from_uri("memory://delegation")
+            .await
+            .unwrap()
+            .0;
+        let latest_identity = handler
+            .resolve_latest_identity(&path, &store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            latest_identity,
+            PredecessorIdentity {
+                version: 7,
+                identity: "configured latest".to_owned(),
+            }
+        );
+        let version_identity = handler
+            .resolve_identity(&path, &store, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            version_identity,
+            PredecessorIdentity {
+                version: 3,
+                identity: "configured version".to_owned(),
+            }
+        );
+        let error = handler
+            .forget_version(&path, version_identity.version, &version_identity.identity)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("configured retirement"));
         let backend = object_store::memory::InMemory::new();
         let error = handler
             .resolve_version_location(&Path::from("dataset"), 1, &backend)
@@ -519,11 +669,8 @@ mod tests {
             .commit(
                 Arc::make_mut(&mut source.manifest),
                 None,
-                &Path::from("dataset"),
-                &ObjectStore::from_uri("memory://delegation")
-                    .await
-                    .unwrap()
-                    .0,
+                &path,
+                &store,
                 lance_table::io::commit::write_manifest_file_to_path,
                 ManifestNamingScheme::V1,
                 None,
@@ -531,6 +678,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(Error::from(error).to_string().contains("configured commit"));
+        let error = handler
+            .commit_after(
+                Arc::make_mut(&mut source.manifest),
+                None,
+                &path,
+                &store,
+                lance_table::io::commit::write_manifest_file_to_path,
+                ManifestNamingScheme::V1,
+                None,
+                &latest_identity,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            Error::from(error)
+                .to_string()
+                .contains("configured conditional commit")
+        );
     }
 
     #[tokio::test]
@@ -1106,17 +1271,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_fragment_reuse_is_inlined_from_local_and_inherited_origins() {
+    async fn external_fragment_reuse_preserves_local_and_inherited_origins() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("external-fri.lance");
         let uri = uri.to_str().unwrap();
         let inline = InlineContent {
-            versions: vec![
+            legacy_versions: vec![
                 lance_table::format::pb::fragment_reuse_index_details::Version {
                     dataset_version: 1,
                     groups: vec![],
                 },
             ],
+            transitions: vec![],
         };
         let payload = inline.encode_to_vec();
         let payload_size = u64::try_from(payload.len()).unwrap();
@@ -1129,8 +1295,8 @@ mod tests {
         let mut local = engine_open(uri).await;
         let mut inherited = engine_open(stock_first.uri()).await;
         for (source, branch) in [
-            (&mut local, "local_normalized"),
-            (&mut inherited, "inherited_normalized"),
+            (&mut local, "local_origin"),
+            (&mut inherited, "inherited_origin"),
         ] {
             let source_indices = read_manifest_indexes(
                 &source.object_store(None).await.unwrap(),
@@ -1181,7 +1347,8 @@ mod tests {
                     .unwrap()
                     .to_msg::<FragmentReuseIndexDetails>()
                     .unwrap();
-                assert_eq!(proto.content, Some(Content::Inline(inline.clone())));
+                assert!(matches!(proto.content, Some(Content::External(_))));
+                assert_eq!(fri.index_details, source_fri.index_details);
                 let base = fri.base_id.unwrap();
                 assert_eq!(dataset.manifest().base_paths[&base].path, raw.uri());
                 let loaded = lance::index::frag_reuse::load_frag_reuse_index_details(dataset, fri)
