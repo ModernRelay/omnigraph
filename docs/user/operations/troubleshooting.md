@@ -86,7 +86,7 @@ current state before another attempt; an output failure does not undo the write.
 The same applies to `load`, `blob put`, `blob clear` and `schema apply`: a closed
 output pipe or failed result flush can follow a successful write. The CLI exits with a failure
 and does not repeat the operation. If stdout cannot carry a JSON failure, stderr
-reports the undelivered diagnostic and its outcome.
+reports the undelivered diagnostic and its outcome, and the exit still follows it.
 
 The exit follows from the outcome:
 
