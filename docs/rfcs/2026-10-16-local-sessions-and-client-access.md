@@ -1,6 +1,6 @@
 ---
 rfc: "2026-10-16-local-sessions-and-client-access"
-title: "Local graph sessions and client access"
+title: "Local graph servers and client access"
 track: maintainer
 status: draft
 implementation: not-started
@@ -15,7 +15,7 @@ blocked_on:
   - "Named targets and CLI coherency (RFC 0059, PR #675) must be accepted: every command here addresses graphs only through `--target`, and this RFC defines the one target writer RFC 0059 does not yet allow."
 ---
 
-# RFC: Local graph sessions and client access
+# RFC: Local graph servers and client access
 
 > A term set in ***bold italics*** is defined at that spot; it is plain text afterwards.
 
@@ -27,25 +27,28 @@ gives. Its scope is the part that can ship on its own; changes with a wider
 blast radius are in [Appendix A](#appendix-a-changes-for-separate-decisions),
 each with a recommended RFC or issue.
 
-1. **Local graph sessions.** A ***session*** is one `omnigraph` process that
-   serves one directly accessed graph on loopback, through the HTTP API and
-   `/mcp`, to clients of the same OS account on the same machine.
-   `omnigraph serve --target NAME` starts one. It is read-only unless
-   `--write` is given, never unauthenticated, never holds cluster admission,
-   and installs a generated Cedar policy on the engine. Its ***session
-   record*** names its URL, token, access mode and actor, so a same-account
-   client attaches by reading it. A graph has at most one session, found
-   through its record.
+1. **Local graph servers.** A ***local server*** is one `omnigraph` process
+   that serves one directly accessed graph on loopback, through the HTTP API
+   and `/mcp`, to clients of the same OS account on the same machine:
+   `omnigraph-server` serves clusters to anyone holding a token, and
+   `omnigraph serve` serves one graph to you. `omnigraph serve --target NAME`
+   starts one. It is read-only unless `--write` is given, never
+   unauthenticated, never holds cluster admission, and installs a generated
+   Cedar policy on the engine. Its ***server record*** names its URL, token,
+   access mode and actor, so a same-account client attaches by reading it. A
+   graph has at most one local server, found through its record, and
+   `omnigraph targets --json` lists the live ones.
 2. **A thin Studio launcher.** `omnigraph studio --target NAME` opens
    `omnigraph-studio://open?target=NAME` and exits, as `codex app` opens the
-   Codex app. Studio owns its sessions: it runs
+   Codex app. Studio owns its local servers: it runs
    `omnigraph serve --target NAME --reuse --json`, which attaches to the
-   graph's live session or starts one as Studio's child. Links carry no secret,
-   no path and no request for write access.
+   graph's live local server or starts one as Studio's child. Links carry no
+   secret, no path and no request for write access.
 3. **MCP for agents.** `omnigraph mcp --target NAME` is a stdio MCP endpoint for
    local graphs and static-token servers, so no agent configuration holds a
    token. Write tools need the endpoint's permission and the agent's own
-   `--write`.
+   `--write`. Each place an agent runs has one write path
+   ([Which path an agent uses](#which-path-an-agent-uses)).
 4. **One registry of targets and static tokens.** The CLI stays the only
    resolver and writer of the operator's targets and static tokens.
    `omnigraph targets` lists, adds and removes targets, and
@@ -78,11 +81,11 @@ package, and defers a stdio bridge "only if local desktop clients need it".
 
 **Several processes reach one graph.** Studio, its agents and terminal agents
 will touch one local graph at once. The engine supports schema apply, branch
-creation and deletion, and cleanup from one writer process only
-([support boundaries](../dev/invariants.md#current-support-boundaries)). A
-session gives every client that attaches to it one writer process. The gap that
-remains for processes that do not attach exists today and is
-[Appendix A1](#a1-cross-process-writer-safety).
+creation and deletion, and cleanup from one writer process only ([support
+boundaries](../dev/invariants.md#current-support-boundaries)). A local server
+gives every client that attaches to it one writer process. The gap that remains
+for processes that do not attach exists today and is [Appendix
+A1](#a1-cross-process-writer-safety).
 
 **A loopback port is exposed.** Every local process can reach it, and web pages
 can through DNS rebinding. The REST routes have no `Host` check and no CORS
@@ -108,16 +111,17 @@ and an exception to RFC 0059's rule against target-administration commands.
 ### Commands
 
 ```bash
-omnigraph serve --target local                     # read-only session
-omnigraph serve --target local --write             # read-write, as operator.actor
-omnigraph serve --target brain --graph people      # cluster graph: read-only
-omnigraph studio --target local                    # open a graph in Studio
-omnigraph mutate --target local --session -e '…'   # write through the live session
-omnigraph mcp --target local                       # stdio MCP, read tools
-omnigraph mcp --target prod --graph people --write # stdio MCP with write tools
-omnigraph targets --json                           # targets and aliases, no secrets
-omnigraph targets add staging --json < entry.json  # the CLI writes the config
-omnigraph credential --target prod --json | …      # a target's static token, to a pipe
+omnigraph serve --target local                        # read-only local server
+omnigraph serve --target local --write                # read-write, as operator.actor
+omnigraph serve --target brain --graph people         # cluster graph: read-only
+omnigraph studio --target local                       # open a graph in Studio
+omnigraph mutate --target local --via-server -e '…'   # write through the live local server
+omnigraph mcp --target local                          # stdio MCP, read tools
+omnigraph mcp --target prod --graph people --write    # stdio MCP with write tools
+omnigraph targets --json                              # targets, aliases, live local servers; no secrets
+omnigraph targets add staging --json < entry.json     # the CLI writes the config
+omnigraph targets remove staging                      # and removes an entry
+omnigraph credential --target prod --json | …         # a target's static token, to a pipe
 ```
 
 Every command here selects its destination as RFC 0059 does, `--target`, else
@@ -125,11 +129,12 @@ Every command here selects its destination as RFC 0059 does, `--target`, else
 compatibility interval, and refuses in a legacy-format operator home
 (`legacy_operator_config`). A graph-scoped kind needs `--graph` or the target's
 `default_graph`; a direct graph target already names its graph and rejects
-`--graph`.
+`--graph`. A command refuses a target kind its column below marks refused
+(`target_kind_unsupported`); [Refusals](#refusals) lists every code.
 
 | Target kind (RFC 0059) | `serve` | `studio` | `mcp` | `credential` |
 |---|---|---|---|---|
-| Direct graph, outside a cluster | Read-only, or read-write with `--write` | Opens Studio, which attaches to or starts a session | Relays to the live session, or hosts one | Refused: sessions carry their own token |
+| Direct graph, outside a cluster | Read-only, or read-write with `--write` | Opens Studio, which attaches to or starts a local server | Relays to the live local server, or hosts one | Refused: a local server's token is in its record |
 | Direct root with `--graph`, or a direct graph under a cluster root (a cluster graph) | Read-only only | As above, read-only | As above, read-only | Refused |
 | Direct catalogue (`og_catalog`) | Refused | Refused | Refused | Refused |
 | Server with a token owner | Refused: the graph already has a server | Opens Studio on it | Relays to the server's `/mcp` with the owner's token | Returns the owner's token |
@@ -138,100 +143,114 @@ compatibility interval, and refuses in a legacy-format operator home
 | Managed cluster | Refused | Refused until [A4](#a4-oauth-for-standard-clients-and-managed-access) | Refused until [A5](#a5-mcp-relay-for-managed-targets) | Refused: managed credentials stay the CLI's |
 | Managed account | Refused | Refused | Refused | Refused |
 
-A session on a cluster graph is the direct-storage view, the same view direct
-CLI reads have. It applies none of the cluster's Cedar policy, stored queries,
-embedding-provider bindings or external-Blob policy, and its startup line says
-so, naming the cluster's server target as the served view when one exists.
+A local server on a cluster graph is the direct-storage view, the same view
+direct CLI reads have. It applies none of the cluster's Cedar policy, stored
+queries, embedding-provider bindings or external-Blob policy, and its startup
+line says so, naming the cluster's server target as the served view when one
+exists.
 
-### Session access and actor
+### Access and actor
 
-A session is read-only unless `--write` is given. `--write` needs an actor,
+A local server is read-only unless `--write` is given. `--write` needs an actor,
 from `--as` or else `operator.actor`, and refuses before opening anything
 without one (`actor_required`); it refuses for a cluster graph
-(`cluster_graph_read_only`). A read-only session uses `operator.actor` when it
-is set and otherwise the actor `default`, the actor a single unnamed server
+(`cluster_graph_read_only`). A read-only local server uses `operator.actor` when
+it is set and otherwise the actor `default`, the actor a single unnamed server
 token already resolves to.
 
 | | Read-only | Read-write |
 |---|---|---|
 | Granted | `read`, `export` on every branch and graph-wide; `graph_list` | Also `change`, `branch_create`, `branch_delete`, `branch_merge`, `commit_publish`, `commit_drop` |
 | Never granted | `schema_apply`, `admin`, `config_manage`, `invoke_query`, and any action not named above | The same |
-| Write routes | 403 `read_only_session` before the body is read | Admitted |
+| Write routes | 403 `forbidden`, the code a policy refusal carries, before the body is read | Admitted |
 | `/mcp` | Read tools only | Read and write tools |
 
 - **Every action is classified.** The generated policy decides each
   `PolicyAction` by an exhaustive match, so an action added later is never
-  granted until an RFC names its session class. Read-only therefore holds even
-  if maintenance or schema apply later arrive through `/mutate`.
-- **One actor per session.** Studio, its agents and terminal agents that
-  attach all write as the session's actor. Commits, batched commits and branch
-  creators cannot tell them apart.
+  granted until an RFC names its local-server class. Read-only therefore holds
+  even if maintenance or schema apply later arrive through `/mutate`.
+- **One actor per local server.** Studio, its agents and terminal agents that
+  attach all write as the local server's actor. Commits, batched commits and
+  branch creators cannot tell them apart.
 - **Previews are routed as writes.** A merge `dry_run` is documented as a read
   of both branches but sent to `/branches/merge`, which ingress classifies as a
-  write before reading the body, so a read-only session refuses it. A future
-  preview needs a read-class route to work there.
-- **Schema.** No session mounts deployment, schema-apply or maintenance
+  write before reading the body, so a read-only local server refuses it. A
+  future preview needs a read-class route to work there.
+- **Schema.** No local server mounts deployment, schema-apply or maintenance
   routes; schema apply and maintenance stay direct CLI commands. A read-write
-  session's merge can still carry a newer schema into a branch once
+  local server's merge can still carry a newer schema into a branch once
   [schema apply with live branches](https://github.com/ModernRelay/omnigraph/pull/963)
   lands, depending on that RFC's answer to whether `branch_merge` suffices.
 - **Actor views.** On a graph that declares
   [actor views](https://github.com/ModernRelay/omnigraph/pull/951), the
-  generated policy is a version-2 bundle that places the session actor in the
-  views' bypass, as anyone holding storage credentials already sees everything,
-  and the startup line says views are not applied. `--write` refuses there until
-  that RFC's write phase, and the `default` fallback applies only to graphs
-  without actor views.
+  generated policy is a version-2 bundle that places the local server's actor
+  in the views' bypass, as anyone holding storage credentials already sees
+  everything, and the startup line says views are not applied. `--write`
+  refuses there (`actor_views_read_only`) until that RFC's write phase, and the
+  `default` fallback applies only to graphs without actor views.
 
-### Session lifetime and output
+### Lifetime and output
 
-A session runs in the foreground until interrupted, or until its parent closes
-it, and shuts down through the server's bounded shutdown. An uncertain write
-completion makes it exit 2, as `omnigraph-server` does; nothing replays the
-write. Logs and the startup line (the resolved target, access mode, actor and
-URL) go to stderr. A session never exports traces, even when the environment
-names an OTLP endpoint. With `--json`, stdout carries exactly one line, when the
-session is ready:
+A local server runs in the foreground until interrupted, or until its parent
+closes it, and shuts down through the server's bounded shutdown. An uncertain
+write completion makes it exit 2, as `omnigraph-server` does; nothing replays
+the write. Logs and the startup line (the resolved target, access mode, actor
+and URL) go to stderr. A local server never exports traces, even when the
+environment names an OTLP endpoint. With `--json`, stdout carries exactly one
+line, when the local server is ready:
 
 ```json
-{"protocol":1,"session":"01JA9…","reused":false,"url":"http://127.0.0.1:53211","graph_id":"default","access":"read_write","actor":"act-me","binding":"sha256:9e1c…","token":"<bearer>","record":"/tmp/omnigraph-501/sessions/01JA9….json"}
+{"protocol":1,"id":"01JA9…","reused":false,"url":"http://127.0.0.1:53211","graph_id":"default","access":"read_write","actor":"act-me","binding":"sha256:9e1c…","token":"<bearer>","record":"/Users/me/Library/Application Support/OmniGraph/servers/01JA9….json"}
 ```
 
-If that line cannot be delivered, the session shuts down and removes its
-record. The token appears in this line and in the record, never in the human
-banner. `binding` is a digest of the resolved destination, not a secret.
+If that line cannot be delivered, the local server shuts down and removes its
+record. `binding` is a digest of the resolved destination, not a secret.
 `--port <n>` replaces port 0 for SSH forwarding; the bind address is always
 `127.0.0.1`.
 
-### One session per graph
+**No command here writes a token to a terminal.** The ready line carries
+`token` only when stdout is not a terminal; to a terminal it omits the field,
+and the record still holds the token. The human banner never shows it,
+`credential` refuses a terminal (`credential_terminal`), and `targets` never
+carries a token. A caller that needs a token reads it through a pipe, as Studio
+and `omnigraph mcp` do.
 
-Before starting, `serve` looks for a live session with the same canonical root:
+### One local server per graph
 
-- Without `--reuse`, it refuses with `session_exists`, naming the session.
-- With `--reuse`, it prints the live session's line with `"reused": true` and
-  exits 0, unless `--write` was asked of a read-only session
-  (`session_access_mismatch`) or the live session's CLI speaks another HTTP
-  contract or cannot serve the graph's storage format
-  (`session_cli_incompatible`). Studio and `omnigraph mcp` always pass
-  `--reuse`.
+Before starting, `serve` looks for a live local server with the same canonical
+root:
 
-Two launches racing can still start two sessions; both stay correct for rows
-through the manifest CAS, as two CLI processes are today.
+- Without `--reuse`, it refuses with `local_server_exists`, naming it.
+- With `--reuse`, it prints the live local server's line with `"reused": true`
+  and exits 0, unless `--write` was asked of a read-only one
+  (`local_server_access_mismatch`) or its CLI speaks another HTTP contract or
+  cannot serve the graph's storage format (`local_server_cli_incompatible`).
+  Studio and `omnigraph mcp` always pass `--reuse`.
 
-When a direct write command targets a root with a live read-write session, or
-`cleanup` or `optimize` targets a root with any live session, it prints one
-notice to stderr naming the session, then runs as it does today. The notice
-changes no outcome; a cleanup can remove versions beneath a session's in-flight
-reads, which then fail loudly.
+Two launches racing can still start two local servers; both stay correct for
+rows through the manifest CAS, as two CLI processes are today.
 
-`--session` on a data write command (load, mutate, branch create, delete and
+When a direct write command targets a root with a live read-write local
+server, it prints one notice to stderr naming the local server and giving the
+same command with `--via-server` added, so a person or an agent switches in one
+step. With `--json` the notice is one JSON object on stderr,
+`{"notice":"local_server_live","id":"01JA9…","command":["omnigraph","mutate","--target","local","--via-server","-e","…"]}`,
+whose `command` is the argument vector, not a shell string. `cleanup` and
+`optimize` print a notice when any local server holds their root. A notice
+changes no outcome; a cleanup can remove versions beneath a local server's
+in-flight reads, which then fail loudly.
+
+`--via-server` on a data write command (load, mutate, branch create, delete and
 merge, commit publish and drop, Blob put and clear) sends the operation over
-HTTP to the root's live read-write session with its token. A served write's
-actor is the server's, so `--as` is only an assertion that must equal the
-session's actor (`session_actor_mismatch`); `--session` cannot change
-attribution. Outcomes are the served ones: a refusal before effects is "not
-started"; a lost response is unknown and never replayed. Nothing routes a
-command through a session unless `--session` asks.
+HTTP to the root's live read-write local server with its token. It refuses
+before any request when no local server is live for the root
+(`local_server_absent`) or the live one is read-only (`local_server_read_only`).
+A served write's actor is the server's, so `--as` is only an assertion that
+must equal the local server's actor (`local_server_actor_mismatch`);
+`--via-server` cannot change attribution. Outcomes are the served ones: a
+refusal before effects is "not started"; a lost response is unknown and never
+replayed. Nothing routes a command through a local server unless
+`--via-server` asks.
 
 ### Opening Studio
 
@@ -240,33 +259,37 @@ command through a session unless `--session` asks.
 link and exits. It owns nothing at runtime, so its one contract with Studio is
 the link format, which Studio owns.
 
-- On macOS it opens Studio by bundle identifier (`open -b`); elsewhere through
-  the platform opener. When Studio is not installed it prints how to install it
-  and exits nonzero, until [installing Studio](#installing-studio) ships. It
-  never opens a browser.
-- With `--json` it prints the link and the target.
+- On macOS it opens Studio by bundle identifier (`open -b`). On Linux and
+  Windows it opens the link only when the platform names a handler for the
+  scheme (`xdg-mime query default x-scheme-handler/omnigraph-studio`, or the
+  scheme's registry association), because `xdg-open`'s generic path hands an
+  unhandled scheme to a web browser. Without Studio or a handler it prints the
+  link and how to install Studio, and refuses (`studio_unavailable`), until
+  [installing Studio](#installing-studio) ships. It never opens a browser.
+- With `--json` it prints
+  `{"protocol":1,"target":"local","binding":"sha256:…","link":"omnigraph-studio://open?target=local&binding=sha256:…"}`.
 - **Studio resolves the target itself**, through the CLI it chose, and checks
   that its resolution has the link's `binding`. A different digest means the
   link was made under another operator home, and Studio refuses it rather than
   open another graph under the same name. A link never names an executable.
 - For a direct target Studio runs `omnigraph serve --target NAME --reuse --json`
-  and attaches to the session in the line: a live one started by a terminal, an
-  agent or Studio, or a new one that is Studio's child. For a server target it
-  runs `omnigraph credential` and connects directly.
-- A link opens read-only. Read-write is a deliberate action inside Studio,
-  which runs `serve --write --reuse`, or a session the person started with
+  and attaches to the local server in the line: a live one started by a
+  terminal, an agent or Studio, or a new one that is Studio's child. For a
+  server target it runs `omnigraph credential` and connects directly.
+- A link opens read-only. Read-write is a deliberate action inside Studio, which
+  runs `serve --write --reuse`, or a local server the person started with
   `omnigraph serve --write`, which Studio attaches to. A link never writes, as
   Studio's own link rules require.
 - **Environment.** Studio passes the environment of an interactive login shell
   (`$SHELL -i -l`), captured once, to the `serve` and `credential` it runs, and
   to nothing else; agents never receive it. A login shell that is not
-  interactive skips `.zshrc`, where people export keys. A session needs that
-  environment for its storage provider's credentials and for text search: the
-  embedding provider comes from `OMNIGRAPH_EMBED_PROVIDER`,
+  interactive skips `.zshrc`, where people export keys. A local server needs
+  that environment for its storage provider's credentials and for text search:
+  the embedding provider comes from `OMNIGRAPH_EMBED_PROVIDER`,
   `OMNIGRAPH_EMBED_BASE_URL`, `OMNIGRAPH_EMBED_MODEL` and its timeout and retry
   settings, with `OPENAI_API_KEY`, `OPENROUTER_API_KEY` or `GEMINI_API_KEY`. A
-  model that differs from the one a schema's `@embed` records refuses
-  `nearest` with text loudly.
+  model that differs from the one a schema's `@embed` records refuses `nearest`
+  with text loudly.
 - A person who needs a terminal-only environment, such as a one-off
   `AWS_PROFILE`, runs `omnigraph serve` in that terminal; Studio attaches to it.
 
@@ -306,6 +329,23 @@ but the installer does not require them. The CLI pins no Studio version: it
 installs whatever the latest URL serves, and Studio updates itself. The two
 versions stay independent, and their only contract remains the link format.
 
+### Platform coverage
+
+The CLI's commands work alike on macOS, Linux and Windows. Studio's side does
+not yet:
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| `serve`, `mcp`, `targets`, `credential`, `--via-server` | Supported | Supported | Supported |
+| Studio opens a link from `omnigraph studio` | Supported | Once Studio registers its scheme and GPUI's Linux platform dispatches opened links | Once Studio registers its scheme and forwards a second launch's link to the running instance |
+| Studio's agent panel | Supported | Supported | Not yet available, as Studio's README says |
+| Installing Studio (phase 5) | A verified, signed disk image | Prints how to install | Opens Studio's installer once one ships |
+
+Until Studio's rows land, `omnigraph studio` on Linux and Windows prints the
+link and refuses with `studio_unavailable`, and agents there use the CLI and
+`omnigraph mcp`. Each gap is a row in
+[the Studio changes](#modernrelayomnigraph-studio).
+
 ### MCP for agents
 
 `omnigraph mcp --target NAME` speaks MCP over stdio for agents that start their
@@ -316,32 +356,50 @@ tools as child processes, such as Claude Code or Codex in a terminal:
 ```
 
 - **Direct target.** Runs the equivalent of `serve --reuse` in its own process:
-  it relays JSON-RPC to the live session's `/mcp` with the record's token, or
-  hosts a session, read-only unless `--write`, and publishes its record so
-  Studio can attach. It exits when its input closes, shutting down a session it
-  hosted.
+  it relays JSON-RPC to the live local server's `/mcp` with the record's token,
+  or hosts a local server, read-only unless `--write`, and publishes its record
+  so Studio can attach. It exits when its input closes, shutting down a local
+  server it hosted. `--write` against a live read-only local server refuses
+  (`local_server_access_mismatch`).
 - **Server target.** Relays to the server's `/mcp` with the owner's stored
   token, which never reaches the agent's configuration.
 - **A 401 while relaying** makes the bridge read the record again (a restarted
-  session) or resolve the owner's token again, once; a second 401 ends the
+  local server) or resolve the owner's token again, once; a second 401 ends the
   bridge with a typed error.
 
-Write tools need two consents. The endpoint is the ceiling: a read-only
-session, or a server without `--mcp-allow-writes`, lists no write tools. The
+Write tools need two consents. The endpoint is the ceiling: a read-only local
+server, or a server without `--mcp-allow-writes`, lists no write tools. The
 agent's own configuration is the other: without `--write`, the bridge lists and
-admits only tools the server annotates `readOnlyHint`, which it already sets
-for every read tool. A person opening a graph read-write in Studio has not
-thereby given every connected agent write access. Tool logic, refusals and the
-write contract stay the server's; the bridge adds no tool.
+admits only tools the server annotates `readOnlyHint`, which it already sets for
+every read tool. A person opening a graph read-write in Studio has not thereby
+given every connected agent write access. Tool logic, refusals and the write
+contract stay the server's; the bridge adds no tool.
 
 **Agents inside Studio keep Studio's gateway.** The gateway limits a panel
 agent's writes to the agent's own branch and can ask the person before each
-write; `omnigraph mcp` does neither. Studio points the gateway at the session's
-URL and token instead of at a server, and in a read-only session it tells the
-agent that its branch writes are refused. Every agent still writes as the
-session's actor until
+write; `omnigraph mcp` does neither. Studio points the gateway at the local
+server's URL and token instead of at a deployed server, and on a read-only
+local server it tells the agent that its branch writes are refused. Every agent
+still writes as the local server's actor until
 [delegated, branch-scoped credentials](https://github.com/ModernRelay/omnigraph/issues/978)
 and actor views' agent identities exist.
+
+### Which path an agent uses
+
+Each place an agent runs has one write path, and the bundled skill, which is
+what agents read, states the rule:
+
+| Where the agent runs | Its path | Beside a live read-write local server |
+|---|---|---|
+| A terminal, using the CLI | Direct commands with `--target` | Adds `--via-server`; the notice on a direct write gives the exact command |
+| A terminal, using MCP | `omnigraph mcp --target NAME` | Attaches to it by itself |
+| Studio's agent panel | Studio's gateway | Studio points the gateway at it |
+
+An agent finds live local servers through `omnigraph targets --json`, never by
+reading the records directory. A direct write beside a live local server gets a
+notice, not a refusal: a record is a hint no write path trusts, and refusing on
+it would make a discovered file a precondition of every direct write without
+protecting processes that never look ([A1](#a1-cross-process-writer-safety)).
 
 ### Targets for clients
 
@@ -350,25 +408,39 @@ CLI is that file's only program writer. Studio, the agents it runs and terminal
 agents then see the same servers, and each stored token exists once.
 
 `omnigraph targets --json` lists the targets and aliases RFC 0059's resolver
-reads, without secrets and without a network request:
+reads, and the live local servers of direct targets, without secrets and
+without a network request:
 
 ```json
 {"protocol":1,"default_target":"staging",
  "targets":[
-  {"name":"local","kind":"direct","scope":"graph","root":"file:///Users/me/company.omni","binding":"sha256:…"},
-  {"name":"brain","kind":"direct","scope":"root","root":"s3://bucket/brain","binding":"sha256:…"},
+  {"name":"local","kind":"direct","scope":"graph","root":"file:///Users/me/company.omni","binding":"sha256:…",
+   "local_servers":[{"id":"01JA9…","url":"http://127.0.0.1:53211","access":"read_only","actor":"default"}]},
+  {"name":"brain","kind":"direct","scope":"root","root":"s3://bucket/brain","binding":"sha256:…",
+   "local_servers":[{"id":"01JAB…","graph":"people","url":"http://127.0.0.1:53340","access":"read_only","actor":"default"}]},
   {"name":"staging","kind":"server","endpoint":"https://staging.example","default_graph":"knowledge","auth":"token","binding":"sha256:…"},
   {"name":"public","kind":"server","endpoint":"https://public.example","auth":"anonymous","binding":"sha256:…"},
   {"name":"cloud","kind":"managed","scope":"cluster","endpoint":"https://…","default_graph":"knowledge","auth":"managed","binding":"sha256:…"}],
  "aliases":[{"name":"people","target":"staging","graph":"knowledge","query":"list_people"}]}
 ```
 
+- A direct target always carries `local_servers`, empty when none is live: each
+  live local server whose canonical root is the target's root or, for a
+  root-scoped target, a graph under it, which `graph` names. Liveness comes
+  from each record's lock, as `serve` decides it, and a record from another
+  machine is never listed. Server and managed targets carry no
+  `local_servers`.
+- The listing never carries a token. A client that needs one runs
+  `serve --reuse --json`, which returns the live local server's line.
+
 `omnigraph targets add NAME --json` reads one target entry, the same fields
 the operator configuration holds, on standard input; `omnigraph targets remove
 NAME` removes one. Both:
 
 - validate through RFC 0059's resolver: a complete binding, an endpoint scope
-  for the credential owner, no duplicate name;
+  for the credential owner (`target_invalid`), and no duplicate name
+  (`target_exists`); `remove` refuses a name it does not hold
+  (`target_unknown`);
 - change only that entry, keep the rest of the file's text, write through a
   temporary file and rename, and refuse (`config_not_editable`) when they cannot
   do that safely;
@@ -401,10 +473,11 @@ static token:
   read. `source` is `environment` or `credentials_file`. The CLI reads no
   unkeyed token.
 - It refuses when stdout is a terminal (`credential_terminal`), so a token never
-  lands in scrollback; a caller reads it through a pipe.
-- It refuses a target that is not a server (`credential_kind`), an anonymous
-  server (`credential_anonymous`) and a target without a stored token
-  (`credential_missing`).
+  lands in scrollback; a caller reads it through a pipe, the rule
+  [Lifetime and output](#lifetime-and-output) states for every command here.
+- It refuses a target that is not a server (`target_kind_unsupported`), an
+  anonymous server (`credential_anonymous`) and a target without a stored
+  token (`credential_missing`).
 - A client sends the token only to URLs under `endpoint`, the rule the CLI
   applies to its own requests.
 
@@ -424,6 +497,46 @@ complete a client's experience is:
 | Listing the server's graphs | `graph_list` in the cluster policy. Without it a client opens the target's `default_graph` or the graph the person names; `/graphs/discovery` serves verified identities only. |
 | Agents over MCP | `--mcp-allowed-host <public host>`, because `/mcp` admits only loopback `Host` values by default (OIDC identity trust admits its resource's host by itself), and `--mcp-allow-writes` for write tools. |
 
+### Refusals
+
+Every refusal here has a stable snake_case code and happens before any effect.
+In JSON the code is a CLI-local `refusal` field beside the CLI's existing
+failure fields, as `missing_credential` is, because the HTTP API's `code`
+enumerates server codes only. A data write command with `--via-server` reports
+its refusal in the command-outcome envelope it already prints, with
+`execution: not_started`, `effects: none` and `action: refresh`. Every refusal
+exits 1. A local server that stops with an uncertain write exits 2, and a
+`--via-server` write whose response was lost reports `execution: unknown`,
+`effects: unknown` and `action: reconcile`, and is never replayed.
+
+| Code | Commands | When |
+|---|---|---|
+| `legacy_operator_config` | All here | The operator home has the legacy format |
+| `target_kind_unsupported` | `serve`, `studio`, `mcp`, `credential` | The command table marks the target's kind refused |
+| `actor_required` | `serve --write`, `mcp --write` | Neither `--as` nor `operator.actor` names an actor |
+| `cluster_graph_read_only` | `serve --write`, `mcp --write` | The graph is inside a cluster |
+| `actor_views_read_only` | `serve --write`, `mcp --write` | The graph declares actor views |
+| `local_server_exists` | `serve` | A live local server holds the graph and `--reuse` was not given |
+| `local_server_access_mismatch` | `serve --reuse --write`, `mcp --write` | The live local server is read-only |
+| `local_server_cli_incompatible` | `serve --reuse`, `mcp` | The live local server's CLI speaks another HTTP contract or cannot serve the graph's storage format |
+| `local_server_records_unsafe` | `serve`, `mcp`, `targets`, `--via-server` | The record directory has another owner, group or other permission bits, or a symlink |
+| `local_server_absent` | `--via-server` | No local server is live for the root |
+| `local_server_read_only` | `--via-server` | The live local server is read-only |
+| `local_server_actor_mismatch` | `--via-server` with `--as` | `--as` differs from the local server's actor |
+| `studio_unavailable` | `studio` | Studio is not installed, or nothing on this platform handles its links |
+| `studio_transport_unsupported` | `studio` | The server target is on a Unix socket |
+| `credential_terminal` | `credential` | Stdout is a terminal |
+| `credential_anonymous` | `credential` | The server target uses anonymous access |
+| `credential_missing` | `credential` | No token is stored for the target's owner |
+| `target_invalid` | `targets add` | The entry fails RFC 0059's resolver |
+| `target_exists` | `targets add` | The name is taken |
+| `target_unknown` | `targets remove` | No target has the name |
+| `target_is_default` | `targets remove` | The target is `defaults.target` |
+| `config_not_editable` | `targets add`, `targets remove` | The entry cannot be changed while keeping the rest of the file's text |
+
+A read-only local server's write routes and the loopback guard answer with the
+existing HTTP `forbidden` code, so the HTTP API gains no code.
+
 ## Design
 
 ### Local embedding API in `omnigraph-server`
@@ -440,10 +553,23 @@ pub struct LocalOptions {
     pub process_defaults: ProcessDefaults,
 }
 
+/// The local server's bearer token: read once, with no `Debug` or `Display`.
+pub struct LocalCredential { /* … */ }
+
+pub enum LocalOpenError {
+    ActorRequired,
+    ClusterGraphReadOnly,
+    ActorViewsReadOnly,
+    Open(OmniError),
+    Policy(PolicyError),
+}
+
+/// `Uncertain` when a write's completion is unknown; callers exit 2.
+pub enum ServeOutcome { Clean, Uncertain }
+
 impl AppState {
-    /// Returns the state and the session's bearer token, once.
     pub async fn local(binding: LocalBinding, options: LocalOptions)
-        -> Result<(AppState, SessionCredential), LocalOpenError>;
+        -> Result<(AppState, LocalCredential), LocalOpenError>;
 }
 
 pub async fn serve_local(
@@ -451,6 +577,11 @@ pub async fn serve_local(
     listener: tokio::net::TcpListener,
     extend: impl FnOnce(Router) -> Router,
 ) -> ServeOutcome;
+
+/// The restricted server subscriber `init_tracing` installs, on a chosen writer.
+pub fn install_log_subscriber<W>(writer: W)
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static;
 ```
 
 `LocalBinding` is the direct binding RFC 0059's resolver captured: the
@@ -461,8 +592,8 @@ never a bare URI string.
 `AppState::local`:
 
 1. Classifies the root with `cluster_root_for_graph_uri`, the rule direct CLI
-   commands use, and refuses `ReadWrite` for a cluster graph or without an
-   actor. It never calls `acquire_graph_admission`.
+   commands use, and refuses `ReadWrite` for a cluster graph, for a graph with
+   actor views, or without an actor. It never calls `acquire_graph_admission`.
 2. Opens read-only with `Omnigraph::open_read_only`, validated against a
    captured `GraphReadAuthority` for a cluster graph, or read-write with
    `Omnigraph::open`.
@@ -490,9 +621,9 @@ points call. It prints nothing to stdout: `serve_config` keeps its
 `OMNIGRAPH_LISTEN_ADDR=` line. It returns an uncertain outcome instead of
 exiting the process, and the server binary and the CLI map that outcome to exit
 2. The caller binds the listener, so it knows the port and writes the record
-before announcing readiness. `extend` receives the router `build_app` built
-from this state. The server crate gains a public way to install its restricted
-log subscriber on a chosen writer, so the CLI logs a session's server events to
+before announcing readiness. `extend` receives the router `build_app` built from
+this state. `install_log_subscriber` makes the private `server_log_subscriber`
+installable on a chosen writer, so the CLI logs a local server's events to
 stderr with the filters `omnigraph-server` uses.
 
 The existing convenience constructors stay until
@@ -503,13 +634,14 @@ The existing convenience constructors stay until
 - **Command structure.** Each command is a `Command` variant in the exhaustive
   `command_plane` and `command_label` matches, with its own module under
   `commands/` and an arm in `app.rs`, which captures the invocation once.
-  `--session` is an argument of the data write commands that
+  `--via-server` is an argument of the data write commands that
   `command_outcome::applies` lists, minus `schema apply`, and reuses that
-  module's outcome evidence for unknown outcomes. The session's uncertain
-  outcome becomes `Completion::exit(2)`.
+  module's outcome evidence for unknown outcomes. A local server's uncertain
+  outcome becomes `Completion::exit(2)`. Refusals carry their code in the
+  `refusal` field of the CLI's failure output.
 - **Contract versions.** `omnigraph version --json` gains a `protocols` object
   naming the version of each machine-readable contract here (`serve`,
-  `credential`, `targets`), beside its `http_contract`, `channel`, `commit` and
+  `studio`, `targets`, `credential`), beside its `http_contract`, `channel`, `commit` and
   `internal_schema`. A client requires the protocol versions it speaks before
   running a command.
 - **Loopback guard**, a layer the CLI adds in `extend`, outside every server
@@ -519,7 +651,7 @@ The existing convenience constructors stay until
     rebinding, which `Origin` alone cannot: a rebound page's `GET` is
     same-origin and carries no `Origin`.
   - Any request carrying `Origin` is 403; native clients send none and a
-    session serves no page.
+    local server serves no page.
   - No response carries a CORS header; every response carries
     `Cross-Origin-Resource-Policy: same-origin`. Nothing relies on `Sec-Fetch-*`,
     which browsers do not send to plain-HTTP origins.
@@ -530,25 +662,46 @@ The existing convenience constructors stay until
 - **The opener** passes only the link, which carries no secret, so its
   appearance in the opener's arguments discloses nothing.
 
-### Session records
+### Server records
 
-Records live in a fixed per-user directory resolved from the OS account, not
-from `HOME`, `TMPDIR` or `OMNIGRAPH_HOME`, so a GUI process and a terminal find
-the same sessions: `/tmp/omnigraph-<uid>/sessions/` on Unix, the account's
-local application data on Windows. The directory must be owned by the account
-with no group or other permission bits and is refused otherwise. Files are
-opened without following symlinks, with the owner and mode checks
-`managed/auth/coordination.rs` already applies.
+Records live in one directory per OS account, resolved from the account rather
+than from `HOME`, `TMPDIR`, `XDG_*` or `OMNIGRAPH_HOME`, so a GUI process, a
+terminal and an agent with its own CLI home find the same local servers. The
+home directory comes from the account database, as the CLI's managed-session
+locks already resolve it (`managed/auth/coordination.rs`):
+
+| Platform | Directory |
+|---|---|
+| macOS | `<home>/Library/Application Support/OmniGraph/servers/` |
+| Linux | `<home>/.local/state/omnigraph/servers/` |
+| Windows | `OmniGraph\servers\` in the account's local application data folder (`FOLDERID_LocalAppData`) |
+
+No system cleaner ages these directories out, while `/tmp` is aged out: macOS's
+daily `com.apple.tmp_cleaner` deletes `/tmp` files whose access, modification
+and change times are all over three days old, so a local server left running
+over a weekend would lose its record and the next `serve` would start a second
+one. Linux uses the state directory rather than `$XDG_RUNTIME_DIR`, which a
+process outside a login session, such as a cron job or a container, lacks;
+falling back from one to the other would split one account's processes between
+two directories.
+
+On macOS and Linux the directory must be owned by the account with no group or
+other permission bits, and is refused otherwise (`local_server_records_unsafe`);
+files are opened without following symlinks, with the owner and mode checks
+`coordination.rs` applies. On Windows the directory inherits its folder's
+access list, which admits only the account, `SYSTEM` and administrators, and
+reparse points are refused as `coordination.rs` refuses them.
 
 ```text
-/tmp/omnigraph-<uid>/sessions/<session>.json    the record, 0600
-/tmp/omnigraph-<uid>/sessions/<session>.lock    held by the session for its whole life
+<directory>/<id>.json    the record, 0600
+<directory>/<id>.lock    held by the local server for its whole life
 ```
 
 ```json
 {
   "format": 1,
-  "session": "01JA9…",
+  "id": "01JA9…",
+  "machine": "5F0C…",
   "root": "file:///Users/me/company.omni",
   "binding": "sha256:9e1c…",
   "graph_id": "default",
@@ -565,31 +718,38 @@ opened without following symlinks, with the owner and mode checks
 The `.lock` file is a liveness signal, not writer exclusion: it decides only
 whether a record's owner is alive. The owner takes it with
 `std::fs::File::try_lock`, opens the graph, binds, writes the record (temporary
-file and rename) and then announces readiness. A reader that can take the lock
-has found a dead session: it ignores the record and may delete both files. The
-operating system releases the lock however its process exits, so liveness never
-consults the process ID, which proves neither liveness nor quiescence
+file and rename) and then announces readiness.
+
+A reader checks `machine` first. It is the platform's host identifier
+(`gethostuuid` on macOS, `/etc/machine-id` on Linux, the `MachineGuid` registry
+value on Windows), and a reader ignores a record from another machine without
+touching its lock or deleting it, so a home directory shared over a network
+cannot send a client to another machine's port or remove a live record. For a
+record from this machine, a reader that can take the lock has found a dead
+local server: it ignores the record and may delete both files. The operating
+system releases the lock however its process exits, so liveness never consults
+the process ID, which proves neither liveness nor quiescence
 ([server runtime RFC](2026-09-29-server-runtime-and-online-deployment.md)). A
 record with an unknown `format` is ignored. `root` is canonical, so two targets
-naming one graph find the same session. `cli` is informational; a client
+naming one graph find the same local server. `cli` is informational; a client
 chooses its CLI itself.
 
 ## Invariants
 
-- **Trust at the boundary (10).** No client supplies an actor. A session's
+- **Trust at the boundary (10).** No client supplies an actor. A local server's
   actor is fixed at start by the direct-path rule, `--as` or else
   `operator.actor` ([CLI addressing](0011-cli-addressing-and-config.md)): the
-  process holds storage access and is entitled to it, as a direct
-  `omnigraph mutate` is. Every request presents a token the server resolves.
-  The session keeps only its token's hash; the record is a user-only delivery
-  file like the CLI's `credentials`. `credential` hands a person's own static
-  token to a process running as that person. The engine enforces the generated
-  policy for every write.
-- **One publication door (2), one view (3), publish once (4).** Sessions write
-  through the existing routes and engine; publication is unchanged.
-- **Bounded and observable (11).** One session per root; fixed shapes for the
-  record and the JSON lines; server limits and the owned-operation lifecycle
-  unchanged; typed refusal codes.
+  process holds storage access and is entitled to it, as a direct `omnigraph
+  mutate` is. Every request presents a token the server resolves. The local
+  server keeps only its token's hash; the record is a user-only delivery file
+  like the CLI's `credentials`. `credential` hands a person's own static token
+  to a process running as that person. The engine enforces the generated policy
+  for every write.
+- **One publication door (2), one view (3), publish once (4).** Local servers
+  write through the existing routes and engine; publication is unchanged.
+- **Bounded and observable (11).** One local server per root; fixed shapes for
+  the record and the JSON lines; server limits and the owned-operation
+  lifecycle unchanged; one table of typed refusal codes.
 - **One source of truth (12).** The CLI is the only resolver of targets, the
   only program writer of their configuration and the only store of their static
   tokens. A record is a hint whose liveness the operating system establishes;
@@ -599,17 +759,19 @@ chooses its CLI itself.
   store, no cloud-only path.
 - **Support boundary.** "The server is cluster-only" becomes: the
   `omnigraph-server` binary is cluster-only; the CLI serves one directly
-  accessed graph to same-account loopback clients as a session. The
-  single-writer-process boundary is unchanged ([A1](#a1-cross-process-writer-safety)).
+  accessed graph to same-account loopback clients as a local server. The
+  single-writer-process boundary is unchanged
+  ([A1](#a1-cross-process-writer-safety)).
 
 ## Compatibility and reversibility
 
 Storage, the server binary and the HTTP API are unchanged. New contracts: the
-five commands and `--session`, the session line, `targets` and `credential`
-output (`protocol: 1`), the `protocols` field of `version --json`, the record
-(`format: 1`) and its directory, the Studio link format, and the local
-embedding API. Existing direct commands behave as today; the only addition is
-the notice when a live session holds their root. Studio stops reading the CLI's
+five commands and `--via-server`, the ready line, `studio`, `targets` and
+`credential` output (`protocol: 1`), the `protocols` field of `version --json`,
+the CLI's `refusal` field and its codes, the record (`format: 1`) and its
+directories, the Studio link format, and the local embedding API. Existing
+direct commands behave as today; the only addition is the notice when a live
+local server holds their root. Studio stops reading the CLI's
 files and keeping its own server list.
 
 RFC 0059 (at `323068fa`) keeps a compatibility interval with legacy adapters.
@@ -624,13 +786,16 @@ Reverting removes the commands and the embedding API; no graph data migrates.
 | Alternative | Why not |
 |---|---|
 | A single-use connect code in the opened link, redeemed over loopback | This RFC's first draft. Jupyter shipped a single-use token in argv and removed it because another logged-in user could read it from the process list; on Linux and Windows a scheme handler receives its URL in argv. It needed a redemption route, attach keys and handoff files; the record replaces all of them. |
-| The launcher hosts the session in its terminal and opens a session link | An earlier revision. It keeps the terminal's environment, but the launcher then owns runtime state and a second link form. Studio owning its sessions, as the Codex app owns its app-server, gives one owner and one contract; a terminal-hosted `serve` remains available and Studio attaches to it. |
+| The launcher hosts the local server in its terminal and opens a link to it | An earlier revision. It keeps the terminal's environment, but the launcher then owns runtime state and a second link form. Studio owning its local servers, as the Codex app owns its app-server, gives one owner and one contract; a terminal-hosted `serve` remains available and Studio attaches to it. |
 | A cooperative writer lock on every direct write | An earlier revision. It changes every direct write for a gap that exists without Studio, and protects only cooperating processes of one account on one machine. See [A1](#a1-cross-process-writer-safety). |
 | A browser UI embedded in the CLI ([PR #850](https://github.com/ModernRelay/omnigraph/pull/850)) | Studio is a native client in its own repository, and embedding a JavaScript build makes a frontend toolchain a prerequisite of every CLI build. Its boot mode takes cluster writer admission and runs unauthenticated. Its point that an embedder must reuse the server lifecycle is adopted as `serve_local`. |
 | Serve local graphs unauthenticated on loopback | Any local process or account can write, writes record no actor, and `Host` checks do not stop another local user. |
 | Never install Studio from the CLI | Leaves the first launch to a manual step. Installing is safe only with a signature to verify, which is why it waits for Studio's signed releases rather than being dropped. |
-| Studio bundles its own engine | A newer engine stamps a branch's storage format forward on first publication, and an older binary refuses a newer stamp. Sessions run the person's own CLI. |
-| Route every direct command through a live session automatically | RFC 0059 forbids discovery from selecting a destination, and [unified access paths](0009-unified-access-paths.md) rejects a localhost funnel for the embedded path. `--session` is explicit. |
+| Studio bundles its own engine | A newer engine stamps a branch's storage format forward on first publication, and an older binary refuses a newer stamp. Local servers run the person's own CLI. |
+| Route every direct command through a live local server automatically | RFC 0059 forbids discovery from selecting a destination, and [unified access paths](0009-unified-access-paths.md) rejects a localhost funnel for the embedded path. `--via-server` is explicit. |
+| Refuse a direct write beside a live read-write local server | A record is a hint no write path trusts. Refusing on it would make a discovered file a precondition of every direct write and break scripts, without protecting processes that never look ([A1](#a1-cross-process-writer-safety)). The notice gives the one-step fix instead. |
+| Call it a session | "Session" already names the engine's session settings, the managed control plane's login sessions and the CLI's internal session plane, whose name its messages print. "Local server" says what runs, and `omnigraph serve` reads as the one-graph form of `omnigraph-server`. |
+| Records under `/tmp` | macOS deletes `/tmp` files untouched for three days (`com.apple.tmp_cleaner`), and many Linux distributions age `/tmp` out through `systemd-tmpfiles`; a long-running local server would lose its record. |
 | Studio parses the CLI's files, or writes them itself | Two resolvers have already drifted, RFC 0059 changes the format and validates it strictly, and a second writer can collide with a person's edit. |
 | Studio keeps its own server list and token copies | Agents Studio runs would see other servers than Studio, and rotated tokens would drift. |
 | Wait for RFC 0059 to add a target writer | RFC 0059 rejects target-administration commands, and Studio cannot add a server without one. This RFC defines the minimal writer and leaves selection to RFC 0059. |
@@ -666,52 +831,65 @@ Extend the existing owners in [the testing map](../dev/testing.md):
 - **Server, in-source `ingress` tests:** every route `build_app` registers is
   classified, enumerated from the router; a local read-only state refuses each
   `Write`-class route before its body, merge `dry_run` included.
-- **Server, `integration/auth_policy.rs`:** the session token resolves to the
-  session actor; every `PolicyAction` has a session class, so adding one fails
-  the test until it is classified; a read-only session's engine refuses a write
-  even where a route would admit it; graph-wide and per-branch reads are
+- **Server, `integration/auth_policy.rs`:** the local server's token resolves
+  to its actor; every `PolicyAction` has a local-server class, so adding one
+  fails the test until it is classified; a read-only local server's engine
+  refuses a write even where a route would admit it, and its write routes
+  answer `forbidden`; graph-wide and per-branch reads are
   granted; `ReadWrite` refuses without an actor, for a cluster graph and on an
   actor-views graph before any open; no local state runs open or default-deny;
   the generated policy's graph id matches the route's.
-- **Server, `integration/mcp.rs`:** a read-only session lists no write tools
-  and refuses one as unknown.
+- **Server, `integration/mcp.rs`:** a read-only local server lists no write
+  tools and refuses one as unknown.
 - **Server, `boot_settings.rs`:** `serve_local` refuses a non-loopback
   listener, prints nothing to stdout, drains admitted writes on shutdown, and
   returns an uncertain outcome on uncertain completion.
-- **Cluster:** a session on a cluster graph leaves `__cluster/lock.json`
+- **Cluster:** a local server on a cluster graph leaves `__cluster/lock.json`
   untouched.
-- **CLI, a new `cli_sessions` integration module** (a new public boundary):
-  session start, the one stdout line, logs on stderr, and the record; shutdown
-  when the line cannot be delivered; the guard's `Host`, `Origin`, CORS and
-  malformed-header cases; read-only refusals; `actor_required`,
-  `cluster_graph_read_only`, `legacy_operator_config`, `session_exists`,
-  `--reuse`, `session_access_mismatch` and `session_cli_incompatible`; the
-  notices to direct writers, cleanup and optimize, with their outcomes
-  unchanged; `--session` with and without a matching `--as`, and its
-  unknown-outcome reporting; a dead owner's record ignored with no process-ID
-  check; directory ownership and mode refusals; `mcp` relaying, hosting,
-  re-resolving after a 401 and filtering write tools without `--write`;
-  `studio` opening its link with the binding digest through a substituted
-  opener, refusing an unsupported transport and refusing when Studio is absent.
+- **CLI, a new `cli_local_servers` integration module** (a new public
+  boundary):
+  - start, the one stdout line, logs on stderr, and the record; shutdown when
+    the line cannot be delivered; the line's `token` present through a pipe and
+    absent under a pseudo-terminal;
+  - the guard's `Host`, `Origin`, CORS and malformed-header cases; read-only
+    refusals;
+  - every code in [Refusals](#refusals) that these commands make, with its
+    `refusal` field, its outcome envelope under `--via-server` and exit 1;
+    `--reuse` returning the live line;
+  - the notices to direct writers, cleanup and optimize, with their outcomes
+    unchanged, the direct writer's notice giving the `--via-server` command in
+    both its human and JSON forms; `--via-server` with and without a matching
+    `--as`, and its unknown-outcome reporting;
+  - records: a dead owner's record ignored with no process-ID check; a record
+    from another machine ignored and kept; the directory resolved from the
+    account database with `HOME`, `TMPDIR` and `XDG_*` pointing elsewhere;
+    ownership and mode refusals;
+  - `mcp` relaying, hosting, re-resolving after a 401 and filtering write tools
+    without `--write`;
+  - `studio` opening its link with the binding digest through a substituted
+    opener, never opening it on Linux or Windows without a scheme handler, and
+    refusing an unsupported transport.
 - **CLI, the installer (phase 5),** with a substituted verifier and download
   source: an app failing the signature requirement is refused before it opens
   and before it installs; a missing app is downloaded, verified and installed
   to the first writable Applications directory; an override URL is verified
   the same way; Linux prints instructions.
 - **CLI, `integration/cli_schema_config.rs`:** `targets --json` for every kind,
-  with aliases, no secret and no network request; `targets add` and `remove`
-  keeping the rest of the file's text, never changing the default, refusing a
-  duplicate, an incomplete binding, the default target and a legacy-format home;
-  `credential` over a pipe from `OMNIGRAPH_TOKEN_<OWNER>` and the credentials
-  file, with the `KeyedServer` support helper; `credential_terminal` under a
-  pseudo-terminal; `credential_kind`, `credential_anonymous` and
-  `credential_missing`; `version --json` reporting `protocols`.
+  with aliases, no secret and no network request, and `local_servers` for live,
+  dead and other-machine records and for a root-scoped target's graphs; `targets
+  add` and `remove` keeping the rest of the file's text, never changing the
+  default, refusing a duplicate, an incomplete binding, the default target and a
+  legacy-format home; `credential` over a pipe from `OMNIGRAPH_TOKEN_<OWNER>`
+  and the credentials file, with the `KeyedServer` support helper;
+  `credential_terminal` under a pseudo-terminal; `target_kind_unsupported`,
+  `credential_anonymous` and `credential_missing`; `version --json` reporting
+  `protocols`.
 - **CLI, `skill.rs` drift tests:** command index rows and condensed reference
-  entries for the five commands.
+  entries for the five commands and `--via-server`.
 
 Run CLI integration tests after building `omnigraph-server`, with
-`RUST_MIN_STACK=16777216`. No cost instrument is needed; sessions add no storage
-I/O to existing paths.
+`RUST_MIN_STACK=16777216`. No cost instrument is needed; local servers add no
+storage I/O to existing paths.
 
 ## Changes by repository
 
@@ -723,21 +901,21 @@ Appendix A lists the changes kept out of this scope.
 
 | Area | Change |
 |---|---|
-| `omnigraph-server` | `AppState::local`, `LocalBinding`, `LocalOptions`, `SessionCredential`; `serve_local` with the lifecycle extracted from `serve_config`, returning its outcome and printing nothing to stdout; a public way to install the restricted log subscriber on a chosen writer; local states mount no `/cluster/*` routes and cap MCP write tools by access; read-only refusal in `ingress::admit`; the exhaustive session class of every `PolicyAction`. |
-| `omnigraph-cli` | `serve` (with `--write`, `--reuse`, `--port`, `--json`), `studio`, `mcp`, `targets`, `credential` and `--session`, each with its `commands/` module and `app.rs` arm; `protocols` in `version --json`; the loopback guard; session records, reusing the `coordination.rs` checks; the notices; the MCP bridge with its `readOnlyHint` filter; the platform opener; later, the Studio installer with code-signature verification. |
-| Docs | Amend the support boundary in [invariants](../dev/invariants.md); a user page for local sessions; the CLI reference; the server authentication page's self-hosting settings; the MCP guide's `omnigraph mcp`; the README's clients table, which still lists the retired stdio package; the public embedding APIs in [control plane](../dev/control-plane.md) and the observability guide's note for embedders; new owners in [testing](../dev/testing.md); a disposition note on RFC 0003 for the stdio bridge it deferred; the bundled skill's command index rows and condensed reference entries, and its lines saying the cluster server is "the only way to serve" and that there is "no single-graph server mode" (`SKILL.md`, `references/cluster.md`, `references/server-policy.md`); one `changelog.d` note per phase. |
+| `omnigraph-server` | `AppState::local`, `LocalBinding`, `LocalOptions`, `LocalCredential`, `LocalOpenError`; `serve_local` with the lifecycle extracted from `serve_config`, returning `ServeOutcome` and printing nothing to stdout; `install_log_subscriber`; local states mount no `/cluster/*` routes and cap MCP write tools by access; read-only refusal in `ingress::admit` with `forbidden`; the exhaustive local-server class of every `PolicyAction`. |
+| `omnigraph-cli` | `serve` (with `--write`, `--reuse`, `--port`, `--json`), `studio`, `mcp`, `targets` (with `local_servers`), `credential` and `--via-server`, each with its `commands/` module and `app.rs` arm; `protocols` in `version --json`; the `refusal` field and its codes; the loopback guard; server records in the per-platform directories, reusing the `coordination.rs` home resolution and checks; the notices, the direct writer's naming its `--via-server` command; the MCP bridge with its `readOnlyHint` filter; the platform opener with its scheme-handler check; later, the Studio installer with code-signature verification. |
+| Docs | Amend the support boundary in [invariants](../dev/invariants.md); a user page for local servers, with the one-line distinction from `omnigraph-server`; the CLI reference; the server authentication page's self-hosting settings; the MCP guide's `omnigraph mcp`; the README's clients table, which still lists the retired stdio package; the public embedding APIs in [control plane](../dev/control-plane.md) and the observability guide's note for embedders; new owners in [testing](../dev/testing.md); a disposition note on RFC 0003 for the stdio bridge it deferred; the bundled skill's command index rows and condensed reference entries, the rule for which path an agent uses, and its lines saying the cluster server is "the only way to serve" and that there is "no single-graph server mode" (`SKILL.md`, `references/cluster.md`, `references/server-policy.md`); one `changelog.d` note per phase. |
 
 ### ModernRelay/omnigraph-studio
 
 | Area | Change |
 |---|---|
 | Choosing the CLI | Choose the `omnigraph` binary by `version --json`: an exact `http_contract` match, the `protocols` it needs, and an `internal_schema.serves` range covering the graph's storage format; warn before a read-write open when `writes` is newer than the graph's format. Never run an executable a link names. |
-| Sessions | Run `omnigraph serve --target NAME --reuse --json` with the interactive login-shell environment captured once; attach to the session in its line; stop a child session on close; treat a vanished session or exit 2 as an unknown outcome and never resubmit. Offer "Open read-write" as a deliberate action. |
-| Links and saved state | Handle `open?target=<name>&binding=<digest>[&graph=<id>][&branch=<name>]`, read-only, and accept `target=` on the `graph`, `node` and `query` routes; refuse a binding Studio's own resolution does not match; drop the unshipped `connect` route. Key saved windows, drafts and agent directories by target or canonical root, not by a session's random URL. Register the scheme on Linux (`MimeType=x-scheme-handler/omnigraph-studio;`, `Exec=omnigraph-studio %u`) and dispatch `open_urls` on GPUI Linux, which stores the callback without calling it; register it on Windows and forward a second launch's link to the running instance. |
+| Local servers | Run `omnigraph serve --target NAME --reuse --json` with the interactive login-shell environment captured once, through a pipe; attach to the local server in its line; stop a child local server on close; treat a vanished local server or exit 2 as an unknown outcome and never resubmit. Offer "Open read-write" as a deliberate action. Show which graphs are open from `targets --json`'s `local_servers`. |
+| Links and saved state | Handle `open?target=<name>&binding=<digest>[&graph=<id>][&branch=<name>]`, read-only, and accept `target=` on the `graph`, `node` and `query` routes; refuse a binding Studio's own resolution does not match; drop the unshipped `connect` route. Key saved windows, drafts and agent directories by target or canonical root, not by a local server's random URL. Register the scheme on Linux (`MimeType=x-scheme-handler/omnigraph-studio;`, `Exec=omnigraph-studio %u`) and dispatch `open_urls` on GPUI Linux, which stores the callback without calling it; register it on Windows and forward a second launch's link to the running instance. |
 | Connections | Remove the operator-config and credentials parsers (`graph_store/src/cli_config.rs`), the name-based token lookup and Studio's own server list: list targets and aliases with `omnigraph targets --json`, add a server with `omnigraph targets add` and `omnigraph login --target NAME` on standard input, and move existing keychain servers the same way once. |
 | Static tokens | Obtain them with `omnigraph credential --json`, keep them in memory, send them only to URLs under `endpoint`, and run it again after a 401. |
-| Access | Show a session's access from its line and hide write affordances in a read-only session. |
-| Agents | Keep the agent gateway for panel agents and point it at the session's URL and token; say when a read-only session refuses their branch writes. Create each conversation's CLI home with `omnigraph targets add` under that home's `OMNIGRAPH_HOME`, so the CLI writes its format, and refuse `--target` and `--session` in the agent wrapper as it refuses `--server` and `--as`. Never pass the captured environment to agents. |
+| Access | Show a local server's access from its line and hide write affordances when it is read-only. |
+| Agents | Keep the agent gateway for panel agents and point it at the local server's URL and token; say when a read-only local server refuses their branch writes. Create each conversation's CLI home with `omnigraph targets add` under that home's `OMNIGRAPH_HOME`, so the CLI writes its format, and refuse `--target` and `--via-server` in the agent wrapper as it refuses `--server` and `--as`. Never pass the captured environment to agents. Bring the agent panel to Windows. |
 | Releases | Configure the Apple secrets so every release is Developer ID signed and notarized; the workflow already does both when they are set, but releases so far are pre-releases signed ad hoc. A fixed, documented team identifier the CLI can pin; full releases with version-free asset names, so a latest URL resolves for each architecture; an updater inside the app; a package identity when Windows ships as an installer rather than a zip. Phase 5 waits for these ([omnigraph-studio#3](https://github.com/ModernRelay/omnigraph-studio/issues/3)). |
 | Specs | Rewrite spec 012's E1–E5 as this RFC, align its E15 with [#1019](https://github.com/ModernRelay/omnigraph/issues/1019), drop spec 013's note that the launcher passes its CLI path, and update specs 002 (links), 003 (connections), 011 and 013 (agents). |
 
@@ -755,10 +933,10 @@ included.
 
 1. **Server foundations:** `AppState::local`, `serve_local`, read-only
    enforcement, the log subscriber. `implementation: in-progress`.
-2. **Read-only sessions:** `serve`, records, the guard, `--reuse`, the
-   `studio` launcher, `targets --json`, `protocols` in `version --json`, user
-   docs and the skill.
-3. **Read-write sessions:** `--write`, `--session` and the notices.
+2. **Read-only local servers:** `serve`, records, the guard, `--reuse`, the
+   `studio` launcher, `targets --json` with `local_servers`, the `refusal`
+   field, `protocols` in `version --json`, user docs and the skill.
+3. **Read-write local servers:** `--write`, `--via-server` and the notices.
 4. **`targets add` and `remove`, `credential` and `omnigraph mcp`.**
 5. **Installing Studio**, once Studio's signed and notarized releases, team
    identifier, latest URL and updater exist
@@ -770,17 +948,13 @@ repository.
 
 ## Unresolved questions
 
-1. **The name.** "Session" already means the engine's session settings, the
-   managed control plane's login sessions, and the CLI's internal session plane,
-   which its messages print. Calling this a ***local server***, with
-   `--via-server` in place of `--session`, would avoid a fourth meaning.
-2. **RFC 0059's agreement** to the `targets` writer and to rows for the new
+1. **RFC 0059's agreement** to the `targets` writer and to rows for the new
    commands. Without it, Studio must keep its own server list, and this RFC
    would say so.
-3. **Catching a branch up through a session.** Whether a merge that carries a
-   newer schema needs `branch_merge` or `schema_apply`, which
-   [schema apply with live branches](https://github.com/ModernRelay/omnigraph/pull/963)
-   leaves open.
+2. **Catching a branch up through a local server.** Whether a merge that carries
+   a newer schema needs `branch_merge` or `schema_apply`, which [schema apply
+   with live branches](https://github.com/ModernRelay/omnigraph/pull/963) leaves
+   open.
 
 ## Appendix A: changes for separate decisions
 
@@ -803,10 +977,10 @@ own decision. None is required for the scope above to ship.
 ### A1. Cross-process writer safety
 
 The engine supports schema apply, branch creation and deletion, and cleanup from
-one writer process only. Its write queues and schema gate are process-local,
-and its comment gives the reason: "a separately-opened handle can apply a
-schema or delete refs, which must serialize with a live writer". Two terminals,
-two agents, or an agent beside a session can break that boundary today with no
+one writer process only. Its write queues and schema gate are process-local, and
+its comment gives the reason: "a separately-opened handle can apply a schema or
+delete refs, which must serialize with a live writer". Two terminals, two
+agents, or an agent beside a local server can break that boundary today with no
 warning, and row writes across processes can return `ReadSetChanged` after
 effects.
 
@@ -839,7 +1013,7 @@ the caller's actor and each action, by the names given and never by whether
 they exist, so it cannot probe what a 404 hides, and reveal nothing about other
 actors or the policy's rules. Static tokens without a policy would get
 `["read"]`, and signed data credentials without one `[]`, matching `authorize`.
-Local sessions would answer it from their generated policy, so a client reads
+Local servers would answer it from their generated policy, so a client reads
 access the same way everywhere. It reports Cedar operations, not actor views,
 whose per-securable roles can still refuse a permitted `change`; a `view` field
 stays reserved, and the actor views RFC should list the route among its
@@ -933,7 +1107,7 @@ reply:
 
 | Ask | State |
 |---|---|
-| Rows for `serve`, `studio`, `mcp`, `credential` and `--session` in its applicability table | Not added; this RFC's command table holds them until it does |
+| Rows for `serve`, `studio`, `mcp`, `credential` and `--via-server` in its applicability table | Not added; this RFC's command table holds them until it does |
 | A read-only `omnigraph targets --json` | Not added; defined here |
 | A structured target writer | Contradicted by its "Add no target administration group"; defined here as the one exception, with the reasoning in [Targets for clients](#targets-for-clients) |
 | A server target's authentication binding | Adopted in substance: a server target names its token owner, bound to an endpoint scope, or selects anonymous access; the listing reports `token` or `anonymous` |
@@ -981,3 +1155,14 @@ naming the exception and its reasons.
   digest on links, stderr-only logs, exhaustive action classes, actor-views
   graphs (#951), the merge `dry_run` refusal, the schema note for #963, `--as`
   under `--session`, and the CLI choice Studio makes.
+- 2026-10-17: Checked against best practice and for one vocabulary across
+  clients. A session became a ***local server*** and `--session` became
+  `--via-server`, because "session" already had three meanings. Records moved
+  out of `/tmp`, which macOS cleans after three days, into per-user directories
+  resolved from the account, and gained the machine they belong to. No command
+  writes a token to a terminal. `targets --json` lists live local servers. Each
+  place an agent runs has one write path, and the notice to a direct writer
+  gives the exact `--via-server` command. Added platform coverage, one refusal
+  table with a CLI-local `refusal` field, `forbidden` for read-only and guard
+  refusals so the HTTP API gains no code, and the Studio link check for a scheme
+  handler. The file keeps its name so existing links resolve.
