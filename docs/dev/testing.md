@@ -150,6 +150,12 @@ search, maintenance, Blob and bounded-memory owners listed in
 canonical workspace, GQT, Clippy and configured object-store gates as separate
 evidence; a local file pass does not qualify S3 or Azure.
 
+Experimental-overlay fixtures keep their positive debug checks and assert
+release refusal with unstable opt-ins absent. The collector owner also runs
+cleanup and proves that the original and overlay inventories remain intact;
+the planning-cost owner continues its modern and legacy cases after refusal.
+Do not enable experimental capabilities to make release qualification pass.
+
 Cross-version evidence must begin with bytes written by the genuine predecessor,
 not a current fixture with a changed writer version. Check indexed and uncovered
 search, nullable vectors, managed Blob payloads, branches and historical reads

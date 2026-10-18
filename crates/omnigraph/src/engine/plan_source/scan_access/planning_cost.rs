@@ -428,6 +428,29 @@ async fn planning_cost_matches_one_cold_builder_for_modern_overlay_and_legacy() 
         .await;
         if kind == "overlay" {
             ds = overlay(ds, &uri).await;
+            if !cfg!(debug_assertions) {
+                // Native overlays remain experimental in release; the modern
+                // and legacy cases below still qualify ordinary cold planning.
+                assert!(!lance_table::feature_flags::can_read_dataset(
+                    lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES
+                ));
+                assert_ne!(
+                    ds.manifest().reader_feature_flags
+                        & lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+                    0
+                );
+                let error = DatasetBuilder::from_uri(&uri)
+                    .with_version(ds.version().version)
+                    .with_session(Arc::new(lance::session::Session::default()))
+                    .load()
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&error, lance::Error::NotSupported { .. }),
+                    "{error:?}"
+                );
+                continue;
+            }
         }
         for value in if kind == "overlay" {
             vec![10, 20, 999]
