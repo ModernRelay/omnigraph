@@ -8,7 +8,7 @@ authors:
   - ragnorc
   - azimafroozeh
 created: 2026-10-07
-updated: 2026-10-17
+updated: 2026-10-18
 discussion: null
 supersedes: []
 superseded_by: []
@@ -221,14 +221,19 @@ keyed node's `@id` is its natural key: two rows tied on the `order` keys can
 hold row ids 1 and 2 and keys `zeta` and `alpha`, and after `zeta` a resume
 filter `@id > "zeta"` skips `alpha`. Keyset paging by filters is exact only
 when the query orders by a unique public tuple and the resume filter repeats
-its comparisons; for keyed members that tuple is the `order` keys, then
-`@type_id`, then the interface's key property. Each arm evaluates that filter
-on its own table, so the result is exact across members. A paging surface for
+its comparisons. For keyed members that tuple is the `order` keys, then
+`@type_id`, then every key property in key order: with `@key(a, b)` two rows
+can share `a`. Each arm evaluates that filter on its own table, so the result
+is exact across members. An unkeyed member has no key property, and its
+public `@id` is the string `Type:number`, which does not sort as the number
+(`Note:10` sorts before `Note:2`). A resume filter on that `@id` is exact for
+string order, not for the internal order. A paging surface for
 stored queries is a separate RFC: its opaque cursor carries the snapshot and
 the last row's internal order tuple, so it needs no public row id. It also
 needs a `limit` that can be a parameter, which GQ lacks today. When it ships,
 a two-row GQT whose key order is opposite to its allocation order checks both
-pages for loss and duplication.
+pages for loss and duplication, and a composite-key case pages on the full
+key and shows that paging on its first column loses or repeats a row.
 
 Traversal endpoints use the same sets. A traversal's destination set is the
 edge's endpoint set, intersected with any declared type of the destination
@@ -302,8 +307,9 @@ query touch($slug: String) {
   of opening every member. A bound type that is not a member of `I` is a typed
   refusal, not zero rows. A bound `$t` or `@type` value that names a type
   hidden from the actor gets the refusal of a value absent from the actor's
-  catalog, byte for byte, so a component cannot probe ids to learn which
-  hidden members exist. A member whose predicate matches nothing stages
+  catalog: the same error code and the same wording apart from the echoed
+  value, and neither says the type is hidden. A component cannot probe ids to
+  learn which hidden members exist. A member whose predicate matches nothing stages
   nothing (on main a zero-match update already stages and publishes nothing),
   so an N-member update costs one staged table commit per matching member and
   one manifest publication.
@@ -328,19 +334,24 @@ query touch($slug: String) {
   resource bounds. The table-handle cache holds at least every table in the
   accepted catalog. Today it holds 64, so a 75-member interface evicts its own
   handles: in the prototype a warm repeat of a 75-member keyed lookup reopened
-  55 to 61 tables, against none at 60 members. Each reopen costs at least one
-  object-store HEAD on S3: Lance 11's `load_by_uri` resolves a pinned
-  version's manifest location through the commit handler, and the default
-  resolver sends a HEAD (`lance` `dataset/builder.rs`, `lance-table`
-  `io/commit.rs` `default_resolve_version`). `DatasetBuilder` takes no
-  manifest location or size. The hook is OmniGraph's own commit handler,
-  whose `resolve_version_location` already answers from the clone context
-  (`omnigraph-core` `lance_clone.rs`): it answers from the manifest location
-  recorded in the pin, so a warm reopen sends no request. Lance consults its
-  manifest cache only when the location carries a size (`Dataset::get_manifest`),
-  and a pin's `manifest_size` and `e_tag` are optional
-  (`TableVersionMetadata`), so a pin without them falls back to the default
-  resolver and its HEAD.
+  55 to 61 tables, against none at 60 members. The handle cache is what
+  keeps a warm query from reopening tables. A reopen after eviction costs at least
+  two object-store requests on S3 today. A written graph table opens its detached
+  pin (`open_pinned_dataset`, `omnigraph-core` `instrumentation.rs`). For a
+  detached version Lance 11 resolves a location with no size and sends no
+  HEAD (`lance-table` `io/commit.rs` `default_resolve_version`), but
+  `Dataset::get_manifest` consults its manifest cache only when the location
+  carries a size, so the manifest is read again: a HEAD for its size and a
+  GET for its footer (`lance-io` `object_reader.rs`). `DatasetBuilder` takes
+  no manifest location or size. OmniGraph's commit handler
+  (`IndexOriginCommitHandler`, `omnigraph-core` `lance_clone.rs`) answers
+  only from the clone context of a branch creation, which refuses detached
+  versions, so it does not serve this open either. The change: the commit
+  handler returns the pin's recorded manifest location, with its size and
+  `e_tag`, on an ordinary open of a detached pin. `get_manifest` then uses
+  the session cache, and a later open of that pin sends no request. A pin's
+  `manifest_size` and `e_tag` are optional (`TableVersionMetadata`), so a pin
+  without them keeps the HEAD and the GET.
 - Every schema migration in this RFC is a schema apply, and schema apply
   refuses while any branch other than `main` exists. A graph that keeps
   long-lived branches lands them before widening an endpoint.
@@ -402,9 +413,11 @@ row shape as a concrete one. The scalar index on each endpoint column serves
 `packed BETWEEN type << 48 AND ((type << 48) | (2^48 - 1))`. That index is a
 BTREE. A bitmap index also answers these predicates, but it loads every
 distinct key when opened (`lance-index` `scalar/bitmap.rs`), and packed
-endpoints are nearly unique. Packed filters are built from `u64` literals: a
-value that passes through `i64` loses the index silently, because Lance then
-compares through a cast instead of probing.
+endpoints are nearly unique. Packed filters are built from `u64` literals.
+Lance coerces a literal to the column type only when the value fits
+(`lance-datafusion` `safe_coerce_scalar`): a non-negative `i64` still
+coerces, but a literal it cannot coerce, such as a wrapped negative `i64` or
+a `Decimal128` above `i64::MAX`, silently loses the index.
 
 The identity upgrade publishes new table versions for the current snapshot.
 Retained pre-upgrade versions still carry string endpoints; their decoding,
@@ -548,54 +561,75 @@ upgraded current format, and historical abstract bindings remain refused.
     change it. Pruning removes an arm's rows, not its statistics, so
     `@type_id = $t` and an equivalent filter that proves no pruning give a row
     the same score.
-  - Every row of every member counts, indexed or not. The engine first
-    collects each member's statistics (its index statistics, plus document and
-    token counts over its unindexed rows with no filter), sums them, and every
-    arm then scores against that total. Lance 11 does not do this even inside
-    one table. For row-level documents the scanner shares no scorer between
-    the indexed branch and the flat branch over unindexed fragments; it shares
-    one only for list elements (`lance` `dataset/scanner.rs`, unchanged in
-    13.0.0). The flat branch adds its own rows to any scorer it is given
-    (`lance-index` `flat_search.rs` `initialize_scorer`). A review probe gave
+  - Each query has one population, selected by the actor as
+    [Actor views and subgraph sharing](https://github.com/ModernRelay/omnigraph/pull/951)
+    selects it, and one procedure collects it for every arm:
+    - **A bypass actor, or a read that no view restricts:** every row of every
+      member, indexed or not. For each member the procedure takes its index
+      statistics plus the document and token counts of its unindexed rows,
+      with no query filter, and sums them. Every arm scores against that
+      total.
+    - **A restricted actor, when the view restricts any member the query
+      reads:** view statistics for every arm, as Actor views defines them for
+      one member: document count, document frequencies and total length over
+      each member's visible rows, counted by Lance's flat operator over the
+      view-filtered rows. The procedure reads no index statistics and counts
+      no row outside the view; a member the view does not restrict counts all
+      of its rows. It sums the members' counts, and every arm scores against
+      that total. The flat operator adds its own input to a supplied base
+      (`lance-index` `flat_search.rs` `initialize_scorer`), so each arm's base
+      is the other arms' sum. Hidden rows, hidden member types and index
+      coverage then change no restricted score.
+
+    A pruned member contributes the query's population like any other member
+    and nothing more. That has a cost: under view statistics a pruned member
+    is still a pass over its visible text, charged to the query's
+    `max_exact_search_rows` with the other arms. It is not measured.
+  - Lance 11 does not keep one corpus even inside one table. For row-level
+    documents the scanner shares no scorer between the indexed branch and the
+    flat branch over unindexed fragments; it shares one only for list
+    elements (`lance` `dataset/scanner.rs`, unchanged in 13.0.0). The flat
+    branch adds its own rows to any scorer it is given. A review probe gave
     two arms one shared scorer and scored the same text at 2.91 on the indexed
     path, 2.75 in an arm with one unindexed row and 1.00 in an arm with fifty.
     OmniGraph commits untrained segments and reconciles postings explicitly,
     so unindexed rows are normal after a write. A member with a write backlog
     would rank its own matches lower, which invariant 7 forbids. One table
     has the same dependence today, between its own indexed and unindexed
-    rows, and the upstream option below removes it there too.
-  - The statistics source follows the actor, as the full-text statistics
-    section of
-    [Actor views and subgraph sharing](https://github.com/ModernRelay/omnigraph/pull/951)
-    selects it: index-wide for bypass actors, view-independent (public or
-    uniform) for restricted actors on placed types. One query uses one source
-    for every arm. When any arm needs view-independent statistics, every arm
-    uses them; bypass actors keep the summed index-wide statistics. Summed
-    index-wide statistics would carry, for a restricted actor, the term
-    frequencies of rows and member types that [Policy](#policy) hides.
+    rows, and the scanner option below removes it there too.
   - The full-text index is declared on the interface property, so every
     member shares its analyzer, and the statistics cover every query token,
     including fuzzy expansions.
   - Every score computed across tables uses this corpus: `bm25` across members
     now, and `rrf` or compound full-text queries over several arms later.
 
-  This RFC does not build the per-arm plans. `Scanner::full_text_search` also
-  selects segments, adds the flat branch for unindexed fragments, blocks
-  overlay-stale rows and falls back to a full scan for legacy segments
-  (`lance` `dataset/scanner.rs`), and the overlay step,
+  This RFC does not build the bypass route's per-arm plans.
+  `Scanner::full_text_search` also selects segments, adds the flat branch for
+  unindexed fragments, blocks overlay-stale rows and falls back to a full scan
+  for legacy segments (`lance` `dataset/scanner.rs`), and the overlay step,
   `MatchQueryExec::with_overlay_block`, is `pub(crate)` in 11.0.0 and 13.0.0.
   An engine-built plan would copy those rules, could not block overlay-stale
-  rows, and would need rechecking at every Lance upgrade. Phase 3 instead
-  depends on two upstream Lance additions: a scanner option that takes a
-  corpus scorer and uses it unchanged in both branches, and a call that
-  returns one dataset's corpus statistics for a query's tokens over its
-  indexed and unindexed rows. Lance 13's `combined_fields` planner already
-  shares one corpus between its two branches. With those additions the
-  engine supplies statistics and Lance keeps planning. Actor views needs the
-  same option for restricted actors, so the two RFCs share one engine module,
-  the only code that chooses or sums statistics, whose input is the resolved
-  type set and the actor's statistics source. Until the option ships,
-  multi-member `bm25` stays refused.
+  rows, and would need rechecking at every Lance upgrade. Phase 3 depends on
+  two upstream Lance additions:
+  1. a scanner option that takes a corpus scorer and uses it unchanged in
+     both branches;
+  2. a call that returns one dataset's corpus statistics for a query's
+     tokens, over its indexed and unindexed rows or over a filtered input.
+
+  Lance 13's `combined_fields` planner shares one corpus between its two
+  branches through the crate-private `SharedFtsScorer`; that is precedent,
+  not a public hook. The restricted route reads no postings, so overlay-stale
+  rows do not arise there, and Actor views builds its single-member plan
+  itself. It needs only the other arms' view statistics. Lance 11's public
+  `flat_bm25_search_stream_with_options_and_scorer` returns the scorer it
+  counted, so a first pass with a zero base yields them today, at the cost of
+  tokenizing the visible text twice; the second addition, given a filtered
+  input, does it in one pass. Both routes live in one engine module shared
+  with Actor views, the only code that chooses or sums statistics: its input
+  is the resolved type set and the actor's population, its output one scorer.
+  Until the scanner option ships, multi-member `bm25` stays refused for every
+  actor, so a restricted actor never ranks across members where a bypass
+  actor cannot.
 - **Search.** `nearest` runs per arm with `k` and merges by `_distance`. The
   merge preserves each arm's accuracy, because the global top k is a subset
   of the union of per-arm top-k results. The overfetch ladder runs per arm.
@@ -914,7 +948,11 @@ A review on 2026-10-17 rechecked the full-text and reopen paths in the pinned
 - `MatchQueryExec::with_overlay_block` is `pub(crate)` in both versions.
 - `DatasetBuilder` has no manifest-location input. `load_by_uri` resolves a
   pinned version through the commit handler, and `Dataset::get_manifest`
-  consults the manifest cache only when the location carries a size.
+  consults the manifest cache only when the location carries a size. For a
+  detached version the default resolver returns no size and sends no HEAD,
+  so the manifest read sends a HEAD and a GET.
+- `flat_bm25_search_stream_with_options_and_scorer` is public and returns the
+  scorer it counted from its base and its input.
 
 ### Prototype
 
@@ -1051,8 +1089,8 @@ extended:
 - **Server:** catalog-route fields and `ETag`; schema hash on reads; feed
   `ChangeScopeMembershipChanged`; once actor views exist, member sets from the
   schema view, identical errors for hidden and undeclared type names,
-  identical error bodies for `$t` bound to a hidden member's id and to an
-  unused id, and `view.restricted`. With phase 3, a restricted actor's `bm25`
+  for `$t` bound to a hidden member's id and to an unused id the same error
+  code and the same body apart from the echoed id, and `view.restricted`. With phase 3, a restricted actor's `bm25`
   scores over an interface do not change when a hidden row, or a hidden
   member type with matching rows, is added.
 - **Search (phase 3):** `bm25_distinct_scores_rank_descending.gqt` on an
@@ -1108,8 +1146,9 @@ graph.
    - Query surface: interface and union bindings, `@type`, `@type_id`, type
      tests and narrowing.
    - Execution: the union-scan node with per-arm resolution, covering every
-     single-table consumer; pruning after parameter binding; concurrent arms
-     and a handle cache sized to the catalog; interface-wide `nearest`, and
+     single-table consumer; pruning after parameter binding; concurrent arms,
+     a handle cache sized to the catalog, and a commit handler that answers a
+     detached pin from its recorded manifest location; interface-wide `nearest`, and
      interface-wide `update`/`delete`.
    - Interface inheritance behind `interface-inheritance`; the catalog route
      with its full field list; the schema hash on reads; stored-query pinning
@@ -1129,9 +1168,11 @@ graph.
    - Interface-scope `@unique` behind `interface-unique`, including full
      prospective-universe validation on schema changes. Earlier phases refuse
      its declarations and feature rather than accept unenforced constraints.
-   - `bm25` across members under the corpus contract, once Lance's scanner
-     accepts a corpus scorer (an upstream dependency), through the statistics
-     module shared with Actor views.
+   - `bm25` across members under the corpus contract, through the statistics
+     module shared with Actor views. It depends on two upstream Lance
+     additions: a scanner option that takes a corpus scorer and uses it
+     unchanged in both branches, and a call that returns a dataset's corpus
+     statistics for a query's tokens, over all its rows or a filtered input.
 5. **Phase 4, extensions.**
    - Covariant interface properties (enum refining String, non-null refining
      nullable; physically identical).
@@ -1212,3 +1253,12 @@ changing no score. It depends on an upstream Lance scanner option rather than
 engine-built plans, and stays refused until that ships. Hidden type ids are
 refused like unknown ones; paging by filters needs a unique public ordering
 tuple; a warm reopen is answered by the commit handler from the pin.
+
+2026-10-18: the corpus contract has one collection procedure per actor
+class. Bypass actors, and reads no view restricts, sum index statistics and
+unindexed rows; restricted actors use Actor views' view statistics for every
+arm, which that RFC adopted in place of public or uniform statistics. A warm
+reopen after eviction still sends a HEAD and a GET today; answering a
+detached pin from its recorded manifest location is a phase-1 change, not
+current behavior. The public paging tuple names every key property, and a
+hidden type id's refusal matches an unknown id apart from the echoed value.
