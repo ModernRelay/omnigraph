@@ -1159,6 +1159,16 @@ graph.
    - Allow metadata-only `implements` additions, subject to schema validation
      once interface-wide constraints exist.
    - Make the three lowering sites handle type sets.
+   - Resolve type references to `StableTypeId` below the compiler
+     ([issue #1079](https://github.com/ModernRelay/omnigraph/issues/1079)):
+     - query IR type references become `TypeRefIR { type_id, type_name }`;
+     - the planner and engine key table lookups, plan pins and caches by id,
+       keeping the name for explain output and errors.
+
+     It ships with or directly after the identity RFC's `NodeRef`, so no phase
+     runs with type names in plans and type ids in rows. Phases 1 and 2 build
+     on it. Its serialized-plan and IR contract changes are decided in that
+     issue's RFC, not here.
 2. **Phase 1, abstract bindings.**
    - Query surface: interface and union bindings, `@type`, `@type_id`, type
      tests and narrowing.
@@ -1286,3 +1296,9 @@ reuse in one apply, so a same-kind rename and re-add, including a move under
 Schema namespaces, is caught by pinning. Type references share Schema
 namespaces' qualified spelling. Item 14's fix is worded without "namespace",
 which that RFC now uses for qualified names.
+
+2026-10-18: phase 0 also resolves type references to `StableTypeId` below
+the compiler (issue #1079), with or directly after the identity RFC's
+`NodeRef`. The prototype's first draft chose between two identity rules per
+site and got four of them wrong (P1, P2, P4, P6), so plans and rows should not
+use different vocabularies.
