@@ -1,6 +1,7 @@
 //! Writable embedded commands share one root admission per CLI invocation.
 //! Read-only commands observe authority without a lock; HTTP uses its server.
 
+use std::io::Write;
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use color_eyre::eyre::{Result, eyre};
@@ -35,7 +36,7 @@ pub(crate) async fn open_read_only(
 
 /// Acquire before the writable opener (including its capability probe), and
 /// reuse only the same canonical root's admission during this command.
-pub(crate) async fn ensure_graph(uri: &str) -> Result<()> {
+pub(crate) async fn ensure_graph(uri: &str, stderr: &mut dyn Write) -> Result<()> {
     let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(uri)
         .await
         .map_err(report)?
@@ -66,11 +67,14 @@ pub(crate) async fn ensure_graph(uri: &str) -> Result<()> {
         // Report before dispatch as well as before any command-local exit or
         // lost output. Success of an arbitrary CLI command is not a qualified
         // native settlement proof; its persisted lock deliberately survives.
-        eprintln!(
+        let custody = format!(
             "cluster admission retained: root={} lock_id={}. After stopping the owner and establishing graph/control I/O quiescence, use exact-ID cluster force-unlock; command completion alone does not release this lock.",
             omnigraph::storage::redacted_storage_uri(owner.canonical_root()),
             owner.lock_id(),
         );
+        writeln!(stderr, "{custody}")
+            .and_then(|()| stderr.flush())
+            .map_err(|error| color_eyre::Report::from(error).wrap_err(custody))?;
         owners.insert(key, owner);
     }
     Ok(())

@@ -163,7 +163,10 @@ async fn the_replay_runs_under_the_captured_memory_limit_not_the_ambient_one() {
     );
     let replay = with_query_memory_limit(
         1,
-        v2.replay_bound_plan(ReadTarget::branch("main"), run.plan.clone()),
+        v2.replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(QUERY, "liked"),
+        ),
     )
     .await
     .expect("the ambient 1-byte limit is not read; the plan's 64 MiB is");
@@ -209,7 +212,10 @@ async fn the_replay_reads_the_plans_env_pair_not_the_process_environment() {
     // SAFETY: the test is `#[serial]` and restores the variable before it returns.
     unsafe { std::env::set_var(EXPAND_INDEXED_MAX_FRONTIER_ENV, "1") };
     let replay = v2
-        .replay_bound_plan(ReadTarget::branch("main"), run.plan.clone())
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &run.replay_envelope(QUERY, "liked"),
+        )
         .await;
     let replanned = v2
         .query_inspected(ReadTarget::branch("main"), QUERY, "liked", &ParamMap::new())
@@ -301,13 +307,14 @@ async fn ann_nprobes_is_a_field_of_the_ranked_scan_and_the_rows_do_not_move() {
                 .contains(&format!("\"nprobes\":{nprobes}")),
             "{explain}"
         );
+        let envelope = run.replay_envelope(NEAREST, "by_vector");
         let replay = session
-            .replay_bound_plan(ReadTarget::branch("main"), run.plan.clone())
+            .replay_bound_plan(ReadTarget::branch("main"), &envelope)
             .await
             .unwrap();
         assert_eq!(rows_of(&replay.result), rows_of(&run.result));
         runs.push(rows_of(&run.result));
-        plans.push(run.plan.clone());
+        plans.push(envelope);
     }
     assert_eq!(
         runs[0], runs[1],
@@ -315,7 +322,7 @@ async fn ann_nprobes_is_a_field_of_the_ranked_scan_and_the_rows_do_not_move() {
     );
     assert_eq!(runs[0].len(), 3);
     let crossed = with_setting(&v2, "ann_nprobes", "64")
-        .replay_bound_plan(ReadTarget::branch("main"), plans[0].clone())
+        .replay_bound_plan(ReadTarget::branch("main"), &plans[0])
         .await
         .expect("the door takes a plan gathered under another session's cap");
     assert_eq!(
@@ -326,7 +333,8 @@ async fn ann_nprobes_is_a_field_of_the_ranked_scan_and_the_rows_do_not_move() {
 }
 
 /// The profile surface: one row per report row in the explain row schema,
-/// its `node` the plan node's kind and its `detail` the row's own fields.
+/// its `node` the plan node's kind and its `detail` the row's own fields,
+/// then one row per search decision the run took.
 #[tokio::test]
 async fn profile_rows_carry_the_report_in_the_explain_row_schema() {
     let dir = tempfile::tempdir().unwrap();
@@ -377,4 +385,49 @@ async fn profile_rows_carry_the_report_in_the_explain_row_schema() {
             );
         }
     }
+
+    let docs = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(docs.path().to_str().unwrap(), DOC_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d0","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","embedding":[1.0,0.0,0.0,0.0]}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
+    let run = with_setting(&db, "engine", "v2")
+        .query_inspected(ReadTarget::branch("main"), NEAREST, "by_vector", &params)
+        .await
+        .unwrap();
+    let batch = run.profile().unwrap().concat_batches().unwrap();
+    let nodes = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let details = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let probes: Vec<Value> = (0..batch.num_rows())
+        .filter(|row| nodes.value(*row) == "probes")
+        .map(|row| serde_json::from_str(details.value(row)).unwrap())
+        .collect();
+    assert_eq!(
+        probes.len(),
+        1,
+        "the nearest scan's one pass records its probes"
+    );
+    assert_eq!(probes[0]["decision"], "probes");
+    assert_eq!(probes[0]["rung"], 0);
+    assert!(
+        !probes[0]["attempts"].as_array().unwrap().is_empty(),
+        "{probes:?}"
+    );
 }

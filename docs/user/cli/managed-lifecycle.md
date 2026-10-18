@@ -1,4 +1,4 @@
-# Create and retire a managed cluster
+# Discover, configure and retire a managed cluster
 
 These commands use your managed service identity and permissions. They do not
 open graph storage or require cloud credentials. The service must support
@@ -6,22 +6,77 @@ cluster creation and lifecycle operations; an older service returns a refusal.
 Every command below requires explicit `--managed`; folder context alone never
 selects the service for a cluster command.
 
+## Find a cluster and recover its configuration
+
+After signing in, list the clusters visible to your selected organization:
+
+```sh
+omnigraph cluster list --managed --api https://control.example \
+  --organization org_customer --json
+omnigraph use CLUSTER_ID --api https://control.example \
+  --organization org_customer --config binding
+omnigraph cluster pull --managed --config binding --out customer-config --json
+```
+
+`use` creates only the folder binding. `pull` downloads the managed repository's
+current configuration and copies that binding into a **new** directory. This
+works on a new laptop or for another authorized team member; cloud credentials
+and access to a Git server are unnecessary. Keep the returned `data.revision`
+for the next `push --expected-revision`. To retrieve a historical source commit,
+add `--rev FULL_COMMIT_ID` to `pull`.
+
+The destination's parent must exist. An existing directory, even empty, a file
+or a symlink refuses. Download into another new directory to compare remote
+changes with local edits; the CLI never merges or overwrites a working tree.
+All files and the context appear together after validation. A failed download
+leaves no partial destination. Source contents are not printed in the result.
+
+Download is currently supported on Linux and macOS. The export is bounded to
+4096 UTF-8 files, 1 MiB per file, 8 MiB total file contents, 512-byte relative
+paths and a 64 MiB JSON response (allowing JSON escaping). Its HTTP deadline is
+120 seconds. Traversal, symlinks, conflicting paths and reserved directories
+are refused. `.git`, credentials and server-side control records are not
+downloaded; `.omnigraph/context` is created locally from the verified binding.
+The service requires cluster admission and `source_read`; an external repository
+binding must be checked out through its own Git provider instead.
+
+## List cluster members
+
+From a bound folder, use its cached session to list enrolled people:
+
+```sh
+omnigraph cluster members list --managed
+omnigraph cluster members list --managed --json
+```
+
+The command requires the selected cluster's `status` permission. It shows names,
+emails, stable principal IDs, cluster admission and this cluster's control grants.
+`--json` returns the API envelope; `--config DIR` selects another bound folder.
+Name and email may be unavailable; stable IDs and enrollment remain visible.
+The list contains people with explicit cluster admission or a cluster-specific
+control grant, up to 1,000 members; exceeding the limit refuses instead of
+truncating. It does not list invitations or calculate effective graph permissions:
+applied Cedar policy authorizes graph operations separately. This command is
+read-only and does not invite people or change their permissions.
+Organization administrators use [team administration](managed-team.md) to invite,
+enroll and remove people through the same cached CLI login.
+
 ## Create an empty cluster
 
 Log in to your control API, then use an unbound configuration directory:
 
 ```sh
-omnigraph login --api https://control.example
+omnigraph login --api https://control.example --organization org_customer
 mkdir customer-demo
 omnigraph cluster create --managed customer-demo --api https://control.example \
-  --config customer-demo --no-wait --json
+  --organization org_customer --config customer-demo --no-wait --json
 ```
 
 The service reserves a fresh cluster and operation. The CLI writes its managed
 context only after checking the returned identity. An existing context is never
 overwritten. Keep the response's `data.canonical_root`, `data.incarnation` and
 `data.operation_id` for the following steps. Without `--no-wait`, creation
-waits for the normal plan/apply bootstrap and serving readiness. The JSON keeps
+waits for the service's initial bootstrap and serving readiness. The JSON keeps
 `data.state` (the operation outcome) separate from
 `data.lifecycle.phase` (provisioning progress).
 
@@ -32,40 +87,46 @@ cancel creation. Follow the saved operation explicitly:
 ```sh
 omnigraph cluster operation --managed OPERATION_ID --config customer-demo --json
 omnigraph cluster operation --managed OPERATION_ID --api https://control.example \
-  --wait --timeout 600 --json
+  --organization org_customer --wait --timeout 600 --json
 ```
 
-An operation can be inspected with `--api` before a folder is bound. If both an
-origin and an existing folder context are present, they must agree. Private
+An operation can be inspected with `--api` before a folder is bound. If an
+explicit origin or organization accompanies an existing folder context, they
+must agree. Unbound commands accept `--organization`; omission selects only a sole
+cached organization for that API. Multiple cached organizations refuse. Private
 clusters still require the connection reported by your service, such as an
 explicit port forward; `ready` does not imply a public endpoint.
 
 ## Prepare and apply configuration
 
 Creation binds the folder; it does not create local configuration files. After
-the operation reaches `ready`, create `customer-demo/cluster.yaml`, replacing
-`CANONICAL_ROOT` with the exact root from the accepted create response:
+the operation reaches `ready`, download its initial configuration, including
+the policy that grants its creator management access:
+
+```sh
+omnigraph cluster pull --managed --config customer-demo --out customer-config --json
+# Keep data.revision as COMMIT below.
+```
+
+Edit `customer-config/cluster.yaml` to add a graph under `graphs`, keeping its
+existing storage root and policy declarations:
 
 ```yaml
-version: 1
-storage: CANONICAL_ROOT
 graphs:
   catalog:
     schema: ./catalog.pg
 ```
 
-Create `customer-demo/catalog.pg` with your graph schema, then read the current
-managed revision before submitting the edit:
+Create `customer-config/catalog.pg` with your graph schema, then submit the edit
+against the exact revision downloaded:
 
 ```sh
-omnigraph cluster status --managed --config customer-demo --json
-# Use data.requested.revision from that response.
-omnigraph cluster push --managed --config customer-demo --expected-revision COMMIT \
+omnigraph cluster push --managed --config customer-config --expected-revision COMMIT \
   --message "Add the knowledge graph" --json
 # Use data.revision returned by push.
-omnigraph cluster plan --managed --config customer-demo --rev NEW_COMMIT --json
-# Use data.run_id from the converged plan.
-omnigraph cluster apply --managed --config customer-demo --plan PLAN_RUN_ID --json
+omnigraph cluster plan --managed --config customer-config --rev NEW_COMMIT --json
+# Use data.preview_id from the ready preview.
+omnigraph cluster apply --managed --config customer-config --plan PREVIEW_ID --json
 ```
 
 `push` uploads only `cluster.yaml`, referenced schemas, stored queries and
@@ -78,10 +139,12 @@ and a 32 MiB request. Path length is limited to 512 bytes and capture to
 descriptor-relative file traversal; other platforms refuse before submission.
 
 The expected revision is a full 40-character lowercase Git commit ID. A stale
-head is refused; read the current revision and reconcile your edit before
-retrying. The storage root cannot change. A saved plan holds the change lease;
-apply or abandon that plan before another upload. `push` requires plan
-permission and never executes a plan; `apply` requires its separate permission.
+head is refused; pull into another new directory and reconcile your edit before
+retrying against that revision. The storage root cannot change. `push` requires
+`source_write` and changes only the managed repository. Source-head observation requires
+`source_read`; it grants no native management permission. The applied cluster
+policy decides whether the caller may plan and deploy configuration. A preview
+does not hold a change lease or prevent another source edit.
 
 ## Delete and undo
 
@@ -140,6 +203,9 @@ pending record while acceptance is uncertain.
 
 JSON output is one response on stdout; progress and idempotency information use
 stderr. A local deadline exits 5 and retains the latest operation response.
-Other outcomes use the [managed exit codes](reference.md#managed-cluster-commands).
+Lifecycle outcomes keep their own mapping: ready or purged exits 0, failed 1,
+refused or blocked 2, partially converged 3, recovery required 4, stalled or a
+local deadline 5, and cancelled 6. A retained tombstone is an observation goal
+for deletion with a nonzero undo interval, not completed physical cleanup.
 All lifecycle commands refuse `--direct` and conflicting actor or storage
 selectors. Authentication and data credentials remain separate.

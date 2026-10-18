@@ -11,9 +11,11 @@
 //! scan Doc as $d: access id_lookup
 //! hash join $d
 //! hash join $d ran id_lookup
+//! anti join $x: key_set
 //! scan Doc as $d: ranked bm25
 //! scan Doc as $d: ranked nearest fetch 10
 //! scan Doc as $d: ranked nearest fetch 10 nprobes 20
+//! scan Doc as $d: ranked bm25 eligibility after_scoring
 //! expand $d Knows $e: mode indexed_scan
 //! expand $d Knows $e: mode indexed_scan ran csr
 //! contains join $p.text contains $m.number
@@ -24,6 +26,7 @@
 //! hydrate $d: columns [body, title]
 //! pass projection_pushdown
 //! not pass aggregate_pushdown
+//! validation scope exact_subset
 //! ```
 //!
 //! A `ran` claim names the side of the node's declared switch that ran,
@@ -31,26 +34,25 @@
 //! node's row), joined to the explain row by the node's `id`.
 
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_planner::optimizer::{
-    PASS_ACCESS_PATH, PASS_ADDRESS_SHORT_CIRCUIT, PASS_AGGREGATE_PUSHDOWN, PASS_EXPAND_MODE,
-    PASS_FRAGMENT_SCOPE, PASS_JOIN_ALGORITHM, PASS_LATE_MATERIALIZATION, PASS_PREDICATE_PUSHDOWN,
-    PASS_PROJECTION_PUSHDOWN, PASS_RESOLVE,
-};
+use omnigraph_planner::ValidationScope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::report::Row;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
 const EXPAND_MODES: [&str; 2] = ["csr", "indexed_scan"];
+const ANTI_JOIN_STRATEGIES: [&str; 2] = ["correlated", "key_set"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AggregateClaim {
     column: String,
     func: String,
+    #[serde(default)]
+    distinct: bool,
     input: String,
     accumulator: omnigraph_planner::Accumulator,
     overflow: omnigraph_planner::Overflow,
@@ -118,6 +120,12 @@ pub(crate) enum PlanLine {
         binding: String,
         ran: Option<String>,
     },
+    /// Every physical `AntiJoin` correlated on `$outer_var` reaches its
+    /// block's matches by `strategy` (`correlated` or `key_set`).
+    AntiJoin {
+        outer_var: String,
+        strategy: String,
+    },
     /// Every selected physical scan is ranked, and one of them by the named
     /// index, asking it for `fetch` candidates and under the probe cap
     /// `nprobes` (`0` no cap) when claimed; an `rrf()` has one scan per arm.
@@ -127,6 +135,8 @@ pub(crate) enum PlanLine {
         index: String,
         fetch: Option<u64>,
         nprobes: Option<u64>,
+        /// Where the scan applies its eligibility, when claimed.
+        eligibility: Option<String>,
     },
     /// Every selected physical scan is marked with a runtime filter on
     /// `column`, or with none when `column` is `None`.
@@ -188,6 +198,11 @@ pub(crate) enum PlanLine {
         name: String,
         negated: bool,
     },
+    /// Acceptance checked the plan to `scope` (`exact_subset` or
+    /// `invariants_only`), as the document's `validation` reports it.
+    ValidationScope {
+        scope: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -215,27 +230,27 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
         {
             let (name, negated) = name;
             let name = name.trim();
-            if ![
-                PASS_RESOLVE,
-                PASS_PREDICATE_PUSHDOWN,
-                PASS_AGGREGATE_PUSHDOWN,
-                PASS_PROJECTION_PUSHDOWN,
-                PASS_FRAGMENT_SCOPE,
-                PASS_ADDRESS_SHORT_CIRCUIT,
-                PASS_LATE_MATERIALIZATION,
-                PASS_JOIN_ALGORITHM,
-                PASS_EXPAND_MODE,
-                PASS_ACCESS_PATH,
-                omnigraph_planner::scan_access::PASS_SCAN_ACCESS,
-                omnigraph_planner::scan_access::PASS_KEY_TO_ID,
-            ]
-            .contains(&name)
-            {
+            if omnigraph_planner::PassId::parse(name).is_none() {
                 return Err(refused("names a known optimizer pass"));
             }
             lines.push(PlanLine::Pass {
                 name: name.to_string(),
                 negated,
+            });
+            continue;
+        }
+        if let Some(scope) = line.strip_prefix("validation scope ") {
+            let scope = scope.trim();
+            if ![
+                ValidationScope::ExactSubset.as_str(),
+                ValidationScope::InvariantsOnly.as_str(),
+            ]
+            .contains(&scope)
+            {
+                return Err(refused("names `exact_subset` or `invariants_only`"));
+            }
+            lines.push(PlanLine::ValidationScope {
+                scope: scope.to_string(),
             });
             continue;
         }
@@ -335,6 +350,10 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                     "names a result column and a known aggregate function",
                 ));
             }
+            let (distinct, input) = match input.trim().strip_prefix("distinct ") {
+                Some(input) => (true, input),
+                None => (false, input),
+            };
             let input = aggregate_type(input.trim())
                 .ok_or_else(|| refused("names a declared input type"))?;
             let result = aggregate_type(result.trim())
@@ -346,6 +365,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             let claim = AggregateClaim {
                 column: column.to_string(),
                 func: func.to_string(),
+                distinct,
                 input,
                 accumulator,
                 overflow,
@@ -427,6 +447,26 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             });
             continue;
         }
+        if let Some(rest) = line.strip_prefix("anti join ") {
+            let claim = rest.split_once(':').and_then(|(outer_var, strategy)| {
+                let outer_var = outer_var
+                    .trim()
+                    .strip_prefix('$')
+                    .filter(|v| identifier(v))?;
+                let strategy = strategy.trim();
+                ANTI_JOIN_STRATEGIES
+                    .contains(&strategy)
+                    .then(|| (outer_var.to_string(), strategy.to_string()))
+            });
+            let Some((outer_var, strategy)) = claim else {
+                return Err(refused("claims `anti join $var: <correlated|key_set>`"));
+            };
+            lines.push(PlanLine::AntiJoin {
+                outer_var,
+                strategy,
+            });
+            continue;
+        }
         let join = if let Some(rest) = line.strip_prefix("contains join ") {
             Some((rest, "contains join"))
         } else {
@@ -457,7 +497,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             (rest, true)
         } else {
             return Err(refused(
-                "knows fourteen line heads: `scan`, `hash join`, `contains join`, `cross join`, `expand`, `filter`, `sort`, `rank fuse`, `aggregate`, `result columns`, `type`, `cast`, `no cast`, `pass`",
+                "knows fifteen line heads: `scan`, `hash join`, `anti join`, `contains join`, `cross join`, `expand`, `filter`, `sort`, `rank fuse`, `aggregate`, `result columns`, `type`, `cast`, `no cast`, `pass`",
             ));
         };
         let Some((selector, claim)) = rest.split_once(':') else {
@@ -546,7 +586,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
         if binding.as_ref().is_some_and(|name| !identifier(name)) {
             return Err(refused("names one nonempty binding"));
         }
-        if !identifier(&type_name) {
+        if !crate::shape::is_type_name(&type_name) {
             return Err(refused("names one node type"));
         }
         let claim = claim.trim();
@@ -578,18 +618,28 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                 .ok_or_else(|| refused("claims `ranked nearest` or `ranked bm25`"))?;
             let mut fetch = None;
             let mut nprobes = None;
+            let mut eligibility = None;
             while let Some(key) = words.next() {
-                let count = words.next().and_then(|count| count.parse::<u64>().ok());
-                match (key, count) {
-                    ("fetch", Some(count)) if fetch.is_none() && nprobes.is_none() => {
+                let value = words.next();
+                let count = value.and_then(|count| count.parse::<u64>().ok());
+                match (key, count, value) {
+                    ("fetch", Some(count), _)
+                        if fetch.is_none() && nprobes.is_none() && eligibility.is_none() =>
+                    {
                         fetch = Some(count);
                     }
-                    ("nprobes", Some(count)) if nprobes.is_none() => {
+                    ("nprobes", Some(count), _) if nprobes.is_none() && eligibility.is_none() => {
                         nprobes = Some(count);
+                    }
+                    ("eligibility", _, Some(placement))
+                        if eligibility.is_none()
+                            && ["before_scoring", "after_scoring"].contains(&placement) =>
+                    {
+                        eligibility = Some(placement.to_string());
                     }
                     _ => {
                         return Err(refused(
-                            "claims `ranked <kind>[ fetch <n>][ nprobes <n>]`: each key optional, at most once, in that order, followed by a whole number",
+                            "claims `ranked <kind>[ fetch <n>][ nprobes <n>][ eligibility <before_scoring|after_scoring>]`: each key optional, at most once, in that order",
                         ));
                     }
                 }
@@ -600,6 +650,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                 index: kind.to_string(),
                 fetch,
                 nprobes,
+                eligibility,
             });
             continue;
         } else if let Some(access) = claim.strip_prefix("access ") {
@@ -753,7 +804,7 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
         for ty in types {
             if crate::shape::is_type_name(ty)
                 && crate::shape::parse_type(ty).is_none()
-                && !catalog.node_types.contains_key(ty)
+                && catalog.query_node_type(ty).is_none()
             {
                 return Err(format!("expect plan: unknown node type `{ty}`"));
             }
@@ -763,7 +814,7 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
                 let parsed = crate::shape::parse_shape_body(&[(0, column)])?;
                 for field in parsed {
                     if let crate::shape::ShapeType::Node(name) = field.shape_type
-                        && !catalog.node_types.contains_key(&name)
+                        && catalog.query_node_type(&name).is_none()
                     {
                         return Err(format!("expect plan: unknown node type `{name}`"));
                     }
@@ -774,7 +825,7 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
             for ty in [&claim.input, &claim.result] {
                 if ty != "exact_integer"
                     && crate::shape::parse_type(ty).is_none()
-                    && !catalog.node_types.contains_key(ty)
+                    && catalog.query_node_type(ty).is_none()
                 {
                     return Err(format!("expect plan: unknown node type `{ty}`"));
                 }
@@ -789,8 +840,7 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
             continue;
         };
         let node = catalog
-            .node_types
-            .get(type_name)
+            .query_node_type(type_name)
             .ok_or_else(|| format!("expect plan: unknown node type `{type_name}`"))?;
         for column in columns {
             if node.arrow_schema.field_with_name(column).is_err() {
@@ -860,6 +910,7 @@ struct PlannedRanking {
     kind: String,
     fetch: Option<u64>,
     nprobes: Option<u64>,
+    eligibility: Option<String>,
 }
 
 /// `<choice>[ ran <choice>]` over the words `allowed`: the planned choice
@@ -911,6 +962,8 @@ struct PlannedNodes {
     modes: Vec<PlannedExpandMode>,
     accesses: Vec<PlannedAccess>,
     joins: Vec<PlannedJoin>,
+    /// `(outer_var, strategy)` of every physical `AntiJoin`.
+    anti_joins: Vec<(String, String)>,
     contains_joins: Vec<PlannedContainsJoin>,
     cross_joins: Vec<Vec<String>>,
     sorts: Vec<Result<Vec<String>, String>>,
@@ -1185,24 +1238,27 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                 "expect plan: Aggregate has no aggregates list".to_string()
             )),
         },
-        Some("AntiJoin") => match node.get("aggregate") {
-            Some(Value::Null) => {}
-            Some(entry) => {
-                let mut entry = entry.clone();
-                if let Some(fields) = entry.as_object_mut()
-                    && let Some(gq) = fields.remove("gq")
-                {
-                    fields.insert("column".into(), gq);
+        Some("AntiJoin") => {
+            out.anti_joins.push((text("outer_var"), text("strategy")));
+            match node.get("aggregate") {
+                Some(Value::Null) => {}
+                Some(entry) => {
+                    let mut entry = entry.clone();
+                    if let Some(fields) = entry.as_object_mut()
+                        && let Some(gq) = fields.remove("gq")
+                    {
+                        fields.insert("column".into(), gq);
+                    }
+                    out.block_aggregates
+                        .push(serde_json::from_value(entry).map_err(|error| {
+                            format!("expect plan: malformed block aggregate entry: {error}")
+                        }));
                 }
-                out.block_aggregates
-                    .push(serde_json::from_value(entry).map_err(|error| {
-                        format!("expect plan: malformed block aggregate entry: {error}")
-                    }));
+                None => out.block_aggregates.push(Err(
+                    "expect plan: AntiJoin has no aggregate declaration".into(),
+                )),
             }
-            None => out.block_aggregates.push(Err(
-                "expect plan: AntiJoin has no aggregate declaration".into(),
-            )),
-        },
+        }
         Some("Expand") => {
             out.selections.push((
                 text("src"),
@@ -1251,6 +1307,10 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                     nprobes: ranked
                         .get("nprobes")
                         .map(|nprobes| nprobes.as_u64().unwrap_or(0)),
+                    eligibility: ranked
+                        .get("eligibility")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 }),
             runtime_filter: node
                 .get("runtime_filter")
@@ -1421,6 +1481,20 @@ pub(crate) fn plan_mismatch(
         .unwrap_or_default();
     for line in lines {
         match line {
+            PlanLine::ValidationScope { scope } => {
+                let reported = explain
+                    .get("validation")
+                    .and_then(|validation| validation.get("scope"))
+                    .and_then(Value::as_str);
+                if reported != Some(scope.as_str()) {
+                    return Some(format!(
+                        "expect plan: validation scope {scope}; the document reports {}",
+                        reported.map_or("no validation".to_string(), |reported| format!(
+                            "scope {reported}"
+                        ))
+                    ));
+                }
+            }
             PlanLine::Type { gq, ty } => {
                 let typed = match typed_nodes(&nodes.typed) {
                     Ok(nodes) => nodes,
@@ -1633,6 +1707,7 @@ pub(crate) fn plan_mismatch(
                 index: kind,
                 fetch,
                 nprobes,
+                eligibility,
             } => {
                 let selected = match physical_scans(&nodes, type_name, binding.as_deref()) {
                     Ok(selected) => selected,
@@ -1671,6 +1746,15 @@ pub(crate) fn plan_mismatch(
                                 "expect plan: the `{kind}` scans of `{type_name}` fetch {fetches:?}, expected {fetch}"
                             ),
                         });
+                    }
+                }
+                if let Some(eligibility) = eligibility {
+                    let placements: Vec<Option<&str>> =
+                        of_kind.iter().map(|r| r.eligibility.as_deref()).collect();
+                    if !placements.contains(&Some(eligibility.as_str())) {
+                        return Some(format!(
+                            "expect plan: the `{kind}` scans of `{type_name}` apply eligibility {placements:?}, expected {eligibility}"
+                        ));
                     }
                 }
                 if let Some(nprobes) = nprobes {
@@ -1844,6 +1928,32 @@ pub(crate) fn plan_mismatch(
                         }
                         Ok(_) => {}
                     }
+                }
+            }
+            PlanLine::AntiJoin {
+                outer_var,
+                strategy,
+            } => {
+                let selected: Vec<&str> = nodes
+                    .anti_joins
+                    .iter()
+                    .filter(|(var, _)| var == outer_var)
+                    .map(|(_, planned)| planned.as_str())
+                    .collect();
+                if selected.is_empty() {
+                    let known: Vec<String> = nodes
+                        .anti_joins
+                        .iter()
+                        .map(|(var, _)| format!("${var}"))
+                        .collect();
+                    return Some(format!(
+                        "expect plan: no anti join correlated on `${outer_var}` in the physical plan; it correlates {known:?}"
+                    ));
+                }
+                if let Some(planned) = selected.iter().find(|planned| **planned != strategy) {
+                    return Some(format!(
+                        "expect plan: the anti join on `${outer_var}` is `{planned}`, expected `{strategy}`"
+                    ));
                 }
             }
             PlanLine::Scan {
@@ -2444,6 +2554,51 @@ mod tests {
         assert_eq!(check(&lines, &explain()), None);
     }
 
+    /// The scope claim reads the document's `validation`; a different scope
+    /// or a document without one fails, and an unknown scope is refused.
+    #[test]
+    fn validation_scope_claims_read_the_documents_validation() {
+        let lines = parse_plan_body(&[(0, "validation scope invariants_only")]).unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::ValidationScope {
+                scope: "invariants_only".to_string()
+            }
+        );
+        let accepted = json!({"validation": {"scope": "invariants_only"}});
+        assert_eq!(check(&lines, &accepted), None);
+        let exact = json!({"validation": {"scope": "exact_subset"}});
+        let mismatch = check(&lines, &exact).unwrap();
+        assert!(
+            mismatch.contains("reports scope exact_subset"),
+            "{mismatch}"
+        );
+        let mismatch = check(&lines, &explain()).unwrap();
+        assert!(mismatch.contains("reports no validation"), "{mismatch}");
+        assert!(parse_plan_body(&[(0, "validation scope everything")]).is_err());
+    }
+
+    /// The eligibility claim reads the ranked scan's declared placement.
+    #[test]
+    fn eligibility_claims_read_the_ranked_scans_placement() {
+        let explain = json!({"physical_plan": {"node": "Scan", "table": "node:Doc", "binding": "d",
+            "ranked": {"kind": "bm25", "fetch": null, "eligibility": "after_scoring"}}});
+        let lines =
+            parse_plan_body(&[(0, "scan Doc as $d: ranked bm25 eligibility after_scoring")])
+                .unwrap();
+        assert_eq!(check(&lines, &explain), None);
+        let lines =
+            parse_plan_body(&[(0, "scan Doc as $d: ranked bm25 eligibility before_scoring")])
+                .unwrap();
+        let mismatch = check(&lines, &explain).unwrap();
+        assert!(mismatch.contains("expected before_scoring"), "{mismatch}");
+        assert!(parse_plan_body(&[(0, "scan Doc: ranked bm25 eligibility sometimes")]).is_err());
+        assert!(
+            parse_plan_body(&[(0, "scan Doc: ranked bm25 eligibility after_scoring fetch 1")])
+                .is_err()
+        );
+    }
+
     #[test]
     fn a_read_column_fails_the_negative_form() {
         let lines = parse_plan_body(&[(0, "scan Doc: not columns [slug]")]).unwrap();
@@ -2729,6 +2884,55 @@ mod tests {
     }
 
     #[test]
+    fn anti_join_claims_read_each_blocks_strategy() {
+        let explain = json!({
+            "physical_plan": {"node": "Projection", "inputs": [
+                {"node": "AntiJoin", "outer_var": "x", "strategy": "key_set", "aggregate": null, "inputs": [
+                    {"node": "AntiJoin", "outer_var": "p", "strategy": "correlated", "aggregate": null, "inputs": [
+                        {"node": "Scan", "table": "node:Person", "binding": "p"},
+                        {"node": "OuterReference", "outer_var": "p"}
+                    ]},
+                    {"node": "Scan", "table": "node:Source", "binding": "s0"}
+                ]}
+            ]},
+            "passes": ["resolve", "anti_join_strategy"],
+        });
+        let lines = parse_plan_body(&[
+            (0, "anti join $x: key_set"),
+            (1, "anti join $p: correlated"),
+            (2, "pass anti_join_strategy"),
+        ])
+        .unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::AntiJoin {
+                outer_var: "x".to_string(),
+                strategy: "key_set".to_string(),
+            }
+        );
+        assert_eq!(check(&lines, &explain), None);
+        for (claim, message) in [
+            (
+                "anti join $x: correlated",
+                "the anti join on `$x` is `key_set`, expected `correlated`",
+            ),
+            ("anti join $q: key_set", "no anti join correlated on `$q`"),
+        ] {
+            let lines = parse_plan_body(&[(0, claim)]).unwrap();
+            let mismatch = check(&lines, &explain).unwrap();
+            assert!(mismatch.contains(message), "{mismatch}");
+        }
+        for refused in [
+            "anti join x: key_set",
+            "anti join $x key_set",
+            "anti join $x: hash_join",
+            "anti join $x:",
+        ] {
+            assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
     fn scalar_access_claims_require_matching_typed_leaves_on_every_scan() {
         let leaf = json!({"kind":"search","index":"by_age","column":"age","search":"age = 1"});
         let scan = json!({"node":"Scan","table":"node:Doc","binding":"d","access":"index_probe",
@@ -2938,6 +3142,7 @@ mod tests {
                 index: "nearest".to_string(),
                 fetch: Some(10),
                 nprobes: None,
+                eligibility: None,
             }
         );
         assert_eq!(lines[2].clone(), {
@@ -3011,6 +3216,7 @@ mod tests {
                 index: "nearest".to_string(),
                 fetch: None,
                 nprobes: Some(20),
+                eligibility: None,
             }
         );
         assert_eq!(

@@ -1,0 +1,263 @@
+name: Build release archives
+
+# The one definition of the platform archives every GitHub release ships,
+# called by `release.yml` (stable tags) and `release-edge.yml` (edge builds).
+# It only uploads workflow artifacts, one `release-<asset>` per platform; the
+# calling workflow's single publisher attaches them to a release. Each archive
+# is stamped with its commit and channel, run on its own platform before
+# upload, and checked as an exact set before the call completes.
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Audited commit to build.
+        required: true
+        type: string
+      channel:
+        description: Release channel stamped into the binaries, stable or edge.
+        required: true
+        type: string
+      check_stamp:
+        description: Require the archives to report the stamp; false only for sources that predate it.
+        required: true
+        type: boolean
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The Linux runners are pinned: a Linux archive needs the glibc it
+          # was linked against (2.39 on Ubuntu 24.04), which the trixie edge
+          # image and the documented support floor rely on. `ubuntu-latest`
+          # moves to Ubuntu 26.04 between 2026-10-19 and 2026-11-19
+          # (actions/runner-images#14748).
+          - runner: ubuntu-24.04
+            asset_name: omnigraph-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            asset_name: omnigraph-linux-arm64
+          - runner: macos-14
+            asset_name: omnigraph-macos-arm64
+            # OmniGraph's release text exceeds arm64's +/-128 MiB direct-branch
+            # range. Use long calls instead of relying on ld branch islands.
+            rustflags: -C code-model=large
+          - runner: windows-latest
+            asset_name: omnigraph-windows-x86_64
+    env:
+      CARGO_TERM_COLOR: always
+      # A set RUSTFLAGS, empty included, replaces the workspace `[build]
+      # rustflags` (.cargo/config.toml): archives build without the cfg.
+      RUSTFLAGS: ${{ matrix.rustflags || '' }}
+      # Read at compile time by `omnigraph version` and the server's
+      # `/healthz` `source_version`; a malformed stamp fails the build.
+      OMNIGRAPH_SOURCE_VERSION: ${{ inputs.source_sha }}
+      OMNIGRAPH_RELEASE_CHANNEL: ${{ inputs.channel }}
+      CHECK_STAMP: ${{ inputs.check_stamp }}
+    steps:
+      - name: Validate build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$OMNIGRAPH_SOURCE_VERSION" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::source_sha must be a full commit id"
+            exit 1
+          }
+          [[ "$OMNIGRAPH_RELEASE_CHANNEL" == stable || "$OMNIGRAPH_RELEASE_CHANNEL" == edge ]] || {
+            echo "::error::channel must be stable or edge"
+            exit 1
+          }
+
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+
+      # The server feature set every release artifact ships, the same as the
+      # stable container image's (publish-image.yml): the AWS Secrets Manager
+      # bearer-token source. Lance's S3 support already builds the AWS SDK
+      # base, so it adds one crate.
+      - name: Build release binaries
+        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission --features omnigraph-server/aws
+
+      - name: Package Unix release archive
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p release
+          install -m 0755 target/release/omnigraph release/omnigraph
+          install -m 0755 target/release/omnigraph-server release/omnigraph-server
+          install -m 0755 target/release/omnigraph-azure-admission release/omnigraph-azure-admission
+          tar -C release -czf "${{ matrix.asset_name }}.tar.gz" omnigraph omnigraph-server omnigraph-azure-admission
+          shasum -a 256 "${{ matrix.asset_name }}.tar.gz" > "${{ matrix.asset_name }}.sha256"
+
+      - name: Package Windows release archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item target/release/omnigraph.exe release/omnigraph.exe
+          Copy-Item target/release/omnigraph-server.exe release/omnigraph-server.exe
+          Copy-Item target/release/omnigraph-azure-admission.exe release/omnigraph-azure-admission.exe
+          Compress-Archive -Path release/omnigraph.exe, release/omnigraph-server.exe, release/omnigraph-azure-admission.exe -DestinationPath "${{ matrix.asset_name }}.zip" -Force
+          $hash = (Get-FileHash "${{ matrix.asset_name }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumPath = Join-Path (Get-Location) "${{ matrix.asset_name }}.sha256"
+          [System.IO.File]::WriteAllText(
+            $checksumPath,
+            "$hash  ${{ matrix.asset_name }}.zip`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          $checksumBytes = [System.IO.File]::ReadAllBytes($checksumPath)
+          if ($checksumBytes -contains 13) {
+            throw "Windows checksum manifest contains CR; expected LF-only"
+          }
+
+      # Run the binaries as the archive ships them, on the platform they were
+      # built for, and require the stamp the release will advertise.
+      - name: Smoke packaged Unix binaries
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          mkdir -p verify
+          tar -C verify -xzf "${{ matrix.asset_name }}.tar.gz"
+          [[ "$(find verify -type f | wc -l | tr -d ' ')" == 3 ]] || {
+            echo "::error::Unix release archive must hold exactly the three binaries"
+            exit 1
+          }
+          if [[ "$CHECK_STAMP" == true ]]; then
+            verify/omnigraph version
+            verify/omnigraph version --json > version.json
+            python3 - <<'PY'
+          import json, os
+          facts = json.load(open("version.json"))
+          expected = (os.environ["OMNIGRAPH_RELEASE_CHANNEL"], os.environ["OMNIGRAPH_SOURCE_VERSION"])
+          if (facts["channel"], facts["commit"]) != expected:
+              raise SystemExit(f"archive reports {facts['channel']}/{facts['commit']}, expected {expected}")
+          PY
+          else
+            verify/omnigraph --help > /dev/null
+          fi
+          verify/omnigraph-server --help > /dev/null
+          verify/omnigraph-azure-admission --help > /dev/null
+
+      - name: Smoke packaged Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path verify | Out-Null
+          Expand-Archive -Path "${{ matrix.asset_name }}.zip" -DestinationPath verify -Force
+          $items = Get-ChildItem -Path verify -File
+          if ($items.Count -ne 3 -or !(Test-Path verify/omnigraph.exe) -or !(Test-Path verify/omnigraph-server.exe) -or !(Test-Path verify/omnigraph-azure-admission.exe)) {
+            throw "Windows release archive is missing expected binaries"
+          }
+          if ($env:CHECK_STAMP -eq "true") {
+            & verify/omnigraph.exe version
+            if ($LASTEXITCODE -ne 0) { throw "omnigraph version failed" }
+            $facts = & verify/omnigraph.exe version --json | Out-String | ConvertFrom-Json
+            if ($facts.channel -ne $env:OMNIGRAPH_RELEASE_CHANNEL -or $facts.commit -ne $env:OMNIGRAPH_SOURCE_VERSION) {
+              throw "archive reports $($facts.channel)/$($facts.commit), expected $env:OMNIGRAPH_RELEASE_CHANNEL/$env:OMNIGRAPH_SOURCE_VERSION"
+            }
+          } else {
+            & verify/omnigraph.exe --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "omnigraph --help failed" }
+          }
+          & verify/omnigraph-server.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "omnigraph-server --help failed" }
+          & verify/omnigraph-azure-admission.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "omnigraph-azure-admission --help failed" }
+
+      # Upload artifacts only — the caller's single publisher attaches them to
+      # the release, so no two jobs ever write a release concurrently.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.asset_name }}
+          path: |
+            ${{ matrix.asset_name }}.*
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    name: Verify release archive set
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download release build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-omnigraph-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify exact release artifact set
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          expected = {
+              "omnigraph-linux-arm64.sha256",
+              "omnigraph-linux-arm64.tar.gz",
+              "omnigraph-linux-x86_64.sha256",
+              "omnigraph-linux-x86_64.tar.gz",
+              "omnigraph-macos-arm64.sha256",
+              "omnigraph-macos-arm64.tar.gz",
+              "omnigraph-windows-x86_64.sha256",
+              "omnigraph-windows-x86_64.zip",
+          }
+          actual = {
+              str(path.relative_to("dist"))
+              for path in Path("dist").rglob("*")
+              if path.is_file()
+          }
+          if actual != expected:
+              missing = sorted(expected - actual)
+              unexpected = sorted(actual - expected)
+              raise SystemExit(
+                  f"invalid release artifact set: missing={missing}, unexpected={unexpected}"
+              )
+          PY
+
+      - name: Verify checksum manifests are Unix-portable
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          for path in sorted(Path("dist").glob("*.sha256")):
+              data = path.read_bytes()
+              if b"\r" in data:
+                  raise SystemExit(f"{path} contains CR; checksums must be LF-only")
+          PY
+          cd dist
+          sha256sum --strict -c ./*.sha256

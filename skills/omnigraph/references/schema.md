@@ -191,7 +191,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@description("...")` — metadata (no migration impact)
 
 **Edge-level:**
-- `@card(min..max)` — edge cardinality (default: unbounded from zero; write an open upper bound as `@card(1..)`)
+- `@card(min..max)` — edge cardinality (default: unbounded from zero; write an open upper bound as `@card(1..)`). Checked only for source nodes whose edges a write adds, moves or removes: a node written with no edge of the type is never counted, so a non-zero minimum needs an orphan check ([`schema-design.md`](schema-design.md#9-enforce-meaning-and-keep-the-rules-in-the-graph))
 
 **Type-level (nodes/edges):**
 - `@instruction("...")` — semantic hint for LLMs/operators
@@ -225,13 +225,11 @@ node Doc implements Searchable {
 
 Most schemas are fine without interfaces. Reach for them only when 3+ node types need to share a property contract.
 
-## Design Principles (brief)
+## Design Principles
 
-- **Identity is explicit** — use `@key` on a semantic slug, not internal row IDs
-- **Narrow types** — `Date` over `String` for dates, `enum` over `String` for lifecycle states
-- **Edge semantics matter** — prefer `AuthoredBy` over `RelatedTo`
-- **Constraints live in the schema** — `@unique`, `@range`, `@card` keep invariants out of application code
-- **Schemas are reviewable** — clear names, explicit enums, obvious keys
+Design guidance (Gruber's criteria, identity, narrow types, edge semantics,
+constraints, provenance, `GraphPolicy` rules, and designing for many agents)
+lives in [`schema-design.md`](schema-design.md).
 
 ## Schema Evolution in Cluster Mode
 

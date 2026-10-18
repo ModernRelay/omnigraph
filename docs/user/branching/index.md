@@ -33,14 +33,17 @@ a missing target branch by combining `--branch <name>` with `--from <base>`.
 
 Each branch operation is also a GQ statement, so a client that already sends
 `.gq` source needs no second transport. The three control writes go to
-`POST /mutate` and the listing to `POST /query`, each with no request target,
-name, or parameters:
+`POST /mutate`, and the listing and the branch reads to `POST /query`, each
+with no request target, name, or parameters:
 
 ```text
 branch create "review/add-benchmark" from main
 branch merge "review/add-benchmark" into main
 branch delete "review/abandoned"
 branch list
+branch diff "review/add-benchmark" into main
+branch merge-base "review/add-benchmark" into main
+branch merge "review/add-benchmark" into main dry run
 ```
 
 `from` defaults to `main` and `into` defaults to `main`. A name outside the
@@ -53,12 +56,19 @@ that publishes a commit reports it in `commit`. `branch list` answers one row
 per branch in column `name`, sorted by name. Each statement runs under the same
 policy check as its HTTP route (`POST /branches`, `DELETE /branches/{branch}`,
 `POST /branches/merge`, `GET /branches`), and `branch list` is a read, so it is
-refused on `POST /mutate` as a control write is refused on `POST /query`.
+refused on `POST /mutate` as a control write is refused on `POST /query`. The
+branch reads `branch diff`, `branch merge-base` and `branch merge … dry run`
+answer rows as `branch list` does and take their routes' checks; see
+[reviewing a branch](changes.md#review-a-branch) and
+[previewing a merge](merge.md#preview-a-merge). A bare `dry run` after the
+names is the clause, so a branch named `dry` is quoted.
 
 Branches are cheap until written: unchanged data remains shared with the source.
 A branch remains after a normal merge, so prefer `--delete-branch` or delete it
 when review is complete. Live branches retain the history they depend on and can
 prevent `omnigraph cleanup` from reclaiming old data.
+
+## Branch names
 
 Branch names may contain `/`, but live names must not be path prefixes of one
 another. For example, `review` and `review/alice` cannot coexist. `main` is
@@ -66,6 +76,15 @@ reserved. A parent branch can be deleted while descendants remain. A path segmen
 may not end in `.` followed by 26 upper-case letters and digits: that shape is
 reserved for OmniGraph's internal per-life branch identity. Ordinary dotted
 names such as `release.1.2` are fine.
+
+A branch name is used exactly as written. A name that is empty, has leading or
+trailing whitespace, or contains a control character is refused wherever a
+branch is named: the branch a read or write targets, `from`, merge sources and
+targets, branch create and delete, Blob writes, change feeds and branch
+statements. The server answers `400 Bad Request` before authorization, the
+embedded engine returns a bad-request error before any effect, and the CLI
+reports either error. Names are never trimmed, so `main ` does not name
+`main`.
 
 Deleting a branch and creating another with the same name yields a fresh
 branch lifetime. Readers that captured the deleted branch fail with a typed
@@ -107,6 +126,29 @@ omnigraph commit show <commit-id> --uri graph.omni
 `main`; selecting a branch includes the history inherited at its fork plus its
 own commits.
 
+A long history can be read a page at a time:
+
+```bash
+omnigraph commit list graph.omni --branch main --limit 50 --json
+omnigraph commit list graph.omni --branch main --page-token <token> --json
+```
+
+`--limit` (1 to 1,000) returns one page with `head_commit_id`, the head the
+listing resolved, and `next_page_token` while older commits remain. Pass the
+token back with the same `--branch` for the next page, of 100 commits unless
+`--limit` sets the size. Later pages answer for that head even after the
+branch moves, so a page never repeats or skips a commit. A page reads only the
+history it returns; without `--limit` or `--page-token` the whole history is
+read and listed at once. Served under a policy, a caller whose `read` does
+not cover every branch continues only from a commit of the branch's history,
+and is refused with `400` otherwise: a commit the branch still holds, or one a
+branch the caller may read published, costs nothing more, and any other is
+looked for down the branch's history, which costs what the whole listing
+costs. Served, the same listing is
+`GET /commits?branch=<name>&limit=<n>` continued with `page_token=<token>`.
+Paging applies to a branch's history, not to `--unpublished` or
+`--unattached`.
+
 ### Unpublished commits
 
 A mutation or a merge written `as commit` records its result as an unpublished
@@ -124,10 +166,15 @@ commit publish "<commit-id>"
 commit drop "<commit-id>"
 ```
 
-`commit publish` installs the commit on the branch it recorded as its target;
-once an ordinary write moved that head past the commit's parent, the publish
-fails its precondition and the commit can only be dropped. A published commit
-is answered as it stands by a repeat publish and is never dropped.
+`commit publish` installs the commit on the branch it recorded as its target.
+The published commit keeps the actor and timestamp of the write that created
+it; the publish records no publisher. A published commit is answered as it
+stands by a repeat publish and is never dropped. An unpublished commit expires
+once an ordinary write moves its target branch's head past the commit's
+parent, or when that branch is deleted or recreated, and can then only be
+dropped: a publish is refused (a moved head fails its precondition), reads at
+its id (`--snapshot`, `commit show`, `commit changes`) answer `not found`, and
+it leaves the `--unpublished` listing.
 
 ```bash
 omnigraph branch merge feature --into main --as-commit --uri graph.omni
@@ -210,16 +257,31 @@ omnigraph query sources_for_claim --query queries.gq \
 A query stays on one snapshot for its entire lifetime. Wildcard traversal is
 refused on an explicit historical target because historical schema membership
 is not reconstructed. Explicit edge alternatives retain named-edge historical
-read rules. Historical reads can
-eventually fail after destructive cleanup removes the versions that commit
-needs. Branch deletion can likewise end access to branch-only history.
+read rules.
+
+A historical query is written against the current schema. A type renamed since
+the commit still reads under its current name, but a property reads only where
+the commit stores that same property under its current name. A property added
+since the commit, renamed since, or dropped and re-added with the same name is
+refused at that commit, naming the property, rather than answering with null or
+with the dropped property's values. A whole-node `return { $p }` reads every
+current property, so it is refused at commits made before a property was added.
+Table data written before v0.10 records no property identity, so a commit that
+reads such data refuses its properties too, unless that data is still the
+table's current version.
+
+Historical reads can eventually fail after destructive cleanup removes the
+versions that commit needs. Branch deletion can likewise end access to branch-only history.
 
 ## Changes and feeds
 
-Inspect the logical changes made by one commit:
+Inspect the logical changes made by one commit, compare two points, or review
+what a branch changed since it left `main`:
 
 ```bash
 omnigraph commit changes <commit-id> --store graph.omni --json
+omnigraph diff --from <commit-id> --to main --store graph.omni --json
+omnigraph branch diff feature --store graph.omni --json
 ```
 
 For continuous consumption, `omnigraph changes poll` follows complete commits
@@ -227,7 +289,7 @@ on one branch and returns an opaque resume cursor. If cleanup has reclaimed
 required history, create a coherent snapshot and new cursor with
 `omnigraph changes baseline`.
 
-See [Changes and Change Feeds](changes.md) for filters, pagination, cursor
-checkpointing, and `410` retention-gap recovery.
+See [Changes, Diffs and Change Feeds](changes.md) for filters, pagination,
+cursor checkpointing, and `410` retention-gap recovery.
 
 See [Merging Branches](merge.md) for merge outcomes and conflict handling.

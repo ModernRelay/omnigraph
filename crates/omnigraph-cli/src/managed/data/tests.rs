@@ -101,6 +101,7 @@ async fn acquisition_preserves_explicit_target_priority_and_refuses_retired_cred
         "malformed-token",
         "wrong-actor",
         "wrong-expiry",
+        "wrong-organization",
     ] {
         let mut cached = credential(&context, "https://data.example");
         expire_identity(&mut cached);
@@ -108,6 +109,16 @@ async fn acquisition_preserves_explicit_target_priority_and_refuses_retired_cred
             "retired-cache" => cached.version = 1,
             "malformed-token" => cached.token = DATA_TOKEN.into(),
             "wrong-actor" => cached.actor = "principal:other".into(),
+            "wrong-organization" => {
+                cached = credential(
+                    &Context {
+                        organization_id: "org_other".into(),
+                        ..context.clone()
+                    },
+                    "https://data.example",
+                );
+                expire_identity(&mut cached);
+            }
             "wrong-expiry" => {
                 cached.expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(60))
                     .format(&Rfc3339)
@@ -218,7 +229,8 @@ async fn acquisition_never_reuses_another_principal_or_accepts_a_wrong_issued_id
 
 fn context() -> Context {
     Context {
-        version: 1,
+        version: 2,
+        organization_id: "org_test".into(),
         cluster: "cluster-a".into(),
         api: "https://control.example".into(),
     }
@@ -233,7 +245,7 @@ fn identity_credential(context: &Context, endpoint: &str) -> Credential {
     let kid = "a".repeat(64);
     let header = json!({"typ":"JWT","alg":"ES256","kid":kid});
     let claims = json!({"version":2,"iss":context.api,"aud":format!("urn:omnigraph:data:{}", context.cluster),
-        "sub":"alice","account_id":"account-a","cluster_id":context.cluster,"cluster_incarnation":"incarnation-a",
+        "sub":"alice","account_id":context.organization_id,"cluster_id":context.cluster,"cluster_incarnation":"incarnation-a",
         "principal_kind":"human","assurance":"verified_human","iat":now,"exp":now+3600,"jti":"test-credential"});
     Credential {
         version: 2,
@@ -401,7 +413,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
     let client = load(&data_store, &context, "knowledge").unwrap();
     let result = client
         .query(
-            ReadTarget::Branch("main".into()),
+            Some(ReadTarget::Branch("main".into())),
             "query q() { return { 42 as value } }",
             Some("q"),
             None,
@@ -419,6 +431,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
             None,
             Some("head-a"),
             &[],
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -561,6 +574,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
                         batch.to_str().unwrap(),
                         crate::cli::CliLoadMode::Append,
                         &[],
+                        &mut Vec::new(),
                     )
                     .await
                     .unwrap_err();
@@ -620,11 +634,20 @@ async fn identity_issuance_rejects_wrong_profile_and_authority_without_cache_rep
         "incarnation",
         "endpoint",
         "token",
+        "organization",
     ] {
         let mut context = context();
         let cp = IntentApiFixture::with_origin(|origin| {
             context.api = origin.to_owned();
-            let credential = identity_credential(&context, "https://data.example");
+            let credential_context = if field == "organization" {
+                Context {
+                    organization_id: "org_other".into(),
+                    ..context.clone()
+                }
+            } else {
+                context.clone()
+            };
+            let credential = identity_credential(&credential_context, "https://data.example");
             let mut response = credential.metadata();
             response["token"] = json!(credential.token);
             let mut envelope = json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}});
@@ -637,6 +660,7 @@ async fn identity_issuance_rejects_wrong_profile_and_authority_without_cache_rep
                     envelope["data"]["endpoint"] = json!("https://user:password@data.example/path")
                 }
                 "token" => envelope["data"]["token"] = json!("x".repeat(MAX_TOKEN + 1)),
+                "organization" => {}
                 _ => envelope["meta"]["incarnation"] = json!("other"),
             }
             vec![IntentReply::json(200, envelope)]
@@ -780,6 +804,51 @@ impl Store for NoCredentialAccess {
     }
     fn remove(&self, _: &str) -> Result<()> {
         panic!("routing preflight removed credentials")
+    }
+}
+
+#[tokio::test]
+async fn managed_operator_warning_delivery_failure_stops_before_credentials() {
+    use crate::managed::tests::{FailedOutput, OutputFault};
+    use crate::operator::InvocationConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    super::super::save_context(dir.path(), &context()).unwrap();
+    let operator = tempfile::tempdir().unwrap();
+    let config = operator.path().join("config.yaml");
+    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
+    for source in ["future_option: true\n", "operator: [malformed\n"] {
+        std::fs::write(&config, source).unwrap();
+        for profile in [None, Some("competing-profile".to_owned())] {
+            for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+                let input = InvocationConfig::at(Some(operator.path().to_owned()), profile.clone());
+                let mut stderr = FailedOutput::new(fault, 0);
+                let error = resolve_with_acquisition(
+                    &cli,
+                    dir.path(),
+                    &NoCredentialAccess,
+                    || has_ambient_target(&input, &mut stderr),
+                    async |_| panic!("routing failure consulted managed identity"),
+                    async |_| panic!("routing failure contacted the issuer"),
+                )
+                .await
+                .err()
+                .expect("routing preflight must refuse");
+                let expected = if profile.is_some() {
+                    ("managed_target_ambiguous", 2)
+                } else if source.starts_with("future_option") {
+                    ("output_delivery_failed", 1)
+                } else {
+                    ("operator_config_invalid", 2)
+                };
+                assert_eq!(error.body["type"], expected.0);
+                assert_eq!(error.exit, expected.1);
+                if profile.is_some() {
+                    assert!(stderr.bytes.is_empty(), "profile must precede config reads");
+                }
+                assert!(!error.body.to_string().contains("malformed"));
+            }
+        }
     }
 }
 
@@ -1114,6 +1183,7 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                         batch.path().to_str().unwrap(),
                         crate::cli::CliLoadMode::Append,
                         &[],
+                        &mut Vec::new(),
                     )
                     .await
                     .unwrap_err(),
@@ -1121,7 +1191,7 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                 "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
                 _ => client
                     .query(
-                        ReadTarget::Branch("main".into()),
+                        Some(ReadTarget::Branch("main".into())),
                         "query q() {}",
                         Some("q"),
                         None,
@@ -1184,6 +1254,7 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
                             batch.path().to_str().unwrap(),
                             crate::cli::CliLoadMode::Append,
                             &[],
+                            &mut Vec::new(),
                         )
                         .await
                         .unwrap_err(),
@@ -1197,6 +1268,7 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
                             None,
                             Some("head-a"),
                             &[],
+                            &mut Vec::new(),
                         )
                         .await
                         .unwrap_err(),
@@ -1252,7 +1324,8 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     let batch = dir.path().join("batch.jsonl");
     let ndjson = "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n{\"type\":\"Person\",\"data\":{\"name\":\"Grace\"}}\n";
     std::fs::write(&batch, ndjson).unwrap();
-    let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345,"published":true});
+    let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345,"published":true,
+        "kind":"published","root_commit_id":null});
     let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"append","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"embedding_generation":null,"actor_id":"principal:alice","commit":commit});
     // This is a real response past the ordinary managed 30-second deadline.
     // The request-construction owner separately pins load's 300-second ceiling.
@@ -1288,6 +1361,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
             batch.to_str().unwrap(),
             crate::cli::CliLoadMode::Append,
             &[],
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -1330,6 +1404,7 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                 file.path().to_str().unwrap(),
                 crate::cli::CliLoadMode::Append,
                 &[],
+                &mut Vec::new(),
             )
             .await
             .unwrap_err()
@@ -1345,6 +1420,7 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                 file.path().to_str().unwrap(),
                 crate::cli::CliLoadMode::Append,
                 &[],
+                &mut Vec::new(),
             )
             .await
             .unwrap_err()
@@ -1374,6 +1450,7 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                     file.path().to_str().unwrap(),
                     crate::cli::CliLoadMode::Append,
                     &[],
+                    &mut Vec::new(),
                 )
                 .await
                 .is_err()

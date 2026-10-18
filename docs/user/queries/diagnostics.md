@@ -8,15 +8,16 @@ fix names the decision instead.
 
 | Field | Meaning |
 |---|---|
-| `code` | Stable identifier: `Q…` from the parser, `T…` from the type checker. A code's meaning is frozen; its message text may improve. |
+| `code` | Stable identifier: `Q…` from the parser, `T…` from the type checker, `P…` from the planner. A code's meaning is frozen; its message text may improve. |
 | `position` | For a parse refusal: `line` and `column` (1-based, in characters) and the `byte` offset. |
-| `stage` and `expression` | For a refusal after parsing: the compiler stage (`typecheck`) and, when the site can render it, the expression it refused. |
+| `stage` and `expression` | For a refusal after parsing: the stage (`typecheck` or `plan`) and, when the site can render it, the expression it refused. |
 | `expected` | What was expected or violated, one line, without a position. |
 | `fix` | One concrete fix, absent when `expected` names the decision. |
 | `suggestion` | Optional source edits with `applicability`, plus `start`, `end` and `replacement` for each edit. |
 
 The one-line `error` text is the code and the expectation in the legacy form
-(`parse error: …`, `type error: T33: …`); the other fields travel beside it.
+(`parse error: …`, `type error: T33: …`, `plan error: P001: …`); the other
+fields travel beside it.
 
 ## The measured case
 
@@ -114,3 +115,17 @@ do not mean there is no possible fix.
 
 Type codes are listed where the construct they guard is described, in
 [Query language](index.md).
+
+## Planner codes
+
+A planner code refuses a well-formed, type-checked query shape by design. It
+is the caller's error, answered as a bad request with the diagnostic, never as
+an internal error.
+
+| Code | Meaning |
+|---|---|
+| `P001` | A ranking (`nearest`, `bm25`) orders a binding that a traversal reaches from another binding. The fix declares that binding first in `match`, so the ranking starts the traversal. |
+| `P002` | An edge alternation or wildcard traversal has no finite traversal work limit. The fix sets `traversal_work_limit` before the query. |
+| `P003` | The traversal work limit is outside `1..=9223372036854775807`, or a plan records it twice. |
+| `P004` | An edge alternation or wildcard traversal was asked to run in CSR traversal mode; it runs in `auto` or `indexed` mode. |
+| `P005` | An `rrf()` ranks two bindings that one traversal connects. One of them always starts the traversal and the other is reached, and engine v2 ranks only the binding a traversal starts from, so no declaration order serves both arms; the refusal offers no fix. |

@@ -10,15 +10,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::aggregate::AggregateSpec;
-use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
-use crate::error::PlanError;
+use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy};
+use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
-    ColumnRef, KeyJoinKind, ScanSpec, filters_json, metadata_count_json, ordering_text, scan_json,
-    tiebreak_text,
+    ColumnRef, CsvSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec, ValidateSpec,
+    csv_source_json, filters_json, fragment_write_json, metadata_count_json, ordering_text,
+    scan_json, tiebreak_text, validate_json,
 };
 use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
-use crate::source::SideId;
+use crate::source::{FullTextCoverage, SideId};
+use omnigraph_compiler::query::codes::{P002, P003};
 
 /// The index of a node in a [`PhysicalPlan`].
 pub type NodeId = usize;
@@ -34,6 +36,12 @@ pub enum RankKind {
 }
 
 impl RankKind {
+    /// Whether the retrieval's contract is approximate: `nearest` membership
+    /// is, even when a run scores flat; `bm25` matching is exact.
+    pub fn approximate(self) -> bool {
+        self == Self::Nearest
+    }
+
     /// The column Lance appends and the direction the query sorts it by.
     pub fn score(self) -> (&'static str, bool) {
         match self {
@@ -125,6 +133,23 @@ pub struct Assumptions {
     /// Retained even when rewrites remove an expansion, for historical replay admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_wildcard_traversal: bool,
+    /// The full-text coverage of every property a ranked scan's eligibility
+    /// placement read, keyed `<table key>.<property>`. A pinned dataset
+    /// version fixes it, so the dataset pins re-establish it on replay.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub full_text: BTreeMap<String, FullTextCoverage>,
+    /// The fingerprint of every catalogue table the plan read, keyed by
+    /// table key: the binary's rows and schema for that type. A replay is
+    /// refused by a binary whose catalogue fingerprints differ.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub catalogue: BTreeMap<String, String>,
+}
+
+impl Assumptions {
+    /// The key a property's full-text coverage is recorded under.
+    pub fn full_text_key(type_key: &str, property: &str) -> String {
+        format!("{type_key}.{property}")
+    }
 }
 
 impl Assumptions {
@@ -136,18 +161,24 @@ impl Assumptions {
     /// `1..=i64::MAX`, or wildcard provenance without a captured limit.
     pub fn validated_traversal_work_limit(&self) -> Result<Option<NonZeroU64>, PlanError> {
         if self.settings.contains_key("traversal_work_limit") {
-            return Err(PlanError::Unsupported {
-                detail: "traversal_work_limit must use the captured typed allowance, not a duplicate settings entry".to_string(),
-            });
+            return Err(PlanError::refused(
+                P003,
+                "traversal_work_limit must use the captured typed allowance, not a duplicate settings entry",
+                None,
+            ));
         }
         match self.traversal_work_limit {
-            Some(limit) if limit == 0 || limit > i64::MAX as u64 => Err(PlanError::Unsupported {
-                detail: "traversal_work_limit must be in 1..=i64::MAX".to_string(),
-            }),
+            Some(limit) if limit == 0 || limit > i64::MAX as u64 => Err(PlanError::refused(
+                P003,
+                "traversal_work_limit must be in 1..=i64::MAX",
+                Some("set `traversal_work_limit` to a value in 1..=9223372036854775807"),
+            )),
             Some(limit) => Ok(NonZeroU64::new(limit)),
-            None if self.has_wildcard_traversal => Err(PlanError::Unsupported {
-                detail: "wildcard traversal requires a finite traversal_work_limit".to_string(),
-            }),
+            None if self.has_wildcard_traversal => Err(PlanError::refused(
+                P002,
+                "wildcard traversal requires a finite traversal_work_limit",
+                Some(SET_TRAVERSAL_WORK_LIMIT),
+            )),
             None => Ok(None),
         }
     }
@@ -169,12 +200,59 @@ pub struct Hop {
 /// ids of `ranked_type` that have every hop in `hops` and ANDs them into the
 /// scans `feeds` names as `id IN (...)`, when the gate policy admits the set.
 /// Empty `hops` admits nothing: the run records the shape fallback and the
-/// scans run as planned.
+/// scans run as planned. Every hop is a required first hop of the query, so
+/// the eligible set holds every row that can survive the traversal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prefilter {
     pub ranked_type: String,
     pub hops: Vec<Hop>,
     pub feeds: Vec<NodeId>,
+    /// What an empty eligible set decides: the empty answer for a
+    /// standalone `nearest`, the unfiltered plan for a fusion.
+    pub on_empty: EmptyEligible,
+    /// Whether the recorded full-text coverage of every `bm25` scan in
+    /// `feeds` is full, the guard under which prefiltering keeps BM25
+    /// scores; true when it feeds no `bm25` scan.
+    pub coverage_admits: bool,
+}
+
+/// What a pre-pass's empty eligible set decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmptyEligible {
+    /// No row survives the traversal: the answer is empty and no scan runs.
+    ProvenEmpty,
+    /// The scans run unfiltered.
+    Postfilter,
+}
+
+/// The adaptive policy of a `nearest` scan, declared before it runs: what
+/// the scan may do after an attempt leaves it short of `fetch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NearestPolicy {
+    /// A short scan under a probe cap rescans under the cap times this,
+    /// and uncapped once that reaches the ranked partitions.
+    pub probe_factor: usize,
+    /// Rows the prefilter admitted at `_distance = +inf` (the partition
+    /// search did not reach them) are rescanned flat and exact.
+    pub flat_rescan_on_unreached: bool,
+    /// A short capped scan without Lance's partition counters rescans
+    /// uncapped (fail closed).
+    pub uncapped_on_missing_counters: bool,
+    /// A scan whose eligible set is no larger than `fetch` scores flat from
+    /// its first attempt.
+    pub flat_when_eligible_within_fetch: bool,
+}
+
+impl NearestPolicy {
+    /// The policy the planner declares: probe caps grow fourfold (20 → 80 →
+    /// 320 → none), and every fallback is on.
+    pub const DEFAULT: Self = Self {
+        probe_factor: 4,
+        flat_rescan_on_unreached: true,
+        uncapped_on_missing_counters: true,
+        flat_when_eligible_within_fetch: true,
+    };
 }
 
 impl Prefilter {
@@ -182,6 +260,19 @@ impl Prefilter {
     pub fn admits(&self) -> bool {
         !self.hops.is_empty() && !self.feeds.is_empty()
     }
+}
+
+/// Where a ranked scan applies its eligibility (its pushed filter, a gate's
+/// eligible set and the members of its search predicates): before the index
+/// scores rows, as Lance's prefilter, or after, on the scored rows. A BM25
+/// score is independent of a filter applied before scoring only when the
+/// property's full-text index covers every fragment; elsewhere eligibility
+/// applies after scoring, so the filter never changes a score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Eligibility {
+    BeforeScoring,
+    AfterScoring,
 }
 
 /// One rerun of a `nearest` scan's overfetch ladder, taken in order after a
@@ -243,6 +334,12 @@ pub struct RankedAccess {
     /// the ranked binding, and on every arm of `rrf()`, whose pre-pass the
     /// `RankFuse` declares.
     pub prefilter: Option<Prefilter>,
+    /// Where the scan applies its eligibility: always before scoring on a
+    /// `nearest` scan, whose candidate window is drawn from eligible rows;
+    /// on a `bm25` scan before scoring only under recorded full coverage.
+    pub eligibility: Eligibility,
+    /// The adaptive policy of a `nearest` scan; `None` on a `bm25` scan.
+    pub policy: Option<NearestPolicy>,
 }
 
 impl RankedAccess {
@@ -265,8 +362,12 @@ impl RankedAccess {
             "fetch": self.fetch,
             "scope": self.scope,
         });
-        if self.kind == RankKind::Nearest {
-            value["nprobes"] = json!(self.nprobes);
+        match self.kind {
+            RankKind::Nearest => {
+                value["nprobes"] = json!(self.nprobes);
+                value["policy"] = json!(self.policy);
+            }
+            RankKind::Bm25 => value["eligibility"] = json!(self.eligibility),
         }
         value
     }
@@ -346,13 +447,65 @@ pub struct StatisticSource {
     pub origin: String,
 }
 
+/// One key of the order a node's output leaves in, typed: the comparator a
+/// sort establishes, the score order a ranking scan produces, or the logical
+/// id order of a diff or merge plan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderKey {
+    /// A diff or merge plan's logical column, ascending.
+    Column(String),
+    /// An expression with its direction and null placement.
+    Expr {
+        expr: IRExpr,
+        descending: bool,
+        nulls_first: bool,
+    },
+    /// A binding's identity metadata key (`@id`, or `@type` of a selected
+    /// edge): ascending, nulls first.
+    Identity(ColumnRef),
+    /// The fused reciprocal rank of an `rrf()` over its arms' bindings,
+    /// descending.
+    Fused { bindings: Vec<String> },
+}
+
+impl OrderKey {
+    /// A written or score sort key: ascending keys place nulls first,
+    /// descending keys nulls last (RFC 0047, "One total order").
+    pub fn of(ordering: &IROrdering) -> Self {
+        Self::Expr {
+            expr: ordering.expr.clone(),
+            descending: ordering.descending,
+            nulls_first: !ordering.descending,
+        }
+    }
+}
+
+impl std::fmt::Display for OrderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column(column) => f.write_str(column),
+            Self::Expr {
+                expr, descending, ..
+            } => write!(f, "{expr} {}", if *descending { "desc" } else { "asc" }),
+            Self::Identity(column) => write!(f, "${column} asc"),
+            Self::Fused { bindings } => {
+                let targets: Vec<String> = bindings
+                    .iter()
+                    .map(|binding| format!("${binding}"))
+                    .collect();
+                write!(f, "rrf({}) desc", targets.join(", "))
+            }
+        }
+    }
+}
+
 /// The properties a physical node declares: derived after selection,
 /// recomputed when a later pass changes the node, never recomputed by an
 /// executor. Each is a bound the executor adapts within, never above.
 #[derive(Debug, Clone)]
 pub struct Properties {
     pub schema: SchemaRef,
-    pub ordering: Option<Vec<String>>,
+    pub ordering: Option<Vec<OrderKey>>,
     pub rows: Estimate,
     pub work_bytes: Estimate,
     pub retained_limit: Option<u64>,
@@ -363,8 +516,12 @@ impl Properties {
     /// Result nodes declare their typed columns separately. Pipeline schemas
     /// remain conservative input schemas and are omitted for query plans.
     fn to_json(&self, query: bool) -> Value {
+        let ordering: Option<Vec<String>> = self
+            .ordering
+            .as_ref()
+            .map(|keys| keys.iter().map(ToString::to_string).collect());
         let mut value = json!({
-            "ordering": self.ordering,
+            "ordering": ordering,
             "rows": self.rows,
             "work_bytes": self.work_bytes,
             "retained_limit": self.retained_limit,
@@ -406,20 +563,171 @@ pub struct HydratedColumn {
     pub property: String,
 }
 
-/// The operator catalog. The change-feed and merge nodes (`Scan`,
-/// `SortMergeJoin`, `HydrateByAddress`, `RowCompare`, `ClassifyThreeWay`,
-/// `Page`) each have one push operator in the engine's `engine/push/`; the
-/// read nodes (`CrossJoin` and `ContainsJoin` among them) each have one arm
-/// in the engine's lowering
-/// (`crates/omnigraph/src/engine/lower.rs`), whose exhaustive match is the
-/// proof. A read node carries the IR pieces its arm takes, so the lowering
-/// never re-derives from `QueryIR`.
-#[derive(Debug, Clone)]
-pub enum PhysicalNode {
+/// A field of a [`PhysicalNode`] that holds the node's children: the ids it
+/// holds now, and every count it can hold, which `@Operator.inputs` reads.
+pub trait ChildSlots {
+    const COUNTS: &'static [usize];
+    fn ids(&self) -> Vec<NodeId>;
+    fn ids_mut(&mut self) -> Vec<&mut NodeId>;
+}
+
+impl ChildSlots for NodeId {
+    const COUNTS: &'static [usize] = &[1];
+
+    fn ids(&self) -> Vec<NodeId> {
+        vec![*self]
+    }
+
+    fn ids_mut(&mut self) -> Vec<&mut NodeId> {
+        vec![self]
+    }
+}
+
+impl ChildSlots for ScanInput {
+    const COUNTS: &'static [usize] = &[0, 1];
+
+    fn ids(&self) -> Vec<NodeId> {
+        self.input().copied().into_iter().collect()
+    }
+
+    fn ids_mut(&mut self) -> Vec<&mut NodeId> {
+        self.input_mut().into_iter().collect()
+    }
+}
+
+impl ChildSlots for [RankArm; 2] {
+    const COUNTS: &'static [usize] = &[2];
+
+    fn ids(&self) -> Vec<NodeId> {
+        self.iter().map(|arm| arm.input).collect()
+    }
+
+    fn ids_mut(&mut self) -> Vec<&mut NodeId> {
+        self.iter_mut().map(|arm| &mut arm.input).collect()
+    }
+}
+
+/// Every sum of one count from `left` and one from `right`, sorted and
+/// distinct: the input counts of a node with both child fields.
+fn sum_counts(left: &[usize], right: &[usize]) -> Vec<usize> {
+    let mut sums: Vec<usize> = left
+        .iter()
+        .flat_map(|a| right.iter().map(move |b| a + b))
+        .collect();
+    sums.sort_unstable();
+    sums.dedup();
+    sums
+}
+
+/// Declares the operator catalog once: the payload-bearing [`PhysicalNode`],
+/// its fieldless [`PhysicalNodeKind`] with `ALL`, each kind's explain name,
+/// and the child visitation and admitted child counts, all from one declaration.
+macro_rules! physical_nodes {
+    (
+        $(
+            $(#[$meta:meta])*
+            $variant:ident {
+                $( $(#[$fmeta:meta])* $field:ident : $ty:ty ),* $(,)?
+            } => $name:literal [ $( $child:ident : $cty:ty ),* ] ;
+        )*
+    ) => {
+        /// The operator catalog. The change-feed and merge nodes (`Scan`,
+        /// `SortMergeJoin`, `HydrateByAddress`, `RowCompare`, `ClassifyThreeWay`,
+        /// `Page`) each have one push operator in the engine's `engine/push/`; the
+        /// read nodes (`CrossJoin` and `ContainsJoin` among them) each have one arm
+        /// in the engine's lowering
+        /// (`crates/omnigraph/src/engine/lower.rs`), whose exhaustive match is the
+        /// proof. A read node carries the IR pieces its arm takes, so the lowering
+        /// never re-derives from `QueryIR`.
+        #[derive(Debug, Clone)]
+        pub enum PhysicalNode {
+            $(
+                $(#[$meta])*
+                $variant { $( $(#[$fmeta])* $field : $ty ),* },
+            )*
+        }
+
+        /// One fieldless kind per [`PhysicalNode`] variant, generated from the
+        /// same declaration, so no variant is enumerated twice or not at all.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum PhysicalNodeKind {
+            $( $variant, )*
+        }
+
+        impl PhysicalNodeKind {
+            /// Every kind, in declaration order.
+            pub const ALL: &'static [PhysicalNodeKind] = &[ $( PhysicalNodeKind::$variant, )* ];
+
+            /// The name explain and the execution report print for the kind.
+            pub fn explain_name(self) -> &'static str {
+                match self { $( Self::$variant => $name, )* }
+            }
+
+            /// Every number of children a node of this kind can have, sorted:
+            /// the sum over its child fields of the counts each admits.
+            pub fn input_counts(self) -> Vec<usize> {
+                match self {
+                    $(
+                        Self::$variant => {
+                            #[allow(unused_mut)]
+                            let mut counts: Vec<usize> = vec![0];
+                            $( counts = sum_counts(&counts, <$cty as ChildSlots>::COUNTS); )*
+                            counts
+                        }
+                    )*
+                }
+            }
+        }
+
+        impl PhysicalNode {
+            pub fn kind(&self) -> PhysicalNodeKind {
+                match self { $( Self::$variant { .. } => PhysicalNodeKind::$variant, )* }
+            }
+
+            pub fn name(&self) -> &'static str {
+                self.kind().explain_name()
+            }
+
+            pub fn inputs(&self) -> Vec<NodeId> {
+                match self {
+                    $(
+                        Self::$variant { $( $child, )* .. } => {
+                            #[allow(unused_mut)]
+                            let mut ids = Vec::new();
+                            $(
+                                let $child: &$cty = $child;
+                                ids.extend(ChildSlots::ids($child));
+                            )*
+                            ids
+                        }
+                    )*
+                }
+            }
+
+            fn inputs_mut(&mut self) -> Vec<&mut NodeId> {
+                match self {
+                    $(
+                        Self::$variant { $( $child, )* .. } => {
+                            #[allow(unused_mut)]
+                            let mut ids = Vec::new();
+                            $(
+                                let $child: &mut $cty = $child;
+                                ids.extend(ChildSlots::ids_mut($child));
+                            )*
+                            ids
+                        }
+                    )*
+                }
+            }
+        }
+    };
+}
+
+physical_nodes! {
     MetadataCount {
         spec: Box<ScanSpec>,
         return_exprs: Vec<IRProjection>,
-    },
+    } => "MetadataCount" [];
     /// One Lance scan of a side: `ordered` sorts it by id under the bounded
     /// ordered-scan envelope, `keys_only` projects the id with `_rowid` and
     /// `_rowaddr` (else every column, Blobs as descriptors), `ranked` scores it.
@@ -429,7 +737,7 @@ pub enum PhysicalNode {
         ordered: bool,
         keys_only: bool,
         ranked: Option<RankedAccess>,
-    },
+    } => "Scan" [source: ScanInput];
     /// An id merge of two inputs. Streaming when both are ordered; with
     /// `build`, the right input sinks into the join (the pipeline breaker),
     /// is sorted once and the left input probes it.
@@ -442,7 +750,7 @@ pub enum PhysicalNode {
         /// Pass 5: a matched pair with one `_rowaddr` on both sides is
         /// unchanged and never leaves the join.
         drop_equal_addresses: bool,
-    },
+    } => "SortMergeJoin" [left: NodeId, right: NodeId];
     /// A traversal's destination (`build`, a table `Scan` of it) read once and
     /// hashed on `<binding>.<id>`, probed by the traversal (`probe`) in its
     /// order; `fallback` is the path a build memory refusal may take instead.
@@ -451,13 +759,13 @@ pub enum PhysicalNode {
         build: NodeId,
         binding: String,
         fallback: Option<AccessPath>,
-    },
+    } => "HashJoin" [probe: NodeId, build: NodeId];
     /// Fetch one side's complete rows by `_rowaddr`, one bounded chunk at a
     /// time, and re-attach them at their positions.
     HydrateByAddress {
         input: NodeId,
         side: SideId,
-    },
+    } => "HydrateByAddress" [input: NodeId];
     /// Pass 6 on a query: the return columns only the output reads, fetched
     /// for the rows that reached it by each binding's row address (the
     /// `ROW_ADDRESS_PREFIX` column the projection below carries) from the
@@ -466,23 +774,23 @@ pub enum PhysicalNode {
     HydrateColumns {
         input: NodeId,
         bindings: Vec<HydratedBinding>,
-    },
+    } => "HydrateColumns" [input: NodeId];
     RowCompare {
         input: NodeId,
-    },
+    } => "RowCompare" [input: NodeId];
     ClassifyThreeWay {
         input: NodeId,
-    },
+    } => "ClassifyThreeWay" [input: NodeId];
     Limit {
         input: NodeId,
         rows: usize,
-    },
+    } => "Page" [input: NodeId];
     Page {
         input: NodeId,
         rows: usize,
         bytes: u64,
         resume: Option<String>,
-    },
+    } => "Page" [input: NodeId];
     /// Two `match` bindings with no edge between them: every pair, or only
     /// the pairs every one of `filters` holds true for, the in-memory
     /// conjuncts of the `Filter` that sat directly on the join.
@@ -490,7 +798,7 @@ pub enum PhysicalNode {
         left: NodeId,
         right: NodeId,
         filters: Vec<IRExpr>,
-    },
+    } => "CrossJoin" [left: NodeId, right: NodeId];
     /// Two `match` bindings joined on `haystack contains needle`, both text:
     /// `left` is collected, its `needle` values filter `right` (the table
     /// `Scan` of the `haystack` binding), and `residual` runs on the pairs.
@@ -501,13 +809,13 @@ pub enum PhysicalNode {
         needle: (String, String),
         conjunct: IRExpr,
         residual: Vec<IRExpr>,
-    },
+    } => "ContainsJoin" [left: NodeId, right: NodeId];
     /// The in-memory arm of a GQ filter: the conjuncts the placement pass
     /// left where the query wrote them, each evaluated on its own.
     Filter {
         input: NodeId,
         filters: Vec<IRExpr>,
-    },
+    } => "Filter" [input: NodeId];
     /// A traversal: its declared mode and fallback policy, input row estimate,
     /// and pinned member datasets. A budgeted plan uses the input estimate only
     /// for diagnostics; costed plans also use it to choose their mode.
@@ -525,18 +833,23 @@ pub enum PhysicalNode {
         frontier_estimate: Option<u64>,
         policy: ExpandPolicy,
         versions: BTreeMap<String, Option<u64>>,
-    },
+    } => "Expand" [input: NodeId];
+    /// A correlated block over `input`. Under `Correlated` the `inner` tree's
+    /// leaf is an `OuterReference` to the input rows; under `KeySet` the inner
+    /// tree reads no outer rows and ends on `outer_var`'s identity, the key
+    /// the input rows are kept by.
     AntiJoin {
         input: NodeId,
         inner: NodeId,
         outer_var: String,
         predicate: SubqueryPredicate,
         aggregate: Option<AggregateSpec>,
-    },
-    /// The enclosing rows, the leaf of an `AntiJoin` inner tree.
+        strategy: AntiJoinStrategy,
+    } => "AntiJoin" [input: NodeId, inner: NodeId];
+    /// The enclosing rows, the leaf of a correlated `AntiJoin` inner tree.
     OuterReference {
         outer_var: String,
-    },
+    } => "OuterReference" [];
     /// `rrf(a, b)`: two arms, each its own copy of the pipeline with one
     /// ranked scan, every arm row emitted with `<primary binding>._rrf`; `k`
     /// as written, `limit` only the nearest arm's window, `prefilter` feeds `bm25`.
@@ -547,18 +860,18 @@ pub enum PhysicalNode {
         prefilter: Prefilter,
         /// Downstream row keys after the arm score and fused node identity.
         row_tiebreak: Vec<ColumnRef>,
-    },
+    } => "RankFuse" [arms: [RankArm; 2]];
     Projection {
         input: NodeId,
         return_exprs: Vec<IRProjection>,
         node_objects: Vec<crate::NodeObjectType>,
-    },
+    } => "Projection" [input: NodeId];
     Aggregate {
         input: NodeId,
         return_exprs: Vec<IRProjection>,
         aggregates: Vec<Option<AggregateSpec>>,
         node_objects: Vec<crate::NodeObjectType>,
-    },
+    } => "Aggregate" [input: NodeId];
     Sort {
         input: NodeId,
         order_by: Vec<IROrdering>,
@@ -566,83 +879,98 @@ pub enum PhysicalNode {
         /// The metadata columns following `order_by`, ascending nulls first,
         /// so the order is total; empty where they cannot change visible order.
         tiebreak: Vec<ColumnRef>,
-    },
+    } => "Sort" [input: NodeId];
+    /// A load's parallel parser: at most `max_partitions` byte ranges cut on
+    /// quote-aware row boundaries, at most `max_workers` readers, batches in
+    /// source order; an unprovable boundary falls back to one reader.
+    CsvSource {
+        spec: Box<CsvSourceSpec>,
+        max_partitions: u32,
+        max_workers: u32,
+    } => "CsvSource" [];
+    /// The one validation over the whole delta, a pipeline breaker: every
+    /// check extracted in one pass per batch, each check's `access` saying
+    /// how its committed image is read after the last batch.
+    Validate {
+        input: NodeId,
+        table: String,
+        checks: Vec<ValidateSpec>,
+        max_workers: u32,
+    } => "Validate" [input: NodeId];
+    /// The fragment sink: the validated delta, every input checked against
+    /// `max_input_bytes`, written by at most `max_workers` writers into one
+    /// staged transaction the driver commits.
+    FragmentWrite {
+        input: NodeId,
+        spec: Box<FragmentWriteSpec>,
+        max_input_bytes: u64,
+        max_workers: u32,
+    } => "FragmentWrite" [input: NodeId];
+}
+
+/// One `@Operator` row: a distinct explain name and the sorted, distinct
+/// child counts every kind reporting that name admits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorRow {
+    pub name: &'static str,
+    pub inputs: Vec<usize>,
+}
+
+/// The `@Operator` rows: [`PhysicalNodeKind::ALL`] grouped by explain name
+/// in declaration order, each group's input counts unioned.
+pub fn operator_rows() -> Vec<OperatorRow> {
+    let mut rows: Vec<OperatorRow> = Vec::new();
+    for kind in PhysicalNodeKind::ALL {
+        let name = kind.explain_name();
+        let counts = kind.input_counts();
+        match rows.iter_mut().find(|row| row.name == name) {
+            Some(row) => {
+                row.inputs.extend(counts);
+                row.inputs.sort_unstable();
+                row.inputs.dedup();
+            }
+            None => rows.push(OperatorRow {
+                name,
+                inputs: counts,
+            }),
+        }
+    }
+    rows
 }
 
 impl PhysicalNode {
-    pub fn name(&self) -> &'static str {
+    /// The most rows this node keeps of its input whatever any predicate
+    /// holds: its count cut. Every variant is listed, so a new node kind
+    /// cannot compile without a classification here; a field that gives an
+    /// existing kind a cut still needs its arm changed by hand. Plan
+    /// acceptance justifies every declared cut against the query.
+    pub fn row_cut(&self) -> Option<usize> {
         match self {
-            Self::Scan { .. } => "Scan",
-            Self::MetadataCount { .. } => "MetadataCount",
-            Self::HashJoin { .. } => "HashJoin",
-            Self::HydrateByAddress { .. } => "HydrateByAddress",
-            Self::HydrateColumns { .. } => "HydrateColumns",
-            Self::SortMergeJoin { .. } => "SortMergeJoin",
-            Self::RowCompare { .. } => "RowCompare",
-            Self::ClassifyThreeWay { .. } => "ClassifyThreeWay",
-            Self::Page { .. } | Self::Limit { .. } => "Page",
-            Self::CrossJoin { .. } => "CrossJoin",
-            Self::ContainsJoin { .. } => "ContainsJoin",
-            Self::Filter { .. } => "Filter",
-            Self::Expand { .. } => "Expand",
-            Self::AntiJoin { .. } => "AntiJoin",
-            Self::OuterReference { .. } => "OuterReference",
-            Self::RankFuse { .. } => "RankFuse",
-            Self::Projection { .. } => "Projection",
-            Self::Aggregate { .. } => "Aggregate",
-            Self::Sort { .. } => "Sort",
-        }
-    }
-
-    pub fn inputs(&self) -> Vec<NodeId> {
-        match self {
-            Self::HydrateByAddress { input, .. }
-            | Self::HydrateColumns { input, .. }
-            | Self::RowCompare { input, .. }
-            | Self::ClassifyThreeWay { input }
-            | Self::Page { input, .. }
-            | Self::Limit { input, .. }
-            | Self::Filter { input, .. }
-            | Self::Expand { input, .. }
-            | Self::Projection { input, .. }
-            | Self::Aggregate { input, .. }
-            | Self::Sort { input, .. } => vec![*input],
-            Self::SortMergeJoin { left, right, .. }
-            | Self::CrossJoin { left, right, .. }
-            | Self::ContainsJoin { left, right, .. } => {
-                vec![*left, *right]
-            }
-            Self::HashJoin { probe, build, .. } => vec![*probe, *build],
-            Self::AntiJoin { input, inner, .. } => vec![*input, *inner],
-            Self::RankFuse { arms, .. } => arms.iter().map(|arm| arm.input).collect(),
-            Self::Scan { source, .. } => source.input().copied().into_iter().collect(),
-            Self::MetadataCount { .. } | Self::OuterReference { .. } => Vec::new(),
-        }
-    }
-
-    fn inputs_mut(&mut self) -> Vec<&mut NodeId> {
-        match self {
-            Self::HydrateByAddress { input, .. }
-            | Self::HydrateColumns { input, .. }
-            | Self::RowCompare { input, .. }
-            | Self::ClassifyThreeWay { input }
-            | Self::Page { input, .. }
-            | Self::Limit { input, .. }
-            | Self::Filter { input, .. }
-            | Self::Expand { input, .. }
-            | Self::Projection { input, .. }
-            | Self::Aggregate { input, .. }
-            | Self::Sort { input, .. } => vec![input],
-            Self::SortMergeJoin { left, right, .. }
-            | Self::CrossJoin { left, right, .. }
-            | Self::ContainsJoin { left, right, .. } => {
-                vec![left, right]
-            }
-            Self::HashJoin { probe, build, .. } => vec![probe, build],
-            Self::AntiJoin { input, inner, .. } => vec![input, inner],
-            Self::RankFuse { arms, .. } => arms.iter_mut().map(|arm| &mut arm.input).collect(),
-            Self::Scan { source, .. } => source.input_mut().into_iter().collect(),
-            Self::MetadataCount { .. } | Self::OuterReference { .. } => Vec::new(),
+            Self::Limit { rows, .. } | Self::Page { rows, .. } => Some(*rows),
+            Self::Sort { fetch, .. } => *fetch,
+            Self::Scan { ranked, .. } => ranked.as_ref().and_then(|ranked| ranked.fetch),
+            // A fusion emits every arm row; its `limit` sizes only the
+            // nearest arm's window, which that arm's scan declares as its
+            // fetch.
+            Self::RankFuse { .. }
+            | Self::MetadataCount { .. }
+            | Self::SortMergeJoin { .. }
+            | Self::HashJoin { .. }
+            | Self::HydrateByAddress { .. }
+            | Self::HydrateColumns { .. }
+            | Self::RowCompare { .. }
+            | Self::ClassifyThreeWay { .. }
+            | Self::CrossJoin { .. }
+            | Self::ContainsJoin { .. }
+            | Self::Filter { .. }
+            | Self::Expand { .. }
+            | Self::AntiJoin { .. }
+            | Self::OuterReference { .. }
+            | Self::Projection { .. }
+            | Self::Aggregate { .. }
+            | Self::CsvSource { .. }
+            | Self::Validate { .. }
+            | Self::FragmentWrite { .. } => None,
         }
     }
 
@@ -994,10 +1322,12 @@ impl PhysicalPlan {
                 outer_var,
                 predicate,
                 aggregate,
+                strategy,
                 ..
             } => json!({
                 "node": node.name(),
                 "outer_var": outer_var,
+                "strategy": strategy,
                 "predicate": predicate.to_string(),
                 "aggregate": crate::typed::block_aggregate(&predicate.left, *aggregate),
                 "typed_left": crate::typed::block(&predicate.left),
@@ -1035,9 +1365,10 @@ impl PhysicalPlan {
                 "typed_exprs": crate::typed::returns(return_exprs),
                 "aggregates": return_exprs.iter().zip(aggregates).map(|(projection, spec)| {
                     match (&projection.expr, spec) {
-                        (IRExpr::Aggregate { func, signature, .. }, Some(spec)) => json!({
+                        (IRExpr::Aggregate { func, distinct, signature, .. }, Some(spec)) => json!({
                             "column": crate::optimizer::result_column(projection),
                             "func": func.to_string(),
+                            "distinct": distinct,
                             "input": signature.arg.spelling(),
                             "accumulator": spec.accumulator,
                             "overflow": spec.overflow,
@@ -1087,6 +1418,38 @@ impl PhysicalPlan {
                 "typed_residual": crate::typed::exprs(residual),
                 "typed_conjunct": crate::typed::expr(conjunct),
             }),
+            PhysicalNode::CsvSource {
+                spec,
+                max_partitions,
+                max_workers,
+            } => {
+                let mut value = csv_source_json(spec);
+                value["max_partitions"] = json!(max_partitions);
+                value["max_workers"] = json!(max_workers);
+                value["fallback"] = json!("single_scan");
+                value
+            }
+            PhysicalNode::Validate {
+                table,
+                checks,
+                max_workers,
+                ..
+            } => {
+                let mut value = validate_json(table, checks);
+                value["max_workers"] = json!(max_workers);
+                value
+            }
+            PhysicalNode::FragmentWrite {
+                spec,
+                max_input_bytes,
+                max_workers,
+                ..
+            } => {
+                let mut value = fragment_write_json(spec);
+                value["max_input_bytes"] = json!(max_input_bytes);
+                value["max_workers"] = json!(max_workers);
+                value
+            }
             other => json!({ "node": other.name() }),
         };
         value["id"] = json!(id);
@@ -1107,144 +1470,213 @@ impl PhysicalPlan {
     /// The pipelines the push operators build for a diff or merge plan:
     /// walking from the root, a streaming node joins the current pipeline; a
     /// join with a build side ends it and starts a child pipeline for the
-    /// build input; a scan is the source. Child pipelines come first.
-    pub fn pipelines_json(&self) -> Value {
+    /// build input; a scan is the source. Child pipelines come first, so a
+    /// pipeline's `depends_on` names only earlier pipelines, and the last
+    /// pipeline is the root one feeding the consumer.
+    pub fn pipelines(&self) -> Vec<PipelineSpec> {
         let mut pipelines = Vec::new();
         let mut operators = Vec::new();
-        let source = self.pipeline_of(self.root, &mut operators, &mut pipelines);
+        let mut depends_on = Vec::new();
+        let source = self.pipeline_of(self.root, &mut operators, &mut pipelines, &mut depends_on);
         operators.reverse();
-        pipelines.push(json!({
-            "source": source,
-            "operators": operators,
-            "sink": "consumer",
-        }));
-        Value::Array(pipelines)
+        let id = pipelines.len();
+        pipelines.push(PipelineSpec {
+            id,
+            source,
+            operators,
+            sink: PipelineSink::Consumer,
+            depends_on,
+        });
+        pipelines
     }
 
-    /// One input of a two-sided streaming node: its source and the operators
-    /// between that source and the node, in run order.
-    fn side_json(&self, id: NodeId, pipelines: &mut Vec<Value>) -> Value {
-        let mut operators = Vec::new();
-        let source = self.pipeline_of(id, &mut operators, pipelines);
-        operators.reverse();
-        json!({ "source": source, "operators": operators })
+    /// [`Self::pipelines`] serialized for explain: per pipeline its `id`,
+    /// `source`, `operators` and `sink`, each operator as `{id, name}` whose
+    /// `id` joins the `physical_plan` nodes, and `depends_on` naming the
+    /// pipelines drained before this one starts.
+    pub fn pipelines_json(&self) -> Value {
+        Value::Array(
+            self.pipelines()
+                .iter()
+                .map(|pipeline| self.pipeline_json(pipeline))
+                .collect(),
+        )
+    }
+
+    fn pipeline_json(&self, pipeline: &PipelineSpec) -> Value {
+        let sink = match pipeline.sink {
+            PipelineSink::Consumer => json!({ "name": "consumer" }),
+            PipelineSink::Node(id) => json!({ "id": id, "name": self.sink_name(id) }),
+        };
+        json!({
+            "id": pipeline.id,
+            "source": self.source_json(&pipeline.source),
+            "operators": self.operators_json(&pipeline.operators),
+            "sink": sink,
+            "depends_on": pipeline.depends_on,
+        })
+    }
+
+    fn operators_json(&self, operators: &[NodeId]) -> Value {
+        Value::Array(
+            operators
+                .iter()
+                .map(|id| json!({ "id": id, "name": self.operator_name(*id) }))
+                .collect(),
+        )
+    }
+
+    fn source_json(&self, source: &PipelineSource) -> Value {
+        match source {
+            PipelineSource::Tombstone(id) => json!({ "id": id, "node": "tombstone" }),
+            PipelineSource::Node(id) => {
+                let mut value = match self.node(*id) {
+                    Some(PhysicalNode::MetadataCount { spec, return_exprs }) => {
+                        metadata_count_json(spec, return_exprs)
+                    }
+                    Some(PhysicalNode::Scan {
+                        source: ScanInput::Table,
+                        spec,
+                        ordered,
+                        ..
+                    }) => json!({
+                        "node": "Scan",
+                        "side": spec.side,
+                        "ordered": ordered,
+                    }),
+                    Some(PhysicalNode::CsvSource { spec, .. }) => json!({
+                        "node": "CsvSource",
+                        "source": spec.source,
+                    }),
+                    Some(PhysicalNode::OuterReference { outer_var }) => json!({
+                        "node": "OuterReference",
+                        "outer_var": outer_var,
+                    }),
+                    Some(other) => json!({ "node": other.name() }),
+                    None => json!({ "node": "tombstone" }),
+                };
+                value["id"] = json!(id);
+                value
+            }
+            PipelineSource::Streaming { node, left, right } => {
+                let name = match self.node(*node) {
+                    Some(PhysicalNode::SortMergeJoin { .. }) => "SortMergeJoin(streaming)",
+                    Some(other) => other.name(),
+                    None => "tombstone",
+                };
+                json!({
+                    "id": node,
+                    "node": name,
+                    "left": self.side_json(left),
+                    "right": self.side_json(right),
+                })
+            }
+        }
+    }
+
+    fn side_json(&self, side: &SideChain) -> Value {
+        json!({
+            "source": self.source_json(&side.source),
+            "operators": self.operators_json(&side.operators),
+        })
+    }
+
+    /// The name an operator occurrence of `id` prints in a pipeline: a join
+    /// names its streaming role, every other node its own name.
+    fn operator_name(&self, id: NodeId) -> String {
+        match self.node(id) {
+            Some(PhysicalNode::HashJoin { .. }) => "HashJoin(probe)".to_string(),
+            Some(PhysicalNode::SortMergeJoin { .. }) => "SortMergeJoin(probe)".to_string(),
+            Some(PhysicalNode::Scan {
+                source: ScanInput::Dependent { .. },
+                ..
+            }) => "Scan(input ids)".to_string(),
+            Some(PhysicalNode::HydrateByAddress { side, .. }) => {
+                format!("HydrateByAddress({})", side.name())
+            }
+            Some(node) => node.name().to_string(),
+            None => "tombstone".to_string(),
+        }
+    }
+
+    /// The name a sink occurrence of `id` prints: the side of the node the
+    /// pipeline drains into.
+    fn sink_name(&self, id: NodeId) -> String {
+        match self.node(id) {
+            Some(PhysicalNode::HashJoin { .. }) => "HashJoin(build)".to_string(),
+            Some(PhysicalNode::SortMergeJoin { .. }) => "SortMergeJoin(build)".to_string(),
+            Some(PhysicalNode::AntiJoin { .. }) => "AntiJoin(inner)".to_string(),
+            Some(PhysicalNode::RankFuse { .. }) => "RankFuse(secondary)".to_string(),
+            Some(node) => node.name().to_string(),
+            None => "tombstone".to_string(),
+        }
     }
 
     fn pipeline_of(
         &self,
         id: NodeId,
-        operators: &mut Vec<String>,
-        pipelines: &mut Vec<Value>,
-    ) -> Value {
+        operators: &mut Vec<NodeId>,
+        pipelines: &mut Vec<PipelineSpec>,
+        depends_on: &mut Vec<usize>,
+    ) -> PipelineSource {
         let Some(node) = self.node(id) else {
-            return json!("tombstone");
+            return PipelineSource::Tombstone(id);
         };
         match node {
-            PhysicalNode::MetadataCount { spec, return_exprs } => {
-                metadata_count_json(spec, return_exprs)
+            PhysicalNode::MetadataCount { .. }
+            | PhysicalNode::Scan {
+                source: ScanInput::Table,
+                ..
             }
+            | PhysicalNode::OuterReference { .. } => PipelineSource::Node(id),
             PhysicalNode::HashJoin { probe, build, .. } => {
-                let mut build_operators = Vec::new();
-                let build_source = self.pipeline_of(*build, &mut build_operators, pipelines);
-                build_operators.reverse();
-                pipelines.push(json!({
-                    "source": build_source,
-                    "operators": build_operators,
-                    "sink": "HashJoin(build)",
-                }));
-                operators.push("HashJoin(probe)".to_string());
-                self.pipeline_of(*probe, operators, pipelines)
+                depends_on.push(self.build_pipeline(*build, id, pipelines));
+                operators.push(id);
+                self.pipeline_of(*probe, operators, pipelines, depends_on)
             }
             PhysicalNode::Scan {
                 source: ScanInput::Dependent { input, .. },
                 ..
             } => {
-                operators.push("Scan(input ids)".to_string());
-                self.pipeline_of(*input, operators, pipelines)
+                operators.push(id);
+                self.pipeline_of(*input, operators, pipelines, depends_on)
             }
-            PhysicalNode::Scan {
-                source: ScanInput::Table,
-                spec,
-                ordered,
-                ..
-            } => json!({
-                "node": "Scan",
-                "side": spec.side,
-                "ordered": ordered,
-            }),
-            PhysicalNode::OuterReference { outer_var } => json!({
-                "node": "OuterReference",
-                "outer_var": outer_var,
-            }),
             PhysicalNode::SortMergeJoin {
                 left,
                 right,
                 build: true,
                 ..
             } => {
-                let mut build_operators = Vec::new();
-                let build_source = self.pipeline_of(*right, &mut build_operators, pipelines);
-                build_operators.reverse();
-                pipelines.push(json!({
-                    "source": build_source,
-                    "operators": build_operators,
-                    "sink": "SortMergeJoin(build)",
-                }));
-                operators.push("SortMergeJoin(probe)".to_string());
-                self.pipeline_of(*left, operators, pipelines)
+                depends_on.push(self.build_pipeline(*right, id, pipelines));
+                operators.push(id);
+                self.pipeline_of(*left, operators, pipelines, depends_on)
             }
             PhysicalNode::SortMergeJoin {
                 left,
                 right,
                 build: false,
                 ..
-            } => json!({
-                "node": "SortMergeJoin(streaming)",
-                "left": self.side_json(*left, pipelines),
-                "right": self.side_json(*right, pipelines),
-            }),
-            PhysicalNode::CrossJoin { left, right, .. } => json!({
-                "node": "CrossJoin",
-                "left": self.side_json(*left, pipelines),
-                "right": self.side_json(*right, pipelines),
-            }),
-            PhysicalNode::ContainsJoin { left, right, .. } => json!({
-                "node": "ContainsJoin",
-                "left": self.side_json(*left, pipelines),
-                "right": self.side_json(*right, pipelines),
-            }),
-            PhysicalNode::AntiJoin { input, inner, .. } => {
-                let mut inner_operators = Vec::new();
-                let inner_source = self.pipeline_of(*inner, &mut inner_operators, pipelines);
-                inner_operators.reverse();
-                pipelines.push(json!({
-                    "source": inner_source,
-                    "operators": inner_operators,
-                    "sink": "AntiJoin(inner)",
-                }));
-                operators.push("AntiJoin".to_string());
-                self.pipeline_of(*input, operators, pipelines)
             }
-            PhysicalNode::HydrateByAddress { input, side } => {
-                operators.push(format!("HydrateByAddress({})", side.name()));
-                self.pipeline_of(*input, operators, pipelines)
+            | PhysicalNode::CrossJoin { left, right, .. }
+            | PhysicalNode::ContainsJoin { left, right, .. } => PipelineSource::Streaming {
+                node: id,
+                left: self.side_chain(*left, pipelines, depends_on),
+                right: self.side_chain(*right, pipelines, depends_on),
+            },
+            PhysicalNode::AntiJoin { input, inner, .. } => {
+                depends_on.push(self.build_pipeline(*inner, id, pipelines));
+                operators.push(id);
+                self.pipeline_of(*input, operators, pipelines, depends_on)
             }
             PhysicalNode::RankFuse { arms, .. } => {
                 let [primary, secondary] = arms;
-                let mut secondary_operators = Vec::new();
-                let secondary_source =
-                    self.pipeline_of(secondary.input, &mut secondary_operators, pipelines);
-                secondary_operators.reverse();
-                pipelines.push(json!({
-                    "source": secondary_source,
-                    "operators": secondary_operators,
-                    "sink": "RankFuse(secondary)",
-                }));
-                operators.push("RankFuse".to_string());
-                self.pipeline_of(primary.input, operators, pipelines)
+                depends_on.push(self.build_pipeline(secondary.input, id, pipelines));
+                operators.push(id);
+                self.pipeline_of(primary.input, operators, pipelines, depends_on)
             }
             PhysicalNode::RowCompare { input }
             | PhysicalNode::ClassifyThreeWay { input }
+            | PhysicalNode::HydrateByAddress { input, .. }
             | PhysicalNode::HydrateColumns { input, .. }
             | PhysicalNode::Page { input, .. }
             | PhysicalNode::Limit { input, .. }
@@ -1252,10 +1684,108 @@ impl PhysicalPlan {
             | PhysicalNode::Expand { input, .. }
             | PhysicalNode::Projection { input, .. }
             | PhysicalNode::Aggregate { input, .. }
-            | PhysicalNode::Sort { input, .. } => {
-                operators.push(node.name().to_string());
-                self.pipeline_of(*input, operators, pipelines)
+            | PhysicalNode::Sort { input, .. }
+            | PhysicalNode::Validate { input, .. }
+            | PhysicalNode::FragmentWrite { input, .. } => {
+                operators.push(id);
+                self.pipeline_of(*input, operators, pipelines, depends_on)
             }
+            PhysicalNode::CsvSource { .. } => PipelineSource::Node(id),
         }
     }
+
+    /// The build side of `sink`: its own pipeline, drained into `sink`
+    /// before the pipeline holding `sink` as an operator starts. Returns the
+    /// child pipeline's id.
+    fn build_pipeline(
+        &self,
+        input: NodeId,
+        sink: NodeId,
+        pipelines: &mut Vec<PipelineSpec>,
+    ) -> usize {
+        let mut operators = Vec::new();
+        let mut depends_on = Vec::new();
+        let source = self.pipeline_of(input, &mut operators, pipelines, &mut depends_on);
+        operators.reverse();
+        let id = pipelines.len();
+        pipelines.push(PipelineSpec {
+            id,
+            source,
+            operators,
+            sink: PipelineSink::Node(sink),
+            depends_on,
+        });
+        id
+    }
+
+    /// One input of a two-sided streaming node: its source and the operators
+    /// between that source and the node, in run order; a build pipeline met
+    /// inside the chain lands in `pipelines` and the caller's `depends_on`.
+    fn side_chain(
+        &self,
+        id: NodeId,
+        pipelines: &mut Vec<PipelineSpec>,
+        depends_on: &mut Vec<usize>,
+    ) -> SideChain {
+        let mut operators = Vec::new();
+        let source = self.pipeline_of(id, &mut operators, pipelines, depends_on);
+        operators.reverse();
+        SideChain {
+            source: Box::new(source),
+            operators,
+        }
+    }
+}
+
+/// One pipeline of a diff or merge plan: `source` feeds `operators` in run
+/// order and the last operator's output reaches `sink`. The push executor
+/// consumes the same decomposition explain serializes, so the printed
+/// pipelines are the executed ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipelineSpec {
+    /// Position in [`PhysicalPlan::pipelines`], child pipelines first.
+    pub id: usize,
+    pub source: PipelineSource,
+    /// Operator node ids between `source` and `sink`, in run order.
+    pub operators: Vec<NodeId>,
+    pub sink: PipelineSink,
+    /// Ids of the pipelines drained before this one starts: its build sides,
+    /// in walk order.
+    pub depends_on: Vec<usize>,
+}
+
+/// Where a pipeline's rows come from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PipelineSource {
+    /// A single source node: a table scan, a metadata count, or an outer
+    /// reference.
+    Node(NodeId),
+    /// A streaming two-sided node (a sort-merge join without a build side, a
+    /// cross join, a contains join): each side is its own chain the node
+    /// pulls, not a separately drained pipeline.
+    Streaming {
+        node: NodeId,
+        left: SideChain,
+        right: SideChain,
+    },
+    /// The walk reached a tombstoned slot.
+    Tombstone(NodeId),
+}
+
+/// One input chain of a [`PipelineSource::Streaming`] node: the side's own
+/// source and the operators between it and the node, in run order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SideChain {
+    pub source: Box<PipelineSource>,
+    pub operators: Vec<NodeId>,
+}
+
+/// What consumes a pipeline's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineSink {
+    /// The plan's consumer pulls the root pipeline.
+    Consumer,
+    /// The pipeline drains into this node's build side before the pipeline
+    /// holding the node as an operator starts.
+    Node(NodeId),
 }

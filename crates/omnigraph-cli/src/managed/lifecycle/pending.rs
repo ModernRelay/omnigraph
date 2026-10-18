@@ -82,6 +82,7 @@ pub(super) fn lock(config: &Path) -> Result<File> {
     Ok(file)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare(
     config: &Path,
     api: &str,
@@ -90,6 +91,7 @@ pub(super) fn prepare(
     principal: &PrincipalIdentity,
     explicit: Option<&str>,
     bound_create: bool,
+    stderr: &mut dyn Write,
 ) -> Result<Pending> {
     let request_digest = format!(
         "{:x}",
@@ -120,7 +122,7 @@ pub(super) fn prepare(
                     "another exact lifecycle request or principal is pending; recover it with the original principal before submitting a different request or key",
                 ));
             }
-            idempotency_key(Some(&existing.idempotency_key))?;
+            idempotency_key(Some(&existing.idempotency_key), stderr)?;
             Ok(existing)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -137,7 +139,7 @@ pub(super) fn prepare(
                 request_digest,
                 principal_id: principal.principal_id.clone(),
                 account_id: principal.account_id.clone(),
-                idempotency_key: idempotency_key(explicit)?,
+                idempotency_key: idempotency_key(explicit, stderr)?,
                 fresh: true,
             };
             save(
@@ -174,7 +176,10 @@ pub(super) fn record(config: &Path, api: &str, identity: &Identity) -> Result<()
 
 pub(super) fn bind(config: &Path, context: &Context) -> Result<()> {
     if let Some(existing) = read_context(config)? {
-        if existing.api == context.api && existing.cluster == context.cluster {
+        if existing.api == context.api
+            && existing.cluster == context.cluster
+            && existing.organization_id == context.organization_id
+        {
             return Ok(());
         }
         return Err(Failure::refused(

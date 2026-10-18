@@ -128,6 +128,38 @@ pub fn missing_graph_type_at_snapshot(table_key: &str) -> String {
     )
 }
 
+/// The current property's lifetime is not in the table version a historical
+/// read pins: it was added since, or the column of that name there belongs to
+/// a dropped property.
+pub fn missing_graph_property_at_snapshot(table_key: &str, property: &str) -> String {
+    format!(
+        "property '{property}' of {} does not exist at this snapshot",
+        graph_type_subject(table_key)
+    )
+}
+
+/// The current property's lifetime is in the pinned table version under the
+/// name it had before a rename.
+pub fn renamed_graph_property_at_snapshot(
+    table_key: &str,
+    property: &str,
+    stored_name: &str,
+) -> String {
+    format!(
+        "property '{property}' of {} is named '{stored_name}' at this snapshot; a historical query cannot read a property across a rename",
+        graph_type_subject(table_key)
+    )
+}
+
+/// The pinned table version stores the column without a stable property id,
+/// so it cannot show which property lifetime the column belongs to.
+pub fn unwitnessed_graph_property_at_snapshot(table_key: &str, property: &str) -> String {
+    format!(
+        "property '{property}' of {} has no persisted property-lifetime witness at this snapshot",
+        graph_type_subject(table_key)
+    )
+}
+
 fn format_key_conflict(type_key: &str) -> String {
     format!("{} already has this id", graph_type_subject(type_key))
 }
@@ -231,6 +263,17 @@ pub enum OmniError {
     /// an arbitrary storage `NotFound` as branch absence.
     #[error("branch '{branch}' not found")]
     BranchNotFound { branch: String },
+    /// A graph diff endpoint names neither a live branch nor a resolvable
+    /// graph commit. Carries only the caller's own spelling.
+    #[error("'{target}' names no branch and no commit")]
+    ReadTargetNotFound { target: String },
+    /// A graph diff endpoint names both a live branch and a resolvable graph
+    /// commit. Refused rather than resolved by precedence, so the same string
+    /// never silently means a different snapshot.
+    #[error(
+        "'{target}' names both a branch and a commit; rename the branch, or name its head by commit id"
+    )]
+    AmbiguousReadTarget { target: String },
     /// A change page or feed can no longer be reconstructed contiguously:
     /// cleanup reclaimed a published dataset version one of its commits pins. Recovery is
     /// the exact baseline handshake, never a retried continuation.

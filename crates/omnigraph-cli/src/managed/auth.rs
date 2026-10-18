@@ -1,6 +1,7 @@
 //! Managed human credentials never share the legacy named-server token file.
-use super::{Api, Failure, Method, Result, Value, canonical_origin, json};
+use super::{Api, Failure, Method, Result, Value, canonical_origin, json, write_diagnostic};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::Instant;
@@ -24,7 +25,7 @@ pub(super) struct OsStore {
 }
 
 const AUTHKIT_STORE: OsStore = OsStore {
-    service: "omnigraph.workos-authkit.session.v1",
+    service: "omnigraph.workos-authkit.session.v2",
 };
 pub(super) const DATA_STORE: OsStore = OsStore {
     service: "omnigraph.data-plane.credential.v1",
@@ -139,16 +140,96 @@ fn automation(origin: &str, token: Option<String>, api: Option<String>) -> Resul
     }
 }
 
-pub(super) async fn credential(origin: &str) -> Result<String> {
-    if let Some(token) = automation(
+enum Source {
+    Human(renewal::Identity),
+    Automation(String),
+}
+
+pub(super) struct Selection {
+    pub account_id: String,
+    pub principal_id: String,
+    source: Source,
+}
+
+fn check_account(expected: Option<&str>, actual: &str) -> Result<()> {
+    super::organization_id(actual)?;
+    if expected.is_some_and(|org| org != actual) {
+        return Err(Failure::refused(
+            "organization_mismatch",
+            "the verified account differs from the selected organization",
+        ));
+    }
+    Ok(())
+}
+
+async fn select_with(
+    store: &dyn Store,
+    origin: &str,
+    organization: Option<&str>,
+    token: Option<String>,
+    api: Option<String>,
+) -> Result<Option<Selection>> {
+    if let Some(org) = organization {
+        super::organization_id(org)?;
+    }
+    if let Some(token) = automation(origin, token, api)? {
+        let body = Api::new(origin.into(), Some(token.clone()))?
+            .request(Method::GET, "/v1/auth/session", None, None)
+            .await
+            .map_err(|failure| scrub(failure, &token))?;
+        let account = bounded_string(&body["data"], "account_id", 128)?;
+        check_account(organization, account)?;
+        return Ok(Some(Selection {
+            account_id: account.into(),
+            principal_id: bounded_string(&body["data"], "principal_id", 1024)?.into(),
+            source: Source::Automation(token),
+        }));
+    }
+    Ok(
+        renewal::load_selected(store, origin, organization)?.map(|saved| Selection {
+            account_id: saved.identity.account_id.clone(),
+            principal_id: saved.identity.principal_id.clone(),
+            source: Source::Human(saved.identity),
+        }),
+    )
+}
+
+pub(super) async fn select(origin: &str, organization: Option<&str>) -> Result<Selection> {
+    let _lock = coordination::lock(origin).await?;
+    let selected = select_with(
+        &AUTHKIT_STORE,
         origin,
+        organization,
         env("OMNIGRAPH_CONTROL_TOKEN")?,
         env("OMNIGRAPH_CONTROL_API")?,
-    )? {
-        return Ok(token);
+    )
+    .await?
+    .ok_or_else(login_required)?;
+    if let Source::Human(identity) = &selected.source {
+        let token = renewal::credential(&AUTHKIT_STORE, origin, identity).await?;
+        let saved = renewal::load_selected(&AUTHKIT_STORE, origin, Some(&identity.account_id))?
+            .ok_or_else(login_required)?;
+        let (verified, _, _) = renewal::verify(origin, &saved.config, &token, None).await?;
+        if verified != *identity {
+            return Err(Failure::refused(
+                "session_identity_mismatch",
+                "the verified sign-in identity changed",
+            ));
+        }
     }
-    let _lock = coordination::lock(origin).await?;
-    renewal::credential(&AUTHKIT_STORE, origin).await
+    Ok(selected)
+}
+
+impl Selection {
+    pub(super) async fn credential(&self, origin: &str) -> Result<String> {
+        match &self.source {
+            Source::Automation(token) => Ok(token.clone()),
+            Source::Human(identity) => {
+                let _lock = coordination::lock(origin).await?;
+                renewal::credential(&AUTHKIT_STORE, origin, identity).await
+            }
+        }
+    }
 }
 
 pub(super) async fn cache_lock(key: &str) -> Result<std::fs::File> {
@@ -158,24 +239,21 @@ pub(super) async fn cache_lock(key: &str) -> Result<std::fs::File> {
 async fn selected_principal_with(
     store: &dyn Store,
     origin: &str,
+    organization: Option<&str>,
     token: Option<String>,
     api: Option<String>,
 ) -> Result<Option<String>> {
-    if let Some(token) = automation(origin, token, api)? {
-        let body = Api::new(origin.into(), Some(token.clone()))?
-            .request(Method::GET, "/v1/auth/session", None, None)
-            .await
-            .map_err(|failure| scrub(failure, &token))?;
-        return bounded_string(&body["data"], "principal_id", 1024)
-            .map(|principal| Some(principal.into()));
-    }
-    Ok(renewal::load(store, origin)?.map(|saved| saved.identity.principal_id))
+    Ok(select_with(store, origin, organization, token, api)
+        .await?
+        .map(|s| s.principal_id))
 }
 
-pub(super) async fn selected_principal(origin: &str) -> Result<Option<String>> {
+pub(super) async fn selected_principal(origin: &str, organization: &str) -> Result<Option<String>> {
+    let _lock = coordination::lock(origin).await?;
     selected_principal_with(
         &AUTHKIT_STORE,
         origin,
+        Some(organization),
         env("OMNIGRAPH_CONTROL_TOKEN")?,
         env("OMNIGRAPH_CONTROL_API")?,
     )
@@ -254,14 +332,16 @@ async fn login_with(
     origin: &str,
     config: provider::Config,
     provider: &provider::Provider,
+    organization: Option<&str>,
+    stderr: &mut dyn Write,
 ) -> Result<Value> {
     let _ = store.get(origin)?;
-    if let Some(saved) = renewal::load(store, origin)?
+    if let Some(saved) = renewal::load_selected(store, origin, organization)?
         && saved.config == config
         && saved.state == renewal::RefreshState::Ready
         && renewal::timestamp(&saved.refresh_expires_at)? > OffsetDateTime::now_utc()
     {
-        match renewal::credential_with(store, origin, provider).await {
+        match renewal::credential_selected(store, origin, &saved.identity, provider).await {
             Ok(token) => {
                 let verified = renewal::verify(origin, &config, &token, None).await;
                 match verified {
@@ -322,7 +402,10 @@ async fn login_with(
     let lifetime = seconds(device.expires_in, 1, 600)?;
     let mut interval = seconds(device.interval.unwrap_or(5.0), 5, 600)?;
     let deadline = started + Duration::from_secs(lifetime);
-    eprintln!("Open {uri}\nEnter code: {}", device.user_code);
+    write_diagnostic(
+        stderr,
+        format_args!("Open {uri}\nEnter code: {}\n", device.user_code),
+    )?;
     loop {
         let next = Instant::now() + Duration::from_secs(interval);
         if next >= deadline {
@@ -342,14 +425,7 @@ async fn login_with(
             })?;
         match reply {
             Ok(tokens) => {
-                let (saved, body) = renewal::accept(origin, config, tokens, None).await?;
-                if let Err(error) = renewal::save(store, &saved) {
-                    // We cannot retain the new renewable session. Revoke it
-                    // when possible without obscuring the custody failure.
-                    saved.revoke().await;
-                    return Err(error);
-                }
-                return Ok(body);
+                return accept_device(store, origin, config, provider, tokens, organization).await;
             }
             Err(error) if error.code() == Some("authorization_pending") => {}
             Err(error) if error.code() == Some("slow_down") => {
@@ -360,17 +436,61 @@ async fn login_with(
     }
 }
 
-pub(super) async fn login(origin: String) -> Result<Value> {
+async fn accept_device(
+    store: &dyn Store,
+    origin: &str,
+    config: provider::Config,
+    provider: &provider::Provider,
+    tokens: workos::AuthenticateResponse,
+    organization: Option<&str>,
+) -> Result<Value> {
+    // Keychain reads can require interactive OS consent. Complete the cached
+    // session collision check under the origin lock before timing network work.
+    let initial = renewal::check_device_session(store, origin, &config, &tokens)?;
+    let (saved, body) = tokio::time::timeout(Duration::from_secs(35), async {
+        let tokens =
+            renewal::select_device_organization(&config, provider, tokens, initial, organization)
+                .await?;
+        renewal::accept(origin, config, tokens, None).await
+    })
+    .await
+    .map_err(|_| renewal::unknown())??;
+    if let Err(error) = check_account(organization, &saved.identity.account_id) {
+        saved.revoke().await;
+        return Err(error);
+    }
+    if let Err(error) = renewal::save(store, &saved) {
+        // We cannot retain the new renewable session. Revoke it when possible
+        // without obscuring the custody failure or touching another session.
+        saved.revoke().await;
+        return Err(error);
+    }
+    Ok(body)
+}
+
+pub(super) async fn login(
+    origin: String,
+    organization: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<Value> {
     let _lock = coordination::lock(&origin).await?;
     let _ = AUTHKIT_STORE.get(&origin)?;
     let config = provider::Config::discover(&origin).await?;
     let provider = provider::Provider::new(&config)?;
-    login_with(&AUTHKIT_STORE, &origin, config, &provider).await
+    login_with(
+        &AUTHKIT_STORE,
+        &origin,
+        config,
+        &provider,
+        organization,
+        stderr,
+    )
+    .await
 }
 
-pub(super) async fn logout(origin: String) -> Result<Value> {
+pub(super) async fn logout(origin: String, organization: Option<&str>) -> Result<Value> {
     let _lock = coordination::lock(&origin).await?;
-    renewal::logout(&AUTHKIT_STORE, &origin).await
+    renewal::logout(&AUTHKIT_STORE, &origin, organization).await
 }
 
 #[cfg(test)]

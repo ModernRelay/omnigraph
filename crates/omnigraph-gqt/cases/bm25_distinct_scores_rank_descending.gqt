@@ -38,3 +38,26 @@ query bm25_ranked($q: String) {
 
 --- expect shape
 n.slug: String
+
+--- query
+query distinct_literal_order($q: String) {
+    match { $n: Note }
+    return distinct { $n.slug, 1 as one }
+    order { bm25($n.body, $q), 1 }
+    limit 3
+}
+
+--- params
+{"q": "tensor"}
+
+--- expect ordered
+{"n.slug": "n1", "one": 1}
+{"n.slug": "n2", "one": 1}
+{"n.slug": "n3", "one": 1}
+
+--- expect shape
+n.slug: String
+one: I64
+
+--- expect plan
+sort no tiebreak

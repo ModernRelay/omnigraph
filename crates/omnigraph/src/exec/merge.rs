@@ -4977,6 +4977,11 @@ impl Session {
         // Keep the planning/publication future out of the public API's callers;
         // deeply composed loads and merges otherwise retain large debug
         // construction frames throughout execution. Poll it in the same task.
+        let mode = if as_commit {
+            MergeMode::Propose
+        } else {
+            MergeMode::Publish
+        };
         let result = Box::pin(self.branch_merge_impl(
             source,
             target,
@@ -4984,7 +4989,7 @@ impl Session {
             self.settings().merge_lineage(),
             HistoryReleaseBytes(self.settings().history_release_bytes()),
             WriteBudget::from_settings(self.settings()),
-            as_commit,
+            mode,
         ))
         .await;
         if let Err(error) = fail(&BRANCH_MERGE_PRE_RETURN) {
@@ -5000,12 +5005,43 @@ impl Session {
         }
         result
     }
+
+    /// Run `branch merge` through base resolution, three-way classification
+    /// and constraint validation, then stop (RFC 0030 §8.4): the outcome, or
+    /// the conflict list, that merging `source` into `target` would produce
+    /// against the branches as captured now. It is a read: it takes no branch
+    /// gate and no merge-input tag, stages only to process-local scratch, and
+    /// commits and publishes nothing, so `commit` is always `None`. Transports
+    /// authorize it as a read of both branches.
+    pub async fn branch_merge_dry_run(&self, source: &str, target: &str) -> Result<MergeResult> {
+        Box::pin(self.branch_merge_impl(
+            source,
+            target,
+            None,
+            self.settings().merge_lineage(),
+            HistoryReleaseBytes(self.settings().history_release_bytes()),
+            WriteBudget::from_settings(self.settings()),
+            MergeMode::DryRun,
+        ))
+        .await
+    }
+}
+
+/// What a branch merge does with its validated result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeMode {
+    /// Publish onto the target: the ordinary merge.
+    Publish,
+    /// Record an unpublished commit (`branch merge … as commit`).
+    Propose,
+    /// Stop after validation and write nothing.
+    DryRun,
 }
 
 impl Omnigraph {
     /// Prove a base from captured records, then read only addressed history
     /// blocks needed by the exact ancestry walk.
-    async fn resolve_merge_base(
+    pub(crate) async fn resolve_merge_base(
         source: &crate::db::commit_graph::CommitGraph,
         target: &crate::db::commit_graph::CommitGraph,
         source_commit_id: &str,
@@ -5033,8 +5069,10 @@ impl Omnigraph {
         lineage: MergeLineage,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
-        as_commit: bool,
+        mode: MergeMode,
     ) -> Result<MergeResult> {
+        let as_commit = mode == MergeMode::Propose;
+        let dry_run = mode == MergeMode::DryRun;
         let outer_prepare_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
         );
@@ -5046,7 +5084,13 @@ impl Omnigraph {
             ));
         }
 
-        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        // A dry run is a read: it takes neither the schema permit nor the
+        // branch gates, so it never waits behind (or blocks) a writer.
+        let _schema_permit = if dry_run {
+            None
+        } else {
+            Some(self.write_queue().acquire_schema_shared().await)
+        };
         // The target gate is held through publication: it keeps a target
         // delete/recreate from reusing the name underneath the plan (ABA) and
         // serializes merges into one target. The source gate is held only
@@ -5056,17 +5100,19 @@ impl Omnigraph {
         // Both are taken in the sorted order `acquire_branches` uses, so the
         // pair cannot deadlock with another multi-branch acquirer.
         let queue = self.write_queue();
-        let (source_gate, _target_gate) = if source_branch <= target_branch {
+        let (source_gate, _target_gate) = if dry_run {
+            (None, None)
+        } else if source_branch <= target_branch {
             let source_gate = queue.acquire_branch(source_branch.as_deref()).await;
             (
-                source_gate,
-                queue.acquire_branch(target_branch.as_deref()).await,
+                Some(source_gate),
+                Some(queue.acquire_branch(target_branch.as_deref()).await),
             )
         } else {
             let target_gate = queue.acquire_branch(target_branch.as_deref()).await;
             (
-                queue.acquire_branch(source_branch.as_deref()).await,
-                target_gate,
+                Some(queue.acquire_branch(source_branch.as_deref()).await),
+                Some(target_gate),
             )
         };
         // Capture each branch as one coherent RFC-022 authority token plus
@@ -5119,14 +5165,21 @@ impl Omnigraph {
             &witness,
         );
         let preparation = async {
-            input_guard.pin(source_txn.manifest_probe.dataset()).await?;
-            input_guard.pin(target_txn.manifest_probe.dataset()).await?;
+            // A dry run holds its inputs only as this read's snapshots: a
+            // cleanup that reclaims one mid-run surfaces as a typed gap,
+            // never as a tag the run left behind.
+            if !dry_run {
+                input_guard.pin(source_txn.manifest_probe.dataset()).await?;
+                input_guard.pin(target_txn.manifest_probe.dataset()).await?;
+            }
             let base_snapshot = if head_is_base {
                 target_txn.base.clone()
             } else {
                 let base =
                     ManifestCoordinator::pinned_graph_commit(self.uri(), &base_commit).await?;
-                input_guard.pin(&base.dataset).await?;
+                if !dry_run {
+                    input_guard.pin(&base.dataset).await?;
+                }
                 Snapshot::wrap(base.snapshot)
             };
             if !source_txn.manifest_probe.is_current().await?
@@ -5194,10 +5247,12 @@ impl Omnigraph {
             history_release_bytes,
             write_budget,
             publication,
+            dry_run,
         ))
         .await;
         let proposal_holds_inputs = as_commit && merge_result.is_ok();
-        if !proposal_holds_inputs
+        if !dry_run
+            && !proposal_holds_inputs
             && !merge_result
                 .as_ref()
                 .is_err_and(|error| error.is_manifest_publish_in_doubt())
@@ -5244,6 +5299,7 @@ impl Omnigraph {
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
         publication: crate::db::omnigraph::Publication,
+        dry_run: bool,
     ) -> Result<MergeResult> {
         let source_snapshot = &source_txn.base;
         let target_snapshot = &target_txn.base;
@@ -5572,6 +5628,19 @@ impl Omnigraph {
             validation_timing.finish();
         }
         fail(&BRANCH_MERGE_POST_CANDIDATE_VALIDATION)?;
+        if dry_run {
+            // Everything a merge decides is decided: the classification found
+            // no conflict and the merged candidates validate. Stop before the
+            // first effect.
+            return Ok(MergeResult {
+                outcome: if is_fast_forward {
+                    MergeOutcome::FastForward
+                } else {
+                    MergeOutcome::Merged
+                },
+                commit: None,
+            });
+        }
 
         // Every `RewriteMerged` / `AdoptWithDelta` / `AdoptPureInserts` logical
         // data step commits one detached link of its table's chain (RFC 0067).

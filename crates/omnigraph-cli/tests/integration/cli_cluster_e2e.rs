@@ -180,7 +180,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
     let policies = policies.replace("peer]", "peer, tools]");
     fs::write(temp.path().join("cluster.yaml"), format!("{config}  tools:\n    schema: ./tools.pg\n    queries:\n      tools:\n        file: ./tools.gq\n{policies}")).unwrap();
     let output = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "live-deployment-token")
+        .envs(server.credential("live-deployment-token"))
         .args(["cluster", "apply", "--server", &server.base_url, "--config"])
         .arg(temp.path())
         .arg("--json")
@@ -247,7 +247,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
     assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("Deployment-ID: {id}")));
     let status = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "live-deployment-token")
+            .envs(server.credential("live-deployment-token"))
             .args([
                 "cluster",
                 "status",
@@ -264,7 +264,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
     // graph creation invocation. Changed bytes under that identity refuse.
     let repeat = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "live-deployment-token")
+            .envs(server.credential("live-deployment-token"))
             .args([
                 "cluster",
                 "apply",
@@ -282,7 +282,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
     fs::write(&tools, format!(" {}", fs::read_to_string(&tools).unwrap())).unwrap();
     let mismatched = output_failure(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "live-deployment-token")
+            .envs(server.credential("live-deployment-token"))
             .args([
                 "cluster",
                 "apply",
@@ -321,7 +321,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
     // The initiating actor still observes its exact receipt after its
     // management grant is revoked and the original server process is gone.
     let boot_status = parse_stdout_json(&output_success(
-        live_policy_cli("live-deployment-token").args([
+        live_policy_cli(&server, "live-deployment-token").args([
             "cluster",
             "status",
             "--server",
@@ -378,7 +378,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
         fs::write(&tools, format!(" {}", fs::read_to_string(&tools).unwrap())).unwrap();
         let unrelated = parse_stdout_json(&output_success(
             cli()
-                .env("OMNIGRAPH_BEARER_TOKEN", "live-deployment-token")
+                .envs(recovering.credential("live-deployment-token"))
                 .args([
                     "cluster",
                     "apply",
@@ -407,7 +407,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
             let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
             let refusal = parse_stdout_json(&output_failure(
                 cli()
-                    .env("OMNIGRAPH_BEARER_TOKEN", "live-deployment-token")
+                    .envs(recovering.credential("live-deployment-token"))
                     .args([
                         "cluster",
                         "apply",
@@ -893,7 +893,7 @@ fn cluster_e2e_payload_drift_requires_authoritative_restore() {
 fn live_apply(config_dir: &std::path::Path, server: &TestServer, token: &str) -> serde_json::Value {
     let mut command = cli();
     command
-        .env("OMNIGRAPH_BEARER_TOKEN", token)
+        .envs(server.credential(token))
         .args(["cluster", "apply", "--server", &server.base_url, "--config"])
         .arg(config_dir)
         .arg("--json")
@@ -926,7 +926,7 @@ fn live_snapshot(server: &TestServer, graph: &str) -> serde_json::Value {
 
 fn assert_live_tool_data(server: &TestServer) {
     let result = parse_stdout_json(&output_success(
-        live_policy_cli("live-deployment-token").args([
+        live_policy_cli(server, "live-deployment-token").args([
             "query",
             "tools",
             "--server",
@@ -942,7 +942,7 @@ fn assert_live_tool_data(server: &TestServer) {
 
 fn assert_live_person_query(server: &TestServer) {
     let result = parse_stdout_json(&output_success(
-        live_policy_cli("live-deployment-token").args([
+        live_policy_cli(server, "live-deployment-token").args([
             "query",
             "find_person",
             "--server",
@@ -973,7 +973,7 @@ fn live_graph_removal_deletes_owned_storage(
     server: &TestServer,
     root: &str,
 ) -> serde_json::Value {
-    output_success(live_policy_cli("live-deployment-token").args([
+    output_success(live_policy_cli(server, "live-deployment-token").args([
         "mutate",
         "seed",
         "--server",
@@ -997,7 +997,7 @@ fn live_graph_removal_deletes_owned_storage(
         .push(yaml_serde::Value::from("retired"));
     fs::write(&config_path, yaml_serde::to_string(&expanded).unwrap()).unwrap();
     live_apply(config_dir, server, "live-deployment-token");
-    output_success(live_policy_cli("live-deployment-token").args([
+    output_success(live_policy_cli(server, "live-deployment-token").args([
         "mutate",
         "seed",
         "--server",
@@ -1016,7 +1016,7 @@ fn live_graph_removal_deletes_owned_storage(
     let status_before = live_policy_status(server, "live-deployment-token");
     let deleted_before = live_snapshot(server, "retired");
     live_policy_expect_forbidden(
-        live_policy_cli("reader-token")
+        live_policy_cli(server, "reader-token")
             .args(["cluster", "apply", "--server", &server.base_url, "--config"])
             .arg(config_dir)
             .arg("--json"),
@@ -1030,7 +1030,7 @@ fn live_graph_removal_deletes_owned_storage(
     // Server-only preview describes destructive removal without changing
     // either the ledger or the graph's readable data/history.
     let plan = parse_stdout_json(&output_success(
-        live_policy_cli("live-deployment-token")
+        live_policy_cli(server, "live-deployment-token")
             .args(["cluster", "plan", "--server", &server.base_url, "--config"])
             .arg(config_dir)
             .arg("--json"),
@@ -1061,7 +1061,7 @@ fn live_graph_removal_deletes_owned_storage(
     assert_eq!(live_snapshot(server, "retired"), deleted_before);
 
     let accepted = parse_stdout_json(&output_success(
-        live_policy_cli("live-deployment-token")
+        live_policy_cli(server, "live-deployment-token")
             .args(["cluster", "apply", "--server", &server.base_url, "--config"])
             .arg(config_dir)
             .args(["--no-wait", "--timeout", "30", "--json"]),
@@ -1071,7 +1071,7 @@ fn live_graph_removal_deletes_owned_storage(
         .or_else(|| accepted["deployment"]["result"]["id"].as_str())
         .unwrap();
     let deleted = parse_stdout_json(&output_success(
-        live_policy_cli("live-deployment-token").args([
+        live_policy_cli(server, "live-deployment-token").args([
             "cluster",
             "status",
             "--server",
@@ -1106,7 +1106,7 @@ fn live_graph_removal_deletes_owned_storage(
     // Reusing the original ID only returns the deletion receipt.
     let id = deleted["deployment"]["result"]["id"].as_str().unwrap();
     let repeat = parse_stdout_json(&output_success(
-        live_policy_cli("live-deployment-token")
+        live_policy_cli(server, "live-deployment-token")
             .args([
                 "cluster",
                 "apply",
@@ -1132,7 +1132,7 @@ fn live_graph_removal_deletes_owned_storage(
     let replacement = live_snapshot(server, "retired");
     assert_ne!(replacement, deleted_before);
     let empty = parse_stdout_json(&output_success(
-        live_policy_cli("live-deployment-token").args([
+        live_policy_cli(server, "live-deployment-token").args([
             "query",
             "tools",
             "--server",
@@ -1145,7 +1145,7 @@ fn live_graph_removal_deletes_owned_storage(
     assert_eq!(empty["row_count"], 0, "{empty}");
     fs::write(&config_path, &source).unwrap();
     let observed = parse_stdout_json(&output_failure(
-        live_policy_cli("live-deployment-token")
+        live_policy_cli(server, "live-deployment-token")
             .args([
                 "cluster",
                 "apply",
@@ -1195,7 +1195,7 @@ fn live_policy_grants_revocations_and_management_handoff(
     )
     .unwrap();
     live_policy_expect_forbidden(
-        live_policy_cli("reader-token")
+        live_policy_cli(server, "reader-token")
             .args(["cluster", "apply", "--server", &server.base_url, "--config"])
             .arg(config_dir)
             .arg("--json"),
@@ -1244,7 +1244,7 @@ fn live_policy_grants_revocations_and_management_handoff(
         current["status"]["result_revision"],
         handoff["deployment"]["result"]["result_revision"]
     );
-    live_policy_expect_forbidden(live_policy_cli("live-deployment-token").args([
+    live_policy_expect_forbidden(live_policy_cli(server, "live-deployment-token").args([
         "cluster",
         "status",
         "--server",
@@ -1253,7 +1253,7 @@ fn live_policy_grants_revocations_and_management_handoff(
     ]));
     fs::write(&management_path, &original_management).unwrap();
     live_policy_expect_forbidden(
-        live_policy_cli("live-deployment-token")
+        live_policy_cli(server, "live-deployment-token")
             .args(["cluster", "apply", "--server", &server.base_url, "--config"])
             .arg(config_dir)
             .arg("--json"),
@@ -1261,7 +1261,7 @@ fn live_policy_grants_revocations_and_management_handoff(
     assert_eq!(live_policy_status(server, "next-token"), current);
     live_apply(config_dir, server, "next-token");
     live_policy_status(server, "live-deployment-token");
-    live_policy_expect_forbidden(live_policy_cli("next-token").args([
+    live_policy_expect_forbidden(live_policy_cli(server, "next-token").args([
         "cluster",
         "status",
         "--server",
@@ -1286,7 +1286,7 @@ fn live_policy_handoff_before_restart(
     fs::write(management_path, handoff).unwrap();
     let result = live_apply(config_dir, server, "live-deployment-token");
     let receipt = parse_stdout_json(&output_success(
-        live_policy_cli("live-deployment-token").args([
+        live_policy_cli(server, "live-deployment-token").args([
             "cluster",
             "status",
             "--server",
@@ -1303,7 +1303,7 @@ fn live_policy_handoff_before_restart(
     assert_eq!(receipt["deployment"], result["deployment"]);
     assert!(receipt.get("status").is_none());
     let current = live_policy_status(server, "next-token");
-    live_policy_expect_forbidden(live_policy_cli("live-deployment-token").args([
+    live_policy_expect_forbidden(live_policy_cli(server, "live-deployment-token").args([
         "cluster",
         "status",
         "--server",
@@ -1311,7 +1311,7 @@ fn live_policy_handoff_before_restart(
         "--json",
     ]));
     live_policy_expect_forbidden(
-        live_policy_cli("live-deployment-token")
+        live_policy_cli(server, "live-deployment-token")
             .args(["cluster", "apply", "--server", &server.base_url, "--config"])
             .arg(config_dir)
             .arg("--json"),
@@ -1325,7 +1325,7 @@ fn live_policy_state_survives_restart(config_dir: &std::path::Path, server: &Tes
     live_policy_expect_forbidden(&mut live_policy_mutation(server, "PolicyAfterRestart"));
     assert_eq!(live_snapshot(server, "knowledge"), before);
     live_policy_assert_granted_row(server);
-    live_policy_expect_forbidden(live_policy_cli("live-deployment-token").args([
+    live_policy_expect_forbidden(live_policy_cli(server, "live-deployment-token").args([
         "cluster",
         "status",
         "--server",
@@ -1334,7 +1334,7 @@ fn live_policy_state_survives_restart(config_dir: &std::path::Path, server: &Tes
     ]));
     let current = live_policy_status(server, "next-token");
     live_policy_expect_forbidden(
-        live_policy_cli("live-deployment-token")
+        live_policy_cli(server, "live-deployment-token")
             .args(["cluster", "apply", "--server", &server.base_url, "--config"])
             .arg(config_dir)
             .arg("--json"),
@@ -1347,7 +1347,7 @@ fn live_policy_state_survives_restart(config_dir: &std::path::Path, server: &Tes
     fs::write(management_path, restored).unwrap();
     live_apply(config_dir, server, "next-token");
     live_policy_status(server, "live-deployment-token");
-    live_policy_expect_forbidden(live_policy_cli("next-token").args([
+    live_policy_expect_forbidden(live_policy_cli(server, "next-token").args([
         "cluster",
         "status",
         "--server",
@@ -1356,16 +1356,16 @@ fn live_policy_state_survives_restart(config_dir: &std::path::Path, server: &Tes
     ]));
 }
 
-fn live_policy_cli(token: &str) -> assert_cmd::Command {
+fn live_policy_cli(server: &TestServer, token: &str) -> assert_cmd::Command {
     let mut command = cli();
     command
-        .env("OMNIGRAPH_BEARER_TOKEN", token)
+        .envs(server.credential(token))
         .timeout(std::time::Duration::from_secs(30));
     command
 }
 
 fn live_policy_mutation(server: &TestServer, name: &str) -> assert_cmd::Command {
-    let mut command = live_policy_cli("reader-token");
+    let mut command = live_policy_cli(server, "reader-token");
     command.args([
         "mutate",
         "policy_probe",
@@ -1396,7 +1396,7 @@ fn live_policy_expect_forbidden(command: &mut assert_cmd::Command) {
 }
 
 fn live_policy_status(server: &TestServer, token: &str) -> serde_json::Value {
-    parse_stdout_json(&output_success(live_policy_cli(token).args([
+    parse_stdout_json(&output_success(live_policy_cli(server, token).args([
         "cluster",
         "status",
         "--server",
@@ -1406,7 +1406,7 @@ fn live_policy_status(server: &TestServer, token: &str) -> serde_json::Value {
 }
 
 fn live_policy_assert_granted_row(server: &TestServer) {
-    let rows = parse_stdout_json(&output_success(live_policy_cli("reader-token").args([
+    let rows = parse_stdout_json(&output_success(live_policy_cli(server, "reader-token").args([
         "query",
         "policy_read",
         "--server",
@@ -1522,7 +1522,7 @@ impl LiveBindingsFixture {
         fs::write(&data, "{\"type\":\"SearchDoc\",\"data\":{\"name\":\"alpha\",\"text\":\"first\",\"embedding\":[1,0,0]}}\n{\"type\":\"SearchDoc\",\"data\":{\"name\":\"beta\",\"text\":\"second\",\"embedding\":[0,1,0]}}\n").unwrap();
         output_success(
             cli()
-                .env("OMNIGRAPH_BEARER_TOKEN", token)
+                .envs(server.credential(token))
                 .args([
                     "load",
                     "--server",
@@ -1590,7 +1590,7 @@ impl LiveBindingsFixture {
         });
         let refused = output_failure(
             cli()
-                .env("OMNIGRAPH_BEARER_TOKEN", token)
+                .envs(server.credential(token))
                 .args(["cluster", "apply", "--server", &server.base_url, "--config"])
                 .arg(config_dir)
                 .arg("--json")

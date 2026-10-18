@@ -14,8 +14,6 @@
 //! mismatches (e.g. a server scope on a maintenance verb) only on the *new*
 //! resolution paths.
 
-use std::env;
-
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 
@@ -47,13 +45,15 @@ pub(crate) struct ScopeFlags<'a> {
     pub(crate) uri: Option<String>,
 }
 
-/// Resolve the scope for a command with `capability`. Precedence (RFC-011):
+/// Resolve only from supplied values, without environment or I/O access.
+/// Precedence (RFC-011):
 /// 1. explicit primitive address (`uri`/`--server`/`--store`) → passthrough;
 /// 2. `--profile` / `OMNIGRAPH_PROFILE`;
 /// 3. flat `defaults.server` + `defaults.default_graph`;
 /// 4. nothing — downstream behaves as today.
 pub(crate) fn resolve_scope(
     op: &OperatorConfig,
+    ambient_profile: Option<&str>,
     capability: Capability,
     flags: ScopeFlags<'_>,
 ) -> Result<ResolvedScope> {
@@ -108,16 +108,13 @@ pub(crate) fn resolve_scope(
         });
     }
 
-    // 2. A named profile (flag, else env).
-    let profile_name = flags
-        .profile
-        .map(str::to_string)
-        .or_else(|| env::var(PROFILE_ENV).ok().filter(|s| !s.is_empty()));
+    // 2. A named profile (flag, else the captured environment value).
+    let profile_name = flags.profile.or(ambient_profile.filter(|s| !s.is_empty()));
     if let Some(name) = profile_name {
-        let profile = op.profile(&name).ok_or_else(|| {
+        let profile = op.profile(name).ok_or_else(|| {
             eyre!("unknown profile '{name}' (not defined under `profiles:` in operator config)")
         })?;
-        let binding = profile.binding(&name)?;
+        let binding = profile.binding(name)?;
         let graph = flags
             .graph
             .map(str::to_string)
@@ -262,18 +259,65 @@ mod tests {
     #[test]
     fn explicit_legacy_address_wins_unchanged() {
         let op = cfg("defaults:\n  server: prod\nservers:\n  prod:\n    url: https://x\n");
-        // A positional URI given → profile/defaults are ignored entirely.
-        let scope = resolve_scope(
-            &op,
-            Capability::Any,
-            ScopeFlags {
-                uri: Some("graph.omni".into()),
-                ..flags()
-            },
-        )
-        .unwrap();
-        assert_eq!(scope.uri.as_deref(), Some("graph.omni"));
-        assert_eq!(scope.server, None);
+        // Every explicit primitive ignores both profiles and operator defaults.
+        for (capability, explicit, expected) in [
+            (
+                Capability::Any,
+                ScopeFlags {
+                    uri: Some("graph.omni".into()),
+                    ..flags()
+                },
+                ResolvedScope {
+                    uri: Some("graph.omni".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                Capability::Any,
+                ScopeFlags {
+                    store: Some("graph.omni"),
+                    ..flags()
+                },
+                ResolvedScope {
+                    uri: Some("graph.omni".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                Capability::Any,
+                ScopeFlags {
+                    server: Some("explicit"),
+                    ..flags()
+                },
+                ResolvedScope {
+                    server: Some("explicit".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                Capability::Direct,
+                ScopeFlags {
+                    cluster: Some("./cluster"),
+                    ..flags()
+                },
+                ResolvedScope {
+                    cluster: Some("./cluster".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let scope = resolve_scope(
+                &op,
+                Some("unknown-ambient"),
+                capability,
+                ScopeFlags {
+                    profile: Some("unknown-explicit"),
+                    ..explicit
+                },
+            )
+            .unwrap();
+            assert_eq!(scope, expected);
+        }
     }
 
     #[test]
@@ -281,6 +325,7 @@ mod tests {
         let op = OperatorConfig::default();
         let scope = resolve_scope(
             &op,
+            None,
             Capability::Any,
             ScopeFlags {
                 store: Some("s3://b/g.omni"),
@@ -316,7 +361,7 @@ mod tests {
                 ..flags()
             },
         ] {
-            let err = resolve_scope(&op, Capability::Direct, flags)
+            let err = resolve_scope(&op, Some("unknown-ambient"), Capability::Direct, flags)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("mutually exclusive"), "{err}");
@@ -328,6 +373,7 @@ mod tests {
         let op = cfg("clusters:\n  brain:\n    root: s3://acme/brain\n");
         let scope = resolve_scope(
             &op,
+            None,
             Capability::Direct,
             ScopeFlags {
                 cluster: Some("brain"),
@@ -345,6 +391,7 @@ mod tests {
         let op = OperatorConfig::default();
         let scope = resolve_scope(
             &op,
+            None,
             Capability::Direct,
             ScopeFlags {
                 cluster: Some("s3://bucket/clusters/brain"),
@@ -366,6 +413,7 @@ mod tests {
         let op = cfg("clusters:\n  brain:\n    root: s3://acme/brain\n");
         let scope = resolve_scope(
             &op,
+            None,
             Capability::Direct,
             ScopeFlags {
                 cluster: Some("brain"),
@@ -392,7 +440,7 @@ mod tests {
                 ..flags()
             },
         ] {
-            let err = resolve_scope(&op, Capability::Any, flags)
+            let err = resolve_scope(&op, None, Capability::Any, flags)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("already a single graph"), "{err}");
@@ -404,9 +452,11 @@ mod tests {
         // RFC-011: `defaults.store` is the zero-flag local default — no flags,
         // no profile → the store URI resolves as the (single-graph) store scope.
         let op = cfg("defaults:\n  store: file:///tmp/dev.omni\n");
-        let scope = resolve_scope(&op, Capability::Any, flags()).unwrap();
-        assert_eq!(scope.uri.as_deref(), Some("file:///tmp/dev.omni"));
-        assert_eq!(scope.server, None);
+        for ambient in [None, Some("")] {
+            let scope = resolve_scope(&op, ambient, Capability::Any, flags()).unwrap();
+            assert_eq!(scope.uri.as_deref(), Some("file:///tmp/dev.omni"));
+            assert_eq!(scope.server, None);
+        }
     }
 
     #[test]
@@ -416,6 +466,7 @@ mod tests {
         let op = cfg("defaults:\n  store: file:///tmp/dev.omni\n");
         let err = resolve_scope(
             &op,
+            None,
             Capability::Any,
             ScopeFlags {
                 graph: Some("knowledge"),
@@ -432,28 +483,36 @@ mod tests {
         let op = cfg(
             "defaults:\n  server: prod\n  default_graph: knowledge\nservers:\n  prod:\n    url: https://x\n",
         );
-        let scope = resolve_scope(&op, Capability::Any, flags()).unwrap();
-        assert_eq!(scope.server.as_deref(), Some("prod"));
-        assert_eq!(scope.graph.as_deref(), Some("knowledge"));
+        for ambient in [None, Some("")] {
+            let scope = resolve_scope(&op, ambient, Capability::Any, flags()).unwrap();
+            assert_eq!(scope.server.as_deref(), Some("prod"));
+            assert_eq!(scope.graph.as_deref(), Some("knowledge"));
+        }
     }
 
     #[test]
     fn profile_server_scope_with_graph_override() {
         let op = cfg(
-            "servers:\n  staging:\n    url: https://s\nprofiles:\n  staging:\n    server: staging\n    default_graph: knowledge\n",
+            "defaults:\n  store: file:///default.omni\nservers:\n  staging:\n    url: https://s\nprofiles:\n  staging:\n    server: staging\n    default_graph: knowledge\n",
         );
-        let scope = resolve_scope(
-            &op,
-            Capability::Any,
-            ScopeFlags {
-                profile: Some("staging"),
-                graph: Some("archive"),
-                ..flags()
-            },
-        )
-        .unwrap();
-        assert_eq!(scope.server.as_deref(), Some("staging"));
-        assert_eq!(scope.graph.as_deref(), Some("archive")); // flag beats profile default
+        for (profile, ambient) in [
+            (Some("staging"), Some("unknown-ambient")),
+            (None, Some("staging")),
+        ] {
+            let scope = resolve_scope(
+                &op,
+                ambient,
+                Capability::Any,
+                ScopeFlags {
+                    profile,
+                    graph: Some("archive"),
+                    ..flags()
+                },
+            )
+            .unwrap();
+            assert_eq!(scope.server.as_deref(), Some("staging"));
+            assert_eq!(scope.graph.as_deref(), Some("archive")); // flag beats profile default
+        }
     }
 
     #[test]
@@ -461,17 +520,17 @@ mod tests {
         let op = cfg(
             "clusters:\n  brain:\n    root: s3://acme/brain\nprofiles:\n  admin:\n    cluster: brain\n    default_graph: knowledge\n",
         );
-        let scope = resolve_scope(
-            &op,
-            Capability::Direct,
-            ScopeFlags {
-                profile: Some("admin"),
-                ..flags()
-            },
-        )
-        .unwrap();
-        assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
-        assert_eq!(scope.cluster_graph.as_deref(), Some("knowledge"));
+        for (profile, ambient) in [(Some("admin"), None), (None, Some("admin"))] {
+            let scope = resolve_scope(
+                &op,
+                ambient,
+                Capability::Direct,
+                ScopeFlags { profile, ..flags() },
+            )
+            .unwrap();
+            assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
+            assert_eq!(scope.cluster_graph.as_deref(), Some("knowledge"));
+        }
     }
 
     #[test]
@@ -483,6 +542,7 @@ mod tests {
         );
         let scope = resolve_scope(
             &op,
+            None,
             Capability::Direct,
             ScopeFlags {
                 profile: Some("admin"),
@@ -498,7 +558,7 @@ mod tests {
     #[test]
     fn server_scope_on_maintenance_verb_errors() {
         let op = cfg("defaults:\n  server: prod\nservers:\n  prod:\n    url: https://x\n");
-        let err = resolve_scope(&op, Capability::Direct, flags())
+        let err = resolve_scope(&op, None, Capability::Direct, flags())
             .unwrap_err()
             .to_string();
         assert!(err.contains("direct storage access"), "{err}");
@@ -509,17 +569,17 @@ mod tests {
         let op = cfg(
             "clusters:\n  brain:\n    root: s3://acme/brain\nprofiles:\n  admin:\n    cluster: brain\n",
         );
-        let err = resolve_scope(
-            &op,
-            Capability::Any,
-            ScopeFlags {
-                profile: Some("admin"),
-                ..flags()
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("not valid for graph data commands"), "{err}");
+        for (profile, ambient) in [(Some("admin"), None), (None, Some("admin"))] {
+            let err = resolve_scope(
+                &op,
+                ambient,
+                Capability::Any,
+                ScopeFlags { profile, ..flags() },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("not valid for graph data commands"), "{err}");
+        }
     }
 
     #[test]
@@ -527,20 +587,20 @@ mod tests {
         // The served registry (`graphs list`) is server-scoped: a store-bound
         // profile fails with scope-shaped advice, not a late embedded-arm error.
         let op = cfg("profiles:\n  localdev:\n    store: file:///data/dev.omni\n");
-        let err = resolve_scope(
-            &op,
-            Capability::Served,
-            ScopeFlags {
-                profile: Some("localdev"),
-                ..flags()
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("requires a server") && err.contains("resolves a store scope"),
-            "{err}"
-        );
+        for (profile, ambient) in [(Some("localdev"), None), (None, Some("localdev"))] {
+            let err = resolve_scope(
+                &op,
+                ambient,
+                Capability::Served,
+                ScopeFlags { profile, ..flags() },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("requires a server") && err.contains("resolves a store scope"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -550,6 +610,7 @@ mod tests {
         );
         let err = resolve_scope(
             &op,
+            None,
             Capability::Served,
             ScopeFlags {
                 profile: Some("admin"),
@@ -576,6 +637,7 @@ mod tests {
         );
         let scope = resolve_scope(
             &op,
+            None,
             Capability::Served,
             ScopeFlags {
                 profile: Some("staging"),
@@ -589,24 +651,38 @@ mod tests {
 
     #[test]
     fn unknown_profile_is_a_loud_error() {
-        let op = OperatorConfig::default();
-        let err = resolve_scope(
-            &op,
-            Capability::Any,
-            ScopeFlags {
-                profile: Some("nope"),
-                ..flags()
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unknown profile 'nope'"), "{err}");
+        let op = cfg(
+            "defaults:\n  store: file:///default.omni\nprofiles:\n  valid:\n    store: file:///profile.omni\n",
+        );
+        for (profile, ambient, name) in [
+            (Some("nope"), Some("valid"), "nope"),
+            (None, Some("nope"), "nope"),
+            (Some(""), Some("valid"), ""),
+            (None, Some(" "), " "),
+        ] {
+            let err = resolve_scope(
+                &op,
+                ambient,
+                Capability::Any,
+                ScopeFlags { profile, ..flags() },
+            )
+            .unwrap_err()
+            .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "unknown profile '{name}' (not defined under `profiles:` in operator config)"
+                )
+            );
+        }
     }
 
     #[test]
     fn no_address_resolves_empty_for_legacy_fallthrough() {
         let op = OperatorConfig::default();
-        let scope = resolve_scope(&op, Capability::Any, flags()).unwrap();
-        assert_eq!(scope, ResolvedScope::default());
+        for ambient in [None, Some("")] {
+            let scope = resolve_scope(&op, ambient, Capability::Any, flags()).unwrap();
+            assert_eq!(scope, ResolvedScope::default());
+        }
     }
 }

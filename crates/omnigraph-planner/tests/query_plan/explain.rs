@@ -238,6 +238,7 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
         params: vec![],
         pipeline: vec![scan("c")],
         return_exprs: vec![projection(prop("c", "slug"), &[scan("c")])],
+        distinct: false,
         order_by: vec![
             IROrdering {
                 expr: IRExpr::Nearest {
@@ -287,7 +288,8 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
     assert_eq!(sort["fetch"], 10);
     assert_eq!(
         sort["properties"]["ordering"],
-        serde_json::json!(["$c._distance asc", "$c.rank desc"])
+        serde_json::json!(["$c._distance asc", "$c.rank desc", "$c.@id asc"]),
+        "a sort's output order is its whole comparator, identity keys included"
     );
     assert!(sort["properties"].get("schema").is_none());
     let projection = &sort["inputs"][0];
@@ -306,6 +308,12 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
             "fetch": 10,
             "nprobes": null,
             "scope": "order",
+            "policy": {
+                "probe_factor": 4,
+                "flat_rescan_on_unreached": true,
+                "uncapped_on_missing_counters": true,
+                "flat_when_eligible_within_fetch": true,
+            },
         })
     );
     assert_eq!(
@@ -450,10 +458,13 @@ fn a_cross_join_side_keeps_its_operators_and_a_query_explain_has_no_pipelines() 
     let pipelines = plan.pipelines_json();
     let join = &pipelines[0]["source"];
     assert_eq!(join["node"], "CrossJoin");
-    assert_eq!(
-        join["left"]["operators"],
-        serde_json::json!(["Expand", "Scan(input ids)"])
-    );
+    let left_operators: Vec<&str> = join["left"]["operators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operator| operator["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(left_operators, ["Expand", "Scan(input ids)"]);
     assert_eq!(join["left"]["source"]["node"], "Scan");
     assert_eq!(join["right"]["operators"], serde_json::json!([]));
     let decision = omnigraph_planner::route(

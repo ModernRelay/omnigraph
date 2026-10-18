@@ -29,18 +29,21 @@ pub mod cost;
 pub mod error;
 pub mod explain;
 pub mod gate;
+mod key_set;
 pub mod logical;
 pub mod lower;
 pub mod mirror;
 pub mod operation;
 pub mod optimizer;
 pub mod output;
+pub mod passes;
 pub mod physical;
 pub mod registry;
 pub mod route;
 pub mod scan_access;
 pub mod source;
 mod typed;
+pub mod validate;
 
 pub use aggregate::{
     Accumulator, AggregateSpec, Overflow, plan_aggregate, plan_block_aggregate,
@@ -48,37 +51,47 @@ pub use aggregate::{
 };
 pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
 pub use cost::{
-    AccessPath, CSR_BUILD_FACTOR, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
-    HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage, choose_access_path,
-    choose_expand_mode, direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes,
-    scan_row_estimate, should_switch_to_csr,
+    AccessPath, AntiJoinStrategy, CSR_BUILD_FACTOR, CoverageProvenance, ExpandCostInputs,
+    ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO,
+    IndexCoverage, PROBE_CHUNK_KEYS, SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs,
+    chain_rows, choose_access_path, choose_anti_join_strategy, choose_expand_mode,
+    choose_validate_access, direction_probe_factor, estimate_rows, executed_hops,
+    hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
 };
 pub use error::PlanError;
 pub use explain::Explain;
-pub use gate::{Decision, Unrouted, plan_query, route};
+pub use gate::{Decision, Unrouted, accept_query, accept_query_explained, plan_query, route};
 pub use logical::{
-    Census, ColumnRef, IndexQuery, JoinKind, KeyJoinKind, LogicalId, LogicalKind, LogicalNode,
-    LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, RuntimeInput, ScanAccess,
-    ScanSpec, SearchArm,
+    Census, ColumnRef, ConsultedImage, CsvSourceSpec, FragmentWriteSpec, IndexQuery, JoinKind,
+    KeyJoinKind, LogicalId, LogicalKind, LogicalNode, LogicalPlan, Predicate, RuntimeFilterKind,
+    RuntimeFilterSpec, RuntimeInput, ScanAccess, ScanSpec, SearchArm, ValidateSpec,
 };
 pub use lower::{
-    AggregateFields, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, RankFuseFields,
-    SortMergeJoinFields,
+    AggregateFields, ContainsJoinFields, CsvSourceFields, ExpandFields, FragmentWriteFields,
+    HashJoinFields, Lower, RankFuseFields, SortMergeJoinFields, ValidateFields,
 };
-pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef};
+pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef, TableSource};
 pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use output::{NodeObjectType, validate_output_schemas};
+pub use passes::{PassId, PassRow, PassStage, pass_rows};
 pub use physical::{
-    Assumptions, DatasetPin, Estimate, GatePolicy, Hop, HydratedBinding, HydratedColumn, NodeId,
-    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, PrefilterMode, Properties,
-    ROW_ADDRESS_PREFIX, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
+    Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, GatePolicy, Hop,
+    HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OperatorRow, OrderKey, OverfetchRung,
+    PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineSink, PipelineSource, PipelineSpec,
+    Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind, RankScope,
+    RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
 };
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
 pub use source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentCoverage, FragmentStat, IndexFact, IndexKind, IndexSplitFuture, MemorySource,
-    NodeTypeSpec, PlanSource, SideId,
+    FragmentCoverage, FragmentStat, FullTextCoverage, IndexFact, IndexKind, IndexSplitFuture,
+    MemorySource, NodeTypeSpec, PlanSource, SideId,
+};
+pub use validate::{
+    AcceptInput, AcceptedBoundPlan, AcceptedPlan, Evidence, KeyIds, ReplayEnvelope, ReplayQuery,
+    ReplayRefusal, ValidationError, ValidationLimits, ValidationScope, ValidationSummary,
+    accept_replay, catalog_digest, decode_replay,
 };
 
 #[cfg(test)]

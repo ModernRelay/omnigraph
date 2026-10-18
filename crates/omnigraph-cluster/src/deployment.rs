@@ -12,6 +12,11 @@ use omnigraph::db::{
 
 mod execution;
 pub use execution::*;
+mod bootstrap;
+pub use bootstrap::{
+    BootstrapServingReceipt, MAX_BOOTSTRAP_SERVING_RECEIPT_BYTES, bootstrap_serving,
+    claim_bootstrap_serving,
+};
 
 pub(crate) const MAX_LEDGER_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
@@ -486,6 +491,8 @@ fn validate_projection(state: &ClusterState) -> Result<(), Diagnostic> {
                         || bindings.len() > MAX_RESOURCES
                         || bindings.iter().any(|binding| {
                             binding != "cluster"
+                                && binding.strip_prefix("graph.")
+                                    != Some(omnigraph_compiler::CATALOGUE_SCOPE)
                                 && (!matches!(resource_kind(binding), ResourceKind::Graph(_))
                                     || !resources.contains_key(binding))
                         })

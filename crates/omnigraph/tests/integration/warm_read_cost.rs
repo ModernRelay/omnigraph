@@ -24,14 +24,46 @@ use crate::helpers::{
     with_setting, with_traversal,
 };
 
-/// A warm same-branch read must do ZERO `__manifest` object-store reads and must
-/// not open the commit graph, even at commit-history depth. Wrapped in
+/// The one `__manifest` request a warm read's freshness probe leaves in the
+/// tracker: its HEAD of the held version's manifest. Its HEAD of the next
+/// version answers "not found", which the tracker does not record, and it
+/// lists nothing; any other recorded request is a manifest open or scan.
+fn assert_only_the_probe_head(manifest_reads: u64, context: &str) {
+    let reads = last_manifest_reads();
+    assert_eq!(manifest_reads, 1, "{context}: {reads:#?}");
+    assert!(
+        reads.len() == 1 && reads[0].contains("/_versions/") && reads[0].ends_with(".manifest"),
+        "{context}: the one `__manifest` request is the probe's HEAD of the held version: {reads:#?}"
+    );
+}
+
+/// A warm named-branch read's recorded `__manifest` requests: the branch's
+/// `BranchContents` lifetime witness and the probe's HEAD of the held version
+/// in the branch tree, never a manifest body.
+fn assert_branch_witness_and_probe_head(reads: &[String]) {
+    assert_eq!(reads.len(), 2, "{reads:#?}");
+    assert!(
+        reads
+            .iter()
+            .any(|read| read.contains("_refs/branches/feature") && read.ends_with(".json")),
+        "the branch-lifetime witness is read: {reads:#?}"
+    );
+    assert!(
+        reads.iter().any(|read| read.contains("/tree/feature")
+            && read.contains("/_versions/")
+            && read.ends_with(".manifest")),
+        "the other request is the probe's HEAD of the held branch version: {reads:#?}"
+    );
+}
+
+/// A warm same-branch read must not open or scan `__manifest` and must not
+/// open the commit graph, even at commit-history depth. Wrapped in
 /// `cost_harness`, so `manifest_reads` is ground truth: the warm-coordinator
-/// freshness probe rides the long-lived handle (which now carries the tracker) and
-/// is served from Lance's cached manifest at 0 store reads, so this `== 0` also
-/// catches any future warm-handle scan a per-op tracker would miss. Fails before
-/// Fix 1, where the read path re-opens a fresh coordinator and scans both internal
-/// tables.
+/// freshness probe rides the long-lived handle (which now carries the tracker),
+/// and its HEAD of the held manifest version is the one request recorded, so
+/// this also catches any future warm-handle scan a per-op tracker would miss.
+/// Fails before Fix 1, where the read path re-opens a fresh coordinator and
+/// scans both internal tables.
 #[tokio::test]
 async fn warm_same_branch_read_does_no_resolution_opens() {
     cost_harness(async {
@@ -55,30 +87,35 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
         // data table by location+version instead of via the namespace, so the
         // per-table __manifest scan is gone too. Pre-fix, each of these is a deep scan
         // of an internal table that grows with commit count.
-        assert_eq!(
-            io.manifest_reads, 0,
-            "warm same-branch read must not scan __manifest (resolution or per-table)"
+        assert_only_the_probe_head(
+            io.manifest_reads,
+            "warm same-branch read must not scan __manifest (resolution or per-table)",
         );
         assert_eq!(
             io.version_probes, 1,
             "warm same-branch read performs exactly one version probe"
         );
-        for branch in ["main", " main "] {
+        let (resolved, io) = measure(db.resolve_snapshot("main")).await;
+        let resolved = resolved.unwrap();
+        assert_eq!(Some(resolved.as_str()), head.as_deref());
+        assert_eq!(io.internal_open_count, 0);
+        assert_eq!(io.manifest_scan_count, 0);
+        assert_eq!(io.version_probes, 1);
+        // A name that is not canonical is refused before any storage request.
+        for branch in [" main ", " "] {
             let (resolved, io) = measure(db.resolve_snapshot(branch)).await;
-            let resolved = resolved.unwrap();
-            assert_eq!(Some(resolved.as_str()), head.as_deref());
+            assert!(resolved.is_err(), "{branch:?}");
             assert_eq!(io.internal_open_count, 0);
             assert_eq!(io.manifest_scan_count, 0);
-            assert_eq!(io.version_probes, 1);
+            assert_eq!(io.version_probes, 0);
         }
-        assert!(db.resolve_snapshot(" ").await.is_err());
     })
     .await;
 }
 
 /// Reading a branch's storage-format stamp (`omnigraph snapshot`, the served
 /// `GET /snapshot`) costs what any warm read costs: one version probe and no
-/// `__manifest` read. The stamp comes from the snapshot's own manifest version,
+/// `__manifest` read beyond its HEAD. The stamp comes from the snapshot's own manifest version,
 /// so it describes the same graph version as the tables beside it, where the
 /// stamp was once read by resolving the branch again and opening `__manifest`
 /// at its newest version.
@@ -95,7 +132,7 @@ async fn warm_stamp_read_costs_one_version_probe() {
             omnigraph_catalog::INTERNAL_MANIFEST_SCHEMA_VERSION
         );
         assert_eq!(io.version_probes, 1, "{io:?}");
-        assert_eq!(io.manifest_reads, 0, "{io:?}");
+        assert_only_the_probe_head(io.manifest_reads, &format!("{io:?}"));
         assert_eq!(io.internal_open_count, 0, "{io:?}");
 
         let (pair, io) = measure(async {
@@ -114,7 +151,7 @@ async fn warm_stamp_read_costs_one_version_probe() {
                 .graph_manifest_version()
         );
         assert_eq!(io.version_probes, 1, "{io:?}");
-        assert_eq!(io.manifest_reads, 0, "{io:?}");
+        assert_only_the_probe_head(io.manifest_reads, &format!("{io:?}"));
         assert_eq!(io.internal_open_count, 0, "{io:?}");
     })
     .await;
@@ -140,9 +177,9 @@ async fn multi_table_query_does_no_manifest_scans() {
         .await;
         out.unwrap();
 
-        assert_eq!(
-            io.manifest_reads, 0,
-            "a multi-table read must not scan __manifest once per touched table"
+        assert_only_the_probe_head(
+            io.manifest_reads,
+            "a multi-table read must not scan __manifest once per touched table",
         );
     })
     .await;
@@ -465,10 +502,8 @@ async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
         assert_eq!(io.version_probes, 1);
         assert_eq!(io.internal_open_count, 0);
         assert_eq!(io.manifest_scan_count, 0);
-        assert_eq!(io.manifest_reads, 1);
-        let reads = last_manifest_reads();
-        assert_eq!(reads.len(), 1);
-        assert!(reads[0].contains("_refs/branches/feature") && reads[0].ends_with(".json"));
+        assert_eq!(io.manifest_reads, 2);
+        assert_branch_witness_and_probe_head(&last_manifest_reads());
         // Write to the branch so its tables are branch-owned (under tree/feature).
         db.mutate(
             "feature",
@@ -490,13 +525,14 @@ async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
         .await;
         out.unwrap();
 
-        assert_eq!(io.manifest_reads, 1, "warm branch read must spend exactly one read on the native branch-lifetime witness; reads: {:#?}", last_manifest_reads());
-        let reads = last_manifest_reads();
-        assert_eq!(reads.len(), 1);
-        assert!(
-            reads[0].contains("_refs/branches/feature") && reads[0].ends_with(".json"),
-            "the sole warm named-branch read must be BranchContents, not a manifest body: {reads:#?}"
+        assert_eq!(
+            io.manifest_reads,
+            2,
+            "warm branch read must spend one read on the native branch-lifetime witness and one \
+             on the probe's HEAD; reads: {:#?}",
+            last_manifest_reads()
         );
+        assert_branch_witness_and_probe_head(&last_manifest_reads());
         assert_eq!(
             io.version_probes, 1,
             "warm branch read probes only the requested branch once"
@@ -1473,7 +1509,7 @@ async fn repeat_warm_read_reuses_table_handles() {
             warm.data_reads, 0,
             "a warm repeat read must reuse the held handle (0 table opens)"
         );
-        assert_eq!(warm.manifest_reads, 0, "warm repeat read: 0 manifest opens");
+        assert_only_the_probe_head(warm.manifest_reads, "warm repeat read: 0 manifest opens");
         assert_eq!(
             warm.version_probes, 1,
             "warm repeat read: exactly one version probe"
@@ -2009,6 +2045,136 @@ async fn open_refresh_and_branch_reads_issue_no_request_to_history() {
     .await;
 }
 
+/// A page of the commit list reads the `__history` objects its own commits
+/// occupy and nothing below them. The newest page of a branch is its buffer
+/// and reads nothing; the oldest page of a deep history reads what it reads in
+/// a short one, while the whole listing reads every released block.
+#[tokio::test]
+async fn a_commit_list_page_reads_the_history_it_returns() {
+    const PAGE: usize = 4;
+    let mut curve: Vec<CommitPagePoint> = Vec::new();
+    for releases in [2usize, 6] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = init_and_load(&dir).await;
+        let release_writer = with_setting(&writer, "history_release_bytes", "2048");
+        let (probes, history) = HistoryPlane::install();
+        let point = with_query_io_probes(
+            probes,
+            Box::pin(async {
+                for release in 0..releases {
+                    publish_until_history_is_written(
+                        &release_writer,
+                        &history,
+                        &format!("release_{release}"),
+                    )
+                    .await;
+                }
+                insert_people(&writer, "buffered", PAGE).await;
+                let listed = writer.list_commits(Some("main")).await.unwrap();
+                let mut paged = Vec::new();
+                let mut oldest_token = None;
+                let mut next = None;
+                loop {
+                    let page = writer
+                        .list_commits_page(None, next.as_deref(), Some(PAGE))
+                        .await
+                        .unwrap();
+                    paged.extend(page.commits);
+                    match page.next_page_token {
+                        Some(token) => {
+                            oldest_token = Some(token.clone());
+                            next = Some(token);
+                        }
+                        None => break,
+                    }
+                }
+                assert_eq!(paged, listed, "pages across released blocks");
+                let oldest_token = oldest_token.expect("test setup: more than one page");
+                history.requests();
+
+                let cold = || async { session(Omnigraph::open(uri).await.unwrap()) };
+                let reader = cold().await;
+                history.requests();
+                let first = reader
+                    .list_commits_page(None, None, Some(PAGE))
+                    .await
+                    .unwrap();
+                assert_eq!(first.commits, listed[..PAGE]);
+                let first = history.requests();
+
+                let reader = cold().await;
+                history.requests();
+                let oldest = reader
+                    .list_commits_page(None, Some(&oldest_token), Some(PAGE))
+                    .await
+                    .unwrap();
+                assert!(oldest.next_page_token.is_none());
+                assert_eq!(oldest.commits.last(), listed.last());
+                let oldest = history.requests();
+
+                let reader = cold().await;
+                history.requests();
+                assert_eq!(reader.list_commits(Some("main")).await.unwrap(), listed);
+                let whole = history.requests();
+                eprintln!(
+                    "COMMIT PAGE releases={releases} commits={}: first={first:?} \
+                     oldest={oldest:?} whole={whole:?}",
+                    listed.len()
+                );
+                CommitPagePoint {
+                    releases,
+                    first,
+                    oldest,
+                    whole,
+                }
+            }),
+        )
+        .await;
+        curve.push(point);
+    }
+    for point in &curve {
+        let releases = point.releases;
+        assert_eq!(
+            point.first,
+            (0, 0),
+            "{releases} releases: the newest page is the branch's buffer"
+        );
+        assert_eq!(
+            point.oldest.1 + point.whole.1,
+            0,
+            "{releases} releases: a read writes nothing"
+        );
+        assert!(
+            point.oldest.0 < point.whole.0,
+            "{releases} releases: a page reads less than the whole listing"
+        );
+    }
+    let (short, deep) = (&curve[0], &curve[1]);
+    assert!(
+        deep.whole.0 > short.whole.0,
+        "the instrument sees history: the whole listing reads more blocks when there are more"
+    );
+    assert!(
+        deep.oldest.0 <= short.oldest.0 + 1,
+        "the oldest page must not read more of `__history` as the history above it grows: \
+         {} releases read {}, {} releases read {}",
+        short.releases,
+        short.oldest.0,
+        deep.releases,
+        deep.oldest.0
+    );
+}
+
+/// The `(read, write)` requests a cold handle sends `__history` for the first
+/// page, the oldest page and the whole listing, after `releases` releases.
+struct CommitPagePoint {
+    releases: usize,
+    first: (u64, u64),
+    oldest: (u64, u64),
+    whole: (u64, u64),
+}
+
 /// The `Person` rows of the graph as of `commit`, read by commit id.
 async fn people_as_of(db: &Session, commit: &omnigraph::db::GraphCommit) -> usize {
     let id = omnigraph::db::SnapshotId::new(commit.graph_commit_id.clone());
@@ -2023,7 +2189,7 @@ async fn people_as_of(db: &Session, commit: &omnigraph::db::GraphCommit) -> usiz
 #[tokio::test]
 async fn by_id_reads_of_held_commits_issue_no_request_to_history() {
     use omnigraph::changes::{
-        ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart, ChangeFilter,
+        ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -2072,14 +2238,14 @@ async fn by_id_reads_of_held_commits_issue_no_request_to_history() {
                     "state of the commit {age} publishes before the head"
                 );
             }
-            reader
-                .diff_commits(
-                    &main[2].graph_commit_id,
-                    &main[1].graph_commit_id,
-                    &ChangeFilter::default(),
-                )
-                .await
-                .unwrap();
+            helpers::graph_diff(
+                &reader,
+                &main[2].graph_commit_id,
+                &main[1].graph_commit_id,
+                &ChangeFeedScope::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 history.requests(),
                 (0, 0),

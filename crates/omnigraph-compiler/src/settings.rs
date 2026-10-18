@@ -21,6 +21,8 @@ pub enum SettingKind {
     Enum(&'static [&'static str]),
     /// An integer from `min` up to `max` inclusive; `None` is unbounded.
     Integer { min: i64, max: Option<i64> },
+    /// Any text, in identifier, string or integer spelling.
+    Text,
 }
 
 /// Who may set a setting: any caller (`request`), or only the process that
@@ -112,14 +114,27 @@ pub const DEFINITIONS: &[SettingSpec] = &[
     },
     SettingSpec {
         name: "write_max_bytes",
-        kind: SettingKind::Integer {
-            min: 1,
-            max: Some(33_554_432),
-        },
+        kind: SettingKind::Integer { min: 1, max: None },
         default: "33554432",
         scope: SettingScope::Request,
         env: "OMNIGRAPH_WRITE_MAX_BYTES",
-        doc: "the byte allowance for bounded writes by mutate, load and branch merge; entity data and materialized Blob payloads each have this independent allowance; lowering it preserves the existing per-type, per-operation and per-chunk scopes",
+        doc: "the byte allowance for bounded writes by mutate, load and branch merge; entity data and materialized Blob payloads each have this independent allowance; lowering it preserves the existing per-type, per-operation and per-chunk scopes; a value raised above the default is held in memory as one typed batch at commit",
+    },
+    SettingSpec {
+        name: "load_source_max_bytes",
+        kind: SettingKind::Integer { min: 1, max: None },
+        default: "33554432",
+        scope: SettingScope::Request,
+        env: "OMNIGRAPH_LOAD_SOURCE_MAX_BYTES",
+        doc: "the largest object a `load csv` statement reads, checked before any payload byte is fetched; a served load is additionally bounded by the server's workload admission",
+    },
+    SettingSpec {
+        name: "query_memory_bytes",
+        kind: SettingKind::Integer { min: 1, max: None },
+        default: "157286400",
+        scope: SettingScope::Request,
+        env: "OMNIGRAPH_QUERY_MEMORY_BYTES",
+        doc: "the memory pool one read query runs under, and the allowance one load statement's retained read-reuse buffers are admitted against; tracked work past it is refused, and a raised value is memory one query or load may hold",
     },
     SettingSpec {
         name: "history_release_bytes",
@@ -131,6 +146,14 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         scope: SettingScope::Request,
         env: "OMNIGRAPH_HISTORY_RELEASE_BYTES",
         doc: "the byte budget of a branch's buffer of unreleased commits; a mutate, load or branch merge of this session whose buffer and head reach it closes a history block and the publish after it writes the block under `__history`; query results never change, only where settled commits are stored and how many requests a publish makes",
+    },
+    SettingSpec {
+        name: "explain_dump_dir",
+        kind: SettingKind::Text,
+        default: "",
+        scope: SettingScope::Process,
+        env: "OMNIGRAPH_EXPLAIN_DUMP_DIR",
+        doc: "the directory each finished explain document is written into, one `<operation>_<logical_hash>.explain.json` per planned operation; empty disables the write",
     },
 ];
 
@@ -144,7 +167,10 @@ pub enum SettingId {
     StageWriteConcurrency,
     TraversalWorkLimit,
     WriteMaxBytes,
+    LoadSourceMaxBytes,
+    QueryMemoryBytes,
     HistoryReleaseBytes,
+    ExplainDumpDir,
 }
 
 impl SettingId {
@@ -157,7 +183,10 @@ impl SettingId {
         SettingId::StageWriteConcurrency,
         SettingId::TraversalWorkLimit,
         SettingId::WriteMaxBytes,
+        SettingId::LoadSourceMaxBytes,
+        SettingId::QueryMemoryBytes,
         SettingId::HistoryReleaseBytes,
+        SettingId::ExplainDumpDir,
     ];
 
     /// The setting a name denotes.
@@ -369,7 +398,10 @@ pub struct SessionSettings {
     stage_write_concurrency: usize,
     traversal_work_limit: u64,
     write_max_bytes: u64,
+    load_source_max_bytes: u64,
+    query_memory_bytes: u64,
     history_release_bytes: usize,
+    explain_dump_dir: String,
 }
 
 impl Default for SessionSettings {
@@ -385,7 +417,10 @@ impl Default for SessionSettings {
             stage_write_concurrency: 1,
             traversal_work_limit: 1,
             write_max_bytes: 1,
+            load_source_max_bytes: 1,
+            query_memory_bytes: 1,
             history_release_bytes: 1024,
+            explain_dump_dir: String::new(),
         };
         for id in SettingId::ALL {
             settings
@@ -453,12 +488,21 @@ impl SessionSettings {
             }
             SettingId::WriteMaxBytes => {
                 self.write_max_bytes = u64::try_from(parse_integer(id, value)?)
-                    .expect("invariant: the row's range is 1..=33554432");
+                    .expect("invariant: the row's range is 1..=i64::MAX");
+            }
+            SettingId::LoadSourceMaxBytes => {
+                self.load_source_max_bytes = u64::try_from(parse_integer(id, value)?)
+                    .expect("invariant: the row's range is 1..=i64::MAX");
+            }
+            SettingId::QueryMemoryBytes => {
+                self.query_memory_bytes = u64::try_from(parse_integer(id, value)?)
+                    .expect("invariant: the row's range is 1..=i64::MAX");
             }
             SettingId::HistoryReleaseBytes => {
                 self.history_release_bytes = usize::try_from(parse_integer(id, value)?)
                     .expect("invariant: the row's range is 1024..=262144");
             }
+            SettingId::ExplainDumpDir => self.explain_dump_dir = value.to_string(),
         }
         Ok(())
     }
@@ -476,8 +520,17 @@ impl SessionSettings {
                 self.stage_write_concurrency = from.stage_write_concurrency;
             }
             SettingId::WriteMaxBytes => self.write_max_bytes = from.write_max_bytes,
+            SettingId::LoadSourceMaxBytes => {
+                self.load_source_max_bytes = from.load_source_max_bytes;
+            }
+            SettingId::QueryMemoryBytes => {
+                self.query_memory_bytes = from.query_memory_bytes;
+            }
             SettingId::HistoryReleaseBytes => {
                 self.history_release_bytes = from.history_release_bytes;
+            }
+            SettingId::ExplainDumpDir => {
+                self.explain_dump_dir = from.explain_dump_dir.clone();
             }
         }
     }
@@ -492,7 +545,10 @@ impl SessionSettings {
             SettingId::StageWriteConcurrency => self.stage_write_concurrency.to_string(),
             SettingId::TraversalWorkLimit => self.traversal_work_limit.to_string(),
             SettingId::WriteMaxBytes => self.write_max_bytes.to_string(),
+            SettingId::LoadSourceMaxBytes => self.load_source_max_bytes.to_string(),
+            SettingId::QueryMemoryBytes => self.query_memory_bytes.to_string(),
             SettingId::HistoryReleaseBytes => self.history_release_bytes.to_string(),
+            SettingId::ExplainDumpDir => self.explain_dump_dir.clone(),
         }
     }
 
@@ -550,11 +606,29 @@ impl SessionSettings {
         self.write_max_bytes
     }
 
+    /// The largest object one `load csv` statement reads, checked before any
+    /// payload byte is fetched.
+    pub fn load_source_max_bytes(&self) -> u64 {
+        self.load_source_max_bytes
+    }
+
+    /// The memory pool one read query runs under; tracked work past it is
+    /// refused.
+    pub fn query_memory_bytes(&self) -> u64 {
+        self.query_memory_bytes
+    }
+
     /// The byte budget of a branch's buffer of unreleased commits for this
     /// session's publishes; the default is the production budget and the
     /// ceiling, so a session may only lower it.
     pub fn history_release_bytes(&self) -> usize {
         self.history_release_bytes
+    }
+
+    /// The directory each finished explain document is written into; `None`
+    /// when unset.
+    pub fn explain_dump_dir(&self) -> Option<&str> {
+        (!self.explain_dump_dir.is_empty()).then_some(self.explain_dump_dir.as_str())
     }
 }
 
@@ -711,7 +785,7 @@ fn setting_names() -> String {
 fn enum_values(id: SettingId) -> String {
     match id.spec().kind {
         SettingKind::Enum(values) => values.join(", "),
-        SettingKind::Integer { .. } => integer_range(id),
+        SettingKind::Integer { .. } | SettingKind::Text => integer_range(id),
     }
 }
 
@@ -723,6 +797,7 @@ fn integer_range(id: SettingId) -> String {
         } => format!("an integer in {min}..={max}"),
         SettingKind::Integer { min, max: None } => format!("an integer of at least {min}"),
         SettingKind::Enum(values) => format!("one of {}", values.join(", ")),
+        SettingKind::Text => "a text value".to_string(),
     }
 }
 
@@ -762,16 +837,16 @@ mod tests {
         let defaults = SessionSettings::default();
         assert_eq!(defaults.get(id), "33554432");
         id.refuse_from_request().unwrap();
-        for value in ["1", "4093", "33554432"] {
+        for value in ["1", "4093", "33554432", "268435456"] {
             let changed = defaults.clone().with("write_max_bytes", value).unwrap();
             assert_eq!(changed.get(id), value);
             let mut copied = defaults.clone();
             copied.copy_field(&changed, id);
             assert_eq!(copied, changed);
         }
-        for value in ["0", "-1", "33554433", "9223372036854775808"] {
+        for value in ["0", "-1", "9223372036854775808"] {
             let error = defaults.clone().with("write_max_bytes", value).unwrap_err();
-            assert!(error.to_string().contains("an integer in 1..=33554432"));
+            assert!(error.to_string().contains("an integer of at least 1"));
         }
         for value in ["many", "\"4093\""] {
             assert!(defaults.clone().with("write_max_bytes", value).is_err());
@@ -792,6 +867,124 @@ mod tests {
             from_env_with(|name| (name == "OMNIGRAPH_WRITE_MAX_BYTES").then(|| "0".to_string()))
                 .unwrap_err();
         assert!(error.to_string().contains("OMNIGRAPH_WRITE_MAX_BYTES"));
+    }
+
+    #[test]
+    fn load_source_max_bytes_row_bounds_and_environment() {
+        let id = SettingId::parse("load_source_max_bytes").unwrap();
+        let defaults = SessionSettings::default();
+        assert_eq!(defaults.get(id), "33554432");
+        assert_eq!(defaults.load_source_max_bytes(), 33_554_432);
+        id.refuse_from_request().unwrap();
+        for value in ["1", "4093", "33554432", "268435456"] {
+            let changed = defaults
+                .clone()
+                .with("load_source_max_bytes", value)
+                .unwrap();
+            assert_eq!(changed.get(id), value);
+            let mut copied = defaults.clone();
+            copied.copy_field(&changed, id);
+            assert_eq!(copied, changed);
+        }
+        for value in ["0", "-1", "9223372036854775808"] {
+            let error = defaults
+                .clone()
+                .with("load_source_max_bytes", value)
+                .unwrap_err();
+            assert!(error.to_string().contains("an integer of at least 1"));
+        }
+        for value in ["many", "\"4093\""] {
+            assert!(
+                defaults
+                    .clone()
+                    .with("load_source_max_bytes", value)
+                    .is_err()
+            );
+        }
+        let (environment, sources) = from_env_with(|name| {
+            (name == "OMNIGRAPH_LOAD_SOURCE_MAX_BYTES").then(|| "4093".to_string())
+        })
+        .unwrap();
+        assert_eq!(environment.get(id), "4093");
+        assert_eq!(sources[id as usize], Source::Env);
+        let error = from_env_with(|name| {
+            (name == "OMNIGRAPH_LOAD_SOURCE_MAX_BYTES").then(|| "0".to_string())
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("OMNIGRAPH_LOAD_SOURCE_MAX_BYTES")
+        );
+    }
+
+    #[test]
+    fn query_memory_bytes_row_bounds_and_environment() {
+        let id = SettingId::parse("query_memory_bytes").unwrap();
+        let defaults = SessionSettings::default();
+        assert_eq!(defaults.get(id), "157286400");
+        assert_eq!(defaults.query_memory_bytes(), 157_286_400);
+        id.refuse_from_request().unwrap();
+        for value in ["1", "4093", "157286400", "1073741824"] {
+            let changed = defaults.clone().with("query_memory_bytes", value).unwrap();
+            assert_eq!(changed.get(id), value);
+            let mut copied = defaults.clone();
+            copied.copy_field(&changed, id);
+            assert_eq!(copied, changed);
+        }
+        for value in ["0", "-1", "9223372036854775808"] {
+            let error = defaults
+                .clone()
+                .with("query_memory_bytes", value)
+                .unwrap_err();
+            assert!(error.to_string().contains("an integer of at least 1"));
+        }
+        for value in ["many", "\"4093\""] {
+            assert!(defaults.clone().with("query_memory_bytes", value).is_err());
+        }
+        let (environment, sources) = from_env_with(|name| {
+            (name == "OMNIGRAPH_QUERY_MEMORY_BYTES").then(|| "4093".to_string())
+        })
+        .unwrap();
+        assert_eq!(environment.get(id), "4093");
+        assert_eq!(sources[id as usize], Source::Env);
+        let error =
+            from_env_with(|name| (name == "OMNIGRAPH_QUERY_MEMORY_BYTES").then(|| "0".to_string()))
+                .unwrap_err();
+        assert!(error.to_string().contains("OMNIGRAPH_QUERY_MEMORY_BYTES"));
+    }
+
+    #[test]
+    fn explain_dump_dir_row_is_process_scoped_text() {
+        let id = SettingId::parse("explain_dump_dir").unwrap();
+        let defaults = SessionSettings::default();
+        assert_eq!(defaults.get(id), "");
+        assert_eq!(defaults.explain_dump_dir(), None);
+        for value in ["/tmp/explains", "\"/tmp/with space\"", "7"] {
+            let changed = defaults.clone().with("explain_dump_dir", value).unwrap();
+            let text = value.trim_matches('"');
+            assert_eq!(changed.get(id), text);
+            assert_eq!(changed.explain_dump_dir(), Some(text));
+            let mut copied = defaults.clone();
+            copied.copy_field(&changed, id);
+            assert_eq!(copied, changed);
+        }
+        let err = id.refuse_from_request().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "setting `explain_dump_dir` is a process setting; it is read from the server's environment, not from a request"
+        );
+        let (environment, sources) = from_env_with(|name| {
+            (name == "OMNIGRAPH_EXPLAIN_DUMP_DIR").then(|| "/tmp/explains".to_string())
+        })
+        .unwrap();
+        assert_eq!(environment.explain_dump_dir(), Some("/tmp/explains"));
+        assert_eq!(sources[id as usize], Source::Env);
+        let (unset, sources) =
+            from_env_with(|name| (name == "OMNIGRAPH_EXPLAIN_DUMP_DIR").then(|| "  ".to_string()))
+                .unwrap();
+        assert_eq!(unset.explain_dump_dir(), None);
+        assert_eq!(sources[id as usize], Source::Default);
     }
 
     #[test]
@@ -866,7 +1059,7 @@ mod tests {
         let err = SettingId::parse("merge_linage").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, history_release_bytes"
+            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir"
         );
         let err = SessionSettings::default().with("engine", "v1").unwrap_err();
         assert_eq!(

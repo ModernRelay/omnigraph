@@ -762,6 +762,20 @@ async fn invoke_stored_query_bad_param_is_400() {
             "body: {body}"
         );
     }
+
+    // The invocation's branch is used as written: a padded spelling of main
+    // is refused before the inner read gate, not read as main.
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({ "params": { "name": "Alice" }, "branch": "main " }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["code"], "bad_request", "body: {body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1303,6 +1317,7 @@ graphs:
         graphs,
         config_path,
         server_policy,
+        ..
     } = settings.mode;
     assert_eq!(graphs.len(), 1, "the one graph is served, none quarantined");
     let state = omnigraph_server::open_multi_graph_state(

@@ -42,6 +42,9 @@ puts each changed path in one class:
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
 
+The catalogue reference, `docs/user/queries/catalogue.md`, is engine input
+because `Test Workspace` checks its inventories against the built CLI.
+
 A class exists only when the set of jobs reading its paths is closed; a path
 outside every class is engine input and runs every job. The `.gqt` corpus is
 read by the `omnigraph-gqt` crate (its `include_str!` cases and its harness,
@@ -225,11 +228,11 @@ workflow carries the `Classify Changes` copy under the name
 regression in the diff: a `.gqt` case anywhere in the corpus or a `#[test]`-attributed
 `issue_N` function, added or strengthened, in a top-level test target
 (`tests/<name>.rs`), `tests/integration/main.rs` or its direct modules, or a
-`src/` module under `crates/*` or `tools/*` (an owner
+`src/` module under `crates/*`, `tools/*` or `skills/` (an owner
 test not yet named for the issue is renamed to carry `issue_N` when
 extended). An integration module requires a bare, top-level `mod <name>;`
 declaration in that root at the range's head commit. Attributed declarations,
-path overrides and deeper modules are not resolved. A PR whose diff changes no path under `crates/` or `tools/`
+path overrides and deeper modules are not resolved. A PR whose diff changes no path under `crates/`, `tools/` or `skills/`
 (Markdown files there aside) and neither root `Cargo.toml` nor `Cargo.lock`
 passes unexamined, with a notice annotation saying so: a fix in a workflow, a
 script, a document, or a deployment file has no logic or Rust test that could
@@ -338,12 +341,18 @@ audit and is owned by `scripts/check-docs.py`. The AWS job reports a successful
 skip when no engine input changed; formatting and Clippy are also skipped by
 the classifier without leaving required contexts pending.
 
-Automatic edge and versioned publication are jobs in the same CI run and cannot
+Automatic versioned publication is a set of jobs in the same CI run and cannot
 start until that run's vocabulary audit succeeds. Each publishing workflow then
 re-verifies the authorizing CI run, resolves its source once to an immutable
 commit, and builds only that commit. Version tags are checked again immediately
-before publication; a stale main audit cannot move the rolling `edge` tag
-backward. A manual backfill must already have a successful non-PR vocabulary
+before publication. The daily edge build has no authorizing run: it builds its
+own commit, the tip of `main` when the schedule fired, and its gate waits up to
+180 minutes for that commit's CI run, which may be queued behind earlier runs on
+`main`, to pass both the vocabulary audit and `CI Gate`, since the build becomes
+a pinnable, attested release. A run cancelled while pending because `main`
+moved on ends the edge run with a notice and no build; a failed check or the
+timeout fails it. A run builds only its own commit because its build provenance
+names that commit; the rolling `edge` tag never moves backward. A manual backfill must already have a successful non-PR vocabulary
 audit for the exact commit. The current manual workflows therefore fail closed
 for historical pre-guard tags rather than offering a force bypass.
 
@@ -633,20 +642,24 @@ The recorded input commit is informational, allowing squash merges; release base
 and migration source ancestry are still required. The publisher installs the
 same pinned parser in a temporary environment after the historical cutoff. It
 derives the GitHub body from that same snapshot with links pinned to the release
-tag. Earlier manual backfills keep their asset-only route. Edge is unchanged.
+tag. Earlier manual backfills keep their asset-only route. Edge builds need no
+snapshot: `scripts/edge_release.py body` puts the build's compatibility facts,
+read from its own `omnigraph version --json` and the latest stable release's,
+before the unreleased preview rendered at the build's commit.
 
 | Workflow | Trigger and output |
 |---|---|
-| `release-edge.yml` | Called by a `main` CI run that changed engine input, after its vocabulary audit, or manually for an already-audited current `main`; updates the rolling `edge` release and platform archives. A `main` push that changes only documentation, `.gqt` cases or deployment files makes no edge release: the binaries did not change (the container image is published from tags). |
-| `release.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds platform archives, publishes the GitHub release, updates Homebrew when credentials are available, and smoke-tests the Windows installer. |
+| `build-release-archives.yml` | Called by the two release workflows only; builds the four platform archives with the server's `aws` feature, the feature set of the stable image (`publish-image.yml`), stamped with their commit and channel (`OMNIGRAPH_SOURCE_VERSION`, `OMNIGRAPH_RELEASE_CHANNEL`), runs each on its platform, and verifies the exact archive set and checksums. It uploads workflow artifacts and writes no release. |
+| `release-edge.yml` | Daily at 04:17 UTC, and by manual dispatch on `main`; builds the run's commit, the tip of `main`, once its whole CI run passes, unless `edge` already holds it. It refuses, before building, while the workspace package version is not above the latest stable release, since `X.Y.Z-edge+<commit>` sorts before `X.Y.Z`. After every archive is built, one job attests their provenance and publishes the build as its own prerelease, `edge-<commit date>-<short commit>`, which never changes once published, then copies that release's archives to the rolling `edge` release when `edge` holds an ancestor of the build and the build is still on `main`; it keeps the 30 newest edge builds plus the newest build of each storage format, recorded in a marker line of the release text (`scripts/edge_release.py prune`), and smoke-tests both through the installers on every platform. Its image job packages the published build's Linux x86_64 archive, after checking its checksum and its attestation for this workflow and commit, on `trixie-slim` (the archives need glibc 2.39 or newer; the root `Dockerfile` takes the base as `BASE_IMAGE`, bookworm by default for the stable image). It checks the stamp inside the image, pushes `edge-<commit date>-<short commit>` to GHCR and, when configured, Docker Hub, attests both digests, and moves the `edge` image tag only when the `edge` release moved; it never touches `latest`, and a rerun reuses the image first pushed for the build. Edge images are not pruned. Runs never overlap, so a newer build cannot move `edge` under an older run's installer checks. GitHub refuses the workflow token a new tag on a commit whose workflow files differ from `main`'s current ones, so a run whose commit's workflows no longer match `main` (checked before building and again before tagging) publishes nothing, with a notice; the next run builds the newer tip. A day whose new commits change only documentation still gets a build. |
+| `release.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds platform archives, attests their provenance, publishes the GitHub release, updates Homebrew when credentials are available, and smoke-tests the installers on every platform. The provenance names the run's commit, so a manual backfill is dispatched at the tag itself (`gh workflow run release.yml --ref <tag> -f tag=<tag>`); from v0.14.0 a backfill run at any other commit is refused. A backfill of a tag before v0.14.0 builds a source that predates the commit stamp, so its archives are run but their stamp is not checked, and it publishes without provenance when run at another commit. |
 | `publish-crates.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; publication remains paused until the registry-ownership policy changes. |
-| `publish-image.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds the bookworm-compatible public server image for GHCR and, when configured, Docker Hub. Manual backfills do not move `latest`. |
+| `publish-image.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds the bookworm-compatible public server image for GHCR and, when configured, Docker Hub. Its binaries carry the commit and `stable` channel stamp, checked in the image before it is pushed, and the pushed GHCR digest is attested. As in `release.yml`, a backfill from v0.14.0 is dispatched at the tag itself, and an older tag backfilled from elsewhere publishes without provenance. Manual backfills do not move `latest`. |
 | `package.yml` / `omnigraph-package.yml` | Manual AWS CodeBuild packaging for default and AWS-feature artifacts, with checksums, digests, and attestations. |
 | `refresh-docs-site.yml` | Documentation changes on `main` or manual dispatch; requests a docs-site redeploy. |
 
 Release archives and containers include the CLI, server, and Azure admission wrapper where their packaging contract requires all three. Keep the reusable package workflow, Dockerfile, and binary-contract check aligned.
 
-Every release build sets `RUSTFLAGS` itself (`release.yml`, `release-edge.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, the documented source build): empty everywhere except the macOS archive row's `-C code-model=large`. A set `RUSTFLAGS`, empty included, replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. A plain `cargo build --release` outside these paths still inherits the cfg. The cfg serves the DST suite and the GQT DST runner only.
+Every release build sets `RUSTFLAGS` itself (`build-release-archives.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, the documented source build): empty everywhere except the macOS archive row's `-C code-model=large`. A set `RUSTFLAGS`, empty included, replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. A plain `cargo build --release` outside these paths still inherits the cfg. The cfg serves the DST suite and the GQT DST runner only.
 
 ## Changing CI
 

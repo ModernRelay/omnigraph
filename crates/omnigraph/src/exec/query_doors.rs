@@ -7,16 +7,18 @@ use std::sync::Arc;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::ir::{IROp, ParamMap, QueryIR};
-use omnigraph_compiler::lower_query;
-use omnigraph_compiler::query::typecheck::typecheck_query;
+use omnigraph_compiler::query::ast::LoadStmt;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
+use omnigraph_compiler::{CheckedRead, lower_query};
 
 use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::engine;
 use crate::error::{OmniError, Result};
-use crate::runtime_cache::CompiledRead;
+use crate::loader::{CsvLoadRequest, csv, plan_load};
+use crate::runtime_cache::{CompiledQuery, CompiledRead};
 use crate::session::Session;
+use crate::storage_layer::WriteBudget;
 
 /// Where a route builds its CSR graph index when the query traverses:
 /// the cross-query `RuntimeCache` entry of a live target, or a build against
@@ -74,15 +76,16 @@ impl Session {
             compiled.ir().has_wildcard_traversal(),
         )?;
         let head = resolved.graph_commit_id.clone();
-        if let CompiledRead::Explain(ir) = &compiled {
+        if let CompiledRead::Explain(query) = &compiled {
             let rows =
-                engine::explain_rows(ir, params, &resolved.snapshot, &catalog, &settings).await?;
+                engine::explain_rows(query, params, Some(&resolved.snapshot), &catalog, &settings)
+                    .await?;
             return Ok((rows, head));
         }
         let result = self
             .execute_on_route(
                 &settings,
-                compiled.ir(),
+                compiled.query(),
                 params,
                 &resolved.snapshot,
                 IndexSource::Cached(&resolved),
@@ -108,12 +111,12 @@ impl Session {
 
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
         admit_wildcard_target(true, compiled.ir().has_wildcard_traversal())?;
-        if let CompiledRead::Explain(ir) = &compiled {
-            return engine::explain_rows(ir, params, &snapshot, &catalog, &settings).await;
+        if let CompiledRead::Explain(query) = &compiled {
+            return engine::explain_rows(query, params, Some(&snapshot), &catalog, &settings).await;
         }
         self.execute_on_route(
             &settings,
-            compiled.ir(),
+            compiled.query(),
             params,
             &snapshot,
             IndexSource::Direct,
@@ -150,13 +153,62 @@ impl Session {
             compiled.ir().has_wildcard_traversal(),
         )?;
         engine::explain_document(
-            compiled.ir(),
+            compiled.query(),
             params,
             &catalog,
-            &resolved.snapshot,
+            Some(&resolved.snapshot),
             &settings,
         )
         .await
+    }
+
+    /// Answer `explain load csv …` on `target`: the plan the statement would
+    /// be accepted under, as explain rows, with the graph head commit id of
+    /// the pinned snapshot. The source is authorized by the graph's external
+    /// Blob policy and probed for its size under the session's
+    /// `load_source_max_bytes`; no payload byte is read, nothing is staged.
+    ///
+    /// # Errors
+    ///
+    /// A historical snapshot target is refused: a load targets a branch head.
+    /// Otherwise the refusals of the probe (policy, deadline, the
+    /// `csv_source_bytes` limit) and of the target's resolution.
+    pub async fn explain_load(
+        &self,
+        target: impl Into<ReadTarget>,
+        stmt: &LoadStmt,
+    ) -> Result<(QueryResult, Option<String>)> {
+        let target = target.into();
+        if let ReadTarget::Snapshot(snapshot) = &target {
+            return Err(OmniError::manifest(format!(
+                "explain load csv: a load targets a branch head, not snapshot '{}'",
+                snapshot.as_str()
+            )));
+        }
+        let (resolved, catalog) = self.capture_read_view(target).await?;
+        let request = CsvLoadRequest::from_statement(stmt);
+        let source_bytes = csv::probe_csv_source_size(
+            self.db(),
+            &request,
+            self.settings().load_source_max_bytes(),
+        )
+        .await?;
+        let decision = plan_load(
+            &catalog,
+            &resolved.snapshot,
+            &request,
+            source_bytes,
+            self.settings().query_memory_bytes(),
+            WriteBudget::from_settings(self.settings()).bytes(),
+        )
+        .await?;
+        let explain = decision.explain().ok_or_else(|| {
+            OmniError::manifest_internal("explain load csv: the planner answered no document")
+        })?;
+        Ok((
+            engine::explain_load_rows(explain)?,
+            resolved.graph_commit_id.clone(),
+        ))
     }
 
     /// The v2 inspection door of the GQT runner: [`Self::query`] answered as an
@@ -176,13 +228,14 @@ impl Session {
     ) -> Result<engine::Executed> {
         let settings = self.effective(query_source)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
-        let CompiledRead::Query(ir) =
+        let CompiledRead::Query(query) =
             self.compile_named_query(&catalog, query_source, query_name)?
         else {
             return Err(OmniError::manifest(
                 "the inspection door runs no `explain` statement",
             ));
         };
+        let ir = &query.ir;
         admit_wildcard_target(
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
             ir.has_wildcard_traversal(),
@@ -202,9 +255,9 @@ impl Session {
             engine::GraphIndexHandle::none()
         };
         engine::execute_query_inspected(
-            &ir,
+            &query,
             params,
-            &resolved.snapshot,
+            Some(&resolved.snapshot),
             graph_index,
             &catalog,
             &engine::EmbeddingResolver::new(self.embedding_cell(), self.embedding_config_ref()),
@@ -213,49 +266,74 @@ impl Session {
         .await
     }
 
-    /// The replay door of the plan-replay tests: executes `bound`, a plan the
-    /// inspection door returned and the test serialized and read back, with
-    /// nothing else about its query: no session setting, no `QueryIR`. It
-    /// builds the engine context `query_inspected` builds (the snapshot and
-    /// catalog of `target`, a graph index scoped to the plan's `Expand`s),
-    /// refuses a snapshot whose dataset versions are not the ones the plan's
-    /// scans, counts and traversals pinned, and calls the same `execute`.
+    /// The replay door of the plan-replay tests: accepts and executes the
+    /// plan a replay envelope carries (an inspected run's bound plan with
+    /// its query's source, name and accepted scope, serialized and read
+    /// back), with no session setting. The envelope is decoded within the
+    /// evidence byte limit, its versions checked first; the query is
+    /// recompiled against `target`'s catalog and bound to the plan's own
+    /// parameter values, and the plan is accepted again against the
+    /// requirements derived from it. It builds the engine context
+    /// `query_inspected` builds (the snapshot and catalog of `target`, a
+    /// graph index scoped to the plan's `Expand`s), refuses a snapshot whose
+    /// dataset versions are not the ones the plan's scans, counts and
+    /// traversals pinned, re-establishes every full-text coverage fact the
+    /// plan records from that snapshot, and calls the same `execute`.
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::query`] on the target, a snapshot the plan did
-    /// not pin, and every run-time error of the plan.
+    /// The errors of [`Self::query`] on the target; a replan-required
+    /// conflict for an unsupported envelope version; a conflict for a
+    /// snapshot the plan did not pin; a bad request for a malformed envelope
+    /// or a plan that fails acceptance; every run-time error of the plan.
     #[doc(hidden)]
     pub async fn replay_bound_plan(
         &self,
         target: impl Into<ReadTarget>,
-        bound: omnigraph_planner::BoundPlan,
+        envelope: &[u8],
     ) -> Result<engine::PlanRun> {
+        let envelope = omnigraph_planner::decode_replay(
+            envelope,
+            omnigraph_planner::ValidationLimits::DEFAULT,
+        )
+        .map_err(engine::replay_refused)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
-        let has_wildcard = bound.plan.assumptions().has_wildcard_traversal || bound.plan.live().any(|(_, node)| {
+        let plan = &envelope.plan.plan;
+        let has_wildcard = plan.assumptions().has_wildcard_traversal || plan.live().any(|(_, node)| {
             matches!(node, omnigraph_planner::PhysicalNode::Expand { edges, .. } if edges.is_wildcard())
         });
         admit_wildcard_target(
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
             has_wildcard,
         )?;
-        engine::plan_pins_snapshot(&bound.plan, &resolved.snapshot)?;
-        let graph_index = if engine::plan_traverses(&bound.plan) {
+        engine::plan_pins_snapshot(plan, Some(&resolved.snapshot))?;
+        engine::replayed_coverage_holds(plan, &resolved.snapshot).await?;
+        let CompiledRead::Query(query) =
+            self.compile_named_query(&catalog, &envelope.query.source, &envelope.query.name)?
+        else {
+            return Err(OmniError::manifest(
+                "a replay envelope names an `explain` statement, which runs nothing",
+            ));
+        };
+        let accepted = engine::accept_replay(&query, envelope, &catalog)?;
+        let plan = &accepted.bound().plan;
+        let graph_index = if engine::plan_traverses(plan) {
             engine::GraphIndexHandle::cached(
                 Arc::clone(&**self),
                 resolved.clone(),
-                engine::plan_edge_types(&bound.plan, &catalog),
+                engine::plan_edge_types(plan, &catalog),
                 catalog.system_columns,
             )
         } else {
             engine::GraphIndexHandle::none()
         };
         let context = engine::EngineContext {
-            snapshot: &resolved.snapshot,
+            snapshot: Some(&resolved.snapshot),
             catalog: &catalog,
             graph_index: Arc::new(graph_index),
+            load: None,
         };
-        engine::execute(bound, &context).await
+        engine::execute(accepted, &context).await
     }
 
     /// One compiled query through the engine, or through the installed
@@ -264,12 +342,13 @@ impl Session {
     async fn execute_on_route(
         &self,
         settings: &SessionSettings,
-        ir: &QueryIR,
+        query: &CompiledQuery,
         params: &ParamMap,
         snapshot: &Snapshot,
         index_source: IndexSource<'_>,
         catalog: &Arc<Catalog>,
     ) -> Result<QueryResult> {
+        let ir: &QueryIR = &query.ir;
         #[cfg(feature = "test-util")]
         if let Some(executor) = self.read_executor() {
             let erased = ir.erase();
@@ -301,9 +380,9 @@ impl Session {
             ),
         };
         engine::execute_query(
-            ir,
+            query,
             params,
-            snapshot,
+            Some(snapshot),
             graph_index,
             catalog,
             &engine::EmbeddingResolver::new(self.embedding_cell(), self.embedding_config_ref()),
@@ -330,12 +409,13 @@ impl Omnigraph {
         }
         let statement = omnigraph_compiler::find_read_statement(query_source, query_name)
             .map_err(super::query_lookup_error)?;
-        let checked = typecheck_query(catalog, statement.decl())?;
-        let ir = Arc::new(lower_query(catalog, &checked)?);
+        let checked = CheckedRead::check(catalog, statement.decl())?;
+        let ir = Arc::new(lower_query(catalog, checked.query())?);
+        let query = CompiledQuery { ir, checked };
         let compiled = if statement.is_explain() {
-            CompiledRead::Explain(ir)
+            CompiledRead::Explain(query)
         } else {
-            CompiledRead::Query(ir)
+            CompiledRead::Query(query)
         };
         crate::instrumentation::record_query_compile();
         cache.insert(catalog, key, compiled.clone());

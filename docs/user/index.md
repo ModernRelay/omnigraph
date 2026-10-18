@@ -13,7 +13,7 @@ deployment.
 ## Model and data
 
 - [Schema language](schema/index.md)
-- [Query language](queries/index.md), [session settings](queries/settings.md), and [explain](queries/explain.md)
+- [Query language](queries/index.md), [session settings](queries/settings.md), [explain](queries/explain.md), and the [engine catalogue](queries/catalogue.md)
 - [Traversal patterns and edge selections](queries/traversal.md)
 - [Diagnostics](queries/diagnostics.md)
 - [Mutations and loading](mutations/index.md)
@@ -24,7 +24,7 @@ deployment.
 ## History and collaboration
 
 - [Branches, commits, and snapshots](branching/index.md)
-- [Commit changes, change feeds, and baselines](branching/changes.md)
+- [Commit changes, diffs, branch review, change feeds, and baselines](branching/changes.md)
 - [Merging and conflicts](branching/merge.md)
 
 ## CLI and HTTP
@@ -33,7 +33,9 @@ deployment.
 - [CLI reference](cli/reference.md)
 - [Managed data credentials and queries](cli/managed-data.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
+- [Managed organization members and invitations](cli/managed-team.md)
 - [HTTP server](operations/server.md)
+- [MCP](operations/mcp.md)
 - [Troubleshooting](operations/troubleshooting.md)
 
 ## Operate a deployment

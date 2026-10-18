@@ -715,6 +715,31 @@ limit 3
     assert!(err.to_string().contains("T15"));
 }
 
+/// The literal-vector shortcut in `nearest` must type its elements: an
+/// overflowing element is T3 at declaration time, the check the stored-query
+/// boot path and cluster config validation run (issue 920).
+#[test]
+fn test_nearest_literal_vector_overflowing_element_is_t3() {
+    let catalog = setup_vector();
+    let qf = parse_query(&format!(
+        r#"
+query q() {{
+match {{ $d: Doc }}
+return {{ $d.id_str }}
+order {{ nearest($d.embedding, [{}.0, 0.0, 0.0]) }}
+limit 3
+}}
+"#,
+        "9".repeat(400)
+    ))
+    .unwrap();
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
+    assert!(
+        err.to_string().contains("T3") && err.to_string().contains("outside the F64 range"),
+        "{err}"
+    );
+}
+
 #[test]
 fn test_nearest_vector_param_ok() {
     let catalog = setup_vector();
@@ -1993,6 +2018,7 @@ return { $d.name }
             expr: Expr::Literal(Literal::String("unreachable".to_string())),
             alias: None,
         }],
+        distinct: false,
         order_clause: Vec::new(),
         limit: None,
         mutations: Vec::new(),

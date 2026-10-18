@@ -1989,6 +1989,7 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
         target: Some("main".to_string()),
         delete_branch: false,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (status, body) = json_response(
@@ -2762,6 +2763,81 @@ async fn branch_statements_dispatch_to_their_route_bodies() {
     assert_eq!(body["error"], "branch 'review/x' not found");
 }
 
+/// A `load csv` statement naming a source no base admits; the loaded test
+/// graph has no external Blob policy, so the served default, deny, applies.
+const LOAD_CSV_PEOPLE: &str =
+    "load csv \"s3://imports/people.csv\" into node:Person mode append header";
+
+/// Served `load csv` on `/mutate`, with and without the request `branch`:
+/// a graph without a policy denies the source before any byte is read, so
+/// no commit is published.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_csv_statement_is_denied_served_without_a_policy_and_moves_no_head() {
+    let (temp, app) = app_for_loaded_graph().await;
+    let head = main_head_commit_id(&app).await;
+    for request in [
+        json!({"query": LOAD_CSV_PEOPLE}),
+        json!({"query": LOAD_CSV_PEOPLE, "branch": "main"}),
+        json!({"query": "load csv \"file:///tmp/people.csv\" into node:Person mode append header"}),
+    ] {
+        let (status, body) = json_response(&app, json_post("/mutate", &request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("ingress is denied for this graph"),
+            "{request}: {error}"
+        );
+    }
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "a denied load publishes nothing"
+    );
+
+    let required = omnigraph_compiler::settings::SessionSettings::default().load_source_max_bytes()
+        + LOAD_CSV_PEOPLE.len() as u64;
+    let graph = graph_path(temp.path());
+    for per_actor in [false, true] {
+        for capacity in [required - 1, required] {
+            let mut limits = omnigraph_server::workload::WorkloadLimits::default();
+            if per_actor {
+                limits.per_actor_bytes_max = capacity;
+            } else {
+                limits.global_bytes_max = capacity;
+            }
+            let workload = omnigraph_server::workload::WorkloadController::with_limits(limits);
+            let state = AppState::new_with_workload(
+                graph.to_string_lossy().to_string(),
+                Omnigraph::open(graph.to_str().unwrap()).await.unwrap(),
+                Vec::new(),
+                workload.clone(),
+            );
+            let operations = state.operation_runtime().clone();
+            let app = build_app(state);
+            let (status, body) = json_response(
+                &app,
+                json_post("/mutate", &json!({"query": LOAD_CSV_PEOPLE})),
+            )
+            .await;
+            if capacity < required {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+                assert_eq!(body["code"], "too_many_requests", "{body}");
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                assert!(
+                    body["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("ingress is denied for this graph"),
+                    "{body}"
+                );
+            }
+            assert_eq!(main_head_commit_id(&app).await, head);
+            assert_admission_open(&operations, &workload, "csv source admission").await;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_statement_refusals_name_the_door_and_the_envelope() {
     let (_temp, app) = app_for_loaded_graph().await;
@@ -2848,6 +2924,26 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
             json!({"query": EXPLAIN_ADULTS}),
             "statement 'explain' is a read; use POST /query",
         ),
+        (
+            "/query",
+            json!({"query": LOAD_CSV_PEOPLE}),
+            "statement 'load csv' is a control write; use POST /mutate",
+        ),
+        (
+            "/query",
+            json!({"query": LOAD_CSV_PEOPLE, "branch": "main"}),
+            target_refusal,
+        ),
+        (
+            "/mutate",
+            json!({"query": LOAD_CSV_PEOPLE, "name": "x"}),
+            name_refusal,
+        ),
+        (
+            "/mutate",
+            json!({"query": LOAD_CSV_PEOPLE, "branch": "main", "params": {"a": 1}}),
+            name_refusal,
+        ),
     ];
     for (path, request, expected) in cases {
         let (status, body) = json_response(&app, json_post(path, &request)).await;
@@ -2863,6 +2959,10 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
         (
             json!({"query": "branch create b0", "name": "x"}),
             name_refusal,
+        ),
+        (
+            json!({"query": LOAD_CSV_PEOPLE}),
+            "a branch statement takes no commit precondition",
         ),
     ];
     for (request, expected) in conditional {
@@ -3118,6 +3218,42 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
     }
     let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
     assert_eq!(listed["commits"], json!([]));
+
+    // An ordinary write past a proposal's parent expires it: reads at its id
+    // answer 404, the listing drops it, a publish fails its precondition, and
+    // a drop still succeeds.
+    let rae = propose_person(&app, "Rae").await;
+    let rae_id = rae["graph_commit_id"].as_str().unwrap().to_string();
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "query add() { insert Person { name: \"Sol\", age: 34 } }"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for path in [
+        format!("/commits/{rae_id}"),
+        format!("/commits/{rae_id}/changes"),
+    ] {
+        let (status, body) = get_json(&app, g(&path)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+    }
+    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    assert_eq!(listed["commits"], json!([]));
+    let (status, body) = json_response(
+        &app,
+        bodiless(Method::POST, &format!("/commits/{rae_id}/publish")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    let response = app
+        .clone()
+        .oneshot(bodiless(Method::DELETE, &format!("/commits/{rae_id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
 /// One mutation `as unattached branch` on main, a root when `base` is `None`
@@ -3485,6 +3621,7 @@ async fn branch_merge_statement_conflict_matches_the_route_409() {
         target: Some("main".to_string()),
         delete_branch: false,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (route_status, route_body) = json_response(
@@ -3849,12 +3986,27 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "request"
             ),
             show_row(
+                "load_source_max_bytes",
+                "33554432",
+                "33554432",
+                "default",
+                "request"
+            ),
+            show_row(
+                "query_memory_bytes",
+                "157286400",
+                "157286400",
+                "default",
+                "request"
+            ),
+            show_row(
                 "history_release_bytes",
                 "262144",
                 "262144",
                 "default",
                 "request"
             ),
+            show_row("explain_dump_dir", "", "", "default", "process"),
         ])
     );
 }
@@ -4044,12 +4196,12 @@ async fn write_max_bytes_request_override_reset_and_load_process_default() {
         );
     }
     let head = main_head_commit_id(&app).await;
-    for limit in [0, 33554433] {
+    for limit in [0, -1] {
         let (status, body) = json_response(&app, json_post("/mutate", &json!({
             "query":MUTATION_QUERIES,"name":"insert_person","params":{"name":"refused","age":1},
             "settings":{"write_max_bytes":limit}
         }))).await;
-        assert_settings_refusal_needle(status, &body, "1..=33554432");
+        assert_settings_refusal_needle(status, &body, "an integer of at least 1");
     }
     let data = json!({"type":"Person","data":{"name":"x".repeat(4094),"age":1}}).to_string();
     for path in ["/load", "/load/ndjson"] {
@@ -4251,6 +4403,112 @@ fn explain_plan_rows<'a>(body: &'a Value, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// `explain load csv` through `POST /query`: the planner's document as explain rows (`logical`,
+/// `physical`, then `plan` rows), no head moved, `branch` honored; `snapshot`, `name`, `params` meet
+/// the envelope refusals; `/mutate` refuses the read; a source no base admits is denied unprobed.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_answers_an_explain_load_statement_as_rows() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let external_dir = tempfile::tempdir().unwrap();
+    let csv_path = external_dir.path().join("people.csv");
+    fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+    let external_base = format!("file://{}/", external_dir.path().display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(external_base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
+    let head = main_head_commit_id(&app).await;
+    let statement = format!(
+        "explain load csv \"file://{}\" into node:Person mode overwrite header",
+        csv_path.display()
+    );
+
+    for request in [
+        json!({"query": statement}),
+        json!({"query": statement, "branch": "main"}),
+    ] {
+        let (status, body) = json_response(&app, json_post("/query", &request)).await;
+        assert_eq!(status, StatusCode::OK, "{request}: {body}");
+        assert_eq!(body["query_name"], "load csv", "{body}");
+        assert_eq!(body["columns"], json!(["tree", "depth", "node", "detail"]));
+        assert_eq!(body["graph_commit_id"], head, "{body}");
+        let physical = explain_tree(&body, "physical");
+        assert_eq!(physical["node"], "FragmentWrite", "{physical}");
+        assert_eq!(physical["mode"], "overwrite", "{physical}");
+        assert_eq!(physical["table"], "node:Person", "{physical}");
+        let validate = &physical["inputs"][0];
+        assert_eq!(validate["node"], "Validate", "{physical}");
+        assert_eq!(validate["inputs"][0]["node"], "CsvSource", "{physical}");
+        assert_eq!(explain_tree(&body, "logical")["node"], "FragmentWrite");
+        assert_eq!(explain_plan_rows(&body, "route"), ["engine"], "{body}");
+        assert_eq!(explain_plan_rows(&body, "explain_version"), ["6"], "{body}");
+    }
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "an explain publishes nothing"
+    );
+    assert!(csv_path.exists(), "the source is only probed");
+
+    let cases = [
+        (
+            "/query",
+            json!({"query": statement, "snapshot": head}),
+            "a branch statement names its branches itself; drop the request target",
+        ),
+        (
+            "/query",
+            json!({"query": statement, "name": "load csv"}),
+            "a branch statement takes no name and no parameters",
+        ),
+        (
+            "/query",
+            json!({"query": statement, "params": {}}),
+            "a branch statement takes no name and no parameters",
+        ),
+        (
+            "/mutate",
+            json!({"query": statement}),
+            "statement 'explain' is a read; use POST /query",
+        ),
+        (
+            "/mutate",
+            json!({"query": statement, "branch": "main"}),
+            "statement 'explain' is a read; use POST /query",
+        ),
+    ];
+    for (path, request, expected) in cases {
+        let (status, body) = json_response(&app, json_post(path, &request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {request}: {body}");
+        assert_eq!(body["error"], expected, "{path} {request}: {body}");
+    }
+
+    let (_denied_temp, denied_app) = app_for_loaded_graph().await;
+    let (status, body) = json_response(
+        &denied_app,
+        json_post(
+            "/query",
+            &json!({"query": format!("explain {LOAD_CSV_PEOPLE}")}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ingress is denied for this graph"),
+        "{body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn query_endpoint_answers_an_explain_statement_as_rows() {
     let (_temp, app) = app_for_loaded_graph().await;
@@ -4266,7 +4524,16 @@ async fn query_endpoint_answers_an_explain_statement_as_rows() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["query_name"], "adults");
     assert_eq!(body["columns"], json!(["tree", "depth", "node", "detail"]));
-    assert_eq!(body["rows"][0]["tree"], "logical", "{body}");
+    assert_eq!(body["rows"][0]["tree"], "logical_initial", "{body}");
+    let initial = explain_tree(&body, "logical_initial");
+    assert_eq!(
+        initial["inputs"][0]["node"], "Filter",
+        "before the passes ran the age filter is its own node: {initial}"
+    );
+    assert!(
+        initial["inputs"][0]["inputs"][0]["filter"].is_null(),
+        "the initial scan carries no pushed filter: {initial}"
+    );
     let logical = explain_tree(&body, "logical");
     assert!(logical["node"].is_string(), "{logical}");
     assert_eq!(
@@ -4354,8 +4621,14 @@ async fn query_endpoint_explain_lists_the_lowered_datafusion_tree() {
     }
     assert_eq!(
         trees,
-        vec!["logical", "physical", "datafusion", "plan"],
-        "the three trees then the plan rows: {body}"
+        vec![
+            "logical_initial",
+            "logical",
+            "physical",
+            "datafusion",
+            "plan"
+        ],
+        "the four trees then the plan rows: {body}"
     );
     let datafusion: Vec<&Value> = rows
         .iter()
@@ -5225,6 +5498,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         target: Some("main".to_string()),
         delete_branch: false,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(
@@ -5378,6 +5652,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
         target: Some("main".to_string()),
         delete_branch: true,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(
@@ -5438,6 +5713,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
         target: Some("feature".to_string()),
         delete_branch: true,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(
@@ -6765,6 +7041,336 @@ async fn mutate_graph_commit_precondition_issue_365() {
     );
 }
 
+// ─── Graph diff routes ──────────────────────────────────────────────────────
+
+/// One `insert_person` through `POST /mutate` on `branch`.
+async fn insert_person_on(app: &axum::Router, branch: &str, name: &str) {
+    let (status, body) = json_response(
+        app,
+        json_post(
+            "/mutate",
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "insert_person",
+                "params": {"name": name, "age": 30},
+                "branch": branch
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+fn change_ids(page: &Value) -> Vec<(String, String)> {
+    page["changes"]
+        .as_array()
+        .expect("a diff page lists its changes")
+        .iter()
+        .map(|change| {
+            (
+                change["id"].as_str().unwrap().to_string(),
+                change["op"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_routes_review_a_branch_against_its_merge_base() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let fork = main_head_commit_id(&app).await;
+    branch_one_commit_ahead(&app, "feature", "Featured").await;
+    insert_person_on(&app, "feature", "Second").await;
+    insert_person_on(&app, "main", "MainOnly").await;
+
+    let (status, base) = get_json(&app, g("/branches/merge-base?source=feature")).await;
+    assert_eq!(status, StatusCode::OK, "{base}");
+    assert_eq!(base["source"], "feature");
+    assert_eq!(base["target"], "main");
+    assert_eq!(base["merge_base"]["graph_commit_id"], fork.as_str());
+
+    // The branch form pages like any change surface; every page names the
+    // base and the source head it resolved first.
+    let (status, first) = get_json(&app, g("/branches/diff?source=feature&limit=1")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["base_commit_id"], fork.as_str());
+    assert_eq!(first["from_commit_id"], fork.as_str());
+    assert_eq!(first["to_commit_id"], base["source_commit_id"]);
+    assert!(first.get("cause").is_none(), "a diff carries no cause");
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("two changes, pages of one");
+    insert_person_on(&app, "feature", "Late").await;
+    let (status, second) = get_json(
+        &app,
+        g(&format!(
+            "/branches/diff?source=feature&target=main&limit=1&page_token={token}"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["to_commit_id"], first["to_commit_id"]);
+    let mut reviewed = change_ids(&first);
+    reviewed.extend(change_ids(&second));
+    assert!(second["next_page_token"].is_null());
+    assert_eq!(
+        reviewed,
+        vec![
+            ("Featured".to_string(), "insert".to_string()),
+            ("Second".to_string(), "insert".to_string()),
+        ]
+    );
+
+    // The two-point form compares the heads, so main's own insert reads as a
+    // delete; a commit id names a side as well as a branch does.
+    let (status, heads) = get_json(&app, g("/diff?from=main&to=feature")).await;
+    assert_eq!(status, StatusCode::OK, "{heads}");
+    assert!(
+        change_ids(&heads).contains(&("MainOnly".to_string(), "delete".to_string())),
+        "{heads}"
+    );
+    let (status, since_fork) = get_json(&app, g(&format!("/diff?from={fork}&to=main"))).await;
+    assert_eq!(status, StatusCode::OK, "{since_fork}");
+    assert_eq!(
+        change_ids(&since_fork),
+        vec![("MainOnly".to_string(), "insert".to_string())]
+    );
+
+    // The branch control reads answer the same through `POST /query`, as
+    // rows; a diff's commits and its continuation token travel in `page`.
+    let (_, base) = get_json(&app, g("/branches/merge-base?source=feature")).await;
+    let (status, base_rows) = query_statement(&app, "branch merge-base feature").await;
+    assert_eq!(status, StatusCode::OK, "{base_rows}");
+    assert_eq!(base_rows["query_name"], "branch merge-base");
+    assert_eq!(
+        base_rows["rows"],
+        json!([{
+            "source": "feature",
+            "target": "main",
+            "source_commit_id": base["source_commit_id"],
+            "target_commit_id": base["target_commit_id"],
+            "merge_base_commit_id": fork,
+        }])
+    );
+    let row_ids = |answer: &Value| {
+        answer["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    row["op"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let (_, review) = get_json(&app, g("/branches/diff?source=feature")).await;
+    let (status, first_rows) = query_statement(&app, "branch diff feature limit 1").await;
+    assert_eq!(status, StatusCode::OK, "{first_rows}");
+    assert_eq!(
+        first_rows["columns"],
+        json!(["kind", "type", "id", "op", "before", "after"])
+    );
+    assert_eq!(first_rows["page"]["base_commit_id"], fork.as_str());
+    assert_eq!(first_rows["page"]["to_commit_id"], review["to_commit_id"]);
+    assert_eq!(first_rows["rows"][0]["type"], "Person");
+    let mut statement_review = row_ids(&first_rows);
+    let mut token = first_rows["page"]["next_page_token"]
+        .as_str()
+        .expect("several changes, pages of one")
+        .to_string();
+    loop {
+        let (status, page) = query_statement(
+            &app,
+            &format!(r#"branch diff feature into main after page "{token}" limit 1"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["page"]["to_commit_id"], review["to_commit_id"]);
+        statement_review.extend(row_ids(&page));
+        match page["page"]["next_page_token"].as_str() {
+            Some(next) => token = next.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(statement_review, change_ids(&review));
+    let (status, head_rows) = query_statement(&app, "branch diff main to feature").await;
+    assert_eq!(status, StatusCode::OK, "{head_rows}");
+    assert_eq!(row_ids(&head_rows), change_ids(&heads));
+    let (status, dry) = query_statement(&app, "branch merge feature dry run").await;
+    assert_eq!(status, StatusCode::OK, "{dry}");
+    assert_eq!(
+        dry["rows"],
+        json!([{"source": "feature", "target": "main", "outcome": "merged"}])
+    );
+    assert_eq!(main_head_commit_id(&app).await, since_fork["to_commit_id"]);
+
+    // A control read is refused at the write door, under its own name.
+    for statement in [
+        "branch diff feature",
+        "branch merge-base feature",
+        "branch merge feature dry run",
+    ] {
+        let (status, body) =
+            json_response(&app, json_post("/mutate", &json!({"query": statement}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{statement}: {body}");
+        let name = statement.split(" feature").next().unwrap();
+        let name = if statement.ends_with("dry run") {
+            "branch merge dry run"
+        } else {
+            name
+        };
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("'{name}' is a read")),
+            "{statement}: {body}"
+        );
+    }
+}
+
+/// One statement at the read door, sent bare.
+async fn query_statement(app: &axum::Router, statement: &str) -> (StatusCode, Value) {
+    json_response(
+        app,
+        json_post(
+            "/query",
+            &json!({"query": statement, "name": null, "params": null, "branch": null, "snapshot": null}),
+        ),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_routes_refuse_malformed_and_unknown_sides() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    for (uri, status, needle) in [
+        (
+            "/diff?from=main",
+            StatusCode::BAD_REQUEST,
+            "query parameter 'to' is required",
+        ),
+        (
+            "/diff?from=main&to=main&branch=main",
+            StatusCode::BAD_REQUEST,
+            "unknown query parameter 'branch'",
+        ),
+        (
+            "/diff?from=main&to=main&limit=0",
+            StatusCode::BAD_REQUEST,
+            "greater than zero",
+        ),
+        (
+            "/diff?from=main&to=nowhere",
+            StatusCode::NOT_FOUND,
+            "'nowhere' names no branch and no commit",
+        ),
+        (
+            "/branches/diff?target=main",
+            StatusCode::BAD_REQUEST,
+            "query parameter 'source' is required",
+        ),
+        (
+            "/branches/diff?source=nowhere",
+            StatusCode::NOT_FOUND,
+            "branch 'nowhere' not found",
+        ),
+        (
+            "/branches/merge-base?source=feature&limit=1",
+            StatusCode::BAD_REQUEST,
+            "unknown query parameter 'limit'",
+        ),
+    ] {
+        let (got, body) = get_json(&app, g(uri)).await;
+        assert_eq!(got, status, "{uri}: {body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains(needle),
+            "{uri}: {body}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_dry_run_answers_the_merge_without_writing() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    branch_one_commit_ahead(&app, "feature", "Featured").await;
+    let head = main_head_commit_id(&app).await;
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches/merge",
+            &json!({"source": "feature", "target": "main", "dry_run": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "fast_forward");
+    assert!(body["commit"].is_null(), "{body}");
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "a dry run moves nothing"
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches/merge",
+            &json!({"source": "feature", "dry_run": true, "as_commit": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("a dry run writes nothing")
+    );
+
+    // The real merge after the dry run answers the outcome the dry run did.
+    let (status, body) = json_response(
+        &app,
+        json_post("/branches/merge", &json!({"source": "feature"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "fast_forward");
+    assert!(
+        body.get("dry_run").is_none(),
+        "a merge omits the dry-run flag"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_dry_run_conflict_matches_the_merge_409() {
+    let temp = divergent_alice_graph().await;
+    let graph = graph_path(temp.path());
+    let app = build_app(
+        AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap(),
+    );
+    let mut bodies = Vec::new();
+    for dry_run in [true, false] {
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/branches/merge",
+                &json!({"source": "feature", "target": "main", "dry_run": dry_run}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        bodies.push(body);
+    }
+    assert_eq!(bodies[0]["merge_conflicts"], bodies[1]["merge_conflicts"]);
+    assert_eq!(bodies[0]["error"], bodies[1]["error"]);
+}
+
 // ─── Commit entity changes route ────────────────────────────────────────────
 
 async fn load_commit(app: &axum::Router, ndjson: &str) -> String {
@@ -6847,6 +7453,91 @@ async fn commit_changes_pages_are_ordered_with_cause_once() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(second["changes"][0]["id"], "Loaded C");
     assert!(second["next_page_token"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_list_pages_answer_for_the_head_their_first_page_named() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let person = |name: &str| format!(r#"{{"type":"Person","data":{{"name":"{name}","age":1}}}}"#);
+    for name in ["Page A", "Page B", "Page C"] {
+        load_commit(&app, &person(name)).await;
+    }
+    let (status, whole) = get_json(&app, g("/commits")).await;
+    assert_eq!(status, StatusCode::OK, "{whole}");
+    assert!(
+        whole.get("head_commit_id").is_none() && whole.get("next_page_token").is_none(),
+        "an unpaged listing keeps its shape: {whole}"
+    );
+    let whole = whole["commits"].as_array().unwrap().clone();
+    assert!(whole.len() > 4, "test setup: several pages of two");
+
+    let (status, first) = get_json(&app, g("/commits?branch=main&limit=2")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["head_commit_id"], whole[0]["graph_commit_id"]);
+    assert_eq!(first["commits"], json!(whole[..2]));
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("a first page of two continues")
+        .to_string();
+
+    load_commit(&app, &person("Page D")).await;
+    let mut paged = first["commits"].as_array().unwrap().clone();
+    let mut next = Some(token.clone());
+    while let Some(token) = next {
+        let (status, page) =
+            get_json(&app, g(&format!("/commits?limit=2&page_token={token}"))).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["head_commit_id"], first["head_commit_id"], "{page}");
+        paged.extend(page["commits"].as_array().unwrap().iter().cloned());
+        next = page["next_page_token"].as_str().map(str::to_string);
+    }
+    assert_eq!(
+        paged, whole,
+        "later pages answer for the head the first page named"
+    );
+    let (status, rest) = get_json(&app, g(&format!("/commits?page_token={token}"))).await;
+    assert_eq!(status, StatusCode::OK, "{rest}");
+    assert_eq!(
+        rest["commits"],
+        json!(whole[2..]),
+        "100 commits per page by default"
+    );
+    assert!(rest.get("next_page_token").is_none(), "{rest}");
+
+    for (uri, expected) in [
+        (
+            format!("/commits?branch=feature&page_token={token}"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/commits?page_token=not-a-token".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/commits?limit=0".to_string(), StatusCode::BAD_REQUEST),
+        (
+            "/commits?limit=2&unpublished=true".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/commits?page_token={token}&unattached=true"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/commits?limit=1001".to_string(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ] {
+        let (status, body) = get_json(&app, g(&uri)).await;
+        assert_eq!(status, expected, "{uri}: {body}");
+    }
+    let (_, body) = get_json(&app, g("/commits?page_token=not-a-token")).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("change cursor rejected: "),
+        "a rejected page token keeps the continuation prefix: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

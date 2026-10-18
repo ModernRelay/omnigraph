@@ -1,0 +1,100 @@
+# issue: none
+# notes: CSV fixtures keep their source policy before and after a DST restart; a failed publication keeps the graph unchanged.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person { name: String @key }
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- csv people.csv
+name
+bob
+
+--- seam
+at: mutation.post_finalize_pre_publisher
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+load csv "people.csv" into node:Person mode append header
+--- expect error: injected failpoint triggered: mutation.post_finalize_pre_publisher
+
+--- restart
+--- query
+query unchanged() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+--- expect shape
+p.name: String
+
+--- mutate
+load csv "people.csv" into node:Person mode append header
+--- expect ok
+
+--- query
+query after_load() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+--- csv replacement.csv
+name
+carol
+
+--- seam
+at: mutation.post_stage_pre_effect_gate
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+load csv "replacement.csv" into node:Person mode overwrite header
+--- expect error: injected failpoint triggered: mutation.post_stage_pre_effect_gate
+
+--- restart
+--- query
+query unchanged_before_effect() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- seam
+at: mutation.post_finalize_pre_publisher
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+load csv "replacement.csv" into node:Person mode overwrite header
+--- expect error: injected failpoint triggered: mutation.post_finalize_pre_publisher
+
+--- restart
+--- query
+query unchanged_before_publish() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- mutate
+load csv "replacement.csv" into node:Person mode overwrite header
+--- expect ok
+
+--- query
+query after_overwrite() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"carol"}
+--- expect shape
+p.name: String

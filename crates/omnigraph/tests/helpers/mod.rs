@@ -15,7 +15,7 @@ use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
 pub use omnigraph::Session;
-use omnigraph::changes::{ChangeFilter, ChangeSet};
+use omnigraph::changes::{ChangeEntityKind, ChangeFeedScope, ChangeOpKind};
 use omnigraph::db::{Omnigraph, ReadTarget, Snapshot, SnapshotId};
 use omnigraph::error::Result;
 use omnigraph::loader::LoadMode;
@@ -568,18 +568,116 @@ pub async fn snapshot_id(db: &Omnigraph, branch: &str) -> Result<SnapshotId> {
     db.resolve_snapshot(branch).await
 }
 
+/// One change of a graph diff flattened for assertions: the entity's kind,
+/// type, id and operation, and an edge's endpoints from its newest image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetChange {
+    pub kind: ChangeEntityKind,
+    pub type_name: String,
+    pub id: String,
+    pub op: ChangeOpKind,
+    pub endpoints: Option<NetEndpoints>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetEndpoints {
+    pub src: String,
+    pub dst: String,
+}
+
+impl NetChange {
+    /// `node:<Type>` or `edge:<Type>`.
+    pub fn type_key(&self) -> String {
+        let prefix = match self.kind {
+            ChangeEntityKind::Node => "node",
+            ChangeEntityKind::Edge => "edge",
+        };
+        format!("{prefix}:{}", self.type_name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetStats {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+}
+
+/// A whole graph diff: its resolved endpoints and every change of every page.
+#[derive(Debug, Clone)]
+pub struct NetDiff {
+    pub from_commit_id: String,
+    pub to_commit_id: String,
+    pub changes: Vec<NetChange>,
+    pub stats: NetStats,
+}
+
+/// The graph diff `from` → `to` (branch names or commit ids) within `scope`,
+/// every page.
+pub async fn graph_diff(
+    db: &Omnigraph,
+    from: &str,
+    to: &str,
+    scope: &ChangeFeedScope,
+) -> Result<NetDiff> {
+    let mut request = omnigraph::changes::GraphDiffRequest {
+        sides: omnigraph::changes::GraphDiffSides::Between {
+            from: from.to_string(),
+            to: to.to_string(),
+        },
+        scope: scope.clone(),
+        page_token: None,
+        max_changes: None,
+        max_bytes: None,
+    };
+    let mut diff = NetDiff {
+        from_commit_id: String::new(),
+        to_commit_id: String::new(),
+        changes: Vec::new(),
+        stats: NetStats::default(),
+    };
+    loop {
+        let page = db.diff_page(&request).await?;
+        diff.from_commit_id = page.from_commit_id;
+        diff.to_commit_id = page.to_commit_id;
+        for change in page.changes {
+            match change.op {
+                ChangeOpKind::Insert => diff.stats.inserts += 1,
+                ChangeOpKind::Update => diff.stats.updates += 1,
+                ChangeOpKind::Delete => diff.stats.deletes += 1,
+            }
+            let endpoints = change
+                .after
+                .as_ref()
+                .or(change.before.as_ref())
+                .and_then(|image| image.endpoints.as_ref())
+                .map(|endpoints| NetEndpoints {
+                    src: endpoints.from.clone(),
+                    dst: endpoints.to.clone(),
+                });
+            diff.changes.push(NetChange {
+                kind: change.kind,
+                type_name: change.entity_type.name,
+                id: change.id,
+                op: change.op,
+                endpoints,
+            });
+        }
+        match page.next_page_token {
+            Some(token) => request.page_token = Some(token),
+            None => return Ok(diff),
+        }
+    }
+}
+
+/// The graph diff from `from_snapshot` to the head of `branch`.
 pub async fn diff_since_branch(
     db: &Omnigraph,
     branch: &str,
     from_snapshot: SnapshotId,
-    filter: &ChangeFilter,
-) -> Result<ChangeSet> {
-    db.diff_between(
-        ReadTarget::Snapshot(from_snapshot),
-        ReadTarget::branch(branch),
-        filter,
-    )
-    .await
+    scope: &ChangeFeedScope,
+) -> Result<NetDiff> {
+    graph_diff(db, from_snapshot.as_str(), branch, scope).await
 }
 
 /// Advance a Lance dataset HEAD directly from tests without going through
@@ -782,4 +880,20 @@ async fn write_ranged_external_blob_row(
         .await
         .unwrap();
     table_uri
+}
+
+/// `token` with its payload edited and its checksum recomputed, as any caller
+/// can: a continuation's envelope is `base64url(json ‖ sha256(json))`.
+pub fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let bytes = engine.decode(token).unwrap();
+    let (payload, _) = bytes.split_at(bytes.len() - 32);
+    let mut payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    edit(&mut payload);
+    let mut encoded = serde_json::to_vec(&payload).unwrap();
+    let checksum = sha2::Sha256::digest(&encoded);
+    encoded.extend_from_slice(&checksum);
+    engine.encode(encoded)
 }

@@ -29,7 +29,7 @@ Tools that support `@` imports include these automatically:
 
 ## Repository snapshot
 
-- Version surveyed: 0.13.0
+- Version surveyed: 0.14.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 11.0.0
 - Workspace: compiler, planner (logical/physical plans and optimizer), storage,
@@ -39,7 +39,9 @@ Tools that support `@` imports include these automatically:
   `omnigraph-catalog` (the `__manifest` catalog: graph branch registrations
   and lineage, the publish), `omnigraph-seams` (the one seam type every
   test-time substitution uses; RFC 0066), engine (`omnigraph-engine`
-  package), policy, API types, cluster, CLI, server, Azure admission
+  package), policy, API types, cluster, CLI,
+  `omnigraph-skill` (rooted at `skills/`; embeds the `skills/omnigraph` agent
+  skill in the CLI), server, Azure admission
   wrapper, benchmark harness,
   `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
   test per case), and `omnigraph-dst` (deterministic simulation testing; needs
@@ -209,6 +211,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   rows with v1's. A defect seen on v1 is fixed on v2
   (`crates/omnigraph/src/engine/`); a v1 edit needs the pin updated in the
   same PR and a reviewer's eyes.
+- A change to what an operation reads or writes in storage adds or updates
+  its row in the DST storage-cost golden,
+  `crates/omnigraph-dst/cost_table.txt`, and the pull request explains every
+  changed line ([testing](docs/dev/testing.md#dst-storage-cost-golden)).
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries

@@ -269,6 +269,14 @@ scenarios:
     text: |
       --- mutate
       query add() { insert Item { key: "c", val: 3 } }
+- id: tiny-mutate-unattached
+  fixture: fixtures/tiny_graph.gqt
+  workload: workloads/tiny_mutate_unattached.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query add() as unattached branch { insert Item { key: "c", val: 3 } }
 - id: tiny-post-reopen
   fixture: fixtures/tiny_graph.gqt
   workload: workloads/tiny_post_reopen.gqt
@@ -385,6 +393,22 @@ scenarios:
     text: |
       --- mutate
       query next_write() { update HistoryRow set { value: 1 } where key = "hot" }
+- id: very-long-history-32-write-unattached
+  fixture: fixtures/very_long_history_32.gqt
+  workload: workloads/very_long_history_write_unattached.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query next_write() as unattached branch { update HistoryRow set { value: 1 } where key = "hot" }
+- id: unattached-chain-32-write
+  fixture: fixtures/unattached_chain_32.gqt
+  workload: workloads/very_long_history_write_unattached.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query next_write() as unattached branch { update HistoryRow set { value: 1 } where key = "hot" }
 - id: e2e-merge-all-changed
   fixture: fixtures/e2e_merge_all_changed.gqt
   workload: workloads/e2e_merge_all_changed.gqt
@@ -1129,6 +1153,10 @@ groups:
   - equal-current-wide-four-batches
   local-smoke:
   - branch-merge-d50-warm
+  unattached-writes:
+  - tiny-mutate-unattached
+  - very-long-history-32-write-unattached
+  - unattached-chain-32-write
   search:
   - nearest-ranks-updated-embedding
   - nearest-skips-deleted-rows-and-fills-limit

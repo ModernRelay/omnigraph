@@ -3,6 +3,7 @@ use crate::helpers;
 use crate::helpers::*;
 use arrow_array::{Array, Int32Array};
 use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 
@@ -394,6 +395,153 @@ async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation(
             .to_string()
             .contains("node type 'Person' does not exist at this snapshot"),
         "unexpected cross-incarnation refusal: {error}"
+    );
+}
+
+/// A historical query binds a current property by its stable property id, as
+/// it binds a type by its table identity. A same-name re-add is a new property
+/// lifetime and must not read the dropped one's values; a rename since and an
+/// addition since have no column of the current lifetime under the current
+/// name. Each refuses as BadRequest instead of answering from another lifetime.
+#[tokio::test]
+async fn historical_query_binds_properties_by_identity_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(
+        Omnigraph::init(
+            uri,
+            "node Person {\n    name: String @key\n    note: String?\n    memo: String?\n}\n\
+             edge Knows: Person -> Person {\n    since: I32?\n}\n",
+        )
+        .await
+        .unwrap(),
+    );
+    db.load(
+        "main",
+        concat!(
+            r#"{"type":"Person","data":{"name":"Alice","note":"secret","memo":"kept"}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Bob"}}"#,
+            "\n",
+            r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"since":2020}}"#,
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let before = version_main(&db).await.unwrap();
+    let before_snapshot = db.resolve_snapshot("main").await.unwrap();
+
+    db.apply_schema(
+        "node Person {\n    name: String @key\n    note: String?\n    remark: String? @rename_from(\"memo\")\n}\n\
+         edge Knows: Person -> Person {\n    since: I32?\n}\n",
+    )
+    .await
+    .unwrap();
+    db.apply_schema(
+        "node Person {\n    name: String @key\n    remark: String?\n}\n\
+         edge Knows: Person -> Person\n",
+    )
+    .await
+    .unwrap();
+    db.apply_schema(
+        "node Person {\n    name: String @key\n    remark: String?\n    note: String?\n    age: I32?\n}\n\
+         edge Knows: Person -> Person {\n    since: I32?\n}\n",
+    )
+    .await
+    .unwrap();
+
+    let note = "query q() { match { $p: Person { name: \"Alice\" } } return { $p.note } }";
+    let live = query_main(&db, note, "q", &ParamMap::new()).await.unwrap();
+    assert!(
+        collect_column_strings(live.batches(), "p.note").is_empty(),
+        "the re-added property starts empty on the live branch"
+    );
+
+    let missing = |property: &str, owner: &str| {
+        format!("property '{property}' of {owner} does not exist at this snapshot")
+    };
+    for (source, expected) in [
+        (note.to_string(), missing("note", "node type 'Person'")),
+        (
+            "query q() { match { $p: Person\n $p.note = \"secret\" } return { $p.name } }"
+                .to_string(),
+            missing("note", "node type 'Person'"),
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name, $p.remark } }".to_string(),
+            "property 'remark' of node type 'Person' is named 'memo' at this snapshot; \
+             a historical query cannot read a property across a rename"
+                .to_string(),
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name, $p.age } }".to_string(),
+            missing("age", "node type 'Person'"),
+        ),
+        (
+            "query q() { match { $p: Person $p $k:knows $f } return { $f.name, $k.since } }"
+                .to_string(),
+            missing("since", "edge type 'Knows'"),
+        ),
+    ] {
+        let at_version = db
+            .run_query_at(before, &source, "q", &ParamMap::new())
+            .await
+            .expect_err("a property lifetime absent at the snapshot must refuse");
+        let at_snapshot = db
+            .query(
+                ReadTarget::Snapshot(before_snapshot.clone()),
+                &source,
+                "q",
+                &ParamMap::new(),
+            )
+            .await
+            .expect_err("a property lifetime absent at the snapshot must refuse");
+        for error in [at_version, at_snapshot] {
+            assert!(
+                matches!(
+                    error,
+                    OmniError::Manifest(ref error)
+                        if error.kind == ManifestErrorKind::BadRequest
+                            && error.message == expected
+                ),
+                "{source}: expected BadRequest {expected:?}; got {error:?}"
+            );
+        }
+    }
+
+    let whole_node = db
+        .run_query_at(
+            before,
+            "query q() { match { $p: Person } return { $p } }",
+            "q",
+            &ParamMap::new(),
+        )
+        .await
+        .expect_err("a whole node reads every current property");
+    assert!(
+        matches!(
+            whole_node,
+            OmniError::Manifest(ref error)
+                if error.kind == ManifestErrorKind::BadRequest
+                    && error.message.contains(" at this snapshot")
+        ),
+        "{whole_node:?}"
+    );
+
+    let names = db
+        .run_query_at(
+            before,
+            "query q() { match { $p: Person } return { $p.name } order { $p.name asc } }",
+            "q",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_column_strings(names.batches(), "p.name"),
+        vec!["Alice".to_string(), "Bob".to_string()],
+        "a property kept under its own name and lifetime still reads at the snapshot"
     );
 }
 

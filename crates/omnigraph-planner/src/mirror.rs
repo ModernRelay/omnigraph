@@ -21,15 +21,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::aggregate::AggregateSpec;
 use crate::bound::{BoundPlan, ValueTable};
-use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
+use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy};
 use crate::error::PlanError;
 use crate::logical::{
-    ColumnRef, GqFilter, KeyJoinKind, Predicate, RuntimeFilterSpec, ScanAccess, ScanSpec,
+    ColumnRef, CsvSourceSpec, FragmentWriteSpec, GqFilter, KeyJoinKind, Predicate,
+    RuntimeFilterSpec, ScanAccess, ScanSpec, ValidateSpec,
 };
 use crate::operation::TableRef;
 use crate::physical::{
-    Assumptions, Estimate, Hop, HydratedBinding, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan,
-    Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
+    Assumptions, Eligibility, EmptyEligible, Estimate, Hop, HydratedBinding, NearestPolicy, NodeId,
+    OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankArm, RankKind,
+    RankScope, RankedAccess, ScanInput, StatisticSource,
 };
 use crate::source::SideId;
 use omnigraph_compiler::types::{AggSignature, ExprType};
@@ -314,6 +316,7 @@ pub enum NodeMirror {
         outer_var: String,
         predicate: SubqueryPredicateMirror,
         aggregate: Option<AggregateSpec>,
+        strategy: AntiJoinStrategy,
     },
     OuterReference {
         outer_var: String,
@@ -342,6 +345,23 @@ pub enum NodeMirror {
         order_by: Vec<OrderingMirror>,
         fetch: Option<usize>,
         tiebreak: Vec<ColumnRef>,
+    },
+    CsvSource {
+        spec: CsvSourceSpec,
+        max_partitions: u32,
+        max_workers: u32,
+    },
+    Validate {
+        input: NodeId,
+        table: String,
+        checks: Vec<ValidateSpec>,
+        max_workers: u32,
+    },
+    FragmentWrite {
+        input: NodeId,
+        spec: FragmentWriteSpec,
+        max_input_bytes: u64,
+        max_workers: u32,
     },
 }
 
@@ -497,12 +517,14 @@ impl From<&PhysicalNode> for NodeMirror {
                 outer_var,
                 predicate,
                 aggregate,
+                strategy,
             } => Self::AntiJoin {
                 input: *input,
                 inner: *inner,
                 outer_var: outer_var.clone(),
                 predicate: SubqueryPredicateMirror::from(predicate),
                 aggregate: *aggregate,
+                strategy: *strategy,
             },
             PhysicalNode::OuterReference { outer_var } => Self::OuterReference {
                 outer_var: outer_var.clone(),
@@ -556,6 +578,37 @@ impl From<&PhysicalNode> for NodeMirror {
                 order_by: order_by.iter().map(OrderingMirror::from).collect(),
                 fetch: *fetch,
                 tiebreak: tiebreak.clone(),
+            },
+            PhysicalNode::CsvSource {
+                spec,
+                max_partitions,
+                max_workers,
+            } => Self::CsvSource {
+                spec: spec.as_ref().clone(),
+                max_partitions: *max_partitions,
+                max_workers: *max_workers,
+            },
+            PhysicalNode::Validate {
+                input,
+                table,
+                checks,
+                max_workers,
+            } => Self::Validate {
+                input: *input,
+                table: table.clone(),
+                checks: checks.clone(),
+                max_workers: *max_workers,
+            },
+            PhysicalNode::FragmentWrite {
+                input,
+                spec,
+                max_input_bytes,
+                max_workers,
+            } => Self::FragmentWrite {
+                input: *input,
+                spec: spec.as_ref().clone(),
+                max_input_bytes: *max_input_bytes,
+                max_workers: *max_workers,
             },
         }
     }
@@ -695,12 +748,14 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 outer_var,
                 predicate,
                 aggregate,
+                strategy,
             } => Self::AntiJoin {
                 input,
                 inner,
                 outer_var,
                 predicate: SubqueryPredicate::from(predicate),
                 aggregate,
+                strategy,
             },
             NodeMirror::OuterReference { outer_var } => Self::OuterReference { outer_var },
             NodeMirror::RankFuse {
@@ -753,6 +808,37 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 fetch,
                 tiebreak,
             },
+            NodeMirror::CsvSource {
+                spec,
+                max_partitions,
+                max_workers,
+            } => Self::CsvSource {
+                spec: Box::new(spec),
+                max_partitions,
+                max_workers,
+            },
+            NodeMirror::Validate {
+                input,
+                table,
+                checks,
+                max_workers,
+            } => Self::Validate {
+                input,
+                table,
+                checks,
+                max_workers,
+            },
+            NodeMirror::FragmentWrite {
+                input,
+                spec,
+                max_input_bytes,
+                max_workers,
+            } => Self::FragmentWrite {
+                input,
+                spec: Box::new(spec),
+                max_input_bytes,
+                max_workers,
+            },
         })
     }
 }
@@ -793,6 +879,8 @@ pub struct RankedMirror {
     pub scope: RankScope,
     pub overfetch: Vec<OverfetchRung>,
     pub prefilter: Option<PrefilterMirror>,
+    pub eligibility: Eligibility,
+    pub policy: Option<NearestPolicy>,
 }
 
 impl From<&RankedAccess> for RankedMirror {
@@ -807,6 +895,8 @@ impl From<&RankedAccess> for RankedMirror {
             scope: ranked.scope,
             overfetch: ranked.overfetch.clone(),
             prefilter: ranked.prefilter.as_ref().map(PrefilterMirror::from),
+            eligibility: ranked.eligibility,
+            policy: ranked.policy,
         }
     }
 }
@@ -823,6 +913,8 @@ impl From<RankedMirror> for RankedAccess {
             scope: mirror.scope,
             overfetch: mirror.overfetch,
             prefilter: mirror.prefilter.map(Prefilter::from),
+            eligibility: mirror.eligibility,
+            policy: mirror.policy,
         }
     }
 }
@@ -838,6 +930,8 @@ pub struct PrefilterMirror {
     pub ranked_type: String,
     pub hops: Vec<HopMirror>,
     pub feeds: Vec<NodeId>,
+    pub on_empty: EmptyEligible,
+    pub coverage_admits: bool,
 }
 
 impl From<&Prefilter> for PrefilterMirror {
@@ -853,6 +947,8 @@ impl From<&Prefilter> for PrefilterMirror {
                 })
                 .collect(),
             feeds: prefilter.feeds.clone(),
+            on_empty: prefilter.on_empty,
+            coverage_admits: prefilter.coverage_admits,
         }
     }
 }
@@ -870,6 +966,8 @@ impl From<PrefilterMirror> for Prefilter {
                 })
                 .collect(),
             feeds: mirror.feeds,
+            on_empty: mirror.on_empty,
+            coverage_admits: mirror.coverage_admits,
         }
     }
 }
@@ -1374,6 +1472,7 @@ pub enum ExprMirror {
     },
     Aggregate {
         func: AggFuncMirror,
+        distinct: bool,
         arg: Box<ExprMirror>,
         signature: AggSignature,
     },
@@ -1483,10 +1582,12 @@ impl From<&IRExpr> for ExprMirror {
             },
             IRExpr::Aggregate {
                 func,
+                distinct,
                 arg,
                 signature,
             } => Self::Aggregate {
                 func: AggFuncMirror::from(*func),
+                distinct: *distinct,
                 arg: boxed(arg),
                 signature: signature.clone(),
             },
@@ -1587,10 +1688,12 @@ impl From<ExprMirror> for IRExpr {
             ExprMirror::Literal { value, ty } => Self::Literal(Literal::from(value), ty),
             ExprMirror::Aggregate {
                 func,
+                distinct,
                 arg,
                 signature,
             } => Self::Aggregate {
                 func: AggFunc::from(func),
+                distinct,
                 arg: unboxed(*arg),
                 signature,
             },
@@ -1713,12 +1816,74 @@ impl From<OrderingMirror> for IROrdering {
     }
 }
 
+/// One typed order key of a node's declared output order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "key", rename_all = "snake_case")]
+pub enum OrderKeyMirror {
+    Column {
+        name: String,
+    },
+    Expr {
+        expr: ExprMirror,
+        descending: bool,
+        nulls_first: bool,
+    },
+    Identity {
+        column: ColumnRef,
+    },
+    Fused {
+        bindings: Vec<String>,
+    },
+}
+
+impl From<&OrderKey> for OrderKeyMirror {
+    fn from(key: &OrderKey) -> Self {
+        match key {
+            OrderKey::Column(name) => Self::Column { name: name.clone() },
+            OrderKey::Expr {
+                expr,
+                descending,
+                nulls_first,
+            } => Self::Expr {
+                expr: ExprMirror::from(expr),
+                descending: *descending,
+                nulls_first: *nulls_first,
+            },
+            OrderKey::Identity(column) => Self::Identity {
+                column: column.clone(),
+            },
+            OrderKey::Fused { bindings } => Self::Fused {
+                bindings: bindings.clone(),
+            },
+        }
+    }
+}
+
+impl From<OrderKeyMirror> for OrderKey {
+    fn from(mirror: OrderKeyMirror) -> Self {
+        match mirror {
+            OrderKeyMirror::Column { name } => Self::Column(name),
+            OrderKeyMirror::Expr {
+                expr,
+                descending,
+                nulls_first,
+            } => Self::Expr {
+                expr: IRExpr::from(expr),
+                descending,
+                nulls_first,
+            },
+            OrderKeyMirror::Identity { column } => Self::Identity(column),
+            OrderKeyMirror::Fused { bindings } => Self::Fused { bindings },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PropertiesMirror {
     pub schema: Vec<FieldMirror>,
     #[serde(default)]
     pub schema_metadata: HashMap<String, String>,
-    pub ordering: Option<Vec<String>>,
+    pub ordering: Option<Vec<OrderKeyMirror>>,
     pub rows: Estimate,
     pub work_bytes: Estimate,
     pub retained_limit: Option<u64>,
@@ -1735,7 +1900,10 @@ impl From<&Properties> for PropertiesMirror {
                 .map(|field| FieldMirror::from(field.as_ref()))
                 .collect(),
             schema_metadata: properties.schema.metadata().clone(),
-            ordering: properties.ordering.clone(),
+            ordering: properties
+                .ordering
+                .as_ref()
+                .map(|keys| keys.iter().map(OrderKeyMirror::from).collect()),
             rows: properties.rows,
             work_bytes: properties.work_bytes,
             retained_limit: properties.retained_limit,
@@ -1760,7 +1928,9 @@ impl TryFrom<PropertiesMirror> for Properties {
         let schema: SchemaRef = Arc::new(Schema::new_with_metadata(fields, mirror.schema_metadata));
         Ok(Self {
             schema,
-            ordering: mirror.ordering,
+            ordering: mirror
+                .ordering
+                .map(|keys| keys.into_iter().map(OrderKey::from).collect()),
             rows: mirror.rows,
             work_bytes: mirror.work_bytes,
             retained_limit: mirror.retained_limit,

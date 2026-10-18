@@ -3,11 +3,36 @@ use super::*;
 
 mod capture;
 mod pending;
+mod source;
+
+pub(super) fn outcome_exit(state: &str) -> Result<Option<i32>> {
+    Ok(match state {
+        "converged" => Some(0),
+        "failed" => Some(1),
+        "refused" | "blocked" => Some(2),
+        "partially_converged" => Some(3),
+        "recovery_required" => Some(4),
+        "stalled" => Some(5),
+        "cancelled" => Some(6),
+        "proposed" | "offered" | "running" => None,
+        _ => return Err(Failure::protocol()),
+    })
+}
+
+fn operation_exit(body: &Value) -> Result<Option<i32>> {
+    outcome_exit(
+        body.pointer("/data/state")
+            .and_then(Value::as_str)
+            .ok_or_else(Failure::protocol)?,
+    )
+}
 
 pub(super) fn handles(command: &ClusterCommand) -> bool {
     matches!(
         command,
         ClusterCommand::Create { .. }
+            | ClusterCommand::List { .. }
+            | ClusterCommand::Pull { .. }
             | ClusterCommand::Delete { .. }
             | ClusterCommand::UndoDelete { .. }
             | ClusterCommand::Push { .. }
@@ -15,8 +40,8 @@ pub(super) fn handles(command: &ClusterCommand) -> bool {
     )
 }
 
-fn client(origin: &str) -> Result<Api> {
-    Api::authenticated(origin.into())
+async fn client(origin: &str, organization: Option<&str>) -> Result<Api> {
+    Api::authenticated(origin.into(), organization).await
 }
 
 fn context_required(config: &Path) -> Result<Context> {
@@ -28,10 +53,25 @@ fn context_required(config: &Path) -> Result<Context> {
     })
 }
 
-pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
+pub(super) async fn dispatch(
+    command: &ClusterCommand,
+    stderr: &mut dyn Write,
+) -> Result<(Value, i32)> {
     let (config, _) = config_and_json(command);
     match command {
-        ClusterCommand::Create { name, api, run, .. } => {
+        ClusterCommand::List {
+            api, organization, ..
+        } => source::list(config, api, organization.as_deref()).await,
+        ClusterCommand::Pull { out, revision, .. } => {
+            source::pull(config, out, revision.as_deref()).await
+        }
+        ClusterCommand::Create {
+            name,
+            api,
+            organization,
+            run,
+            ..
+        } => {
             if name.is_empty()
                 || name.len() > 64
                 || name.trim() != name
@@ -44,18 +84,22 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
             }
             let origin = canonical_origin(api)?;
             let body = json!({"name":name});
+            let context = read_context(config)?;
+            let selected =
+                selected_organization(context.as_ref(), &origin, organization.as_deref())?;
             submit(
-                &client(&origin)?,
+                &client(&origin, selected).await?,
                 Submission {
                     config,
                     path: "/v1/clusters".into(),
                     body,
                     kind: "create",
-                    context: read_context(config)?,
+                    context,
                     incarnation: None,
                     run,
                     tombstone: false,
                 },
+                stderr,
             )
             .await
         }
@@ -87,7 +131,7 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
             };
             let path = format!("/v1/clusters/{}:{kind}", context.cluster);
             submit(
-                &client(&context.api)?,
+                &client(&context.api, Some(&context.organization_id)).await?,
                 Submission {
                     config,
                     path,
@@ -98,12 +142,14 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
                     run,
                     tombstone,
                 },
+                stderr,
             )
             .await
         }
         ClusterCommand::Operation {
             operation_id: id,
             api,
+            organization,
             wait,
             timeout,
             ..
@@ -129,7 +175,9 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
                     ));
                 }
             };
-            let api = client(&origin)?;
+            let selected =
+                selected_organization(context.as_ref(), &origin, organization.as_deref())?;
+            let api = client(&origin, selected).await?;
             let options = ClusterRunArgs {
                 no_wait: !wait,
                 timeout: *timeout,
@@ -155,7 +203,7 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
             };
             let identity = Identity::read(&body, None)?;
             identity.matches(context.as_ref(), None, Some(id))?;
-            wait_operation(&api, body, &identity, &options, deadline, false).await
+            wait_operation(&api, body, &identity, &options, deadline, false, stderr).await
         }
         ClusterCommand::Push {
             expected_revision,
@@ -177,7 +225,8 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
             }
             let context = context_required(config)?;
             let body = capture::request(config, expected_revision, message)?;
-            let body = client(&context.api)?
+            let body = client(&context.api, Some(&context.organization_id))
+                .await?
                 .request(
                     Method::POST,
                     &format!("/v1/clusters/{}/config", context.cluster),
@@ -210,6 +259,13 @@ struct Identity {
 }
 
 impl Identity {
+    fn diagnostic(&self, stderr: &mut dyn Write, message: std::fmt::Arguments<'_>) -> Result<()> {
+        write_diagnostic(stderr, message).map_err(|mut error| {
+            error.body["accepted_operation"] = serde_json::to_value(self).expect("string identity");
+            error
+        })
+    }
+
     fn read(body: &Value, expected_kind: Option<&str>) -> Result<Self> {
         let get = |field: &str| body["data"][field].as_str().ok_or_else(Failure::protocol);
         let cluster_id = get("cluster_id")?;
@@ -232,7 +288,7 @@ impl Identity {
                 "lifecycle response identity or action differs from the request",
             ));
         }
-        run_exit(body)?;
+        operation_exit(body)?;
         Ok(Self {
             cluster_id: cluster_id.into(),
             incarnation: incarnation.into(),
@@ -277,27 +333,12 @@ struct PrincipalIdentity {
     account_id: String,
 }
 
-async fn principal(api: &Api, deadline: Instant) -> Result<PrincipalIdentity> {
-    let response = tokio::time::timeout_at(
-        deadline,
-        api.request(Method::GET, "/v1/auth/session", None, None),
-    )
-    .await
-    .map_err(|_| {
-        Failure::new(
-            "wait_timeout",
-            "principal lookup exceeded the local deadline",
-            5,
-        )
-    })??;
-    let identity: PrincipalIdentity =
-        serde_json::from_value(response["data"].clone()).map_err(|_| Failure::protocol())?;
-    for field in [&identity.principal_id, &identity.account_id] {
-        if field.is_empty() || field.len() > 256 || field.chars().any(char::is_control) {
-            return Err(Failure::protocol());
-        }
-    }
-    Ok(identity)
+fn principal(api: &Api) -> Result<PrincipalIdentity> {
+    let selected = api.selection.as_ref().ok_or_else(Failure::protocol)?;
+    Ok(PrincipalIdentity {
+        principal_id: selected.principal_id.clone(),
+        account_id: selected.account_id.clone(),
+    })
 }
 
 fn definitive_refusal(response: &Response) -> bool {
@@ -343,29 +384,40 @@ fn definitive_refusal(response: &Response) -> bool {
     )
 }
 
-async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
+async fn submit(
+    api: &Api,
+    mut intent: Submission<'_>,
+    stderr: &mut dyn Write,
+) -> Result<(Value, i32)> {
     let lock = pending::lock(intent.config)?;
     let current = read_context(intent.config)?;
     if intent.kind == "create" {
         intent.context = current;
-    } else if current.as_ref().map(|c| (&c.api, &c.cluster))
-        != intent.context.as_ref().map(|c| (&c.api, &c.cluster))
+    } else if current
+        .as_ref()
+        .map(|c| (&c.api, &c.cluster, &c.organization_id))
+        != intent
+            .context
+            .as_ref()
+            .map(|c| (&c.api, &c.cluster, &c.organization_id))
     {
         return Err(Failure::refused(
             "context_mismatch",
             "folder context changed before submission",
         ));
     }
-    if intent.context.as_ref().is_some_and(|c| c.api != api.origin) {
+    if intent.context.as_ref().is_some_and(|c| {
+        c.api != api.origin || !api.account_id().is_ok_and(|org| org == c.organization_id)
+    }) {
         return Err(Failure::refused(
             "context_mismatch",
             "the pending create uses another API origin",
         ));
     }
     let deadline = Instant::now() + Duration::from_secs(intent.run.timeout.unwrap_or(300));
-    // The service scopes idempotency to the principal. The same captured bearer
-    // performs this read and the submission, including after a session renewal.
-    let principal = principal(api, deadline).await?;
+    // Idempotency belongs to the selected account and principal. The captured
+    // identity owns the submission, including after a session renewal.
+    let principal = principal(api)?;
     let pending = pending::prepare(
         intent.config,
         &api.origin,
@@ -374,6 +426,7 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
         &principal,
         intent.run.idempotency_key.as_deref(),
         intent.kind == "create" && intent.context.is_some(),
+        stderr,
     )?;
     let response = tokio::time::timeout_at(
         deadline,
@@ -418,7 +471,8 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
             pending::bind(
                 intent.config,
                 &Context {
-                    version: 1,
+                    version: 2,
+                    organization_id: principal.account_id.clone(),
                     cluster: identity.cluster_id.clone(),
                     api: api.origin.clone(),
                 },
@@ -440,6 +494,7 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
         intent.run,
         deadline,
         intent.tombstone,
+        stderr,
     )
     .await
 }
@@ -451,39 +506,46 @@ async fn wait_operation(
     options: &ClusterRunArgs,
     deadline: Instant,
     tombstone: bool,
+    stderr: &mut dyn Write,
 ) -> Result<(Value, i32)> {
     if options.no_wait {
         return Ok((body, 0));
     }
     loop {
-        if let Some(exit) = run_exit(&body)? {
+        if let Some(exit) = operation_exit(&body)? {
             return Ok((body, exit));
         }
         let phase = body
             .pointer("/data/lifecycle/phase")
             .and_then(Value::as_str)
             .unwrap_or("pending");
-        eprintln!(
-            "operation {}: {} ({phase})",
-            identity.operation_id,
-            body["data"]["state"].as_str().unwrap_or("pending")
-        );
+        identity.diagnostic(
+            stderr,
+            format_args!(
+                "operation {}: {} ({phase})\n",
+                identity.operation_id,
+                body["data"]["state"].as_str().unwrap_or("pending")
+            ),
+        )?;
         if tombstone && phase == "tombstoned" {
-            eprintln!(
-                "undo deadline: {}",
-                body.pointer("/data/lifecycle/purgeAfter")
-                    .and_then(Value::as_str)
-                    .ok_or_else(Failure::protocol)?
-            );
+            identity.diagnostic(
+                stderr,
+                format_args!(
+                    "undo deadline: {}\n",
+                    body.pointer("/data/lifecycle/purgeAfter")
+                        .and_then(Value::as_str)
+                        .ok_or_else(Failure::protocol)?
+                ),
+            )?;
             return Ok((body, 0));
         }
         let next = Instant::now() + POLL_INTERVAL;
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
-            eprintln!(
-                "wait deadline reached; operation {} continues; use cluster operation --managed {}",
+            identity.diagnostic(stderr, format_args!(
+                "wait deadline reached; operation {} continues; use cluster operation --managed {}\n",
                 identity.operation_id, identity.operation_id
-            );
+            ))?;
             return Ok((body, 5));
         }
         tokio::time::sleep_until(next).await;
@@ -514,5 +576,94 @@ async fn wait_operation(
             Some(&identity.operation_id),
         )?;
         body = next_body;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed::tests::{FailedOutput, OutputFault};
+    use crate::managed_http_fixture::IntentApiFixture;
+
+    #[tokio::test]
+    async fn undelivered_operation_progress_retains_identity_without_polling() {
+        for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+            let server = IntentApiFixture::new(vec![]);
+            let api =
+                Api::new(server.origin.clone(), Some("automation-secret".to_owned())).unwrap();
+            let identity = Identity {
+                cluster_id: "cluster-original".to_owned(),
+                incarnation: "incarnation-original".to_owned(),
+                operation_id: "operation-original".to_owned(),
+                kind: "create".to_owned(),
+            };
+            let options = ClusterRunArgs {
+                no_wait: false,
+                timeout: Some(30),
+                idempotency_key: None,
+            };
+            let error = wait_operation(
+                &api,
+                json!({"data":{"state":"running"}}),
+                &identity,
+                &options,
+                Instant::now() + Duration::from_secs(30),
+                false,
+                &mut FailedOutput::new(fault, 0),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.body["type"], "output_delivery_failed");
+            assert_eq!(error.exit, 1);
+            assert_eq!(
+                error.body["accepted_operation"],
+                serde_json::to_value(&identity).unwrap()
+            );
+            assert!(server.requests().is_empty());
+            server.assert_complete();
+        }
+    }
+
+    #[test]
+    fn undelivered_pending_key_does_not_replace_saved_recovery_state() {
+        for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+            let temp = tempfile::tempdir().unwrap();
+            let _lock = pending::lock(temp.path()).unwrap();
+            let principal = PrincipalIdentity {
+                principal_id: "principal-original".to_owned(),
+                account_id: "org_original".to_owned(),
+            };
+            let request = json!({"name":"original"});
+            let mut delivered = Vec::new();
+            let original = pending::prepare(
+                temp.path(),
+                "https://api.example",
+                "/v1/clusters",
+                &request,
+                &principal,
+                Some("original-key"),
+                false,
+                &mut delivered,
+            )
+            .unwrap();
+            assert_eq!(delivered, b"Idempotency-Key: original-key\n");
+            let path = temp.path().join(".omnigraph/pending-lifecycle.json");
+            let before = std::fs::read(&path).unwrap();
+            let error = pending::prepare(
+                temp.path(),
+                "https://api.example",
+                "/v1/clusters",
+                &request,
+                &principal,
+                None,
+                false,
+                &mut FailedOutput::new(fault, 0),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.body["type"], "output_delivery_failed");
+            assert_eq!(error.body["idempotency_key"], original.idempotency_key);
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
     }
 }

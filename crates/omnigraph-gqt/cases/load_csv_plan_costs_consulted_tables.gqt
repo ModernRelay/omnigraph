@@ -1,0 +1,66 @@
+# issue: none
+# traversal: auto
+# notes: The same CSV input probes a large indexed endpoint table and scans a small one.
+# notes: The traversal header prepares the seed's indexes without pinning load access.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Small { id: String @key }
+node Large { id: String @key }
+edge SmallLink: Small -> Small
+edge LargeLink: Large -> Large
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Small
+    rows: 8
+    commits: 1
+    columns:
+      id: {kind: key, prefix: p-, width: 4}
+  - kind: node
+    name: Large
+    rows: 1024
+    commits: 1
+    columns:
+      id: {kind: key, prefix: p-, width: 4}
+
+--- csv links.csv
+from,to
+p-0000,p-0001
+p-0001,p-0002
+
+--- mutate
+load csv "links.csv" into edge:SmallLink mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:SmallLink from Small: access scan
+load validate edge_ri edge:SmallLink to Small: access scan
+load executed: partitions 1 rows 2
+
+--- mutate
+load csv "links.csv" into edge:LargeLink mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:LargeLink from Large: access probe
+load validate edge_ri edge:LargeLink to Large: access probe
+load executed: partitions 1 rows 2
+
+--- query
+query small_rows() { match { $a: Small $a smallLink $b } return { count($b) as n } }
+--- expect unordered
+{"n":2}
+--- expect shape
+n: I64
+
+--- query
+query large_rows() { match { $a: Large $a largeLink $b } return { count($b) as n } }
+--- expect unordered
+{"n":2}
+--- expect shape
+n: I64

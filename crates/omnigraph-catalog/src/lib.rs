@@ -261,7 +261,7 @@ pub struct Snapshot {
     /// version (see `ManifestState::schema_contract`).
     schema_contract: Option<SchemaContractHead>,
     contract_source: ContractSource,
-    manifest_dataset: Option<Dataset>,
+    manifest_dataset: Option<Arc<Dataset>>,
     captured_contract: Option<Arc<SchemaContractRow>>,
     /// Logical graph branch used to capture this snapshot, including historical reads.
     graph_branch: Option<String>,
@@ -274,12 +274,19 @@ pub struct Snapshot {
     /// snapshots, time-travel / Snapshot-id reads, and directly-built test
     /// snapshots, which fall back to a plain open.
     read_caches: Option<SnapshotReadCaches>,
+    /// Table keys this view pins at a version the accepted contract it plans
+    /// against was not published with: set by `bind_catalog_aliases` on a
+    /// historical query view, empty on every other view.
+    uncovered_tables: HashSet<String>,
 }
 
 #[derive(Clone)]
 pub struct SnapshotReadCaches {
     pub session: Arc<lance::session::Session>,
     pub handles: Arc<TableHandleCache>,
+    /// A statement-scoped store wrapper (the load read memo); `None` on the
+    /// graph-lifetime caches live Branch reads attach.
+    pub table_wrapper: Option<Arc<omnigraph_core::read_memo::RangeMemoWrapper>>,
 }
 
 impl std::fmt::Debug for SnapshotReadCaches {
@@ -560,6 +567,51 @@ impl SnapshotDataset {
 }
 
 impl Snapshot {
+    /// Conservative allocation of `clone`, excluding immutable state shared by Arc.
+    /// Includes collection growth and owned strings without allocating to measure them.
+    pub fn clone_allocation_bytes(&self) -> usize {
+        fn text(value: &str) -> usize {
+            value.len().saturating_mul(2).saturating_add(32)
+        }
+        fn slots<T>(capacity: usize) -> usize {
+            capacity
+                .saturating_mul(std::mem::size_of::<T>().saturating_add(1))
+                .saturating_mul(4)
+        }
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(text(&self.root_uri))
+            .saturating_add(slots::<(String, DatasetEntry)>(self.entries.capacity()))
+            .saturating_add(slots::<(String, String)>(self.graph_heads.capacity()))
+            .saturating_add(slots::<String>(self.uncovered_tables.capacity()));
+        for (key, entry) in &self.entries {
+            bytes = bytes
+                .saturating_add(text(key))
+                .saturating_add(text(&entry.type_key))
+                .saturating_add(text(&entry.dataset_path))
+                .saturating_add(entry.native_dataset_branch.as_deref().map_or(0, text))
+                .saturating_add(entry.version_metadata.clone_allocation_bytes());
+        }
+        for (branch, head) in &self.graph_heads {
+            bytes = bytes
+                .saturating_add(text(branch))
+                .saturating_add(text(head));
+        }
+        for table in &self.uncovered_tables {
+            bytes = bytes.saturating_add(text(table));
+        }
+        if let Some(contract) = &self.schema_contract {
+            bytes = bytes
+                .saturating_add(text(&contract.schema_ir_hash))
+                .saturating_add(text(&contract.schema_identity_domain));
+        }
+        if let ContractSource::Archive(Some(hash)) = &self.contract_source {
+            bytes = bytes.saturating_add(text(hash));
+        }
+        bytes
+            .saturating_add(self.graph_branch.as_deref().map_or(0, text))
+            .saturating_add(self.native_branch.as_deref().map_or(0, text))
+    }
+
     pub fn graph_branch(&self) -> Option<&str> {
         self.graph_branch.as_deref()
     }
@@ -615,7 +667,13 @@ impl Snapshot {
     /// table lifetime under its current name. Conversely, a reused name whose
     /// current identity is absent from the historical snapshot is removed from
     /// the execution view, preventing cross-incarnation adoption.
-    pub fn bind_catalog_aliases(&mut self, catalog: &Catalog) -> Result<()> {
+    ///
+    /// `live` is the live view `catalog` was accepted against. A bound table
+    /// whose pinned version is not exactly the one `live` pins is recorded as
+    /// uncovered (`contract_covers`): the catalog's property names were not
+    /// published with that version, so a read there resolves each property by
+    /// its persisted stable property id instead.
+    pub fn bind_catalog_aliases(&mut self, catalog: &Catalog, live: &Snapshot) -> Result<()> {
         // Freeze the historical identity map before changing any aliases. A
         // renamed-away alias may later be reused by a new live type; resolving
         // that replacement first must not remove the only entry needed to bind
@@ -650,6 +708,7 @@ impl Snapshot {
             }))
             .collect::<Vec<_>>();
 
+        self.uncovered_tables.clear();
         for (table_key, stable_table_id, incarnation_id) in table_aliases {
             let identity = TableIdentity::new(stable_table_id, incarnation_id)?;
 
@@ -658,10 +717,25 @@ impl Snapshot {
             // historical name.
             self.entries.remove(&table_key);
             if let Some(entry) = historical_by_identity.get(&identity) {
+                let covered = live
+                    .entries
+                    .get(&table_key)
+                    .is_some_and(|live_entry| live_entry.same_physical_version(entry));
+                if !covered {
+                    self.uncovered_tables.insert(table_key.clone());
+                }
                 self.entries.insert(table_key, entry.clone());
             }
         }
         Ok(())
+    }
+
+    /// Whether the accepted contract this view plans against was published
+    /// with the version it pins for `type_key`, so its property names name
+    /// that version's columns. False only on a historical query view, for a
+    /// table pinned at a version other than the live one.
+    pub fn contract_covers(&self, type_key: &str) -> bool {
+        !self.uncovered_tables.contains(type_key)
     }
 
     /// Open a backing dataset at its pinned version by qualified graph type key. With read caches present
@@ -706,6 +780,7 @@ impl Snapshot {
                         entry.version_metadata.last_linear_version(),
                         &location,
                         Some(&caches.session),
+                        caches.table_wrapper.clone(),
                     )
                     .await
             }
@@ -829,14 +904,55 @@ impl CapturedManifestProbe {
     }
 }
 
+/// The latest attached version of `dataset`'s location (main or the branch
+/// tree it is checked out on), asked for by name from the version it holds.
+///
+/// `latest_version_id` lists `_versions/`. On a store whose listing is
+/// ordered (S3, GCS, Azure) that is one request returning up to a thousand
+/// keys however few of them are new, and a warm read pays it on every query.
+/// Attached versions are contiguous: Lance writes version `v + 1` only with a
+/// put-if-absent over a read of `v`, and nothing deletes a version of a live
+/// branch's `__manifest`, so while the held version `v` exists the first
+/// absent name above it ends the history. (`cleanup` collects a retired
+/// branch's whole tree; the named-branch probe's identifier read catches
+/// that.) A reclamation of old `__manifest` versions must keep every version
+/// above one a live handle holds.
+///
+/// The probe HEADs `v` and `v + 1` together, then `v + 2` when `v + 1`
+/// exists. `v` must answer: a removed or unreadable `__manifest` answers "not
+/// found" for every name, and only the listing reports it as the failure it
+/// is. A gap of more than two versions, a detached handle, an absent `v` or
+/// any error falls back to the listing, which stays the authority. Like the
+/// listing, the probe relies on the store showing a completed write to a
+/// later request.
+async fn latest_attached_version(dataset: &Dataset) -> lance::Result<u64> {
+    let held = dataset.version().version;
+    if !lance_table::format::is_detached_version(held) {
+        let scheme = dataset.manifest_location().naming_scheme;
+        let base = dataset.branch_location().path;
+        let store = dataset.object_store(None).await?;
+        let [at, next, after] = [held, held + 1, held + 2].map(|v| scheme.manifest_path(&base, v));
+        let (held_present, next_present) = futures::join!(store.exists(&at), store.exists(&next));
+        match (held_present, next_present) {
+            (Ok(true), Ok(false)) => return Ok(held),
+            (Ok(true), Ok(true)) => {
+                if let Ok(false) = store.exists(&after).await {
+                    return Ok(held + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    dataset.latest_version_id().await
+}
+
 async fn probe_dataset_latest_incarnation(
     dataset: &Dataset,
     active_branch: Option<&str>,
 ) -> Result<ManifestIncarnation> {
     if active_branch.is_none() {
         return Ok(ManifestIncarnation {
-            version: dataset
-                .latest_version_id()
+            version: latest_attached_version(dataset)
                 .await
                 .map_err(OmniError::storage)?,
             e_tag: dataset.manifest_location().e_tag.clone(),
@@ -853,8 +969,7 @@ async fn probe_dataset_latest_incarnation(
     // yields the replacement identifier rather than a false match to the held
     // lifetime.
     let held = async {
-        let version = dataset
-            .latest_version_id()
+        let version = latest_attached_version(dataset)
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
         let native = dataset.manifest().branch.as_deref().ok_or_else(|| {
@@ -1311,6 +1426,7 @@ impl ManifestCoordinator {
             graph_branch: None,
             native_branch: None,
             read_caches: None,
+            uncovered_tables: HashSet::new(),
         }
     }
 
@@ -1425,7 +1541,7 @@ impl ManifestCoordinator {
         purpose: &str,
     ) -> Result<Dataset> {
         if let Some(dataset) = &snapshot.manifest_dataset {
-            return Ok(dataset.clone());
+            return Ok(dataset.as_ref().clone());
         }
         if snapshot.graph_branch().is_some() && snapshot.native_branch().is_none() {
             return Err(OmniError::manifest(format!(
@@ -1714,7 +1830,7 @@ impl ManifestCoordinator {
             }
         };
         snapshot.native_branch = native;
-        snapshot.manifest_dataset = Some(dataset);
+        snapshot.manifest_dataset = Some(Arc::new(dataset));
         snapshot.graph_branch = branch
             .filter(|branch| *branch != "main")
             .map(str::to_string);
@@ -1756,7 +1872,7 @@ impl ManifestCoordinator {
         let mut snapshot = Self::snapshot_from_state(&self.root_uri, self.known_state.clone());
         snapshot.native_branch = self.native_branch.clone();
         snapshot.graph_branch = self.active_branch.clone();
-        snapshot.manifest_dataset = Some(self.dataset.clone());
+        snapshot.manifest_dataset = Some(Arc::new(self.dataset.clone()));
         snapshot.captured_contract = self.captured_contract.clone();
         snapshot
     }

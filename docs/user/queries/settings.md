@@ -75,8 +75,11 @@ refuses startup; no default is substituted.
 | `ann_nprobes` | integer, at least `0` | `20` | request | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap |
 | `stage_write_concurrency` | integer `1..=64` | `8` | process | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate` |
 | `traversal_work_limit` | integer `1..=9223372036854775807` | `1000000` | request | `OMNIGRAPH_TRAVERSAL_WORK_LIMIT` | shared traversal row-work cap for statements containing alternatives or wildcard |
-| `write_max_bytes` | integer `1..=33554432` | `33554432` (32 MiB) | request | `OMNIGRAPH_WRITE_MAX_BYTES` | independent row-data and Blob-payload allowances for bounded writes; lowers the existing mutate, load and materializing branch-merge limits |
+| `write_max_bytes` | integer, at least `1` | `33554432` (32 MiB) | request | `OMNIGRAPH_WRITE_MAX_BYTES` | independent row-data and Blob-payload allowances for bounded writes; changes the existing mutate, load and materializing branch-merge limits; a value raised above the default is held in memory as one typed batch at an overwrite load's commit; a `load csv` statement applies it to each staged-write input: an overwrite stages the reader's 8,192-row batches and refuses a batch over it as `staged_write_input_bytes`, while append and merge keep the keyed adapter's ceilings |
+| `load_source_max_bytes` | integer, at least `1` | `33554432` (32 MiB) | request | `OMNIGRAPH_LOAD_SOURCE_MAX_BYTES` | the largest object a `load csv` statement reads, checked before any payload byte is fetched; a served load is additionally bounded by the server's workload admission |
+| `query_memory_bytes` | integer, at least `1` | `157286400` (150 MiB) | request | `OMNIGRAPH_QUERY_MEMORY_BYTES` | the memory pool one read query runs under; operators that cannot spill refuse work beyond it, while spillable operators may use bounded scratch storage; raising it permits more tracked memory per query; a load statement additionally admits its read-reuse buffers (a statement-scoped session, held table handles and a byte-range memo) against a bounded share of this allowance, and runs its reads uncached when the share cannot be admitted; it is also the aggregate allowance of one `load csv` statement's tracked memory: the retained source bytes (captured once per statement and reused by every reprepare attempt), every decoded batch, validation state and the staging working set reserved before the first fragment write; a statement the allowance cannot hold refuses with the `query_memory_bytes` resource error before any fragment write; a CSV load needs roughly the source plus twice its typed input; JSONL loads keep their existing bounds |
 | `history_release_bytes` | integer `1024..=262144` | `262144` | request | `OMNIGRAPH_HISTORY_RELEASE_BYTES` | the byte budget of a branch's buffer of unreleased commits; a mutate, load or branch merge of the session whose buffer and head reach it closes a history block, and the publish after it writes the block under `__history` (schema apply, branch create and delete, repair and upgrade publish under the production budget); a load reaches it only through the CLI or an embedded `Session`, since the HTTP load routes take no settings; query results never change, only the number of requests and files; production keeps the default, a caller may only lower it |
+| `explain_dump_dir` | text | empty (disabled) | process | `OMNIGRAPH_EXPLAIN_DUMP_DIR` | the directory each finished explain document is written into, one `<operation>_<logical_hash>.explain.json` per operation and logical hash; each complete document atomically replaces the previous one at that path; empty disables the write; a failed write reports on stderr and never fails the operation |
 
 For these statements the cap covers all traversals, including named and nested
 ones, and remains shared across retries. It charges consumed source rows,
@@ -109,13 +112,20 @@ captured once for an operation, including its retries and merge publication.
 A one-row keyed write costs about 1 to 3 KiB of row data from Arrow buffer
 rounding, so allowances below a few KiB refuse every write.
 
-The maximum is inclusive. A lower environment value is a process default,
-so a request may still select any valid value up to `33554432`. Embedded
-sessions and direct `--store` CLI loads can override it. HTTP load routes
-inherit the process default and accept no request setting; remote CLI loads
-refuse `--set`. HTTP bodies, Blob reads, compaction and external URI metadata
-retain their independent limits. Lower values can produce smaller merge
-chunks or reject a write that the default admits.
+Neither byte setting has a fixed maximum. A lower environment value is a
+process default, so a request may still select any value of at least `1`.
+Raising `write_max_bytes` above the default admits a larger staged-write
+input (a JSONL load's typed batch, a CSV overwrite's reader batch), held in
+memory at commit; raising `load_source_max_bytes` admits a
+larger `load csv` source object into memory before parsing. On a server both
+stay bounded by workload admission (`OMNIGRAPH_GLOBAL_BYTES_MAX`,
+`OMNIGRAPH_PER_ACTOR_BYTES_MAX`). Embedded sessions and direct `--store` CLI
+loads can override them; a `load csv` statement travels on `/mutate`, whose
+`settings` field and `set` prefix apply. The JSONL HTTP load routes inherit
+the process default and accept no request setting; remote CLI loads of those
+routes refuse `--set`. HTTP bodies, Blob reads, compaction and external URI
+metadata retain their independent limits. Lower values can produce smaller
+merge chunks or reject a write that the default admits.
 
 `history_release_bytes` is measured against the branch's buffered commit and
 table-change rows as stored, plus the head whole; the row layout is in
@@ -140,7 +150,7 @@ settings line's refusal as `ERROR line <n>, column <c>: <message>`.
 set merge_lineage = fast;
 error: unknown value `fast` for setting `merge_lineage`; expected one of off, on, verify
 set traversal = csr;                      (likewise reset traversal; and show traversal;)
-error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, history_release_bytes
+error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir
 set ann_nprobes = "many";
 error: setting `ann_nprobes` takes an integer of at least 0, got a string
 set stage_write_concurrency = 0;
