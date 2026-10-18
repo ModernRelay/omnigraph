@@ -10,7 +10,7 @@ use lance::blob::blob_field;
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::types::{PropType, ScalarType};
+use omnigraph_compiler::types::PropType;
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep, SchemaShape,
     SchemaTypeKind, SystemColumns, build_catalog_from_ir, compile_schema_shape,

@@ -102,6 +102,12 @@ pub enum SchemaMigrationStep {
     /// stay in the existing data files until a compaction rewrites them, and
     /// older graph commits read it until `omnigraph cleanup` stops retaining
     /// them.
+    ///
+    /// Every constraint that names only dropped properties goes with them,
+    /// such as the property's own `@index`, `@unique`, `@range` or `@check`;
+    /// the same commit removes the column's index. A `@key`, or a constraint
+    /// that also names a field that stays, is not dropped this way: removing
+    /// it plans as `UnsupportedChange`.
     DropProperty {
         type_kind: SchemaTypeKind,
         type_name: String,
@@ -451,7 +457,7 @@ fn plan_nodes(
             &node.annotations,
             steps,
         );
-        plan_properties(
+        let dropped = plan_properties(
             SchemaTypeKind::Node,
             &node.name,
             &existing.properties,
@@ -463,6 +469,7 @@ fn plan_nodes(
             &node.name,
             &existing.constraints,
             &node.constraints,
+            &dropped,
             steps,
             system_columns,
         );
@@ -542,7 +549,7 @@ fn plan_edges(
             &edge.annotations,
             steps,
         );
-        plan_properties(
+        let dropped = plan_properties(
             SchemaTypeKind::Edge,
             &edge.name,
             &existing.properties,
@@ -554,6 +561,7 @@ fn plan_edges(
             &edge.name,
             &existing.constraints,
             &edge.constraints,
+            &dropped,
             steps,
             system_columns,
         );
@@ -572,13 +580,15 @@ fn plan_edges(
     }
 }
 
+/// Plans one type's property changes and returns the stable ids of the
+/// properties it drops.
 fn plan_properties(
     type_kind: SchemaTypeKind,
     type_name: &str,
     accepted: &[PropertyIR],
     desired: &[PropertyIR],
     steps: &mut Vec<SchemaMigrationStep>,
-) {
+) -> HashSet<StablePropertyId> {
     let accepted_by_id = accepted
         .iter()
         .map(|property| (property.property_id, property))
@@ -714,6 +724,7 @@ fn plan_properties(
         );
     }
 
+    let mut dropped = HashSet::new();
     for leftover in accepted
         .iter()
         .filter(|property| !consumed.contains(&property.property_id))
@@ -722,12 +733,14 @@ fn plan_properties(
         // from the table's schema by a metadata-only commit. Retention, which
         // the OG-DS-104 destructive tier expects, is stated on
         // `SchemaMigrationStep::DropProperty`.
+        dropped.insert(leftover.property_id);
         steps.push(SchemaMigrationStep::DropProperty {
             type_kind,
             type_name: type_name.to_string(),
             property_name: leftover.name.clone(),
         });
     }
+    dropped
 }
 
 fn embed_sources_semantically_equal(
@@ -819,6 +832,7 @@ fn plan_constraints(
     type_name: &str,
     accepted: &[ConstraintIR],
     desired: &[ConstraintIR],
+    dropped: &HashSet<StablePropertyId>,
     steps: &mut Vec<SchemaMigrationStep>,
     system_columns: super::schema_ir::SystemColumns,
 ) {
@@ -834,9 +848,11 @@ fn plan_constraints(
         .collect::<BTreeMap<_, _>>();
 
     let removed = accepted_map
-        .keys()
-        .filter(|key| !desired_map.contains_key(*key))
-        .cloned()
+        .iter()
+        .filter(|(key, constraint)| {
+            !desired_map.contains_key(*key) && !ends_with_dropped_properties(constraint, dropped)
+        })
+        .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     if !removed.is_empty() {
         steps.push(SchemaMigrationStep::UnsupportedChange {
@@ -875,6 +891,25 @@ fn plan_constraints(
             }),
         }
     }
+}
+
+/// A constraint ends with the properties it names when the plan drops every
+/// one of them: no value is left for it to index or check, and the drop's
+/// commit removes the column's index. A key never ends this way, since entity
+/// ids derive from it, and neither does a constraint that also names a system
+/// field or a property that stays.
+fn ends_with_dropped_properties(
+    constraint: &ConstraintIR,
+    dropped: &HashSet<StablePropertyId>,
+) -> bool {
+    use super::schema_ir::FieldRefIR;
+
+    let fields = constraint.fields();
+    !matches!(constraint, ConstraintIR::Key { .. })
+        && !fields.is_empty()
+        && fields.iter().all(|field| {
+            matches!(field, FieldRefIR::Property(reference) if dropped.contains(&reference.property_id))
+        })
 }
 
 fn plan_type_metadata(
@@ -1486,6 +1521,113 @@ node Person {
                 .any(|step| matches!(step, UnsupportedChange { .. })),
             "a property drop must not emit UnsupportedChange: {plan:?}",
         );
+    }
+
+    #[test]
+    fn plan_drops_a_property_with_the_constraints_that_name_only_it_issue_1014() {
+        // A constraint whose every field is a dropped property ends with
+        // those properties; one that also names a field that stays, and
+        // every key change, still refuses. That the apply then removes the
+        // dropped column's index is verified by
+        // `apply_schema_column_changes_keep_data_files_ids_and_index_coverage_issue_1014`
+        // in `crates/omnigraph/tests/schema_apply.rs`.
+        let cases: &[(&str, &str, &str, bool)] = &[
+            (
+                "scalar @index",
+                "node Doc { slug: String @key\n score: I64 @index\n note: String? }",
+                "node Doc { slug: String @key\n note: String? }",
+                true,
+            ),
+            (
+                "full-text @index",
+                "node Doc { slug: String @key\n body: String? @index }",
+                "node Doc { slug: String @key }",
+                true,
+            ),
+            (
+                "vector @index",
+                "node Doc { slug: String @key\n v: Vector(3)? @index }",
+                "node Doc { slug: String @key }",
+                true,
+            ),
+            (
+                "@unique",
+                "node Doc { slug: String @key\n email: String? @unique }",
+                "node Doc { slug: String @key }",
+                true,
+            ),
+            (
+                "@range and @check",
+                "node Doc { slug: String @key\n age: I32?\n code: String?\n @range(age, 0..200)\n @check(code, \"[A-Z]+\") }",
+                "node Doc { slug: String @key }",
+                true,
+            ),
+            (
+                "composite @unique, every member dropped",
+                "node Doc { slug: String @key\n a: String?\n b: String?\n @unique(a, b) }",
+                "node Doc { slug: String @key }",
+                true,
+            ),
+            (
+                "edge property @index",
+                "node P { n: String @key }\nedge E: P -> P { w: I64? @index }",
+                "node P { n: String @key }\nedge E: P -> P",
+                true,
+            ),
+            (
+                "composite @unique, one member stays",
+                "node Doc { slug: String @key\n a: String?\n b: String?\n @unique(a, b) }",
+                "node Doc { slug: String @key\n b: String? }",
+                false,
+            ),
+            (
+                "edge @unique naming a system field",
+                "node P { n: String @key }\nedge E: P -> P { w: I64?\n @unique(@src, w) }",
+                "node P { n: String @key }\nedge E: P -> P",
+                false,
+            ),
+            (
+                "@key property",
+                "node Doc { slug: String @key\n note: String? }",
+                "node Doc { note: String? }",
+                false,
+            ),
+            (
+                "@index removed from a property that stays",
+                "node Doc { slug: String @key\n score: I64 @index }",
+                "node Doc { slug: String @key\n score: I64 }",
+                false,
+            ),
+            (
+                "a drop beside an @index removed from a property that stays",
+                "node Doc { slug: String @key\n score: I64 @index\n rank: I64 @index }",
+                "node Doc { slug: String @key\n rank: I64 }",
+                false,
+            ),
+        ];
+        for (name, accepted, desired, supported) in cases {
+            let accepted = ir(accepted);
+            let desired = evolve(&accepted, desired);
+            let plan = plan_schema_migration(&accepted, &desired).unwrap();
+            assert_eq!(plan.supported, *supported, "{name}: {plan:?}");
+            if *supported {
+                assert!(
+                    plan.steps
+                        .iter()
+                        .all(|step| matches!(step, SchemaMigrationStep::DropProperty { .. })),
+                    "{name}: a drop plans as drops alone: {plan:?}"
+                );
+            } else {
+                assert!(
+                    plan.steps.iter().any(|step| matches!(
+                        step,
+                        UnsupportedChange { reason, .. }
+                            if reason.starts_with("removing constraints from")
+                    )),
+                    "{name}: the removed constraint is what refuses: {plan:?}"
+                );
+            }
+        }
     }
 
     #[test]

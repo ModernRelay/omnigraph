@@ -2870,6 +2870,55 @@ fn reject_edge_binding_search_field(ctx: &TypeContext, field: &Expr, func: &str)
     Ok(())
 }
 
+/// T27: a full-text call reads the full-text index of the node property it
+/// names, which the schema declares with a one-column `@index` (or `@key`)
+/// on a free-text String property
+/// ([`crate::catalog::NodeType::has_full_text_index`]). The check reads the
+/// schema only, never physical index state; without the declaration the
+/// substrate would scan with a bare, case-sensitive tokenizer. A field that
+/// is not a String property keeps its operand type error (T19, T20).
+fn require_full_text_index(
+    catalog: &Catalog,
+    ctx: &TypeContext,
+    field: &Expr,
+    func: &str,
+) -> Result<()> {
+    let Expr::PropAccess { variable, property } = field else {
+        return Ok(());
+    };
+    let Some(BoundVariable::Node { type_name }) = ctx.bindings.get(variable) else {
+        return Ok(());
+    };
+    let Some(node_type) = catalog.node_types.get(type_name) else {
+        return Ok(());
+    };
+    let Some(prop) = node_type.properties.get(property) else {
+        return Ok(());
+    };
+    if prop.scalar != ScalarType::String || prop.list || node_type.has_full_text_index(property) {
+        return Ok(());
+    }
+    let fix = if prop.is_enum() {
+        format!(
+            "`{type_name}.{property}` is an enum, which takes no full-text index; match its values with `${variable}.{property} = \"<value>\"`"
+        )
+    } else {
+        format!(
+            "declare `{property}: String @index` on `{type_name}`; every write then carries the index's analyzer"
+        )
+    };
+    Err(CompilerError::query(
+        QueryDiagnostic::typecheck(
+            T27,
+            format!(
+                "`{func}` over `${variable}.{property}` needs a full-text index, and `{type_name}.{property}` declares none"
+            ),
+        )
+        .with_expression(format!("${variable}.{property}"))
+        .with_fix(fix),
+    ))
+}
+
 /// A catalogue type has no index: text and rank search over its rows is
 /// refused at the check, before any storage planning. Scalar predicates,
 /// projection, aggregation, ordering and joins stay available.
@@ -3158,6 +3207,7 @@ fn resolve_expr(
         }
         Expr::Search { field, query } => {
             reject_edge_binding_search_field(ctx, field, "search")?;
+            require_full_text_index(catalog, ctx, field, "search")?;
             let field = resolve_expr(catalog, field, ctx, params, scope)?;
             match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
@@ -3204,6 +3254,7 @@ fn resolve_expr(
             max_edits,
         } => {
             reject_edge_binding_search_field(ctx, field, "fuzzy")?;
+            require_full_text_index(catalog, ctx, field, "fuzzy")?;
             let field = resolve_expr(catalog, field, ctx, params, scope)?;
             match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
@@ -3279,6 +3330,7 @@ fn resolve_expr(
         }
         Expr::MatchText { field, query } => {
             reject_edge_binding_search_field(ctx, field, "match_text")?;
+            require_full_text_index(catalog, ctx, field, "match_text")?;
             let field = resolve_expr(catalog, field, ctx, params, scope)?;
             match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
@@ -3321,6 +3373,7 @@ fn resolve_expr(
         }
         Expr::Bm25 { field, query } => {
             reject_edge_binding_search_field(ctx, field, "bm25")?;
+            require_full_text_index(catalog, ctx, field, "bm25")?;
             let field = resolve_expr(catalog, field, ctx, params, scope)?;
             match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}

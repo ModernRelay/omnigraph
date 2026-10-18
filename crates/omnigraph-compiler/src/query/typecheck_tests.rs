@@ -114,7 +114,7 @@ fn setup() -> Catalog {
     let schema = parse_schema(
         r#"
 node Person {
-name: String
+name: String @index
 age: I32?
 }
 node Company {
@@ -154,7 +154,7 @@ fn setup_vector() -> Catalog {
     let schema = parse_schema(
         r#"
 node Doc {
-id_str: String
+id_str: String @index
 embedding: Vector(3)
 }
 "#,
@@ -774,6 +774,106 @@ limit 3
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.scope.bindings.contains_key("d"));
+}
+
+/// T27: a full-text call needs a one-column full-text index on its node
+/// property, read from the schema alone. `@key` declares one, a composite
+/// `@index` does not, an enum takes none, and a field that is not a String
+/// keeps its operand error.
+#[test]
+fn full_text_calls_need_a_declared_full_text_index() {
+    let catalog = build_catalog(
+        &parse_schema(
+            r#"
+node Doc {
+slug: String @key
+title: String @index
+body: String?
+summary: String
+kind: enum(note, essay)
+pages: I32?
+@index(summary, body)
+}
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let check = |call: &str| {
+        let source = format!(
+            "query q($q: String) {{ match {{ $d: Doc }} return {{ $d.slug }} {call} limit 3 }}"
+        );
+        typecheck_query(&catalog, parse_query(&source).unwrap().single_decl())
+    };
+    for accepted in [
+        "order { bm25($d.title, $q) }",
+        "order { bm25($d.slug, $q) }",
+    ] {
+        check(accepted).unwrap_or_else(|error| panic!("{accepted}: {error}"));
+    }
+    let accepted = typecheck_query(
+        &catalog,
+        parse_query(
+            "query q($q: String) { match { $d: Doc search($d.title, $q) } return { $d.slug } }",
+        )
+        .unwrap()
+        .single_decl(),
+    );
+    accepted.unwrap();
+    for (call, property) in [
+        ("search($d.body, $q)", "body"),
+        ("fuzzy($d.body, $q)", "body"),
+        ("match_text($d.summary, $q)", "summary"),
+    ] {
+        let source =
+            format!("query q($q: String) {{ match {{ $d: Doc {call} }} return {{ $d.slug }} }}");
+        let error =
+            typecheck_query(&catalog, parse_query(&source).unwrap().single_decl()).unwrap_err();
+        let diagnostic = error.diagnostic().expect("T27 carries a diagnostic");
+        assert_eq!(diagnostic.code.as_str(), "T27", "{call}: {error}");
+        assert_eq!(
+            diagnostic
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.expression.as_deref()),
+            Some(format!("$d.{property}").as_str())
+        );
+        assert!(
+            diagnostic
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains(&format!("{property}: String @index"))),
+            "{call}: {diagnostic:?}"
+        );
+    }
+    let error = check("order { bm25($d.body, $q) }").unwrap_err();
+    assert_eq!(error.diagnostic().unwrap().code.as_str(), "T27", "{error}");
+    let error = typecheck_query(
+        &catalog,
+        parse_query("query q() { match { $d: Doc search($d.kind, \"note\") } return { $d.slug } }")
+            .unwrap()
+            .single_decl(),
+    )
+    .unwrap_err();
+    let diagnostic = error.diagnostic().unwrap();
+    assert_eq!(diagnostic.code.as_str(), "T27", "{error}");
+    assert!(
+        diagnostic
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("$d.kind = ")),
+        "{diagnostic:?}"
+    );
+    let error = typecheck_query(
+        &catalog,
+        parse_query(
+            "query q($q: String) { match { $d: Doc search($d.pages, $q) } return { $d.slug } }",
+        )
+        .unwrap()
+        .single_decl(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("T19"), "{error}");
 }
 
 #[test]
@@ -2252,8 +2352,8 @@ fn setup_expressions() -> Catalog {
     let schema = parse_schema(
         r#"
 node Person {
-name: String
-email: String?
+name: String @index
+email: String? @index
 age: I32?
 active: Bool
 tags: [String]?
@@ -3041,7 +3141,7 @@ fn expected_visits_of(expr: &Expr, out: &mut Vec<Visit>) {
 fn checked_tree_retains_every_source_field() {
     let catalog = build_catalog(
         &parse_schema(
-            "node Doc { text: String  score: I32?  embedding: Vector(2) }\nedge Cites: Doc -> Doc",
+            "node Doc { text: String @index  score: I32?  embedding: Vector(2) }\nedge Cites: Doc -> Doc",
         )
         .unwrap(),
     )

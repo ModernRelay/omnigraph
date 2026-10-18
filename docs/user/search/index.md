@@ -96,6 +96,12 @@ Use full-text functions for token search, fuzzy terms, and relevance. Use the
 query language's exact `contains` and `starts_with` predicates for literal,
 case-sensitive substring and prefix matching.
 
+A full-text function needs a full-text index on its property: a one-column
+`@index` or `@key` on a free-text String property of a node. The index's
+analyzer folds case and stems, so `"deep"` matches `"Deep Learning"`. A call
+on any other String property is refused at type checking (`T27`); for an
+enum, compare its values with `=` instead. The check reads only the schema.
+
 `search`, `match_text`, and `fuzzy` are positive predicates in `match`: use
 a standalone call or compare the call to literal `true` with `=`. Other
 comparisons, including `= false`, `!= true`, a Boolean parameter, and a
@@ -195,7 +201,14 @@ Indexes are derived performance data. A new declaration may still be pending,
 and newly written entities may fall outside existing coverage. Queries remain
 correct by scanning missing or uncovered data: full-text functions match the
 scanned rows with the index's analyzer, and vector search falls back to an
-exact scan when needed. Run:
+exact scan when needed. Every write records a declared full-text index's
+analyzer before its postings are built. A table version written by an older
+release may hold rows and no part of the index at all; a full-text call on
+it is refused before any scan with HTTP `409` and a
+`full_text_index_required` detail naming `Type.property`, never answered
+with a case-sensitive scan. Build the index to lift it: `omnigraph optimize`
+on `main`, or `omnigraph rebuild-full-text-indexes --branch <branch>` on
+another branch. Historical snapshots of that version stay refused. Run:
 
 ```bash
 omnigraph optimize graph.omni

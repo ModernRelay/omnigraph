@@ -880,9 +880,17 @@ recorded fact the snapshot contradicts, or a plan that fails a check
 (well-formedness included), is invalid evidence, a bad request.
 
 Full-text coverage is derived from the index facts the planner reads for the
-pinned dataset (`FullTextCoverage::of_facts`): `absent` without an inverted
+pinned dataset (`FullTextCoverage::of_table`): `absent` without an inverted
 index on the column, `full` only when every inverted segment there reports a
-known coverage of every fragment, `partial` otherwise.
+known coverage of every fragment, `partial` otherwise; a table version with no
+fragment, and a type the snapshot does not hold, are `full`. Resolution reads
+the coverage of every property a full-text call names
+(`optimizer::full_text_targets`: `search`, `fuzzy` and `match_text` in any
+filter, `bm25` in the leading order key or an `rrf()` arm) and refuses
+`absent` with `FullTextIndexRequired`, the typed 409; an untrained segment is
+`partial`, since it carries the analyzer. Acceptance refuses a plan that
+records no coverage, or `absent`, for a call it makes, and replay derives
+every recorded coverage again from the pinned dataset.
 
 ## Search and rank
 

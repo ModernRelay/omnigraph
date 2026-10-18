@@ -128,6 +128,12 @@ A `409` is not one universal retry signal:
   `code: "conflict"`. This condition persists until an operator rebuilds the
   affected branch's indexes; do not automatically retry the same query. Follow
   the [full-text upgrade procedure](upgrade.md#full-text-index-upgrade).
+- A full-text index with no part at the query's snapshot includes
+  `full_text_index_required: { "index": "Type.property" }` with
+  `code: "conflict"`. It persists until the branch's index is built
+  (`omnigraph optimize` on `main`, `omnigraph rebuild-full-text-indexes
+  --branch <branch>` elsewhere); do not retry the same query. See
+  [Search indexes](../search/index.md#indexes).
 - “Already initialized” means the target already contains a graph. Choose a new
   root or deliberately use the command's destructive option when appropriate.
 
