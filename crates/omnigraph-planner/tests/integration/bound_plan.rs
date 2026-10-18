@@ -10,8 +10,8 @@ use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::{CompOp, Literal};
 use omnigraph_compiler::{ExprType, PropType, SYSTEM_COLUMNS_V3, ScalarType};
 use omnigraph_planner::{
-    BoundPlan, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan, RankKind, RankScope,
-    TableRef, ValueTable, plan_query,
+    BOUND_PLAN_VERSION, BoundPlan, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan,
+    RankKind, RankScope, TableRef, ValueTable, plan_query,
 };
 
 use crate::fixture_bounds;
@@ -30,11 +30,7 @@ fn source() -> MemorySource {
     MemorySource::default().with_node_type(
         "Doc",
         NodeTypeSpec {
-            table: TableRef {
-                type_key: "node:Doc".to_string(),
-                dataset_path: "node/Doc".to_string(),
-                native_branch: None,
-            },
+            table: TableRef::dataset("node:Doc", "node/Doc", None),
             version: Some(3),
             columns: SYSTEM_COLUMNS_V3,
             schema,
@@ -145,12 +141,12 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
         values: Default::default(),
     };
     let encoded = serde_json::to_value(&bound).unwrap();
-    assert_eq!(encoded["bound_plan_version"], 7);
+    assert_eq!(encoded["bound_plan_version"], BOUND_PLAN_VERSION);
     assert!(encoded.get("plan").is_none());
     assert!(encoded["body"]["plan"].is_object());
     assert_eq!(round_trip(&bound), bound);
 
-    for version in [1, 2, 3, 4, 5, 6] {
+    for version in [1, 2, 3, 4, 5, 6, 7] {
         let mut older = encoded.clone();
         older["bound_plan_version"] = serde_json::json!(version);
         assert!(
@@ -163,16 +159,17 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
     let legacy = encoded["body"].clone();
     let error = serde_json::from_value::<BoundPlan>(legacy).unwrap_err();
     assert!(error.to_string().contains("regenerate"), "{error}");
-    let mut future = encoded.clone();
-    future["bound_plan_version"] = serde_json::json!(8);
-    let error = serde_json::from_value::<BoundPlan>(future).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("unsupported bound plan version 8"),
-        "{error}"
-    );
-
+    for version in [BOUND_PLAN_VERSION - 1, BOUND_PLAN_VERSION + 1] {
+        let mut other = encoded.clone();
+        other["bound_plan_version"] = serde_json::json!(version);
+        let error = serde_json::from_value::<BoundPlan>(other).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unsupported bound plan version {version}")),
+            "{error}"
+        );
+    }
     let mut missing_distinct = encoded.clone();
     let aggregate = missing_distinct["body"]["plan"]["slots"]
         .as_array_mut()
@@ -796,6 +793,7 @@ fn block_bound(left: omnigraph_compiler::ir::BlockAggregateExpr, right: IRExpr) 
             op: CompOp::Gt,
             right,
         },
+        strategy: omnigraph_planner::AntiJoinStrategy::KeySet,
     });
     plan.set_root(root);
     BoundPlan {
@@ -1060,7 +1058,12 @@ fn block_mirrors_and_explain_preserve_every_nested_cast_in_order() {
         panic!("block");
     };
     assert_eq!(predicate, back);
+    assert_eq!(
+        restored, bound,
+        "the block's strategy survives the saved plan"
+    );
     let explain = restored.plan.to_json();
+    assert_eq!(explain["strategy"], "key_set");
     assert_eq!(explain["predicate"], "count > $bound");
     assert_eq!(explain["typed_left"]["type"], "F64");
     assert_eq!(explain["typed_left"]["args"][0]["type"], "exact_integer");

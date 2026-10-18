@@ -16,7 +16,8 @@ use handlers::*;
 use settings::*;
 pub use settings::{
     ServerRuntimeState, classify_server_runtime_state, load_server_settings,
-    load_server_settings_with_data_token_trust, load_server_settings_with_identity_trust,
+    load_server_settings_with_bootstrap_handoff, load_server_settings_with_data_token_trust,
+    load_server_settings_with_identity_trust,
 };
 pub mod auth;
 pub mod data_tokens;
@@ -31,6 +32,7 @@ pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, AuthenticatedActor, GraphKey, ResolvedActor, Scope, TenantId};
+pub use mcp::McpSettings;
 pub use registry::{
     BlockedGraph, GraphEntry, GraphHandle, GraphRegistry, InsertError, LoadingGraph,
     RegistryLookup, RegistrySnapshot, StartupFailure,
@@ -62,7 +64,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
@@ -112,6 +114,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
     ),
     paths(
         mcp::resource_metadata,
+        mcp::resource_metadata_at_resource_path,
         deployment::status,
         deployment::lookup,
         deployment::apply,
@@ -144,6 +147,9 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_commit_publish,
         handlers::server_commit_drop,
         handlers::server_commit_changes,
+        handlers::server_diff,
+        handlers::server_branch_diff,
+        handlers::server_merge_base,
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
     ),
@@ -184,7 +190,6 @@ impl utoipa::Modify for SecurityAddon {
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 const INGEST_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
 /// The maximum internal-schema (storage-format) version this binary supports.
 const SERVER_INTERNAL_SCHEMA_VERSION: u32 =
     omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
@@ -223,17 +228,18 @@ pub struct ServerConfig {
     pub cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
 }
 
-/// Applied server settings paired with already validated offline token trust.
+/// Applied server settings bound to a root and optional validated identity trust.
 ///
-/// Constructed only by [`load_server_settings_with_data_token_trust`]. The
-/// settings are exposed read-only so their graphs cannot be replaced after the
-/// canonical serving root has been checked against the trust document.
+/// Constructed by the identity-trust and bootstrap-handoff settings loaders. The
+/// settings are exposed read-only so their graphs cannot be replaced after
+/// ownership or identity trust has been bound to the canonical serving root.
 #[derive(Debug, Clone)]
 pub struct ManagedServerConfig {
     config: ServerConfig,
     canonical_root: String,
     trust: Option<data_tokens::DataTokenTrust>,
     oidc_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
+    mcp: McpSettings,
 }
 
 impl ManagedServerConfig {
@@ -248,6 +254,12 @@ impl ManagedServerConfig {
     /// Change only the shutdown bound, preserving the validated root binding.
     pub fn with_shutdown_grace(mut self, grace: std::time::Duration) -> Self {
         self.config.shutdown_grace = grace;
+        self
+    }
+
+    /// Set the MCP boot settings, preserving the validated root binding.
+    pub fn with_mcp_settings(mut self, mcp: McpSettings) -> Self {
+        self.mcp = mcp;
         self
     }
 }
@@ -320,8 +332,15 @@ pub enum ServerConfigMode {
         /// Server-level Cedar policy for the management endpoints
         /// (`GET /graphs`). Wired into `GET /graphs` authorization.
         server_policy: Option<PolicySource>,
+        /// The policy bound to `graph.og_catalog`: it governs reads of the
+        /// engine catalogue scope, which every binary serves and no
+        /// deployment creates.
+        catalogue_policy: Option<PolicySource>,
     },
 }
+
+/// The route prefix of the engine catalogue scope, `/graphs/og_catalog`.
+pub(crate) const CATALOGUE_ROUTE_PREFIX: &str = "/graphs/og_catalog";
 
 /// Where a Cedar policy bundle comes from at startup. Cluster-local files are
 /// used during config application; inline digest-verified catalog content is
@@ -395,6 +414,8 @@ pub struct AppState {
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
+    /// MCP boot settings: which opt-in tools `/mcp` lists and admits.
+    mcp: Arc<McpSettings>,
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.
     export_transport: export_transport::ExportTransport,
@@ -764,6 +785,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
@@ -817,6 +839,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
@@ -824,6 +847,22 @@ impl AppState {
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             process_defaults: Arc::new(ProcessDefaults::default()),
         })
+    }
+
+    /// Install the policy of the engine catalogue scope; `serve` passes the
+    /// `graph.og_catalog` binding's, a deployment activation replaces it.
+    pub fn set_catalogue_policy(&self, policy: Option<PolicyEngine>) {
+        self.routing
+            .registry
+            .initialize_catalogue_policy(policy.map(Arc::new));
+    }
+
+    pub(crate) fn catalogue_policy(&self) -> Option<Arc<PolicyEngine>> {
+        self.routing
+            .registry
+            .snapshot_ref()
+            .catalogue_policy
+            .clone()
     }
 
     /// Attach the boot witness `/readyz` reports and the flag shutdown sets
@@ -908,6 +947,17 @@ impl AppState {
         self
     }
 
+    /// Attach the MCP boot settings `/mcp` reads for every request.
+    #[must_use]
+    pub fn with_mcp_settings(mut self, mcp: McpSettings) -> Self {
+        self.mcp = Arc::new(mcp);
+        self
+    }
+
+    pub(crate) fn mcp_settings(&self) -> &McpSettings {
+        &self.mcp
+    }
+
     pub(crate) fn oidc_resource_metadata(&self) -> Option<serde_json::Value> {
         self.oidc_identity_trust
             .as_ref()
@@ -921,6 +971,14 @@ impl AppState {
             .map(str::to_owned)
     }
 
+    /// Whether any bearer credential can authenticate a request: static
+    /// tokens, signed data tokens or OIDC. Fixed at construction.
+    pub(crate) fn has_credential_source(&self) -> bool {
+        !self.bearer_tokens.is_empty()
+            || self.data_token_trust.is_some()
+            || self.oidc_identity_trust.is_some()
+    }
+
     fn requires_bearer_auth(&self) -> bool {
         if !self.bearer_tokens.is_empty()
             || self.data_token_trust.is_some()
@@ -929,7 +987,7 @@ impl AppState {
             return true;
         }
         let snapshot = self.routing.registry.snapshot_ref();
-        if snapshot.server_policy.is_some() {
+        if snapshot.server_policy.is_some() || snapshot.catalogue_policy.is_some() {
             return true;
         }
         // Any per-graph policy also requires auth — otherwise the
@@ -1474,6 +1532,8 @@ impl ApiError {
             OmniError::BranchNotFound { branch } => {
                 Self::not_found(format!("branch '{branch}' not found"))
             }
+            error @ OmniError::ReadTargetNotFound { .. } => Self::not_found(error.to_string()),
+            error @ OmniError::AmbiguousReadTarget { .. } => Self::bad_request(error.to_string()),
             // Retention loss under a change continuation: 410 with the
             // structured resume hint. Recovery is the baseline handshake.
             OmniError::ChangeFeedGap {
@@ -1546,7 +1606,9 @@ impl ApiError {
             // Engine-layer policy enforcement (MR-722). Authentication
             // middleware has already distinguished a missing/invalid bearer
             // (401); policy denials and evaluation failures surface as 403.
-            // Most handlers also perform an HTTP-layer policy check.
+            // Most handlers also perform an HTTP-layer policy check. Clients
+            // read this 403 as proof the write never started, so `enforce`
+            // must precede every durable effect (docs/dev/writes.md).
             OmniError::Policy(message) => Self::forbidden(message),
             // `Omnigraph::init` against an existing graph URI in strict
             // mode. Not currently HTTP-reachable (POST /graphs was
@@ -2268,6 +2330,7 @@ mod external_blob_startup_tests {
                 policy: None,
             }),
             expected: None,
+            io_scope: None,
         };
         let error = match open_prepared_graph(prepared).await {
             Ok(_) => panic!("a missing root must not open"),
@@ -2652,6 +2715,8 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/branches/{branch}", delete(server_branch_delete))
         .route("/branches/merge", post(server_branch_merge))
+        .route("/branches/diff", get(server_branch_diff))
+        .route("/branches/merge-base", get(server_merge_base))
         .route("/commits", get(server_commit_list))
         .route(
             "/commits/{commit_id}",
@@ -2659,6 +2724,7 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/commits/{commit_id}/publish", post(server_commit_publish))
         .route("/commits/{commit_id}/changes", get(server_commit_changes))
+        .route("/diff", get(server_diff))
         .route("/changes", get(server_changes_feed))
         .route("/changes/baseline", post(server_changes_baseline))
         .route_layer(middleware::from_fn_with_state(
@@ -2706,9 +2772,27 @@ pub fn build_app(state: AppState) -> Router {
             require_bearer_auth,
         ));
 
+    let catalogue = Router::new()
+        .route("/query", post(handlers::catalogue::catalogue_query))
+        .route("/schema", get(handlers::catalogue::catalogue_schema))
+        .route("/{*rest}", any(handlers::catalogue::catalogue_refused))
+        .route("/", any(handlers::catalogue::catalogue_refused))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            |State(state): State<AppState>, request: Request, next: Next| async move {
+                ingress::admit(&state, request, next).await
+            },
+        ))
+        .route_layer(middleware::from_fn(http_contract::require_contract))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_auth,
+        ));
+
     // RFC-011 cluster-only: per-graph routes always nest under
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
     let protected: Router<AppState> = Router::new()
+        .nest(CATALOGUE_ROUTE_PREFIX, catalogue)
         .nest("/graphs/{graph_id}", per_graph_protected)
         .merge(management)
         .merge(deployments);
@@ -2718,7 +2802,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/readyz", get(server_ready))
         .route("/openapi.json", get(server_openapi))
         .merge(protected);
-    if state.oidc_identity_trust.is_some() {
+    // MCP needs an authenticated caller; without a credential source there is
+    // no actor for its policy checks, so the endpoint does not exist.
+    if state.has_credential_source() {
         app = app.merge(mcp::router(state.clone()));
     }
     app.layer(middleware::from_fn(http_contract::identify_response))
@@ -2728,19 +2814,26 @@ pub fn build_app(state: AppState) -> Router {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
-    serve_config(config, None, None).await
+    serve_config(config, None, None, McpSettings::default()).await
 }
 
-/// Serve settings whose offline data-token trust was validated against their
-/// applied snapshot's canonical root before any graph engine open.
+/// Serve with explicit MCP boot settings (`--mcp-*` flags and their
+/// environment variables, resolved by [`McpSettings::resolve`]).
+pub async fn serve_with_mcp_settings(config: ServerConfig, mcp: McpSettings) -> Result<()> {
+    serve_config(config, None, None, mcp).await
+}
+
+/// Serve root-bound settings whose enabled identity trust was validated against
+/// the applied snapshot's canonical root before any graph engine open.
 pub async fn serve_with_data_token_trust(config: ManagedServerConfig) -> Result<()> {
-    serve_config(config.config, config.trust, config.oidc_trust).await
+    serve_config(config.config, config.trust, config.oidc_trust, config.mcp).await
 }
 
 async fn serve_config(
     config: ServerConfig,
     data_token_trust: Option<data_tokens::DataTokenTrust>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
+    mcp: McpSettings,
 ) -> Result<()> {
     // RFC 0049: the signal listener is installed before anything else, so
     // the shutdown bound covers startup. On the signal it sets `draining`,
@@ -2782,8 +2875,13 @@ async fn serve_config(
         ServerConfigMode::Multi {
             graphs,
             server_policy,
+            catalogue_policy,
             ..
-        } => server_policy.is_some() || graphs.iter().any(|g| g.policy.is_some()),
+        } => {
+            server_policy.is_some()
+                || catalogue_policy.is_some()
+                || graphs.iter().any(|g| g.policy.is_some())
+        }
     };
     let runtime_state = classify_server_runtime_state(
         !tokens.is_empty() || data_token_trust.is_some() || oidc_identity_trust.is_some(),
@@ -2812,6 +2910,7 @@ async fn serve_config(
             graphs,
             config_path,
             server_policy,
+            catalogue_policy,
         } => {
             info!(
                 bind = %bind,
@@ -2820,14 +2919,16 @@ async fn serve_config(
                 config = %config_path.display(),
                 "serving omnigraph"
             );
-            prepare_multi_graph_state(
+            let (state, prepared) = prepare_multi_graph_state(
                 graphs,
                 tokens,
                 server_policy.as_ref(),
                 config_path,
                 config.cluster_admission,
             )
-            .await?
+            .await?;
+            state.set_catalogue_policy(load_catalogue_policy(catalogue_policy.as_ref())?);
+            (state, prepared)
         }
     };
 
@@ -2858,7 +2959,8 @@ async fn serve_config(
             Arc::clone(&draining),
             shutdown_grace,
         )
-        .with_process_defaults(process_defaults);
+        .with_process_defaults(process_defaults)
+        .with_mcp_settings(mcp);
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
     let startup_owner = operations
@@ -2903,11 +3005,30 @@ async fn serve_config(
     served?;
     startup_result.wrap_err("graph startup owner failed")??;
     if let Some(owner) = retained_admission {
-        warn!(
-            root = %omnigraph::storage::redacted_storage_uri(owner.canonical_root()),
-            lock_id = %owner.lock_id(),
-            "v2 cluster admission retained after shutdown; establish prior graph/control I/O quiescence before exact-ID force-unlock"
-        );
+        if owner.canonical_root().starts_with("az://") {
+            // Azure keeps its existing stopped-process boundary until its
+            // native clean-release path has independent qualification.
+            warn!("Azure cluster admission retained after logical shutdown");
+            return Ok(());
+        }
+        let scope = owner.io_scope().ok_or_else(|| {
+            eyre!("cluster storage lifetime is untracked; retaining its admission")
+        })?;
+        scope.close();
+        scope.wait_idle().await;
+        if scope.is_uncertain() {
+            return Err(eyre!(
+                "storage completion uncertain; retaining cluster admission"
+            ));
+        }
+        // Axum's connection completion notification can precede destruction
+        // of its Hyper service and AppState. Drain those actual owners too;
+        // the original process watchdog still bounds this wait.
+        owner.wait_for_exclusive_owner().await;
+        owner
+            .release_after_settlement()
+            .await
+            .map_err(|error| eyre!("clean cluster release refused: {error:?}"))?;
     }
     Ok(())
 }
@@ -2918,6 +3039,14 @@ fn load_graph_policy(source: &PolicySource, graph_id: &str) -> Result<PolicyEngi
         PolicySource::File(path) => Ok(PolicyEngine::load_graph(path, graph_id)?),
         PolicySource::Inline(text) => Ok(PolicyEngine::load_graph_from_source(text, graph_id)?),
     }
+}
+
+/// The engine catalogue scope's policy, compiled against the resource
+/// `Graph::"og_catalog"` like any graph binding.
+pub(crate) fn load_catalogue_policy(source: Option<&PolicySource>) -> Result<Option<PolicyEngine>> {
+    source
+        .map(|source| load_graph_policy(source, omnigraph_compiler::CATALOGUE_SCOPE))
+        .transpose()
 }
 
 /// Parallel open of every graph in the startup config, with bounded
@@ -3090,7 +3219,10 @@ async fn prepare_multi_graph_state(
         );
         let uri = cfg.uri.clone();
         match prepare_single_graph(cfg, expected) {
-            Ok(graph) => {
+            Ok(mut graph) => {
+                graph.io_scope = admission
+                    .as_ref()
+                    .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
                 entries.push(GraphEntry::Loading(Arc::clone(&graph.pending)));
                 prepared.push(graph);
             }
@@ -3229,6 +3361,7 @@ struct PreparedGraphOpen {
     cfg: GraphStartupConfig,
     pending: Arc<LoadingGraph>,
     expected: Option<omnigraph::db::SchemaContractDigest>,
+    io_scope: Option<omnigraph::storage::StorageIoScope>,
 }
 
 #[cfg(test)]
@@ -3307,6 +3440,7 @@ fn prepare_single_graph(
             policy,
         }),
         expected,
+        io_scope: None,
     })
 }
 
@@ -3317,6 +3451,7 @@ async fn open_prepared_graph(
         cfg,
         pending,
         expected,
+        io_scope,
     } = prepared;
     let graph_id = &pending.key.graph_id;
     let uri = pending.uri.clone();
@@ -3326,7 +3461,11 @@ async fn open_prepared_graph(
         policy: policy.clone(),
         cause,
     };
-    let db = Omnigraph::open(&uri).await.map_err(|err| {
+    let opened = match io_scope {
+        Some(scope) => Omnigraph::open_with_io_scope(&uri, scope).await,
+        None => Omnigraph::open(&uri).await,
+    };
+    let db = opened.map_err(|err| {
         failure(
             StartupFailure::OpenFailed,
             eyre!(

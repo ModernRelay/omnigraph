@@ -5,14 +5,18 @@
 
 use super::*;
 use crate::api::branch_statement_refusals as refusals;
+use omnigraph::loader::CsvLoadRequest;
 use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, SettingStmt, show_statement_name,
+    BranchDiffSides, BranchRead, BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME,
+    LoadStmt, SettingStmt, show_statement_name,
 };
 use omnigraph_compiler::settings::{SettingId, SettingRow};
 
 /// The HTTP entry a GQ source arrived through. A statement is served only at
-/// its own door: `Query` serves `branch list` and `explain`, `Mutate` serves
-/// `branch create`, `branch delete`, and `branch merge`.
+/// its own door: `Query` serves `branch list`, the branch control reads
+/// (`branch diff`, `branch merge-base`, `branch merge … dry run`) and
+/// `explain`; `Mutate` serves `branch create`, `branch delete`, and
+/// `branch merge`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Door {
     Query,
@@ -20,8 +24,9 @@ pub(crate) enum Door {
 }
 
 /// What [`run_query`] answered: a declared query's rows, the branch names
-/// of a `branch list` statement sorted in byte order, or the setting rows of
-/// a `show` statement in definition order.
+/// of a `branch list` statement sorted in byte order, the answer of a branch
+/// control read, or the setting rows of a `show` statement in definition
+/// order.
 pub(crate) enum ReadDispatch {
     Rows {
         query_name: String,
@@ -30,6 +35,7 @@ pub(crate) enum ReadDispatch {
         graph_commit_id: Option<String>,
     },
     BranchList(Vec<String>),
+    BranchRead(ReadOutput),
     Show(Vec<SettingRow>),
 }
 
@@ -48,6 +54,7 @@ impl ReadDispatch {
             ReadDispatch::BranchList(branches) => {
                 api::branch_list_read_output(&branches).map_err(render_error)
             }
+            ReadDispatch::BranchRead(output) => Ok(output),
             ReadDispatch::Show(rows) => api::show_read_output(&rows).map_err(render_error),
         }
     }
@@ -114,10 +121,75 @@ pub(super) fn commit_write_at_read_door(write: &CommitWrite) -> ApiError {
     ))
 }
 
-pub(super) fn read_at_write_door() -> ApiError {
+/// `load csv` is a write: the refusal a branch write meets at the read
+/// door, under the statement's own name.
+pub(super) fn load_at_read_door(stmt: &LoadStmt) -> ApiError {
+    ApiError::bad_request(refusals::with_statement(
+        refusals::CONTROL_WRITE_AT_READ_DOOR,
+        stmt.statement_name(),
+    ))
+}
+
+/// Run one `load csv` statement as a mutation body: the request `branch`
+/// (defaulting to `main` only here) receives the load after the `Change`
+/// check on it and admission; the answer counts the loaded nodes and edges
+/// and carries the load's own publication.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_load_statement(
+    state: &AppState,
+    handle: &GraphRequest,
+    session: &Session,
+    actor: Option<&AuthenticatedActor>,
+    ingress: IngressLease,
+    stmt: LoadStmt,
+    branch: Option<String>,
+    source_len: usize,
+) -> std::result::Result<ChangeOutput, ApiError> {
+    let branch = branch.unwrap_or_else(|| "main".to_string());
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Change,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let retained_input_bytes =
+        (source_len as u64).saturating_add(session.settings().load_source_max_bytes());
+    let admission = state
+        .workload
+        .try_admit(&actor_arc, retained_input_bytes)
+        .map_err(ApiError::from_workload_reject)?;
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref().to_string());
+    let query_name = stmt.statement_name().to_string();
+    let request = CsvLoadRequest::from_statement(&stmt);
+    let session = session.clone();
+    owned_write(state, admission, ingress, handle.clone(), async move {
+        let receipt = session
+            .load_csv_as_with_receipt(&branch, &request, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)?;
+        Ok(ChangeOutput {
+            branch: receipt.result.branch,
+            query_name,
+            affected_nodes: receipt.result.nodes_loaded.values().sum(),
+            affected_edges: receipt.result.edges_loaded.values().sum(),
+            actor_id,
+            commit: Some(api::commit_output(&receipt.commit)),
+            outcome: None,
+        })
+    })
+    .await
+}
+
+pub(super) fn read_at_write_door(statement_name: &str) -> ApiError {
     ApiError::bad_request(refusals::with_statement(
         refusals::READ_AT_WRITE_DOOR,
-        BranchStmt::List.statement_name(),
+        statement_name,
     ))
 }
 
@@ -136,8 +208,64 @@ pub(super) fn refuse_wrong_door(
 ) -> std::result::Result<(), ApiError> {
     match (door, stmt) {
         (Door::Query, BranchStmt::Write(write)) => Err(control_write_at_read_door(write)),
-        (Door::Mutate, BranchStmt::List) => Err(read_at_write_door()),
-        (Door::Query, BranchStmt::List) | (Door::Mutate, BranchStmt::Write(_)) => Ok(()),
+        (Door::Mutate, BranchStmt::List | BranchStmt::Read(_)) => {
+            Err(read_at_write_door(stmt.statement_name()))
+        }
+        (Door::Query, BranchStmt::List | BranchStmt::Read(_))
+        | (Door::Mutate, BranchStmt::Write(_)) => Ok(()),
+    }
+}
+
+/// Answer a branch control read with the body of the route it shares: the
+/// same authorization, engine call and error mapping as `GET /diff`,
+/// `GET /branches/diff`, `GET /branches/merge-base` and the dry run of
+/// `POST /branches/merge`.
+pub(super) async fn branch_read_body(
+    handle: &GraphRequest,
+    session: &Session,
+    actor: Option<&AuthenticatedActor>,
+    read: BranchRead,
+) -> std::result::Result<ReadOutput, ApiError> {
+    match read {
+        BranchRead::Diff { sides, page } => {
+            let scope = omnigraph::changes::ChangeFeedScope::default();
+            let diff = match sides {
+                BranchDiffSides::Branch { source, into } => {
+                    branch_diff_page(
+                        handle,
+                        actor,
+                        &source,
+                        into.as_deref(),
+                        scope,
+                        page.after_page,
+                        page.limit,
+                    )
+                    .await?
+                }
+                BranchDiffSides::Between { from, to } => {
+                    two_point_diff_page(handle, actor, from, to, scope, page.after_page, page.limit)
+                        .await?
+                }
+            };
+            api::branch_diff_read_output(&diff).map_err(render_error)
+        }
+        BranchRead::MergeBase { source, into } => {
+            let (source, target, base) =
+                merge_base_body(handle, actor, &source, into.as_deref()).await?;
+            api::branch_merge_base_read_output(&source, &target, &base).map_err(render_error)
+        }
+        BranchRead::MergeDryRun { source, into } => {
+            let target = into.unwrap_or_else(|| "main".to_string());
+            // A read of both branches: no merge admission, no write gate, no
+            // `branch_merge` grant. Conflicts answer the 409 a merge does.
+            authorize_branch_reads(actor, handle.policy.as_deref(), [&source, &target])?;
+            let result = session
+                .branch_merge_dry_run(&source, &target)
+                .await
+                .map_err(ApiError::from_omni)?;
+            api::branch_merge_dry_run_read_output(&source, &target, result.outcome.into())
+                .map_err(render_error)
+        }
     }
 }
 

@@ -1,7 +1,10 @@
-//! init/config scaffolding, schema plan/apply, graphs listing, version.
+//! init/config scaffolding, schema plan/apply, graphs listing, version,
+//! and the built-in agent skill.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use omnigraph::db::{Omnigraph, ReadTarget};
 use serde_json::Value;
@@ -12,21 +15,277 @@ use crate::support;
 use crate::support::*;
 
 #[test]
-fn version_command_prints_current_cli_version() {
+fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_977() {
+    use omnigraph::db::manifest::{
+        INTERNAL_MANIFEST_SCHEMA_VERSION as WRITES, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION as LOWEST,
+    };
+    use omnigraph_api_types::HTTP_API_CONTRACT;
+
+    // The release workflows stamp both at compile time; the test binary is
+    // built with whatever this build was given, normally neither.
+    let channel = option_env!("OMNIGRAPH_RELEASE_CHANNEL");
+    let commit = option_env!("OMNIGRAPH_SOURCE_VERSION");
+    let version = match (channel, commit) {
+        (Some("edge"), Some(commit)) => {
+            format!("{}-edge+{}", env!("CARGO_PKG_VERSION"), &commit[..7])
+        }
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    };
+
+    // The first two lines keep their earlier text and position; the contract
+    // line follows them, then the commit of a packaged build.
     let output = output_success(cli().arg("version"));
     let stdout = stdout_string(&output);
+    let mut expected = vec![
+        format!("omnigraph {version}"),
+        format!("internal-schema {WRITES} (serves v{LOWEST} to v{WRITES})"),
+        format!("http-contract {HTTP_API_CONTRACT}"),
+    ];
+    expected.extend(commit.map(|commit| format!("commit {commit}")));
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), expected);
 
+    // `--version` prints the first line alone.
+    let output = output_success(cli().arg("--version"));
+    assert_eq!(
+        stdout_string(&output).trim_end(),
+        format!("omnigraph {version}")
+    );
+
+    // Equality with the whole object pins the field set: a field added or
+    // renamed changes this test.
+    let output = output_success(cli().args(["version", "--json"]));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "version": version,
+            "channel": channel,
+            "commit": commit,
+            "http_contract": HTTP_API_CONTRACT,
+            "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
+        }),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn clap_exit_status_survives_closed_output() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    for (args, expected, uses_stderr) in [
+        (vec!["--help"], 0, false),
+        (vec!["--version"], 0, false),
+        (vec!["query", "--help"], 0, false),
+        (vec!["--unknown-option"], 2, true),
+    ] {
+        // Close the reader before spawning, avoiding the race in `| head -n0`.
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let mut command = cli_process();
+        command.args(&args).stdin(Stdio::null());
+        if uses_stderr {
+            command.stderr(Stdio::from(writer));
+        } else {
+            command.stdout(Stdio::from(writer));
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+    }
+}
+
+/// `skills/omnigraph`, the one copy of the skill the binary embeds.
+fn source_skill_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/omnigraph")
+}
+
+/// Every file below `root` by `/`-separated path, skipping names that start
+/// with `.` as the embedding does (the export record among them).
+fn skill_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, prefix: &str, files: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = format!("{prefix}{name}");
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path(), &format!("{path}/"), files);
+            } else {
+                files.insert(path, fs::read(entry.path()).unwrap());
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    walk(root, "", &mut files);
+    files
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[test]
+fn skill_export_writes_the_built_in_skill_byte_for_byte() {
+    let temp = tempdir().unwrap();
+    let dir = temp.path().join("agent/skills/omnigraph");
+    let output = output_success(cli().args(["skill", "export"]).arg(&dir).arg("--json"));
+    let report = parse_stdout_json(&output);
+
+    let source = skill_tree(&source_skill_dir());
+    let exported = skill_tree(&dir);
+    let differing: Vec<&String> = source
+        .keys()
+        .chain(exported.keys())
+        .filter(|path| source.get(*path) != exported.get(*path))
+        .collect();
     assert!(
-        stdout.contains(&format!("omnigraph {}", env!("CARGO_PKG_VERSION"))),
-        "version output must include the CLI version line, got: {stdout}"
+        differing.is_empty(),
+        "exported skill differs from skills/omnigraph at {differing:?}"
+    );
+
+    assert_eq!(report["directory"], dir.display().to_string());
+    assert_eq!(report["skill"], "omnigraph");
+    assert_eq!(report["cli_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        report["http_contract"],
+        omnigraph_api_types::HTTP_API_CONTRACT
+    );
+    let skill_md = String::from_utf8(source["SKILL.md"].clone()).unwrap();
+    let version_line = format!(
+        "  version: \"{}\"",
+        report["skill_version"].as_str().unwrap()
     );
     assert!(
-        stdout.contains(&format!(
-            "internal-schema {}",
-            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
-        )),
-        "version output must include the internal-schema line, got: {stdout}"
+        skill_md.lines().any(|line| line == version_line),
+        "skill_version {} is not SKILL.md's metadata.version",
+        report["skill_version"]
     );
+    assert_eq!(
+        report["files"],
+        serde_json::json!(source.keys().collect::<Vec<_>>())
+    );
+    assert_eq!(report["record"], ".omnigraph-skill.json");
+    assert_eq!(report["removed"], serde_json::json!([]));
+    assert_eq!(report["kept"], serde_json::json!([]));
+
+    let record: Value =
+        serde_json::from_slice(&fs::read(dir.join(".omnigraph-skill.json")).unwrap()).unwrap();
+    assert_eq!(record["format"], 1);
+    assert_eq!(record["skill_version"], report["skill_version"]);
+    let recorded = record["files"].as_object().unwrap();
+    assert_eq!(recorded.len(), source.len());
+    for (path, bytes) in &source {
+        assert_eq!(recorded[path], sha256_hex(bytes), "{path}");
+    }
+
+    let shown = output_success(cli().args(["skill", "show"]));
+    assert_eq!(shown.stdout, source["SKILL.md"]);
+    let shown = output_success(cli().args(["skill", "show", "references/commands.md"]));
+    assert_eq!(shown.stdout, source["references/commands.md"]);
+    let missing = output_failure(cli().args(["skill", "show", "references/absent.md"]));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("the skill has no references/absent.md"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[test]
+fn skill_export_refuses_existing_files_and_force_removes_only_unchanged_recorded_files() {
+    let temp = tempdir().unwrap();
+    let dir = temp.path().join("omnigraph");
+    output_success(cli().args(["skill", "export"]).arg(&dir));
+    let skill_md = dir.join("SKILL.md");
+    fs::write(&skill_md, "edited\n").unwrap();
+
+    let refused = output_failure(cli().args(["skill", "export"]).arg(&dir));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("pass --force"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(fs::read_to_string(&skill_md).unwrap(), "edited\n");
+
+    // As if an earlier export had written files this skill no longer has:
+    // one still as written, one edited since, and (on Unix) one replaced by a
+    // symbolic link to a file outside the directory. `notes.md` was never
+    // recorded.
+    let record_path = dir.join(".omnigraph-skill.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let written = b"retired reference\n";
+    fs::write(dir.join("references/retired.md"), written).unwrap();
+    fs::write(dir.join("references/edited.md"), "my notes\n").unwrap();
+    let outside = temp.path().join("outside.md");
+    fs::write(&outside, written).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, dir.join("references/linked.md")).unwrap();
+    let stale: Vec<&str> = ["references/retired.md", "references/edited.md"]
+        .into_iter()
+        .chain(cfg!(unix).then_some("references/linked.md"))
+        .collect();
+    for path in &stale {
+        record["files"][path] = serde_json::json!(sha256_hex(written));
+    }
+    fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::write(dir.join("notes.md"), "unrelated\n").unwrap();
+
+    let output = output_success(
+        cli()
+            .args(["skill", "export", "--force", "--json"])
+            .arg(&dir),
+    );
+    let report = parse_stdout_json(&output);
+    assert_eq!(
+        report["removed"],
+        serde_json::json!(["references/retired.md"])
+    );
+    let mut kept = vec![serde_json::json!({"path": "references/edited.md", "reason": "modified"})];
+    if cfg!(unix) {
+        kept.push(serde_json::json!({"path": "references/linked.md", "reason": "not_a_file"}));
+    }
+    assert_eq!(report["kept"], serde_json::json!(kept));
+    assert!(!dir.join("references/retired.md").exists());
+    assert_eq!(
+        fs::read_to_string(dir.join("references/edited.md")).unwrap(),
+        "my notes\n"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), written);
+    assert_eq!(
+        fs::read_to_string(dir.join("notes.md")).unwrap(),
+        "unrelated\n"
+    );
+    assert_eq!(
+        fs::read(&skill_md).unwrap(),
+        fs::read(source_skill_dir().join("SKILL.md")).unwrap()
+    );
+    let rewritten: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    for path in &stale {
+        assert!(rewritten["files"].get(path).is_none(), "{path}");
+    }
+
+    // A record naming a path outside the directory refuses a forced export
+    // before it writes anything.
+    let mut escaping = rewritten.clone();
+    escaping["files"]["../escape.md"] = serde_json::json!(sha256_hex(written));
+    fs::write(&record_path, serde_json::to_vec(&escaping).unwrap()).unwrap();
+    fs::write(&skill_md, "edited again\n").unwrap();
+    let refused = output_failure(cli().args(["skill", "export", "--force"]).arg(&dir));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("leaves the skill directory"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(fs::read_to_string(&skill_md).unwrap(), "edited again\n");
 }
 
 #[test]
@@ -37,6 +296,7 @@ fn help_groups_commands_by_capability() {
     // ordering — to avoid brittle full-text assertions on clap's help body.
     let output = output_success(cli().arg("--help"));
     let stdout = stdout_string(&output);
+    assert!(output.stderr.is_empty(), "{output:?}");
 
     assert!(
         stdout.contains("COMMANDS BY CAPABILITY"),
@@ -69,6 +329,14 @@ fn help_groups_commands_by_capability() {
         pos("optimize") < pos("cluster"),
         "direct commands should be listed before the control command"
     );
+
+    // Help must exit before cross-level validation requires a managed plan.
+    let output = output_success(cli().args(["cluster", "apply", "--managed", "--help"]));
+    assert!(
+        stdout_string(&output).contains("Usage: omnigraph cluster apply"),
+        "{output:?}"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]
@@ -147,7 +415,8 @@ fn schema_show_preserves_plain_source_and_json_contract() {
         payload,
         serde_json::json!({
             "schema_source": source,
-            "system_columns": { "id": "__id", "src": "__src", "dst": "__dst" }
+            "system_columns": { "id": "__id", "src": "__src", "dst": "__dst" },
+            "catalogue_source": omnigraph_compiler::catalogue_declarations()
         })
     );
 }
@@ -186,30 +455,34 @@ fn schema_plan_json_reports_supported_additive_change() {
 
 #[test]
 fn schema_plan_with_server_flag_errors_wrong_plane() {
+    let temp = tempdir().unwrap();
     let server = support::managed_http::IntentApiFixture::graph(Vec::new());
     for command in ["plan", "apply"] {
-        let output = output_failure(
-            cli()
-                .args(["schema", command, "--schema"])
-                .arg(fixture("test.pg"))
-                .args(["--server", &server.origin]),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!(
-                "`schema {command}` is a direct (storage-native) command"
-            )),
-            "schema {command} wrong-capability message not found; got: {stderr}"
-        );
-        if command == "apply" {
-            assert!(stderr.contains("cluster apply --server"), "{stderr}");
-        } else {
-            assert!(stderr.contains("Pass a storage URI."), "{stderr}");
+        for schema in [fixture("test.pg"), temp.path().join("missing.pg")] {
+            let output = output_failure(
+                cli()
+                    .args(["schema", command, "--schema"])
+                    .arg(&schema)
+                    .args(["--server", &server.origin]),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(&format!(
+                    "`schema {command}` is a direct (storage-native) command"
+                )),
+                "schema {command} must reject its plane before reading {schema:?}; got: {stderr}"
+            );
+            if command == "apply" {
+                assert!(stderr.contains("cluster apply --server"), "{stderr}");
+            } else {
+                assert!(stderr.contains("Pass a storage URI."), "{stderr}");
+            }
+            assert!(output.stdout.is_empty());
+            assert!(
+                server.requests().is_empty(),
+                "refuse before discovery or dispatch"
+            );
         }
-        assert!(
-            server.requests().is_empty(),
-            "refuse before discovery or dispatch"
-        );
     }
     server.assert_complete();
 }
@@ -695,10 +968,11 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
             serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"apply_correction_or_restart"}]})
         };
         let server = IntentApiFixture::graph(vec![IntentReply::json(200, reply.clone())]);
+        let operator = KeyedServer::new(&server.origin);
         let mut command = cli();
         command
             .current_dir(directory.path())
-            .env("OMNIGRAPH_BEARER_TOKEN", &token)
+            .envs(operator.env(&token))
             .args(["graphs", "list", "--server", &server.origin]);
         if json_output {
             command.arg("--json");
@@ -861,16 +1135,35 @@ fn registry_profile_home() -> tempfile::TempDir {
 
 #[test]
 fn graphs_list_without_scope_needs_server() {
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
     // No addressing and no operator defaults: the served-registry resolver
     // asks for a server scope — not the graph-shaped "no graph addressed"
     // advice, which points at flags graphs list cannot consume.
-    let output = output_failure(cli().arg("graphs").arg("list"));
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("`graphs list` needs a server scope")
-            && stderr.contains("--server <name|url> or --profile <name>"),
-        "expected the needs-a-server-scope error in stderr; got:\n{stderr}"
-    );
+    for ambient in [
+        None,
+        Some(OsString::new()),
+        #[cfg(unix)]
+        Some(OsString::from_vec(vec![0xff])),
+    ] {
+        let mut command = cli();
+        command
+            .args(["graphs", "list"])
+            .env_remove("OMNIGRAPH_PROFILE");
+        if let Some(value) = &ambient {
+            command.env("OMNIGRAPH_PROFILE", value);
+        }
+        let output = output_failure(&mut command);
+        assert!(output.stdout.is_empty(), "{ambient:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("`graphs list` needs a server scope")
+                && stderr.contains("--server <name|url> or --profile <name>"),
+            "expected the needs-a-server-scope error for {ambient:?}; got:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -879,20 +1172,34 @@ fn graphs_list_rejects_store_bound_profile() {
     // is server-scoped, so resolution fails with scope-shaped advice instead
     // of the late embedded-arm engine-limitation message.
     let home = registry_profile_home();
-    let output = output_failure(
-        cli()
+    for (profile, ambient) in [
+        (Some("localdev"), None),
+        (None, Some("localdev")),
+        (Some("localdev"), Some("unknown-profile")),
+    ] {
+        let mut command = cli();
+        command
             .env("OMNIGRAPH_HOME", home.path())
-            .arg("graphs")
-            .arg("list")
-            .arg("--profile")
-            .arg("localdev"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("requires a server")
-            && stderr.contains("profile 'localdev' resolves a store scope"),
-        "expected the served store-scope rejection in stderr; got:\n{stderr}"
-    );
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["graphs", "list"]);
+        if let Some(value) = ambient {
+            command.env("OMNIGRAPH_PROFILE", value);
+        }
+        if let Some(value) = profile {
+            command.args(["--profile", value]);
+        }
+        let output = output_failure(&mut command);
+        assert!(
+            output.stdout.is_empty(),
+            "{profile:?}/{ambient:?}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("requires a server")
+                && stderr.contains("profile 'localdev' resolves a store scope"),
+            "expected the served store-scope rejection for {profile:?}/{ambient:?}; got:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -901,21 +1208,35 @@ fn graphs_list_rejects_cluster_bound_profile() {
     // points at `cluster status` for cluster-graph enumeration instead of the
     // misleading graph-data-command error.
     let home = registry_profile_home();
-    let output = output_failure(
-        cli()
+    for (profile, ambient) in [
+        (Some("brain-admin"), None),
+        (None, Some("brain-admin")),
+        (Some("brain-admin"), Some("unknown-profile")),
+    ] {
+        let mut command = cli();
+        command
             .env("OMNIGRAPH_HOME", home.path())
-            .arg("graphs")
-            .arg("list")
-            .arg("--profile")
-            .arg("brain-admin"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("requires a server")
-            && stderr.contains("profile 'brain-admin' resolves a cluster scope")
-            && stderr.contains("cluster status"),
-        "expected the served cluster-scope rejection in stderr; got:\n{stderr}"
-    );
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["graphs", "list"]);
+        if let Some(value) = ambient {
+            command.env("OMNIGRAPH_PROFILE", value);
+        }
+        if let Some(value) = profile {
+            command.args(["--profile", value]);
+        }
+        let output = output_failure(&mut command);
+        assert!(
+            output.stdout.is_empty(),
+            "{profile:?}/{ambient:?}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("requires a server")
+                && stderr.contains("profile 'brain-admin' resolves a cluster scope")
+                && stderr.contains("cluster status"),
+            "expected the served cluster-scope rejection for {profile:?}/{ambient:?}; got:\n{stderr}"
+        );
+    }
 }
 
 #[test]

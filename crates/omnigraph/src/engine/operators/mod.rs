@@ -28,13 +28,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::{OmniError, Result};
 
 mod anti_join;
+mod catalogue;
 mod contains_join;
 mod cross_join;
+mod csv_source;
 mod expand;
 mod expand_stream;
 mod filter;
 #[cfg(test)]
 mod fixtures;
+mod fragment_sink;
 mod hash_join;
 mod hydrate;
 mod limit;
@@ -49,16 +52,20 @@ mod single_hop;
 mod sort;
 mod subquery_aggregate;
 mod text_match;
+mod validate;
 
 pub(super) use anti_join::{
     AntiJoinMaskExec, OuterReferenceExec, OuterSlot, fresh_tag_column, tagged_schema,
 };
+pub(super) use catalogue::CatalogueExec;
 pub(super) use contains_join::ContainsJoinExec;
 pub(super) use cross_join::CrossJoinExec;
+pub(super) use csv_source::CsvSourceExec;
 pub(super) use expand::{
     ExpandExec, ExpandExecution, ExpandStep, GraphEnv, NamedExpand, validate_expand_structure,
 };
 pub(super) use filter::FilterExec;
+pub(super) use fragment_sink::LanceFragmentSink;
 pub(super) use hash_join::{HashJoinExec, LookupSpec};
 pub(super) use hydrate::HydrateExec;
 pub(super) use limit::LimitExec;
@@ -69,6 +76,7 @@ use scan::{Filled, Needles};
 pub(super) use scan::{RuntimeFilterSlot, ScanExec, ScanSource};
 pub(super) use sort::{SortExec, SortKey};
 pub(crate) use subquery_aggregate::RowCountPredicate;
+pub(super) use validate::{LoadJudge, ValidateExec};
 
 /// The `polls` counter: one per `poll_next` of any stream the operator handed
 /// out, so a zero says no consumer ever asked the operator for a batch.

@@ -172,7 +172,7 @@ then dated RFCs by date.
 |---|---|---|---|---|
 | [0001](0001-fragment-adopt-branch-merge.md) | Branch merge by fragment adoption | maintainer | draft | not-started |
 | [0002](0002-config-cli-architecture.md) | Config and CLI architecture | maintainer | superseded | partial |
-| [0003](0003-mcp-server-surface.md) | MCP server surface | maintainer | draft | not-started |
+| [0003](0003-mcp-server-surface.md) | MCP server surface | maintainer | draft | partial |
 | [0004](0004-cluster-graph-schema-apply.md) | Cluster graph and schema apply | maintainer | accepted | complete |
 | [0005](0005-server-cluster-boot.md) | Server boot from cluster state | maintainer | accepted | partial |
 | [0006](0006-object-storage-cluster-roots.md) | Object-storage cluster roots | maintainer | accepted | complete |
@@ -194,7 +194,7 @@ then dated RFCs by date.
 | [0027](0027-lineage-merge-deltas.md) | Lineage-based merge deltas | maintainer | draft | not-started |
 | [0028](0028-stable-schema-identity.md) | Stable schema identity and table incarnation | maintainer | accepted | complete |
 | [0029](0029-azure-blob-storage.md) | Native Azure Blob storage | public | accepted | in-progress |
-| [0030](0030-cdc-time-travel.md) | Graph change feed and retained-history contract | maintainer | accepted | partial |
+| [0030](0030-cdc-time-travel.md) | Graph diffs, change feeds and retained history | maintainer | accepted | partial |
 | [0031](0031-comparative-cost-harness.md) | Comparative cost harness | maintainer | draft | not-started |
 | [0032](0032-adversarial-correctness-harness.md) | Adversarial correctness harness | maintainer | draft | not-started |
 | [0033](0033-blob-management.md) | Blob management | maintainer | accepted | partial |
@@ -248,3 +248,5 @@ then dated RFCs by date.
 | [2026-10-10](2026-10-10-merge-base-block-registry.md) | Block registry for merge base lookup | maintainer | draft | in-progress |
 | [2026-10-11](2026-10-11-unattached-graph-branches.md) | Unattached graph branches | maintainer | draft | not-started |
 | [2026-10-11](2026-10-11-actor-views-and-subgraph-sharing.md) | Actor views and subgraph sharing | maintainer | draft | not-started |
+| [2026-10-15](2026-10-15-bulk-load-as-a-query-plan.md) | Bulk load as a query plan | maintainer | draft | partial |
+| [2026-10-16](2026-10-16-engine-catalogue.md) | Engine catalogue | maintainer | draft | in-progress |

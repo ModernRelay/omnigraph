@@ -192,6 +192,7 @@ fn openapi_info_contains_version() {
 // protected route nests under `/graphs/{graph_id}/…`.
 const EXPECTED_PATHS: &[&str] = &[
     "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/{resource_path}",
     "/healthz",
     "/readyz",
     "/graphs",
@@ -214,6 +215,9 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches",
     "/graphs/{graph_id}/branches/{branch}",
     "/graphs/{graph_id}/branches/merge",
+    "/graphs/{graph_id}/branches/diff",
+    "/graphs/{graph_id}/branches/merge-base",
+    "/graphs/{graph_id}/diff",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
     "/graphs/{graph_id}/commits/{commit_id}/publish",
@@ -221,6 +225,12 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/changes",
     "/graphs/{graph_id}/changes/baseline",
 ];
+
+/// The routes that answer in the change vocabulary: the change feed, a
+/// commit's changes, and the graph diff, branch diff and merge base.
+fn is_change_route(path: &str) -> bool {
+    path.contains("/changes") || path.ends_with("/diff") || path.ends_with("/merge-base")
+}
 
 #[test]
 fn openapi_contains_all_expected_paths() {
@@ -481,12 +491,12 @@ fn openapi_change_operations_reach_only_graph_vocabulary_schemas() {
         .as_object()
         .unwrap()
         .iter()
-        .filter(|(path, _)| path.contains("/changes"))
+        .filter(|(path, _)| is_change_route(path))
         .collect();
     assert_eq!(
         change_paths.len(),
-        3,
-        "the three change routes are registered: {change_paths:?}"
+        6,
+        "the six change routes are registered: {change_paths:?}"
     );
 
     let mut frontier = std::collections::BTreeSet::new();
@@ -1668,7 +1678,7 @@ fn error_code_schema_has_expected_variants() {
 }
 
 #[test]
-fn external_blob_source_error_is_structured_and_declared_on_write_routes() {
+fn external_blob_source_error_is_structured_and_declared_on_source_probe_routes() {
     let doc = openapi_json();
     let detail = &doc["components"]["schemas"]["ExternalBlobSourceOutput"];
     let required: HashSet<&str> = detail["required"]
@@ -1687,6 +1697,7 @@ fn external_blob_source_error_is_structured_and_declared_on_write_routes() {
     assert_eq!(output_ref, "#/components/schemas/ExternalBlobSourceOutput");
 
     for path in [
+        "/graphs/{graph_id}/query",
         "/graphs/{graph_id}/mutate",
         "/graphs/{graph_id}/mutate/if-graph-commit",
         "/graphs/{graph_id}/queries/{name}",
@@ -1787,6 +1798,9 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/branches", "post"),
         ("/graphs/{graph_id}/branches/{branch}", "delete"),
         ("/graphs/{graph_id}/branches/merge", "post"),
+        ("/graphs/{graph_id}/branches/diff", "get"),
+        ("/graphs/{graph_id}/branches/merge-base", "get"),
+        ("/graphs/{graph_id}/diff", "get"),
         ("/graphs/{graph_id}/commits", "get"),
         ("/graphs/{graph_id}/commits/{commit_id}", "get"),
         ("/graphs/{graph_id}/commits/{commit_id}", "delete"),
@@ -2179,7 +2193,11 @@ async fn auth_mode_healthz_still_has_no_security() {
         .body(Body::empty())
         .unwrap();
     let (_, json) = json_response(&app, request).await;
-    for path in ["/healthz", "/.well-known/oauth-protected-resource"] {
+    for path in [
+        "/healthz",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/{resource_path}",
+    ] {
         let operation = &json["paths"][path]["get"];
         assert!(
             operation.get("security").is_none() || operation["security"].is_null(),
@@ -2240,6 +2258,9 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches",
     "/graphs/{graph_id}/branches/{branch}",
     "/graphs/{graph_id}/branches/merge",
+    "/graphs/{graph_id}/branches/diff",
+    "/graphs/{graph_id}/branches/merge-base",
+    "/graphs/{graph_id}/diff",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
     "/graphs/{graph_id}/commits/{commit_id}/publish",
@@ -2319,6 +2340,9 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
         "/branches",
         "/branches/{branch}",
         "/branches/merge",
+        "/branches/diff",
+        "/branches/merge-base",
+        "/diff",
         "/commits",
         "/commits/{commit_id}",
         "/commits/{commit_id}/publish",
@@ -2351,6 +2375,7 @@ async fn multi_mode_openapi_keeps_management_paths_flat() {
         "/cluster/deployments",
         "/cluster/deployments/{id}",
         "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/{resource_path}",
     ] {
         assert!(
             paths.contains_key(flat),
@@ -2390,6 +2415,7 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
                 | "/cluster/deployments"
                 | "/cluster/deployments/{id}"
                 | "/.well-known/oauth-protected-resource"
+                | "/.well-known/oauth-protected-resource/{resource_path}"
         ) {
             continue;
         }
@@ -2462,6 +2488,7 @@ async fn multi_mode_openapi_declares_graph_id_path_parameter() {
         "/cluster/deployments",
         "/cluster/deployments/{id}",
         "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/{resource_path}",
     ] {
         let item = paths.get(flat).unwrap();
         for method in ["get", "head", "post", "put", "delete", "patch"] {
@@ -2551,6 +2578,9 @@ async fn served_spec_always_nests_under_cluster_prefix() {
         "/branches",
         "/branches/{branch}",
         "/branches/merge",
+        "/branches/diff",
+        "/branches/merge-base",
+        "/diff",
         "/commits",
         "/commits/{commit_id}",
         "/commits/{commit_id}/publish",
@@ -2590,7 +2620,7 @@ fn openapi_describes_api_contract_admission_and_response_identity() {
                 .iter()
                 .filter(|parameter| parameter["name"] == HTTP_API_CONTRACT_HEADER)
                 .collect();
-            let oauth = path == "/.well-known/oauth-protected-resource";
+            let oauth = path.starts_with("/.well-known/oauth-protected-resource");
             let protected =
                 path == "/graphs" || path.starts_with("/graphs/") || path.starts_with("/cluster/");
             if protected {
@@ -2614,7 +2644,7 @@ fn openapi_describes_api_contract_admission_and_response_identity() {
                 } else {
                     // The admission envelope is {error, code}, also valid under
                     // the change feed's narrower graph-vocabulary projection.
-                    let error_schema = if path.contains("/changes") {
+                    let error_schema = if is_change_route(path) {
                         "#/components/schemas/ChangeErrorOutput"
                     } else {
                         "#/components/schemas/ErrorOutput"

@@ -947,3 +947,324 @@ query total($q: Vector(4)) {
         );
     }
 }
+
+const KEY_SET_SCHEMA: &str = r#"
+node Channel { slug: String @key }
+node Source { slug: String @key }
+node Touchpoint { slug: String @key action: String }
+node ExternalID { slug: String @key }
+edge ChannelWatchesSource: Channel -> Source
+edge TouchpointOnSource: Touchpoint -> Source
+edge TouchpointByIdentity: Touchpoint -> ExternalID
+"#;
+
+const KEY_SET_QUERY: &str = r#"
+query lookalikes($channel: String, $exclude: String) {
+    match {
+        $c: Channel { slug: $channel }
+        $s: Source
+        $c channelWatchesSource $s
+        $t: Touchpoint { action: "star" }
+        $t touchpointOnSource $s
+        $x: ExternalID
+        $t touchpointByIdentity $x
+        not {
+            $s0: Source { slug: $exclude }
+            $t0: Touchpoint
+            $t0 touchpointOnSource $s0
+            $t0 touchpointByIdentity $x
+        }
+    }
+    return { $x.slug, count($t) as repos }
+}
+"#;
+
+/// A channel watching `watched` sources, `identities` identities that star
+/// each of them and touch `elsewhere` other touchpoints, and the first
+/// `excluded` identities starring the excluded source once.
+fn key_set_seed(watched: usize, identities: usize, elsewhere: usize, excluded: usize) -> String {
+    let mut lines = vec![
+        r#"{"type":"Channel","data":{"slug":"c"}}"#.to_string(),
+        r#"{"type":"Source","data":{"slug":"excluded"}}"#.to_string(),
+        r#"{"type":"Source","data":{"slug":"elsewhere"}}"#.to_string(),
+    ];
+    for source in 0..watched {
+        lines.push(format!(
+            r#"{{"type":"Source","data":{{"slug":"s{source}"}}}}"#
+        ));
+        lines.push(format!(
+            r#"{{"edge":"ChannelWatchesSource","from":"c","to":"s{source}"}}"#
+        ));
+    }
+    let mut touch = |slug: String, source: &str, identity: usize| {
+        lines.push(format!(
+            r#"{{"type":"Touchpoint","data":{{"slug":"{slug}","action":"star"}}}}"#
+        ));
+        lines.push(format!(
+            r#"{{"edge":"TouchpointOnSource","from":"{slug}","to":"{source}"}}"#
+        ));
+        lines.push(format!(
+            r#"{{"edge":"TouchpointByIdentity","from":"{slug}","to":"x{identity}"}}"#
+        ));
+    };
+    for identity in 0..identities {
+        for source in 0..watched {
+            touch(
+                format!("t{identity}-{source}"),
+                &format!("s{source}"),
+                identity,
+            );
+        }
+        for other in 0..elsewhere {
+            touch(format!("e{identity}-{other}"), "elsewhere", identity);
+        }
+    }
+    for identity in 0..excluded {
+        touch(format!("x{identity}"), "excluded", identity);
+    }
+    for identity in 0..identities {
+        lines.push(format!(
+            r#"{{"type":"ExternalID","data":{{"slug":"x{identity}"}}}}"#
+        ));
+    }
+    lines.join("\n")
+}
+
+/// A correlated block bound by a key equality on one of its own bindings runs
+/// once from that binding: its inner rows follow the excluded source's three
+/// touchpoints, not the 400 outer rows times each identity's 31 touchpoints
+/// (the correlated tree expands 12,030 rows here). The anti-join's input
+/// still carries every outer row, and the kept rows are the identities the
+/// excluded source never saw.
+#[tokio::test]
+async fn bounded_correlated_block_runs_once_from_its_key_set() {
+    use omnigraph_planner::{AntiJoinStrategy, PhysicalNode};
+
+    const WATCHED: usize = 10;
+    const IDENTITIES: usize = 40;
+    const ELSEWHERE: usize = 20;
+    const EXCLUDED: usize = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), KEY_SET_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        &key_set_seed(WATCHED, IDENTITIES, ELSEWHERE, EXCLUDED),
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let executed = db
+        .query_inspected(
+            "main",
+            KEY_SET_QUERY,
+            "lookalikes",
+            &params(&[("channel", "c"), ("exclude", "excluded")]),
+        )
+        .await
+        .unwrap();
+
+    let serde_json::Value::Array(mut kept) = executed.result.to_rust_json().unwrap() else {
+        panic!("rows");
+    };
+    kept.sort_by_key(|row| row["x.slug"].as_str().unwrap().to_string());
+    let expected: Vec<serde_json::Value> = {
+        let mut slugs: Vec<String> = (EXCLUDED..IDENTITIES).map(|i| format!("x{i}")).collect();
+        slugs.sort();
+        slugs
+            .into_iter()
+            .map(|slug| serde_json::json!({"x.slug": slug, "repos": WATCHED}))
+            .collect()
+    };
+    assert_eq!(kept, expected);
+
+    let plan = &executed.plan.plan;
+    let (outer, inner) = plan
+        .live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::AntiJoin {
+                input,
+                inner,
+                strategy,
+                ..
+            } => {
+                assert_eq!(*strategy, AntiJoinStrategy::KeySet, "{node:?}");
+                Some((*input, *inner))
+            }
+            _ => None,
+        })
+        .expect("the plan holds the block's AntiJoin");
+    let report = serde_json::to_value(&executed.report).unwrap();
+    let rows_of_node = |id| {
+        report["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == serde_json::json!(id))
+            .and_then(|row| row["attempts"].as_array()?.last()?["actual_rows"].as_u64())
+            .unwrap_or_else(|| panic!("node {id} has no report row: {report}"))
+    };
+    assert_eq!(rows_of_node(outer), (WATCHED * IDENTITIES) as u64);
+    let mut pending = vec![inner];
+    let mut inner_expands = Vec::new();
+    while let Some(id) = pending.pop() {
+        let node = plan.node(id).unwrap();
+        assert!(
+            !matches!(node, PhysicalNode::OuterReference { .. }),
+            "a key-set inner tree reads no outer rows"
+        );
+        if matches!(node, PhysicalNode::Expand { .. }) {
+            inner_expands.push(rows_of_node(id));
+        }
+        pending.extend(node.inputs());
+    }
+    assert_eq!(inner_expands, vec![EXCLUDED as u64; 2], "{report}");
+}
+
+/// Ordinary execution, the explain document, the `explain` statement and the
+/// inspected run accept one plan for one query: the same physical plan and
+/// validation scope, or the same refusal with the same diagnostic. Rust and
+/// not `.gqt`: a case reaches one door per step, and the claim is that the
+/// doors agree.
+#[tokio::test]
+async fn every_read_door_shares_one_acceptance() {
+    use arrow_array::StringArray;
+    use omnigraph::db::ReadTarget;
+
+    const SCHEMA: &str = r#"
+node Person {
+    name: String @key
+    age: I64
+}
+node Doc {
+    slug: String @key
+    title: String @index
+}
+edge Likes: Person -> Doc
+"#;
+    const ADULTS: &str = "query adults($min: I64) {
+    match { $p: Person $p.age >= $min }
+    return { $p.name }
+    order { $p.age desc }
+    limit 2
+}";
+    const RANKED: &str = "query ranked($q: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.title, $q) as score }
+    order { bm25($d.title, $q) }
+    limit 2
+}";
+    const LIKED: &str = "query liked() {
+    match { $p: Person $p likes $d }
+    return { $p.name, count($d) as n }
+    order { $p.name }
+}";
+    const RANKED_DESTINATION: &str = "query ranked_destination($q: String) {
+    match { $p: Person $p likes $d }
+    return { $d.slug }
+    order { bm25($d.title, $q) }
+}";
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"ann","age":40}}
+{"type":"Person","data":{"name":"bob","age":20}}
+{"type":"Doc","data":{"slug":"d1","title":"graph engines"}}
+{"type":"Doc","data":{"slug":"d2","title":"graph graph search"}}
+{"edge":"Likes","from":"ann","to":"d1"}
+{"edge":"Likes","from":"bob","to":"d2"}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices().await.unwrap();
+    for (source, name, params) in [
+        (ADULTS, "adults", int_params(&[("min", 18)])),
+        (RANKED, "ranked", params(&[("q", "graph")])),
+        (LIKED, "liked", params(&[])),
+    ] {
+        let main = || ReadTarget::branch("main");
+        let document = db
+            .explain_query(main(), source, name, &params)
+            .await
+            .unwrap();
+        let run = db
+            .query_inspected(main(), source, name, &params)
+            .await
+            .unwrap();
+        let rendered = run.explain.to_value();
+        assert_eq!(
+            document["physical_plan"], rendered["physical_plan"],
+            "{name}"
+        );
+        assert_eq!(
+            document["validation"],
+            serde_json::json!({ "scope": run.evidence.scope().as_str() }),
+            "{name}"
+        );
+        assert_eq!(document["validation"], rendered["validation"], "{name}");
+        let ordinary = db.query(main(), source, name, &params).await.unwrap();
+        assert_eq!(
+            ordinary.concat_batches().unwrap(),
+            run.result.concat_batches().unwrap(),
+            "{name}"
+        );
+        let statement = db
+            .query(main(), &format!("explain {source}"), name, &params)
+            .await
+            .unwrap()
+            .concat_batches()
+            .unwrap();
+        let column = |name: &str| {
+            statement
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+        let (nodes, details) = (column("node"), column("detail"));
+        let validation = (0..statement.num_rows())
+            .find(|row| nodes.value(*row) == "validation")
+            .map(|row| details.value(row).to_string());
+        let validation: serde_json::Value =
+            serde_json::from_str(&validation.expect("the statement reports its validation"))
+                .unwrap();
+        assert_eq!(validation, document["validation"], "{name}");
+    }
+    let params = params(&[("q", "graph")]);
+    let main = || ReadTarget::branch("main");
+    let refusals = [
+        db.explain_query(main(), RANKED_DESTINATION, "ranked_destination", &params)
+            .await
+            .err(),
+        db.query_inspected(main(), RANKED_DESTINATION, "ranked_destination", &params)
+            .await
+            .err(),
+        db.query(main(), RANKED_DESTINATION, "ranked_destination", &params)
+            .await
+            .err(),
+        db.query(
+            main(),
+            &format!("explain {RANKED_DESTINATION}"),
+            "ranked_destination",
+            &params,
+        )
+        .await
+        .err(),
+    ];
+    for refusal in refusals {
+        let refusal = refusal.expect("ranking a destination is refused at every door");
+        let diagnostic = refusal
+            .diagnostic()
+            .expect("a refusal by design carries its diagnostic");
+        assert_eq!(diagnostic.code.as_str(), "P001", "{refusal}");
+    }
+}

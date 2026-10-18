@@ -4,9 +4,9 @@ A `.gq` file contains named, typed queries. Read queries match graph patterns
 and return columns; mutation queries use the same declaration form and are
 covered in [Mutations](../mutations/index.md). A file may instead hold exactly
 one statement, never beside a query declaration: a branch statement (`branch
-create`, `branch delete`, `branch merge`, or `branch list`; see
-[Branches, Commits, and History](../branching/index.md)), a `show` statement
-(see [session settings](#session-settings)), or an `explain` statement, which
+create`, `delete`, `merge`, `list`, `diff`, or `merge-base`; see [Branches,
+Commits, and History](../branching/index.md)), a `show` statement (see
+[session settings](#session-settings)), or an `explain` statement, which
 answers the plan a read query would run under instead of its rows (see
 [Explain](explain.md)). Any of them may open with
 [session settings](#session-settings) lines.
@@ -128,11 +128,11 @@ skips null values.
 
 The block narrows the rows before `order` and `limit`, so a paged listing
 filtered by a relationship count is exact. A binding the block's traversal
-connects to the outer row is reached through that traversal, never scanned as
-a whole table, however many rows the outer pattern has; a binding correlated
-only through a filter, or read by a text search, is scanned. A
-single-hop, filter-free `count { ... }` over a directed, unbound edge is
-answered from the graph index's degree. A bare aggregate in `match`,
+connects to the outer row is reached through it, or the block runs once from a
+node it binds by key if that is cheaper (`strategy` in [explain](explain.md));
+a binding correlated only through a filter, or read by a text search, is
+scanned. A single-hop, filter-free `count { ... }` over a directed, unbound
+edge is answered from the graph index's degree. A bare aggregate in `match`,
 `count($d) > 2` without a block, is refused: it names no row to group by.
 
 ```
@@ -181,12 +181,12 @@ no binding, the bare form serves: `delete Person where @id = $who`,
 `delete Knows where @src = $who`. A bare `id` (`$p.id`, `where id = ...`)
 always names a user property called `id`; where none is declared it is the
 unknown-property error, which names the meta-field. Edge inserts keep
-addressing endpoints as `from` and `to`.
-
-`$e.@type` returns the bound edge's canonical schema type name as a non-null
-`String`, including on ordinary named traversals. It is synthesized query
-metadata and cannot be written. `@src` and `@dst` preserve stored orientation,
-including when the query traverses in reverse.
+addressing endpoints as `from` and `to`. `$e.@type` returns the bound edge's
+canonical schema type name as a non-null `String`, including on ordinary named
+traversals; it is synthesized query metadata and cannot be written. `@src` and
+`@dst` preserve stored orientation, including when the query traverses in
+reverse. In type position the same prefix names an engine-owned, read-only
+type: `$o: @Operator` binds the rows of the [engine catalogue](catalogue.md).
 
 ## Return, order, and limit
 
@@ -213,8 +213,11 @@ counts distinct non-null values, so a node reached by several paths counts once.
 Other aggregates require a property (`T8`) and refuse `distinct` (`T57`).
 
 A comparison or Boolean expression requires an alias (`T43`), such as
-`$p.age > 30 as adult`. Its result is `Bool`, or `Bool?` with a nullable operand;
-`is null` and `is not null` always return `Bool`. Aggregates refuse these projections (`T9`).
+`$p.age > 30 as adult`; its result is `Bool`, or `Bool?` with a nullable operand,
+and `is null` is always `Bool`. In an aggregated return its operands are
+aggregates, literals, `now()` and parameters, evaluated per group after
+aggregation: `count($p) > 0 as any` is `Bool?` because `count` is `I64?`. A group
+value beside an aggregate is refused (`T58`), any other Boolean item too (`T9`).
 
 `return distinct { $p.name }` keeps one row per complete projected tuple.
 Repeated traversal matches and equal values on different entities collapse;
@@ -225,15 +228,12 @@ ordering and limiting, so the limit counts distinct rows. Aggregates with
 order keys must be projected values or aliases, including property keys
 (`T42`). Remaining projected columns break ties ascending; no identity tiebreak is added.
 
-For ordinary returns, explicit order is total: entity ids break ties only
-when they can change the visible order. When every projection is an order key,
-equal rows are indistinguishable and no id is read. Ascending order puts nulls
-first; descending puts them last. `nearest(...)` requires a limit.
-
-Outside DISTINCT, property and system-field order keys need not be projected.
-Other keys, except the leading search function, must be return aliases or
-expressions written in return (`T42`), such as `count($d)` after
-`return { count($d) as deals }`.
+For ordinary returns, explicit order is total: entity ids break ties only when
+they can change the visible order, and no id is read when every projection is a
+key. Ascending puts nulls first, descending last. `nearest(...)` requires a limit.
+On ungrouped, non-DISTINCT rows, property and system-field order keys need not be projected;
+other keys, except the leading search function, must be return aliases or
+expressions written in return (`T42`), like `count($d)` after `return { count($d) as deals }`.
 
 For ordinary returns, `nearest(...)` orders by ascending distance and `bm25`
 and `rrf` by descending score, including through traversals. The search

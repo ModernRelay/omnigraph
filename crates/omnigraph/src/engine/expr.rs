@@ -47,7 +47,10 @@ impl ProjectionContext {
                 | PhysicalNode::RankFuse { .. }
                 | PhysicalNode::Projection { .. }
                 | PhysicalNode::Aggregate { .. }
-                | PhysicalNode::Sort { .. } => {}
+                | PhysicalNode::Sort { .. }
+                | PhysicalNode::CsvSource { .. }
+                | PhysicalNode::Validate { .. }
+                | PhysicalNode::FragmentWrite { .. } => {}
             }
         }
         Self {
@@ -58,7 +61,7 @@ impl ProjectionContext {
 
     /// The node type bound to `variable`, when the catalog declares it.
     pub(super) fn node_type(&self, variable: &str) -> Option<&NodeType> {
-        self.catalog.node_types.get(self.bindings.get(variable)?)
+        self.catalog.query_node_type(self.bindings.get(variable)?)
     }
 
     pub(super) fn declared_field(
@@ -78,7 +81,7 @@ impl ProjectionContext {
                 "internal exact integer cannot be a public result field",
             )),
             ExprType::Node { type_name } => {
-                let node = self.catalog.node_types.get(type_name).ok_or_else(|| {
+                let node = self.catalog.query_node_type(type_name).ok_or_else(|| {
                     OmniError::manifest_internal(format!("node type {type_name} is absent"))
                 })?;
                 let fields: Vec<_> = node
@@ -293,6 +296,7 @@ pub(super) fn evaluate_expr(
                 .ok_or_else(|| OmniError::manifest(format!("parameter '{name}' not provided")))?;
             typed_literal_to_array(lit, ty, batch.num_rows())?
         }
+        IRExpr::AliasRef(name, _) => alias_column(batch, name)?,
         IRExpr::Nearest { .. }
         | IRExpr::Search { .. }
         | IRExpr::Fuzzy { .. }
@@ -300,8 +304,7 @@ pub(super) fn evaluate_expr(
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _) => {
+        | IRExpr::Aggregate { .. } => {
             return Err(OmniError::manifest(format!(
                 "unsupported expression in filter: {expr}"
             )));
@@ -309,6 +312,16 @@ pub(super) fn evaluate_expr(
     };
     check_array_type(&values, expr.ty(), &expr.to_string())?;
     Ok(values)
+}
+
+/// A result column of the input: an aggregate leaf or a group key the
+/// `Aggregate` node below projected under this name.
+fn alias_column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
+    batch.column_by_name(name).map(Arc::clone).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "the projection input carries no column '{name}' the alias names"
+        ))
+    })
 }
 
 /// Membership is null for a null list or needle; null items never match.
@@ -394,9 +407,9 @@ pub(super) fn array_value_eq(
     Ok(equal.value(0))
 }
 
-/// Evaluate a single projection expression against a wide batch; a Boolean
-/// expression projects its `evaluate_filter` mask under its GQ text, and the
-/// lowering names the column by the alias T43 requires.
+/// Evaluate one return expression; lowering applies its alias.
+/// The projection adapter validates the complete declared field, including
+/// the captured members of a bare node.
 pub(super) fn evaluate_projection(
     wide_batch: &RecordBatch,
     expr: &IRExpr,
@@ -474,14 +487,14 @@ pub(super) fn evaluate_projection(
         IRExpr::Binary { .. } | IRExpr::Not(_, _) | IRExpr::IsNull { .. } | IRExpr::Cast { .. } => {
             Ok((expr.to_string(), evaluate_expr(wide_batch, expr, params)?))
         }
+        IRExpr::AliasRef(name, _) => Ok((name.clone(), alias_column(wide_batch, name)?)),
         IRExpr::Nearest { .. }
         | IRExpr::Search { .. }
         | IRExpr::Fuzzy { .. }
         | IRExpr::MatchText { .. }
         | IRExpr::Bm25 { .. }
         | IRExpr::Rrf { .. }
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _) => Err(OmniError::manifest(format!(
+        | IRExpr::Aggregate { .. } => Err(OmniError::manifest(format!(
             "unsupported projection expression: {}",
             expr
         ))),

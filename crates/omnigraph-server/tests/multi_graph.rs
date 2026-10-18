@@ -415,6 +415,7 @@ async fn cluster_boot_serves_applied_state() {
         graphs,
         config_path,
         server_policy,
+        ..
     } = settings.mode;
     assert_eq!(graphs.len(), 1);
     assert_eq!(graphs[0].graph_id, "knowledge");
@@ -815,6 +816,7 @@ graphs:
         graphs,
         config_path,
         server_policy,
+        ..
     } = settings.mode;
     let state = omnigraph_server::open_multi_graph_state(
         graphs,

@@ -38,6 +38,8 @@ impl RedactedCause {
             OmniError::ResourceLimitExceeded { .. } => "ResourceLimitExceeded",
             OmniError::ChangeCursorRejected { .. } => "ChangeCursorRejected",
             OmniError::BranchNotFound { .. } => "BranchNotFound",
+            OmniError::ReadTargetNotFound { .. } => "ReadTargetNotFound",
+            OmniError::AmbiguousReadTarget { .. } => "AmbiguousReadTarget",
             OmniError::ChangeFeedGap { .. } => "ChangeFeedGap",
             OmniError::CommitHasNoParent { .. } => "CommitHasNoParent",
             OmniError::ChangeSchemaBoundary { .. } => "ChangeSchemaBoundary",

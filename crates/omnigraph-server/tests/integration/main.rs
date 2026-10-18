@@ -4,6 +4,7 @@
 //! `multi_graph` (exhausts the process-wide export budget) stay their own binaries under tests/.
 
 mod auth_policy;
+mod catalogue_routes;
 mod data_routes;
 mod mcp;
 mod openapi;

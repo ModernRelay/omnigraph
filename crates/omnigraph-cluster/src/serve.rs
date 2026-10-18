@@ -100,6 +100,18 @@ pub struct AdmittedServingSnapshot {
 }
 
 impl AdmittedServingSnapshot {
+    pub(crate) fn from_bootstrap(
+        snapshot: ServingSnapshot,
+        canonical_root: String,
+        admission: crate::admission::ClusterAdmission,
+    ) -> Self {
+        Self {
+            snapshot,
+            canonical_root,
+            admission: Some(admission),
+        }
+    }
+
     pub fn canonical_root(&self) -> &str {
         &self.canonical_root
     }
@@ -126,6 +138,9 @@ pub async fn admit_serving_snapshot(
     } else {
         store_for_serving_snapshot(Path::new(cluster))?
     };
+    let store = store
+        .with_io_scope(omnigraph_storage::StorageIoScope::new())
+        .map_err(|diagnostic| vec![diagnostic])?;
     let admission = crate::admission::acquire_with_store(
         &store,
         crate::admission::ClusterAdmissionPurpose::Serve,
@@ -169,6 +184,9 @@ pub async fn acquire_serving_admission(
     } else {
         store_for_serving_snapshot(Path::new(cluster))?
     };
+    let store = store
+        .with_io_scope(omnigraph_storage::StorageIoScope::new())
+        .map_err(|diagnostic| vec![diagnostic])?;
     crate::admission::acquire_with_store(&store, crate::admission::ClusterAdmissionPurpose::Serve)
         .await
         .map_err(|diagnostic| vec![diagnostic])
@@ -736,7 +754,8 @@ async fn read_snapshot_impl(
                     .into_iter()
                     .filter(|binding| {
                         binding.strip_prefix("graph.").is_none_or(|graph| {
-                            selected(graph) && !quarantined_graphs.contains(graph)
+                            graph == omnigraph_compiler::CATALOGUE_SCOPE
+                                || (selected(graph) && !quarantined_graphs.contains(graph))
                         })
                     })
                     .collect();

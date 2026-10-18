@@ -7,7 +7,8 @@ pub const NOW_PARAM_NAME: &str = "__nanograph_now";
 
 /// A parsed `.gq` source: the `set` and `reset` lines at its head, then its
 /// body, which is a list of `query` declarations, one branch statement, one
-/// `show` statement, or one `explain` statement wrapping a read declaration.
+/// `show` statement, or one `explain` statement wrapping a read declaration
+/// or a load statement.
 #[derive(Debug, Clone)]
 pub struct QueryFile {
     pub settings: Vec<SettingStmt>,
@@ -21,8 +22,121 @@ pub enum FileBody {
     Queries(Vec<QueryDecl>),
     Branch(BranchStmt),
     Commit(CommitWrite),
+    Load(LoadStmt),
     Show(Option<SettingId>),
     Explain(QueryDecl),
+    /// `explain load csv …`: the read doors answer the accepted load plan
+    /// as explain rows, reading no payload byte.
+    ExplainLoad(LoadStmt),
+}
+
+/// A top-level load statement: `load csv "<uri>" into node:Person mode
+/// overwrite [delimiter "|"] [header] [columns (a, b)]`. The source is an
+/// object the engine reads under the graph's external Blob policy; the
+/// statement loads into the request's branch like a mutation declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadStmt {
+    /// The URI as written, decoded from its string literal.
+    pub source: String,
+    pub target: LoadTarget,
+    pub mode: LoadStmtMode,
+    /// One ASCII byte; `,` when unspelled.
+    pub delimiter: u8,
+    /// Whether the first record names the columns.
+    pub header: bool,
+    /// Property names by column position, `from`/`to` for an edge file's
+    /// endpoints; `None` when the header names the columns.
+    pub columns: Option<Vec<String>>,
+}
+
+/// The declared type a load statement fills, as spelled: `node:Person` or
+/// `edge:Knows`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadTarget {
+    Node(String),
+    Edge(String),
+}
+
+impl LoadTarget {
+    /// The catalog table key, `node:<name>` or `edge:<name>`.
+    pub fn table_key(&self) -> String {
+        match self {
+            LoadTarget::Node(name) => format!("node:{name}"),
+            LoadTarget::Edge(name) => format!("edge:{name}"),
+        }
+    }
+
+    pub fn type_name(&self) -> &str {
+        match self {
+            LoadTarget::Node(name) | LoadTarget::Edge(name) => name,
+        }
+    }
+}
+
+/// `mode overwrite | append | merge`, the load modes `omnigraph load` takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadStmtMode {
+    Overwrite,
+    Append,
+    Merge,
+}
+
+impl LoadStmtMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoadStmtMode::Overwrite => "overwrite",
+            LoadStmtMode::Append => "append",
+            LoadStmtMode::Merge => "merge",
+        }
+    }
+}
+
+impl LoadStmt {
+    /// The statement's two keywords.
+    pub fn statement_name(&self) -> &'static str {
+        "load csv"
+    }
+
+    /// The statement as the grammar reads it back: every spelled option in
+    /// its canonical order, the default delimiter left unspelled.
+    pub fn render(&self) -> String {
+        let mut statement = format!(
+            "load csv {} into {} mode {}",
+            render_string_literal(&self.source),
+            self.target.table_key(),
+            self.mode.as_str()
+        );
+        if self.delimiter != b',' {
+            let _ = write!(
+                statement,
+                " delimiter {}",
+                render_string_literal(&(self.delimiter as char).to_string())
+            );
+        }
+        if self.header {
+            statement.push_str(" header");
+        }
+        if let Some(columns) = &self.columns {
+            let _ = write!(statement, " columns ({})", columns.join(", "));
+        }
+        statement
+    }
+
+    /// Refusal text for a consumer that expected `query` declarations.
+    pub fn not_a_declaration_message(&self) -> String {
+        format!(
+            "`{}` is a load statement, not a query declaration",
+            self.statement_name()
+        )
+    }
+}
+
+/// `text` as a GQ string literal: quoted, with the backslash and the quote
+/// escaped.
+fn render_string_literal(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// A top-level control write on an unpublished commit:
@@ -103,6 +217,12 @@ pub fn show_statement_name(id: Option<SettingId>) -> String {
 /// [`BranchStmt::not_a_declaration_message`].
 const EXPLAIN_NOT_A_DECLARATION: &str = "`explain` is a statement, not a query declaration";
 
+/// Refusal text for a read-declaration consumer that got `explain load csv`:
+/// the read doors match the variant before selecting declarations and answer
+/// the load plan themselves.
+const EXPLAIN_LOAD_NOT_A_READ_DECLARATION: &str =
+    "`explain load csv` is answered as a load plan by the read doors, not as a query declaration";
+
 /// The statement name of `explain`, as the door refusals spell it.
 pub const EXPLAIN_STATEMENT_NAME: &str = "explain";
 
@@ -118,11 +238,13 @@ impl FileBody {
             FileBody::Queries(queries) => Ok(queries),
             FileBody::Branch(stmt) => Err(stmt.not_a_declaration_message()),
             FileBody::Commit(write) => Err(write.not_a_declaration_message()),
+            FileBody::Load(stmt) => Err(stmt.not_a_declaration_message()),
             FileBody::Show(id) => Err(format!(
                 "`{}` is a settings statement, not a query declaration",
                 show_statement_name(id)
             )),
             FileBody::Explain(_) => Err(EXPLAIN_NOT_A_DECLARATION.to_string()),
+            FileBody::ExplainLoad(_) => Err(EXPLAIN_NOT_A_DECLARATION.to_string()),
         }
     }
 
@@ -132,7 +254,9 @@ impl FileBody {
     /// # Errors
     ///
     /// As [`FileBody::into_declarations`] for a branch or `show` statement,
-    /// and the `explain` refusal when the wrapped declaration holds mutations.
+    /// the `explain` refusal when the wrapped declaration holds mutations,
+    /// and the load-plan refusal for `explain load csv`, which a read door
+    /// answers itself before it selects declarations.
     pub fn into_read_declarations(self) -> Result<Vec<QueryDecl>, String> {
         match self {
             FileBody::Explain(decl) if !decl.mutations.is_empty() => Err(format!(
@@ -140,11 +264,13 @@ impl FileBody {
                 decl.name
             )),
             FileBody::Explain(decl) => Ok(vec![decl]),
+            FileBody::ExplainLoad(_) => Err(EXPLAIN_LOAD_NOT_A_READ_DECLARATION.to_string()),
             body => body.into_declarations(),
         }
     }
 
-    /// Whether this body is an `explain` statement.
+    /// Whether this body is an `explain` statement wrapping a query
+    /// declaration; `explain load csv` answers no declaration's plan.
     pub fn is_explain(&self) -> bool {
         matches!(self, FileBody::Explain(_))
     }
@@ -192,18 +318,76 @@ impl QueryFile {
             },
             FileBody::Branch(stmt) => panic!("{}", stmt.not_a_declaration_message()),
             FileBody::Commit(write) => panic!("{}", write.not_a_declaration_message()),
+            FileBody::Load(stmt) => panic!("{}", stmt.not_a_declaration_message()),
             FileBody::Show(id) => panic!("`{}` is not a declaration", show_statement_name(*id)),
-            FileBody::Explain(_) => panic!("{EXPLAIN_NOT_A_DECLARATION}"),
+            FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
+                panic!("{EXPLAIN_NOT_A_DECLARATION}")
+            }
         }
     }
 }
 
-/// A top-level branch statement: a control write, or `branch list`, the
-/// one statement that changes no branch.
+/// A top-level branch statement: a control write, `branch list`, or a
+/// control read that compares or previews branches (RFC 0030 §8). Only a
+/// control write changes a branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchStmt {
     Write(BranchWrite),
     List,
+    Read(BranchRead),
+}
+
+/// A branch control read: it changes no branch and publishes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchRead {
+    /// `branch diff <source> [into <target>]` or `branch diff <from> to <to>`,
+    /// one page of net entity changes.
+    Diff {
+        sides: BranchDiffSides,
+        page: DiffPageClause,
+    },
+    /// `branch merge-base <source> [into <target>]`.
+    MergeBase {
+        source: String,
+        into: Option<String>,
+    },
+    /// `branch merge <source> [into <target>] dry run`: the merge decided,
+    /// nothing written.
+    MergeDryRun {
+        source: String,
+        into: Option<String>,
+    },
+}
+
+/// The two sides of `branch diff`. `into` is `None` when unspelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchDiffSides {
+    /// What `source` changed since its merge base with `into`.
+    Branch {
+        source: String,
+        into: Option<String>,
+    },
+    /// The net change from `from` to `to`, each a branch or a commit id.
+    Between { from: String, to: String },
+}
+
+/// The paging clauses of `branch diff`: `after page "<token>"` continues a
+/// previous answer, `limit <n>` bounds the page's changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffPageClause {
+    pub after_page: Option<String>,
+    pub limit: Option<usize>,
+}
+
+impl BranchRead {
+    /// The read's leading words.
+    pub fn statement_name(&self) -> &'static str {
+        match self {
+            BranchRead::Diff { .. } => "branch diff",
+            BranchRead::MergeBase { .. } => "branch merge-base",
+            BranchRead::MergeDryRun { .. } => "branch merge dry run",
+        }
+    }
 }
 
 /// A control write: `branch create <name> [from <parent>]`,
@@ -238,16 +422,17 @@ impl BranchWrite {
 }
 
 impl BranchStmt {
-    /// `false` only for `branch list`.
+    /// `true` only for a control write.
     pub fn is_write(&self) -> bool {
         matches!(self, BranchStmt::Write(_))
     }
 
-    /// The statement's two keywords, `branch create` through `branch list`.
+    /// The statement's leading words, `branch create` through `branch diff`.
     pub fn statement_name(&self) -> &'static str {
         match self {
             BranchStmt::Write(write) => write.statement_name(),
             BranchStmt::List => "branch list",
+            BranchStmt::Read(read) => read.statement_name(),
         }
     }
 

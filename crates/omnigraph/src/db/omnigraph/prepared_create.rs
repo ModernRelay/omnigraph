@@ -134,11 +134,23 @@ impl Omnigraph {
     /// Invoke one durably recorded birth exactly once. Existing roots refuse;
     /// callers reconcile an uncertain invocation instead of calling this again.
     pub async fn apply_prepared_graph_create(prepared: &PreparedGraphCreate) -> Result<Self> {
+        Self::apply_prepared_graph_create_with_io_scope(prepared, None).await
+    }
+
+    /// Invoke a recorded birth using the serving owner's explicit storage lifetime.
+    pub async fn apply_prepared_graph_create_with_io_scope(
+        prepared: &PreparedGraphCreate,
+        scope: Option<crate::storage::StorageIoScope>,
+    ) -> Result<Self> {
         prepared.validate()?;
+        let storage = match scope {
+            Some(scope) => crate::storage::storage_for_uri_scoped(prepared.root(), scope)?,
+            None => storage_for_uri(prepared.root())?,
+        };
         Self::init_with_storage_for_vintage(
             prepared.root(),
             prepared.source(),
-            storage_for_uri(prepared.root())?,
+            storage,
             InitOptions::default(),
             false,
             Some(prepared),

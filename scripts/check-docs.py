@@ -503,6 +503,31 @@ def check_skill_version(errors: list[str]) -> None:
             f"{version.group(1)!r} != omnigraph-cli {cli_version.group(1)!r}"
         )
 
+    # The CLI reports its HTTP contract beside the skill it exports, so the
+    # skill's declared contract must be the one the binary speaks.
+    api_types = ROOT / "crates" / "omnigraph-api-types" / "src" / "lib.rs"
+    contract = re.search(
+        r'(?m)^pub const HTTP_API_CONTRACT: &str = "([^"]+)";',
+        api_types.read_text(encoding="utf-8"),
+    )
+    compatibility = re.search(r"(?m)^compatibility:\s*(.*)$", text[4:end])
+    declared = (
+        re.search(r"\bHTTP contract (\S+?)[.,;]?(?:\s|$)", compatibility.group(1))
+        if compatibility
+        else None
+    )
+    if contract is None:
+        errors.append(f"{api_types.relative_to(ROOT)}: HTTP_API_CONTRACT is required")
+    elif declared is None:
+        errors.append(
+            "skills/omnigraph/SKILL.md: compatibility must name the 'HTTP contract' it covers"
+        )
+    elif declared.group(1) != contract.group(1):
+        errors.append(
+            "skills/omnigraph/SKILL.md: compatibility names HTTP contract "
+            f"{declared.group(1)!r} != omnigraph-api-types {contract.group(1)!r}"
+        )
+
 
 def main() -> int:
     from release_notes import check_working_notes

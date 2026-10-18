@@ -2,10 +2,12 @@
 //! claim is the call sequence an engine sees, which no query result shows.
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
+use omnigraph_planner::EmptyEligible;
 use omnigraph_planner::{
-    AggregateFields, ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, HydratedBinding,
-    Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields,
-    RankKind, RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
+    AggregateFields, ColumnRef, ContainsJoinFields, CsvSourceFields, ExpandFields,
+    FragmentWriteFields, HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode,
+    PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind, RankedAccess, ScanInput,
+    ScanSpec, SideId, SortMergeJoinFields, ValidateFields,
 };
 
 fn no_prefilter() -> Prefilter {
@@ -13,6 +15,8 @@ fn no_prefilter() -> Prefilter {
         ranked_type: "Doc".to_string(),
         hops: Vec::new(),
         feeds: Vec::new(),
+        on_empty: EmptyEligible::Postfilter,
+        coverage_admits: true,
     }
 }
 
@@ -207,6 +211,28 @@ impl Lower for Trace {
         self.call("sort", id, &[&input])
     }
 
+    fn csv_source(&mut self, id: NodeId, _: CsvSourceFields<'_>) -> Result<String, PlanError> {
+        self.call("csv_source", id, &[])
+    }
+
+    fn validate(
+        &mut self,
+        id: NodeId,
+        _: ValidateFields<'_>,
+        input: String,
+    ) -> Result<String, PlanError> {
+        self.call("validate", id, &[&input])
+    }
+
+    fn fragment_write(
+        &mut self,
+        id: NodeId,
+        _: FragmentWriteFields<'_>,
+        input: String,
+    ) -> Result<String, PlanError> {
+        self.call("fragment_write", id, &[&input])
+    }
+
     fn finish(&mut self, root: NodeId, op: String) -> Result<String, PlanError> {
         self.call("finish", root, &[&op])
     }
@@ -268,11 +294,7 @@ fn a_hash_join_lowers_its_probe_then_its_build_scan_then_itself() {
         spec: Box::new(ScanSpec {
             access: None,
             side: SideId::Base,
-            table: omnigraph_planner::TableRef {
-                type_key: "node:Doc".to_string(),
-                dataset_path: "node_Doc".to_string(),
-                native_branch: None,
-            },
+            table: omnigraph_planner::TableRef::dataset("node:Doc", "node_Doc", None),
             version: None,
             columns: omnigraph_compiler::SystemColumns {
                 id: "__id",
@@ -349,6 +371,7 @@ fn an_anti_join_hands_over_its_outer_input_before_the_inner_tree_is_lowered() {
         outer_var: "o".to_string(),
         predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
         aggregate: None,
+        strategy: omnigraph_planner::AntiJoinStrategy::Correlated,
     });
     plan.set_root(anti);
 

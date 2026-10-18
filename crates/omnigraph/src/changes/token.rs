@@ -1,10 +1,13 @@
 //! Opaque continuation tokens and feed cursors.
 //!
-//! Three payload kinds share one envelope: `base64url_no_pad(json ‖ sha256)`.
-//! A commit page token continues one bounded commit diff; a feed cursor is the
-//! caller-owned durable position after a complete commit; a feed page token
-//! continues one interrupted poll at its captured cut. Kind tags make every
-//! cross-use a typed rejection instead of a silently misread position.
+//! Five payload kinds share one envelope: `base64url_no_pad(json ‖ sha256)`.
+//! A commit page token continues one bounded commit diff; a diff page token
+//! continues one bounded graph diff between the two commits its first page
+//! resolved; a feed cursor is the caller-owned durable position after a
+//! complete commit; a feed page token continues one interrupted poll at its
+//! captured cut; a commit list page token continues one branch's commit list
+//! below the head its first page resolved. Kind tags make every cross-use a
+//! typed rejection instead of a silently misread position.
 //!
 //! Payload contents are private transport state. They never expose table
 //! aliases, dataset paths, Lance versions, or row addresses; the numeric table
@@ -35,8 +38,10 @@ pub(crate) const CONTINUATION_EXACT_ID_MAX_BYTES: usize = 256;
 const CONTINUATION_ID_PREFIX_MAX_BYTES: usize = 64;
 
 pub(crate) const KIND_COMMIT_PAGE: &str = "commit-page";
+pub(crate) const KIND_DIFF_PAGE: &str = "diff-page";
 pub(crate) const KIND_FEED_CURSOR: &str = "feed-cursor";
 pub(crate) const KIND_FEED_PAGE: &str = "feed-page";
+pub(crate) const KIND_COMMIT_LIST_PAGE: &str = "commit-list-page";
 
 /// Cursor purpose for the v1 forward entity feed.
 pub(crate) const FEED_PURPOSE: &str = "changes/forward";
@@ -199,6 +204,49 @@ pub(crate) struct CommitPageTokenV1 {
     pub change_index: usize,
 }
 
+/// Continues one bounded graph diff. Binds the request's sides (as a digest,
+/// so a branch name never rides in the token), the two commits the first page
+/// resolved them to, and the canonical filter scope. Continuations answer for
+/// those commits whatever the named branches did since.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DiffPageTokenV1 {
+    pub version: u8,
+    pub kind: String,
+    /// Hashed graph identity (schema identity domain), never the raw domain.
+    pub graph_identity: String,
+    /// Digest of the request's sides: their form and the names it spelled.
+    pub sides: String,
+    pub from_commit_id: String,
+    pub to_commit_id: String,
+    /// The merge base, present for the branch form; equal to `from_commit_id`.
+    pub base_commit_id: Option<String>,
+    pub filter_digest: String,
+    /// Opaque graph type identity of the last emitted change.
+    pub type_id: String,
+    pub position: IdPositionV1,
+    pub operation_rank: u8,
+    pub change_index: usize,
+}
+
+/// Continues one branch's commit list, newest first. Binds the branch (as a
+/// digest, so its name never rides in the token) and the head the first page
+/// resolved; the position is the commit the next page starts at and the
+/// generation it must stay below. Continuations answer for that head's
+/// first-parent chain whatever the branch did since.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CommitListPageTokenV1 {
+    pub version: u8,
+    pub kind: String,
+    /// Hashed graph identity (schema identity domain), never the raw domain.
+    pub graph_identity: String,
+    pub branch: BranchScopeV1,
+    pub head_commit_id: String,
+    pub next_commit_id: String,
+    /// The generation of the last commit listed: the next page's first commit
+    /// has a lower one.
+    pub below_generation: u64,
+}
+
 /// Durable caller-owned feed position: everything needed to prove the resumed
 /// chain is the same graph, history incarnation, branch incarnation, and
 /// filter contract, plus the last completed commit.
@@ -251,8 +299,10 @@ pub(crate) struct FeedPageTokenV1 {
 fn kind_label(kind: &str) -> &'static str {
     match kind {
         KIND_COMMIT_PAGE => "commit changes page token",
+        KIND_DIFF_PAGE => "diff page token",
         KIND_FEED_CURSOR => "change feed cursor",
         KIND_FEED_PAGE => "change feed page token",
+        KIND_COMMIT_LIST_PAGE => "commit list page token",
         _ => "unrecognized continuation",
     }
 }
@@ -275,6 +325,27 @@ pub(crate) fn opaque_type_id(schema_identity_domain: &str, identity: TableIdenti
     hasher.update([0x1f]);
     hasher.update(identity.table_incarnation_id.to_le_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+/// Digest of a graph diff request's sides. The form is part of the digest, so
+/// a two-point request and a branch request over the same names never share a
+/// continuation.
+pub(crate) fn sides_digest(sides: &super::model::GraphDiffSides) -> String {
+    let canonical = match sides {
+        super::model::GraphDiffSides::Between { from, to } => serde_json::json!({
+            "v": 1,
+            "form": "between",
+            "from": from,
+            "to": to,
+        }),
+        super::model::GraphDiffSides::Branch { source, target } => serde_json::json!({
+            "v": 1,
+            "form": "branch",
+            "source": source,
+            "target": target,
+        }),
+    };
+    hashed_identity(&canonical.to_string())
 }
 
 /// Canonical digest of one feed scope. Sorted and deduplicated per dimension,
@@ -403,6 +474,31 @@ pub(crate) fn decode_commit_page_token(token: &str) -> Result<CommitPageTokenV1>
     Ok(decoded)
 }
 
+pub(crate) fn decode_diff_page_token(token: &str) -> Result<DiffPageTokenV1> {
+    let decoded: DiffPageTokenV1 = decode_token(token, KIND_DIFF_PAGE)?;
+    if decoded.type_id.is_empty()
+        || decoded.operation_rank > ChangeOpKind::Delete.rank()
+        || decoded.from_commit_id.is_empty()
+        || decoded.to_commit_id.is_empty()
+    {
+        return Err(cursor_rejected("invalid diff page token identity"));
+    }
+    decoded.position.validate("diff page token")?;
+    Ok(decoded)
+}
+
+pub(crate) fn decode_commit_list_page_token(token: &str) -> Result<CommitListPageTokenV1> {
+    let decoded: CommitListPageTokenV1 = decode_token(token, KIND_COMMIT_LIST_PAGE)?;
+    decoded.branch.validate("commit list page token")?;
+    if decoded.head_commit_id.is_empty()
+        || decoded.next_commit_id.is_empty()
+        || decoded.below_generation == 0
+    {
+        return Err(cursor_rejected("invalid commit list page token position"));
+    }
+    Ok(decoded)
+}
+
 pub(crate) fn decode_feed_cursor(token: &str) -> Result<FeedCursorV1> {
     let decoded: FeedCursorV1 = decode_token(token, KIND_FEED_CURSOR)?;
     if decoded.purpose != FEED_PURPOSE {
@@ -494,11 +590,41 @@ mod tests {
         }
     }
 
+    fn diff_page_token() -> DiffPageTokenV1 {
+        DiffPageTokenV1 {
+            version: TOKEN_VERSION,
+            kind: KIND_DIFF_PAGE.to_string(),
+            graph_identity: hashed_identity("graph"),
+            sides: sides_digest(&crate::changes::model::GraphDiffSides::Branch {
+                source: "feature".to_string(),
+                target: "main".to_string(),
+            }),
+            from_commit_id: "base".to_string(),
+            to_commit_id: "head".to_string(),
+            base_commit_id: Some("base".to_string()),
+            filter_digest: filter_digest(&ChangeFeedScope::default()),
+            type_id: opaque_type_id(
+                "graph",
+                TableIdentity {
+                    stable_table_id: 3,
+                    table_incarnation_id: 7,
+                },
+            ),
+            position: IdPositionV1::for_id("alice"),
+            operation_rank: 0,
+            change_index: 2,
+        }
+    }
+
     #[test]
     fn tokens_round_trip() {
         let token = commit_page_token();
         let decoded = decode_commit_page_token(&encode_token(&token).unwrap()).unwrap();
         assert_eq!(decoded, token);
+
+        let diff = diff_page_token();
+        let decoded = decode_diff_page_token(&encode_token(&diff).unwrap()).unwrap();
+        assert_eq!(decoded, diff);
 
         let cursor = feed_cursor();
         let decoded = decode_feed_cursor(&encode_token(&cursor).unwrap()).unwrap();
@@ -507,6 +633,74 @@ mod tests {
         let page = feed_page_token();
         let decoded = decode_feed_page_token(&encode_token(&page).unwrap()).unwrap();
         assert_eq!(decoded, page);
+
+        let list = commit_list_page_token();
+        let decoded = decode_commit_list_page_token(&encode_token(&list).unwrap()).unwrap();
+        assert_eq!(decoded, list);
+    }
+
+    fn commit_list_page_token() -> CommitListPageTokenV1 {
+        CommitListPageTokenV1 {
+            version: TOKEN_VERSION,
+            kind: KIND_COMMIT_LIST_PAGE.to_string(),
+            graph_identity: hashed_identity("graph"),
+            branch: BranchScopeV1::for_branch(Some("feature")),
+            head_commit_id: "head".to_string(),
+            next_commit_id: "parent".to_string(),
+            below_generation: 7,
+        }
+    }
+
+    #[test]
+    fn commit_list_page_tokens_hold_a_position_below_a_listed_commit() {
+        let encoded = encode_token(&commit_list_page_token()).unwrap();
+        assert!(
+            !String::from_utf8(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&encoded)
+                    .unwrap()
+            )
+            .unwrap_or_default()
+            .contains("feature"),
+            "the branch rides as a digest"
+        );
+        let diff = encode_token(&diff_page_token()).unwrap();
+        let OmniError::ChangeCursorRejected { reason } =
+            decode_commit_list_page_token(&diff).unwrap_err()
+        else {
+            panic!("expected rejection");
+        };
+        assert!(
+            reason.contains("diff page token") && reason.contains("commit list page token"),
+            "{reason}"
+        );
+        assert!(matches!(
+            decode_diff_page_token(&encoded).unwrap_err(),
+            OmniError::ChangeCursorRejected { .. }
+        ));
+        for broken in [
+            CommitListPageTokenV1 {
+                below_generation: 0,
+                ..commit_list_page_token()
+            },
+            CommitListPageTokenV1 {
+                next_commit_id: String::new(),
+                ..commit_list_page_token()
+            },
+            CommitListPageTokenV1 {
+                branch: BranchScopeV1("feature".to_string()),
+                ..commit_list_page_token()
+            },
+        ] {
+            let encoded = encode_token(&broken).unwrap();
+            assert!(
+                matches!(
+                    decode_commit_list_page_token(&encoded).unwrap_err(),
+                    OmniError::ChangeCursorRejected { .. }
+                ),
+                "{broken:?}"
+            );
+        }
     }
 
     #[test]
@@ -677,6 +871,50 @@ mod tests {
 
         let err = decode_feed_page_token(&page).unwrap_err();
         assert!(matches!(err, OmniError::ChangeCursorRejected { .. }));
+
+        // A commit page token and a diff page token never stand in for each
+        // other, even though both continue a bounded entity-change response.
+        let err = decode_diff_page_token(&page).unwrap_err();
+        let OmniError::ChangeCursorRejected { reason } = err else {
+            panic!("expected rejection");
+        };
+        assert!(
+            reason.contains("commit changes page token") && reason.contains("diff page token"),
+            "{reason}"
+        );
+        let diff = encode_token(&diff_page_token()).unwrap();
+        let err = decode_commit_page_token(&diff).unwrap_err();
+        assert!(matches!(err, OmniError::ChangeCursorRejected { .. }));
+        assert!(matches!(
+            decode_feed_cursor(&diff).unwrap_err(),
+            OmniError::ChangeCursorRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn sides_digest_binds_the_form_and_the_spelled_names() {
+        use crate::changes::model::GraphDiffSides;
+        let between = sides_digest(&GraphDiffSides::Between {
+            from: "main".to_string(),
+            to: "feature".to_string(),
+        });
+        let branch = sides_digest(&GraphDiffSides::Branch {
+            source: "main".to_string(),
+            target: "feature".to_string(),
+        });
+        let swapped = sides_digest(&GraphDiffSides::Between {
+            from: "feature".to_string(),
+            to: "main".to_string(),
+        });
+        assert_ne!(between, branch);
+        assert_ne!(between, swapped);
+        assert_eq!(
+            between,
+            sides_digest(&GraphDiffSides::Between {
+                from: "main".to_string(),
+                to: "feature".to_string(),
+            })
+        );
     }
 
     #[test]

@@ -53,6 +53,21 @@ pub(crate) struct EmbedOutput {
     pub model: String,
 }
 
+pub(crate) fn write_human(output: &EmbedOutput, stdout: &mut dyn Write) -> Result<()> {
+    writeln!(
+        stdout,
+        "embedded {} records (selected {}, cleaned {}) from {} -> {} [{} {}d]",
+        output.embedded_records,
+        output.selected_records,
+        output.cleaned_records,
+        output.input,
+        output.output,
+        output.mode,
+        output.dimension
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct EmbedJob {
     input: PathBuf,

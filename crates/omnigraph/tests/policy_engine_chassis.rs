@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::OmniError;
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
 
@@ -412,6 +412,16 @@ async fn blob_put_and_clear_enforce_change_for_the_actor() {
     db.clear_blob_at_as("main", cell(), None, Some("act-allowed"))
         .await
         .expect("act-allowed may Change on main");
+    assert_non_canonical_branch(
+        db.put_blob_at_as(" main", cell(), bytes(), None, Some("act-allowed"))
+            .await,
+        "put_blob_at_as on a padded branch name",
+    );
+    assert_non_canonical_branch(
+        db.clear_blob_at_as("main ", cell(), None, Some("act-allowed"))
+            .await,
+        "clear_blob_at_as on a padded branch name",
+    );
 }
 
 #[tokio::test]
@@ -605,6 +615,156 @@ async fn branch_merge_as_allows_when_policy_permits_actor() {
     db.branch_merge_as("feature", "main", Some("act-allowed"))
         .await
         .expect("act-allowed should be able to BranchMerge");
+}
+
+fn assert_non_canonical_branch(result: Result<impl std::fmt::Debug, OmniError>, what: &str) {
+    match result {
+        Err(OmniError::Manifest(error))
+            if error.kind == ManifestErrorKind::BadRequest
+                && (error.message.contains("leading or trailing whitespace")
+                    || error.message.contains("contains a control character")) => {}
+        other => panic!("{what}: expected a non-canonical branch name refusal, got {other:?}"),
+    }
+}
+
+/// The head commit of each protected branch and the live branch names: what a
+/// refused writer must leave as it found them.
+async fn protected_state(db: &Session) -> (String, String, Vec<String>) {
+    let head = |commits: Vec<omnigraph::db::GraphCommit>| commits[0].graph_commit_id.clone();
+    let mut branches = db.branch_list().await.unwrap();
+    branches.sort();
+    (
+        head(db.list_commits(None).await.unwrap()),
+        head(db.list_commits(Some("release")).await.unwrap()),
+        branches,
+    )
+}
+
+/// The policy judges a branch name as written, and the engine acts on the
+/// name it is given. An actor allowed to write and control only unprotected
+/// branches therefore cannot reach a protected one through a spelling the
+/// engine could read as it: every writer refuses the spelling as a typed bad
+/// request before policy or effects, and both protected heads stay put.
+#[tokio::test]
+async fn non_canonical_branch_names_cannot_reach_a_protected_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    {
+        let db = init_and_load(&dir).await;
+        db.branch_create("feature").await.unwrap();
+        db.branch_create("release").await.unwrap();
+        let params = mixed_params(&[("$name", "Feature")], &[("$age", 30)]);
+        db.mutate("feature", MUTATION_QUERIES, "insert_person", &params)
+            .await
+            .unwrap();
+    }
+    let policy = POLICY_YAML
+        .replace(
+            "protected_branches: [main]",
+            "protected_branches: [main, release]",
+        )
+        .replace("      branch_scope: any", "      branch_scope: unprotected")
+        .replace(
+            "      target_branch_scope: any",
+            "      target_branch_scope: unprotected",
+        );
+    let (db, _engine) =
+        install_policy_source(Omnigraph::open(&uri).await.unwrap(), dir.path(), &policy);
+    let actor = Some("act-allowed");
+    let params = mixed_params(&[("$name", "Eve")], &[("$age", 22)]);
+    // The canonical spellings are judged as the policy says.
+    assert_denied(
+        db.mutate_as("main", MUTATION_QUERIES, "insert_person", &params, actor)
+            .await,
+        "mutate_as on protected main",
+    );
+    assert_denied(
+        db.branch_merge_as("feature", "main", actor).await,
+        "branch_merge_as into protected main",
+    );
+    assert_denied(
+        db.branch_delete_as("release", actor).await,
+        "branch_delete_as of protected release",
+    );
+    let before = protected_state(&db).await;
+
+    let check =
+        |what: String, result: Result<(), OmniError>, after: (String, String, Vec<String>)| {
+            assert_eq!(after, before, "{what} reached a protected branch");
+            assert_non_canonical_branch(result, &what);
+        };
+    for main in [" main", "main ", " main ", "\tmain", "main\u{3000}"] {
+        let result = db
+            .mutate_as(main, MUTATION_QUERIES, "insert_person", &params, actor)
+            .await
+            .map(drop);
+        check(
+            format!("mutate_as({main:?})"),
+            result,
+            protected_state(&db).await,
+        );
+        let result = db
+            .load_as(main, None, ONE_PERSON_JSONL, LoadMode::Merge, actor)
+            .await
+            .map(drop);
+        check(
+            format!("load_as({main:?})"),
+            result,
+            protected_state(&db).await,
+        );
+        let result = db.branch_merge_as("feature", main, actor).await.map(drop);
+        check(
+            format!("branch_merge_as(feature -> {main:?})"),
+            result,
+            protected_state(&db).await,
+        );
+        let result = db
+            .rebuild_full_text_indices_on_as(main, actor)
+            .await
+            .map(drop);
+        check(
+            format!("rebuild_full_text_indices_on_as({main:?})"),
+            result,
+            protected_state(&db).await,
+        );
+        let result = db
+            .load_as(
+                "fresh",
+                Some(main),
+                ONE_PERSON_JSONL,
+                LoadMode::Merge,
+                actor,
+            )
+            .await
+            .map(drop);
+        check(
+            format!("load_as(fresh from {main:?})"),
+            result,
+            protected_state(&db).await,
+        );
+        let result = db
+            .branch_create_from_as(ReadTarget::branch(main), "fresh", actor)
+            .await;
+        check(
+            format!("branch_create_from_as({main:?} -> fresh)"),
+            result,
+            protected_state(&db).await,
+        );
+    }
+    for release in [" release", "release "] {
+        let result = db.branch_delete_as(release, actor).await;
+        check(
+            format!("branch_delete_as({release:?})"),
+            result,
+            protected_state(&db).await,
+        );
+        let result = db.branch_create_as(release, actor).await;
+        check(
+            format!("branch_create_as({release:?})"),
+            result,
+            protected_state(&db).await,
+        );
+    }
 }
 
 #[tokio::test]

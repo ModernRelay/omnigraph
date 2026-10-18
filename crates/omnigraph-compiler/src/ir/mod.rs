@@ -1,9 +1,13 @@
 pub mod coerce;
 mod erase;
 pub mod fold;
+pub mod load;
 pub(crate) mod lower;
 pub mod untyped;
 pub(crate) mod validate;
+
+pub use load::{Endpoint, LoadCheck, LoadIR, UniqueRole, ValidateCheck, lower_load};
+pub use lower::is_fresh_variable;
 
 use std::collections::HashMap;
 

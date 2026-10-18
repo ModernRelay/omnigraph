@@ -207,6 +207,10 @@ impl SnapshotDataset {
 }
 
 impl Snapshot {
+    pub(crate) fn clone_allocation_bytes(&self) -> usize {
+        self.inner.clone_allocation_bytes()
+    }
+
     pub(crate) fn same_manifest_image(&self, other: &Self) -> bool {
         self.inner.same_manifest_image(&other.inner)
     }

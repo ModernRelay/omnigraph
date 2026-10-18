@@ -66,12 +66,14 @@ pub fn cli_process() -> StdCommand {
 }
 
 pub mod managed_http;
+#[cfg(unix)]
+pub mod unix_gateway;
 
 pub fn write_managed_context(config: &Path, origin: &str) {
     fs::create_dir_all(config.join(".omnigraph")).unwrap();
     fs::write(
         config.join(".omnigraph/context"),
-        format!("version: 1\ncluster: managed-test\napi: {origin}\n"),
+        format!("version: 2\ncluster: managed-test\napi: {origin}\norganization_id: account-one\n"),
     )
     .unwrap();
 }
@@ -255,15 +257,61 @@ policy: {{}}
     )
 }
 
+/// The name every [`KeyedServer`] declares under `servers:`, and the variable
+/// that binds its token.
+pub const KEYED_SERVER_NAME: &str = "test-server";
+pub const KEYED_SERVER_TOKEN_ENV: &str = "OMNIGRAPH_TOKEN_TEST_SERVER";
+
+/// An operator home declaring one server at `url`. The CLI sends a bearer
+/// token only to the server it is keyed to, so a served command binds its
+/// token through [`KeyedServer::env`].
+pub struct KeyedServer {
+    home: TempDir,
+}
+
+impl KeyedServer {
+    pub fn new(url: &str) -> Self {
+        let home = tempdir().unwrap();
+        fs::write(
+            home.path().join("config.yaml"),
+            format!(
+                "servers:\n  {KEYED_SERVER_NAME}:\n    url: {}\n",
+                yaml_string(url)
+            ),
+        )
+        .unwrap();
+        Self { home }
+    }
+
+    pub fn home(&self) -> &Path {
+        self.home.path()
+    }
+
+    /// `OMNIGRAPH_HOME` at this home, with `token` bound to its server.
+    pub fn env(&self, token: &str) -> [(&'static str, std::ffi::OsString); 2] {
+        [
+            ("OMNIGRAPH_HOME", self.home.path().as_os_str().to_owned()),
+            (KEYED_SERVER_TOKEN_ENV, token.into()),
+        ]
+    }
+}
+
 pub struct TestServer {
     child: Child,
     pub base_url: String,
     stderr_log: NamedTempFile,
+    operator: KeyedServer,
 }
 
 impl TestServer {
     pub fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// The environment that binds `token` to this server for a CLI command
+    /// addressing `base_url`.
+    pub fn credential(&self, token: &str) -> [(&'static str, std::ffi::OsString); 2] {
+        self.operator.env(token)
     }
 
     pub fn stop(mut self) -> String {
@@ -374,6 +422,7 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
                 child,
                 base_url: base_url.clone(),
                 stderr_log,
+                operator: KeyedServer::new(base_url),
             };
         }
         if let Some(status) = child.try_wait().unwrap() {
@@ -1400,12 +1449,12 @@ policies:
 }
 
 /// Run one CLI invocation per arm with identical verb args: locally against
-/// `local_graph` and remotely against a server URL. Actor-bearing operations
+/// `local_graph` and remotely against `server`. Actor-bearing operations
 /// use `--as` locally and an equivalent bearer identity remotely; read-only
 /// Blob commands reject `--as`. Returns raw outputs for parity comparison.
 pub fn run_both(
     local_graph: &Path,
-    server_url: &str,
+    server: &TestServer,
     args: &[&str],
 ) -> (std::process::Output, std::process::Output) {
     // Address both arms with GLOBAL flags (`--store` / `--server`) appended after
@@ -1420,14 +1469,17 @@ pub fn run_both(
     if args.first() == Some(&"blob") {
         local.env("NO_COLOR", "1");
     }
-    // The read commands (blob get/stat, query, changes, commit) reject `--as`:
-    // a served read resolves the actor from its bearer token and a direct read
-    // attributes none, so passing `--as` there is an error. Only the write
-    // verbs, `blob put` and `blob clear` among them, carry the parity actor on
-    // the direct arm.
+    // The read commands (blob get/stat, branch diff/merge-base, commit
+    // list/show/changes, query, changes, diff) reject `--as`: a served read
+    // resolves the actor from its bearer token and a direct read attributes
+    // none, so passing `--as` there is an error. Only the write verbs,
+    // `blob put`/`clear` and `commit publish`/`drop` among them, carry the
+    // parity actor on the direct arm.
     let read = match args {
         ["blob", verb, ..] => matches!(*verb, "get" | "stat"),
-        [verb, ..] => matches!(*verb, "query" | "changes" | "commit"),
+        ["branch", verb, ..] => matches!(*verb, "diff" | "merge-base"),
+        ["commit", verb, ..] => matches!(*verb, "list" | "show" | "changes"),
+        [verb, ..] => matches!(*verb, "query" | "changes" | "diff"),
         [] => false,
     };
     if !read {
@@ -1436,10 +1488,10 @@ pub fn run_both(
 
     let mut remote = cli();
     remote
-        .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+        .envs(server.credential(PARITY_TOKEN))
         .args(args)
         .arg("--server")
-        .arg(server_url)
+        .arg(&server.base_url)
         // RFC-011: the parity server is cluster-only (multi-graph), so the
         // remote arm must name the graph it addresses.
         .arg("--graph")

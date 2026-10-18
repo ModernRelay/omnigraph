@@ -34,13 +34,26 @@ impl Default for LanceAccessContext {
 
 impl LanceAccessContext {
     pub fn new() -> Self {
+        Self::with_registry(Arc::clone(&STORE_REGISTRY))
+    }
+
+    /// Bind every store opened by either session to one explicit lifetime scope.
+    /// The dedicated registry prevents a cached unscoped client from bypassing it.
+    pub fn with_io_scope(scope: Option<omnigraph_storage::StorageIoScope>) -> Self {
+        match scope {
+            Some(scope) => Self::with_registry(scoped::registry(scope)),
+            None => Self::new(),
+        }
+    }
+
+    fn with_registry(registry: Arc<ObjectStoreRegistry>) -> Self {
         Self {
             data_session: Arc::new(Session::new(
                 DEFAULT_INDEX_CACHE_SIZE,
                 DEFAULT_METADATA_CACHE_SIZE,
-                Arc::clone(&STORE_REGISTRY),
+                Arc::clone(&registry),
             )),
-            control_session: control_session(),
+            control_session: Arc::new(Session::new(0, 0, registry)),
         }
     }
 
@@ -53,6 +66,8 @@ impl LanceAccessContext {
     }
 }
 
+mod scoped;
+
 /// Control-plane session for `__manifest` and other mutable-tip metadata.
 ///
 /// Zero-capacity Lance caches still coordinate in-flight loads. Keep the session
@@ -61,6 +76,21 @@ impl LanceAccessContext {
 /// metadata is retained across branch recreation.
 pub fn control_session() -> Arc<Session> {
     Arc::new(Session::new(0, 0, Arc::clone(&STORE_REGISTRY)))
+}
+
+/// Statement-scoped data session: caches sized to one statement's admitted
+/// read-reuse allowance, on the owner's registry so a storage IO scope is
+/// never bypassed. Dropped with the statement that admitted it.
+pub fn statement_session(
+    registry: Arc<ObjectStoreRegistry>,
+    index_cache_bytes: usize,
+    metadata_cache_bytes: usize,
+) -> Arc<Session> {
+    Arc::new(Session::new(
+        index_cache_bytes,
+        metadata_cache_bytes,
+        registry,
+    ))
 }
 
 /// DST seam (Lance-realm listing): the process-wide Lance object-store

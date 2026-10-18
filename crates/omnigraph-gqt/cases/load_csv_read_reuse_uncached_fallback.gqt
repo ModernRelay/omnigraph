@@ -1,0 +1,99 @@
+# issue: none
+# notes: A load whose session `query_memory_bytes` cannot admit the statement's read-reuse
+# notes: buffers after mandatory validation admission runs its committed reads
+# notes: uncached and still loads: over the same fragmented committed table, the small-allowance
+# notes: load and the default-allowance load land the same rows with the same outcomes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    id: String @key
+    v: I64
+}
+edge Knows: Person -> Person {
+    w: I64
+}
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 1024
+    commits: 4
+    columns:
+      id: {kind: key, prefix: person-, width: 4}
+      v: {kind: ordinal, start: 0, step: 1}
+
+--- csv knows_uncached.csv
+Person.id|Person.id|w
+person-0000|person-0001|1
+person-0001|person-0002|2
+
+--- mutate
+set query_memory_bytes = 3145728;
+load csv "knows_uncached.csv" into edge:Knows mode append delimiter "|" header
+
+--- expect ok
+
+--- csv knows_admitted.csv
+Person.id|Person.id|w
+person-0002|person-0003|3
+person-0003|person-0004|4
+
+--- mutate
+load csv "knows_admitted.csv" into edge:Knows mode append delimiter "|" header
+
+--- expect ok
+
+--- query
+query loaded() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.id, $b.id }
+}
+
+--- expect unordered
+{"a.id": "person-0000", "b.id": "person-0001"}
+{"a.id": "person-0001", "b.id": "person-0002"}
+{"a.id": "person-0002", "b.id": "person-0003"}
+{"a.id": "person-0003", "b.id": "person-0004"}
+
+--- expect shape
+a.id: String
+b.id: String
+
+--- mutate
+set query_memory_bytes = 3145728;
+load csv "knows_uncached.csv" into edge:Knows mode overwrite delimiter "|" header
+--- expect ok
+
+--- query
+query replaced_uncached() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n":2}
+--- expect shape
+n: I64
+
+--- mutate
+load csv "knows_admitted.csv" into edge:Knows mode overwrite delimiter "|" header
+--- expect ok
+
+--- query
+query replaced_admitted() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": "person-0002", "b.id": "person-0003"}
+{"a.id": "person-0003", "b.id": "person-0004"}
+--- expect shape
+a.id: String
+b.id: String

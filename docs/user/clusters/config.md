@@ -154,8 +154,10 @@ because disjointness cannot be proven. Moving the base does not clear that
 code; the storage root spelling does.
 
 The allow-list controls which external objects an authorized writer may cause
-the process to inspect. Cedar policy separately decides who may write. See
-[Blob values](../blobs.md).
+the process to inspect: a new external Blob reference, and the source of a
+`load csv` statement, which the engine reads in full once
+([CSV loading](../mutations/index.md#csv-loading)). Cedar policy separately
+decides who may write. See [Blob values](../blobs.md).
 
 ## Policies
 

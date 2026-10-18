@@ -192,7 +192,7 @@ pub struct QueryIoProbes {
     /// This must equal the newly deleted offset count; a fragment scan would
     /// make it grow with the compacted catalog's history instead.
     pub projection_identity_rows: Arc<AtomicU64>,
-    /// Pre-effect reprepares `Omnigraph::mutate` took after a `ReadSetChanged`
+    /// Pre-effect reprepares a mutation or a load took after a `ReadSetChanged`
     /// (bounded by `MAX_PRE_EFFECT_REPREPARES`). The caller sees only the
     /// exhaustion of that loop, so this is the one view of the attempts behind
     /// an acknowledged write.
@@ -710,6 +710,77 @@ pub fn rrf_gate_subset_drop() -> Option<String> {
 
 tokio::task_local! {
     static STAGE_WRITE_PROBES: StageWriteProbes;
+}
+
+tokio::task_local! {
+    static EXTERNAL_PAYLOAD_READ_STALL: ();
+}
+
+/// Run `fut` with every external object payload read parked forever at its
+/// request site, so a test can prove that a deadline around the read fires
+/// and nothing after it runs. Production leaves this task-local unset, so
+/// the read only pays the unset lookup.
+pub async fn with_external_payload_read_stalled<F>(fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    EXTERNAL_PAYLOAD_READ_STALL.scope((), fut).await
+}
+
+tokio::task_local! {
+    static EXTERNAL_PAYLOAD_READ_HOLD: ExternalPayloadReadHold;
+}
+
+/// A rendezvous at the external object payload request site: a read under
+/// the hold reports that it reached the site and waits for [`Self::release`],
+/// so a test can change the object between its metadata probe and its
+/// payload read. Production leaves the task-local unset.
+#[derive(Clone, Default)]
+pub struct ExternalPayloadReadHold {
+    state: Arc<ExternalPayloadReadHoldState>,
+}
+
+#[derive(Default)]
+struct ExternalPayloadReadHoldState {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl ExternalPayloadReadHold {
+    /// Resolve once a read under this hold has reached its request site.
+    pub async fn reached(&self) {
+        self.state.reached.notified().await;
+    }
+
+    /// Let the held read issue its request.
+    pub fn release(&self) {
+        self.state.release.notify_one();
+    }
+
+    async fn park(&self) {
+        self.state.reached.notify_one();
+        self.state.release.notified().await;
+    }
+}
+
+/// Run `fut` with every external object payload read parked at its request
+/// site until `hold` releases it.
+pub async fn with_external_payload_read_held<F>(hold: ExternalPayloadReadHold, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    EXTERNAL_PAYLOAD_READ_HOLD.scope(hold, fut).await
+}
+
+/// Park here before an external object payload read when a test asked for
+/// the stall or installed a hold; return at once otherwise.
+pub async fn external_payload_read_stall() {
+    if EXTERNAL_PAYLOAD_READ_STALL.try_with(|_| ()).is_ok() {
+        std::future::pending::<()>().await;
+    }
+    if let Ok(hold) = EXTERNAL_PAYLOAD_READ_HOLD.try_with(Clone::clone) {
+        hold.park().await;
+    }
 }
 
 /// Deterministic probe for the number of table-fragment staging futures that

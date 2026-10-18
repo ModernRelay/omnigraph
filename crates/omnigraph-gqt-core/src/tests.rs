@@ -568,6 +568,55 @@ fn refuses_mutation_declaration_under_query() {
     assert!(refusal("x", &text).contains("use `--- mutate`"));
 }
 
+/// A branch control read is a `--- query` rows step whose shape is its own:
+/// it carries no shape section, takes `${name}` for a bound commit in its
+/// sides and its expected rows, and is refused under `--- mutate`, with an
+/// unbound name, or with a shape section.
+#[test]
+fn branch_read_steps_parse_and_refuse() {
+    const BIND: &str = "--- mutate\nquery ins() {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $c\n";
+    let accepted = format!(
+        "{HDR}{SCHEMA}{SEED}{BIND}\
+         --- query\nbranch diff \"${{c}}\" to main\n--- expect ordered\n\
+         --- query\nbranch merge-base main\n--- expect ordered\n\
+         {{\"source\": \"main\", \"target\": \"main\", \"source_commit_id\": \"${{c}}\", \"target_commit_id\": \"${{c}}\", \"merge_base_commit_id\": \"${{c}}\"}}\n\
+         --- query\nbranch merge main dry run\n--- expect error: nothing\n"
+    );
+    let case = parse_case("x", &accepted).unwrap();
+    let reads = case
+        .items
+        .iter()
+        .filter(|item| matches!(item, Item::Step(Step::BranchRead(_))))
+        .count();
+    assert_eq!(reads, 3);
+
+    for (step, want) in [
+        (
+            "--- mutate\nbranch diff feature\n--- expect ok\n".to_string(),
+            "`branch diff` under `--- mutate` is refused; use `--- query`",
+        ),
+        (
+            "--- query\nbranch diff \"${x}\" to main\n--- expect ordered\n".to_string(),
+            "`${x}` is not bound; `--- bind commit $x` must precede this step",
+        ),
+        (
+            "--- query\nbranch merge-base feature\n--- expect ok\n".to_string(),
+            "`branch merge-base` takes `unordered`, `ordered`, or `error:`",
+        ),
+    ] {
+        let text = format!("{HDR}{SCHEMA}{SEED}{step}");
+        assert_eq!(refusal("x", &text), want, "{step}");
+    }
+    let shaped = format!(
+        "{HDR}{SCHEMA}{SEED}--- query\nbranch merge feature dry run\n--- expect ordered\n--- expect shape\noutcome: String\n"
+    );
+    assert!(
+        refusal("x", &shaped)
+            .contains("answers its own columns; drop the `--- expect shape` section"),
+        "{shaped}"
+    );
+}
+
 const CREATE: &str = "--- mutate\nbranch create b0\n--- expect ok\n";
 const LIST: &str = "--- query\nbranch list\n--- expect unordered\n{\"name\": \"b0\"}\n{\"name\": \"main\"}\n--- expect shape\nname: String\n";
 
@@ -1904,6 +1953,7 @@ mod result_contract {
                     op: CompOp::Gt,
                     right,
                 },
+                strategy: omnigraph_planner::AntiJoinStrategy::Correlated,
             });
             bound.plan.set_root(id);
             assert_eq!(check_bound_plan_round_trip(&bound), Ok(()));
@@ -3287,4 +3337,34 @@ async fn traversal_pin_preserves_the_hosts_query_io_probes() {
     })
     .await;
     assert_eq!(inherited.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_load_plan_section_follows_a_load_steps_expect_ok_only() {
+    const CSV: &str = "--- csv people.csv\nname\ncarol\n";
+    const LOAD: &str =
+        "--- mutate\nload csv \"people.csv\" into node:Person mode overwrite header\n";
+    const PLAN: &str = "--- expect plan\nload route: plan\nload write: overwrite fragments\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{CSV}{LOAD}{EXPECT_OK}{PLAN}");
+    let case = parse_case("load_plan", &text).unwrap();
+    let [
+        Item::Step(Step::Control(ControlStep {
+            write: ControlWrite::Load {
+                plan: Some(plan), ..
+            },
+            ..
+        })),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected one load step carrying a plan expect");
+    };
+    assert_eq!(plan.lines.len(), 2);
+    let after_error = text.replace("--- expect ok\n", "--- expect error: anything\n");
+    assert!(parse_case("load_plan", &after_error).is_err());
+    let after_a_query = format!("{HDR}{SCHEMA}{SEED}{CSV}{LOAD}{EXPECT_OK}{QUERY}{EXPECT}{PLAN}");
+    assert!(parse_case("load_plan", &after_a_query).is_err());
+    let malformed = text.replace("load route: plan", "load route: express");
+    assert!(parse_case("load_plan", &malformed).is_err());
+    let on_a_mutation = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{PLAN}");
+    assert!(parse_case("load_plan", &on_a_mutation).is_err());
 }

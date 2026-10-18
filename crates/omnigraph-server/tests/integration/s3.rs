@@ -208,6 +208,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         graphs,
         config_path,
         server_policy,
+        ..
     } = settings.mode;
     let state = omnigraph_server::open_multi_graph_state(
         graphs,
@@ -398,6 +399,7 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
         graphs,
         config_path,
         server_policy,
+        ..
     } = settings.mode;
     let state = omnigraph_server::open_multi_graph_state(
         graphs,

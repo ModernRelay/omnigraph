@@ -162,19 +162,25 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     )];
     let predecessor = spawn_server_with_cluster_binary_env(root, &old_server, &server_env);
     let query = "query people() { match { $p: Person } return { $p.name, $p.age, $p.bio } }";
-    let served = |binary: &Path, base: &str, args: &[&str]| {
+    let served = |binary: &Path, server: &support::TestServer, args: &[&str]| {
         parse_stdout_json(&output_success(
             cli_at(binary)
-                .env("OMNIGRAPH_BEARER_TOKEN", "parity-tok")
+                .envs(server.credential("parity-tok"))
                 .args(args)
-                .args(["--server", base, "--graph", "knowledge", "--json"]),
+                .args([
+                    "--server",
+                    &server.base_url,
+                    "--graph",
+                    "knowledge",
+                    "--json",
+                ]),
         ))
     };
-    let apply = |binary: &Path, base: &str| {
+    let apply = |binary: &Path, server: &support::TestServer| {
         parse_stdout_json(&output_success(
             cli_at(binary)
-                .env("OMNIGRAPH_BEARER_TOKEN", "parity-tok")
-                .args(["cluster", "apply", "--server", base, "--config"])
+                .envs(server.credential("parity-tok"))
+                .args(["cluster", "apply", "--server", &server.base_url, "--config"])
                 .arg(root)
                 .arg("--json"),
         ))
@@ -206,16 +212,16 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         "node Person { name: String @key age: I32? bio: String? }\n",
     )
     .unwrap();
-    let old_applied = apply(&old, &predecessor.base_url);
+    let old_applied = apply(&old, &predecessor);
     assert_eq!(old_applied["active"], true, "{old_applied}");
     assert_eq!(
         old_applied["deployment"]["result"]["restart_required"],
         false
     );
     assert!(old_applied["deployment"]["result"]["activation"].is_object());
-    let old_snapshot = served(&old, &predecessor.base_url, &["snapshot"]);
+    let old_snapshot = served(&old, &predecessor, &["snapshot"]);
     assert_eq!(old_snapshot["internal_schema_version"], 14);
-    let old_history = served(&old, &predecessor.base_url, &["commit", "list"]);
+    let old_history = served(&old, &predecessor, &["commit", "list"]);
     assert_eq!(old_history["commits"].as_array().unwrap().len(), 3);
     let seeded_commit = old_history["commits"][1]["graph_commit_id"]
         .as_str()
@@ -229,13 +235,9 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         "--snapshot",
         seeded_commit,
     ];
-    let historical_rows = served(&old, &predecessor.base_url, &historical_args)["rows"].clone();
+    let historical_rows = served(&old, &predecessor, &historical_args)["rows"].clone();
     assert_eq!(historical_rows, json!([{"p.name":"Alice","p.age":31}]));
-    let old_read = served(
-        &old,
-        &predecessor.base_url,
-        &["query", "people", "-e", query],
-    );
+    let old_read = served(&old, &predecessor, &["query", "people", "-e", query]);
     assert_eq!(old_read["columns"], json!(["p.name", "p.age", "p.bio"]));
     let old_rows = old_read["rows"].clone();
     // JSON object rows omit null cells; the columns still prove the new field.
@@ -302,24 +304,17 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     let pid = candidate.id();
     let contract = omnigraph_api_types::HTTP_API_CONTRACT;
     assert_eq!(reported_contract(&candidate.base_url), contract);
+    assert_eq!(served(&current, &candidate, &["snapshot"]), old_snapshot);
     assert_eq!(
-        served(&current, &candidate.base_url, &["snapshot"]),
-        old_snapshot
-    );
-    assert_eq!(
-        served(&current, &candidate.base_url, &["commit", "list"]),
+        served(&current, &candidate, &["commit", "list"]),
         old_history
     );
     assert_eq!(
-        served(&current, &candidate.base_url, &historical_args)["rows"],
+        served(&current, &candidate, &historical_args)["rows"],
         historical_rows
     );
     assert_eq!(
-        served(
-            &current,
-            &candidate.base_url,
-            &["query", "people", "-e", query]
-        )["rows"],
+        served(&current, &candidate, &["query", "people", "-e", query])["rows"],
         old_rows
     );
     assert_eq!(reader(&candidate.base_url, contract, query).status(), 403);
@@ -336,7 +331,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         policy.replace("readers: [act-unbound]", "readers: [act-reader]"),
     )
     .unwrap();
-    let applied = apply(&current, &candidate.base_url);
+    let applied = apply(&current, &candidate);
     assert_eq!(applied["active"], true, "{applied}");
     assert_eq!(applied["deployment"]["result"]["converged"], true);
     let current_query = "query people() { match { $p: Person } return { $p.name, $p.email } }";
@@ -350,23 +345,20 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         new_state["applied_revision"]["schema_contracts"]["knowledge"]["schema_identity_domain"],
         original_domain
     );
-    let history = served(&current, &candidate.base_url, &["commit", "list"]);
+    let history = served(&current, &candidate, &["commit", "list"]);
     assert_eq!(
         &history["commits"].as_array().unwrap()[1..],
         old_history["commits"].as_array().unwrap()
     );
     fs::write(root.join("graph.policy.yaml"), policy).unwrap();
-    assert_eq!(apply(&current, &candidate.base_url)["active"], true);
+    assert_eq!(apply(&current, &candidate)["active"], true);
     assert_eq!(
         reader(&candidate.base_url, contract, current_query).status(),
         403
     );
+    assert_eq!(served(&current, &candidate, &["commit", "list"]), history);
     assert_eq!(
-        served(&current, &candidate.base_url, &["commit", "list"]),
-        history
-    );
-    assert_eq!(
-        served(&current, &candidate.base_url, &historical_args)["rows"],
+        served(&current, &candidate, &historical_args)["rows"],
         historical_rows
     );
     assert_eq!(candidate.id(), pid);

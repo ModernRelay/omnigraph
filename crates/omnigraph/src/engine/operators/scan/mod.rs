@@ -19,7 +19,7 @@ use omnigraph_compiler::ir::{IRExpr, ParamMap};
 use super::{breaker_properties, breaker_stream, conform, external, polled, streaming_properties};
 use crate::db::Snapshot;
 use crate::engine::scan::{execute_node_scan, prefix_batch, scan_output_schema};
-use crate::engine::search::{NeededColumns, ScanReport, SearchMode};
+use crate::engine::search::{NeededColumns, ScanReport, ScanReports, SearchMode};
 use crate::error::Result;
 
 mod input;
@@ -33,7 +33,9 @@ pub(super) use runtime_filter::{Filled, Needles};
 pub(crate) enum ScanSource {
     Table {
         mode: Box<SearchMode>,
-        report: Arc<Mutex<ScanReport>>,
+        /// Where a nearest scan reports its ladder, under `node`.
+        report: Arc<Mutex<ScanReports>>,
+        node: omnigraph_planner::NodeId,
     },
     Dependent {
         input: Arc<dyn ExecutionPlan>,
@@ -214,13 +216,15 @@ impl ExecutionPlan for ScanExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "ScanExec has one partition");
-        let (mode, report) = match &self.source {
+        let (mode, report, node) = match &self.source {
             ScanSource::Dependent { input } => {
                 return self
                     .execute_input(input.execute(0, Arc::clone(&ctx))?, ctx)
                     .map(|stream| polled(&self.metrics, stream));
             }
-            ScanSource::Table { mode, report } => (mode.as_ref().clone(), Arc::clone(report)),
+            ScanSource::Table { mode, report, node } => {
+                (mode.as_ref().clone(), Arc::clone(report), *node)
+            }
         };
         if self.pipelines() {
             let filter = self.runtime_filter.as_ref().and_then(|slot| slot.take());
@@ -270,9 +274,10 @@ impl ExecutionPlan for ScanExec {
                     reservation.metric("nearest_dataset_rows", nearest.dataset_rows as usize);
                 }
                 if scan_report.nearest_scan.is_some() {
-                    *report
+                    report
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = scan_report;
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(node, scan_report);
                 }
                 let prefixed = prefix_batch(&batch, &binding).map_err(external)?;
                 conform(prefixed, &declared).map_err(external)
