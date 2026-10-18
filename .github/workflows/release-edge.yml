@@ -424,8 +424,23 @@ jobs:
           subject-digest: ${{ steps.ghcr.outputs.digest }}
           push-to-registry: true
 
+      # The `edge` image tag follows the rolling release as it is now, not as
+      # this run left it: a rerun of an older run's failed job must not move it
+      # back behind a newer build.
+      - name: Decide whether the rolling edge image moves
+        id: rolling
+        run: |
+          set -euo pipefail
+          current_edge="$(git ls-remote origin refs/tags/edge | awk '{print $1}')"
+          if [[ "$MOVED" == true && "$current_edge" == "$SOURCE_SHA" ]]; then
+            echo "move=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::the edge release names ${current_edge:-nothing}; the edge image tag stays"
+            echo "move=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Move the rolling edge image
-        if: env.MOVED == 'true'
+        if: steps.rolling.outputs.move == 'true'
         env:
           IMAGE: ${{ steps.ghcr.outputs.image }}
         run: |
@@ -442,6 +457,7 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           IMAGE: ${{ steps.ghcr.outputs.image }}
+          MOVE: ${{ steps.rolling.outputs.move }}
         run: |
           set -euo pipefail
           if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
@@ -465,7 +481,7 @@ jobs:
             docker tag "${IMAGE}:${BUILD_TAG}" "${hub}:${BUILD_TAG}"
             docker push "${hub}:${BUILD_TAG}"
           fi
-          if [[ "$MOVED" == true ]]; then
+          if [[ "$MOVE" == true ]]; then
             docker tag "${IMAGE}:${BUILD_TAG}" "${hub}:edge"
             docker push "${hub}:edge"
           fi
@@ -546,7 +562,10 @@ jobs:
           }
           VERSION="$BUILD_TAG" INSTALL_DIR="$RUNNER_TEMP/pinned" bash scripts/install.sh
           check "$RUNNER_TEMP/pinned"
-          if [[ "$MOVED" == true ]]; then
+          # The channel serves this build only while the rolling release still
+          # names it; a later rerun of this job may find a newer build there.
+          current_edge="$(git ls-remote origin refs/tags/edge | awk '{print $1}')"
+          if [[ "$MOVED" == true && "$current_edge" == "$SOURCE_SHA" ]]; then
             RELEASE_CHANNEL=edge INSTALL_DIR="$RUNNER_TEMP/channel" bash scripts/install.sh
             check "$RUNNER_TEMP/channel"
           fi
@@ -568,7 +587,10 @@ jobs:
           }
           ./scripts/install.ps1 -Version $env:BUILD_TAG -InstallDir "$env:RUNNER_TEMP/pinned"
           Test-Installed "$env:RUNNER_TEMP/pinned"
-          if ($env:MOVED -eq "true") {
+          # The channel serves this build only while the rolling release still
+          # names it; a later rerun of this job may find a newer build there.
+          $currentEdge = ((git ls-remote origin refs/tags/edge) -split '\s+')[0]
+          if ($env:MOVED -eq "true" -and $currentEdge -eq $env:SOURCE_SHA) {
             ./scripts/install.ps1 -ReleaseChannel edge -InstallDir "$env:RUNNER_TEMP/channel"
             Test-Installed "$env:RUNNER_TEMP/channel"
           }

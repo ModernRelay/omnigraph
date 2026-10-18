@@ -99,8 +99,12 @@ jobs:
           workspaces: |
             . -> target
 
+      # The server feature set every release artifact ships, the same as the
+      # stable container image's (publish-image.yml): the AWS Secrets Manager
+      # bearer-token source. Lance's S3 support already builds the AWS SDK
+      # base, so it adds one crate.
       - name: Build release binaries
-        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission
+        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission --features omnigraph-server/aws
 
       - name: Package Unix release archive
         if: runner.os != 'Windows'
