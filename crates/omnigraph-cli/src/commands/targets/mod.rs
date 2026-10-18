@@ -183,14 +183,19 @@ fn attach_local_servers(config: &OperatorConfig, targets: &mut [TargetOutput]) -
     {
         return Ok(());
     }
-    // A records directory that is absent or cannot be read safely leaves
-    // `local_servers` absent, meaning unknown, rather than failing a listing
+    // No records directory means no local server has run, so every list
+    // stays empty. One that cannot be read safely makes them unknown, which
+    // `local_servers` reports by its absence rather than failing a listing
     // that needs no local server.
-    let Some(live) = crate::local_servers::Records::existing()
-        .ok()
-        .flatten()
-        .and_then(|records| records.live_records().ok())
-    else {
+    let live = match crate::local_servers::Records::existing() {
+        Ok(None) => return Ok(()),
+        Ok(Some(records)) => records.live_records().ok(),
+        Err(_) => None,
+    };
+    let Some(live) = live else {
+        for target in targets.iter_mut() {
+            target.local_servers = None;
+        }
         return Ok(());
     };
     for target in targets.iter_mut() {

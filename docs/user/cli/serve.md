@@ -108,8 +108,8 @@ another start of it to publish its record, then refuses with
 
 `omnigraph target list --json` and `target show NAME --json` name each direct
 target's live local servers under `local_servers`, with their `id`, `url`,
-`access` and `actor`, never their token; `local_servers` is absent when no
-records directory exists or it cannot be read safely.
+`access` and `actor`, never their token; `local_servers` is absent when the
+records directory cannot be read safely.
 
 ## Loopback only
 

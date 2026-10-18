@@ -113,6 +113,7 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
         | Command::Use { .. }
         | Command::Profile { .. }
         | Command::Skill { .. }
+        | Command::Serve(_)
         | Command::Version { .. } => None,
     }
 }

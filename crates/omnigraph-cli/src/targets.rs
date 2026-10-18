@@ -489,7 +489,8 @@ pub(crate) struct TargetOutput {
     pub(crate) credential: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) binding: Option<String>,
-    /// A direct target's live local servers. None run yet, so this is empty.
+    /// A direct target's live local servers, filled from their records;
+    /// absent when the records cannot be read safely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) local_servers: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]

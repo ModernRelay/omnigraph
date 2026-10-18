@@ -18,6 +18,8 @@ use tempfile::{NamedTempFile, TempDir, tempdir};
 /// ~/.omnigraph/ (an absent operator config is an empty layer). Tests
 /// exercising the operator layer override the var explicitly.
 pub const HERMETIC_OPERATOR_HOME: &str = "/nonexistent/omnigraph-test-home";
+/// No local server records, so a listing never reads this account's.
+pub const HERMETIC_LOCAL_SERVERS_DIR: &str = "/nonexistent/omnigraph-test-local-servers";
 
 /// Controlled diagnostics use the same explicit pool in fixture and SUT children.
 pub const HTTP_DIAGNOSTIC_LANCE_POOL_BYTES: &str = "104857600";
@@ -37,6 +39,7 @@ pub fn graph_http_client() -> Client {
 pub fn cli() -> Command {
     let mut command = Command::cargo_bin("omnigraph").unwrap();
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env("OMNIGRAPH_LOCAL_SERVERS_DIR", HERMETIC_LOCAL_SERVERS_DIR);
     command.env_remove("OMNIGRAPH_CONFIG");
     command.env_remove("OMNIGRAPH_CONTROL_TOKEN");
     command.env_remove("OMNIGRAPH_CONTROL_API");
@@ -50,6 +53,7 @@ pub fn cli_at(binary: &Path) -> Command {
     command.env_clear();
     command.env("LANCE_MEM_POOL_SIZE", HTTP_DIAGNOSTIC_LANCE_POOL_BYTES);
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env("OMNIGRAPH_LOCAL_SERVERS_DIR", HERMETIC_LOCAL_SERVERS_DIR);
     command.env("LANG", "C");
     command.env("LC_ALL", "C");
     command.timeout(Duration::from_secs(60));
@@ -59,6 +63,7 @@ pub fn cli_at(binary: &Path) -> Command {
 pub fn cli_process() -> StdCommand {
     let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("omnigraph"));
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env("OMNIGRAPH_LOCAL_SERVERS_DIR", HERMETIC_LOCAL_SERVERS_DIR);
     command.env_remove("OMNIGRAPH_CONFIG");
     command.env_remove("OMNIGRAPH_CONTROL_TOKEN");
     command.env_remove("OMNIGRAPH_CONTROL_API");
@@ -516,6 +521,7 @@ pub fn spawn_server_with_cluster_binary_env(
     command.env_clear();
     command.env("LANCE_MEM_POOL_SIZE", HTTP_DIAGNOSTIC_LANCE_POOL_BYTES);
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env("OMNIGRAPH_LOCAL_SERVERS_DIR", HERMETIC_LOCAL_SERVERS_DIR);
     command.env("LANG", "C");
     command.env("LC_ALL", "C");
     for (name, value) in envs {
