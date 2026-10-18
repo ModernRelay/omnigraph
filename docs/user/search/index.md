@@ -147,6 +147,35 @@ order sorts every row by the fused score, then the keys written after
 an entity that fans out to several rows contributes each of them. The full
 ordering contract lives on the [queries page](../queries/index.md).
 
+## Ranking a traversal-reached binding
+
+A search order may rank any binding of the pattern, whichever binding the
+`match` block declares first, and whether or not the ranked binding is
+declared at all:
+
+```gq
+query passages($matter: String, $q: String) {
+  match {
+    $r: SourceRevision { matter_number: $matter }
+    $r hasPassage $p
+  }
+  return { $r.path, $p.locator }
+  order { bm25($p.text, $q) }
+  limit 5
+}
+```
+
+The ranking starts the traversal: the query scans every `Passage`, ranks it
+and keeps the passages the traversal reaches from the selected revision, in
+score order. Ranking a destination therefore costs a scan of the ranked type,
+however few entities the other end reaches. A `nearest()` ranking ranks the
+reached entities, never a global top list that the traversal later cuts.
+
+An `rrf()` whose two arms rank two different bindings one traversal connects,
+directly or over several hops, is refused at type checking (`T59`): a ranking
+starts the traversal at the binding it ranks, and one traversal cannot start
+at both. Rank one binding in both arms, or bindings no traversal joins.
+
 ## Indexes
 
 `@index` and `@key` declare index intent. For a single-property node declaration,

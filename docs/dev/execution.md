@@ -87,9 +87,10 @@ an input row's columns into every output row that row produces. What bounds
 multi-hop fan-out is:
 
 - deferred bindings: the compiler's IR lowering gives at most one binding of
-  each connected pattern a `NodeScan`, normally the first declared
-  (`scan_root`), and `Expand` introduces the rest, so connected bindings never
-  become a cross join closed by a filter;
+  each connected pattern a `NodeScan`: the binding the leading search order
+  ranks, else the first declared (`scan_root`). `Expand` introduces the rest,
+  in either direction, so connected bindings never become a cross join closed
+  by a filter;
 - bounded streaming: every `Expand` emits chunks of at most
   `EXPAND_OUTPUT_ROWS` (256) rows through a two-batch producer channel, and a
   downstream `Limit` that stops reading cancels the producer (the `Expand` row
@@ -890,6 +891,14 @@ execution concepts. Rank and score remain columns through downstream
 operations; traversal or projection must not silently discard them. RRF
 executes its sources independently against the same graph snapshot and fuses
 their ordered results.
+
+A ranking is always a root scan. Lowering roots the traversal component that
+holds the ranked binding (both arms' binding for an `rrf()`) at that binding,
+whatever the declaration order; a ranked binding only a traversal introduces
+gets a `NodeScan` of its checked type. The type checker refuses an `rrf()`
+whose arms rank two bindings one traversal connects (`T59`). The planner's
+`rank` therefore treats a ranked dependent scan, a hash join's build side, or
+fusion arms one traversal connects as a lowering defect, an internal error.
 
 BM25 scans have no candidate cap. The final ordering applies the score,
 secondary keys and every binding's identity before the query limit; a full
