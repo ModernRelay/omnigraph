@@ -253,11 +253,126 @@ pub fn write_count_schema() -> SchemaRef {
 /// Stage 1, pass 1 for a GQ query: the flat `IROp` pipeline folded into a
 /// tree, then a leading search function, the `return`, the remaining
 /// `order` keys and the `limit` above it.
+/// The node properties the query's full-text calls read the index of, as
+/// `(type name, property)`, first appearance first: `search`, `fuzzy` and
+/// `match_text` in any filter (correlated blocks included), and `bm25` in the
+/// leading order key or either arm of an `rrf()` there. Planning checks each
+/// one's coverage (`require_full_text_indexes`) and acceptance requires the
+/// plan to record it.
+pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
+    fn bindings(ops: &[IROp], out: &mut HashMap<String, String>) {
+        for op in ops {
+            match op {
+                IROp::NodeScan {
+                    variable,
+                    type_name,
+                    filters: _,
+                } => {
+                    out.insert(variable.clone(), type_name.clone());
+                }
+                IROp::Expand {
+                    dst_var, dst_type, ..
+                } => {
+                    out.insert(dst_var.clone(), dst_type.clone());
+                }
+                IROp::AntiJoin { inner, .. } => bindings(inner, out),
+                IROp::Filter(_) => {}
+            }
+        }
+    }
+    fn calls(expr: &IRExpr, out: &mut Vec<(String, String)>) {
+        match expr {
+            IRExpr::Search { field, .. }
+            | IRExpr::Fuzzy { field, .. }
+            | IRExpr::MatchText { field, .. }
+            | IRExpr::Bm25 { field, .. } => {
+                if let IRExpr::PropAccess {
+                    variable, property, ..
+                } = field.as_ref()
+                {
+                    out.push((variable.clone(), property.clone()));
+                }
+            }
+            IRExpr::Rrf {
+                primary, secondary, ..
+            } => {
+                calls(primary, out);
+                calls(secondary, out);
+            }
+            IRExpr::Binary { left, right, .. } => {
+                calls(left, out);
+                calls(right, out);
+            }
+            IRExpr::Not(inner, _)
+            | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::IsNull { expr: inner, .. } => calls(inner, out),
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(..)
+            | IRExpr::Param(..)
+            | IRExpr::Literal(..)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(..) => {}
+        }
+    }
+    fn filter_calls(ops: &[IROp], out: &mut Vec<(String, String)>) {
+        for op in ops {
+            match op {
+                IROp::NodeScan { filters, .. }
+                | IROp::Expand {
+                    dst_filters: filters,
+                    ..
+                } => filters.iter().for_each(|filter| calls(filter, out)),
+                IROp::Filter(filter) => calls(filter, out),
+                IROp::AntiJoin { inner, .. } => filter_calls(inner, out),
+            }
+        }
+    }
+    let mut types = HashMap::new();
+    bindings(&ir.pipeline, &mut types);
+    let mut variables = Vec::new();
+    filter_calls(&ir.pipeline, &mut variables);
+    if let Some(leading) = ir.order_by.first() {
+        calls(&leading.expr, &mut variables);
+    }
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for (variable, property) in variables {
+        if let Some(type_name) = types.get(&variable) {
+            let target = (type_name.clone(), property);
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
+/// Every full-text call reads its property's full-text index, whose analyzer
+/// (case folding, stemming) a segment carries: a trained one with postings or
+/// the untrained declaration every write records. Coverage may be full or
+/// partial, since Lance scans uncovered rows with that analyzer; an absent
+/// index means no segment records the analyzer at the pinned snapshot, and
+/// Lance would fall back to a bare, case-sensitive tokenizer, so the call is
+/// refused rather than answered differently. The type checker (`T27`)
+/// already required the declaration.
+fn require_full_text_indexes(ir: &QueryIR, source: &dyn PlanSource) -> Result<(), PlanError> {
+    for (type_name, property) in full_text_targets(ir) {
+        let type_key = format!("node:{type_name}");
+        if source.full_text_coverage(&type_key, &property) == FullTextCoverage::Absent {
+            return Err(PlanError::FullTextIndexRequired {
+                index: format!("{type_name}.{property}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn resolve_query(
     plan: &mut LogicalPlan,
     ir: &QueryIR,
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
+    require_full_text_indexes(ir, source)?;
     if ir.has_edge_selections() {
         let limit = source.traversal_work_limit().ok_or_else(|| {
             PlanError::refused(

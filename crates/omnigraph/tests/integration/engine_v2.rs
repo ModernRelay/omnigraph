@@ -12,7 +12,7 @@ async fn vector_doc_graph(dir: &tempfile::TempDir) -> omnigraph::Session {
     let schema = r#"
 node Doc {
     slug: String @key
-    title: String
+    title: String @index
     embedding: Vector(4)?
 }
 "#;

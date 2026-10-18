@@ -8190,7 +8190,7 @@
             }
           },
           "409": {
-            "description": "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
+            "description": "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required); neither is cleared by retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -8830,7 +8830,7 @@
             }
           },
           "409": {
-            "description": "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
+            "description": "A full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required); neither is cleared by retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -10744,6 +10744,17 @@
               }
             ]
           },
+          "full_text_index_required": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FullTextIndexRequiredOutput",
+                "description": "Set with HTTP 409 when a full-text call reads a declared index that\nhas no segment at the query's snapshot. Building the index clears it;\nretrying does not."
+              }
+            ]
+          },
           "key_conflict": {
             "oneOf": [
               {
@@ -10870,6 +10881,19 @@
           "reason": {
             "type": "string",
             "description": "Human-readable diagnosis; branch on the enclosing detail's presence,\nnot this text, to distinguish the operator-action-required condition."
+          }
+        }
+      },
+      "FullTextIndexRequiredOutput": {
+        "type": "object",
+        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes\n--branch` elsewhere). Historical snapshots stay unchanged.",
+        "required": [
+          "index"
+        ],
+        "properties": {
+          "index": {
+            "type": "string",
+            "description": "The index's property as `Type.property`."
           }
         }
       },

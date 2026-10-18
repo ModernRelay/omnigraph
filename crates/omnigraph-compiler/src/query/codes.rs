@@ -48,6 +48,7 @@ codes! {
     T23 = "a node or edge binding is used in an incompatible role";
     T24 = "a Blob property is not a read value";
     T25 = "two projections produce the same result column";
+    T27 = "a full-text call needs a full-text index on its property";
     T32 = "a retrieval cannot sit under an aggregate";
     T33 = "a projected rank must repeat the executed retrieval";
     T35 = "a search predicate cannot be projected";

@@ -166,7 +166,7 @@ fn value_violation(table_key: &str, err: OmniError) -> Violation {
 // the source table or the unindexed staged temp (which carries no index).
 
 /// A declared integrity constraint, derived from the catalog. Mirrors the
-/// `node_prop_index_kind` chokepoint: adding a kind is one variant + one arm in
+/// `PropType::index_kind` chokepoint: adding a kind is one variant + one arm in
 /// [`evaluate`], run on every surface that adopts the evaluator.
 #[derive(Debug, Clone)]
 pub(crate) enum Constraint {
