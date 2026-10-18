@@ -1427,3 +1427,71 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
     .await;
     assert_eq!(allowed["result"]["isError"], false, "{allowed}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_server_reads_ad_hoc_and_lists_write_tools_only_when_it_writes() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let before = manifest_dataset_version(&graph).await;
+    for access in [
+        omnigraph_server::LocalAccess::ReadOnly,
+        omnigraph_server::LocalAccess::ReadWrite,
+    ] {
+        let binding = omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap();
+        let (state, credential) = AppState::local(
+            omnigraph_server::LocalScope::Graph(binding),
+            omnigraph_server::LocalOptions {
+                access,
+                actor: Some("act-local".into()),
+                process_defaults: omnigraph_server::ProcessDefaults::default(),
+            },
+        )
+        .await
+        .ok()
+        .unwrap();
+        let app = omnigraph_server::build_app(state);
+        let token = credential.reveal();
+        let writes_allowed = access == omnigraph_server::LocalAccess::ReadWrite;
+        let names: Vec<String> = tool_list(&app, &token)
+            .await
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        // A standalone graph has no stored queries, so ad-hoc reads are on.
+        assert!(names.iter().any(|name| name == "read"), "{names:?}");
+        for write in [
+            "mutate",
+            "load",
+            "branches_create",
+            "branches_delete",
+            "branches_merge",
+        ] {
+            assert_eq!(
+                names.iter().any(|name| name == write),
+                writes_allowed,
+                "{access:?} {write}"
+            );
+        }
+        let graphs = call(&app, &token, "graphs", json!({})).await;
+        assert_eq!(graphs["result"]["isError"], false, "{graphs}");
+        let read = call(
+            &app,
+            &token,
+            "read",
+            json!({"graph":"default","query":"query n() { match { $p: Person } return { $p.name } }"}),
+        )
+        .await;
+        assert_eq!(read["result"]["isError"], false, "{read}");
+        if !writes_allowed {
+            let refused = call(
+                &app,
+                &token,
+                "mutate",
+                json!({"graph":"default","query":"query add() { insert Person { name: \"Eve\", age: 7 } }"}),
+            )
+            .await;
+            assert!(refused.get("error").is_some(), "{refused}");
+        }
+    }
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+}

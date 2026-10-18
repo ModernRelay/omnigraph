@@ -121,6 +121,13 @@ pub(crate) async fn admit(
         .or_else(|| matched.as_str().strip_prefix(crate::CATALOGUE_ROUTE_PREFIX))
         .unwrap_or(matched.as_str());
     let class = classify(&mut parts, route).await?;
+    // A read-only local server refuses every write before its body, beside the
+    // engine policy that would refuse it again.
+    if matches!(class, AdmissionClass::Write) && state.is_read_only_local() {
+        return Err(ApiError::forbidden(
+            "this local server is read-only; start it with --write to change the graph",
+        ));
+    }
     let graph = parts.extensions.get::<GraphRequest>().cloned();
     let mcp_graph = if route == "/mcp" {
         let slot = McpGraphRequest::default();

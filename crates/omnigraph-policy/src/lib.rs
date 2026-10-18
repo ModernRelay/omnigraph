@@ -574,6 +574,20 @@ impl PolicyEngine {
         PolicyCompiler::compile(&config, graph_id)
     }
 
+    /// Compile a per-graph policy built in code rather than read from a
+    /// file, with the same kind check `load_graph` applies.
+    pub fn graph_from_config(config: &PolicyConfig, graph_id: &str) -> Result<Self> {
+        validate_kind_alignment(config, PolicyEngineKind::Graph)?;
+        PolicyCompiler::compile(config, graph_id)
+    }
+
+    /// Compile a server-level policy built in code, with the same kind check
+    /// `load_server` applies.
+    pub fn server_from_config(config: &PolicyConfig) -> Result<Self> {
+        validate_kind_alignment(config, PolicyEngineKind::Server)?;
+        PolicyCompiler::compile(config, SERVER_RESOURCE_ID)
+    }
+
     /// Load a server-level policy file. Rejects rules whose actions
     /// are per-graph (e.g. `read`, `change`) — those belong in a
     /// per-graph policy file, not the server one. Takes no `graph_id`:
