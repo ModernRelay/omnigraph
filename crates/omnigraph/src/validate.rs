@@ -327,9 +327,9 @@ pub(crate) fn constraints_for(catalog: &Catalog) -> Vec<Constraint> {
         // `@key` is id-backed: cross-version duplication is impossible (the key
         // IS the identity), so it needs only intra-delta dedup — `is_key: true`
         // tells the evaluator to skip the committed lookup. Sound only because
-        // a key exists from type creation on: schema_plan refuses adding or
-        // removing constraints on an existing type, so committed rows always
-        // carry derived ids.
+        // a key exists from type creation on: schema_plan refuses every key
+        // change on an existing type, so committed rows always carry derived
+        // ids.
         if let Some(key) = &edge_type.key {
             out.push(Constraint::Unique {
                 table_key: table_key.clone(),

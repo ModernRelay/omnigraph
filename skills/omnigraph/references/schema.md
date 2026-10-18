@@ -165,10 +165,13 @@ Changing the key field is effectively a replace — it invalidates every externa
 ### Constraints: only `@index` is added in place
 
 Adding a constraint other than `@index` (`@key`, `@unique`, `@range`, `@check`)
-to an existing type, removing any constraint, and changing edge cardinality or
-endpoints are refused as unsupported. In-place migrations are additions of
-nullable properties and types, `@index` additions, enum widening, renames, and
-drops; tightening a constraint means a rebuild.
+to an existing type, removing a constraint from a property that stays, and
+changing edge cardinality or endpoints are refused as unsupported. Dropping a
+property drops every constraint that names only dropped properties (its own
+`@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
+or a constraint that also names a field that stays, is refused. In-place
+migrations are additions of nullable properties and types, `@index` additions,
+enum widening, renames, and drops; tightening a constraint means a rebuild.
 
 ### `schema apply` blocks writes while running
 
