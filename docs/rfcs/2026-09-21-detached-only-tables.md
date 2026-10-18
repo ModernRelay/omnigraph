@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-21
-updated: 2026-10-16
+updated: 2026-10-18
 discussion: null
 supersedes: []
 superseded_by: []
@@ -876,7 +876,18 @@ New evidence, each an entry in `blocked_on`:
   prefix empty (`s3_collector_retry_converges_after_every_sweep_window` in
   the RustFS failpoints job and
   `azure_collector_retry_converges_after_every_sweep_window` in the Azurite
-  job). DST's shared-memory store lists it empty too.
+  job). The between-manifests file fixture also reopens through
+  `open_with_io_scope`, the served `file-object-store` path; its final
+  directory removal can return `NotFound` after listing an absent prefix.
+  DST's shared-memory store lists it empty too. The active DST pin exercises
+  the shared hunt constructor at seed 9/skip 0, its probe pass and the fleet
+  constructor, requiring the target's own `Deferred` verdict and a clean
+  retry, with strict replay. A successful, legally rejected or deferred
+  setup attempt keeps the target unarmed until an attempt records a crash.
+  Deferral attribution covers returned table errors; warning-only native-fork
+  reconciliation failures remain outside
+  that channel. RustFS and Azurite qualify these sweep windows, not live
+  Azure lease-loss or delayed-write behavior.
 
 ### Acceptance thresholds
 

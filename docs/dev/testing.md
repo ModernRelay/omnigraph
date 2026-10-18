@@ -109,6 +109,14 @@ helper takes a seam declaring exactly its effect, that production code under
 it) arms it; a crossing never counts as arming. `scripts/seam_corpus.py`
 lists every seam with where it is declared and which cases cover it.
 
+The collector retry owners in `failpoints.rs` exercise each sweep window
+on file, RustFS/S3 and Azurite. The between-manifests fixture also reopens
+through `open_with_io_scope`, covering served file I/O's separate Lance
+provider. The DST dead-staging pin exercises the census, hunt and fleet
+constructors; its maintenance sensitivity owner requires a failed deferred
+cleanup retry to fail the universe. Neither local emulators nor shared-memory
+DST qualify live Azure lease loss or delayed accepted writes.
+
 When adding a new writer, update all of these layers. See [recovery.md](recovery.md).
 
 ### Blob behavior

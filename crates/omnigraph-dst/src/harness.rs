@@ -646,16 +646,17 @@ pub struct Scenario {
     /// TARGETED SCHEDULING: schedule the crash at failpoint
     /// `.0` on the `.1`-th sampled op whose KIND matches the window's family
     /// (`window_matches`), instead of a blind fixed index — merge windows get
-    /// hit by actual merges. At most one crash per universe, exactly like
-    /// `crash_at`, and just as deterministic: the trigger is a pure function
-    /// of the seeded op stream.
+    /// hit by actual merges. At most one targeted attempt per universe,
+    /// in addition to any setup crash; the trigger is a pure function of
+    /// the seeded op stream.
     pub crash_on_match: Option<(&'static str, usize)>,
-    /// SETUP CRASH: a real crash at failpoint `.0` on the `.1`-th sampled op
-    /// whose kind matches it, scheduled before `crash_on_match`. A window
-    /// whose precondition is an earlier crash's aftermath takes its setup
-    /// from [`setup_crash_for`]. `crash_on_match` starts matching only on the
-    /// op after the setup crash, so its skip counts ops that can see the
-    /// aftermath; `probe_only` leaves the setup a real crash.
+    /// SETUP CRASH: skip `.1` matching ops, then attempt failpoint `.0`
+    /// before `crash_on_match`. Successful, legally rejected and deferred
+    /// attempts leave setup pending until a recorded crash. A window whose
+    /// precondition is an earlier crash's aftermath takes its setup from
+    /// [`setup_crash_for`]. The target starts matching on the following op,
+    /// so its skip counts ops that can see the aftermath; `probe_only`
+    /// leaves the setup as a real crash attempt.
     pub setup_crash: Option<(&'static str, usize)>,
     /// CROSSING PROBE: with `crash_on_match` set, install a
     /// RECORD-ONLY callback instead of an injected failure — the op executes
@@ -663,7 +664,7 @@ pub struct Scenario {
     /// walked through the window. The hunt uses this to tell
     /// "scheduled-but-never-reached" apart from "crossed-but-ABSORBED":
     /// windows whose injected error the engine heals transparently (the
-    /// branch post_native ambiguity classifiers, phase-D sidecar delete) are
+    /// branch post_native ambiguity classifiers) are
     /// invisible to the `crashes > 0` signal yet fully exercised.
     pub probe_only: bool,
     /// Storage-fault plan for the whole universe (None = clean storage).
@@ -690,7 +691,7 @@ pub struct Scenario {
     /// handle instead of reopening — the whole universe runs on one handle,
     /// like a real client under a fault storm, and the report's `reopens`
     /// stays zero. Incompatible with the crash knobs (`crash_at`,
-    /// `crash_on_match`, `die_at_write`, `recovery_crash`): a dead process
+    /// `setup_crash`, `crash_on_match`, `die_at_write`, `recovery_crash`): a dead process
     /// has no handle to keep.
     pub keep_handle: bool,
     /// Kill-at-kth-write: die at durable write #k (1-based). `usize::MAX`
@@ -708,9 +709,9 @@ pub struct Scenario {
     /// Unlike `probe_only` (which scopes the probe to the single matched op
     /// for the hunt's per-op attribution), this answers the census question
     /// "did ANY execution in this universe walk the line" — and it composes
-    /// with a REAL `crash_on_match` setup crash, which is how the
-    /// recovery.* internals get their preconditions built. Cleanup workloads
-    /// obtain unused forks through ordinary branch deletion.
+    /// with a real `setup_crash`, which can strand unpublished staging for
+    /// cleanup. Cleanup workloads obtain unused forks through ordinary
+    /// branch deletion.
     pub probe_window: Option<&'static str>,
     /// SENSITIVITY KNOB (test-only red proof): force
     /// the maintenance-obligation RERUN to fail through a real engine
@@ -842,18 +843,13 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "cleanup.table_gc" | "cleanup.pre_gates" => {
             return vec![MutateMain, DeleteFixtureOnMain, CleanupMain];
         }
-        // A dead staging for cleanup to reclaim: the census's setup crash
+        // A dead staging for cleanup to reclaim: `setup_crash_for`'s crash
         // stops the index build at its pre-manifest window, stranding a
         // detached commit whose witness records main's head; the second
         // insert moves that head on, so the next cleanup judges the staging
         // dead and deletes its files before its manifest.
         "cleanup.sweep_pre_dead_manifest_delete" => {
             return vec![MutateMain, EnsureIndicesMain, MutateMain, CleanupMain];
-        }
-        // Recovery internals: build the PRIMARY crash's precondition (the
-        // census adds the crash itself).
-        "recovery.before_roll_forward_publish" => {
-            return vec![EnsureBranch, DataOnBranch, DataOnBranch, MergeBranch];
         }
         _ => {}
     }
@@ -865,7 +861,7 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "fork" => vec![ForkLoad],
         "load" if window == "load.post_branch_create_pre_stage" => vec![ForkLoad],
         "load" => vec![DataOnBranch], // LoadMerge/Append on main
-        "mutation" | "graph_publish" | "publish" | "classify" | "recovery" => vec![MutateMain],
+        "mutation" | "graph_publish" | "publish" | "classify" => vec![MutateMain],
         "ensure_indices" => vec![MutateMain, EnsureIndicesMain],
         "cleanup" => vec![MutateMain, CleanupMain],
         "optimize" => vec![MutateMain],
@@ -1919,12 +1915,10 @@ fn is_load_op(op: &Op) -> bool {
 }
 
 /// Window family (failpoint name prefix) → the op kinds that can execute
-/// through it. Static knowledge read off the catalog plus the v0/v1 hunts'
-/// EVIDENCE: `mutation.*`, `graph_publish.*`, `publish.*`, `fork.*`,
-/// `recovery.*` and `classify.*` all hit via mutation ops (the write path
-/// consults recovery sidecars and fork classification at txn open); loads
-/// share that machinery; refresh/sync run the roll-forward healer (loader
-/// walk Finding 5); the maintenance and branch families are their own verbs.
+/// through it. Mutation and load ops share graph publication, detached
+/// staging and fork classification. Maintenance and branch families have
+/// their own verbs. Precision rules below narrow individual windows whose
+/// preconditions require a particular op within a family.
 /// Families the workload has NO op for return false everywhere (init/open →
 /// schedule-scope).
 fn window_matches(window: &str, wop: &WorldOp) -> bool {
@@ -1996,12 +1990,6 @@ fn window_matches(window: &str, wop: &WorldOp) -> bool {
             matches!(wop, WorldOp::LoadFork { .. })
                 || matches!(wop, WorldOp::Data { op, .. } if is_mutation_op(op) || is_load_op(op))
         }
-        "recovery" => {
-            matches!(wop, WorldOp::LoadFork { .. })
-                || matches!(wop, WorldOp::Data { op, .. } if is_mutation_op(op)
-                    || is_load_op(op)
-                    || matches!(op, Op::Refresh | Op::SyncBranch))
-        }
         _ => false,
     }
 }
@@ -2052,7 +2040,6 @@ pub fn workload_can_reach(window: &str) -> bool {
             | "graph_publish"
             | "publish"
             | "fork"
-            | "recovery"
             | "classify"
     )
 }
@@ -4823,7 +4810,9 @@ enum CrashOutcome {
 
 /// Was the scheduled window hit inside this cleanup? Cleanup catches a
 /// table's error into that table's row, so the window's error text is in
-/// the deferrals the op recorded rather than in its result.
+/// the deferrals the op recorded rather than in its result. This covers
+/// returned per-table errors only; warning-only native-fork reconciliation
+/// failures are not exposed through this channel.
 #[cfg(feature = "failpoints")]
 fn cleanup_deferred_by(db: &Session, wop: &WorldOp, failpoint: &str) -> bool {
     if !matches!(
@@ -5696,7 +5685,6 @@ impl UniverseScenario<RustResources> for Scenario {
                 let (failpoint, _) = sc.setup_crash.expect("pending implies present");
                 if window_matches(failpoint, &wop) {
                     if setup_skip == 0 {
-                        setup_pending = false;
                         setup_now = Some(failpoint);
                     } else {
                         setup_skip -= 1;
@@ -5739,6 +5727,9 @@ impl UniverseScenario<RustResources> for Scenario {
                 ))
                 .await;
                 db = new_db;
+                if setup_now.is_some() && matches!(&outcome, CrashOutcome::Crashed { .. }) {
+                    setup_pending = false;
+                }
                 let owed = match outcome {
                     CrashOutcome::OpSucceeded => {
                         apply_world(&mut world, &wop);

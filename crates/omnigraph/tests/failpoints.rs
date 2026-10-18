@@ -9847,8 +9847,20 @@ async fn collector_retry_treats_an_index_directory_an_interrupted_pass_removed_a
 /// them again; it finds them gone, removes the rest and converges.
 async fn assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(
     uri: &str,
+    scoped: bool,
 ) {
     let db = helpers::init_and_load_at(uri, helpers::TEST_SCHEMA).await;
+    // Serving scopes file I/O through Lance's file-object-store provider,
+    // whose list/delete path also removes the directory and can return NotFound.
+    let db = if scoped {
+        helpers::session(
+            Omnigraph::open_with_io_scope(uri, omnigraph::storage::StorageIoScope::new())
+                .await
+                .unwrap(),
+        )
+    } else {
+        db
+    };
     let person_uri = node_table_uri(&db, "Person").await;
     insert_person(&db, "main", "between-first").await;
     insert_person(&db, "main", "between-second").await;
@@ -9956,11 +9968,14 @@ async fn assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_
 #[serial]
 async fn collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep() {
     let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(
-        dir.path().to_str().unwrap(),
-    )
-    .await;
+    for scoped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(
+            dir.path().to_str().unwrap(),
+            scoped,
+        )
+        .await;
+    }
 }
 
 /// A dead staging's files are deleted before its manifest as well. A pass
@@ -10123,8 +10138,10 @@ async fn s3_collector_retry_converges_after_every_sweep_window() {
         &before_manifests,
     )
     .await;
-    assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(&between)
-        .await;
+    assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(
+        &between, false,
+    )
+    .await;
     assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_removes_them(&dead).await;
 }
 
@@ -10144,8 +10161,10 @@ async fn azure_collector_retry_converges_after_every_sweep_window() {
         &before_manifests,
     )
     .await;
-    assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(&between)
-        .await;
+    assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(
+        &between, false,
+    )
+    .await;
     assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_removes_them(&dead).await;
     for root in [before_manifests, between, dead] {
         delete_azure_graph(&root).await;

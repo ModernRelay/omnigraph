@@ -160,19 +160,7 @@ fn dst_hunt_crash_window_sweep() {
         let mut hit_any = false;
         'attempts: for seed in [7u64, 8, 9, 10, 11, 12] {
             for skip in [0usize, 1, 2, 3] {
-                let sc = Scenario {
-                    seed,
-                    ops: 24,
-                    setup_crash: omnigraph_dst::harness::setup_crash_for(window),
-                    crash_on_match: Some((window, skip)),
-                    // Wide only where its ops are the ONLY route (load.*) —
-                    // the wide die dilutes branch-verb frequency and measured
-                    // as all merge windows going dark in an all-wide pass.
-                    // The schema face is scoped the same way.
-                    wide: omnigraph_dst::harness::window_needs_wide(window),
-                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
-                    ..Default::default()
-                };
+                let sc = hunt_window_scenario(seed, window, skip);
                 let root = format!("shared-memory://dst-hunt-{w}-{seed}-{skip}");
                 let report = run_universe(&root, &sc);
                 universes += 1;
@@ -196,8 +184,8 @@ fn dst_hunt_crash_window_sweep() {
 
     // CROSSING-PROBE pass over the dark windows: record-only callbacks tell
     // "crossed-but-ABSORBED" (the engine heals the injected failure — branch
-    // post_native ambiguity classifiers, phase-D sidecar delete: the STRONGEST
-    // kind of pass) apart from genuinely never reached (workload/path gap).
+    // post_native ambiguity classifiers) apart from genuinely never reached
+    // (workload/path gap).
     let mut absorbed: Vec<&str> = Vec::new();
     let mut dark: Vec<&str> = Vec::new();
     for (w, window) in never_reached.drain(..).enumerate() {
@@ -205,14 +193,8 @@ fn dst_hunt_crash_window_sweep() {
         'probe: for seed in [7u64, 8, 9, 10] {
             for skip in [0usize, 1] {
                 let sc = Scenario {
-                    seed,
-                    ops: 24,
-                    setup_crash: omnigraph_dst::harness::setup_crash_for(window),
-                    crash_on_match: Some((window, skip)),
                     probe_only: true,
-                    wide: omnigraph_dst::harness::window_needs_wide(window),
-                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
-                    ..Default::default()
+                    ..hunt_window_scenario(seed, window, skip)
                 };
                 let root = format!("shared-memory://dst-probe-{w}-{seed}-{skip}");
                 let report = run_universe(&root, &sc);
@@ -258,6 +240,21 @@ fn window_hit(report: &omnigraph_dst::harness::UniverseReport, window: &str) -> 
             .and_then(|rest| rest.split_once('@'))
             .is_some_and(|(hit, _)| hit == window)
     })
+}
+
+/// Both hunt passes use the same setup and op stream; the probe changes
+/// only whether the target window injects a failure.
+fn hunt_window_scenario(seed: u64, window: &'static str, skip: usize) -> Scenario {
+    Scenario {
+        seed,
+        ops: 24,
+        setup_crash: omnigraph_dst::harness::setup_crash_for(window),
+        crash_on_match: Some((window, skip)),
+        // Widen only where required, preserving branch-verb frequency elsewhere.
+        wide: omnigraph_dst::harness::window_needs_wide(window),
+        schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
+        ..Default::default()
+    }
 }
 
 /// The fleet's window arm: the window's milestone recipe woven into the
@@ -1906,24 +1903,17 @@ fn dst_maintenance_obligations_bite_and_replay() {
     }
 }
 
-/// DEAD-STAGING MANIFEST WINDOW, the active pin. The window's setup crash
-/// (`setup_crash_for`) stops the recipe's index build before its manifest
-/// commit, stranding a detached staging; the recipe's next insert moves
-/// main's head past the head the staging recorded, so the recipe's cleanup
-/// judges it dead. The reach census's cell must cross
-/// `cleanup.sweep_pre_dead_manifest_delete`. The fleet's window arm, which
-/// schedules the window after its setup, stops that cleanup there, after
-/// the dead staging's files and before its manifest: the table is left
-/// owed, and the obligation pass's clean rerun must finish it with the
-/// collector oracle finding no dead staging left. Both universes replay
-/// strictly.
+/// DEAD-STAGING MANIFEST WINDOW, the active pin. The census recipe, fleet
+/// arm and ordinary hunt all need a real setup crash before they can reach
+/// the dead staging. A deferred cleanup is a target hit, and its obligation
+/// rerun must leave no dead staging. Every selected universe replays strictly.
 #[cfg(feature = "failpoints")]
 #[test]
 #[serial]
 fn dst_dead_staging_sweep_window_is_reached_and_retried() {
     let _s = omnigraph::seams::FailScenario::setup();
     let window = omnigraph::seams::catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.name();
-    let probe = Scenario {
+    let census = Scenario {
         seed: 40_052,
         ops: 30,
         setup_crash: omnigraph_dst::harness::setup_crash_for(window),
@@ -1931,36 +1921,80 @@ fn dst_dead_staging_sweep_window_is_reached_and_retried() {
         reach_target: Some(window),
         ..Default::default()
     };
-    let a = run_universe("shared-memory://dst-dead-staging-probe-a", &probe);
-    assert!(a.crossed, "the recipe's cleanup must cross {window}");
-    assert_eq!(a.crashes, 1, "only the setup crash dies");
-    let b = run_universe("shared-memory://dst-dead-staging-probe-b", &probe);
-    omnigraph_dst::harness::assert_strict_replay(&a, &b, "dead-staging probe: strict replay");
+    let hunt_probe = Scenario {
+        probe_only: true,
+        ..hunt_window_scenario(9, window, 0)
+    };
+    for (label, probe) in [("census", census), ("hunt", hunt_probe)] {
+        let a = run_universe(&format!("shared-memory://dst-dead-{label}-probe-a"), &probe);
+        assert!(a.crossed, "{label}'s cleanup must cross {window}");
+        assert_eq!(a.crashes, 1, "{label}: only the setup crash dies");
+        let b = run_universe(&format!("shared-memory://dst-dead-{label}-probe-b"), &probe);
+        omnigraph_dst::harness::assert_strict_replay(&a, &b, &format!("{label} probe"));
+    }
 
-    let stopped = fleet_window_scenario(40_052, window);
-    let a = run_universe("shared-memory://dst-dead-staging-stop-a", &stopped);
-    assert!(
-        window_hit(&a, window),
-        "the fleet arm must stop the cleanup at {window}: {:?}",
+    for (label, stopped) in [
+        ("fleet", fleet_window_scenario(40_052, window)),
+        ("hunt", hunt_window_scenario(9, window, 0)),
+    ] {
+        let a = run_universe(
+            &format!("shared-memory://dst-dead-{label}-stop-a"),
+            &stopped,
+        );
+        assert!(
+            window_hit(&a, window),
+            "{label} must stop the cleanup at {window}: {:?}",
+            a.reconcile_verdicts
+        );
+        assert!(
+            a.reconcile_verdicts.iter().any(|(tag, verdict, channel)| {
+                tag.starts_with(&format!("deferred:{window}@"))
+                    && verdict == "Deferred"
+                    && channel == "cleanup"
+            }),
+            "{label}: stopped cleanup leaves the table owed: {:?}",
+            a.reconcile_verdicts
+        );
+        assert_eq!(a.crashes, 1, "{label}: only the setup dies");
+        assert_eq!(
+            a.maintenance_reruns, 2,
+            "{label}: setup and deferred cleanup each get an obligation pass"
+        );
+        println!("dead-staging {label} verdicts: {:?}", a.reconcile_verdicts);
+        let b = run_universe(
+            &format!("shared-memory://dst-dead-{label}-stop-b"),
+            &stopped,
+        );
+        omnigraph_dst::harness::assert_strict_replay(&a, &b, &format!("{label} stop"));
+    }
+}
+
+/// Matching an op family does not prove its setup seam ran. These three
+/// milestones perform two effectful mutations, then cleanup; neither mutation
+/// crosses the no-effect seam, so the dependent cleanup must stay unarmed.
+#[cfg(feature = "failpoints")]
+#[test]
+#[serial]
+fn dst_setup_crash_waits_for_a_crossed_window() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let target = "cleanup.pre_gates";
+    let sc = Scenario {
+        seed: 7,
+        ops: 3,
+        setup_crash: Some(("mutation.post_no_effect_pre_gate", 0)),
+        crash_on_match: Some((target, 0)),
+        reach_target: Some(target),
+        ..Default::default()
+    };
+    let a = run_universe("shared-memory://dst-setup-miss-a", &sc);
+    assert_eq!(
+        a.crashes, 0,
+        "an uncrossed setup must not arm the target: {:?}",
         a.reconcile_verdicts
     );
-    assert!(
-        a.reconcile_verdicts.iter().any(|(tag, verdict, _)| {
-            tag.starts_with(&format!("deferred:{window}@")) && verdict == "Deferred"
-        }),
-        "the stopped cleanup must leave the table owed: {:?}",
-        a.reconcile_verdicts
-    );
-    assert_eq!(
-        a.crashes, 1,
-        "the window defers a table; only the setup dies"
-    );
-    assert_eq!(
-        a.maintenance_reruns, 2,
-        "the setup crash and the owed table each get their obligation pass"
-    );
-    let b = run_universe("shared-memory://dst-dead-staging-stop-b", &stopped);
-    omnigraph_dst::harness::assert_strict_replay(&a, &b, "dead-staging stop: strict replay");
+    assert!(!window_hit(&a, target));
+    let b = run_universe("shared-memory://dst-setup-miss-b", &sc);
+    omnigraph_dst::harness::assert_strict_replay(&a, &b, "uncrossed setup");
 }
 
 #[cfg(feature = "failpoints")]
@@ -2026,7 +2060,7 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
             &sc,
         );
         let Err(panic) = result else {
-            panic!("s20 sensitivity: a failing rerun MUST redden the universe");
+            panic!("s20 sensitivity [{case}]: a failing rerun MUST redden the universe");
         };
         let msg = omnigraph_dst::harness::panic_message(panic.as_ref());
         assert!(
