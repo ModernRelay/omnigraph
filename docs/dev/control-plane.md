@@ -223,28 +223,41 @@ release and acquisition, so an older bootstrap create cannot recreate its owner.
 Clean native shutdown closes logical admission, drains its existing operation
 owners, then closes and drains an explicit `StorageIoScope` shared by control
 adapters and graph Lance sessions. The wrappers count actual mutating requests
-and multipart lifetimes. What an unacknowledged request can still do is a
-property of the key it names. Lance's table files are written once under fresh
-names (`data/`, its Blob sidecars, `_transactions/`, `_deletions/`,
-`_indices/<uuid>/`, `_bt/`, detached `_versions/d*.manifest`) and its numbered
-manifest versions put-if-absent, so a request to one of those keys that lands
-late or twice is unreachable garbage or a refused duplicate: it fails with its
-definite error and settles, and so does a multipart upload to such a key
-whatever happens to its `complete`, its `abort` or the upload itself. A
-cancelled or ambiguous request to any other key (a Lance ref, the version
-hint, a control object under `__cluster/`, an unknown path) sticks even if a
-higher layer consumes the error, and the scope logs that first request with
-its key and error. One consequence of a manifest put the store did not
-acknowledge is handled by the scope itself: Lance reads the version back once,
-takes one "not found" as definitive and deletes the attempt's transaction
-file, which a manifest landing later would name, so the scope refuses every
-delete under that dataset's `_transactions/` for its own lifetime and the
-collector reclaims the file from another process. Single-attempt conditional
-conflicts and a delete answered "not found" remain settled refusals. Scoped clients disable both transport and
-Lance AIMD retries, and local Lance uses its object-store file provider so
-direct file writes cannot bypass the scope. Embedded defaults and Azure serving
-clients are unchanged; the automatic scoped shutdown path applies only to local
-and S3 roots.
+and multipart lifetimes. Physical settlement depends on the operation and the
+key it names. The wrapper recognizes Lance 11's fresh `data/*.lance` files,
+their `data/<file-key>/*.blob` sidecars, `_transactions/*.txn`,
+`_deletions/*.arrow|*.bin`, flat files in `_indices/<uuid>/`, detached
+`_versions/d*.manifest`, and numbered manifests created only if absent.
+Late fresh files remain unreachable and a conditional create cannot replace
+an existing publication. Such requests settle at the physical scope after
+an error or cancellation, including multipart uploads. This does not prove
+that a graph publication failed: the catalogue still owns the outcome of an
+unacknowledged numbered-manifest publication, and its uncertainty reaches the
+logical operation owner independently of the storage scope.
+
+Refs, version hints, cluster control objects, unknown paths, if-match
+replacements and recursive deletes remain conservative. A cancelled or
+ambiguous request sticks even if a higher layer consumes the error, and the
+scope logs its key and error. Rename also accounts for removal of its source.
+Single-attempt conditional conflicts and a delete answered "not found" are
+settled refusals.
+
+An unacknowledged manifest write may land after Lance reads it back as absent
+and attempts to delete its transaction file. One sticky flag therefore
+refuses transaction-file deletion throughout that scope, including rename
+source deletion and recursive removal. This intentionally retains other
+datasets' transaction files too, bounding the accounting state. Normal data
+serving can continue, while transaction cleanup can be deferred until a
+replacement scope. The collector must still establish its normal
+reachability, authority and age predicates before reclaiming retained files;
+replacing the scope is not permission to delete them. Definite conditional
+conflicts do not set the hold. A successful multipart abort does not clear a
+hold from an earlier unacknowledged completion.
+
+Scoped clients disable both transport and Lance AIMD retries, and local Lance
+uses its object-store file provider so direct file writes cannot bypass the
+scope. Embedded defaults and Azure serving clients are unchanged; the
+automatic scoped shutdown path applies only to local and S3 roots.
 
 Only unique admission, successful startup and unpoisoned settlement permit final
 release. Original adapters remain permanently closed; a private single-attempt
@@ -416,12 +429,14 @@ same bounded process shutdown, retaining
 unresolved reservations until exit. The engine's completion evidence decides:
 a failure it proves left the graph unchanged, before any effect or after
 detached effects no manifest names (`BeforeEffect`, `Unpublished`), is
-nonfatal whatever status it maps to, including a 500. The data writers mark
-an opaque error (storage, I/O, DataFusion, internal) `Unpublished` from
-their first staged file to the publisher call; a typed refusal keeps its
-shape, since its type already states what happened. A write error with
-neither fails closed as uncertain. Read/write body and response lanes have independent capacity; bodyless
-reads consume only read observers. Once HTTP connections and the remaining known
+not itself a reason for logical containment, whatever status it maps to,
+including a 500. Mutation, load, Blob write and merge mark opaque errors (storage, I/O, DataFusion, internal) at their pre-publication
+steps, alongside the table store's staged-write and detached-commit sites.
+A typed refusal keeps its shape. Other opaque schema and maintenance
+preparation errors without completion evidence still fail closed as uncertain. Proven publication followed by
+`RecoveryRequired`, and uncertain publication itself, are never downgraded.
+Read/write body and response lanes have independent capacity; bodyless reads
+consume only read observers. Once HTTP connections and the remaining known
 logical owners finish, uncertain completion exits 2 immediately, with the original
 watchdog as the upper bound. This does not establish native-I/O settlement.
 

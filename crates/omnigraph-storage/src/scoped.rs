@@ -4,36 +4,33 @@
 //! wrapped remote client must disable retries before construction: a successful
 //! retry cannot establish what happened to an earlier, unacknowledged request.
 //!
-//! What an unacknowledged request can still do decides whether it poisons the
-//! scope, and that is a property of the key it names ([`KeyClass`]):
+//! Settlement depends on the request's operation and the Lance 11 key it names:
 //!
-//! - Lance writes its table files once under fresh names (`data/*.lance` and
-//!   the Blob sidecars below them, `_transactions/*.txn`, `_deletions/*`,
-//!   `_indices/<uuid>/*`, detached `_versions/d*.manifest`) and its numbered
-//!   `_versions/*.manifest` put-if-absent. A request to one of those keys
-//!   that lands late or twice changes nothing a `__manifest` publication
-//!   resolves: a file nothing names is reclaimable garbage, a detached
-//!   version's random id is never reused, and a numbered manifest's
-//!   precondition admits one copy, which the next reader observes. Such a
-//!   request settles with its definite error.
-//! - Every other key (a Lance ref under `_refs/`, the version hint, a
-//!   control object under `__cluster/`, a path this module does not know)
-//!   may be rewritten or removed by a request that lands after the owner
-//!   gave up on it, so an unsettled request there permanently makes the
-//!   scope uncertain. The first such request is logged with its key and
-//!   error; nothing else records the cause.
-//! - A manifest put the store did not acknowledge may still land. Lance
-//!   reads the version back once, takes one "not found" as definitive, and
-//!   deletes the attempt's transaction file; a manifest landing after that
-//!   would name a file that is gone. So after such a put the scope refuses
-//!   every delete under that dataset's `_transactions/` for its own
-//!   lifetime: the file stays as reclaimable garbage, and a late manifest
-//!   stays complete. A conditional conflict is a definite refusal and holds
-//!   nothing.
-//! - A multipart upload to an immutable key settles whatever happens to its
-//!   `complete`, its `abort` or the upload itself: the object either exists
-//!   whole under its fresh name or never does, and leftover parts are the
-//!   bucket's to expire.
+//! - Lance writes fresh table files (`data/*.lance`, their Blob sidecars,
+//!   `_transactions/*.txn`, `_deletions/*.arrow|*.bin`, flat files in
+//!   `_indices/<uuid>/`, detached `_versions/d*.manifest`) and creates numbered
+//!   manifest versions only if absent. Late fresh files remain unreachable;
+//!   a conditional create cannot replace an existing publication. These
+//!   requests settle at the physical scope even after an error or cancellation.
+//!   This is not evidence of graph non-publication: the catalogue still owns
+//!   the result of an unacknowledged numbered-manifest publication, and its
+//!   uncertainty must reach the logical owner independently of this scope.
+//! - Other keys (refs, version hints, control objects and unknown paths),
+//!   if-match replacements and recursive deletes stay conservative. An
+//!   unacknowledged request makes the scope uncertain even if its caller
+//!   consumes the error. Rename accounts for its source deletion too.
+//! - A manifest write the store did not acknowledge may still land after
+//!   Lance reads it back as absent and tries to delete its transaction file.
+//!   One sticky flag therefore refuses transaction-file deletion throughout
+//!   this scope, including rename source deletion and recursive removal. This
+//!   deliberately over-retains other datasets' transaction files without an
+//!   unbounded path list. A replacement scope may reclaim them only through
+//!   the collector's normal reachability, authority and age checks. Definite
+//!   conditional conflicts hold nothing.
+//! - Multipart uploads to fresh immutable keys settle even if completion or
+//!   abort fails or the handle is abandoned: the object exists whole or not at
+//!   all. Leftover parts are the bucket's to expire. Unacknowledged manifest
+//!   completion retains transaction files by the same rule above.
 
 use std::fmt;
 use std::ops::Range;
@@ -52,7 +49,7 @@ use tokio::sync::Notify;
 
 /// Shared mutation accounting for an explicitly owned storage lifetime.
 ///
-/// Failed or abandoned requests permanently make the scope uncertain. Closing
+/// Failed or abandoned requests to mutable keys make the scope uncertain. Closing
 /// it refuses new mutations, while already admitted multipart uploads may still
 /// finish or abort. Reads remain available. An idle scope is not proof of
 /// settlement unless it is also unpoisoned and its logical owners have drained.
@@ -72,9 +69,9 @@ struct ScopeState {
     pending: usize,
     closed: bool,
     uncertain: bool,
-    /// `_transactions/` directories whose files may be named by a manifest
-    /// the store did not acknowledge; deletes under them are refused.
-    held_transaction_dirs: Vec<Path>,
+    /// An unacknowledged manifest write may still land. Retain transaction
+    /// files for this scope's lifetime with bounded, conservative state.
+    hold_transaction_deletes: bool,
 }
 
 impl StorageIoScope {
@@ -129,10 +126,7 @@ impl StorageIoScope {
         if state.uncertain {
             return Err(uncertain_error());
         }
-        if request.op == "delete"
-            && let Some(parent) = parent_dir(&request.path)
-            && state.held_transaction_dirs.contains(&parent)
-        {
+        if state.hold_transaction_deletes && request.deletes_transactions() {
             // A settled refusal: Lance's best-effort cleanup logs it and
             // returns the commit's own error; the collector reclaims the
             // file later from another process.
@@ -146,7 +140,7 @@ impl StorageIoScope {
         Ok(Mutation {
             scope: self.clone(),
             settled: false,
-            hold_transactions: request.transactions_dir.is_some(),
+            hold_transactions: request.writes_manifest,
             request,
         })
     }
@@ -162,31 +156,19 @@ impl StorageIoScope {
         Ok(Mutation {
             scope: self.clone(),
             settled: false,
-            hold_transactions: false,
+            // Completion can publish before returning or being cancelled.
+            // A later successful abort cannot erase that earlier evidence.
+            hold_transactions: request.writes_manifest && request.op == "multipart complete",
             request,
         })
     }
 }
 
-/// The directory a key sits in, or `None` for a one-segment key.
-fn parent_dir(path: &Path) -> Option<Path> {
+/// Match a file in a known Lance directory at the tail of its key.
+fn file_in_directory(path: &Path, directory: &str, suffix: &str) -> bool {
     let parts: Vec<_> = path.parts().collect();
-    let (_, dirs) = parts.split_last()?;
-    Some(Path::from_iter(dirs.iter().cloned()))
-}
-
-/// For a put of `<dataset>/_versions/<name>.manifest`, the dataset's
-/// `_transactions/` directory, whose files that manifest may name.
-fn manifest_transactions_dir(path: &Path) -> Option<Path> {
-    let parts: Vec<_> = path.parts().collect();
-    let [dataset @ .., versions, name] = parts.as_slice() else {
-        return None;
-    };
-    (versions.as_ref() == "_versions" && name.as_ref().ends_with(".manifest")).then(|| {
-        Path::from_iter(dataset.iter().cloned().chain(std::iter::once(
-            object_store::path::PathPart::from("_transactions"),
-        )))
-    })
+    matches!(parts.as_slice(), [.., parent, name]
+        if parent.as_ref() == directory && name.as_ref().ends_with(suffix))
 }
 
 /// Whether a request to this key that lands after its owner gave up on it,
@@ -210,9 +192,8 @@ pub(crate) struct Request {
     /// refusal and whose late landing applies at most once.
     conditional: bool,
     class: KeyClass,
-    /// For a manifest put, the `_transactions/` directory whose files the
-    /// manifest may name.
-    transactions_dir: Option<Path>,
+    /// This request may write a manifest which names a transaction file.
+    writes_manifest: bool,
 }
 
 impl Request {
@@ -221,11 +202,21 @@ impl Request {
             op,
             path: path.clone(),
             conditional,
-            class: key_class(path, conditional),
-            transactions_dir: (op == "put")
-                .then(|| manifest_transactions_dir(path))
-                .flatten(),
+            class: if op == "delete_prefix" {
+                // A directory name never proves its descendants immutable.
+                KeyClass::Mutable
+            } else {
+                key_class(path, conditional)
+            },
+            writes_manifest: matches!(op, "put" | "copy" | "rename" | "multipart")
+                && file_in_directory(path, "_versions", ".manifest"),
         }
+    }
+
+    fn deletes_transactions(&self) -> bool {
+        self.op == "delete_prefix"
+            || (matches!(self.op, "delete" | "rename source delete")
+                && file_in_directory(&self.path, "_transactions", ".txn"))
     }
 }
 
@@ -244,9 +235,6 @@ pub(crate) fn key_class(path: &Path, conditional: bool) -> KeyClass {
         "data" => name.ends_with(".lance"),
         "_transactions" => name.ends_with(".txn"),
         "_deletions" => name.ends_with(".arrow") || name.ends_with(".bin"),
-        // Managed Blob payloads of the current Lance layout; 11.0.0 writes
-        // them beside their data file instead (below).
-        "_blobs" => name.ends_with(".blob"),
         "_versions" => match name.strip_suffix(".manifest") {
             Some(version) => match version.strip_prefix('d') {
                 Some(detached) => digits(detached),
@@ -264,22 +252,12 @@ pub(crate) fn key_class(path: &Path, conditional: bool) -> KeyClass {
         if *grandparent == "data" && name.ends_with(".blob") {
             return KeyClass::Immutable;
         }
-        // Fragment tree objects, content-addressed under `_bt/`.
-        if *grandparent == "_bt"
-            && matches!(
-                (*parent, name.rsplit_once('.').map(|(_, ext)| ext)),
-                ("root", Some("root")) | ("node", Some("node")) | ("leaf", Some("lance"))
-            )
-        {
+        // Lance 11 writes each index's files directly in its UUID directory.
+        // Unknown nested paths stay mutable: a root prefix can itself contain
+        // `_indices/<uuid>/` before an unrelated control object.
+        if *grandparent == "_indices" && is_uuid(parent) {
             return KeyClass::Immutable;
         }
-    }
-    // Index files: anything below `_indices/<uuid>/`.
-    let index_dir = parts[..parts.len() - 1]
-        .windows(2)
-        .any(|pair| pair[0] == "_indices" && is_uuid(pair[1]));
-    if index_dir {
-        return KeyClass::Immutable;
     }
     KeyClass::Mutable
 }
@@ -312,7 +290,7 @@ fn transaction_file_held_error() -> object_store::Error {
     object_store::Error::Generic {
         store: "owned storage",
         source: std::io::Error::other(
-            "a manifest put with an unknown outcome may name this transaction file; it stays until cleanup",
+            "a manifest write with an unknown outcome may name this transaction file; it stays until cleanup from a replacement scope",
         )
         .into(),
     }
@@ -322,8 +300,8 @@ fn transaction_file_held_error() -> object_store::Error {
 pub(crate) struct Mutation {
     scope: StorageIoScope,
     settled: bool,
-    /// Set for a manifest put until the store acknowledges it or refuses it
-    /// definitively: on drop, the dataset's transaction files are held.
+    /// Set for a manifest write until the store acknowledges it or refuses it
+    /// definitively: on drop, this scope holds transaction-file deletion.
     hold_transactions: bool,
     request: Request,
 }
@@ -346,8 +324,8 @@ impl Mutation {
                 object_store::Error::AlreadyExists { .. }
                     | object_store::Error::Precondition { .. }
             );
-        let already_gone =
-            self.request.op == "delete" && matches!(error, object_store::Error::NotFound { .. });
+        let already_gone = matches!(self.request.op, "delete" | "rename source delete")
+            && matches!(error, object_store::Error::NotFound { .. });
         self.settled = conflict || already_gone || self.request.class == KeyClass::Immutable;
         // A definite refusal is the caller's own outcome and is not logged.
         if conflict || already_gone {
@@ -360,7 +338,7 @@ impl Mutation {
                 path = %self.request.path,
                 conditional = self.request.conditional,
                 error = %error,
-                "storage request failed on an immutable key; the outcome is definite"
+                "storage request failed on an immutable key; the physical scope remains settled"
             );
         } else {
             tracing::error!(
@@ -376,12 +354,29 @@ impl Mutation {
 
     pub(crate) fn settle(mut self) {
         self.settled = true;
+        self.hold_transactions = false;
     }
 
-    /// Account the second phase of a two-request mutation under its own key.
-    fn with_request(mut self, request: Request) -> Self {
+    /// The previous request was acknowledged. Account the next request before
+    /// it can be polled, even when new admission closed between the phases.
+    fn with_request(mut self, request: Request) -> Result<Self> {
+        self.settled = true;
+        self.hold_transactions = false;
+        if self
+            .scope
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .hold_transaction_deletes
+            && request.deletes_transactions()
+        {
+            return Err(transaction_file_held_error());
+        }
+        self.hold_transactions = request.writes_manifest;
         self.request = request;
-        self
+        self.settled = false;
+        Ok(self)
     }
 }
 
@@ -396,7 +391,7 @@ impl Drop for Mutation {
                 tracing::warn!(
                     op = self.request.op,
                     path = %self.request.path,
-                    "storage request abandoned on an immutable key; the outcome is definite"
+                    "storage request abandoned on an immutable key; the physical scope remains settled"
                 );
             } else {
                 tracing::error!(
@@ -407,12 +402,7 @@ impl Drop for Mutation {
                 state.uncertain = true;
             }
         }
-        if self.hold_transactions
-            && let Some(dir) = &self.request.transactions_dir
-            && !state.held_transaction_dirs.contains(dir)
-        {
-            state.held_transaction_dirs.push(dir.clone());
-        }
+        state.hold_transaction_deletes |= self.hold_transactions;
         state.pending -= 1;
         drop(state);
         self.scope.inner.changed.notify_waiters();
@@ -441,7 +431,13 @@ impl ObjectStore for ScopedObjectStore {
         opts: PutOptions,
     ) -> Result<PutResult> {
         let conditional = !matches!(opts.mode, object_store::PutMode::Overwrite);
-        let mutation = self.scope.begin(Request::new("put", path, conditional))?;
+        let mut request = Request::new("put", path, conditional);
+        if matches!(opts.mode, object_store::PutMode::Update(_)) {
+            // If-match can replace existing bytes, including a publication
+            // key. Only Create has the numbered-manifest exemption.
+            request.class = KeyClass::Mutable;
+        }
+        let mutation = self.scope.begin(request)?;
         mutation.finish(self.inner.put_opts(path, payload, opts).await)
     }
 
@@ -517,6 +513,17 @@ impl ObjectStore for ScopedObjectStore {
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()> {
+        if self
+            .scope
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .hold_transaction_deletes
+            && file_in_directory(from, "_transactions", ".txn")
+        {
+            return Err(transaction_file_held_error());
+        }
         if opts.target_mode == object_store::RenameTargetMode::Create {
             // The standard conditional rename is copy-Create then delete.
             // Keep its phases visible: a copy conflict is known no-effect,
@@ -531,15 +538,20 @@ impl ObjectStore for ScopedObjectStore {
             match self.inner.copy_opts(from, to, copy).await {
                 Err(error) => mutation.finish(Err(error)),
                 Ok(()) => {
-                    let delete = self.inner.delete(from).await;
-                    mutation
-                        .with_request(Request::new("rename source delete", from, false))
-                        .finish(delete)
+                    let mutation =
+                        mutation.with_request(Request::new("rename source delete", from, false))?;
+                    mutation.finish(self.inner.delete(from).await)
                 }
             }
         } else {
             // Preserve the backend's optimized atomic overwrite rename.
-            let mutation = self.scope.begin(Request::new("rename", to, false))?;
+            let mut request = Request::new("rename", to, false);
+            if key_class(from, false) == KeyClass::Mutable {
+                // An atomic rename changes both keys; a safe destination
+                // cannot establish settlement of a mutable source removal.
+                request.class = KeyClass::Mutable;
+            }
+            let mutation = self.scope.begin(request)?;
             mutation.finish(self.inner.rename_opts(from, to, opts).await)
         }
     }
@@ -766,6 +778,19 @@ mod tests {
         point: Point,
         lost_ack: bool,
     ) -> (StorageIoScope, Arc<dyn ObjectStore>, Arc<Fault>) {
+        let (scope, store, fault, _) = fixture_with_inner(point, lost_ack).await;
+        (scope, store, fault)
+    }
+
+    async fn fixture_with_inner(
+        point: Point,
+        lost_ack: bool,
+    ) -> (
+        StorageIoScope,
+        Arc<dyn ObjectStore>,
+        Arc<Fault>,
+        Arc<InMemory>,
+    ) {
         let scope = StorageIoScope::new();
         let fault = Arc::new(Fault {
             point,
@@ -779,10 +804,10 @@ mod tests {
             .await
             .unwrap();
         let store = scope.wrap_object_store(Arc::new(FaultStore {
-            inner,
+            inner: inner.clone(),
             fault: fault.clone(),
         }));
-        (scope, store, fault)
+        (scope, store, fault, inner)
     }
 
     async fn mutate(store: Arc<dyn ObjectStore>, point: Point) -> Result<()> {
@@ -879,10 +904,6 @@ mod tests {
                 false,
             ),
             (
-                "g/node_Person/_indices/1b4e28ba-2fa1-11d2-883f-0016d3cca427/part/0.idx",
-                false,
-            ),
-            (
                 "g/node_Person/_versions/d12770445047132701458.manifest",
                 false,
             ),
@@ -896,19 +917,31 @@ mod tests {
                 "{key}"
             );
         }
-        for key in [
-            "g/node_Person/_bt/root/1b4e28ba-2fa1-11d2-883f-0016d3cca427.root",
-            "g/node_Person/_bt/node/1b4e28ba-2fa1-11d2-883f-0016d3cca427.node",
-            "g/node_Person/_bt/leaf/1b4e28ba-2fa1-11d2-883f-0016d3cca427.lance",
-            "g/node_Person/_blobs/1b4e28ba-2fa1-11d2-883f-0016d3cca427.blob",
-        ] {
-            assert_eq!(
-                key_class(&Path::from(key), false),
-                KeyClass::Immutable,
-                "{key}"
-            );
-        }
         let mutable = [
+            (
+                "g/node_Person/_bt/root/1b4e28ba-2fa1-11d2-883f-0016d3cca427.root",
+                false,
+            ),
+            (
+                "g/node_Person/_bt/node/1b4e28ba-2fa1-11d2-883f-0016d3cca427.node",
+                false,
+            ),
+            (
+                "g/node_Person/_bt/leaf/1b4e28ba-2fa1-11d2-883f-0016d3cca427.lance",
+                false,
+            ),
+            (
+                "g/node_Person/_blobs/1b4e28ba-2fa1-11d2-883f-0016d3cca427.blob",
+                false,
+            ),
+            (
+                "g/node_Person/_indices/1b4e28ba-2fa1-11d2-883f-0016d3cca427/part/0.idx",
+                false,
+            ),
+            (
+                "_indices/1b4e28ba-2fa1-11d2-883f-0016d3cca427/cluster/__cluster/lock.json",
+                true,
+            ),
             ("g/__manifest/_versions/14.manifest", false),
             ("g/__manifest/_versions/latest_version_hint.json", false),
             ("g/__manifest/_refs/branches/main", true),
@@ -1026,6 +1059,10 @@ mod tests {
                 object_store::PutMode::Create,
             ),
             ("g/__cluster/lock.json", object_store::PutMode::Create),
+            (
+                "_indices/1b4e28ba-2fa1-11d2-883f-0016d3cca427/cluster/__cluster/lock.json",
+                object_store::PutMode::Create,
+            ),
         ] {
             let (scope, store, _) = fixture(Point::Put, true).await;
             assert!(
@@ -1066,11 +1103,10 @@ mod tests {
         assert!(scope.is_uncertain(), "a lost ref delete poisons");
     }
 
-    /// After a manifest put the store did not acknowledge, the dataset's
-    /// transaction files cannot be deleted through the scope: Lance's own
-    /// cleanup is refused with a settled error and the file stays for a late
-    /// manifest to name. A definite conflict on the put holds nothing, and
-    /// another dataset's transaction files are untouched.
+    /// After a manifest put the store did not acknowledge, transaction files
+    /// cannot be deleted through this scope. One sticky flag intentionally
+    /// retains other datasets' transactions too, bounding the bookkeeping.
+    /// The refusal is settled; a definite conflict on the put holds nothing.
     #[tokio::test]
     async fn unacknowledged_manifest_put_holds_the_transaction_file_issue_1067() {
         let manifest = Path::from("g/node_Person/_versions/d12770445047132701458.manifest");
@@ -1100,10 +1136,12 @@ mod tests {
                 store.get(&transaction).await.is_ok(),
                 "{mode:?}: the file stays"
             );
-            store
-                .delete(&other)
-                .await
-                .expect("another dataset's transaction files are not held");
+            let refused = store.delete(&other).await.unwrap_err();
+            assert!(refused.to_string().contains("transaction file"));
+            assert!(
+                store.get(&other).await.is_ok(),
+                "the bounded hold covers every dataset"
+            );
             assert!(
                 !scope.is_uncertain(),
                 "{mode:?}: a held delete is a settled refusal"
@@ -1139,6 +1177,345 @@ mod tests {
             .await
             .expect("a definite conflict holds nothing");
         assert!(!scope.is_uncertain());
+    }
+
+    /// A rename also removes its source. Cancellation must use that source's
+    /// classification as soon as its delete begins, including when the target
+    /// is one of Lance's immutable files.
+    async fn rename_to_immutable_file_keeps_mutable_source_uncertainty(conditional: bool) {
+        for lost_ack in [false, true] {
+            let point = if conditional {
+                Point::Delete
+            } else {
+                Point::Rename
+            };
+            let (scope, store, fault) = fixture(point, lost_ack).await;
+            let target = Path::from("g/node_Person/data/renamed.lance");
+            let task = {
+                let store = store.clone();
+                let target = target.clone();
+                tokio::spawn(async move {
+                    store
+                        .rename_opts(
+                            &Path::from("source"),
+                            &target,
+                            RenameOptions {
+                                target_mode: if conditional {
+                                    object_store::RenameTargetMode::Create
+                                } else {
+                                    object_store::RenameTargetMode::Overwrite
+                                },
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                })
+            };
+            if lost_ack {
+                assert!(task.await.unwrap().is_err());
+            } else {
+                tokio::time::timeout(Duration::from_secs(2), fault.entered.notified())
+                    .await
+                    .unwrap();
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+            scope.wait_idle().await;
+            assert!(
+                scope.is_uncertain(),
+                "conditional={conditional}, lost_ack={lost_ack}: a mutable source delete stays uncertain"
+            );
+            assert!(store.get(&target).await.is_ok(), "the target copy landed");
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_rename_keeps_mutable_source_uncertainty_issue_1067() {
+        rename_to_immutable_file_keeps_mutable_source_uncertainty(true).await;
+    }
+
+    #[tokio::test]
+    async fn overwrite_rename_keeps_mutable_source_uncertainty_issue_1067() {
+        rename_to_immutable_file_keeps_mutable_source_uncertainty(false).await;
+    }
+
+    /// Windows' Lance RenameCommitHandler publishes with conditional rename;
+    /// the wrapper implements that as a conditional copy followed by delete.
+    /// A lost or cancelled copy acknowledgement must retain transaction files
+    /// just as an unacknowledged manifest put does.
+    #[tokio::test]
+    async fn unacknowledged_manifest_copy_or_rename_holds_transactions_issue_1067() {
+        for rename in [false, true] {
+            for lost_ack in [false, true] {
+                for name in ["14.manifest", "d12770445047132701458.manifest"] {
+                    let (scope, store, fault, inner) =
+                        fixture_with_inner(Point::Copy, lost_ack).await;
+                    let manifest = Path::from(format!("g/node_Person/_versions/{name}"));
+                    let transaction = Path::from("g/node_Person/_transactions/13-attempt.txn");
+                    store.put(&transaction, "transaction".into()).await.unwrap();
+                    let task = {
+                        let store = store.clone();
+                        let manifest = manifest.clone();
+                        tokio::spawn(async move {
+                            if rename {
+                                store
+                                    .rename_opts(
+                                        &Path::from("source"),
+                                        &manifest,
+                                        RenameOptions {
+                                            target_mode: object_store::RenameTargetMode::Create,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await
+                            } else {
+                                store
+                                    .copy_opts(
+                                        &Path::from("source"),
+                                        &manifest,
+                                        CopyOptions {
+                                            mode: object_store::CopyMode::Create,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await
+                            }
+                        })
+                    };
+                    if lost_ack {
+                        assert!(task.await.unwrap().is_err());
+                    } else {
+                        tokio::time::timeout(Duration::from_secs(2), fault.entered.notified())
+                            .await
+                            .unwrap();
+                        task.abort();
+                        assert!(task.await.unwrap_err().is_cancelled());
+                    }
+                    scope.wait_idle().await;
+                    assert!(
+                        !scope.is_uncertain(),
+                        "rename={rename}, lost_ack={lost_ack}, {name}"
+                    );
+                    assert!(
+                        store.get(&manifest).await.is_ok(),
+                        "the copied manifest landed"
+                    );
+                    let refused = store.delete(&transaction).await.unwrap_err();
+                    assert!(
+                        refused.to_string().contains("transaction file"),
+                        "{refused}"
+                    );
+                    assert!(store.get(&transaction).await.is_ok());
+                    scope.close();
+                    scope.wait_idle().await;
+                    assert!(!scope.is_uncertain(), "the retention refusal is settled");
+
+                    // The hold is local to the old scope. A replacement owner
+                    // can delete after its collector establishes the ordinary
+                    // reachability/authority/age predicates; this fixture has
+                    // no graph references and removes the manifest first.
+                    let fresh_scope = StorageIoScope::new();
+                    let fresh = fresh_scope.wrap_object_store(inner);
+                    fresh.delete(&manifest).await.unwrap();
+                    fresh.delete(&transaction).await.unwrap();
+                    assert!(fresh.get(&transaction).await.is_err());
+                    assert!(!fresh_scope.is_uncertain());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_a_numbered_manifest_is_not_create_only_issue_1067() {
+        let (scope, store, _) = fixture(Point::Put, true).await;
+        let manifest = Path::from("g/__manifest/_versions/14.manifest");
+        assert!(
+            store
+                .put_opts(
+                    &manifest,
+                    "first".into(),
+                    object_store::PutMode::Create.into()
+                )
+                .await
+                .is_err()
+        );
+        assert!(!scope.is_uncertain());
+        let version = store.head(&manifest).await.unwrap();
+        let update = object_store::PutMode::Update(object_store::UpdateVersion {
+            e_tag: version.e_tag,
+            version: version.version,
+        });
+        assert!(
+            store
+                .put_opts(&manifest, "replacement".into(), update.into())
+                .await
+                .is_err()
+        );
+        assert!(
+            scope.is_uncertain(),
+            "if-match can replace an existing publication key"
+        );
+    }
+
+    #[test]
+    fn recursive_delete_never_inherits_a_file_key_class_issue_1067() {
+        let scope = StorageIoScope::new();
+        let mutation = scope
+            .begin(Request::new(
+                "delete_prefix",
+                &Path::from("data/x.lance"),
+                false,
+            ))
+            .unwrap();
+        drop(mutation);
+        assert!(
+            scope.is_uncertain(),
+            "a recursive removal can also delete mutable descendants"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_transaction_delete_cannot_hide_inside_rename_issue_1067() {
+        let (scope, store, _) = fixture(Point::Put, true).await;
+        let transaction = Path::from("g/node_Person/_transactions/13-attempt.txn");
+        let manifest = Path::from("g/node_Person/_versions/d12770445047132701458.manifest");
+        assert!(store.put(&transaction, "transaction".into()).await.is_err());
+        assert!(store.put(&manifest, "manifest".into()).await.is_err());
+        assert!(!scope.is_uncertain());
+        for target_mode in [
+            object_store::RenameTargetMode::Create,
+            object_store::RenameTargetMode::Overwrite,
+        ] {
+            let target = Path::from("g/node_Person/data/moved.lance");
+            let refused = store
+                .rename_opts(
+                    &transaction,
+                    &target,
+                    RenameOptions {
+                        target_mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("transaction file"),
+                "{refused}"
+            );
+            assert!(store.get(&transaction).await.is_ok());
+            assert!(
+                store.get(&target).await.is_err(),
+                "refusal precedes the copy"
+            );
+            assert!(!scope.is_uncertain());
+        }
+        let refused = scope
+            .begin(Request::new(
+                "delete_prefix",
+                &Path::from("g/node_Person"),
+                false,
+            ))
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("transaction file"),
+            "{refused}"
+        );
+        assert!(
+            !scope.is_uncertain(),
+            "retention refusals do not poison the scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn definite_manifest_copy_or_rename_conflict_holds_nothing_issue_1067() {
+        for rename in [false, true] {
+            let (scope, store, _) = fixture(Point::Copy, true).await;
+            let manifest = Path::from("g/node_Person/_versions/14.manifest");
+            let transaction = Path::from("g/node_Person/_transactions/13-attempt.txn");
+            store.put(&transaction, "transaction".into()).await.unwrap();
+            store
+                .put_opts(
+                    &manifest,
+                    "winner".into(),
+                    object_store::PutMode::Create.into(),
+                )
+                .await
+                .unwrap();
+            let result = if rename {
+                store
+                    .rename_opts(
+                        &Path::from("source"),
+                        &manifest,
+                        RenameOptions {
+                            target_mode: object_store::RenameTargetMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            } else {
+                store
+                    .copy_opts(
+                        &Path::from("source"),
+                        &manifest,
+                        CopyOptions {
+                            mode: object_store::CopyMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            };
+            assert!(matches!(
+                result,
+                Err(object_store::Error::AlreadyExists { .. })
+            ));
+            store
+                .delete(&transaction)
+                .await
+                .expect("a definite conflict never holds transaction cleanup");
+            assert!(!scope.is_uncertain());
+        }
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_manifest_completion_holds_transactions_after_abort_issue_1067() {
+        for lost_ack in [false, true] {
+            let (scope, store, fault) = fixture(Point::Complete, lost_ack).await;
+            let manifest = Path::from("g/node_Person/_versions/d12770445047132701458.manifest");
+            let transaction = Path::from("g/node_Person/_transactions/13-attempt.txn");
+            store.put(&transaction, "transaction".into()).await.unwrap();
+            let mut upload = store.put_multipart(&manifest).await.unwrap();
+            upload.put_part("manifest".into()).await.unwrap();
+            if lost_ack {
+                assert!(upload.complete().await.is_err());
+            } else {
+                let complete = upload.complete();
+                tokio::pin!(complete);
+                tokio::select! {
+                    result = &mut complete => panic!("completion acknowledgement should be parked: {result:?}"),
+                    reached = tokio::time::timeout(Duration::from_secs(2), fault.entered.notified()) => reached.unwrap(),
+                }
+                // Dropping this borrowed completion future cancels it while
+                // retaining the upload handle, so abort can still succeed.
+            }
+            upload.abort().await.unwrap();
+            drop(upload);
+            scope.wait_idle().await;
+            assert!(!scope.is_uncertain());
+            assert!(
+                store.get(&manifest).await.is_ok(),
+                "complete published the object"
+            );
+            let refused = store.delete(&transaction).await.unwrap_err();
+            assert!(
+                refused.to_string().contains("transaction file"),
+                "{refused}"
+            );
+            assert!(store.get(&transaction).await.is_ok());
+            assert!(
+                !scope.is_uncertain(),
+                "successful abort cannot erase a prior unknown completion"
+            );
+        }
     }
 
     /// A multipart upload to an immutable key settles whatever its `complete`,
@@ -1393,6 +1770,27 @@ mod tests {
             "original"
         );
         scope.wait_idle().await;
+
+        // InMemory treats a missing delete as success. Exercise the explicit
+        // NotFound response at the same source-delete guard boundary: the copy
+        // was acknowledged and the source is definitely absent.
+        let scope = StorageIoScope::new();
+        let result: Result<()> = scope
+            .begin(Request::new(
+                "rename source delete",
+                &Path::from("source"),
+                false,
+            ))
+            .unwrap()
+            .finish(Err(object_store::Error::NotFound {
+                path: "source".into(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound).into(),
+            }));
+        assert!(matches!(result, Err(object_store::Error::NotFound { .. })));
+        assert!(
+            !scope.is_uncertain(),
+            "the missing source is a definite delete outcome"
+        );
     }
 
     async fn single_attempt_http(fail_status: Option<u16>) {

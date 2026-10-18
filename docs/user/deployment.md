@@ -99,9 +99,9 @@ and starts the same shutdown without renewing its deadline. Once HTTP connection
 and other known logical owners finish, it exits 2 immediately; the watchdog is
 the upper bound. Unresolved reservations stay charged until exit. This contains
 the process; it does not prove native I/O settled or the engine can be reused.
-A proven pre-effect failure, such as a failed initial schema read or a native-tag
-retirement refusal, or a write that fails after its detached effects and before
-its publication, keeps admission open; status or category alone proves nothing.
+A failure proven to leave the graph unchanged can keep admission open when its
+physical storage requests have also settled. Error status or category alone
+proves nothing; uncertain publication and unclassified failures still fail closed.
 A clean native shutdown exits 0. Set the orchestrator's own
 termination grace longer than this value; a cutoff is crash-equivalent for the
 work it interrupts, and the next open recovers it as after any crash.
