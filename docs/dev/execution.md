@@ -950,10 +950,12 @@ required first hop of the query. The execution report records each gate's
 verdict with the counts it read and each probe attempt per overfetch rung
 (`search` decisions), and a replay must record the same.
 
-Lance 13 still loses final KNN ordering metadata in one late payload-hydration
-shape, so OmniGraph requests one output partition for the affected nearest
-path. The compatibility guard is owned by `lance_surface_guards.rs` and
-`search.rs`; do not remove the fence based only on upstream release notes.
+Lance 13 V2 row-stream payload hydration preserves input order and the valid
+prefixes of its ordering metadata. `WorkMemory` uses that metadata for the final
+sorted merge, so nearest keeps parallel output on V2. Legacy V1 `TakeExec`
+still loses the metadata; nearest requests one output partition for that format.
+`lance_surface_guards.rs::flat_knn_late_payload_order_tracks_file_format` pins
+both paths, and `search.rs` owns the engine's complete ranked-result check.
 
 ## Mutations
 

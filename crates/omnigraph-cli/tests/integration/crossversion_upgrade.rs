@@ -2161,17 +2161,20 @@ query nullable_vectors() {
     let rows = |binary: &Path, selector: &str, value: &str, name: &str| {
         let params = match name {
             "vectors" => r#"{"q":[0.1,0.2,0.3,0.4]}"#,
-            "terms" => r#"{"term":"organism"}"#,
+            "terms" => r#"{"term":"ORGANISM"}"#,
             _ => "{}",
         };
-        support::parse_stdout_json(&run(
+        let response = support::parse_stdout_json(&run(
             binary,
             &[
                 "query", name, "--query", query_path, "--store", uri, selector, value, "--params",
                 params, "--json",
             ],
-        ))["rows"]
-            .clone()
+        ));
+        if name == "nullable_vectors" {
+            assert_eq!(response["columns"], json!(["v.name", "v.embedding"]));
+        }
+        response["rows"].clone()
     };
     let export = |binary: &Path, branch: &str| {
         canonical_export_rows(&run(binary, &["export", uri, "--branch", branch]).stdout)
@@ -2429,9 +2432,11 @@ query nullable_vectors() {
         rows(&current, "--branch", "main", "terms"),
         json!([{"d.slug":"ml-intro"}, {"d.slug":"new-doc"}, {"d.slug":"old-tail"}])
     );
+    // The JSON renderer omits null-valued keys; `rows` still asserts both
+    // projected column names so an omitted projection cannot satisfy this.
     assert_eq!(
         rows(&current, "--branch", "main", "nullable_vectors"),
-        json!([{"v.name":"new-null", "v.embedding":null}, {"v.name":"old-null", "v.embedding":null}])
+        json!([{"v.name":"new-null"}, {"v.name":"old-null"}])
     );
     let written_export = run(&current, &["export", uri]);
     for name in ["old-blob", "new-blob"] {

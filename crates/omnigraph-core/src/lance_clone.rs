@@ -228,6 +228,26 @@ fn fragment_reuse_range(
 struct ClonePreflightCommitHandler {
     inner: Arc<dyn CommitHandler>,
     reuse_main_source_location: bool,
+    normalize_local_discovery_etag: bool,
+}
+
+// Lance 13's direct local discovery still uses its unquoted inode-mtime-size
+// helper, while object_store 0.14 returns that same generation token quoted.
+// Normalize only this known native representation; opaque provider tokens and
+// missing or malformed tokens keep their exact meaning.
+fn normalize_local_discovery_etag(location: &mut ManifestLocation) {
+    let Some(tag) = location.e_tag.as_deref() else {
+        return;
+    };
+    let mut parts = tag.split('-');
+    if (0..3).all(|_| {
+        parts.next().is_some_and(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }) && parts.next().is_none()
+    {
+        location.e_tag = Some(format!("\"{tag}\""));
+    }
 }
 
 impl ClonePreflightCommitHandler {
@@ -265,6 +285,7 @@ pub fn wrap_commit_handler(inner: Arc<dyn CommitHandler>) -> Arc<dyn CommitHandl
     Arc::new(ClonePreflightCommitHandler {
         inner,
         reuse_main_source_location: false,
+        normalize_local_discovery_etag: false,
     })
 }
 
@@ -292,9 +313,14 @@ pub async fn configured_commit_handler(
                 | "goosefs"
         )
     });
+    let normalize_local_discovery_etag = url::Url::parse(uri).map_or(true, |url| {
+        matches!(url.scheme(), "file" | "file-object-store")
+            || (cfg!(windows) && url.scheme().len() == 1)
+    });
     Ok(Arc::new(ClonePreflightCommitHandler {
         inner: lance_table::io::commit::commit_handler_from_url(uri, params).await?,
         reuse_main_source_location,
+        normalize_local_discovery_etag,
     }))
 }
 
@@ -334,9 +360,14 @@ impl CommitHandler for ClonePreflightCommitHandler {
         base_path: &Path,
         object_store: &ObjectStore,
     ) -> Result<ManifestLocation> {
-        self.inner
+        let mut location = self
+            .inner
             .resolve_latest_location(base_path, object_store)
-            .await
+            .await?;
+        if self.normalize_local_discovery_etag && object_store.has_direct_local_paths() {
+            normalize_local_discovery_etag(&mut location);
+        }
+        Ok(location)
     }
 
     async fn resolve_version_location(
@@ -561,6 +592,21 @@ mod tests {
             Err(Error::io("configured retirement"))
         }
 
+        async fn resolve_latest_location(
+            &self,
+            base_path: &Path,
+            _object_store: &ObjectStore,
+        ) -> Result<ManifestLocation> {
+            Ok(ManifestLocation {
+                version: 7,
+                path: ManifestNamingScheme::V1.manifest_path(base_path, 7),
+                size: Some(128),
+                naming_scheme: ManifestNamingScheme::V1,
+                e_tag: Some("1a-2b-3c".to_string()),
+                identity: Some("configured latest".to_string()),
+            })
+        }
+
         async fn resolve_version_location(
             &self,
             _base_path: &Path,
@@ -584,6 +630,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_discovery_only_quotes_the_native_generation_token() {
+        for (before, after) in [
+            (None, None),
+            (Some(""), Some("")),
+            (Some("1a-2b-3c"), Some("\"1a-2b-3c\"")),
+            (Some("\"1a-2b-3c\""), Some("\"1a-2b-3c\"")),
+            (Some("W/\"1a-2b-3c\""), Some("W/\"1a-2b-3c\"")),
+            (Some("1a-2b"), Some("1a-2b")),
+            (Some("1a-2b-3c-4d"), Some("1a-2b-3c-4d")),
+            (Some("1a--3c"), Some("1a--3c")),
+            (Some("1a-2b-nothex"), Some("1a-2b-nothex")),
+        ] {
+            let mut location = ManifestLocation {
+                version: 7,
+                path: "dataset/_versions/7.manifest".into(),
+                size: Some(128),
+                naming_scheme: ManifestNamingScheme::V1,
+                e_tag: before.map(str::to_string),
+                identity: Some("retained record".to_string()),
+            };
+            let mut expected = location.clone();
+            expected.e_tag = after.map(str::to_string);
+            normalize_local_discovery_etag(&mut location);
+            assert_eq!(
+                (
+                    location.version,
+                    &location.path,
+                    location.size,
+                    location.naming_scheme,
+                    &location.e_tag,
+                    &location.identity,
+                ),
+                (
+                    expected.version,
+                    &expected.path,
+                    expected.size,
+                    expected.naming_scheme,
+                    &expected.e_tag,
+                    &expected.identity,
+                ),
+                "token={before:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn creation_preserves_configured_handler_session_and_failure_semantics() {
         let session = Arc::new(Session::default());
@@ -603,6 +695,21 @@ mod tests {
         assert!(!handler.propagate_commit_error_after_success());
         assert!(handler.supports_predecessor_condition());
         let path = Path::from("dataset");
+        // A custom local handler owns opaque tokens too: an ETag that happens
+        // to resemble the native representation must remain byte-identical.
+        let custom_local = configured_commit_handler(
+            "file:///configured",
+            &None,
+            Some(Arc::new(ConfiguredBackend)),
+        )
+        .await
+        .unwrap();
+        let location = custom_local
+            .resolve_latest_location(&path, &ObjectStore::local())
+            .await
+            .unwrap();
+        assert_eq!(location.e_tag.as_deref(), Some("1a-2b-3c"));
+        assert_eq!(location.identity.as_deref(), Some("configured latest"));
         let store = ObjectStore::from_uri("memory://delegation")
             .await
             .unwrap()
@@ -713,6 +820,23 @@ mod tests {
         let mut first = create_branch(&mut source, "first", version).await.unwrap();
         let version = first.version().version;
         let second = create_branch(&mut first, "second", version).await.unwrap();
+        for dataset in [&source, &first, &second] {
+            let store = dataset.object_store(None).await.unwrap();
+            let handler =
+                configured_commit_handler(dataset.uri(), &dataset.store_params().cloned(), None)
+                    .await
+                    .unwrap();
+            let discovered = handler
+                .resolve_latest_location(&dataset.branch_location().path, &store)
+                .await
+                .unwrap();
+            let object = store.inner.head(&discovered.path).await.unwrap();
+            assert_eq!(discovered.e_tag, object.e_tag);
+            assert_eq!(discovered.identity, dataset.manifest_location().identity);
+            if let Some(published) = dataset.manifest_location().e_tag.as_ref() {
+                assert_eq!(discovered.e_tag.as_ref(), Some(published));
+            }
+        }
         let index = second.load_indices().await.unwrap()[0].clone();
         assert_eq!(
             second.manifest().base_paths[&index.base_id.unwrap()].path,
@@ -744,6 +868,10 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use object_store::ObjectStoreExt;
     pub(crate) async fn fresh_dataset(uri: &str) -> Dataset {
+        fresh_dataset_with_stable_row_ids(uri, true).await
+    }
+
+    async fn fresh_dataset_with_stable_row_ids(uri: &str, stable_row_ids: bool) -> Dataset {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("value", DataType::Int32, false),
@@ -759,7 +887,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let params = WriteParams {
             mode: WriteMode::Create,
-            enable_stable_row_ids: true,
+            enable_stable_row_ids: stable_row_ids,
             data_storage_version: Some(LanceFileVersion::V2_2),
             ..Default::default()
         };
@@ -1216,7 +1344,11 @@ mod tests {
         offset: u64,
         size: u64,
     ) -> Dataset {
-        let mut source = fresh_dataset(uri).await;
+        // Legacy FRI translates row addresses. Stable IDs plus a BTree index
+        // are incompatible with it in Lance 13, even when the history is empty.
+        // Keep this native-format compatibility fixture on ordinary row addresses;
+        // production graph tables retain stable IDs and never enable deferred remap.
+        let mut source = fresh_dataset_with_stable_row_ids(uri, false).await;
         source
             .create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
             .replace(true)
@@ -1254,7 +1386,7 @@ mod tests {
             .put_opts(&path, payload.into(), object_store::PutOptions::default())
             .await
             .unwrap();
-        Dataset::commit(
+        let source = Dataset::commit(
             uri,
             lance::dataset::transaction::Operation::CreateIndex {
                 new_indices: vec![metadata],
@@ -1267,7 +1399,15 @@ mod tests {
             false,
         )
         .await
-        .unwrap()
+        .unwrap();
+        assert!(!source.manifest().uses_stable_row_ids());
+        assert_eq!(
+            (source.manifest().reader_feature_flags | source.manifest().writer_feature_flags)
+                & lance_table::feature_flags::FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+            0,
+            "the fixture must not depend on debug-only stable-ID fragment reuse"
+        );
+        source
     }
 
     #[tokio::test]

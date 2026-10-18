@@ -2066,16 +2066,18 @@ async fn public_physical_ref_token_rejects_local_same_version_aba() {
     recreate_named_branch_and_assert_token_changes(&mut second, true).await;
 }
 
-/// Exercise the production-shaped shared-Session case. "Stable" here means
-/// stable across an unchanged reopen: an ordinary commit must rotate the
-/// current transaction/e_tag witness while preserving the branch identifier.
+/// Exercise native shared-Session discovery. Lance 13 returns a quoted local
+/// ETag from commit and an unquoted one from direct local discovery. The clone
+/// adapter owns normalization; this guard pins the upstream discrepancy and
+/// still requires stable discovery across unchanged reopens. An ordinary
+/// commit must rotate the transaction/e_tag witness, not the branch identifier.
 /// Once the canonical first incarnation is cached, deleting and recreating
 /// main at the same URI/version must still resolve the second incarnation
 /// rather than reuse the cached transaction UUID. A fresh public DatasetBuilder
 /// open is the cache-bypass fallback and must agree with the shared-Session
 /// result.
 #[tokio::test]
-async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
+async fn local_physical_ref_token_survives_shared_session_aba_with_native_etag_quoting() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rfc024-shared-session-token.lance");
     let uri = path.to_str().unwrap();
@@ -2097,8 +2099,22 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
         .expect("the first local incarnation must reopen through the shared Session");
     let first_token = public_physical_ref_incarnation(&first).await;
     assert_eq!(
-        first_committed_token, first_token,
-        "the public token must be stable from the commit result through a shared-Session reopen"
+        first_committed_token.branch_identifier,
+        first_token.branch_identifier
+    );
+    assert_eq!(
+        first_committed_token.transaction_uuid,
+        first_token.transaction_uuid
+    );
+    let discovered_etag = first_token
+        .manifest_e_tag
+        .as_ref()
+        .expect("native local discovery must expose its metadata-derived ETag");
+    assert!(!discovered_etag.starts_with('"'));
+    assert_eq!(
+        first_committed_token.manifest_e_tag,
+        Some(format!("\"{discovered_etag}\"")),
+        "Lance's native local ETag quoting changed; re-audit the narrow clone-adapter normalization"
     );
 
     let first_again = DatasetBuilder::from_uri(uri)
@@ -4337,6 +4353,23 @@ async fn linear_vector_dataset(
     dimension: usize,
     rows_per_fragment: usize,
 ) -> Dataset {
+    linear_vector_dataset_with_format(
+        uri,
+        rows,
+        dimension,
+        rows_per_fragment,
+        LanceFileVersion::V2_2,
+    )
+    .await
+}
+
+async fn linear_vector_dataset_with_format(
+    uri: &str,
+    rows: usize,
+    dimension: usize,
+    rows_per_fragment: usize,
+    file_format: LanceFileVersion,
+) -> Dataset {
     use arrow_array::{FixedSizeListArray, Float32Array};
 
     let item = Arc::new(Field::new("item", DataType::Float32, true));
@@ -4374,7 +4407,7 @@ async fn linear_vector_dataset(
             mode: WriteMode::Create,
             enable_stable_row_ids: true,
             max_rows_per_file: rows_per_fragment,
-            data_storage_version: Some(LanceFileVersion::V2_2),
+            data_storage_version: Some(file_format),
             ..Default::default()
         }),
     )
@@ -4903,17 +4936,15 @@ async fn fts_prefilter_changes_unindexed_scores_and_postfilter_keeps_them() {
     );
 }
 
-// --- Guard: fence late-hydrated KNN ordering -----------------------------
+// --- Guard: late-hydrated KNN ordering by file format --------------------
 //
-// lance#7868 makes execute_plan preserve order when the plan still advertises
-// its sorted KNN candidate stream. An ordinary projected payload adds a late
-// `LanceRead` that still drops that metadata in Lance 13, so the parallel final
-// coalesce can still scramble large-k results. OmniGraph temporarily requests
-// one output partition for nearest scans. This full-payload stable-row-ID guard
-// pins both the residual and the fence's exact globally ordered result.
+// Lance 13 carries sorted KNN candidate metadata through V2 row-stream payload
+// hydration, so the final merge preserves global order with parallel output.
+// Legacy V1 TakeExec still drops that metadata and needs one output partition.
+// Pin both paths with full payloads, stable row IDs and multiple output batches.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn flat_knn_late_payload_order_is_fenced_to_one_output_partition() {
+async fn flat_knn_late_payload_order_tracks_file_format() {
     use arrow_array::types::{Float32Type, Int32Type};
     use datafusion::physical_plan::ExecutionPlanProperties;
 
@@ -4922,75 +4953,88 @@ async fn flat_knn_late_payload_order_is_fenced_to_one_output_partition() {
     const ROWS_PER_FRAGMENT: usize = 5_000;
     const K: usize = 8_193;
 
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().join("flat_knn_global_order.lance");
-    let uri = uri.to_str().unwrap();
-    let dataset = linear_vector_dataset(
-        uri,
-        FRAGMENTS * ROWS_PER_FRAGMENT,
-        DIMENSION,
-        ROWS_PER_FRAGMENT,
-    )
-    .await;
-    assert_eq!(
-        dataset.fragments().len(),
-        FRAGMENTS,
-        "the guard needs four independently scheduled scan partitions"
-    );
-    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+    for file_format in [LanceFileVersion::V2_2, LanceFileVersion::Legacy] {
+        let legacy = file_format == LanceFileVersion::Legacy;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("flat_knn_global_order.lance");
+        let uri = uri.to_str().unwrap();
+        let dataset = linear_vector_dataset_with_format(
+            uri,
+            FRAGMENTS * ROWS_PER_FRAGMENT,
+            DIMENSION,
+            ROWS_PER_FRAGMENT,
+            file_format,
+        )
+        .await;
+        assert_eq!(
+            dataset.fragments().len(),
+            FRAGMENTS,
+            "the guard needs four independently scheduled scan partitions"
+        );
+        let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
 
-    let mut unfenced = dataset.scan();
-    unfenced.nearest("vector", &query, K).unwrap();
-    unfenced.use_index(false);
-    unfenced.target_parallelism(8);
-    let unfenced_plan = unfenced.create_plan().await.unwrap();
-    assert!(
-        unfenced_plan.properties().partitioning.partition_count() > 1,
-        "the compatibility tripwire must exercise parallel late hydration"
-    );
-    assert!(
-        unfenced_plan.output_ordering().is_none(),
-        "Lance now preserves KNN ordering through late payload hydration; remove the \
-         target_parallelism(1) compatibility fence and replace this residual assertion"
-    );
-
-    let mut fenced_plan_scanner = dataset.scan();
-    fenced_plan_scanner.nearest("vector", &query, K).unwrap();
-    fenced_plan_scanner.use_index(false);
-    fenced_plan_scanner.target_parallelism(1);
-    let fenced_plan = fenced_plan_scanner.create_plan().await.unwrap();
-    assert_eq!(
-        fenced_plan.properties().partitioning.partition_count(),
-        1,
-        "the compatibility fence must leave no scheduling-ordered final coalesce"
-    );
-
-    // Keep repeated execution even behind the fence: a future optimizer may
-    // silently reintroduce partitions above the plan node asserted above.
-    for iteration in 0..10 {
-        let mut scanner = dataset.scan();
-        scanner.nearest("vector", &query, K).unwrap();
-        scanner.use_index(false);
-        scanner.target_parallelism(1);
-        let batch = scanner.try_into_batch().await.unwrap();
-        assert_eq!(batch.num_rows(), K, "iteration {iteration}");
-
-        let ids = batch["id"].as_primitive::<Int32Type>();
-        for position in 0..K {
+        let mut parallel = dataset.scan();
+        parallel.nearest("vector", &query, K).unwrap();
+        parallel.use_index(false);
+        parallel.target_parallelism(8);
+        let parallel_plan = parallel.create_plan().await.unwrap();
+        assert!(
+            parallel_plan.properties().partitioning.partition_count() > 1,
+            "{file_format:?}: the guard must exercise parallel late hydration"
+        );
+        if legacy {
+            assert!(
+                parallel_plan.output_ordering().is_none(),
+                "Lance now preserves legacy V1 KNN ordering through late payload hydration; \
+                 remove the remaining target_parallelism(1) compatibility fence"
+            );
+            parallel.target_parallelism(1);
+            let fenced_plan = parallel.create_plan().await.unwrap();
             assert_eq!(
-                ids.value(position),
-                position as i32,
-                "flat KNN lost exact global order at result {position}, iteration {iteration}"
+                fenced_plan.properties().partitioning.partition_count(),
+                1,
+                "legacy hydration needs no scheduling-ordered final coalesce"
+            );
+        } else {
+            assert!(
+                parallel_plan.output_ordering().is_some(),
+                "V2 late payload hydration must retain KNN ordering for the final merge"
             );
         }
-        let distances = batch["_distance"].as_primitive::<Float32Type>();
-        for pair in distances.values().windows(2) {
-            assert!(
-                pair[0] <= pair[1],
-                "flat KNN results must be globally sorted at iteration {iteration}: {} before {}",
-                pair[0],
-                pair[1]
+
+        // Repeated execution catches reordering across output batches, including
+        // optimizer changes above the plan node whose properties we checked.
+        for iteration in 0..10 {
+            let mut scanner = dataset.scan();
+            scanner.nearest("vector", &query, K).unwrap();
+            scanner.use_index(false);
+            scanner.target_parallelism(if legacy { 1 } else { 8 });
+            let batch = scanner.try_into_batch().await.unwrap();
+            assert_eq!(
+                batch.num_rows(),
+                K,
+                "{file_format:?}, iteration {iteration}"
             );
+
+            let ids = batch["id"].as_primitive::<Int32Type>();
+            for position in 0..K {
+                assert_eq!(
+                    ids.value(position),
+                    position as i32,
+                    "{file_format:?}: flat KNN lost exact global order at result {position}, \
+                     iteration {iteration}"
+                );
+            }
+            let distances = batch["_distance"].as_primitive::<Float32Type>();
+            for pair in distances.values().windows(2) {
+                assert!(
+                    pair[0] <= pair[1],
+                    "{file_format:?}: flat KNN results must be globally sorted at iteration \
+                     {iteration}: {} before {}",
+                    pair[0],
+                    pair[1]
+                );
+            }
         }
     }
 }
@@ -5603,8 +5647,13 @@ async fn indexed_update_only_route_leaves_rewritten_fragments_uncovered() {
         .iter()
         .map(|field| field.id as u32)
         .collect::<Vec<_>>();
+    let schema_preorder_fields = dataset
+        .schema()
+        .fields_pre_order()
+        .map(|field| field.id as u32)
+        .collect::<Vec<_>>();
     assert!(
-        dataset.schema().fields_pre_order().count() > top_level_fields.len(),
+        schema_preorder_fields.len() > top_level_fields.len(),
         "list property must contribute a nested field id"
     );
     let indices_before = dataset.load_indices().await.unwrap();
@@ -5671,7 +5720,9 @@ async fn indexed_update_only_route_leaves_rewritten_fragments_uncovered() {
     else {
         panic!("indexed update-only route must stage Operation::Update");
     };
-    assert_eq!(fields_for_preserving_frag_bitmap, &top_level_fields);
+    // Lance 13 includes nested field ids: omitting them could make a stale
+    // nested-field index falsely claim the rewritten fragment as covered.
+    assert_eq!(fields_for_preserving_frag_bitmap, &schema_preorder_fields);
     assert_eq!(
         update_mode,
         &Some(lance::dataset::transaction::UpdateMode::RewriteRows)

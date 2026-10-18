@@ -604,6 +604,15 @@ is available for GQT query and traversal workloads.
 
 Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; deterministic engine cost contracts remain in `crates/omnigraph/tests/`.
 
+The checkpoint and durable-head lookup instruments keep logical rows, ranges,
+fragments, and index pages exact while bounding local compacted physical I/O
+separately. Lance 13 batches page and column reads before nearby byte ranges
+coalesce; equal logical work can read fewer bytes through more physical ranges.
+Their local budgets cover the measured 20/80-publish samples. They do not qualify
+larger histories or the S3 path, and do not activate either proposed format.
+Re-audit those budgets on a substrate change instead of widening every counter
+or requiring an older byte-growth pattern to persist.
+
 ### DST storage-cost golden
 
 `crates/omnigraph-dst/cost_table.txt` records the exact object-store calls of

@@ -10,6 +10,7 @@ use arrow_schema::SchemaRef;
 use datafusion::prelude::{Expr, col, lit as df_lit};
 use datafusion::scalar::ScalarValue;
 use lance_core::ROW_ADDR;
+use lance_file::version::LanceFileVersion;
 use lance_index::scalar::FullTextSearchQuery;
 
 /// `id IN (ids)` as one structured DataFusion `Expr` — the scan-pushdown
@@ -409,7 +410,13 @@ pub(super) async fn execute_node_scan(
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                 Some(summary.clone());
                         }));
-                        scanner.target_parallelism(1);
+                        // V2 row-stream hydration retains the KNN ordering that
+                        // WorkMemory merges. Legacy TakeExec still drops it.
+                        if read.ds.manifest().data_storage_format.lance_file_format()
+                            == LanceFileVersion::Legacy.resolve()
+                        {
+                            scanner.target_parallelism(1);
+                        }
                     }
                     Ok(())
                 })
