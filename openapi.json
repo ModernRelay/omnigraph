@@ -12510,7 +12510,7 @@
       },
       "KeyConflictOutput": {
         "type": "object",
-        "description": "A strict insert rejected because `entity_id` already names an entity in the\nselected node or edge type. The refused rows wrote nothing; an earlier step\nof the same request, such as the branch a load forks, may already have\npublished, which the error's `outcome` states. Partial or ambiguous\nattempts surface `recovery_required` instead.",
+        "description": "A strict insert rejected because `entity_id` already names an entity in the\nselected node or edge type. The refused write changed nothing; an earlier\nstep of the same request, such as the branch a load forks, may already have\npublished, which the error's `outcome` states. Partial or ambiguous\nattempts surface `recovery_required` instead.",
         "required": [
           "entity_kind",
           "type_name"
