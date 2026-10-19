@@ -93,7 +93,8 @@ impl LocalBinding {
                 "a local server serves a root on this machine's file system, not {text}"
             )));
         }
-        let absolute = std::path::absolute(path)
+        // One spelling per directory: `..` folds before the root is stored.
+        let absolute = omnigraph::storage::absolutize_lexically(path.to_path_buf())
             .map_err(|error| LocalOpenError::Root(format!("{}: {error}", path.display())))?;
         let absolute = absolute.to_str().ok_or_else(|| {
             LocalOpenError::Root(format!("{} is not a UTF-8 path", absolute.display()))
@@ -913,6 +914,9 @@ mod tests {
             binding.root().ends_with("relative/graph.omni"),
             "{binding:?}"
         );
+        // One directory has one spelling: `.` and `..` fold away.
+        let folded = LocalBinding::local("/tmp/a/../b/./graph.omni").unwrap();
+        assert_eq!(folded.root(), "/tmp/b/graph.omni");
         for uri in [
             "s3://bucket/graph",
             "az://container/graph",
