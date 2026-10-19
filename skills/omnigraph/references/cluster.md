@@ -113,9 +113,11 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
   so re-spell the root or remove those bases.
 - **`--as <actor>` labels a direct `cluster apply` or `cluster upgrade-ledger`**
   (deployment record and engine commits where applicable). It defaults from
-  operator config's `operator.actor`. `cluster apply --server` refuses it,
-  because the server takes the actor from the bearer token; the other cluster
-  subcommands reject this flag.
+  operator config's `operator.actor`. With `--server`, `cluster plan` and
+  `cluster apply` take the actor from the bearer token and send `--as` as an
+  assertion the server checks: another actor is refused with `actor_mismatch`
+  and exit 4, before anything is submitted. The other cluster subcommands
+  reject this flag.
 - **Deployment scope**: apply creates graphs and updates schemas, queries,
   policies, provider definitions/bindings, and `external_blobs` rules. Removing
   a graph declaration deletes its exact managed root, including retained

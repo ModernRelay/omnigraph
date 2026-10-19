@@ -146,6 +146,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         let error = finish(
             result,
             Some(evidence),
+            None,
             Some(MachineErrors::Json),
             &mut stdout,
             &mut stderr,
@@ -178,6 +179,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         let completion = finish(
             result,
             Some(evidence),
+            None,
             Some(MachineErrors::Json),
             &mut stdout,
             &mut stderr,
@@ -208,7 +210,15 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
             fault: OutputFault::Flush,
             bytes: b"warning after committed write\n".to_vec(),
         };
-        let error = finish(result, Some(evidence), machine, &mut stdout, &mut stderr).unwrap_err();
+        let error = finish(
+            result,
+            Some(evidence),
+            None,
+            machine,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
         let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
         let failure = serde_json::to_value(&undelivered.failure).unwrap();
         assert_eq!(
@@ -228,7 +238,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         fault: OutputFault::Flush,
         bytes: Vec::new(),
     };
-    let error = finish(result, Some(evidence), None, &mut stdout, &mut stderr).unwrap_err();
+    let error = finish(result, Some(evidence), None, None, &mut stdout, &mut stderr).unwrap_err();
     let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
     let failure = serde_json::to_value(&undelivered.failure).unwrap();
     assert_eq!(failure["error"], "response lost after dispatch");
@@ -291,7 +301,8 @@ async fn delivered_refusals_keep_their_exit_status_when_unused_stdout_cannot_flu
             bytes: Vec::new(),
         };
         let mut stderr = Vec::new();
-        let completion = finish(result, Some(evidence), None, &mut stdout, &mut stderr).unwrap();
+        let completion =
+            finish(result, Some(evidence), None, None, &mut stdout, &mut stderr).unwrap();
         assert_eq!(completion.code(), expected);
         assert!(stdout.bytes.is_empty());
         let diagnostic = String::from_utf8(stderr).unwrap();
@@ -318,7 +329,7 @@ fn handled_nonzero_completions_do_not_flush_an_unrelated_or_failed_stream() {
                 (&mut unused, &mut delivered)
             };
             let completion =
-                finish(Ok(Completion::exit(code)), None, None, stdout, stderr).unwrap();
+                finish(Ok(Completion::exit(code)), None, None, None, stdout, stderr).unwrap();
             assert_eq!(completion.code(), code);
             assert_eq!(delivered, b"already delivered and flushed\n");
             assert!(unused.bytes.is_empty());
@@ -587,6 +598,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                 let completed = finish(
                     result,
                     Some(evidence),
+                    None,
                     json.then_some(MachineErrors::Json),
                     &mut stdout,
                     &mut stderr,
@@ -680,6 +692,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
     let completion = finish(
         result,
         Some(evidence),
+        None,
         Some(MachineErrors::Json),
         &mut stdout,
         &mut stderr,
@@ -755,6 +768,7 @@ async fn transfer_reads_use_the_supplied_sink_and_propagate_delivery_errors() {
             let mut stderr = Vec::new();
             let error = finish(
                 result.map(|()| Completion::success()),
+                None,
                 None,
                 None,
                 &mut stdout,
@@ -869,6 +883,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
             let completed = finish(
                 result,
                 Some(evidence),
+                None,
                 json.then_some(MachineErrors::Json),
                 &mut stdout,
                 &mut stderr,
@@ -953,6 +968,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
         finish(
             result,
             Some(evidence),
+            None,
             Some(MachineErrors::Json),
             &mut stdout,
             &mut stderr
@@ -1007,6 +1023,7 @@ async fn init_output_failure_preserves_the_initialized_graph() {
         .await;
         let error = finish(
             result.map(|()| Completion::success()),
+            None,
             None,
             None,
             &mut stdout,
@@ -1135,6 +1152,7 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
             assert_eq!(result.is_ok(), matches!(fault, OutputFault::Flush));
             let error = finish(
                 result.map(|()| Completion::success()),
+                None,
                 None,
                 json.then_some(MachineErrors::Json),
                 &mut stdout,

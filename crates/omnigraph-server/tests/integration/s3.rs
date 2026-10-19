@@ -259,8 +259,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
 
     // A missing object beneath that same admitted base is a dependency
     // failure, not a policy refusal or generic server error. The response
-    // carries the normalized, credential-free URI without extending the
-    // closed ErrorCode enum.
+    // carries its own code and the normalized, credential-free URI.
     let missing_input_uri = format!("{external_blob_base}/missing%7Easset.bin");
     let normalized_missing_uri = format!("{external_blob_base}/missing~asset.bin");
     let missing = IngestRequest {
@@ -292,9 +291,14 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         StatusCode::FAILED_DEPENDENCY,
         "missing allowed source must be HTTP 424, not a generic 500: {missing_body}"
     );
-    assert!(
-        missing_body.get("code").is_none(),
-        "the closed ErrorCode enum must remain absent: {missing_body}"
+    assert_eq!(
+        missing_body["code"], "external_blob_source",
+        "{missing_body}"
+    );
+    assert_eq!(
+        missing_body["outcome"],
+        json!({"execution": "not_started", "effects": "none", "action": "refresh"}),
+        "an unreadable source refuses the load before its publication: {missing_body}"
     );
     assert_eq!(
         missing_body["external_blob_source"]["uri"], normalized_missing_uri,

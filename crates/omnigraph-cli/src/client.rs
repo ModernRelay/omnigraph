@@ -1348,12 +1348,21 @@ impl GraphClient {
             GraphClient::Embedded { uri, actor } => {
                 refuse_noncanonical_branches([Some(branch), from])?;
                 let data = std::fs::read_to_string(data)?;
-                if from.is_some() {
-                    // A missing branch is forked first, which publishes on
-                    // its own.
+                let session = Self::open_write_session(uri, settings, stderr).await?;
+                // A missing branch is forked first, which publishes on its
+                // own, so a later refusal follows an effect. Read the branch
+                // list as the server's load does, so the two report alike.
+                if from.is_some()
+                    && !session
+                        .db()
+                        .branch_list()
+                        .await
+                        .engine_write()?
+                        .iter()
+                        .any(|name| name == branch)
+                {
                     crate::command_outcome::compound();
                 }
-                let session = Self::open_write_session(uri, settings, stderr).await?;
                 let receipt = session
                     .load_graph_batch_as_with_receipt(
                         branch,

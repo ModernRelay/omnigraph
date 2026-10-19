@@ -1,11 +1,13 @@
 # Troubleshooting
 
 CLI failures include a human-readable message. Add `--json` where supported to
-receive structured fields suitable for automation. Application-generated HTTP
-errors use a JSON body with `error`, an optional broad `code`, and optional
-details for conflicts, limits, Blob ranges, external sources, or recovery.
-Router, method, media-type, malformed-body, and extractor rejections may be
-plain responses, including 404, 405, 415, or 422.
+receive structured fields suitable for automation. Every HTTP error the server
+answers, an unknown route, a method the route does not serve and a malformed
+body, query string or path parameter included, uses a JSON body with `error`,
+`code`, `outcome` and optional details for conflicts, limits, Blob ranges,
+external sources, or recovery. A malformed request is `400`, a body without a
+JSON content type `415`. MCP tool calls report errors in their own result shapes
+([MCP](mcp.md#results-and-errors)).
 
 Do not parse human-readable error text when a structured field is present.
 
@@ -67,18 +69,24 @@ the same way. See [Diagnostics](../queries/diagnostics.md).
 ## Failed data-write commands
 
 Every server error body, and every CLI data-write and read failure, carries an `outcome`:
-`execution` is `not_started` or `unknown`, `effects` is `none` or `unknown`, and
-`action` is `retry`, `refresh`, `recover` or `reconcile`. The server states it
-for the request it answered: only a write whose completion it could not settle
-is `unknown`, with `code: outcome_unknown`; a refusal, a lost conflict or a read
-failure is `not_started`, except a refusal after a load forked its branch, which
-is `unknown` with `refresh`. The CLI reports the server's outcome when that request
-was the command's only effectful one, and otherwise its own account of the whole
-command, so a lost response is `unknown` with `reconcile`. A read command changes
-nothing, so its failure is always `not_started` with `effects: none`. JSON mode
-writes the failure to stdout; human mode prints the `outcome` line on stderr.
-HTTP failures also retain `http_status` and, when present, the original
-`retry_after` string.
+`execution` is `not_started` or `unknown`, `effects` is `none` or `unknown` to
+match, and `action` is `retry`, `refresh`, `recover` or `reconcile`. The server
+decides it for the request it answered by the first row that matches:
+
+| Error | `execution` | `action` |
+|---|---|---|
+| Any error before the request submitted a write | `not_started` | `recover` for a recovery intent or index rebuild; `retry` for `429` or `503`; else `refresh` |
+| A write whose completion the server could not settle; `code` becomes `outcome_unknown` unless the action is `recover` | `unknown` | `reconcile`, or `recover` |
+| A refusal after an earlier step of the write published, such as a load that forked its missing branch; `code` is kept | `unknown` | `refresh` |
+| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), or a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a resource limit, an external Blob source, a query diagnostic) | `not_started` | `retry` for `429`, else `refresh` |
+| Any other error after a write, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
+
+The CLI reports the server's outcome when that request was the command's only
+effectful one, and otherwise its own account of the whole command, so a lost
+response is `unknown` with `reconcile`. A read command changes nothing, so its
+failure is always `not_started` with `effects: none`. JSON mode writes the
+failure to stdout; human mode prints the `outcome` line on stderr. HTTP failures also retain
+`http_status` and, when present, the original `retry_after` string.
 
 This includes `commit publish` and `commit drop`, as well as their `mutate`
 statement forms. If a response or result output is lost, inspect the commit's
@@ -88,7 +96,9 @@ output pipe or failed result flush can follow a successful write. The CLI exits 
 and does not repeat the operation. If stdout cannot carry a JSON failure, stderr
 reports the undelivered diagnostic and its outcome, and the exit still follows it.
 
-The exit follows from the outcome:
+For the data commands the CLI classifies (queries, reads, `load`, `mutate`,
+branch, commit, schema and Blob commands, aliases and target commands), the
+exit follows from the outcome:
 
 | CLI exit | What to do |
 |---:|---|
@@ -97,7 +107,12 @@ The exit follows from the outcome:
 | 2 | `unknown`: the command may have had effects. Reconcile or recover as `action` says before another attempt; a conflict, resource limit, incomplete response or lost connection does not by itself permit repeating the write. |
 | 4 | A condition you set did not hold, with no earlier command effects: a verified write precondition or an `--as` assertion. Re-read the branch and choose a new precondition deliberately. |
 | 75 | `not_started` with `retry`: the server refused before starting, as when the actor is busy. Honor `Retry-After` and bound any caller retry. |
-| 64 | The command line was refused before anything ran (`EX_USAGE`). |
+| 64 | The argument parser refused the command line before anything ran (`EX_USAGE`); an addressing refusal inside a command, such as two scope flags, exits 1. |
+
+Maintenance commands (`init`, `upgrade`, `optimize`, `rebuild-full-text-indexes`,
+`repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy` and the
+managed commands keep their own exits for now: their exit 1 does not by itself
+say that nothing changed, so read their report.
 
 A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
 `api_contract_mismatch` exits 1 with `execution: not_started`, `effects: none`
@@ -120,8 +135,10 @@ CLI performs no automatic retry.
 
 The outcome covers the entire command. A later refused subrequest cannot undo
 an earlier branch creation, load or publication. An embedded write's own
-refusal says what the engine did, as a server's does, so embedded and served
-commands exit alike; any later failure, such as rendering a committed receipt,
+refusal says what the engine did, projected as a server would project it: a
+policy refusal precedes every publication, a `load --from` fork included, and
+another refusal after that fork is `unknown`. Embedded and served commands
+therefore exit alike; any later failure, such as rendering a committed receipt,
 stays `unknown`.
 Disconnecting an admitted HTTP write does not cancel it: the server keeps
 running the original operation, and a lost response can leave the caller's

@@ -11,7 +11,10 @@ use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::{Content, Ref, RefOr};
 
 use crate::ApiError;
-use crate::api::{EXPECT_ACTOR_HEADER, ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
+use crate::api::{
+    EXPECT_ACTOR_ASSERTION, EXPECT_ACTOR_HEADER, ErrorCode, HTTP_API_ASSERTIONS_HEADER,
+    HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER,
+};
 
 fn mismatch_message() -> String {
     format!(
@@ -27,8 +30,9 @@ pub(crate) async fn require_contract(request: Request, next: Next) -> Result<Res
         return Err(ApiError {
             completion_uncertain: false,
             owned_write: false,
+            compound: false,
             status: StatusCode::BAD_REQUEST,
-            code: Some(ErrorCode::ApiContractMismatch),
+            code: ErrorCode::ApiContractMismatch,
             message: mismatch_message().into_boxed_str(),
             details: None,
         });
@@ -46,6 +50,10 @@ pub(crate) async fn identify_response(request: Request, next: Next) -> Response 
     response.headers_mut().insert(
         HTTP_API_CONTRACT_HEADER,
         HeaderValue::from_static(HTTP_API_CONTRACT),
+    );
+    response.headers_mut().insert(
+        HTTP_API_ASSERTIONS_HEADER,
+        HeaderValue::from_static(EXPECT_ACTOR_ASSERTION),
     );
     if discovery {
         response.headers_mut().insert(
@@ -196,6 +204,15 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     response
                         .headers
                         .insert(HTTP_API_CONTRACT_HEADER.into(), header);
+                    let mut assertions = Object::with_type(Type::String);
+                    assertions.enum_values = Some(vec![EXPECT_ACTOR_ASSERTION.into()]);
+                    let mut header = Header::new(assertions);
+                    header.description = Some(format!(
+                        "The request assertions this server enforces; a client sends {EXPECT_ACTOR_HEADER} only when this lists {EXPECT_ACTOR_ASSERTION}."
+                    ));
+                    response
+                        .headers
+                        .insert(HTTP_API_ASSERTIONS_HEADER.into(), header);
                     if path == "/healthz" {
                         let mut cache_schema = Object::with_type(Type::String);
                         cache_schema.enum_values = Some(vec!["no-store".into()]);
