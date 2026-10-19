@@ -9677,7 +9677,7 @@
             "items": {
               "$ref": "#/components/schemas/AccessAction"
             },
-            "description": "Actions allowed whatever the branch: the graph-scoped ones, and the\nbranch-scoped ones a rule allows on every branch."
+            "description": "Actions allowed with no branch named: the graph-scoped ones, and the\nbranch-scoped ones a single rule allows on every branch (a rule with no\nbranch scope, `branch_scope: any` or `target_branch_scope: any`).\nRules that cover every branch only together, one for protected\nbranches and one for the rest, allow each named branch but leave the\naction out of this list; read `actions` for a branch."
           },
           "target_branch": {
             "type": [

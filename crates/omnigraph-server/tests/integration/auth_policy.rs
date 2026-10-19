@@ -369,6 +369,13 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         StatusCode::FORBIDDEN,
         "JWT must not inherit static no-policy read default"
     );
+    // The access route says the same: the credential resolves, and allows
+    // nothing with no branch named or on `main`.
+    let (status, body) = json_response(&app, get_request(&g("/access?branch=main"), &token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["actor"].is_string(), "{body}");
+    assert_eq!(body["graph_wide"], json!([]), "{body}");
+    assert_eq!(body["actions"], json!([]), "{body}");
     let (status, _) = json_response(
         &app,
         get_request(&g("/snapshot?branch=main"), "static-token"),
@@ -448,6 +455,7 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         (Method::GET, "/branches/merge-base"),
         (Method::GET, "/changes"),
         (Method::POST, "/changes/baseline"),
+        (Method::GET, "/access"),
     ] {
         for rejected in ["invalid.jwt.signature", &retired] {
             let response = app

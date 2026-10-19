@@ -1862,8 +1862,12 @@ pub struct AccessOutput {
     /// without authentication.
     pub actor: Option<String>,
     pub graph_id: String,
-    /// Actions allowed whatever the branch: the graph-scoped ones, and the
-    /// branch-scoped ones a rule allows on every branch.
+    /// Actions allowed with no branch named: the graph-scoped ones, and the
+    /// branch-scoped ones a single rule allows on every branch (a rule with no
+    /// branch scope, `branch_scope: any` or `target_branch_scope: any`).
+    /// Rules that cover every branch only together, one for protected
+    /// branches and one for the rest, allow each named branch but leave the
+    /// action out of this list; read `actions` for a branch.
     pub graph_wide: Vec<AccessAction>,
     /// The branch asked about, when one was.
     pub branch: Option<String>,
