@@ -143,8 +143,21 @@ enum CreateStart {
     Commit(GraphCommit),
 }
 
-/// Table versions a commit start probes at once to prove they are retained.
-const BRANCH_START_RETENTION_OPENS: usize = 8;
+/// Table versions a commit start opens at once, and objects it probes at
+/// once, to prove the commit is retained.
+const BRANCH_START_RETENTION_PROBES: usize = 8;
+
+/// A start at `commit_id` refused because cleanup reclaimed the version of
+/// `entry` the commit pins.
+fn branch_start_not_retained(commit_id: &str, entry: &crate::db::DatasetEntry) -> OmniError {
+    OmniError::branch_start_refused(
+        commit_id,
+        BranchStartRefusal::NotRetained {
+            table_key: entry.type_key.clone(),
+            published_dataset_version: entry.published_dataset_version,
+        },
+    )
+}
 
 /// A merge's disposition and the graph commit published by that invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3839,10 +3852,21 @@ impl Omnigraph {
         self.ensure_schema_state_valid()
             .await
             .map_err(OmniError::before_effect)?;
-        let mut source_coord = self
-            .capture_branch_control_source(branch.as_deref())
-            .await
-            .map_err(OmniError::before_effect)?;
+        let (mut source_coord, start_record) = match &start {
+            CreateStart::Head(_) => (
+                self.capture_branch_control_source(branch.as_deref())
+                    .await
+                    .map_err(OmniError::before_effect)?,
+                None,
+            ),
+            CreateStart::Commit(commit) => {
+                let (source, record) =
+                    Box::pin(self.capture_commit_start_source(branch.as_deref(), commit))
+                        .await
+                        .map_err(OmniError::before_effect)?;
+                (source, Some(record))
+            }
+        };
         let (_control_catalog, _table_guards) = self
             .join_control_catalog_to_capture(
                 control_catalog,
@@ -3857,14 +3881,13 @@ impl Omnigraph {
         // A locally owned source coordinator cannot be swapped by a concurrent
         // `branch_create_from`; the ref write is durable whichever handle
         // issued it.
-        let created = match start {
-            CreateStart::Head(from) => BranchCreated {
+        let created = match (start, start_record) {
+            (CreateStart::Head(from), _) => BranchCreated {
                 from_commit_id: source_coord.branch_create(&target_branch).await?,
                 from,
             },
-            CreateStart::Commit(commit) => {
-                let record = self
-                    .commit_start_record(&source_coord, &commit.graph_commit_id)
+            (CreateStart::Commit(commit), Some(record)) => {
+                self.prove_commit_start(&source_coord, &record)
                     .await
                     .map_err(OmniError::before_effect)?;
                 source_coord
@@ -3875,34 +3898,65 @@ impl Omnigraph {
                     from_commit_id: commit.graph_commit_id,
                 }
             }
+            (CreateStart::Commit(_), None) => {
+                unreachable!("a commit start captures the commit's record with its source")
+            }
         };
         self.invalidate_read_caches().await;
         Ok(created)
     }
 
-    /// The record a branch starts from at `commit_id`, proved under the
-    /// control gates from the captured `source`: the captured incarnation
-    /// wrote the commit, at or below the captured head; the commit's schema
-    /// is the accepted one; and every table version its snapshot pins still
-    /// opens with every object it references, so the new branch's first
-    /// manifest names a complete snapshot that its base keeps from cleanup
-    /// from then on.
-    async fn commit_start_record(
+    /// The source a branch starting at the published `commit` clones, and
+    /// the commit's record read from it, captured under the control gates.
+    /// The branch incarnation that wrote the commit must still be the live
+    /// one under its name. A deleted name and a name created again since
+    /// are the same fact, so both answer `BranchDeleted`, before any effect
+    /// and on every door.
+    async fn capture_commit_start_source(
+        &self,
+        branch: Option<&str>,
+        commit: &GraphCommit,
+    ) -> Result<(GraphCoordinator, super::manifest::HistoryRecord)> {
+        let commit_id = commit.graph_commit_id.as_str();
+        let deleted = || {
+            OmniError::branch_start_refused(
+                commit_id,
+                BranchStartRefusal::BranchDeleted {
+                    branch: commit
+                        .graph_branch
+                        .clone()
+                        .unwrap_or_else(|| "main".to_string()),
+                },
+            )
+        };
+        let source = match self.capture_branch_control_source(branch).await {
+            Err(OmniError::BranchNotFound { .. }) => return Err(deleted()),
+            captured => captured?,
+        };
+        match source.published_record(commit_id).await? {
+            Some(record) if record.commit.native_branch.as_deref() == source.native_branch() => {
+                Ok((source, record))
+            }
+            Some(_) => Err(deleted()),
+            // Addressed as published, its record is held by no live
+            // incarnation of its branch now: that branch was deleted.
+            None if commit.graph_branch.is_some() => Err(deleted()),
+            None => Err(commit_not_found(&SnapshotId::new(commit_id))),
+        }
+    }
+
+    /// Prove under the control gates that a branch can start at `record`,
+    /// which the captured `source` wrote: the commit is at or below the
+    /// captured head; its schema is the accepted one; and every table
+    /// version its snapshot pins still opens with every object it
+    /// references, so the new branch's first manifest names a complete
+    /// snapshot that its base keeps from cleanup from then on.
+    async fn prove_commit_start(
         &self,
         source: &GraphCoordinator,
-        commit_id: &str,
-    ) -> Result<super::manifest::HistoryRecord> {
-        let record = source
-            .published_record(commit_id)
-            .await?
-            .ok_or_else(|| commit_not_found(&SnapshotId::new(commit_id)))?;
-        if record.commit.native_branch.as_deref() != source.native_branch() {
-            return Err(OmniError::manifest(format!(
-                "commit '{commit_id}' has no persisted native-branch incarnation witness: branch \
-                 '{}' was deleted and recreated after the commit was written",
-                record.commit.graph_branch.as_deref().unwrap_or("main")
-            )));
-        }
+        record: &super::manifest::HistoryRecord,
+    ) -> Result<()> {
+        let commit_id = record.commit.graph_commit_id.as_str();
         if record.commit.graph_manifest_version > source.version() {
             return Err(OmniError::manifest_internal(format!(
                 "commit '{commit_id}' names `__manifest` version {} above the captured head \
@@ -3912,13 +3966,14 @@ impl Omnigraph {
             )));
         }
         let snapshot = Snapshot::wrap(record.snapshot(self.root_uri())?);
-        // Every commit of a format this build writes records its contract;
-        // one that records none predates it.
+        // Every record carries the contract its commit was written under:
+        // the storage upgrade gives each converted commit one too. A commit
+        // from before the upgrade is refused where its `__manifest` version
+        // is cloned, which only the legacy history reads.
         let Some(contract) = snapshot.schema_contract() else {
-            return Err(OmniError::branch_start_refused(
-                commit_id,
-                BranchStartRefusal::EarlierStorageFormat,
-            ));
+            return Err(OmniError::manifest_internal(format!(
+                "the record of commit '{commit_id}' carries no schema contract"
+            )));
         };
         if Some(contract) != source.snapshot().schema_contract() {
             return Err(OmniError::branch_start_refused(
@@ -3931,48 +3986,53 @@ impl Omnigraph {
         // be a version an interrupted cleanup already emptied: its sweep
         // deletes a version's files before its manifest, so the manifest
         // opening proves nothing about them, and each object it references
-        // is probed.
+        // is probed. These requests run under the exclusive schema permit,
+        // which every write in the process waits on, so the pins open and
+        // their objects are probed with bounded concurrency, stopping at the
+        // first missing object.
         use futures::StreamExt;
         let head = source.snapshot();
-        let entries: Vec<_> = snapshot
+        let entries: std::collections::BTreeMap<_, _> = snapshot
             .datasets()
             .filter(|entry| {
                 !head
                     .datasets()
                     .any(|held| held.same_physical_version(entry))
             })
-            .cloned()
+            .map(|entry| (entry.type_key.clone(), entry.clone()))
             .collect();
-        let mut probes = futures::stream::iter(entries)
+        let mut opens = futures::stream::iter(entries.values().cloned())
             .map(|entry| async move {
-                let not_retained = || {
-                    OmniError::branch_start_refused(
-                        commit_id,
-                        BranchStartRefusal::NotRetained {
-                            table_key: entry.type_key.clone(),
-                            published_dataset_version: entry.published_dataset_version,
-                        },
-                    )
-                };
                 let dataset = match self.table_store.open_at_entry(&entry).await {
                     Ok(dataset) => dataset,
                     Err(OmniError::HistoricalVersionReclaimed { .. }) => {
-                        return Err(not_retained());
+                        return Err(branch_start_not_retained(commit_id, &entry));
                     }
                     Err(error) => return Err(error),
                 };
                 let mut objects = collector::CollectorPathSnapshot::default();
                 collector::capture_dataset_paths(&mut objects, &dataset, &entry.type_key).await?;
-                match objects.missing_paths().await?.is_empty() {
-                    true => Ok(()),
-                    false => Err(not_retained()),
-                }
+                Ok(objects)
             })
-            .buffer_unordered(BRANCH_START_RETENTION_OPENS);
-        while let Some(probed) = probes.next().await {
-            probed?;
+            .buffer_unordered(BRANCH_START_RETENTION_PROBES);
+        let mut objects = collector::CollectorPathSnapshot::default();
+        while let Some(opened) = opens.next().await {
+            objects.absorb(opened?);
         }
-        Ok(record)
+        match objects
+            .first_missing_location(BRANCH_START_RETENTION_PROBES)
+            .await?
+        {
+            None => Ok(()),
+            Some(type_key) => Err(branch_start_not_retained(
+                commit_id,
+                entries.get(&type_key).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "a branch start probe reported '{type_key}', which no probed pin names"
+                    ))
+                })?,
+            )),
+        }
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {

@@ -1109,7 +1109,10 @@ pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) 
             name,
             from_commit_id,
         }) => {
-            writeln!(writer, "created branch {name} from {from} at {from_commit_id}")?;
+            writeln!(
+                writer,
+                "created branch {name} from {from} at {from_commit_id}"
+            )?;
         }
         Some(BranchOutcomeOutput::Deleted { name }) => writeln!(writer, "deleted branch {name}")?,
         Some(BranchOutcomeOutput::Merged {

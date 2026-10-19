@@ -2076,6 +2076,9 @@ pub enum BranchStartRefusalReason {
     SchemaChanged,
     /// HTTP 409: the commit was written before the storage upgrade.
     EarlierStorageFormat,
+    /// HTTP 409: the branch that wrote the commit was deleted, and may have
+    /// been created again under the same name since.
+    BranchDeleted,
     /// HTTP 409: the commit is unpublished; publish it first.
     UnpublishedCommit,
     /// HTTP 409: the commit is an unattached snapshot, never branch history.
@@ -2094,6 +2097,9 @@ pub struct BranchStartRefusalOutput {
     /// For `not_retained`, the graph type whose stored version cleanup reclaimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_name: Option<String>,
+    /// For `branch_deleted`, the branch that wrote the commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// A selected full-text index cannot safely serve the current analyzer (HTTP 409).

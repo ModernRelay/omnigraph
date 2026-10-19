@@ -166,8 +166,8 @@ omnigraph branch create fix/import --from-commit <commit-id> --store graph.omni
 
 The statement is `branch create "fix/import" from commit "<commit-id>"`, and
 `POST /branches` takes the id in `from_commit`, which excludes `from` (a
-request with both answers `400`). An id no commit has answers `404`, as does a
-commit of a branch that was deleted. The receipt names the branch the new
+request with both answers `400`). An id no commit has answers `404`. The
+receipt names the branch the new
 branch was forked off in `from`, for a commit start the branch that wrote the
 commit, and the commit it starts at in `from_commit_id`. Every receipt carries
 `from_commit_id`: for a start from a branch it is that branch's head when the
@@ -179,6 +179,7 @@ still there under the graph's current schema; otherwise nothing is created:
 | A commit whose table versions `cleanup` reclaimed, wholly or in a run that stopped part way | `410` | `not_retained`, with the type in `type_name` |
 | A commit written under an earlier schema than the graph's | `409` | `schema_changed` |
 | A commit written before the storage upgrade | `409` | `earlier_storage_format` |
+| A commit of a branch that was deleted, even if a branch has since been created under its name | `409` | `branch_deleted`, with the branch in `branch` |
 | An [unpublished commit](#unpublished-commits) | `409` | `unpublished_commit`; publish it, then start at the published commit |
 | An [unattached snapshot](#unattached-branches) | `409` | `unattached_snapshot`; it never becomes branch history |
 

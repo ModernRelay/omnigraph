@@ -178,6 +178,9 @@ pub enum BranchStartRefusal {
     /// The commit's `__manifest` version predates the storage upgrade; this
     /// build reads it only through the legacy history.
     EarlierStorageFormat,
+    /// The branch incarnation that wrote the commit was deleted: its name
+    /// names no branch now, or a later branch created under the same name.
+    BranchDeleted { branch: String },
     /// The commit is an unpublished proposal, which belongs to no branch's
     /// history until it is published.
     UnpublishedCommit,
@@ -202,6 +205,10 @@ fn format_branch_start_refusal(graph_commit_id: &str, reason: &BranchStartRefusa
         BranchStartRefusal::EarlierStorageFormat => "it was written before the storage upgrade; \
              start the branch at a commit written after it"
             .to_string(),
+        BranchStartRefusal::BranchDeleted { branch } => format!(
+            "branch '{branch}', which wrote it, was deleted; start the branch at a commit of a \
+             live branch"
+        ),
         BranchStartRefusal::UnpublishedCommit => "it is an unpublished commit; publish it with \
              `commit publish` and start the branch at the published commit"
             .to_string(),

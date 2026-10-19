@@ -1416,6 +1416,7 @@ fn error_output_schema_has_expected_fields() {
             "not_retained",
             "schema_changed",
             "earlier_storage_format",
+            "branch_deleted",
             "unpublished_commit",
             "unattached_snapshot",
             "unknown"

@@ -2898,23 +2898,9 @@ async fn branch_create_body(
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
     owned_write(state, admission, ingress, handle.clone(), async move {
         engine
-            .branch_create_from_as(start.clone(), &name, actor_id.as_deref())
+            .branch_create_from_as(start, &name, actor_id.as_deref())
             .await
-            .map_err(|error| {
-                let (error, evidence) = error.into_completion_evidence();
-                let error = match (error, &start) {
-                    // The branch that wrote the commit is gone: the commit is
-                    // not found, never the branch its record names.
-                    (OmniError::BranchNotFound { .. }, ReadTarget::Snapshot(commit_id)) => {
-                        OmniError::manifest_not_found(format!("commit '{commit_id}' not found"))
-                    }
-                    (error, _) => error,
-                };
-                ApiError::from_omni(match evidence {
-                    Some(evidence) => error.with_completion_evidence(evidence),
-                    None => error,
-                })
-            })
+            .map_err(ApiError::from_omni)
     })
     .await
 }

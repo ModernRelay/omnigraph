@@ -3449,8 +3449,9 @@ async fn branch_create_at_a_named_branch_commit_reads_that_branch_version() {
 
 /// What is not branch history is refused before any effect, never
 /// approximated: an unknown id, an unpublished commit, an unattached
-/// snapshot, a commit of a deleted branch, and a commit written under an
-/// earlier schema. No refusal creates a branch or moves main.
+/// snapshot, a commit of a deleted branch (one answer whether its name
+/// names nothing or a branch created again since), and a commit written
+/// under an earlier schema. No refusal creates a branch or moves main.
 #[tokio::test]
 async fn branch_create_at_a_commit_refuses_what_is_not_branch_history() {
     let dir = tempfile::tempdir().unwrap();
@@ -3538,16 +3539,27 @@ query park($name: String, $age: I32) as unattached branch {
         unwrapped(db.branch_create_from(at_commit(&unknown), "b3").await),
         OmniError::Manifest(error) if error.kind == ManifestErrorKind::NotFound
     ));
-    assert!(
-        matches!(
-            unwrapped(
-                db.branch_create_from(at_commit(&on_gone.graph_commit_id), "b4")
-                    .await
-            ),
-            OmniError::BranchNotFound { branch } if branch == "gone"
+    let deleted = BranchStartRefusal::BranchDeleted {
+        branch: "gone".to_string(),
+    };
+    assert_eq!(
+        refusal(
+            db.branch_create_from(at_commit(&on_gone.graph_commit_id), "b4")
+                .await
         ),
-        "a commit whose branch was deleted is not readable, so no branch starts there"
+        deleted,
+        "the branch that wrote the commit is gone"
     );
+    db.branch_create("gone").await.unwrap();
+    assert_eq!(
+        refusal(
+            db.branch_create_from(at_commit(&on_gone.graph_commit_id), "b4")
+                .await
+        ),
+        deleted,
+        "a branch created again under the name did not write the commit"
+    );
+    db.branch_delete("gone").await.unwrap();
     assert!(matches!(
         unwrapped(db.branch_create_from(at_commit(&loaded.graph_commit_id), "main").await),
         OmniError::Manifest(error) if error.message.contains("cannot create branch 'main'")

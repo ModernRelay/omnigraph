@@ -9934,6 +9934,13 @@
           "graph_commit_id"
         ],
         "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `branch_deleted`, the branch that wrote the commit."
+          },
           "graph_commit_id": {
             "type": "string"
           },
@@ -9956,6 +9963,7 @@
           "not_retained",
           "schema_changed",
           "earlier_storage_format",
+          "branch_deleted",
           "unpublished_commit",
           "unattached_snapshot",
           "unknown"

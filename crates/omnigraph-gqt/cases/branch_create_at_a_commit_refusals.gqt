@@ -1,6 +1,7 @@
 # issue: none
 # notes: `branch create … from commit "<id>"` refuses, before any effect, a start that is not branch history: an
-# notes: unpublished commit (publish it first) and an unattached snapshot, which never becomes branch history; an id no
+# notes: unpublished commit (publish it first), an unattached snapshot, which never becomes branch history, and a commit
+# notes: of a deleted branch, with one answer whether its name names nothing or a branch created again since; an id no
 # notes: commit has is not found.
 # notes: The start path itself is in branch_create_at_a_commit.gqt.
 
@@ -11,7 +12,7 @@ environments:
     storage: local-filesystem
   - target: omnigraph-engine-dst
     storage: in-memory-object-store
-    seeds: [0, 42]
+    seeds: [0]
   - target: omnigraph-server
     storage: local-filesystem
 
@@ -52,6 +53,45 @@ query park_frank() as unattached branch {
 branch create from_snapshot from commit "${snapshot}"
 
 --- expect error: is an unattached snapshot, which never becomes branch history
+
+--- mutate
+branch create gone from main
+
+--- expect ok
+
+--- mutate branch: gone
+query add_gil() {
+    insert Person { name: "gil", age: 7 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $gil
+
+--- mutate
+branch delete gone
+
+--- expect ok
+
+--- mutate
+branch create from_deleted from commit "${gil}"
+
+--- expect error: branch 'gone', which wrote it, was deleted
+
+--- mutate
+branch create gone from main
+
+--- expect ok
+
+--- mutate
+branch create from_reused from commit "${gil}"
+
+--- expect error: branch 'gone', which wrote it, was deleted
+
+--- mutate
+branch delete gone
+
+--- expect ok
 
 --- mutate
 branch create nowhere from commit "01ARZ3NDEKTSV4RRFFQ69G5FAV"

@@ -81,17 +81,23 @@ branch whose incarnation wrote the commit and clones that branch's
 `__manifest` at the version that published it: Lance `create_branch` takes any
 retained version, so the new branch's first manifest holds the commit's table
 pins, head, buffer and schema contract, exactly as a create while the commit
-was the head. No second publication follows. Under the gates the engine reads
-the commit's record from the capture and refuses, before any effect, a record
-another incarnation wrote, a version above the captured head, a schema
-contract other than the accepted one, a version only the legacy history
-serves, a version whose head row is another commit, and any pinned table
-version that no longer opens (cleanup reclaimed it) or misses an object its
-manifest references. The collector's sweep deletes a version's files before
-its manifest, so a manifest that opens proves nothing after an interrupted
-run: every pin the captured head does not also hold (the head's pins are
-roots, whose files the collector never deletes) is probed object by object,
-as the collector oracle probes retained roots. The probe stands in for a
+was the head. No second publication follows. Under the gates the engine
+captures the branch by name and reads the commit's record from the capture.
+The incarnation that wrote the commit must be the one the name resolves to:
+a name that resolves to nothing and a name created again since are one fact,
+refused as `BranchDeleted` in that one place, on every door. It then refuses,
+before any effect, a version above the captured head, a schema contract
+other than the accepted one, a version only the legacy history serves, a
+version whose head row is another commit, and any pinned table version that
+no longer opens (cleanup reclaimed it) or misses an object its manifest
+references. The collector's sweep deletes a version's files before its
+manifest, so a manifest that opens proves nothing after an interrupted run:
+every object of every pin the captured head does not also hold (the head's
+pins are roots, whose files the collector never deletes) is probed, as the
+collector oracle probes retained roots. The probe runs under the exclusive
+schema permit every write waits on, so it opens the pins and probes their
+objects with bounded concurrency and stops at the first missing object; it
+still sends one request per object of those pins. The probe stands in for a
 property the collector does not yet give every reader: a manifest that is
 present names only objects that are present. A sweep that deleted a version's
 manifest before its files would give it, and the probe would then reduce to

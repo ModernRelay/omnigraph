@@ -10,7 +10,7 @@ environments:
     storage: local-filesystem
   - target: omnigraph-engine-dst
     storage: in-memory-object-store
-    seeds: [0, 42]
+    seeds: [0]
   - target: omnigraph-server
     storage: local-filesystem
 

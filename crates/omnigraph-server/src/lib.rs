@@ -1561,7 +1561,7 @@ impl ApiError {
                 else {
                     unreachable!()
                 };
-                let (reason, type_name) = match reason {
+                let (reason, type_name, branch) = match reason {
                     BranchStartRefusal::NotRetained { table_key, .. } => {
                         let Ok((_, type_name)) = api::entity_type_parts(&table_key) else {
                             return Self::internal(
@@ -1571,20 +1571,30 @@ impl ApiError {
                         (
                             api::BranchStartRefusalReason::NotRetained,
                             Some(type_name.to_string()),
+                            None,
                         )
                     }
                     BranchStartRefusal::SchemaChanged => {
-                        (api::BranchStartRefusalReason::SchemaChanged, None)
+                        (api::BranchStartRefusalReason::SchemaChanged, None, None)
                     }
-                    BranchStartRefusal::EarlierStorageFormat => {
-                        (api::BranchStartRefusalReason::EarlierStorageFormat, None)
-                    }
+                    BranchStartRefusal::EarlierStorageFormat => (
+                        api::BranchStartRefusalReason::EarlierStorageFormat,
+                        None,
+                        None,
+                    ),
+                    BranchStartRefusal::BranchDeleted { branch } => (
+                        api::BranchStartRefusalReason::BranchDeleted,
+                        None,
+                        Some(branch),
+                    ),
                     BranchStartRefusal::UnpublishedCommit => {
-                        (api::BranchStartRefusalReason::UnpublishedCommit, None)
+                        (api::BranchStartRefusalReason::UnpublishedCommit, None, None)
                     }
-                    BranchStartRefusal::UnattachedSnapshot => {
-                        (api::BranchStartRefusalReason::UnattachedSnapshot, None)
-                    }
+                    BranchStartRefusal::UnattachedSnapshot => (
+                        api::BranchStartRefusalReason::UnattachedSnapshot,
+                        None,
+                        None,
+                    ),
                 };
                 Self::branch_start_refusal(
                     message,
@@ -1592,6 +1602,7 @@ impl ApiError {
                         reason,
                         graph_commit_id,
                         type_name,
+                        branch,
                     },
                 )
             }
@@ -1986,6 +1997,15 @@ mod api_error_tests {
                 None,
             ),
             (
+                BranchStartRefusal::BranchDeleted {
+                    branch: "gone".to_string(),
+                },
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::BranchDeleted,
+                None,
+            ),
+            (
                 BranchStartRefusal::UnpublishedCommit,
                 StatusCode::CONFLICT,
                 Some(ErrorCode::Conflict),
@@ -2014,6 +2034,10 @@ mod api_error_tests {
             assert_eq!(refusal.reason, wire);
             assert_eq!(refusal.graph_commit_id, "01JTESTROOT");
             assert_eq!(refusal.type_name, type_name);
+            assert_eq!(
+                refusal.branch.as_deref(),
+                (wire == api::BranchStartRefusalReason::BranchDeleted).then_some("gone")
+            );
         }
     }
 
