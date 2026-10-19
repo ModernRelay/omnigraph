@@ -16,7 +16,8 @@ use crate::helpers::CliRefusal;
 use crate::operator::{InvocationConfig, OperatorConfig};
 use crate::output::write_json;
 use crate::targets::{
-    self, ConfigEditLock, ServerAuth, TARGET_PROTOCOL, TargetBinding, TargetEntry, TargetOutput,
+    self, ACCESS_PROTOCOL, ConfigEditLock, ServerAuth, TARGET_PROTOCOL, TargetBinding, TargetEntry,
+    TargetOutput,
 };
 
 /// The most a `target add` entry on stdin may hold.
@@ -653,7 +654,7 @@ pub(crate) async fn run_access(
         ));
     };
     let report = AccessReport {
-        protocol: TARGET_PROTOCOL,
+        protocol: ACCESS_PROTOCOL,
         target,
         source,
         access,

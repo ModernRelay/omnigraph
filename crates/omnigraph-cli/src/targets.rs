@@ -33,6 +33,10 @@ pub(crate) const TARGET_CONFIG_VERSION: u32 = 1;
 /// The version of the `target` and `credential` commands' machine output.
 pub(crate) const TARGET_PROTOCOL: u32 = 1;
 
+/// The version of the `access` report, a contract of its own that changes
+/// apart from the `target` and `credential` envelopes.
+pub(crate) const ACCESS_PROTOCOL: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TargetKind {
