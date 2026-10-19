@@ -1468,13 +1468,6 @@ impl ApiError {
         self
     }
 
-    /// Mark an owned write's error as one of a compound operation when an
-    /// earlier step of it published.
-    pub(crate) fn in_compound_write(mut self, compound: bool) -> Self {
-        self.compound |= compound;
-        self
-    }
-
     /// Carry what the request being served has done onto the error itself.
     /// That record is task-local, so an error that crosses into another task
     /// on its way to a response, as an MCP tool call's does, takes it along.
@@ -1825,6 +1818,11 @@ impl ApiError {
             Some(omnigraph::error::CompletionEvidence::Uncertain) => {
                 response.completion_uncertain = true;
             }
+            // The graph moved before this failure; what the failing step did
+            // is what its status says, as with no evidence.
+            Some(omnigraph::error::CompletionEvidence::PartlyPublished) => {
+                response.compound = true;
+            }
             None => {}
         }
         response
@@ -1984,27 +1982,21 @@ pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
 ///
 /// `after_write`: the request had submitted a write before this failure, so
 /// the failure may follow its effects. Without it the failure did not start,
-/// whatever its cause, and keeps its own code.
-///
-/// `compound`: an earlier step of the same operation published on its own,
-/// as the fork a load makes of a missing branch does, so even a refusal of a
-/// later step follows a publication. A fork is itself a write: the flag
-/// changes the outcome only together with `after_write`.
-pub fn engine_error_output_after(
-    error: OmniError,
-    after_write: bool,
-    compound: bool,
-) -> api::ErrorOutput {
+/// whatever its cause, and keeps its own code. When the engine says an earlier
+/// step of the same operation published, as the fork a load makes of a
+/// missing branch does, even a refusal of a later step follows a publication;
+/// a fork is itself a write, so that changes the outcome only together with
+/// `after_write`.
+pub fn engine_error_output_after(error: OmniError, after_write: bool) -> api::ErrorOutput {
     let mut error = ApiError::from_omni(error);
     error.owned_write = after_write;
-    error.compound = compound;
     error.into_judged_output()
 }
 
 /// The error body of an embedded read's engine failure: a read writes
 /// nothing, so it did not start and keeps its own code.
 pub fn engine_read_error_output(error: OmniError) -> api::ErrorOutput {
-    engine_error_output_after(error, false, false)
+    engine_error_output_after(error, false)
 }
 
 #[cfg(test)]
@@ -2230,13 +2222,22 @@ mod api_error_tests {
             output_of(lost()).await.outcome,
             not_started(OutcomeAction::Refresh)
         );
-        let compound = output_of(lost().in_compound_write(true)).await;
-        assert_eq!(compound.code, Some(ErrorCode::Conflict));
-        assert_eq!(compound.outcome, unknown(OutcomeAction::Refresh));
-        assert_eq!(
-            output_of(lost().in_compound_write(false)).await.outcome,
-            not_started(OutcomeAction::Refresh)
-        );
+        let compound = |mut error: ApiError| {
+            error.compound = true;
+            error
+        };
+        let error = output_of(compound(lost())).await;
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
+        assert_eq!(error.outcome, unknown(OutcomeAction::Refresh));
+        // The engine's mark of an earlier publication is that fact.
+        let marked = ApiError::from_omni(
+            OmniError::key_conflict("node:Person", "Alice").after_earlier_publication(),
+        )
+        .after_owned_write();
+        assert!(marked.compound && !marked.completion_uncertain);
+        let error = output_of(marked).await;
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
+        assert_eq!(error.outcome, unknown(OutcomeAction::Refresh));
 
         // Refusals a write meets before it starts took no effect, unless an
         // earlier step of the operation published.
@@ -2244,12 +2245,7 @@ mod api_error_tests {
         assert_eq!(error.outcome, not_started(OutcomeAction::Refresh));
         let error = output_of(ApiError::too_many_requests("busy").after_owned_write()).await;
         assert_eq!(error.outcome, not_started(OutcomeAction::Retry));
-        let error = output_of(
-            ApiError::forbidden("denied")
-                .after_owned_write()
-                .in_compound_write(true),
-        )
-        .await;
+        let error = output_of(compound(ApiError::forbidden("denied").after_owned_write())).await;
         assert_eq!(error.code, Some(ErrorCode::Forbidden));
         assert_eq!(error.outcome, unknown(OutcomeAction::Refresh));
 
@@ -2279,7 +2275,7 @@ mod api_error_tests {
                     .submit((), async move { Err::<(), _>(refused()).into() })?
                     .result()
                     .await
-                    .map_err(|error| error.in_compound_write(true))
+                    .map_err(compound)
             })
             .result()
             .await
@@ -2329,15 +2325,15 @@ mod api_error_tests {
             || OmniError::manifest_internal("historical published dataset version 1 was reclaimed");
         for read in [
             engine_read_error_output(reclaimed()),
-            engine_error_output_after(reclaimed(), false, false),
-            engine_error_output_after(reclaimed(), false, true),
+            engine_error_output_after(reclaimed(), false),
+            engine_error_output_after(reclaimed().after_earlier_publication(), false),
         ] {
             assert_eq!(read.code, Some(ErrorCode::Internal));
             assert_eq!(read.outcome, not_started(OutcomeAction::Refresh));
         }
         for write in [
-            engine_error_output_after(reclaimed(), true, false),
-            engine_error_output_after(reclaimed(), true, true),
+            engine_error_output_after(reclaimed(), true),
+            engine_error_output_after(reclaimed().after_earlier_publication(), true),
             engine_error_output(reclaimed()),
         ] {
             assert_eq!(write.code, Some(ErrorCode::OutcomeUnknown));
@@ -2345,20 +2341,26 @@ mod api_error_tests {
         }
 
         // A typed refusal of the write's one publication did not start it;
-        // after an earlier publication of the same operation it follows one.
+        // after an earlier publication of the same operation it follows one,
+        // which only the engine's own mark says.
         let refusals: [fn() -> OmniError; 2] = [
             || OmniError::Policy("change denied".into()),
             || OmniError::key_conflict("node:Person", "Alice"),
         ];
         for refusal in refusals {
-            let code = engine_error_output_after(refusal(), false, false).code;
+            let code = engine_error_output_after(refusal(), false).code;
             for (after_write, compound, outcome) in [
                 (false, false, not_started(OutcomeAction::Refresh)),
                 (false, true, not_started(OutcomeAction::Refresh)),
                 (true, false, not_started(OutcomeAction::Refresh)),
                 (true, true, unknown(OutcomeAction::Refresh)),
             ] {
-                let output = engine_error_output_after(refusal(), after_write, compound);
+                let error = if compound {
+                    refusal().after_earlier_publication()
+                } else {
+                    refusal()
+                };
+                let output = engine_error_output_after(error, after_write);
                 assert_eq!(output.code, code, "{after_write} {compound}");
                 assert_eq!(output.outcome, outcome, "{after_write} {compound}");
             }

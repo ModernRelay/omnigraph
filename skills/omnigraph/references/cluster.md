@@ -111,13 +111,14 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
   root spelled with an empty or percent-sign path component is refused with
   `external_blob_storage_root_uncomparable`; moving the base does not clear it,
   so re-spell the root or remove those bases.
-- **`--as <actor>` labels a direct `cluster apply` or `cluster upgrade-ledger`**
-  (deployment record and engine commits where applicable). It defaults from
-  operator config's `operator.actor`. With `--server`, `cluster plan` and
-  `cluster apply` take the actor from the bearer token and send `--as` as an
-  assertion the server checks: another actor is refused with `actor_mismatch`
-  and exit 4, before anything is submitted. The other cluster subcommands
-  reject this flag.
+- **`--as <actor>`** is accepted by `cluster plan`, `cluster apply` and
+  `cluster upgrade-ledger`. A direct `cluster apply` or `cluster upgrade-ledger`
+  records it (deployment record and engine commits where applicable); it
+  defaults from operator config's `operator.actor`. With `--server`, `cluster
+  plan` and `cluster apply` take the actor from the bearer token and send `--as`
+  as an assertion the server checks: another actor is refused with
+  `actor_mismatch` and exit 4, before anything is submitted. Every other cluster
+  subcommand, and every `--managed` form, rejects this flag.
 - **Deployment scope**: apply creates graphs and updates schemas, queries,
   policies, provider definitions/bindings, and `external_blobs` rules. Removing
   a graph declaration deletes its exact managed root, including retained

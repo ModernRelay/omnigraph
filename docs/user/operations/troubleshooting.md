@@ -136,10 +136,11 @@ CLI performs no automatic retry.
 The outcome covers the entire command. A later refused subrequest cannot undo
 an earlier branch creation, load or publication. An embedded write's own
 refusal says what the engine did, projected as a server would project it: a
-policy refusal precedes every publication, a `load --from` fork included, and
-another refusal after that fork is `unknown`. Embedded and served commands
-therefore exit alike; any later failure, such as rendering a committed receipt,
-stays `unknown`.
+policy refusal precedes every publication, a `load --from` fork included, so it
+is `not_started` on both planes. The engine marks a refusal that follows a fork
+which did publish, and that refusal is `unknown` on both planes. A `load
+--from` onto a branch that already exists forks nothing. Any later failure,
+such as rendering a committed receipt, stays `unknown`.
 Disconnecting an admitted HTTP write does not cancel it: the server keeps
 running the original operation, and a lost response can leave the caller's
 outcome unknown. There is no durable request-result lookup in this release.
