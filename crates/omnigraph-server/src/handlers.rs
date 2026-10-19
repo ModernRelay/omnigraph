@@ -849,14 +849,8 @@ pub(crate) async fn server_snapshot(
 pub(crate) async fn server_access(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
-    query: std::result::Result<Query<api::AccessQuery>, QueryRejection>,
+    ApiQuery(query): ApiQuery<api::AccessQuery>,
 ) -> std::result::Result<Json<api::AccessOutput>, ApiError> {
-    let Query(query) = query.map_err(|rejection| {
-        ApiError::bad_request(format!(
-            "invalid access query parameters: {}",
-            rejection.body_text()
-        ))
-    })?;
     Ok(Json(access_body(
         &handle,
         actor.as_ref().map(|Extension(actor)| actor),
@@ -1012,10 +1006,8 @@ pub(crate) async fn server_query(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
-    request: std::result::Result<Json<QueryRequest>, JsonRejection>,
+    ApiJson(request): ApiJson<QueryRequest>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
-    let Json(request) = request
-        .map_err(|rejection| ApiError::json_rejection("invalid query request", rejection))?;
     let session = state.session(&handle, request.settings.as_ref())?;
     let output = run_query(
         handle,
@@ -1115,9 +1107,8 @@ pub(crate) async fn server_blob_get(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
-    query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
+    ApiQuery(query): ApiQuery<BlobReadQuery>,
 ) -> std::result::Result<Response, ApiError> {
-    let query = parse_blob_read_query(query)?;
     let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
         .await?;
     blob_transport::serve_blob_get(read, &headers).inspect_err(log_blob_transport_internal)
@@ -1179,9 +1170,8 @@ pub(crate) async fn server_blob_head(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
-    query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
+    ApiQuery(query): ApiQuery<BlobReadQuery>,
 ) -> std::result::Result<Response, ApiError> {
-    let query = parse_blob_read_query(query)?;
     let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
         .await?;
     blob_transport::serve_blob_head(read, &headers).inspect_err(log_blob_transport_internal)
@@ -1234,7 +1224,7 @@ pub(crate) async fn server_blob_put(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
-    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+    ApiQuery(query): ApiQuery<BlobWriteQuery>,
     request: Request,
 ) -> std::result::Result<Response, ApiError> {
     let ingress = request
@@ -1242,7 +1232,6 @@ pub(crate) async fn server_blob_put(
         .get::<IngressLease>()
         .cloned()
         .ok_or_else(|| ApiError::internal("missing ingress reservation"))?;
-    let query = parse_blob_write_query(query)?;
     let precondition = blob_write_precondition(request.headers())?;
     let actor = actor.as_ref().map(|Extension(actor)| actor);
     let branch = query.branch.clone().unwrap_or_else(|| "main".to_string());
@@ -1349,9 +1338,8 @@ pub(crate) async fn server_blob_delete(
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
-    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+    ApiQuery(query): ApiQuery<BlobWriteQuery>,
 ) -> std::result::Result<Response, ApiError> {
-    let query = parse_blob_write_query(query)?;
     let precondition = blob_write_precondition(&headers)?;
     let actor = actor.as_ref().map(|Extension(actor)| actor);
     let branch = query.branch.clone().unwrap_or_else(|| "main".to_string());
@@ -1377,17 +1365,6 @@ pub(crate) async fn server_blob_delete(
     })
     .await?;
     blob_write_response(output)
-}
-
-fn parse_blob_write_query(
-    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
-) -> std::result::Result<BlobWriteQuery, ApiError> {
-    query.map(|Query(query)| query).map_err(|rejection| {
-        ApiError::bad_request(format!(
-            "invalid Blob write query parameters: {}",
-            rejection.body_text()
-        ))
-    })
 }
 
 fn blob_write_precondition(
@@ -1483,17 +1460,6 @@ fn blob_write_response(output: BlobWriteOutput) -> std::result::Result<Response,
         );
     }
     Ok((StatusCode::OK, headers, Json(output)).into_response())
-}
-
-fn parse_blob_read_query(
-    query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
-) -> std::result::Result<BlobReadQuery, ApiError> {
-    query.map(|Query(query)| query).map_err(|rejection| {
-        ApiError::bad_request(format!(
-            "invalid Blob selector query parameters: {}",
-            rejection.body_text()
-        ))
-    })
 }
 
 async fn read_blob_for_delivery(
@@ -1600,10 +1566,8 @@ pub(crate) async fn server_export(
     Extension(observer): Extension<operations::ReadObserver>,
     Extension(input): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    request: std::result::Result<Json<ExportRequest>, JsonRejection>,
+    ApiJson(request): ApiJson<ExportRequest>,
 ) -> std::result::Result<Response, ApiError> {
-    let Json(request) = request
-        .map_err(|rejection| ApiError::json_rejection("invalid export request", rejection))?;
     let branch = requested_branch(request.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
@@ -2185,10 +2149,8 @@ pub(crate) async fn server_mutate(
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
-    request: std::result::Result<Json<ChangeRequest>, JsonRejection>,
+    ApiJson(request): ApiJson<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
-    let Json(request) = request
-        .map_err(|rejection| ApiError::json_rejection("invalid mutation request", rejection))?;
     reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
     let session = state.session(&handle, request.settings.as_ref())?;
     Ok(Json(
@@ -2243,10 +2205,8 @@ pub(crate) async fn server_mutate_if_graph_commit(
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
-    request: std::result::Result<Json<ChangeRequest>, JsonRejection>,
+    ApiJson(request): ApiJson<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
-    let Json(request) = request
-        .map_err(|rejection| ApiError::json_rejection("invalid mutation request", rejection))?;
     let expected_head = require_graph_commit_expected_head(&headers)?;
     let session = state.session(&handle, request.settings.as_ref())?;
     Ok(Json(
@@ -3180,10 +3140,8 @@ pub(crate) async fn server_branch_merge(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    request: std::result::Result<Json<BranchMergeRequest>, JsonRejection>,
+    ApiJson(request): ApiJson<BranchMergeRequest>,
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
-    let Json(request) = request
-        .map_err(|rejection| ApiError::json_rejection("invalid branch merge request", rejection))?;
     if request.as_commit && request.delete_branch {
         return Err(ApiError::bad_request(
             "a merge `as_commit` keeps its source until the commit is published or dropped; drop `delete_branch`",

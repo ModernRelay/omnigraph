@@ -3,12 +3,14 @@
 //! does, with its code and outcome. Handlers take these instead of axum's own
 //! `Json`, `Query` and `Path`, whose rejections are plain text.
 
-use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{FromRequest, FromRequestParts, Request};
+use axum::http::StatusCode;
 use axum::http::request::Parts;
 use serde::de::DeserializeOwned;
 
 use crate::ApiError;
+use crate::api::ErrorCode;
 
 /// A JSON request body.
 pub(crate) struct ApiJson<T>(pub(crate) T);
@@ -29,7 +31,7 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, ApiError> {
         let axum::Json(value) = axum::Json::from_request(request, state)
             .await
-            .map_err(|rejection| ApiError::json_rejection("invalid request body", rejection))?;
+            .map_err(json_rejection)?;
         Ok(Self(value))
     }
 }
@@ -64,6 +66,22 @@ where
     }
 }
 
+/// Axum refuses a body for its data or syntax (400, and 422 for a serde
+/// data-shape failure, which OmniGraph answers as its typed 400), its size
+/// over the route's limit (413), or a missing or wrong JSON `Content-Type`
+/// (415). Each keeps its own code and status.
+fn json_rejection(rejection: JsonRejection) -> ApiError {
+    let code = match rejection.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => ErrorCode::PayloadTooLarge,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => ErrorCode::UnsupportedMediaType,
+        _ => ErrorCode::BadRequest,
+    };
+    ApiError::new(
+        code,
+        format!("invalid request body: {}", rejection.body_text()),
+    )
+}
+
 fn query_rejection(rejection: QueryRejection) -> ApiError {
     ApiError::bad_request(format!("invalid query string: {}", rejection.body_text()))
 }
@@ -84,7 +102,10 @@ fn path_rejection(rejection: PathRejection) -> ApiError {
 #[cfg(test)]
 mod tests {
     /// A handler that takes axum's own extractor answers a malformed request
-    /// in plain text, outside the error contract.
+    /// in plain text, outside the error contract, or maps its refusal by
+    /// hand, where a body's 413 or 415 can lose its status. Its parameter may
+    /// hide inside `Result` or `Option`; its rejection type names the hand
+    /// mapping wherever it is.
     #[test]
     fn handlers_take_extractors_that_refuse_with_the_error_body() {
         let mut offenders = Vec::new();
@@ -100,18 +121,31 @@ mod tests {
                     continue;
                 }
                 let source = std::fs::read_to_string(&path).unwrap();
+                let this_module = path.ends_with("extract.rs");
                 for (number, line) in source.lines().enumerate() {
                     let code = line.split("//").next().unwrap_or_default();
-                    let code = code.replace("axum::extract::", "").replace("axum::", "");
-                    for extractor in ["Json", "Query", "Path"] {
-                        if code.contains(&format!(": {extractor}<")) {
-                            offenders.push(format!(
-                                "{}:{}: {}",
-                                path.display(),
-                                number + 1,
-                                line.trim()
-                            ));
-                        }
+                    let code = code
+                        .replace("axum::extract::rejection::", "")
+                        .replace("axum::extract::", "")
+                        .replace("axum::", "")
+                        .replace("std::result::", "")
+                        .replace(' ', "");
+                    let parameter = ["Json", "Query", "Path"].iter().any(|extractor| {
+                        ["", "Result<", "Option<"]
+                            .iter()
+                            .any(|wrapper| code.contains(&format!(":{wrapper}{extractor}<")))
+                    });
+                    let rejection = !this_module
+                        && ["JsonRejection", "QueryRejection", "PathRejection"]
+                            .iter()
+                            .any(|rejection| code.contains(rejection));
+                    if parameter || rejection {
+                        offenders.push(format!(
+                            "{}:{}: {}",
+                            path.display(),
+                            number + 1,
+                            line.trim()
+                        ));
                     }
                 }
             }

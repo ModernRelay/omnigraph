@@ -60,8 +60,7 @@ use api::{
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
-use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{Extension, OriginalUri, Query, Request, State};
+use axum::extract::{Extension, OriginalUri, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -1077,19 +1076,6 @@ impl ApiError {
 
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::BadRequest, message)
-    }
-
-    /// Axum uses `JsonRejection` for data and syntax failures (400, and 422
-    /// for a serde data-shape failure, which OmniGraph answers as its typed
-    /// 400), a body over its limit (413), and a missing or wrong JSON
-    /// `Content-Type` (415). Each keeps its own code and status.
-    fn json_rejection(context: &str, rejection: JsonRejection) -> Self {
-        let code = match rejection.status() {
-            StatusCode::PAYLOAD_TOO_LARGE => ErrorCode::PayloadTooLarge,
-            StatusCode::UNSUPPORTED_MEDIA_TYPE => ErrorCode::UnsupportedMediaType,
-            _ => ErrorCode::BadRequest,
-        };
-        Self::new(code, format!("{context}: {}", rejection.body_text()))
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {

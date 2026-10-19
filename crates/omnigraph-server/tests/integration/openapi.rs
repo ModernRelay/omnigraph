@@ -1721,6 +1721,9 @@ fn error_code_schema_has_expected_variants() {
             "service_unavailable",
             "graph_unavailable",
             "internal",
+            "cancelled",
+            "deadline_exceeded",
+            "result_too_large",
         ]),
         "ErrorCode must match the closed HTTP contract, including its \
          explicit API admission and graph availability refusals",

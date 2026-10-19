@@ -6,8 +6,8 @@ answers, an unknown route, a method the route does not serve and a malformed
 body, query string or path parameter included, uses a JSON body with `error`,
 `code`, `disposition` and optional details for conflicts, limits, Blob ranges,
 external sources, or recovery. A malformed request is `400`, a body without a
-JSON content type `415`. MCP tool calls report errors in their own result shapes
-([MCP](mcp.md#results-and-errors)).
+JSON content type `415`. MCP tool calls report the same body beside the HTTP
+status ([MCP](mcp.md#results-and-errors)).
 
 Do not parse human-readable error text when a structured field is present.
 

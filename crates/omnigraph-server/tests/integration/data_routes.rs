@@ -664,12 +664,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
                 Some(omnigraph_server::api::ErrorCode::BadRequest),
                 "{case}"
             );
-            assert!(
-                output
-                    .error
-                    .starts_with("invalid Blob selector query parameters:"),
-                "{case}"
-            );
+            assert!(output.error.starts_with("invalid query string:"), "{case}");
         }
     }
 }

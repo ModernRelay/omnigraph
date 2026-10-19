@@ -2082,6 +2082,14 @@ error_codes! {
     /// The server failed. An error before any write took no effect; see the
     /// server log.
     Internal = "internal", Some(500);
+    /// MCP only: the client cancelled a read tool call. A cancelled write
+    /// answers `outcome_unknown`.
+    Cancelled = "cancelled", None;
+    /// MCP only: a read tool call passed its deadline. A write that does
+    /// answers `outcome_unknown`.
+    DeadlineExceeded = "deadline_exceeded", None;
+    /// MCP only: a tool result exceeds the result limit. Narrow the read.
+    ResultTooLarge = "result_too_large", None;
 }
 
 impl utoipa::PartialSchema for ErrorCode {
@@ -2121,7 +2129,9 @@ impl ErrorCode {
             }
             Self::RecoveryRequired => DispositionAction::Recover,
             Self::OutcomeUnknown => DispositionAction::Reconcile,
-            Self::RequestTimeout => DispositionAction::Retry,
+            Self::RequestTimeout | Self::Cancelled | Self::DeadlineExceeded => {
+                DispositionAction::Retry
+            }
             // The request itself is wrong; no state it could read changes that.
             Self::Unauthorized
             | Self::BadRequest
@@ -2132,7 +2142,8 @@ impl ErrorCode {
             | Self::UnattachedCannotPublish
             | Self::PayloadTooLarge
             | Self::UnsupportedMediaType
-            | Self::RangeNotSatisfiable => DispositionAction::Fix,
+            | Self::RangeNotSatisfiable
+            | Self::ResultTooLarge => DispositionAction::Fix,
             // The state the request met refused it, or the server failed.
             Self::Forbidden
             | Self::PreconditionFailed
