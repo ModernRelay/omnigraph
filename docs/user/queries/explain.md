@@ -208,12 +208,10 @@ row `datafusion` reads `unavailable: …` with the reason.
 
 ## Profile
 
-The third surface beside the rows and explain is `profile`: what each node
-of the plan a `v2` run executed did, written back as rows in the explain row
-schema (`tree`, `depth`, `node`, `detail`) with `tree` `profile`, no `depth`,
-`node` the plan node's kind (`Scan`, `HashJoin`, `ContainsJoin`, `Expand`,
-`Sort`, `Page`, …) and `detail` one JSON object per node of the run, from the one operator
-the node built:
+The run's `profile` describes each plan node in the explain row schema
+(`tree`, `depth`, `node`, `detail`). Rows use `tree` `profile`, no `depth`,
+the plan node's kind in `node` (`Scan`, `HashJoin`, `ContainsJoin`, …),
+and its operator's JSON report in `detail`:
 
 | Key | Meaning |
 |---|---|

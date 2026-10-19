@@ -634,6 +634,23 @@ it; a failed planning step has no document and keeps its `expect error:`.
 Nothing is compared as rendered text, so a planner that reaches the same
 facts by another route keeps the case green.
 
+A nearest ranked-scan line may end in `diagnostics present`, for example
+`scan Doc as $d: ranked nearest fetch 3 diagnostics present`. Every selected
+nearest scan must report at least one measured attempt; an RRF with two
+nearest arms must report both, while a BM25 sibling is not selected. A missing
+scan, missing report, or missing diagnostic fails the assertion. Other attempts
+may have no metrics, and their positions are never renumbered. The clause is
+refused on BM25 and takes no duration or counter value.
+
+Every successful inspected query also validates any ANN diagnostics without
+requiring a plan section: known counter/timing names with unsigned integer
+values, nonempty metric rows, unique `(id, rung, attempt)` identities, and joins
+to a physical nearest scan and an existing probe attempt. The same run's profile
+must preserve those diagnostics. Missing fields remain absent and zero is valid;
+no elapsed time, physical count, or equality across runs is asserted. Diagnostics
+are not added to DST replay observations. The explicit presence clause catches
+complete loss of metrics that these conditional checks alone would allow.
+
 A `scan <Type>[ as $var]: access sequential` line requires the recorded
 sequential choice. `access index_probe <physical-column>` requires a probe
 with that physical column in a leaf of `index_query`; it does not compare

@@ -582,6 +582,15 @@ Query behavior has two test tiers. A `.gqt` case owns what is visible in rows, c
 
 The scrubbed side is `crates/omnigraph/tests/engine_v2_scrubbed_replay.rs` (process environment, which no case can express): a grep that fails on any `std::env` read under `crates/omnigraph/src/engine/` outside `plan_source.rs`, the one permitted reader of configuration, before planning; two replays that set an ambient value the plan did not capture (the task-local memory limit, `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`) and require the captured one to win; and the replay of a plan gathered under one `ann_nprobes` in a session set to another. `Session::replay_bound_plan` takes no settings argument and sizes the pool from the plan's memory limit. The inventory sweep is one case per input class that a case can set two ways, `cases/v2/planner/input_*.gqt` (`engine`, `ann_nprobes`, index build state), each requiring equal rows or a plan line that differs, and the clock class is one of the replay plans of `integration/engine_v2_plan_replay.rs`; the `ran` line and the `nprobes` claim of `--- expect plan` are what a differing plan line is spelled with.
 
+GQT also owns the public ANN diagnostics contract: every inspected query checks
+metric types and names, attempt identities, scan/probe attribution and same-run
+profile preservation. Existing ranked-scan cases use `diagnostics present` to
+refuse silent metric loss, including one missing RRF arm; see the
+[GQT plan assertions](../../crates/omnigraph-gqt/README.md#plan-expectations).
+Rust retains controlled partition layouts and independent native-counter oracles
+in `search.rs`, plus synthetic missing/zero/unknown/maximum metric inputs and
+replay separation in `engine/search.rs` and `engine/report/tests.rs`.
+
 The `--- expect plan` of an inspected step reads the explain document of that same `Executed`, never a second planning run; its `ran` lines read the report of that run (`crates/omnigraph-gqt-core/src/report.rs` reads the rows). A parameter refusal, a settings error and a query that failed produce no `Executed` and keep their ordinary checks.
 
 ### GQT execution through DST
