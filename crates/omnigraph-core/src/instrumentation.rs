@@ -2058,8 +2058,8 @@ async fn dataset_builder(
     let session = session
         .cloned()
         .unwrap_or_else(crate::lance_access::control_session);
+    let mut store_params = crate::storage::lance_store_params_for_session(uri, &session)?;
     builder = builder.with_session(session);
-    let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
     if let Some(wrapper) = wrapper {
         store_params.object_store_wrapper = Some(wrapper.clone());
     }
@@ -2149,6 +2149,12 @@ impl CountingStorageAdapter {
 
 #[async_trait]
 impl StorageAdapter for CountingStorageAdapter {
+    fn binding(&self) -> Option<crate::storage::CapturedStorageBinding> {
+        self.inner.binding()
+    }
+    fn io_scope(&self) -> Option<crate::storage::StorageIoScope> {
+        self.inner.io_scope()
+    }
     async fn read_text(&self, uri: &str) -> Result<String> {
         self.counts.read_text.fetch_add(1, Ordering::Relaxed);
         self.inner.read_text(uri).await

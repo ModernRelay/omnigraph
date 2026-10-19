@@ -24,9 +24,9 @@ The upgrade is offline, and it cannot verify that itself:
 3. Check, then convert, then verify with the new binary:
 
 ```bash
-omnigraph upgrade ./graph.omni --check --json
-omnigraph upgrade ./graph.omni --json
-omnigraph commit list ./graph.omni --json
+omnigraph upgrade --target ./graph.omni --check --json
+omnigraph upgrade --target ./graph.omni --json
+omnigraph commit list --target ./graph.omni --json
 ```
 
 `--check` writes nothing. A run without `--check` first marks the graph as
@@ -148,8 +148,8 @@ full-text queries until the selected indexes have been rebuilt.
 4. Use the new operator CLI to rebuild each branch on the inventory checklist:
 
    ```bash
-   omnigraph rebuild-full-text-indexes ./graph.omni --branch main --as operator --json
-   omnigraph rebuild-full-text-indexes ./graph.omni --branch review --as operator --json
+   omnigraph rebuild-full-text-indexes --target ./graph.omni --branch main --as operator --json
+   omnigraph rebuild-full-text-indexes --target ./graph.omni --branch review --as operator --json
    ```
 
    `--as` is optional actor attribution, not server-policy authorization. Inspect
@@ -246,7 +246,7 @@ If the graph's generation is newer than the binary, upgrade the binary instead.
 
 ## System-column upgrade (legacy spellings)
 
-`omnigraph schema upgrade-system-columns <graph>` respells a served graph's
+`omnigraph schema upgrade-system-columns --target <graph>` respells a standalone graph's
 legacy system columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`).
 It needs a graph that normal open accepts. The respelling
 changes no storage layout and publishes the replacement contract with the
@@ -331,7 +331,7 @@ these cutovers:
 
 - **New graph ID in the same cluster.** Add (for example)
   `knowledge_next` with the desired schema, query, provider, and policy
-  bindings. Validate, plan, and submit `cluster apply --server` so the running
+  bindings. Validate, plan, and submit `cluster apply --target` so the running
   owner creates and activates its derived root. Load through that server, verify
   the new ID, back up what you need, and move clients. Removing the old declaration
   and applying deletes its managed storage and all retained history.

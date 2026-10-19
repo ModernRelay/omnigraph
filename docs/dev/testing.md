@@ -179,10 +179,10 @@ filtering and wrong-plane refusal before configuration or HTTP access. The exist
 these CLI changes require no additional query-semantic GQT cases.
 
 Local command tests in `commands/local` own supplied login input, credential
-changes after report failure, captured profile configuration, and completed skill
+changes after report failure, captured target configuration, and completed skill
 or embedding files after output loss. `skill.rs` owns exact file delivery and its
 existing broken-pipe exception. Extend `cli_schema_config` for version and skill
-process behavior and `cli_data` for profile/embedding output. Its existing
+process behavior and `cli_data` for target/embedding output. Its existing
 discovery-swap fixture also replaces the credential file, requiring registry
 probing and the subsequent command to retain the original token. Application and
 managed-output tests own completion, partial-write and flush failures; managed
@@ -227,8 +227,10 @@ turnover, exercising bounded re-observation for aggregate and exact status.
 CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
 retries, malformed-receipt refusal, terminal outcomes and caller timeout without
 replay. Its managed fixtures cover status/history scope and filters, explicit
-`--managed` selection, and wrong-mode refusals before context or external access.
-Direct apply must ignore both valid and malformed managed folder context.
+managed target selection, and unsupported target-kind refusals before credentials
+or external access. Default target selection refuses applicable retired folder
+routing; explicit direct targets never route through it. Legacy lifecycle custody
+remains guarded even with explicit selection.
 Managed deployment fixtures also exercise immutable preview/delivery bodies,
 original-ID recovery, current authorization refusals, bounded waiting through
 uncertain delivery/archival, and queued-only cancellation. They do not replace

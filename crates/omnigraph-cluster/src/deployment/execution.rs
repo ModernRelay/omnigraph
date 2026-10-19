@@ -177,7 +177,23 @@ pub async fn deployment_status(
     id: Option<&str>,
     caller: &DeploymentCaller,
 ) -> Result<DeploymentStatus, Diagnostic> {
-    let store = ClusterStore::for_storage_root(root)?;
+    deployment_status_in_store(ClusterStore::for_storage_root(root)?, id, caller).await
+}
+
+/// Ledger lookup against an already captured storage destination.
+pub async fn deployment_status_with_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+    id: Option<&str>,
+    caller: &DeploymentCaller,
+) -> Result<DeploymentStatus, Diagnostic> {
+    deployment_status_in_store(ClusterStore::for_storage_binding(binding)?, id, caller).await
+}
+
+async fn deployment_status_in_store(
+    store: ClusterStore,
+    id: Option<&str>,
+    caller: &DeploymentCaller,
+) -> Result<DeploymentStatus, Diagnostic> {
     let (state, _) = read_existing(&store).await?;
     require_v2(&state)?;
     lookup_policies(&store, &state, caller, id).await?;
@@ -301,6 +317,15 @@ pub async fn force_unlock_storage_root(root: &str, lock_id: &str) -> Result<(), 
     store.force_unlock(lock_id, &mut store.observations()).await
 }
 
+/// Exact-ID unlock with fixed provider authority.
+pub async fn force_unlock_storage_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+    lock_id: &str,
+) -> Result<(), Diagnostic> {
+    let store = ClusterStore::for_storage_binding(binding)?;
+    store.force_unlock(lock_id, &mut store.observations()).await
+}
+
 async fn capture_applied_graph_contracts(
     store: &ClusterStore,
     state: &ClusterState,
@@ -312,10 +337,10 @@ async fn capture_applied_graph_contracts(
     let mut contracts = BTreeMap::new();
     for graph in graph_ids(state) {
         let uri = store.graph_root(&graph);
-        Omnigraph::ensure_no_pending_recovery(&uri)
+        Omnigraph::ensure_no_pending_recovery_with_storage(&uri, store.graph_storage(&uri)?)
             .await
             .map_err(|e| refusal("graph_recovery_required", e.to_string()))?;
-        let db = Omnigraph::open_read_only(&uri)
+        let db = Omnigraph::open_read_only_with_storage(&uri, store.graph_storage(&uri)?)
             .await
             .map_err(|e| refusal("graph_unavailable", e.to_string()))?;
         if state
@@ -348,13 +373,39 @@ pub async fn upgrade_deployment_ledger(
     writers_stopped: bool,
     caller: &DeploymentCaller,
 ) -> Result<DeploymentStatus, Diagnostic> {
+    upgrade_deployment_ledger_in_store(
+        ClusterStore::for_storage_root(root)?,
+        writers_stopped,
+        caller,
+    )
+    .await
+}
+
+/// Ledger conversion with the selected target's captured provider authority.
+pub async fn upgrade_deployment_ledger_with_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+    writers_stopped: bool,
+    caller: &DeploymentCaller,
+) -> Result<DeploymentStatus, Diagnostic> {
+    upgrade_deployment_ledger_in_store(
+        ClusterStore::for_storage_binding(binding)?,
+        writers_stopped,
+        caller,
+    )
+    .await
+}
+
+async fn upgrade_deployment_ledger_in_store(
+    store: ClusterStore,
+    writers_stopped: bool,
+    caller: &DeploymentCaller,
+) -> Result<DeploymentStatus, Diagnostic> {
     if !writers_stopped {
         return Err(refusal(
             "writers_stopped_required",
             "conversion requires --writers-stopped",
         ));
     }
-    let store = ClusterStore::for_storage_root(root)?;
     let (before, conversion) = store.read_state_for_ledger_upgrade().await?;
     let before = before
         .state
@@ -366,7 +417,7 @@ pub async fn upgrade_deployment_ledger(
         ));
     }
     if before.version == 2 && !conversion {
-        return deployment_status(root, None, caller).await;
+        return deployment_status_in_store(store, None, caller).await;
     }
     // Refuse unauthorized conversion before acquiring durable admission; a
     // denied caller must not strand a lock. Recheck current policy under it.
@@ -439,7 +490,7 @@ pub async fn upgrade_deployment_ledger(
         .await
         .map_err(|error| retained_error(error, guard.lock_id()))?;
     store.release_settled(guard.lock_id()).await?;
-    deployment_status(root, None, caller).await
+    deployment_status_in_store(store, None, caller).await
 }
 
 pub(super) fn empty_ledger() -> ClusterState {
@@ -601,7 +652,7 @@ fn bundle_from_capture(
 
 pub(super) fn validate_bundle(bundle: &DeploymentBundle, root: &str) -> Result<(), Diagnostic> {
     validate_bundle_with_root(bundle, root, |declared| {
-        ClusterStore::for_storage_root(declared)?.canonical_root()
+        crate::store::canonical_storage_root(declared)
     })
 }
 
@@ -949,15 +1000,13 @@ async fn open_graph(
     read_only: bool,
 ) -> Result<Omnigraph, Diagnostic> {
     let uri = store.graph_root(graph);
-    Omnigraph::ensure_no_pending_recovery(&uri)
+    Omnigraph::ensure_no_pending_recovery_with_storage(&uri, store.graph_storage(&uri)?)
         .await
         .map_err(|error| refusal("graph_recovery_required", error.to_string()))?;
     let db = if read_only {
-        Omnigraph::open_read_only(&uri).await
-    } else if let Some(scope) = store.io_scope() {
-        Omnigraph::open_with_io_scope(&uri, scope).await
+        Omnigraph::open_read_only_with_storage(&uri, store.graph_storage(&uri)?).await
     } else {
-        Omnigraph::open(&uri).await
+        Omnigraph::open_with_storage(&uri, store.graph_storage(&uri)?).await
     }
     .map_err(|error| refusal("graph_unavailable", error.to_string()))?;
     Ok(match policies.graph(graph) {
@@ -1150,6 +1199,16 @@ pub fn capture_deployment(config_dir: impl AsRef<Path>) -> Result<CapturedDeploy
     capture_deployment_input(config_dir.as_ref(), None)
 }
 
+/// Capture source files for a separately selected direct storage root.
+/// An optional declared root is checked against this destination, never selected.
+pub fn capture_deployment_at_root(
+    config_dir: impl AsRef<Path>,
+    root: &str,
+) -> Result<CapturedDeployment, Diagnostic> {
+    let captured = config::capture_desired_at_root(config_dir.as_ref(), root);
+    finish_captured_input(captured, None)
+}
+
 /// Capture local sources for the root advertised by an authenticated server.
 /// No storage backend is constructed and no server path is opened on this host.
 /// Omitted storage selects that server; an explicit storage root must match its
@@ -1193,7 +1252,17 @@ fn capture_deployment_input(
     config_dir: &Path,
     server_canonical_root: Option<&str>,
 ) -> Result<CapturedDeployment, Diagnostic> {
-    let captured = config::capture_desired(config_dir);
+    let captured = match server_canonical_root {
+        Some(_) => config::capture_desired_source(config_dir),
+        None => config::capture_desired(config_dir),
+    };
+    finish_captured_input(captured, server_canonical_root)
+}
+
+fn finish_captured_input(
+    captured: config::CapturedDesired,
+    server_canonical_root: Option<&str>,
+) -> Result<CapturedDeployment, Diagnostic> {
     if let Some(error) = captured
         .outcome
         .diagnostics
@@ -1222,9 +1291,12 @@ pub(crate) fn capture_desired_deployment(
     }
     let root = match server_canonical_root {
         Some(root) => root.to_owned(),
-        None => {
-            store_for(&desired.config_dir, desired.storage_root.as_deref())?.canonical_root()?
-        }
+        None => crate::store::canonical_storage_root(
+            desired
+                .storage_root
+                .as_deref()
+                .unwrap_or(&desired.config_dir.to_string_lossy()),
+        )?,
     };
     let bundle = bundle_from_capture(desired, sources, root.clone());
     if server_canonical_root.is_some() {
@@ -1300,7 +1372,7 @@ async fn capture_deployment_preview(
     }
     validate_bundle(bundle, admission.canonical_root())?;
     admission.validate_deployment().await?;
-    let store = ClusterStore::for_storage_root(admission.canonical_root())?;
+    let store = admission.store();
     let (state, cas) = read_existing(&store).await?;
     require_v2(&state)?;
     let policy = deployment_policies(&store, &state, bundle, caller).await?;
@@ -1539,7 +1611,62 @@ pub async fn apply_deployment(
     report_id: impl FnOnce(&str, &str, &str),
 ) -> Result<DeploymentLookup, Diagnostic> {
     let bundle = capture_deployment(config_dir)?;
-    let store = ClusterStore::for_storage_root(bundle.canonical_root())?;
+    apply_direct_bundle(
+        ClusterStore::for_storage_root(bundle.canonical_root())?,
+        bundle,
+        requested_id,
+        caller,
+        report_id,
+    )
+    .await
+}
+
+/// Submit source against a separately selected direct storage root. The ordinary
+/// owner retains capture, same-ID nonexecution, admission, and publication rules.
+pub async fn apply_deployment_at_root(
+    config_dir: impl AsRef<Path>,
+    root: &str,
+    requested_id: Option<&str>,
+    caller: &DeploymentCaller,
+    report_id: impl FnOnce(&str, &str, &str),
+) -> Result<DeploymentLookup, Diagnostic> {
+    let bundle = capture_deployment_at_root(config_dir, root)?;
+    apply_direct_bundle(
+        ClusterStore::for_storage_root(bundle.canonical_root())?,
+        bundle,
+        requested_id,
+        caller,
+        report_id,
+    )
+    .await
+}
+
+/// Apply source to a target without re-reading provider endpoint settings.
+pub async fn apply_deployment_with_binding(
+    config_dir: impl AsRef<Path>,
+    binding: &omnigraph_storage::CapturedStorageBinding,
+    requested_id: Option<&str>,
+    caller: &DeploymentCaller,
+    report_id: impl FnOnce(&str, &str, &str),
+) -> Result<DeploymentLookup, Diagnostic> {
+    let bundle = capture_deployment_at_root(config_dir, binding.uri())?;
+    apply_direct_bundle(
+        ClusterStore::for_storage_binding(binding)?,
+        bundle,
+        requested_id,
+        caller,
+        report_id,
+    )
+    .await
+}
+
+async fn apply_direct_bundle(
+    store: ClusterStore,
+    bundle: CapturedDeployment,
+    requested_id: Option<&str>,
+    caller: &DeploymentCaller,
+    report_id: impl FnOnce(&str, &str, &str),
+) -> Result<DeploymentLookup, Diagnostic> {
     bootstrap_ledger(&store, &bundle, caller).await?;
     if let Some(id) = requested_id {
         let (state, _) = read_existing(&store).await?;
@@ -1767,7 +1894,7 @@ pub(super) async fn execute_captured_deployment_in_store(
                 .state = GraphDeploymentState::Started;
             cas = replace(store, &mut state, &cas).await?;
             seams::fail(&DEPLOYMENT_AFTER_STARTED)?;
-            let db = Omnigraph::apply_prepared_graph_create_with_io_scope(create, store.io_scope()).await
+            let db = Omnigraph::apply_prepared_graph_create_with_storage(create, store.graph_storage(create.root())?).await
                 .map_err(|error| refusal("deployment_outcome_unknown", format!("deployment {id} graph creation remains outstanding under admission {}: {error}", admission.lock_id())))?;
             let snapshot = db
                 .snapshot_of(ReadTarget::branch("main"))
@@ -1932,15 +2059,15 @@ pub async fn preflight_deployment(
     let store = ClusterStore::for_storage_root(bundle.canonical_root())?;
     validate_bundle(bundle, &store.canonical_root()?)?;
     let snapshot = store.read_state(&mut store.observations()).await?;
-    preflight_deployment_at(bundle, caller, snapshot).await
+    preflight_deployment_at(bundle, caller, snapshot, &store).await
 }
 
 pub(crate) async fn preflight_deployment_at(
     bundle: &CapturedDeployment,
     caller: &DeploymentCaller,
     snapshot: crate::store::StateSnapshot,
+    store: &ClusterStore,
 ) -> Result<BTreeMap<String, SchemaMigrationPlan>, Diagnostic> {
-    let store = ClusterStore::for_storage_root(bundle.canonical_root())?;
     validate_bundle(bundle, &store.canonical_root()?)?;
     let state = snapshot.state.unwrap_or_else(empty_ledger);
     require_v2(&state)?;
@@ -2081,10 +2208,13 @@ async fn prepare_graphs(
                     ),
                 ));
             }
-            let create =
-                Omnigraph::prepare_graph_create(&uri, source_for(bundle, &schema_address)?)
-                    .await
-                    .map_err(|error| refusal("graph_create_preflight_failed", error.to_string()))?;
+            let create = Omnigraph::prepare_graph_create_with_storage(
+                &uri,
+                source_for(bundle, &schema_address)?,
+                store.graph_storage(&uri)?,
+            )
+            .await
+            .map_err(|error| refusal("graph_create_preflight_failed", error.to_string()))?;
             admission::admitted_graph_id(
                 &bundle.canonical_root,
                 &BTreeMap::from([(graph.clone(), create.desired_contract().clone())]),
@@ -2537,7 +2667,7 @@ pub async fn applied_deployment_contracts(
     result_revision: u64,
 ) -> Result<BTreeMap<String, omnigraph::db::SchemaContractDigest>, Diagnostic> {
     admission.validate_deployment().await?;
-    let store = ClusterStore::for_storage_root(admission.canonical_root())?;
+    let store = admission.store();
     let (state, _) = read_existing(&store).await?;
     require_v2(&state)?;
     if state.outstanding.is_some()
@@ -2559,7 +2689,37 @@ pub async fn reconcile_deployment(
     writers_stopped: bool,
     caller: &DeploymentCaller,
 ) -> Result<DeploymentLookup, Diagnostic> {
-    let store = ClusterStore::for_storage_root(root)?;
+    reconcile_deployment_in_store(
+        ClusterStore::for_storage_root(root)?,
+        id,
+        writers_stopped,
+        caller,
+    )
+    .await
+}
+
+/// Reconcile one accepted invocation with the selected provider binding.
+pub async fn reconcile_deployment_with_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+    id: &str,
+    writers_stopped: bool,
+    caller: &DeploymentCaller,
+) -> Result<DeploymentLookup, Diagnostic> {
+    reconcile_deployment_in_store(
+        ClusterStore::for_storage_binding(binding)?,
+        id,
+        writers_stopped,
+        caller,
+    )
+    .await
+}
+
+async fn reconcile_deployment_in_store(
+    store: ClusterStore,
+    id: &str,
+    writers_stopped: bool,
+    caller: &DeploymentCaller,
+) -> Result<DeploymentLookup, Diagnostic> {
     let (before, _) = read_existing(&store).await?;
     require_v2(&before)?;
     lookup_policies(&store, &before, caller, Some(id)).await?;
@@ -2630,9 +2790,12 @@ pub async fn reconcile_deployment(
                 } else {
                     // A partial purge need not have a complete recovery catalog.
                     // Still reject a readable foreign manifest before deleting it.
-                    Omnigraph::open_read_only(&delete.root)
-                        .await
-                        .map_err(|error| refusal("graph_unavailable", error.to_string()))
+                    Omnigraph::open_read_only_with_storage(
+                        &delete.root,
+                        store.graph_storage(&delete.root)?,
+                    )
+                    .await
+                    .map_err(|error| refusal("graph_unavailable", error.to_string()))
                 };
                 match opened {
                     Ok(db) => {
@@ -2713,8 +2876,9 @@ pub async fn reconcile_deployment(
                         .unwrap()
                         .recovery_executor = Some(caller.authority()?);
                     cas = replace(&store, &mut state, &cas).await?;
-                    match Omnigraph::settle_prepared_graph_create_after_quiescence(
+                    match Omnigraph::settle_prepared_graph_create_after_quiescence_with_storage(
                         entry.create.as_ref().unwrap(),
+                        store.graph_storage(entry.create.as_ref().unwrap().root())?,
                     )
                     .await
                     .map_err(|error| refusal("deployment_outcome_unknown", error.to_string()))?

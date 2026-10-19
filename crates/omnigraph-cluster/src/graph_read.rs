@@ -36,6 +36,33 @@ impl GraphReadAuthority {
             };
         };
         let store = ClusterStore::for_storage_root(&root)?;
+        Self::capture_with_store(graph_uri, expected_state_cas, store).await
+    }
+
+    /// Capture read authority using the target's already-resolved provider binding.
+    pub async fn capture_with_binding(
+        binding: &omnigraph_storage::CapturedStorageBinding,
+        expected_state_cas: Option<&str>,
+    ) -> Result<Option<Self>, Diagnostic> {
+        let Some(root) = crate::serve::cluster_root_for_graph_binding(binding).await? else {
+            return if expected_state_cas.is_some() {
+                Err(revision_changed())
+            } else {
+                Ok(None)
+            };
+        };
+        let root_binding = binding.for_uri(&root).map_err(|error| {
+            Diagnostic::error("storage_root_invalid", "storage", error.to_string())
+        })?;
+        let store = ClusterStore::for_storage_binding(&root_binding)?;
+        Self::capture_with_store(binding.uri(), expected_state_cas, store).await
+    }
+
+    async fn capture_with_store(
+        graph_uri: &str,
+        expected_state_cas: Option<&str>,
+        store: ClusterStore,
+    ) -> Result<Option<Self>, Diagnostic> {
         let snapshot = store.read_state(&mut store.observations()).await?;
         let state = snapshot.state.ok_or_else(revision_changed)?;
         let state_cas = snapshot.state_cas.ok_or_else(revision_changed)?;

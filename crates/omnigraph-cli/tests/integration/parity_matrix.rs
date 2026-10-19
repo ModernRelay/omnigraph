@@ -4,7 +4,7 @@
 //! invocation against (a) the local graph directly and (b) a spawned
 //! server on a twin copy of the same graph. Actor-bearing operations use the
 //! SAME actor on both arms (local `--as act-parity`; remote bearer token
-//! resolving to `act-parity`); read-only Blob commands reject `--as`.
+//! resolving to `act-parity`); read commands reject `--as`.
 //! Scrub the declared-volatile allowlist
 //! (`support::scrub_volatile` — ids, wall-clock, transport locations);
 //! everything else must match exactly.
@@ -26,7 +26,7 @@ const KNOWN_DIVERGENCES: &[&str] = &[
 ];
 
 /// One matched setup per row: twin graphs + the parity Cedar bundle on the
-/// served arm. The local (`--store`) arm carries no policy (RFC-011); the
+/// served arm. The local (`--target`) arm carries no policy (RFC-011); the
 /// bundle is permissive for `act-parity`, so the arms still agree.
 struct Parity {
     _temp: TempDir,
@@ -267,15 +267,15 @@ fn parity_schema_show() {
     std::fs::write(
         home.join("config.yaml"),
         format!(
-            "servers:\n  local:\n    url: '{}'\nprofiles:\n  catalogue:\n    server: local\n    default_graph: og_catalog\n",
+            "target_config_version: 1\ntargets:\n  local:\n    kind: server\n    endpoint: '{}'\n    credential: local\n    default_graph: og_catalog\n",
             p.server.base_url
         ),
     )
     .unwrap();
     for addressing in [
-        vec!["--store", "og_catalog"],
-        vec!["--server", &p.server.base_url, "--graph", "og_catalog"],
-        vec!["--profile", "catalogue"],
+        vec!["--target", "og_catalog"],
+        vec!["--target", &p.server.base_url, "--graph", "og_catalog"],
+        vec!["--target", "local"],
     ] {
         let output = output_success(
             cli()
@@ -409,14 +409,14 @@ fn parity_mutate() {
             command.args(args);
             if arm == "local" {
                 command
-                    .arg("--store")
+                    .arg("--target")
                     .arg(&p.local)
                     .arg("--as")
                     .arg(PARITY_ACTOR);
             } else {
                 command
                     .envs(p.server.credential(PARITY_TOKEN))
-                    .arg("--server")
+                    .arg("--target")
                     .arg(&p.server.base_url)
                     .arg("--graph")
                     .arg(PARITY_GRAPH_ID);
@@ -1003,7 +1003,7 @@ fn assert_slow_export_and_baseline_complete(p: &Parity) {
         "--json",
     ]);
     assert_write_parity("slow export fixture", &local, &remote);
-    let expected = output_success(cli().args(["export", "--store", p.local.to_str().unwrap()]));
+    let expected = output_success(cli().args(["export", "--target", p.local.to_str().unwrap()]));
     assert!(
         expected.stdout.len() > 8 * 1024 * 1024,
         "fixture must exceed socket buffers"

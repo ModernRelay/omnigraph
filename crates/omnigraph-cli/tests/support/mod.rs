@@ -69,24 +69,41 @@ pub mod managed_http;
 #[cfg(unix)]
 pub mod unix_gateway;
 
-pub fn write_managed_context(config: &Path, origin: &str) {
-    fs::create_dir_all(config.join(".omnigraph")).unwrap();
-    fs::write(
-        config.join(".omnigraph/context"),
-        format!("version: 2\ncluster: managed-test\napi: {origin}\norganization_id: account-one\n"),
-    )
-    .unwrap();
+/// Operator home for a managed fixture; folder contents never select a target.
+pub fn managed_home(config: &Path) -> PathBuf {
+    config.join("operator-home")
 }
 
-pub fn managed_cli(config: &Path, origin: &str) -> Command {
+pub fn write_managed_target(config: &Path, origin: &str) {
+    let home = managed_home(config);
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("config.yaml"), format!(
+        "target_config_version: 1\ntargets:\n  managed-test:\n    kind: managed\n    scope: cluster\n    api: {origin}\n    organization_id: account-one\n    cluster_id: managed-test\n    cluster_incarnation: inc-one\n    control_auth: automation-env\n  managed-account:\n    kind: managed\n    scope: account\n    api: {origin}\n    organization_id: account-one\n    control_auth: automation-env\n"
+    )).unwrap();
+}
+
+pub fn managed_command(config: &Path, origin: &str, target: &str) -> Command {
     let mut command = cli();
     command
+        .env("OMNIGRAPH_HOME", managed_home(config))
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", origin)
         .env("OMNIGRAPH_TOKEN", "data-token-must-not-be-used")
         .current_dir(config)
-        .args(["cluster", "--managed"])
+        .args(["--target", target])
         .timeout(Duration::from_secs(15));
+    command
+}
+
+pub fn managed_cli(config: &Path, origin: &str) -> Command {
+    let mut command = managed_command(config, origin, "managed-test");
+    command.arg("cluster");
+    command
+}
+
+pub fn managed_account_cli(config: &Path, origin: &str) -> Command {
+    let mut command = managed_command(config, origin, "managed-account");
+    command.arg("cluster");
     command
 }
 
@@ -179,6 +196,13 @@ pub fn stdout_string(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
 }
 
+/// Machine output may still carry the mandatory resolved-target line on stderr.
+pub fn only_target_report(output: &Output) -> bool {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .all(|line| line.starts_with("target "))
+}
+
 pub fn parse_stdout_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
@@ -197,6 +221,7 @@ pub fn load_fixture(graph: &Path) {
             .arg("overwrite")
             .arg("--data")
             .arg(&data)
+            .arg("--target")
             .arg(graph),
     );
 }
@@ -257,7 +282,7 @@ policy: {{}}
     )
 }
 
-/// The name every [`KeyedServer`] declares under `servers:`, and the variable
+/// The credential owner every [`KeyedServer`] declares under `targets:`, and the variable
 /// that binds its token.
 pub const KEYED_SERVER_NAME: &str = "test-server";
 pub const KEYED_SERVER_TOKEN_ENV: &str = "OMNIGRAPH_TOKEN_TEST_SERVER";
@@ -275,7 +300,7 @@ impl KeyedServer {
         fs::write(
             home.path().join("config.yaml"),
             format!(
-                "servers:\n  {KEYED_SERVER_NAME}:\n    url: {}\n",
+                "target_config_version: 1\ntargets:\n  {KEYED_SERVER_NAME}:\n    kind: server\n    endpoint: {}\n    credential: {KEYED_SERVER_NAME}\n",
                 yaml_string(url)
             ),
         )
@@ -312,6 +337,24 @@ impl TestServer {
     /// addressing `base_url`.
     pub fn credential(&self, token: &str) -> [(&'static str, std::ffi::OsString); 2] {
         self.operator.env(token)
+    }
+
+    /// Only predecessor executables use their historical operator format.
+    pub fn legacy_credential(&self, token: &str) -> [(&'static str, std::ffi::OsString); 2] {
+        let home = self.operator.home().join("legacy");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            format!(
+                "servers:\n  {KEYED_SERVER_NAME}:\n    url: {}\n",
+                yaml_string(&self.base_url)
+            ),
+        )
+        .unwrap();
+        [
+            ("OMNIGRAPH_HOME", home.into_os_string()),
+            (KEYED_SERVER_TOKEN_ENV, token.into()),
+        ]
     }
 
     pub fn stop(mut self) -> String {
@@ -655,6 +698,7 @@ pub fn converged_loaded_cluster(graph_id: &str, policy_yaml: Option<&str>) -> Cl
             .arg(fixture("test.jsonl"))
             .arg("--mode")
             .arg("overwrite")
+            .arg("--target")
             .arg(&served_root),
     );
 
@@ -849,7 +893,7 @@ pub fn unlock_cluster_fixture(root: &Path) {
     }
     let lock: Value = serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
     output_success(cli().args([
-        "--cluster",
+        "--target",
         &format!("file://{}", root.display()),
         "cluster",
         "force-unlock",
@@ -862,7 +906,9 @@ pub fn unlock_cluster_fixture(root: &Path) {
 pub fn apply_cluster_fixture(root: &Path) -> Value {
     let output = output_success(
         cli()
-            .args(["--as", "act-cluster-test", "cluster", "apply", "--config"])
+            .args(["--as", "act-cluster-test", "--target"])
+            .arg(root)
+            .args(["cluster", "apply", "--config"])
             .arg(root)
             .arg("--json"),
     );
@@ -877,14 +923,15 @@ pub fn cluster_json(root: &std::path::Path, command: &str) -> serde_json::Value 
     if command == "apply" {
         return apply_cluster_fixture(root);
     }
-    parse_stdout_json(&output_success(
-        cli()
-            .arg("cluster")
-            .arg(command)
-            .arg("--config")
-            .arg(root)
-            .arg("--json"),
-    ))
+    let mut invocation = cli();
+    invocation.args(["cluster", command, "--json"]);
+    if command != "validate" {
+        invocation.arg("--target").arg(root);
+    }
+    if matches!(command, "plan" | "observe" | "validate") {
+        invocation.arg("--config").arg(root);
+    }
+    parse_stdout_json(&output_success(&mut invocation))
 }
 
 pub fn write_multi_graph_cluster_fixture(root: &std::path::Path) {
@@ -1223,6 +1270,8 @@ policies:
         cli()
             .arg("cluster")
             .arg("apply")
+            .arg("--target")
+            .arg(&cluster_dir)
             .arg("--config")
             .arg(&cluster_dir),
     );
@@ -1419,6 +1468,8 @@ policies:
         fixture_cli()
             .arg("cluster")
             .arg("apply")
+            .arg("--target")
+            .arg(&cluster_dir)
             .arg("--config")
             .arg(&cluster_dir),
     );
@@ -1433,6 +1484,7 @@ policies:
             .arg(fixture("test.jsonl"))
             .arg("--mode")
             .arg("overwrite")
+            .arg("--target")
             .arg(&served_root),
     );
 
@@ -1450,39 +1502,32 @@ policies:
 
 /// Run one CLI invocation per arm with identical verb args: locally against
 /// `local_graph` and remotely against `server`. Actor-bearing operations
-/// use `--as` locally and an equivalent bearer identity remotely; read-only
-/// Blob commands reject `--as`. Returns raw outputs for parity comparison.
+/// use `--as` locally and an equivalent bearer identity remotely; reads
+/// reject `--as`. Returns raw outputs for parity comparison.
 pub fn run_both(
     local_graph: &Path,
     server: &TestServer,
     args: &[&str],
 ) -> (std::process::Output, std::process::Output) {
-    // Address both arms with GLOBAL flags (`--store` / `--server`) appended after
-    // the verb + its args, so the address is placed correctly regardless of
-    // subcommand nesting (a positional graph only works for top-level verbs;
-    // `schema show <graph>` etc. need the global flag). Local = embedded store,
-    // remote = served. RFC-011: a direct (`--store`) write carries no Cedar
-    // policy — the parity policy is permissive for `act-parity` on the served
-    // arm, so the two arms still agree.
+    // The same global --target grammar addresses both direct and served arms.
+    // Direct writes carry no Cedar policy; the served parity policy permits
+    // act-parity, so both arms still agree.
     let mut local = cli();
-    local.args(args).arg("--store").arg(local_graph);
+    local.args(args).arg("--target").arg(local_graph);
     if args.first() == Some(&"blob") {
         local.env("NO_COLOR", "1");
     }
-    // The read commands (blob get/stat, branch diff/merge-base, commit
-    // list/show/changes, query, changes, diff) reject `--as`: a served read
-    // resolves the actor from its bearer token and a direct read attributes
-    // none, so passing `--as` there is an error. Only the write verbs,
-    // `blob put`/`clear` and `commit publish`/`drop` among them, carry the
-    // parity actor on the direct arm.
-    let read = match args {
-        ["blob", verb, ..] => matches!(*verb, "get" | "stat"),
-        ["branch", verb, ..] => matches!(*verb, "diff" | "merge-base"),
-        ["commit", verb, ..] => matches!(*verb, "list" | "show" | "changes"),
-        [verb, ..] => matches!(*verb, "query" | "changes" | "diff"),
+    // Only actor-bearing writes carry --as on the direct arm. The served
+    // arm always resolves its actor from the bearer credential.
+    let actor = match args {
+        ["blob", verb, ..] => matches!(*verb, "put" | "clear"),
+        ["branch", verb, ..] => matches!(*verb, "create" | "delete" | "merge"),
+        ["commit", verb, ..] => matches!(*verb, "publish" | "drop"),
+        ["schema", "apply", ..] => true,
+        [verb, ..] => matches!(*verb, "mutate" | "load" | "rebuild-full-text-indexes"),
         [] => false,
     };
-    if !read {
+    if actor {
         local.arg("--as").arg(PARITY_ACTOR);
     }
 
@@ -1490,7 +1535,7 @@ pub fn run_both(
     remote
         .envs(server.credential(PARITY_TOKEN))
         .args(args)
-        .arg("--server")
+        .arg("--target")
         .arg(&server.base_url)
         // RFC-011: the parity server is cluster-only (multi-graph), so the
         // remote arm must name the graph it addresses.

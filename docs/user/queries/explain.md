@@ -22,7 +22,7 @@ explain query adults() {
 ```
 
 ```bash
-omnigraph query --query explain.gq --store graph.omni --format kv
+omnigraph query --query explain.gq --target ./graph.omni --format kv
 ```
 
 The result is a table with one row per plan node, in the order an `EXPLAIN`

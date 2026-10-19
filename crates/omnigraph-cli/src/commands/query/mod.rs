@@ -14,19 +14,14 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{ReadTarget, SnapshotId};
 use omnigraph_api_types::{ChangeOutput, ReadOutput};
 use omnigraph_compiler::query::ast::{BranchWrite, CommitWrite, LoadStmtMode};
-use reqwest::Method;
 use serde_json::Value;
 
 use crate::client::{GraphClient, parse_set_flags};
-use crate::helpers::{
-    confirm_destructive, remote_json, remote_url, resolve_query_path,
-    resolve_server_flag_with_config, served_client_with_config,
-};
+use crate::helpers::{confirm_destructive, resolve_query_path};
 use crate::input::Input;
 use crate::invocation::MachineErrors;
-use crate::operator::{InvocationConfig, OperatorAlias, OperatorConfig};
+use crate::operator::{InvocationConfig, OperatorAlias};
 use crate::output::{write_change_human, write_json};
-use crate::planes::Capability;
 use crate::presentation::ReadPresentation;
 
 use args::ParamsArgs;
@@ -36,12 +31,9 @@ use prepare::{Envelope, MutationOperation, QueryInput, ReadOperation};
 /// Only the global arguments this command family consumes.
 pub(crate) struct GraphScope<'a> {
     pub operator: &'a InvocationConfig,
-    pub capability: Capability,
-    pub server: Option<&'a str>,
+    pub target: &'a crate::targets::ResolvedTarget,
     pub graph: Option<&'a str>,
     pub actor: Option<&'a str>,
-    pub profile: Option<&'a str>,
-    pub store: Option<&'a str>,
     pub yes: bool,
 }
 
@@ -65,31 +57,13 @@ pub(crate) async fn run_query(
         json,
     } = args;
     let settings = parse_set_flags(&settings)?;
-    // Ordinary query routing and rendering share this snapshot. A managed
-    // client has already resolved its own context; preserve its existing
-    // tolerance of an invalid optional operator presentation file.
-    let fallback = OperatorConfig::default();
-    let operator = if managed_client.is_some() {
-        scope.operator.optional_get(stderr)?.unwrap_or(&fallback)
-    } else {
-        scope.operator.get(stderr)?
-    };
+    let operator = scope.operator.get(stderr)?;
     let presentation = ReadPresentation::capture(operator, format, json, None);
     *machine = presentation.machine_errors();
     let client = if let Some(client) = managed_client {
         client
     } else {
-        GraphClient::resolve_with_config(
-            scope.operator,
-            operator,
-            scope.capability,
-            scope.server,
-            scope.graph,
-            None,
-            scope.profile,
-            scope.store,
-        )
-        .await?
+        GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr).await?
     };
     let params_json = load_params_json(&params)?;
     let has_target = branch.is_some() || snapshot.is_some();
@@ -189,15 +163,11 @@ pub(crate) async fn run_mutate(
     let client = if let Some(client) = managed_client {
         client
     } else {
-        GraphClient::resolve_with_policy(
+        GraphClient::from_target(
             scope.operator,
-            scope.capability,
-            scope.server,
+            scope.target,
             scope.graph,
-            None,
             scope.actor,
-            scope.profile,
-            scope.store,
             stderr,
         )
         .await?
@@ -306,6 +276,7 @@ pub(crate) async fn run_mutate(
 
 pub(crate) async fn run_alias(
     input: &InvocationConfig,
+    target: &crate::targets::ResolvedTarget,
     args: AliasArgs,
     machine: &mut Option<MachineErrors>,
     stdout: &mut dyn Write,
@@ -319,24 +290,18 @@ pub(crate) async fn run_alias(
         json,
     } = args;
     let operator_config = input.get(stderr)?;
-    let Some(operator_alias) = operator_config.aliases.get(&name) else {
-        let defined: Vec<&str> = operator_config.aliases.keys().map(String::as_str).collect();
-        bail!(
-            "unknown alias '{name}'; defined aliases: [{}] \
-             (add it under `aliases:` in ~/.omnigraph/config.yaml)",
-            defined.join(", ")
-        );
-    };
+    let operator_alias = operator_config.alias(&name)?;
     let presentation =
         ReadPresentation::capture(operator_config, format, json, operator_alias.format);
     *machine = presentation.machine_errors();
     let output = execute_operator_alias(
         input,
-        operator_config,
+        target,
         &name,
         operator_alias,
         &args,
         load_params_json(&params)?,
+        stderr,
     )
     .await?;
     presentation.write_read(&output, stdout)?;
@@ -381,32 +346,26 @@ fn load_params_json(params: &ParamsArgs) -> Result<Option<Value>> {
 
 async fn execute_operator_alias(
     input: &InvocationConfig,
-    operator_config: &OperatorConfig,
+    target: &crate::targets::ResolvedTarget,
     alias_name: &str,
     alias: &OperatorAlias,
     alias_args: &[String],
     explicit_params: Option<Value>,
+    stderr: &mut dyn Write,
 ) -> Result<ReadOutput> {
-    let root = resolve_server_flag_with_config(operator_config, Some(&alias.server), None)?
-        .expect("server name is present");
-    let uri =
-        resolve_server_flag_with_config(operator_config, Some(&root), alias.graph.as_deref())?
-            .expect("server name is present");
-    let (client, bearer_token) = served_client_with_config(input, operator_config, &root, &uri)?;
+    let client =
+        GraphClient::from_target(input, target, alias.graph.as_deref(), None, stderr).await?;
     let params = prepare::alias_params(alias_name, alias, alias_args, explicit_params)?;
-    let mut body = serde_json::Map::new();
-    body.insert("expect_mutation".to_string(), Value::Bool(false));
-    if !params.is_empty() {
-        body.insert("params".to_string(), Value::Object(params));
-    }
-    remote_json(
-        &client,
-        Method::POST,
-        remote_url(&uri, &["queries", &alias.query], &[])?,
-        Some(Value::Object(body)),
-        bearer_token.as_deref(),
-    )
-    .await
+    client
+        .invoke_named(
+            &alias.query,
+            false,
+            (!params.is_empty()).then_some(&Value::Object(params)),
+            None,
+            None,
+            None,
+        )
+        .await
 }
 
 /// Authorize an embedded file source's directory, without opening the source.

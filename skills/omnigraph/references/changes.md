@@ -13,7 +13,7 @@ commit published by that attempt; a no-op mutation returns `"commit": null`.
 
 Protect a mutation derived from a read with `--if-commit <graph_commit_id>`.
 Any intervening branch commit fails without effects (HTTP `412`; CLI exit `4`
-through a server, exit `1` on a direct `--store` open).
+through a server, exit `1` on a direct `--target` open).
 Re-read and decide again rather than retrying the stale mutation.
 
 ## Branch statements
@@ -35,7 +35,7 @@ are refused on deprecated query/mutation routes and the conditional-write route.
 ## Inspect one commit
 
 ```bash
-omnigraph commit changes <commit-id> --store graph.omni --json
+omnigraph commit changes <commit-id> --target ./graph.omni --json
 ```
 
 The commit is compared with its first parent. Inserts contain `after`, updates
@@ -55,10 +55,10 @@ capture a baseline instead of treating them as empty changes.
 ## Follow a branch
 
 ```bash
-omnigraph changes poll --start now --store graph.omni --json
-omnigraph changes poll --start beginning --store graph.omni --json
-omnigraph changes poll --start after:<commit-id> --store graph.omni --json
-omnigraph changes poll --cursor <cursor> --store graph.omni --json
+omnigraph changes poll --start now --target ./graph.omni --json
+omnigraph changes poll --start beginning --target ./graph.omni --json
+omnigraph changes poll --start after:<commit-id> --target ./graph.omni --json
+omnigraph changes poll --cursor <cursor> --target ./graph.omni --json
 ```
 
 Each poll captures a fixed branch head and walks complete commits in first-parent
@@ -82,7 +82,7 @@ Cleanup can reclaim history needed by a cursor. A `410 change_feed_gap` cannot
 be repaired by retrying the same cursor. Capture and install a new baseline:
 
 ```bash
-omnigraph changes baseline --out snapshot.jsonl --store graph.omni --json
+omnigraph changes baseline --out snapshot.jsonl --target ./graph.omni --json
 ```
 
 The HTTP equivalent streams snapshot entity records followed by one terminal

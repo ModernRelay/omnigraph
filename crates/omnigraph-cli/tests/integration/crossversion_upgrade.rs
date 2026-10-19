@@ -43,8 +43,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::support::{
-    HERMETIC_OPERATOR_HOME, apply_cluster_fixture, cli, fixture, output_failure, output_success,
-    unlock_cluster_fixture,
+    HERMETIC_OPERATOR_HOME, apply_cluster_fixture, cli, fixture, only_target_report,
+    output_failure, output_success, unlock_cluster_fixture,
 };
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::{BlobCell, BlobContent, EntityKind};
@@ -119,7 +119,11 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         let path = root.join("__cluster/lock.json");
         let lock: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         output_success(cli_at(binary).args([
-            "--cluster",
+            if binary == old.as_path() {
+                "--cluster"
+            } else {
+                "--target"
+            },
             &root_uri,
             "cluster",
             "force-unlock",
@@ -165,10 +169,18 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     let served = |binary: &Path, server: &support::TestServer, args: &[&str]| {
         parse_stdout_json(&output_success(
             cli_at(binary)
-                .envs(server.credential("parity-tok"))
+                .envs(if binary == old.as_path() {
+                    server.legacy_credential("parity-tok")
+                } else {
+                    server.credential("parity-tok")
+                })
                 .args(args)
                 .args([
-                    "--server",
+                    if binary == old.as_path() {
+                        "--server"
+                    } else {
+                        "--target"
+                    },
                     &server.base_url,
                     "--graph",
                     "knowledge",
@@ -179,8 +191,22 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     let apply = |binary: &Path, server: &support::TestServer| {
         parse_stdout_json(&output_success(
             cli_at(binary)
-                .envs(server.credential("parity-tok"))
-                .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+                .envs(if binary == old.as_path() {
+                    server.legacy_credential("parity-tok")
+                } else {
+                    server.credential("parity-tok")
+                })
+                .args([
+                    "cluster",
+                    "apply",
+                    if binary == old.as_path() {
+                        "--server"
+                    } else {
+                        "--target"
+                    },
+                    &server.base_url,
+                    "--config",
+                ])
                 .arg(root)
                 .arg("--json"),
         ))
@@ -268,7 +294,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     assert_eq!(fs::read(&state_path).unwrap(), old_bytes);
     assert!(!root.join("__cluster/lock.json").exists());
     let refused = output_failure(cli_at(&current).args([
-        "--cluster",
+        "--target",
         &root_uri,
         "cluster",
         "upgrade-ledger",
@@ -280,7 +306,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     output_success(cli_at(&current).args([
         "--as",
         "act-parity",
-        "--cluster",
+        "--target",
         &root_uri,
         "cluster",
         "upgrade-ledger",
@@ -824,7 +850,7 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
 
     // 3. The CURRENT binary refuses the genuine v3 graph, names the writing
     //    release, and nudges to export — on the real on-disk shape.
-    let refusal = output_failure(cli().arg("snapshot").arg(&old_graph));
+    let refusal = output_failure(cli().arg("snapshot").arg("--target").arg(&old_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
         stderr.contains("export"),
@@ -852,11 +878,12 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
             .arg("overwrite")
             .arg("--data")
             .arg(&v3_jsonl)
+            .arg("--target")
             .arg(&new_graph),
     );
 
     // 5. Round-trip fidelity: re-export with the current binary and compare.
-    let reexport = output_success(cli().arg("export").arg(&new_graph));
+    let reexport = output_success(cli().arg("export").arg("--target").arg(&new_graph));
     assert_export_fidelity("v3 → v10", &export.stdout, &reexport.stdout);
     assert_rebuilt_v10_graph(&new_graph);
 }
@@ -907,7 +934,7 @@ fn current_v10_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v10() {
     let jsonl = temp.path().join("v4.jsonl");
     std::fs::write(&jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
-    let refusal = output_failure(cli().arg("snapshot").arg(&old_graph));
+    let refusal = output_failure(cli().arg("snapshot").arg("--target").arg(&old_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(stderr.contains("0.8.x"), "got: {stderr}");
     assert!(stderr.contains("export"), "got: {stderr}");
@@ -927,9 +954,10 @@ fn current_v10_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v10() {
             .arg("overwrite")
             .arg("--data")
             .arg(&jsonl)
+            .arg("--target")
             .arg(&new_graph),
     );
-    let reexport = output_success(cli().arg("export").arg(&new_graph));
+    let reexport = output_success(cli().arg("export").arg("--target").arg(&new_graph));
     assert_export_fidelity("v4 → v10", &export.stdout, &reexport.stdout);
     assert_rebuilt_v10_graph(&new_graph);
 
@@ -1011,7 +1039,7 @@ fn current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10() {
     let jsonl = temp.path().join("v5.jsonl");
     std::fs::write(&jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
-    let refusal = output_failure(cli().arg("snapshot").arg(&v5_graph));
+    let refusal = output_failure(cli().arg("snapshot").arg("--target").arg(&v5_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
         stderr.contains("unreleased final-v5") && stderr.contains("46b6d908"),
@@ -1061,6 +1089,7 @@ fn current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10() {
             .arg("overwrite")
             .arg("--data")
             .arg(&duplicate_jsonl)
+            .arg("--target")
             .arg(&rejected_graph),
     );
     let rejected_stderr = String::from_utf8_lossy(&rejected.stderr);
@@ -1095,9 +1124,10 @@ fn current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10() {
             .arg("overwrite")
             .arg("--data")
             .arg(&jsonl)
+            .arg("--target")
             .arg(&v9_graph),
     );
-    let reexport = output_success(cli().arg("export").arg(&v9_graph));
+    let reexport = output_success(cli().arg("export").arg("--target").arg(&v9_graph));
     assert_export_fidelity("v5 → v10", &export.stdout, &reexport.stdout);
     assert_exported_blob_fidelity("v5 → v10", &export.stdout, &reexport.stdout);
     assert_rebuilt_v10_graph(&v9_graph);
@@ -1177,7 +1207,7 @@ fn current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10() {
     let jsonl = temp.path().join("v6.jsonl");
     std::fs::write(&jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
-    let refusal = output_failure(cli().arg("snapshot").arg(&v6_graph));
+    let refusal = output_failure(cli().arg("snapshot").arg("--target").arg(&v6_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
         stderr.contains("0.9.x or 0.10.x"),
@@ -1203,9 +1233,10 @@ fn current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10() {
             .arg("overwrite")
             .arg("--data")
             .arg(&jsonl)
+            .arg("--target")
             .arg(&v9_graph),
     );
-    let reexport = output_success(cli().arg("export").arg(&v9_graph));
+    let reexport = output_success(cli().arg("export").arg("--target").arg(&v9_graph));
     assert_export_fidelity("v6 → v10", &export.stdout, &reexport.stdout);
     assert_exported_blob_fidelity("v6 → v10", &export.stdout, &reexport.stdout);
     assert_rebuilt_v10_graph(&v9_graph);
@@ -1241,10 +1272,11 @@ fn storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph() {
     let before = graph_files(&graph);
 
     for args in [
-        vec!["upgrade", uri, "--check", "--json"],
-        vec!["upgrade", uri, "--json"],
+        vec!["upgrade", "--target", uri, "--check", "--json"],
+        vec!["upgrade", "--target", uri, "--json"],
         vec![
             "upgrade",
+            "--target",
             uri,
             "--check",
             "--to-format",
@@ -1261,6 +1293,7 @@ fn storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph() {
     for other in ["7", "8", "10", "11", "13"] {
         let refused = support::parse_stdout_json(&output_failure(cli().args([
             "upgrade",
+            "--target",
             uri,
             "--check",
             "--to-format",
@@ -1279,12 +1312,12 @@ fn storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph() {
     }
     assert_eq!(graph_files(&graph), before, "upgrade must not write");
 
-    let report =
-        support::parse_stdout_json(&output_success(cli().args(["upgrade", uri, "--json"])));
+    let report = support::parse_stdout_json(&output_success(
+        cli().args(["upgrade", "--target", uri, "--json"]),
+    ));
     let location = report["location"].as_str().unwrap();
-    let echo = format!("omnigraph upgrade → {location} (direct, local)");
     for (flags, mode) in [(vec!["--check"], "check"), (vec![], "execute")] {
-        let output = output_success(cli().args(["upgrade", uri]).args(&flags));
+        let output = output_success(cli().args(["upgrade", "--target", uri]).args(&flags));
         let mut expected = human_report_lines(
             &report,
             &format!("upgrade {location}: already_current ({mode})"),
@@ -1295,31 +1328,23 @@ fn storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph() {
             expected.push(CHECK_ADVISORY_LINE.to_owned());
         }
         assert_eq!(
-            String::from_utf8(output.stdout)
-                .unwrap()
+            String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .collect::<Vec<_>>(),
             expected,
             "{mode}"
         );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            stderr.lines().any(|line| line == echo),
-            mode == "execute",
-            "only execute mode echoes the write target: {stderr}"
-        );
+        assert!(only_target_report(&output), "{mode}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("target "));
     }
-    let quiet = output_success(cli().args(["--quiet", "upgrade", uri]));
-    assert!(
-        !String::from_utf8_lossy(&quiet.stderr).contains("omnigraph upgrade →"),
-        "--quiet must drop the write-target echo"
-    );
+    let retired = output_failure(cli().args(["--quiet", "upgrade", "--target", uri]));
+    assert!(String::from_utf8_lossy(&retired.stderr).contains("--quiet"));
     assert_eq!(graph_files(&graph), before, "upgrade must not write");
 }
 
 const CHECK_ADVISORY_LINE: &str = "Check is advisory. Keep the graph offline: stop all readers, \
      writers and maintenance, retain a verified backup of the whole root, then run `omnigraph \
-     upgrade <graph>` without `--check`.";
+     upgrade --target <graph>` without `--check`.";
 
 /// The human `upgrade` lines of a finding-free report: the three passed lines
 /// are literal, the rest carry the values the JSON report of that state holds.
@@ -1589,7 +1614,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         })
         .collect();
 
-    let refusal = output_failure(cli().arg("snapshot").arg(&graph));
+    let refusal = output_failure(cli().arg("snapshot").arg("--target").arg(&graph));
     let refusal_stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
         refusal_stderr.contains("ledger_upgrade_required"),
@@ -1639,7 +1664,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         if branch != "main" {
             load.args(["--from", "main"]);
         }
-        output_success(load.arg(&rebuilt));
+        output_success(load.arg("--target").arg(&rebuilt));
         unlock_cluster_fixture(&rebuilt_cluster);
     }
 
@@ -1655,12 +1680,13 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             .args(target);
         command
     };
-    let direct = ["--store", rebuilt_uri];
+    let direct = ["--target", rebuilt_uri];
     let vector_params = r#"{"q":[0.1,0.2,0.3,0.4]}"#;
     let term_params = r#"{"term":"organism"}"#;
 
     for (i, branch) in ["main", "review"].into_iter().enumerate() {
-        let exported = output_success(cli().args(["export", rebuilt_uri, "--branch", branch]));
+        let exported =
+            output_success(cli().args(["export", "--target", rebuilt_uri, "--branch", branch]));
         assert_eq!(
             canonical_export_rows(&exported.stdout),
             canonical_export_rows(&exports[i])
@@ -1693,7 +1719,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     }
 
     let server = spawn_server_with_cluster(&rebuilt_cluster);
-    let remote = ["--server", server.base_url.as_str(), "--graph", "knowledge"];
+    let remote = ["--target", server.base_url.as_str(), "--graph", "knowledge"];
     for branch in ["main", "review"] {
         for (name, params) in [
             ("docs", "{}"),
@@ -1779,7 +1805,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     unlock_cluster_fixture(&rebuilt_cluster);
     let reopened = spawn_server_with_cluster(&rebuilt_cluster);
     let remote = [
-        "--server",
+        "--target",
         reopened.base_url.as_str(),
         "--graph",
         "knowledge",
@@ -1882,7 +1908,7 @@ fn storage_upgrade_refuses_cluster_path_aliases() {
             let mut command = cli();
             command
                 .current_dir(&cluster)
-                .args(["upgrade", &alias, "--json"]);
+                .args(["upgrade", "--target", &alias, "--json"]);
             if check {
                 command.arg("--check");
             }
@@ -1988,7 +2014,20 @@ fn journey_rows(
         "{}"
     };
     let args = [
-        "query", name, "--query", query_path, "--store", uri, selector, value, "--params", params,
+        "query",
+        name,
+        "--query",
+        query_path,
+        if binary.is_some() {
+            "--store"
+        } else {
+            "--target"
+        },
+        uri,
+        selector,
+        value,
+        "--params",
+        params,
         "--json",
     ];
     let output = match binary {
@@ -2446,14 +2485,14 @@ fn storage_upgrade_preserves_history(
         }
     }
 
-    let refused = output_failure(cli().args(["snapshot", uri]));
+    let refused = output_failure(cli().args(["snapshot", "--target", uri]));
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
         stderr.contains("`omnigraph upgrade <graph> --check`"),
         "the stamp-{source_format} refusal must name the route: {stderr}"
     );
     let check = support::parse_stdout_json(&output_success(
-        cli().args(["upgrade", uri, "--check", "--json"]),
+        cli().args(["upgrade", "--target", uri, "--check", "--json"]),
     ));
     assert_eq!(check["outcome"], "check_passed", "{check}");
     assert_eq!(check["observed_format"], source_format);
@@ -2468,7 +2507,7 @@ fn storage_upgrade_preserves_history(
         "{check}"
     );
     assert_eq!(graph_files(&graph), before, "--check must write nothing");
-    let human = output_success(cli().args(["upgrade", uri, "--check"]));
+    let human = output_success(cli().args(["upgrade", "--target", uri, "--check"]));
     let mut expected = human_report_lines(
         &check,
         &format!(
@@ -2487,19 +2526,17 @@ fn storage_upgrade_preserves_history(
     );
     expected.push(CHECK_ADVISORY_LINE.to_owned());
     assert_eq!(
-        String::from_utf8(human.stdout)
-            .unwrap()
+        String::from_utf8_lossy(&human.stdout)
             .lines()
             .collect::<Vec<_>>(),
         expected
     );
-    assert!(
-        !String::from_utf8_lossy(&human.stderr).contains("omnigraph upgrade →"),
-        "--check writes nothing, so it echoes no write target"
-    );
+    assert!(only_target_report(&human), "{human:?}");
+    assert!(String::from_utf8_lossy(&human.stderr).contains("target "));
     assert_eq!(graph_files(&graph), before, "--check must write nothing");
     let other_target = support::parse_stdout_json(&output_failure(cli().args([
         "upgrade",
+        "--target",
         uri,
         "--check",
         "--to-format",
@@ -2521,8 +2558,9 @@ fn storage_upgrade_preserves_history(
         "a refused target writes nothing"
     );
 
-    let upgraded =
-        support::parse_stdout_json(&output_success(cli().args(["upgrade", uri, "--json"])));
+    let upgraded = support::parse_stdout_json(&output_success(
+        cli().args(["upgrade", "--target", uri, "--json"]),
+    ));
     assert_eq!(upgraded["outcome"], "completed", "{upgraded}");
     assert_eq!(upgraded["observed_format"], source_format);
     assert_eq!(upgraded["target_format"], 16);
@@ -2550,7 +2588,7 @@ fn storage_upgrade_preserves_history(
             );
         }
         let served = support::parse_stdout_json(&output_success(
-            cli().args(["schema", "show", uri, "--json"]),
+            cli().args(["schema", "show", "--target", uri, "--json"]),
         ));
         assert_eq!(
             served["schema_source"], predecessor_schema,
@@ -2559,7 +2597,7 @@ fn storage_upgrade_preserves_history(
     }
     for check_mode in [true, false] {
         let mut command = cli();
-        command.args(["upgrade", uri, "--json"]);
+        command.args(["upgrade", "--target", uri, "--json"]);
         if check_mode {
             command.arg("--check");
         }
@@ -2574,19 +2612,19 @@ fn storage_upgrade_preserves_history(
     );
 
     for (index, branch) in JOURNEY_LIVE_BRANCHES.into_iter().enumerate() {
-        let exported = output_success(cli().args(["export", uri, "--branch", branch]));
+        let exported = output_success(cli().args(["export", "--target", uri, "--branch", branch]));
         assert_eq!(
             canonical_export_rows(&exported.stdout),
             exports[index],
             "{branch}"
         );
         let served = support::parse_stdout_json(&output_success(
-            cli().args(["snapshot", uri, "--branch", branch, "--json"]),
+            cli().args(["snapshot", "--target", uri, "--branch", branch, "--json"]),
         ));
         assert_eq!(served["internal_schema_version"], 16, "{branch}");
-        let listing = support::parse_stdout_json(&output_success(
-            cli().args(["commit", "list", uri, "--branch", branch, "--json"]),
-        ));
+        let listing = support::parse_stdout_json(&output_success(cli().args([
+            "commit", "list", "--target", uri, "--branch", branch, "--json",
+        ])));
         for commit in histories[index].as_array().unwrap() {
             assert_lists_commit(&listing, commit);
         }
@@ -2652,7 +2690,7 @@ fn storage_upgrade_preserves_history(
                 "rated",
                 "--query",
                 rated_path.as_str(),
-                "--store",
+                "--target",
                 uri,
                 "--snapshot",
                 id.as_str(),
@@ -2674,10 +2712,10 @@ fn storage_upgrade_preserves_history(
     }
 
     output_success(cli().args([
-        "mutate", "revise", "--query", query_path, "--store", uri, "--branch", "review",
+        "mutate", "revise", "--query", query_path, "--target", uri, "--branch", "review",
     ]));
     output_success(cli().args([
-        "branch", "merge", "review", "--into", "main", "--uri", uri, "--json",
+        "branch", "merge", "review", "--into", "main", "--target", uri, "--json",
     ]));
     let merged = journey_rows(None, uri, query_path, "--branch", "main", "docs");
     assert!(merged.as_array().unwrap().iter().any(
@@ -2693,9 +2731,9 @@ fn storage_upgrade_preserves_history(
     let written_after_upgrade: Vec<(&str, String)> = [(0, "main"), (1, "review")]
         .into_iter()
         .map(|(index, branch)| {
-            let listing = support::parse_stdout_json(&output_success(
-                cli().args(["commit", "list", uri, "--branch", branch, "--json"]),
-            ));
+            let listing = support::parse_stdout_json(&output_success(cli().args([
+                "commit", "list", "--target", uri, "--branch", branch, "--json",
+            ])));
             let fresh: Vec<&str> = listing["commits"]
                 .as_array()
                 .unwrap()
@@ -2745,6 +2783,7 @@ fn storage_upgrade_preserves_history(
         });
     let kept = support::parse_stdout_json(&output_success(cli().args([
         "cleanup",
+        "--target",
         uri,
         "--keep",
         "4",
@@ -2758,7 +2797,7 @@ fn storage_upgrade_preserves_history(
         journey_rows(None, uri, query_path, "--branch", "main", "docs"),
         merged
     );
-    let child = output_success(cli().args(["export", uri, "--branch", "child"]));
+    let child = output_success(cli().args(["export", "--target", uri, "--branch", "child"]));
     assert_eq!(canonical_export_rows(&child.stdout), exports[2]);
     for (branch, id) in &written_after_upgrade {
         for name in ["docs", "edges"] {
@@ -2777,7 +2816,7 @@ fn storage_upgrade_preserves_history(
                 "docs",
                 "--query",
                 query_path,
-                "--store",
+                "--target",
                 uri,
                 "--snapshot",
                 id,
@@ -2914,13 +2953,13 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
         "v0.11.0 cleanup",
         &run_old(old, &["cleanup", uri, "--keep", "1", "--confirm"]),
     );
-    let docs_at = |id: &str| {
+    let docs_at = |id: &str, target_flag: &str| {
         [
             "query",
             "docs",
             "--query",
             query_path,
-            "--store",
+            target_flag,
             uri,
             "--snapshot",
             id,
@@ -2934,7 +2973,7 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
         .flat_map(|(_, history)| history.as_array().unwrap())
     {
         let id = commit["graph_commit_id"].as_str().unwrap();
-        let args = docs_at(id);
+        let args = docs_at(id, "--store");
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         predecessor_reads.insert(
             id.to_owned(),
@@ -2949,12 +2988,13 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
     );
 
     let check = support::parse_stdout_json(&output_success(
-        cli().args(["upgrade", uri, "--check", "--json"]),
+        cli().args(["upgrade", "--target", uri, "--check", "--json"]),
     ));
     assert_eq!(check["outcome"], "check_passed", "{check}");
     assert_eq!(check["route"], serde_json::json!([V9_HANDLER]));
-    let upgraded =
-        support::parse_stdout_json(&output_success(cli().args(["upgrade", uri, "--json"])));
+    let upgraded = support::parse_stdout_json(&output_success(
+        cli().args(["upgrade", "--target", uri, "--json"]),
+    ));
     assert_eq!(upgraded["outcome"], "completed", "{upgraded}");
     assert_eq!(upgraded["observed_format"], 9);
     assert_eq!(
@@ -2964,7 +3004,8 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
 
     let head_exports = || {
         LIVE_BRANCHES.map(|branch| {
-            let exported = output_success(cli().args(["export", uri, "--branch", branch]));
+            let exported =
+                output_success(cli().args(["export", "--target", uri, "--branch", branch]));
             canonical_export_rows(&exported.stdout)
         })
     };
@@ -2972,9 +3013,9 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
         LIVE_BRANCHES.into_iter().zip(&captured).zip(head_exports())
     {
         assert_eq!(&served, export, "{branch}");
-        let listing = support::parse_stdout_json(&output_success(
-            cli().args(["commit", "list", uri, "--branch", branch, "--json"]),
-        ));
+        let listing = support::parse_stdout_json(&output_success(cli().args([
+            "commit", "list", "--target", uri, "--branch", branch, "--json",
+        ])));
         for commit in history.as_array().unwrap() {
             assert_lists_commit(&listing, commit);
         }
@@ -2982,7 +3023,7 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
     for (id, expected) in &predecessor_reads {
         let served = snapshot_read(
             &format!("docs at {id}"),
-            cli().args(docs_at(id)).output().unwrap(),
+            cli().args(docs_at(id, "--target")).output().unwrap(),
         );
         assert_same_answer(
             &format!("commit {id} after the upgrade, as 0.11.0 read it after its cleanup"),
@@ -2992,16 +3033,16 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
     }
 
     output_success(cli().args([
-        "mutate", "revise", "--query", query_path, "--store", uri, "--branch", "review",
+        "mutate", "revise", "--query", query_path, "--target", uri, "--branch", "review",
     ]));
     output_success(cli().args([
-        "branch", "merge", "review", "--into", "main", "--uri", uri, "--json",
+        "branch", "merge", "review", "--into", "main", "--target", uri, "--json",
     ]));
     let heads = head_exports();
     let refuses = |policy: &[&str], when: &str| {
         let report = support::parse_stdout_json(&output_success(
             cli()
-                .args(["cleanup", uri])
+                .args(["cleanup", "--target", uri])
                 .args(policy)
                 .args(["--confirm", "--json"]),
         ));
@@ -3040,6 +3081,7 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
         .collect();
     let kept = support::parse_stdout_json(&output_success(cli().args([
         "cleanup",
+        "--target",
         uri,
         "--keep",
         "1",
@@ -3063,6 +3105,7 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
     refuses(&["--keep", "100"], "with every commit inside the policy");
     let aged = support::parse_stdout_json(&output_success(cli().args([
         "cleanup",
+        "--target",
         uri,
         "--older-than",
         "0s",

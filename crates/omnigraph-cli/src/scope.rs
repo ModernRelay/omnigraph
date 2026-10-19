@@ -1,688 +1,559 @@
-//! RFC-011 Slice A scope resolution.
-//!
-//! Translates the new scope inputs (`--profile` / `--store` / operator-config
-//! `profiles`/`clusters`/`defaults`) into the SAME effective addressing tuple
-//! the existing `GraphClient` factories (`client.rs`) and the maintenance
-//! resolver (`helpers::resolve_storage_uri`) already consume. This is a
-//! translation layer that sits *in front* of those resolvers — it is purely
-//! additive: an explicit legacy address (`--uri`/`--target`/`--server`/
-//! `--store`) wins and reproduces today's behavior exactly, so existing
-//! invocations are unaffected.
-//!
-//! The access path (served vs direct) is never chosen here; it falls out of the
-//! scope's binding × the verb's capability. The capability→scope check rejects
-//! mismatches (e.g. a server scope on a maintenance verb) only on the *new*
-//! resolution paths.
+//! Capture exactly one destination. Command inputs never participate in routing.
+use crate::cli::{Cli, Command};
+use crate::operator::InvocationConfig;
+use crate::planes::{self, Requirement};
+use crate::targets::{
+    self, CredentialOwner, ResolvedTarget, ServerAuth, StorageProvider, TargetBinding,
+    TargetProvenance,
+};
+use color_eyre::eyre::{Result, bail};
+use std::io::Write;
+use std::path::Path;
 
-use color_eyre::Result;
-use color_eyre::eyre::{bail, eyre};
-
-use crate::operator::{OperatorConfig, ScopeBinding};
-use crate::planes::Capability;
-
-pub(crate) const PROFILE_ENV: &str = "OMNIGRAPH_PROFILE";
-
-/// The effective addressing a command should use, in the terms the existing
-/// resolvers consume. Data/served verbs read `server`/`graph`/`uri`/`target`;
-/// maintenance verbs read `cluster`/`cluster_graph`.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ResolvedScope {
-    pub(crate) server: Option<String>,
-    pub(crate) graph: Option<String>,
-    pub(crate) uri: Option<String>,
-    pub(crate) cluster: Option<String>,
-    pub(crate) cluster_graph: Option<String>,
+pub(crate) fn resolve(
+    cli: &Cli,
+    input: &InvocationConfig,
+    cwd: &Path,
+    explicit_config: bool,
+    stderr: &mut dyn Write,
+) -> Result<Option<ResolvedTarget>> {
+    planes::guard_addressing(cli)
+        .map_err(|e| targets::refusal("argument_conflict", e.to_string()))?;
+    let need = planes::requirement(&cli.command);
+    if need == Requirement::Local {
+        return Ok(None);
+    }
+    let config = input.get(stderr)?;
+    let init_uri = match &cli.command {
+        Command::Init(args) => args.uri.as_deref(),
+        _ => None,
+    };
+    if init_uri.is_some() && cli.target.is_some() {
+        return Err(targets::refusal(
+            "argument_conflict",
+            "init URI and --target are mutually exclusive",
+        ));
+    }
+    let alias = match &cli.command {
+        Command::Alias(args) => Some(config.alias(&args.name)?),
+        _ => None,
+    };
+    let explicit = init_uri
+        .or(cli.target.as_deref())
+        .or(alias.map(|a| a.target.as_str()));
+    let (selection, is_default) = match explicit {
+        Some(value) => (value, false),
+        None => {
+            if input.has_profile() {
+                return Err(targets::refusal(
+                    "legacy_routing",
+                    "OMNIGRAPH_PROFILE is retired; unset it and select --target explicitly or configure defaults.target",
+                ));
+            }
+            // The old folder binding applied to managed data/control commands.
+            if matches!(
+                need,
+                Requirement::Graph { managed: true, .. }
+                    | Requirement::Registry
+                    | Requirement::Deployment
+                    | Requirement::ManagedAccount
+                    | Requirement::ManagedCluster
+                    | Requirement::ManagedOperation
+                    | Requirement::Authentication
+            ) {
+                match std::fs::symlink_metadata(cwd.join(".omnigraph/context")) {
+                    Ok(_) => {
+                        return Err(targets::refusal(
+                            "legacy_routing",
+                            "folder routing is retired; select --target explicitly, or import recovery custody with target import and archive .omnigraph/context before using defaults.target",
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            (
+                config.default_target().ok_or_else(|| {
+                    targets::refusal(
+                        "target_required",
+                        "select --target NAME|ADDRESS or configure defaults.target",
+                    )
+                })?,
+                true,
+            )
+        }
+    };
+    if selection.is_empty() {
+        return Err(targets::refusal(
+            "target_invalid",
+            "target must not be empty",
+        ));
+    }
+    let inline = matches!(selection, "." | "..")
+        || init_uri.is_some()
+        || selection.contains(':')
+        || selection.contains('/')
+        || selection.starts_with('~');
+    if (is_default
+        || alias.is_some()
+        || matches!(need, Requirement::Authentication | Requirement::Credential))
+        && inline
+    {
+        return Err(targets::refusal(
+            "target_invalid",
+            "this selection requires a registered target name",
+        ));
+    }
+    let target = if selection == "og_catalog" && !is_default && alias.is_none() {
+        ResolvedTarget::new(
+            TargetBinding::DirectCatalogue,
+            TargetProvenance::Inline {
+                address: selection.into(),
+            },
+        )
+    } else if inline {
+        let binding = if crate::graph_http::server_scheme(selection).is_some() {
+            targets::validate_server_endpoint(selection)
+                .map_err(|error| targets::refusal("target_invalid", error.to_string()))?;
+            let request = crate::graph_http::RequestTarget::of(selection, selection)?;
+            let auth = match config.credential_owner_for(&request) {
+                Some(CredentialOwner::Keyed(owner)) => ServerAuth::Token {
+                    owner: owner.into(),
+                },
+                _ => ServerAuth::Anonymous,
+            };
+            TargetBinding::Server {
+                endpoint: selection.into(),
+                auth,
+                default_graph: None,
+            }
+        } else {
+            let uri = targets::normalize_storage_uri(selection, cwd)
+                .map_err(|error| targets::refusal("target_invalid", error.to_string()))?;
+            let provider = StorageProvider::capture(&uri)
+                .map_err(|error| targets::refusal("target_invalid", error.to_string()))?;
+            if init_uri.is_none() && (planes::root_input(&cli.command) || cli.graph.is_some()) {
+                TargetBinding::DirectRoot {
+                    uri,
+                    provider,
+                    default_graph: None,
+                }
+            } else {
+                TargetBinding::DirectGraph { uri, provider }
+            }
+        };
+        ResolvedTarget::new(
+            binding,
+            TargetProvenance::Inline {
+                address: selection.into(),
+            },
+        )
+    } else {
+        ResolvedTarget::new(
+            config.binding(selection)?,
+            if is_default {
+                TargetProvenance::Default {
+                    name: selection.into(),
+                }
+            } else {
+                TargetProvenance::Explicit {
+                    name: selection.into(),
+                }
+            },
+        )
+    };
+    planes::validate_target(cli, &target, explicit_config)
+        .map_err(|e| targets::refusal("target_incompatible", e.to_string()))?;
+    if matches!(need, Requirement::Graph { .. }) {
+        graph_selection(&target, cli.graph.as_deref())
+            .map_err(|error| targets::refusal("target_incompatible", error.to_string()))?;
+    }
+    if matches!(
+        &target.binding,
+        TargetBinding::DirectGraph { .. } | TargetBinding::DirectRoot { .. }
+    ) {
+        target.storage()?;
+    }
+    Ok(Some(target))
 }
 
-/// The raw addressing inputs for one command: the global scope flags plus the
-/// command's own positional URI.
-pub(crate) struct ScopeFlags<'a> {
-    pub(crate) profile: Option<&'a str>,
-    pub(crate) store: Option<&'a str>,
-    pub(crate) server: Option<&'a str>,
-    pub(crate) cluster: Option<&'a str>,
-    pub(crate) graph: Option<&'a str>,
-    pub(crate) uri: Option<String>,
-}
-
-/// Resolve only from supplied values, without environment or I/O access.
-/// Precedence (RFC-011):
-/// 1. explicit primitive address (`uri`/`--server`/`--store`) → passthrough;
-/// 2. `--profile` / `OMNIGRAPH_PROFILE`;
-/// 3. flat `defaults.server` + `defaults.default_graph`;
-/// 4. nothing — downstream behaves as today.
-pub(crate) fn resolve_scope(
-    op: &OperatorConfig,
-    ambient_profile: Option<&str>,
-    capability: Capability,
-    flags: ScopeFlags<'_>,
-) -> Result<ResolvedScope> {
-    // At most one explicit scope primitive may address a command — a positional
-    // URI, `--store`, `--server`, or `--cluster` are mutually exclusive ways to
-    // name the graph. Combining them is a contradiction, not a silent precedence.
-    let primitives: Vec<&str> = [
-        flags.uri.as_deref().map(|_| "a positional URI"),
-        flags.store.map(|_| "--store"),
-        flags.server.map(|_| "--server"),
-        flags.cluster.map(|_| "--cluster"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if primitives.len() > 1 {
-        bail!(
-            "{} are mutually exclusive — pick one way to address the graph",
-            primitives.join(" and ")
-        );
-    }
-
-    // 1a. `--cluster` is the cluster scope primitive (maintenance): resolve its
-    //     root + select the graph with `--graph`.
-    if let Some(cluster) = flags.cluster {
-        return scope_from_binding(
-            op,
-            capability,
-            ScopeBinding::Cluster(cluster.to_string()),
-            flags.graph.map(str::to_string),
-            "--cluster",
-        );
-    }
-
-    // 1b. Any other explicit address wins; reproduce today's behavior untouched.
-    //     `--store` is an explicit store URI — fold it into `uri`.
-    if flags.uri.is_some() || flags.server.is_some() || flags.store.is_some() {
-        // `--graph` selects within a multi-graph scope; a bare positional URI /
-        // `--store` is already a single graph, so a stray `--graph` is an error
-        // rather than a silently-dropped flag.
-        if flags.graph.is_some() && flags.server.is_none() {
-            bail!(
-                "--graph selects a graph within a server or cluster scope; a positional \
-                 URI / --store is already a single graph"
-            );
-        }
-        return Ok(ResolvedScope {
-            server: flags.server.map(str::to_string),
-            graph: flags.graph.map(str::to_string),
-            uri: flags.store.map(str::to_string).or(flags.uri),
-            ..Default::default()
-        });
-    }
-
-    // 2. A named profile (flag, else the captured environment value).
-    let profile_name = flags.profile.or(ambient_profile.filter(|s| !s.is_empty()));
-    if let Some(name) = profile_name {
-        let profile = op.profile(name).ok_or_else(|| {
-            eyre!("unknown profile '{name}' (not defined under `profiles:` in operator config)")
-        })?;
-        let binding = profile.binding(name)?;
-        let graph = flags
-            .graph
-            .map(str::to_string)
-            .or_else(|| profile.default_graph.clone());
-        return scope_from_binding(op, capability, binding, graph, &format!("profile '{name}'"));
-    }
-
-    // 3. Flat default server scope.
-    if let Some(server) = op.default_server() {
-        let graph = flags
-            .graph
-            .map(str::to_string)
-            .or_else(|| op.default_graph().map(str::to_string));
-        return scope_from_binding(
-            op,
-            capability,
-            ScopeBinding::Server(server.to_string()),
-            graph,
-            "operator defaults",
-        );
-    }
-
-    // 3b. Flat default store scope — the zero-flag local-dev default (RFC-011).
-    //     Mutually exclusive with `defaults.server` (enforced at config load).
-    if let Some(store) = op.default_store() {
-        return scope_from_binding(
-            op,
-            capability,
-            ScopeBinding::Store(store.to_string()),
-            flags.graph.map(str::to_string),
-            "operator defaults",
-        );
-    }
-
-    // 4. Nothing resolved — leave the tuple empty; downstream falls through to
-    //    today's behavior (legacy `cli.graph` default or a no-address error).
-    Ok(ResolvedScope::default())
-}
-
-/// Map a resolved binding to the effective tuple, enforcing scope × capability
-/// capability (RFC-011): a server scope is served (data only); a cluster scope
-/// is privileged direct (maintenance/control only); a store scope is direct
-/// (either).
-fn scope_from_binding(
-    op: &OperatorConfig,
-    capability: Capability,
-    binding: ScopeBinding,
-    graph: Option<String>,
-    source: &str,
-) -> Result<ResolvedScope> {
-    match binding {
-        ScopeBinding::Server(server) => {
-            if capability == Capability::Direct {
-                bail!(
-                    "this command needs direct storage access, but {source} resolves a \
-                     server scope; name storage explicitly with --store <uri> (or \
-                     --cluster <dir> --graph <id> for a managed graph)"
-                );
-            }
-            Ok(ResolvedScope {
-                server: Some(server),
-                graph,
-                ..Default::default()
-            })
-        }
-        ScopeBinding::Cluster(cluster) => {
-            if capability == Capability::Any {
-                bail!(
-                    "{source} resolves a cluster scope, which is not valid for graph data \
-                     commands; run data commands through a server, or use --store <uri> \
-                     for ad-hoc direct access"
-                );
-            }
-            if capability == Capability::Served {
-                bail!(
-                    "this command requires a server, but {source} resolves a cluster \
-                     scope; address the server with --server <name|url> or --profile \
-                     <name> (to enumerate a cluster's graphs: `omnigraph cluster status \
-                     --config <dir>`)"
-                );
-            }
-            // A cluster value is a config name (resolved against `clusters:`)
-            // or a literal root: an `s3://`/`az://`/`file://` URI or a local cluster
-            // directory. Only a configured name is rewritten; anything else is
-            // passed through to the cluster-state resolver verbatim, so a bare
-            // directory path keeps working as it did for per-command `--cluster`.
-            let root = op
-                .cluster_root(&cluster)
-                .map(str::to_string)
-                .unwrap_or(cluster);
-            // A cluster holds many graphs; maintenance addresses one at a time.
-            // When no `--graph`/`default_graph` is given, leave `cluster_graph`
-            // empty and defer to the async storage-URI resolver (RFC-011 D7),
-            // which enumerates the catalog: auto-use a sole graph, else error
-            // and list the candidates.
-            Ok(ResolvedScope {
-                cluster: Some(root),
-                cluster_graph: graph,
-                ..Default::default()
-            })
-        }
-        ScopeBinding::Store(uri) => {
-            if capability == Capability::Served {
-                bail!(
-                    "this command requires a server, but {source} resolves a store scope; \
-                     address the server with --server <name|url> or --profile <name>"
-                );
-            }
+pub(crate) fn graph_selection<'a>(
+    target: &'a ResolvedTarget,
+    graph: Option<&'a str>,
+) -> Result<Option<&'a str>> {
+    let default = match &target.binding {
+        TargetBinding::Server { default_graph, .. }
+        | TargetBinding::DirectRoot { default_graph, .. } => default_graph.as_deref(),
+        TargetBinding::Managed(binding) => binding
+            .cluster
+            .as_ref()
+            .and_then(|c| c.default_graph.as_deref()),
+        TargetBinding::DirectGraph { .. } | TargetBinding::DirectCatalogue => {
             if graph.is_some() {
-                bail!(
-                    "--graph does not apply to a store scope ({source}): a store is already \
-                     a single graph"
-                );
+                bail!("this target already identifies its graph; remove --graph");
             }
-            Ok(ResolvedScope {
-                uri: Some(uri),
-                ..Default::default()
-            })
+            return Ok(None);
         }
+    };
+    let graph = graph.or(default).ok_or_else(|| targets::refusal("graph_required", "select --graph ID or configure target.default_graph; graphs are never selected by discovery"))?;
+    crate::helpers::require_graph_segment(graph)?;
+    Ok(Some(graph))
+}
+
+pub(crate) fn direct_root_uri(target: &ResolvedTarget) -> Result<&str> {
+    match &target.binding {
+        TargetBinding::DirectRoot { uri, .. } => Ok(uri),
+        _ => bail!("this operation requires a direct root target"),
     }
+}
+
+pub(crate) async fn direct_graph_uri(
+    target: &ResolvedTarget,
+    graph: Option<&str>,
+) -> Result<String> {
+    match &target.binding {
+        TargetBinding::DirectGraph { uri, .. } => {
+            graph_selection(target, graph)?;
+            Ok(uri.clone())
+        }
+        TargetBinding::DirectRoot { .. } => {
+            let graph = graph_selection(target, graph)?.expect("root requires graph");
+            omnigraph_cluster::resolve_graph_storage_uri_with_binding(
+                &capture_storage_binding(target)?,
+                graph,
+            )
+            .await
+            .map_err(|d| color_eyre::eyre::eyre!("{}", d.message))
+        }
+        _ => bail!("this operation requires direct storage"),
+    }
+}
+
+pub(crate) fn report(
+    input: &InvocationConfig,
+    target: &ResolvedTarget,
+    graph: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    let source = match &target.provenance {
+        TargetProvenance::Explicit { .. } => "explicit",
+        TargetProvenance::Default { .. } => "default",
+        TargetProvenance::Inline { .. } => "inline",
+    };
+    let destination = match &target.binding {
+        TargetBinding::DirectGraph { uri, provider } => {
+            format!(
+                "direct graph {}; requested={uri}; provider={provider:?}",
+                target.storage()?.uri()
+            )
+        }
+        TargetBinding::DirectRoot { uri, provider, .. } => {
+            format!(
+                "direct root {}; requested={uri}; provider={provider:?}",
+                target.storage()?.uri()
+            )
+        }
+        TargetBinding::DirectCatalogue => "direct catalogue og_catalog".into(),
+        TargetBinding::Server { endpoint, .. } => format!("server {endpoint}"),
+        TargetBinding::Managed(binding) => format!(
+            "managed {}; organization={}; cluster={}; incarnation={}; endpoint={}",
+            binding.api,
+            binding.organization_id.as_deref().unwrap_or("unselected"),
+            binding
+                .cluster
+                .as_ref()
+                .map_or("none", |c| c.cluster_id.as_str()),
+            binding
+                .cluster
+                .as_ref()
+                .map_or("none", |c| c.cluster_incarnation.as_str()),
+            binding
+                .cluster
+                .as_ref()
+                .and_then(|c| c.endpoint.as_deref())
+                .unwrap_or("none")
+        ),
+    };
+    let config = if source == "inline" {
+        String::new()
+    } else {
+        format!(
+            "; config={}",
+            input
+                .config_path()
+                .map_or_else(|| "none".into(), |p| p.display().to_string())
+        )
+    };
+    writeln!(
+        stderr,
+        "target {} ({source}): {destination}{}{}",
+        target.label(),
+        graph.map_or_else(String::new, |g| format!("; graph={g}")),
+        config
+    )?;
+    stderr.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::invocation::parse_from;
 
-    fn cfg(yaml: &str) -> OperatorConfig {
-        yaml_serde::from_str(yaml).unwrap()
+    fn fixture(yaml: &str) -> (tempfile::TempDir, InvocationConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), yaml).unwrap();
+        let input = InvocationConfig::at(Some(dir.path().to_owned()), None);
+        (dir, input)
     }
-
-    fn flags<'a>() -> ScopeFlags<'a> {
-        ScopeFlags {
-            profile: None,
-            store: None,
-            server: None,
-            cluster: None,
-            graph: None,
-            uri: None,
-        }
-    }
-
-    #[test]
-    fn explicit_legacy_address_wins_unchanged() {
-        let op = cfg("defaults:\n  server: prod\nservers:\n  prod:\n    url: https://x\n");
-        // Every explicit primitive ignores both profiles and operator defaults.
-        for (capability, explicit, expected) in [
-            (
-                Capability::Any,
-                ScopeFlags {
-                    uri: Some("graph.omni".into()),
-                    ..flags()
-                },
-                ResolvedScope {
-                    uri: Some("graph.omni".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                Capability::Any,
-                ScopeFlags {
-                    store: Some("graph.omni"),
-                    ..flags()
-                },
-                ResolvedScope {
-                    uri: Some("graph.omni".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                Capability::Any,
-                ScopeFlags {
-                    server: Some("explicit"),
-                    ..flags()
-                },
-                ResolvedScope {
-                    server: Some("explicit".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                Capability::Direct,
-                ScopeFlags {
-                    cluster: Some("./cluster"),
-                    ..flags()
-                },
-                ResolvedScope {
-                    cluster: Some("./cluster".into()),
-                    ..Default::default()
-                },
-            ),
-        ] {
-            let scope = resolve_scope(
-                &op,
-                Some("unknown-ambient"),
-                capability,
-                ScopeFlags {
-                    profile: Some("unknown-explicit"),
-                    ..explicit
-                },
-            )
-            .unwrap();
-            assert_eq!(scope, expected);
-        }
-    }
-
-    #[test]
-    fn store_flag_folds_into_uri_and_rejects_graph() {
-        let op = OperatorConfig::default();
-        let scope = resolve_scope(
-            &op,
-            None,
-            Capability::Any,
-            ScopeFlags {
-                store: Some("s3://b/g.omni"),
-                ..flags()
-            },
+    fn selected(
+        args: &[&str],
+        input: &InvocationConfig,
+        cwd: &Path,
+    ) -> Result<Option<ResolvedTarget>> {
+        let parsed = parse_from(std::iter::once("omnigraph").chain(args.iter().copied())).unwrap();
+        resolve(
+            &parsed.cli,
+            input,
+            cwd,
+            parsed.explicit_config,
+            &mut Vec::new(),
         )
+    }
+    const CONFIG: &str = "target_config_version: 1\ndefaults:\n  target: missing\ntargets:\n  local:\n    kind: direct\n    scope: graph\n    uri: ./graph.omni\n    provider:\n      kind: local\n  server:\n    kind: server\n    endpoint: https://example.test/api\n    auth: anonymous\n    default_graph: knowledge\n";
+
+    #[test]
+    fn explicit_target_never_falls_back_or_validates_an_unused_default() {
+        let (dir, input) = fixture(CONFIG);
+        let target = selected(
+            &["query", "-e", "query { return 1 }", "--target", "local"],
+            &input,
+            dir.path(),
+        )
+        .unwrap()
         .unwrap();
-        assert_eq!(scope.uri.as_deref(), Some("s3://b/g.omni"));
-    }
-
-    #[test]
-    fn scope_primitives_are_mutually_exclusive() {
-        let op = OperatorConfig::default();
-        for flags in [
-            ScopeFlags {
-                store: Some("s3://b/g.omni"),
-                uri: Some("file://other.omni".into()),
-                ..flags()
-            },
-            ScopeFlags {
-                store: Some("s3://b/g.omni"),
-                server: Some("prod"),
-                ..flags()
-            },
-            ScopeFlags {
-                cluster: Some("./brain"),
-                uri: Some("file://other.omni".into()),
-                ..flags()
-            },
-            ScopeFlags {
-                cluster: Some("./brain"),
-                server: Some("prod"),
-                ..flags()
-            },
-        ] {
-            let err = resolve_scope(&op, Some("unknown-ambient"), Capability::Direct, flags)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("mutually exclusive"), "{err}");
+        assert!(matches!(target.binding, TargetBinding::DirectGraph { .. }));
+        for name in ["", "absent"] {
+            assert!(selected(&["query", "q", "--target", name], &input, dir.path()).is_err());
         }
-    }
-
-    #[test]
-    fn cluster_flag_resolves_root_and_graph_for_maintenance() {
-        let op = cfg("clusters:\n  brain:\n    root: s3://acme/brain\n");
-        let scope = resolve_scope(
-            &op,
-            None,
-            Capability::Direct,
-            ScopeFlags {
-                cluster: Some("brain"),
-                graph: Some("knowledge"),
-                ..flags()
-            },
-        )
-        .unwrap();
-        assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
-        assert_eq!(scope.cluster_graph.as_deref(), Some("knowledge"));
-    }
-
-    #[test]
-    fn cluster_flag_accepts_a_literal_root_uri() {
-        let op = OperatorConfig::default();
-        let scope = resolve_scope(
-            &op,
-            None,
-            Capability::Direct,
-            ScopeFlags {
-                cluster: Some("s3://bucket/clusters/brain"),
-                graph: Some("knowledge"),
-                ..flags()
-            },
-        )
-        .unwrap();
-        assert_eq!(scope.cluster.as_deref(), Some("s3://bucket/clusters/brain"));
-        assert_eq!(scope.cluster_graph.as_deref(), Some("knowledge"));
-    }
-
-    #[test]
-    fn cluster_scope_without_a_graph_defers_to_catalog_enumeration() {
-        // RFC-011 D7: with no `--graph`/`default_graph`, resolution no longer
-        // bails here — it resolves the cluster root and leaves `cluster_graph`
-        // empty, deferring to the async storage-URI resolver (which enumerates
-        // the catalog: auto-use a sole graph, else error listing candidates).
-        let op = cfg("clusters:\n  brain:\n    root: s3://acme/brain\n");
-        let scope = resolve_scope(
-            &op,
-            None,
-            Capability::Direct,
-            ScopeFlags {
-                cluster: Some("brain"),
-                ..flags()
-            },
-        )
-        .unwrap();
-        assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
-        assert_eq!(scope.cluster_graph, None);
-    }
-
-    #[test]
-    fn graph_on_a_bare_store_or_uri_is_rejected() {
-        let op = OperatorConfig::default();
-        for flags in [
-            ScopeFlags {
-                uri: Some("graph.omni".into()),
-                graph: Some("knowledge"),
-                ..flags()
-            },
-            ScopeFlags {
-                store: Some("s3://b/g.omni"),
-                graph: Some("knowledge"),
-                ..flags()
-            },
-        ] {
-            let err = resolve_scope(&op, None, Capability::Any, flags)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("already a single graph"), "{err}");
-        }
-    }
-
-    #[test]
-    fn flat_default_store_drives_local_verbs() {
-        // RFC-011: `defaults.store` is the zero-flag local default — no flags,
-        // no profile → the store URI resolves as the (single-graph) store scope.
-        let op = cfg("defaults:\n  store: file:///tmp/dev.omni\n");
-        for ambient in [None, Some("")] {
-            let scope = resolve_scope(&op, ambient, Capability::Any, flags()).unwrap();
-            assert_eq!(scope.uri.as_deref(), Some("file:///tmp/dev.omni"));
-            assert_eq!(scope.server, None);
-        }
-    }
-
-    #[test]
-    fn flat_default_store_rejects_graph() {
-        // A store is already a single graph, so `--graph` against a default
-        // store is a loud error.
-        let op = cfg("defaults:\n  store: file:///tmp/dev.omni\n");
-        let err = resolve_scope(
-            &op,
-            None,
-            Capability::Any,
-            ScopeFlags {
-                graph: Some("knowledge"),
-                ..flags()
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("does not apply to a store scope"), "{err}");
-    }
-
-    #[test]
-    fn flat_default_server_drives_data_verbs() {
-        let op = cfg(
-            "defaults:\n  server: prod\n  default_graph: knowledge\nservers:\n  prod:\n    url: https://x\n",
-        );
-        for ambient in [None, Some("")] {
-            let scope = resolve_scope(&op, ambient, Capability::Any, flags()).unwrap();
-            assert_eq!(scope.server.as_deref(), Some("prod"));
-            assert_eq!(scope.graph.as_deref(), Some("knowledge"));
-        }
-    }
-
-    #[test]
-    fn profile_server_scope_with_graph_override() {
-        let op = cfg(
-            "defaults:\n  store: file:///default.omni\nservers:\n  staging:\n    url: https://s\nprofiles:\n  staging:\n    server: staging\n    default_graph: knowledge\n",
-        );
-        for (profile, ambient) in [
-            (Some("staging"), Some("unknown-ambient")),
-            (None, Some("staging")),
-        ] {
-            let scope = resolve_scope(
-                &op,
-                ambient,
-                Capability::Any,
-                ScopeFlags {
-                    profile,
-                    graph: Some("archive"),
-                    ..flags()
-                },
-            )
-            .unwrap();
-            assert_eq!(scope.server.as_deref(), Some("staging"));
-            assert_eq!(scope.graph.as_deref(), Some("archive")); // flag beats profile default
-        }
-    }
-
-    #[test]
-    fn profile_cluster_scope_resolves_root_for_maintenance() {
-        let op = cfg(
-            "clusters:\n  brain:\n    root: s3://acme/brain\nprofiles:\n  admin:\n    cluster: brain\n    default_graph: knowledge\n",
-        );
-        for (profile, ambient) in [(Some("admin"), None), (None, Some("admin"))] {
-            let scope = resolve_scope(
-                &op,
-                ambient,
-                Capability::Direct,
-                ScopeFlags { profile, ..flags() },
-            )
-            .unwrap();
-            assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
-            assert_eq!(scope.cluster_graph.as_deref(), Some("knowledge"));
-        }
-    }
-
-    #[test]
-    fn profile_cluster_scope_with_graph_override() {
-        // The deferral closed by this slice: a `--graph` flag overrides a
-        // profile cluster's default_graph, exactly as it does for a server scope.
-        let op = cfg(
-            "clusters:\n  brain:\n    root: s3://acme/brain\nprofiles:\n  admin:\n    cluster: brain\n    default_graph: knowledge\n",
-        );
-        let scope = resolve_scope(
-            &op,
-            None,
-            Capability::Direct,
-            ScopeFlags {
-                profile: Some("admin"),
-                graph: Some("archive"),
-                ..flags()
-            },
-        )
-        .unwrap();
-        assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
-        assert_eq!(scope.cluster_graph.as_deref(), Some("archive")); // flag beats profile default
-    }
-
-    #[test]
-    fn server_scope_on_maintenance_verb_errors() {
-        let op = cfg("defaults:\n  server: prod\nservers:\n  prod:\n    url: https://x\n");
-        let err = resolve_scope(&op, None, Capability::Direct, flags())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("direct storage access"), "{err}");
-    }
-
-    #[test]
-    fn cluster_scope_on_data_verb_errors() {
-        let op = cfg(
-            "clusters:\n  brain:\n    root: s3://acme/brain\nprofiles:\n  admin:\n    cluster: brain\n",
-        );
-        for (profile, ambient) in [(Some("admin"), None), (None, Some("admin"))] {
-            let err = resolve_scope(
-                &op,
-                ambient,
-                Capability::Any,
-                ScopeFlags { profile, ..flags() },
-            )
-            .unwrap_err()
-            .to_string();
-            assert!(err.contains("not valid for graph data commands"), "{err}");
-        }
-    }
-
-    #[test]
-    fn store_scope_on_served_verb_errors() {
-        // The served registry (`graphs list`) is server-scoped: a store-bound
-        // profile fails with scope-shaped advice, not a late embedded-arm error.
-        let op = cfg("profiles:\n  localdev:\n    store: file:///data/dev.omni\n");
-        for (profile, ambient) in [(Some("localdev"), None), (None, Some("localdev"))] {
-            let err = resolve_scope(
-                &op,
-                ambient,
-                Capability::Served,
-                ScopeFlags { profile, ..flags() },
-            )
-            .unwrap_err()
-            .to_string();
-            assert!(
-                err.contains("requires a server") && err.contains("resolves a store scope"),
-                "{err}"
-            );
-        }
-    }
-
-    #[test]
-    fn cluster_scope_on_served_verb_points_at_cluster_status() {
-        let op = cfg(
-            "clusters:\n  brain:\n    root: s3://acme/brain\nprofiles:\n  admin:\n    cluster: brain\n",
-        );
-        let err = resolve_scope(
-            &op,
-            None,
-            Capability::Served,
-            ScopeFlags {
-                profile: Some("admin"),
-                ..flags()
-            },
-        )
-        .unwrap_err()
-        .to_string();
         assert!(
-            err.contains("requires a server")
-                && err.contains("resolves a cluster scope")
-                && err.contains("cluster status"),
-            "{err}"
+            selected(&["query", "q"], &input, dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
         );
     }
 
     #[test]
-    fn server_scope_on_served_verb_resolves_with_default_graph_carried() {
-        // A served-registry caller resolves the server binding like any served
-        // verb; the profile's default_graph rides along in the scope (the
-        // registry factory deliberately ignores it — pinned in client.rs).
-        let op = cfg(
-            "servers:\n  prod:\n    url: https://x\nprofiles:\n  staging:\n    server: prod\n    default_graph: kb\n",
-        );
-        let scope = resolve_scope(
-            &op,
-            None,
-            Capability::Served,
-            ScopeFlags {
-                profile: Some("staging"),
-                ..flags()
-            },
-        )
-        .unwrap();
-        assert_eq!(scope.server.as_deref(), Some("prod"));
-        assert_eq!(scope.graph.as_deref(), Some("kb"));
+    fn named_paths_use_operator_directory_and_inline_paths_use_invocation_directory() {
+        let (dir, input) = fixture(CONFIG);
+        let cwd = tempfile::tempdir().unwrap();
+        for (value, expected) in [("local", dir.path()), ("./graph.omni", cwd.path())] {
+            let target = selected(&["query", "-e", "q", "--target", value], &input, cwd.path())
+                .unwrap()
+                .unwrap();
+            let TargetBinding::DirectGraph { uri, .. } = target.binding else {
+                panic!("direct graph");
+            };
+            assert_eq!(uri, expected.join("graph.omni").to_string_lossy());
+        }
     }
 
     #[test]
-    fn unknown_profile_is_a_loud_error() {
-        let op = cfg(
-            "defaults:\n  store: file:///default.omni\nprofiles:\n  valid:\n    store: file:///profile.omni\n",
+    fn local_commands_ignore_bad_config_but_refuse_irrelevant_selectors() {
+        let (dir, input) = fixture("invalid: [");
+        assert!(
+            selected(&["version"], &input, dir.path())
+                .unwrap()
+                .is_none()
         );
-        for (profile, ambient, name) in [
-            (Some("nope"), Some("valid"), "nope"),
-            (None, Some("nope"), "nope"),
-            (Some(""), Some("valid"), ""),
-            (None, Some(" "), " "),
-        ] {
-            let err = resolve_scope(
-                &op,
-                ambient,
-                Capability::Any,
-                ScopeFlags { profile, ..flags() },
+        assert!(selected(&["version", "--target", "anything"], &input, dir.path()).is_err());
+    }
+
+    #[test]
+    fn default_selection_refuses_retired_routing_and_explicit_selection_does_not() {
+        let (dir, _) = fixture(&CONFIG.replace("target: missing", "target: local"));
+        let input = InvocationConfig::at(Some(dir.path().to_owned()), Some("old".into()));
+        assert!(
+            selected(&["query", "q"], &input, dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("OMNIGRAPH_PROFILE")
+        );
+        assert!(
+            selected(
+                &["query", "-e", "q", "--target", "local"],
+                &input,
+                dir.path()
             )
-            .unwrap_err()
-            .to_string();
-            assert_eq!(
-                err,
-                format!(
-                    "unknown profile '{name}' (not defined under `profiles:` in operator config)"
+            .is_ok()
+        );
+        let input = InvocationConfig::at(Some(dir.path().to_owned()), None);
+        std::fs::create_dir(dir.path().join(".omnigraph")).unwrap();
+        std::fs::write(dir.path().join(".omnigraph/context"), "unparsed evidence").unwrap();
+        assert!(
+            selected(&["query", "q"], &input, dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("folder routing")
+        );
+        assert!(
+            selected(
+                &["query", "-e", "q", "--target", "local"],
+                &input,
+                dir.path()
+            )
+            .is_ok()
+        );
+        #[cfg(unix)]
+        {
+            let context = dir.path().join(".omnigraph/context");
+            std::fs::remove_file(&context).unwrap();
+            std::os::unix::fs::symlink("missing-context", &context).unwrap();
+            assert!(
+                selected(&["query", "-e", "q"], &input, dir.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("folder routing")
+            );
+            assert!(
+                selected(
+                    &["query", "-e", "q", "--target", "local"],
+                    &input,
+                    dir.path()
                 )
+                .is_ok()
             );
         }
     }
 
     #[test]
-    fn no_address_resolves_empty_for_legacy_fallthrough() {
-        let op = OperatorConfig::default();
-        for ambient in [None, Some("")] {
-            let scope = resolve_scope(&op, ambient, Capability::Any, flags()).unwrap();
-            assert_eq!(scope, ResolvedScope::default());
+    fn graph_selection_is_explicit_and_registry_ignores_graph_defaults() {
+        let (dir, input) = fixture(CONFIG);
+        assert!(
+            selected(
+                &["query", "q", "--target", "https://example.test"],
+                &input,
+                dir.path()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("graph_required")
+        );
+        let target = selected(&["query", "q", "--target", "server"], &input, dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(graph_selection(&target, None).unwrap(), Some("knowledge"));
+        assert!(
+            selected(
+                &["graphs", "list", "--target", "server"],
+                &input,
+                dir.path()
+            )
+            .is_ok()
+        );
+        assert!(
+            selected(
+                &[
+                    "graphs",
+                    "list",
+                    "--target",
+                    "server",
+                    "--graph",
+                    "knowledge"
+                ],
+                &input,
+                dir.path()
+            )
+            .is_err()
+        );
+        assert!(
+            selected(
+                &[
+                    "query",
+                    "-e",
+                    "q",
+                    "--target",
+                    "local",
+                    "--graph",
+                    "knowledge"
+                ],
+                &input,
+                dir.path()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn init_uri_is_explicit_inline_and_conflicts_with_target() {
+        let (dir, input) = fixture(CONFIG);
+        let target = selected(
+            &["init", "scratch.omni", "--schema", "unused.pg"],
+            &input,
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(target.provenance, TargetProvenance::Inline { .. }));
+        assert!(
+            selected(
+                &[
+                    "init",
+                    "scratch.omni",
+                    "--schema",
+                    "unused.pg",
+                    "--target",
+                    "local"
+                ],
+                &input,
+                dir.path()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_kind_is_rejected_without_reading_credentials() {
+        let (dir, input) = fixture(CONFIG);
+        std::fs::write(dir.path().join("credentials"), "invalid credential bytes").unwrap();
+        let error = selected(&["cleanup", "--target", "server"], &input, dir.path()).unwrap_err();
+        assert!(error.to_string().contains("not available"), "{error}");
+        for args in [
+            vec!["query", "stored", "--target", "local"],
+            vec!["query", "stored", "--target", "og_catalog"],
+            vec![
+                "mutate",
+                "stored",
+                "--target",
+                "./unopened-root",
+                "--graph",
+                "knowledge",
+            ],
+            vec!["query", "--target", "server"],
+            vec!["mutate", "--target", "server"],
+        ] {
+            let error = selected(&args, &input, dir.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("stored query"),
+                "{args:?}: {error}"
+            );
+        }
+        assert!(!dir.path().join("unopened-root").exists());
+        for args in [
+            vec!["query", "stored", "--target", "server"],
+            vec!["mutate", "stored", "--target", "server"],
+            vec!["query", "--query", "unread.gq", "--target", "local"],
+            vec!["mutate", "-e", "unparsed source", "--target", "local"],
+        ] {
+            assert!(selected(&args, &input, dir.path()).is_ok(), "{args:?}");
         }
     }
+}
+
+/// Convert the validated CLI destination into the storage layer's captured binding.
+pub(crate) fn capture_storage_binding(
+    target: &ResolvedTarget,
+) -> Result<omnigraph::storage::CapturedStorageBinding> {
+    target.storage()
 }

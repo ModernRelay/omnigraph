@@ -319,12 +319,21 @@ impl ManifestCoordinator {
         root_uri: &str,
         commit: &GraphCommit,
     ) -> Result<PinnedGraphManifest> {
-        let main = super::open_manifest_dataset_native_with_session(
+        Self::pinned_graph_commit_with_session(
             root_uri,
-            None,
+            commit,
             &crate::lance_access::control_session(),
         )
-        .await?;
+        .await
+    }
+
+    pub async fn pinned_graph_commit_with_session(
+        root_uri: &str,
+        commit: &GraphCommit,
+        session: &Arc<lance::session::Session>,
+    ) -> Result<PinnedGraphManifest> {
+        let main =
+            super::open_manifest_dataset_native_with_session(root_uri, None, session).await?;
         let legacy = ExtentCache::default();
         let mut candidates = Vec::new();
         match commit.graph_branch.as_deref() {
@@ -387,12 +396,21 @@ impl ManifestCoordinator {
         root_uri: &str,
         history: &HistoryCache,
     ) -> Result<Vec<(String, CommitGraph)>> {
-        let main = super::open_manifest_dataset_native_with_session(
+        Self::retired_commit_graphs_with_session(
             root_uri,
-            None,
+            history,
             &crate::lance_access::control_session(),
         )
-        .await?;
+        .await
+    }
+
+    pub async fn retired_commit_graphs_with_session(
+        root_uri: &str,
+        history: &HistoryCache,
+        session: &Arc<lance::session::Session>,
+    ) -> Result<Vec<(String, CommitGraph)>> {
+        let main =
+            super::open_manifest_dataset_native_with_session(root_uri, None, session).await?;
         let mut names = retired_manifest_branches(&main)
             .await?
             .into_keys()

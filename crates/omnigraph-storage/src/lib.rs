@@ -17,6 +17,9 @@ use url::Url;
 
 use thiserror::Error;
 
+mod binding;
+pub use binding::{CapturedStorageBinding, StorageDestination, storage_handle_for_binding};
+
 mod scoped;
 pub use scoped::StorageIoScope;
 

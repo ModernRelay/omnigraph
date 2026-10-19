@@ -143,16 +143,16 @@ for an unpublished commit (see [Unattached graph branches](../../rfcs/2026-10-11
 Policy commands read the applied bundle from a cluster:
 
 ```bash
-omnigraph policy validate --cluster ./company-brain --graph knowledge
+omnigraph policy validate --target ./company-brain --graph knowledge
 omnigraph policy test --tests policy.tests.yaml \
-  --cluster ./company-brain --graph knowledge
+  --target ./company-brain --graph knowledge
 omnigraph policy explain \
-  --cluster ./company-brain --graph knowledge \
+  --target ./company-brain --graph knowledge \
   --actor act-alice --action read --branch main
 ```
 
 Edit the policy file or its `applies_to` bindings, then run
-`cluster apply --server URL --config DIR`. The server finishes admitted requests
+`cluster apply --target URL --config DIR`. The server finishes admitted requests
 before activating matching HTTP and engine permissions. Later requests use the
 new rules. Cluster management policy changes take effect in the same deployment;
 a newly granted administrator cannot authorize that grant.
@@ -226,8 +226,8 @@ Successful graph commits record the actor for the whole atomic change. Inspect
 the audit trail with:
 
 ```bash
-omnigraph commit list --store ./graph.omni --json
-omnigraph commit show <COMMIT_ID> --store ./graph.omni --json
+omnigraph commit list --target ./graph.omni --json
+omnigraph commit show <COMMIT_ID> --target ./graph.omni --json
 ```
 
 ## Server startup modes

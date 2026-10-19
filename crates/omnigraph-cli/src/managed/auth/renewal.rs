@@ -183,6 +183,19 @@ fn index(store: &dyn Store, origin: &str) -> Result<Index> {
     Ok(index)
 }
 
+/// Check the bounded cache without selecting an organization or renewing a session.
+pub(super) fn validate_custody(store: &dyn Store, origin: &str) -> Result<()> {
+    let index = index(store, origin)?;
+    for (organization, reference) in index.sessions {
+        let raw = store.get(&reference)?.ok_or_else(invalid)?;
+        let saved = parse(&raw, origin)?;
+        if key(&saved)? != reference || saved.identity.account_id != organization {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn load_selected(
     store: &dyn Store,
     origin: &str,
@@ -197,7 +210,7 @@ pub(super) fn load_selected(
         None if index.sessions.len() > 1 => {
             return Err(Failure::refused(
                 "organization_required",
-                "multiple organizations are signed in; select --organization or a bound folder",
+                "multiple organizations are signed in; select a target with an organization_id",
             ));
         }
         None => index
@@ -410,7 +423,7 @@ pub(super) async fn accept(
 pub(super) fn unknown() -> Failure {
     Failure::refused(
         "refresh_outcome_unknown",
-        "renewal may have completed; run login --api explicitly to recover",
+        "renewal may have completed; run login --target NAME explicitly to recover",
     )
 }
 

@@ -220,6 +220,7 @@ then dated RFCs by date.
 | [0055](0055-gq-branch-statements.md) | Branch statements in GQ | maintainer | draft | in-progress |
 | [0057](0057-bounded-merge-preparation.md) | Accepted-context reuse and bounded merge preparation | maintainer | accepted | in-progress |
 | [0058](0058-retained-merged-ancestry.md) | Retained merged ancestry | maintainer | draft | not-started |
+| [0059](0059-config-cli-coherency.md) | Named targets and CLI coherency | maintainer | accepted | in-progress |
 | [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |
 | [0062](0062-manifest-version-clock.md) | Manifest version as the table registration clock | maintainer | draft | in-progress |
 | [0063](0063-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |

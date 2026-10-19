@@ -203,8 +203,16 @@ pub struct CommitOutcome {
 /// `migrations::guard_stamp`, which the open paths use instead). Surfaces
 /// the storage version to operators (`omnigraph snapshot`).
 pub async fn internal_schema_stamp_at(root_uri: &str, branch: Option<&str>) -> Result<Option<u32>> {
-    let control_session = crate::lance_access::control_session();
-    let dataset = open_manifest_dataset_with_session(root_uri, branch, &control_session).await?;
+    internal_schema_stamp_at_with_session(root_uri, branch, &crate::lance_access::control_session())
+        .await
+}
+
+pub async fn internal_schema_stamp_at_with_session(
+    root_uri: &str,
+    branch: Option<&str>,
+    session: &Arc<lance::session::Session>,
+) -> Result<Option<u32>> {
+    let dataset = open_manifest_dataset_with_session(root_uri, branch, session).await?;
     Ok(migrations::read_stamp(&dataset))
 }
 
@@ -228,8 +236,20 @@ pub async fn manifest_has_external_base_paths(
     root_uri: &str,
     branch: Option<&str>,
 ) -> Result<bool> {
-    let control_session = crate::lance_access::control_session();
-    let dataset = open_manifest_dataset_with_session(root_uri, branch, &control_session).await?;
+    manifest_has_external_base_paths_with_session(
+        root_uri,
+        branch,
+        &crate::lance_access::control_session(),
+    )
+    .await
+}
+
+pub async fn manifest_has_external_base_paths_with_session(
+    root_uri: &str,
+    branch: Option<&str>,
+    session: &Arc<lance::session::Session>,
+) -> Result<bool> {
+    let dataset = open_manifest_dataset_with_session(root_uri, branch, session).await?;
     Ok(!dataset.manifest().base_paths.is_empty())
 }
 
@@ -784,7 +804,12 @@ impl Snapshot {
                     )
                     .await
             }
-            None => open_dataset_entry(entry, &self.root_uri, None).await,
+            None => {
+                let session = self.manifest_dataset.as_ref().map(|dataset| {
+                    crate::lance_access::statement_session(dataset.session().store_registry(), 0, 0)
+                });
+                open_dataset_entry(entry, &self.root_uri, session.as_ref()).await
+            }
         }
     }
 
@@ -1173,8 +1198,14 @@ impl CollectorBranch {
         history: &crate::commit_graph::HistoryCache,
     ) -> Result<Option<Snapshot>> {
         let branch = self.branch.as_deref();
-        let (dataset, state) =
-            snapshot_state_at(&self.root_uri, branch, version, history.objects()).await?;
+        let (dataset, state) = snapshot_state_at(
+            &self.root_uri,
+            branch,
+            version,
+            history.objects(),
+            &self.dataset.session(),
+        )
+        .await?;
         ManifestCoordinator::version_snapshot(&self.root_uri, branch, version, dataset, state)
     }
 }
@@ -1506,7 +1537,17 @@ impl ManifestCoordinator {
                      contract cannot be read",
                 ));
             };
-            let control_session = crate::lance_access::control_session();
+            let control_session = snapshot
+                .manifest_dataset
+                .as_ref()
+                .map(|dataset| dataset.session())
+                .or_else(|| {
+                    snapshot
+                        .read_caches
+                        .as_ref()
+                        .map(|cache| cache.session.clone())
+                })
+                .unwrap_or_else(crate::lance_access::control_session);
             return history::read_schema(&snapshot.root_uri, &control_session, digest, head).await;
         }
         let dataset =
@@ -1804,8 +1845,42 @@ impl ManifestCoordinator {
         version: u64,
         history: &HistoryCache,
     ) -> Result<Snapshot> {
+        Self::snapshot_at_in_with_session(
+            root_uri,
+            branch,
+            version,
+            history,
+            &crate::lance_access::control_session(),
+        )
+        .await
+    }
+
+    pub async fn snapshot_at_with_session(
+        root_uri: &str,
+        branch: Option<&str>,
+        version: u64,
+        session: &Arc<lance::session::Session>,
+    ) -> Result<Snapshot> {
+        Self::snapshot_at_in_with_session(
+            root_uri,
+            branch,
+            version,
+            &HistoryCache::default(),
+            session,
+        )
+        .await
+    }
+
+    pub async fn snapshot_at_in_with_session(
+        root_uri: &str,
+        branch: Option<&str>,
+        version: u64,
+        history: &HistoryCache,
+        session: &Arc<lance::session::Session>,
+    ) -> Result<Snapshot> {
         let root = root_uri.trim_end_matches('/');
-        let (dataset, state) = snapshot_state_at(root, branch, version, history.objects()).await?;
+        let (dataset, state) =
+            snapshot_state_at(root, branch, version, history.objects(), session).await?;
         let native = dataset.manifest().branch.clone();
         Self::version_snapshot(root, branch, version, dataset, state)?
             .ok_or_else(|| crate::legacy::pre_genesis(native.as_deref(), version))

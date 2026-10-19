@@ -1,5 +1,5 @@
 //! Managed control routing (RFC 0052) and offline data credentials (RFC 0053).
-//! Explicit --managed selects this routing; context supplies its bound authority.
+//! One resolved target supplies all managed authority for an invocation.
 
 use crate::cli::{Cli, ClusterCommand, ClusterMembersCommand, ClusterRunArgs, Command};
 use reqwest::{Client, Method, StatusCode};
@@ -19,6 +19,20 @@ mod lifecycle;
 mod members;
 mod organization;
 
+pub(crate) fn legacy_custody_binding(
+    source: &Path,
+) -> color_eyre::Result<Option<(String, String)>> {
+    lifecycle::pending::legacy_binding(source)
+}
+
+pub(crate) fn import_custody(
+    source: &Path,
+    home: &Path,
+    binding: &Binding,
+) -> color_eyre::Result<()> {
+    lifecycle::pending::import(source, home, binding)
+}
+
 /// Managed transports must not render an endpoint's reflected credential.
 pub(crate) fn scrub_response_error(text: String, secret: &str) -> String {
     let text = if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
@@ -31,7 +45,6 @@ pub(crate) fn scrub_response_error(text: String, secret: &str) -> String {
     text.replace(secret, "[redacted]")
 }
 
-const MAX_CONTEXT: u64 = 16 * 1024;
 const MAX_BODY: usize = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -42,6 +55,8 @@ type Result<T> = std::result::Result<T, Failure>;
 struct Failure {
     body: Value,
     exit: i32,
+    /// Trusted transport evidence, kept separate from an endpoint's error body.
+    response_status: Option<StatusCode>,
 }
 
 impl Failure {
@@ -49,6 +64,7 @@ impl Failure {
         Self {
             body: json!({"type":kind,"title":kind.replace('_', " "),"detail":detail}),
             exit,
+            response_status: None,
         }
     }
     fn refused(kind: &str, detail: &str) -> Self {
@@ -288,13 +304,116 @@ fn write_diagnostic(stderr: &mut dyn Write, message: std::fmt::Arguments<'_>) ->
         .map_err(|_| Failure::output_delivery())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The operator-owned managed destination, captured before any authentication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Binding {
+    pub(crate) api: String,
+    pub(crate) organization_id: Option<String>,
+    pub(crate) cluster: Option<ClusterBinding>,
+    pub(crate) control_auth: ControlAuth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClusterBinding {
+    pub(crate) cluster_id: String,
+    pub(crate) cluster_incarnation: String,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) default_graph: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ControlAuth {
+    HumanDevice,
+    AutomationEnv,
+}
+
+/// Complete cluster authority. Never read from a project or refreshed in flight.
+#[derive(Debug, Clone)]
 struct Context {
-    version: u8,
     cluster: String,
+    incarnation: String,
     api: String,
     organization_id: String,
+    endpoint: Option<String>,
+    default_graph: Option<String>,
+    control_auth: ControlAuth,
+}
+
+impl Binding {
+    fn organization(&self) -> Result<&str> {
+        self.organization_id.as_deref().ok_or_else(|| {
+            Failure::refused(
+                "organization_required",
+                "complete the target's organization_id from login output before this operation",
+            )
+        })
+    }
+
+    fn account(&self) -> Result<()> {
+        self.organization()?;
+        if self.cluster.is_some() {
+            return Err(Failure::refused(
+                "managed_account_required",
+                "this command requires a managed account target",
+            ));
+        }
+        Ok(())
+    }
+
+    fn context(&self) -> Result<Context> {
+        let organization_id = self.organization()?.to_owned();
+        let cluster = self.cluster.as_ref().ok_or_else(|| {
+            Failure::refused(
+                "managed_cluster_required",
+                "this command requires a managed cluster target",
+            )
+        })?;
+        Ok(Context {
+            cluster: cluster.cluster_id.clone(),
+            incarnation: cluster.cluster_incarnation.clone(),
+            api: self.api.clone(),
+            organization_id,
+            endpoint: cluster.endpoint.clone(),
+            default_graph: cluster.default_graph.clone(),
+            control_auth: self.control_auth,
+        })
+    }
+
+    async fn client(&self) -> Result<Api> {
+        Api::authenticated(
+            self.api.clone(),
+            Some(self.organization()?),
+            self.control_auth,
+        )
+        .await
+    }
+}
+
+impl Context {
+    fn verify(&self, body: &Value) -> Result<()> {
+        cluster_matches(body, &self.cluster)?;
+        if body.pointer("/meta/incarnation").and_then(Value::as_str)
+            != Some(self.incarnation.as_str())
+        {
+            return Err(Failure::refused(
+                "target_mismatch",
+                "the response belongs to another cluster incarnation",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn client(&self) -> Result<Api> {
+        let mut api = Api::authenticated(
+            self.api.clone(),
+            Some(&self.organization_id),
+            self.control_auth,
+        )
+        .await?;
+        api.cluster = Some((self.cluster.clone(), self.incarnation.clone()));
+        Ok(api)
+    }
 }
 
 /// Only exact loopback hosts may use HTTP. Url parsing canonicalizes DNS
@@ -304,7 +423,7 @@ fn canonical_origin(input: &str) -> Result<String> {
     let invalid = || {
         Failure::refused(
             "api_origin_invalid",
-            "--api must be an HTTPS origin (HTTP is allowed only for localhost, 127.0.0.1, or [::1])",
+            "the target API must be an HTTPS origin (HTTP is allowed only for localhost, 127.0.0.1, or [::1])",
         )
     };
     let url = Url::parse(input).map_err(|_| invalid())?;
@@ -353,143 +472,12 @@ fn organization_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn selected_organization<'a>(
-    context: Option<&'a Context>,
-    origin: &str,
-    explicit: Option<&'a str>,
-) -> Result<Option<&'a str>> {
-    if let Some(org) = explicit {
-        organization_id(org)?;
-    }
-    if let Some(context) = context {
-        if context.api != origin || explicit.is_some_and(|org| org != context.organization_id) {
-            return Err(Failure::refused(
-                "context_mismatch",
-                "the explicit API or organization differs from the selected folder context",
-            ));
-        }
-        return Ok(Some(&context.organization_id));
-    }
-    Ok(explicit)
-}
-
-fn session_organization(
-    config: &Path,
-    origin: &str,
-    explicit: Option<&str>,
-) -> Result<Option<String>> {
-    // Explicit session management is independent of any folder binding.
-    let context = if explicit.is_some() {
-        None
-    } else {
-        read_context(config)?
-    };
-    selected_organization(context.as_ref(), origin, explicit).map(|org| org.map(str::to_owned))
-}
-
-fn read_context_bytes(config: &Path) -> Result<Option<Vec<u8>>> {
-    let dir = config.join(".omnigraph");
-    let invalid_file = || {
-        Failure::refused(
-            "context_invalid",
-            ".omnigraph must be a directory and context must be a regular file; symbolic links and special files are not supported",
-        )
-    };
-    match std::fs::symlink_metadata(&dir) {
-        Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => return Err(invalid_file()),
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(invalid_file()),
-    }
-    let path = dir.join("context");
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => return Err(invalid_file()),
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(invalid_file()),
-    }
-    // O_NOFOLLOW closes replacement with a symlink between metadata and open;
-    // O_NONBLOCK prevents a raced FIFO from hanging before its type is checked.
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(_) => {
-            return Err(Failure::refused(
-                "context_invalid",
-                "cannot read .omnigraph/context",
-            ));
-        }
-    };
-    if !file.metadata().map_err(|_| invalid_file())?.is_file() {
-        return Err(invalid_file());
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_CONTEXT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| Failure::refused("context_invalid", "cannot read .omnigraph/context"))?;
-    let invalid = || {
-        Failure::refused(
-            "context_invalid",
-            ".omnigraph/context must be valid version 2 YAML, at most 16 KiB, with only version, cluster, api, and organization_id fields; bind again with use after a fresh managed login",
-        )
-    };
-    if bytes.len() as u64 > MAX_CONTEXT {
-        return Err(invalid());
-    }
-    Ok(Some(bytes))
-}
-
-fn read_context(config: &Path) -> Result<Option<Context>> {
-    let Some(bytes) = read_context_bytes(config)? else {
-        return Ok(None);
-    };
-    let invalid = || {
-        Failure::refused(
-            "context_invalid",
-            "use a version 2 managed context; sign in with explicit --api and --organization, then bind again with use --api and --organization",
-        )
-    };
-    let context: Context = yaml_serde::from_slice(&bytes).map_err(|_| invalid())?;
-    if context.version != 2
-        || organization_id(&context.organization_id).is_err()
-        || identifier(&context.cluster).is_err()
-        || !canonical_origin(&context.api).is_ok_and(|origin| origin == context.api)
-    {
-        return Err(invalid());
-    }
-    Ok(Some(context))
-}
-
-fn save_context(config: &Path, context: &Context) -> Result<()> {
-    let fail = || {
-        Failure::new(
-            "context_write_failed",
-            "could not atomically save .omnigraph/context",
-            1,
-        )
-    };
-    read_context_bytes(config)?;
-    let dir = config.join(".omnigraph");
-    std::fs::create_dir_all(&dir).map_err(|_| fail())?;
-    let mut file = tempfile::NamedTempFile::new_in(&dir).map_err(|_| fail())?;
-    let bytes = yaml_serde::to_string(context).map_err(|_| fail())?;
-    file.write_all(bytes.as_bytes()).map_err(|_| fail())?;
-    file.as_file().sync_all().map_err(|_| fail())?;
-    file.persist(dir.join("context")).map_err(|_| fail())?;
-    crate::sync_dir(&dir).map_err(|_| fail())
-}
-
 struct Api {
     client: Client,
     origin: String,
     token: Option<String>,
     selection: Option<auth::Selection>,
+    cluster: Option<(String, String)>,
 }
 
 struct Response {
@@ -523,11 +511,16 @@ impl Api {
             origin,
             token,
             selection: None,
+            cluster: None,
         })
     }
 
-    async fn authenticated(origin: String, organization: Option<&str>) -> Result<Self> {
-        let selection = auth::select(&origin, organization).await?;
+    async fn authenticated(
+        origin: String,
+        organization: Option<&str>,
+        mechanism: ControlAuth,
+    ) -> Result<Self> {
+        let selection = auth::select(&origin, organization, mechanism).await?;
         let mut api = Self::new(origin, None)?;
         api.selection = Some(selection);
         Ok(api)
@@ -685,15 +678,35 @@ impl Api {
                 body["data"]["files"] = files;
             }
         }
-        if status.is_success() {
-            if !body.get("data").is_some_and(Value::is_object)
-                || !body.get("meta").is_some_and(Value::is_object)
-            {
+        let validate = || -> Result<()> {
+            if status.is_success() {
+                if !body.get("data").is_some_and(Value::is_object)
+                    || !body.get("meta").is_some_and(Value::is_object)
+                {
+                    return Err(Failure::protocol());
+                }
+            } else if !body.get("type").is_some_and(Value::is_string) {
                 return Err(Failure::protocol());
             }
-        } else if !body.get("type").is_some_and(Value::is_string) {
-            return Err(Failure::protocol());
-        }
+            if status.is_success()
+                && let Some((cluster, incarnation)) = &self.cluster
+            {
+                cluster_matches(&body, cluster)?;
+                if body.pointer("/meta/incarnation").and_then(Value::as_str)
+                    != Some(incarnation.as_str())
+                {
+                    return Err(Failure::refused(
+                        "target_mismatch",
+                        "the response belongs to another cluster incarnation",
+                    ));
+                }
+            }
+            Ok(())
+        };
+        validate().map_err(|mut error| {
+            error.response_status = Some(status);
+            error
+        })?;
         Ok(Response { status, body })
     }
 
@@ -710,6 +723,7 @@ impl Api {
         } else {
             Err(Failure {
                 body: response.body,
+                response_status: Some(response.status),
                 exit: if response.status.is_client_error() {
                     2
                 } else {
@@ -745,39 +759,33 @@ fn idempotency_key(value: Option<&str>, stderr: &mut dyn Write) -> Result<String
     Ok(key)
 }
 
-fn config_and_json(command: &ClusterCommand) -> (&Path, bool) {
+fn command_json(command: &ClusterCommand) -> bool {
     match command {
-        ClusterCommand::Plan { config, json, .. }
-        | ClusterCommand::Apply { config, json, .. }
-        | ClusterCommand::Status { config, json, .. }
-        | ClusterCommand::Operation { config, json, .. }
-        | ClusterCommand::History { config, json, .. }
-        | ClusterCommand::Cancel { config, json, .. }
-        | ClusterCommand::Token { config, json, .. }
-        | ClusterCommand::Create { config, json, .. }
-        | ClusterCommand::List { config, json, .. }
-        | ClusterCommand::Pull { config, json, .. }
-        | ClusterCommand::Delete { config, json, .. }
-        | ClusterCommand::UndoDelete { config, json, .. }
-        | ClusterCommand::Push { config, json, .. } => (config, *json),
+        ClusterCommand::Plan { json, .. }
+        | ClusterCommand::Apply { json, .. }
+        | ClusterCommand::Status { json, .. }
+        | ClusterCommand::Operation { json, .. }
+        | ClusterCommand::History { json, .. }
+        | ClusterCommand::Cancel { json, .. }
+        | ClusterCommand::Token { json, .. }
+        | ClusterCommand::Create { json, .. }
+        | ClusterCommand::List { json, .. }
+        | ClusterCommand::Pull { json, .. }
+        | ClusterCommand::Delete { json, .. }
+        | ClusterCommand::UndoDelete { json, .. }
+        | ClusterCommand::Push { json, .. } => *json,
         ClusterCommand::Members {
-            command: ClusterMembersCommand::List { config, json },
-        } => (config, *json),
-        _ => unreachable!("local-only commands cannot select --managed"),
+            command: ClusterMembersCommand::List { json },
+        } => *json,
+        _ => false,
     }
 }
 
 fn reject_scope(cli: &Cli) -> Result<()> {
-    if cli.as_actor.is_some()
-        || cli.server.is_some()
-        || cli.graph.is_some()
-        || cli.profile.is_some()
-        || cli.store.is_some()
-        || cli.cluster.is_some()
-    {
+    if cli.as_actor.is_some() || cli.graph.is_some() {
         return Err(Failure::refused(
             "managed_scope_conflict",
-            "cluster --managed uses folder context and authenticated identity; --as, --server, --graph, --profile, --store, and --cluster do not apply",
+            "managed control operations use the target's authenticated identity; --as and --graph do not apply",
         ));
     }
     Ok(())
@@ -794,154 +802,105 @@ async fn cluster_command(
             .await
             .map(|body| (body, 0));
     }
-    let api = Api::authenticated(context.api.clone(), Some(&context.organization_id)).await?;
+    let api = context.client().await?;
     deployment::dispatch(&api, context, command, stderr).await
 }
 
-/// Only explicit managed commands and managed authentication enter this dispatcher.
-pub(crate) async fn dispatch(cli: &Cli, stderr: &mut dyn Write) -> Option<Output> {
+/// Only a resolved managed target enters this dispatcher; project folders never route.
+pub(crate) async fn dispatch(
+    cli: &Cli,
+    binding: &Binding,
+    input: &crate::operator::InvocationConfig,
+    stderr: &mut dyn Write,
+) -> Option<Output> {
     match &cli.command {
-        Command::Organization {
-            managed: true,
-            target,
-            command,
-        } => {
-            if let Err(error) = reject_scope(cli).and_then(|()| {
-                if cli.direct {
-                    Err(Failure::refused(
-                        "managed_scope_conflict",
-                        "--managed and --direct cannot be used together",
-                    ))
-                } else {
-                    Ok(())
+        Command::Organization { args, command } => {
+            if let Err(error) = reject_scope(cli).and_then(|()| binding.account()) {
+                return Some(Output::from_result(Err(error), args.json, 2));
+            }
+            Some(organization::dispatch(binding, args, command, stderr).await)
+        }
+        Command::Login { json, .. } => {
+            let result = async {
+                reject_scope(cli)?;
+                if binding.control_auth != ControlAuth::HumanDevice {
+                    return Err(Failure::refused(
+                        "authentication_mode_conflict",
+                        "automation targets cannot alter human login sessions",
+                    ));
                 }
-            }) {
-                return Some(Output::from_result(Err(error), target.json, 2));
-            }
-            Some(organization::dispatch(target, command, stderr).await)
-        }
-        Command::Login {
-            api: Some(api),
-            organization,
-            json,
-            ..
-        } => {
-            let result = async {
-                reject_scope(cli)?;
-                let origin = canonical_origin(api)?;
-                let selected =
-                    session_organization(Path::new("."), &origin, organization.as_deref())?;
-                auth::login(origin, selected.as_deref(), stderr).await
-            }
-            .await;
-            Some(Output::from_result(result, *json, 0))
-        }
-        Command::Logout {
-            api: Some(api),
-            organization,
-            json,
-            ..
-        } => {
-            let result = async {
-                reject_scope(cli)?;
-                let origin = canonical_origin(api)?;
-                let selected =
-                    session_organization(Path::new("."), &origin, organization.as_deref())?;
-                auth::logout(origin, selected.as_deref()).await
-            }
-            .await;
-            Some(Output::from_result(result, *json, 0))
-        }
-        Command::Use {
-            cluster_id,
-            api,
-            organization,
-            config,
-            json,
-        } => {
-            let result = async {
-                reject_scope(cli)?;
-                identifier(cluster_id)?;
-                let context = if organization.is_some() {
-                    read_context_bytes(config)?;
-                    None
-                } else {
-                    read_context(config)?
-                };
-                let origin = canonical_origin(api)?;
-                let selected =
-                    selected_organization(context.as_ref(), &origin, organization.as_deref())?;
-                let client = Api::authenticated(origin.clone(), selected).await?;
-                let body = client
-                    .request(
-                        Method::GET,
-                        &format!("/v1/clusters/{cluster_id}"),
-                        None,
-                        None,
-                    )
-                    .await?;
-                cluster_matches(&body, cluster_id)?;
-                if body.pointer("/data/cluster_id").and_then(Value::as_str) != Some(cluster_id) {
-                    return Err(Failure::protocol());
+                if binding.cluster.is_some() {
+                    binding.organization()?;
                 }
-                save_context(
-                    config,
-                    &Context {
-                        version: 2,
-                        organization_id: client.account_id()?.into(),
-                        cluster: cluster_id.clone(),
-                        api: origin,
-                    },
-                )?;
-                Ok(body)
+                auth::login(
+                    binding.api.clone(),
+                    binding.organization_id.as_deref(),
+                    stderr,
+                )
+                .await
             }
             .await;
             Some(Output::from_result(result, *json, 0))
         }
-        Command::Cluster {
-            managed: true,
-            command,
-        } => {
-            let (config, json) = config_and_json(command);
-            if cli.direct {
+        Command::Logout { json, .. } => {
+            let result = async {
+                reject_scope(cli)?;
+                let organization = binding.organization()?;
+                if binding.control_auth != ControlAuth::HumanDevice {
+                    return Err(Failure::refused(
+                        "authentication_mode_conflict",
+                        "automation targets cannot alter human login sessions",
+                    ));
+                }
+                auth::logout(binding.api.clone(), Some(organization)).await
+            }
+            .await;
+            Some(Output::from_result(result, *json, 0))
+        }
+        Command::Cluster { command } => {
+            let json = command_json(command);
+            let scope = match command {
+                ClusterCommand::Token { ttl, clear, .. } => data::token_scope(cli, *ttl, *clear),
+                _ => reject_scope(cli),
+            };
+            if let Err(error) = scope {
+                return Some(Output::from_result(Err(error), json, 2));
+            }
+            if let ClusterCommand::Plan {
+                config: Some(_), ..
+            }
+            | ClusterCommand::Apply {
+                config: Some(_), ..
+            } = command
+            {
                 return Some(Output::from_result(
                     Err(Failure::refused(
-                        "managed_scope_conflict",
-                        "--managed and --direct cannot be used together",
+                        "managed_source_conflict",
+                        "managed plan/apply use pushed source; omit --config and use cluster push for local changes",
                     )),
                     json,
                     2,
                 ));
             }
-            let scope = match command {
-                ClusterCommand::Token { ttl, clear, .. } => data::token_scope(cli, *ttl, *clear),
-                _ => reject_scope(cli),
-            };
-            if let Err(err) = scope {
-                return Some(Output::from_result(Err(err), json, 2));
-            }
-            if matches!(command, ClusterCommand::Members { .. }) {
-                return Some(members::list(config, json).await);
-            }
             if lifecycle::handles(command) {
-                return Some(match lifecycle::dispatch(command, stderr).await {
-                    Ok((body, exit)) => Output::from_result(Ok(body), json, exit),
-                    Err(err) => Output::from_result(Err(err), json, 1),
-                });
+                return Some(
+                    match lifecycle::dispatch(binding, input, command, stderr).await {
+                        Ok((body, exit)) => Output::from_result(Ok(body), json, exit),
+                        Err(error) => Output::from_result(Err(error), json, 1),
+                    },
+                );
             }
-            let result = async {
-                let context = read_context(config)?.ok_or_else(|| {
-                    Failure::refused(
-                        "managed_context_required",
-                        "cluster --managed requires the selected folder's .omnigraph/context",
-                    )
-                })?;
-                cluster_command(cli, &context, command, stderr).await
+            let context = match binding.context() {
+                Ok(context) => context,
+                Err(error) => return Some(Output::from_result(Err(error), json, 2)),
+            };
+            if matches!(command, ClusterCommand::Members { .. }) {
+                return Some(members::list(&context, json).await);
             }
-            .await;
+            let result = cluster_command(cli, &context, command, stderr).await;
             Some(match result {
                 Ok((body, exit)) => Output::from_result(Ok(body), json, exit),
-                Err(err) => Output::from_result(Err(err), json, 1),
+                Err(error) => Output::from_result(Err(error), json, 1),
             })
         }
         _ => None,

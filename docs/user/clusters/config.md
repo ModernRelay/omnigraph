@@ -1,6 +1,8 @@
 # Cluster configuration reference
 
-Cluster commands read a directory containing `cluster.yaml`:
+`--config DIR` reads desired configuration from a directory containing
+`cluster.yaml`. `--target NAME|ADDRESS` separately selects the backend for
+plan, apply and observation. Validation needs only source files:
 
 ```bash
 omnigraph cluster validate --config ./company-brain
@@ -17,7 +19,7 @@ version: 1
 metadata:
   name: company-brain
 
-# Omit for a cluster stored in this directory.
+# Optional assertion: must match the selected target for plan/apply.
 storage: s3://company-data/omnigraph/company-brain
 
 state:
@@ -57,7 +59,7 @@ policies:
 |---|---:|---|
 | `version` | yes | Configuration schema; currently `1` |
 | `metadata.name` | no | Display name |
-| `storage` | no | Cluster root; direct default is the config directory, remote apply defaults to the selected server |
+| `storage` | no | Optional root assertion; must match the selected target for direct or server plan/apply |
 | `state.backend` | no | Omit or set to `cluster` |
 | `state.lock` | no | Exclusive writer admission; omit or set to `true`; `false` refuses execution |
 | `providers.embedding` | no | Named embedding provider profiles |
@@ -131,13 +133,13 @@ embedded host and may permit a local `file://` directory; it is not installed
 by the HTTP server or direct-store CLI. Bases must be absolute, non-overlapping,
 and free of credentials, query strings, fragments, and path traversal.
 
-A base must also name storage outside the cluster's storage root: the config
-directory when `storage` is omitted, or the `storage` URI. That root holds every
-graph and the applied state, and ingress reads with the process's own storage
-credentials, so a base over it would let any writer copy another graph's data
-or the cluster ledger into a readable Blob value. `cluster validate`, `plan`,
-and `apply` refuse such a base with `external_blob_base_overlaps_storage_root`,
-whatever its scope. Put external objects under a sibling prefix instead, for
+A base must also name storage outside the selected cluster root. That root
+holds every graph and the applied state, and ingress reads with the process's
+own storage credentials, so a base over it would let any writer copy another
+graph's data or the cluster ledger into a readable Blob value. Plan and apply
+refuse such a base with `external_blob_base_overlaps_storage_root`, whatever
+its scope. Offline validation checks overlap when `storage` declares a root;
+otherwise the destination check waits for plan/apply. Put external objects under a sibling prefix instead, for
 example `s3://company-assets/cluster-external/` beside
 `storage: s3://company-assets/cluster`. A server that finds an overlapping
 `server_safe` base in the applied state quarantines that graph and serves the
@@ -177,15 +179,16 @@ Only one bundle may bind a given graph or the cluster scope. See
 
 ## Storage
 
-For direct apply, omitted `storage` puts applied state and graph data under the
-config directory. `cluster apply --server` instead uses the selected server’s
-canonical root when `storage` is omitted; an explicit absolute path or `file://`,
-`s3://` or `az://` URI must match it. Remote apply rejects relative storage paths
-and reads only the source bundle from the caller’s filesystem.
+Plan and apply always use the selected direct-root or server target. Omitting
+`storage` makes the bundle portable between explicitly selected destinations.
+If present, `storage` is an equality assertion: a mismatch refuses before
+effects. Remote operations require an absolute path or `file://`, `s3://` or
+`az://` URI and read only source files from the caller's filesystem.
 
-Use the standard storage credential environment for the chosen backend. Azure
-is a qualification preview and requires the admission wrapper for every writer;
-see [Deployment](../deployment.md#azure-blob-preview).
+A direct target's provider settings fix its account, service endpoint and
+region independently of its credentials. Use the native provider credential
+chain. Azure remains a qualification preview and requires the admission wrapper
+for every writer; see [Deployment](../deployment.md#azure-blob-preview).
 
 ## Declared paths
 
@@ -213,8 +216,8 @@ Prefer relative paths; they are what keep a bundle portable and hermetic.
 | `force-unlock` | yes | Remove one proven-stale lock by exact ID |
 | `upgrade-ledger` | state only | Convert a stopped legacy ledger without resetting graph data |
 
-All execution uses ledger v2 and requires `state.lock: true`. With `--server`,
-apply submits to the existing writer and activates without restart. Direct
+All execution uses ledger v2 and requires `state.lock: true`. A server target
+submits apply to its existing writer and activates without restart. Direct
 apply owns exclusive admission and requires an explicit handoff before serving.
 Retained graph roots and storage formats stay fixed. Policy/provider/Blob bindings
 can change; removing a graph declaration deletes its managed storage and history. See
@@ -248,3 +251,9 @@ to admit a new deployment; outstanding authority is retained. These bounds do
 not cap graph data, native manifest-history scans or total process memory.
 
 See [Operating a cluster](index.md) for the end-to-end workflow.
+
+## Operator targets
+
+The operator file declares destinations separately from this source bundle.
+See [Operator targets](../cli/targets.md) for the format, provider settings,
+credentials, administration and migration.

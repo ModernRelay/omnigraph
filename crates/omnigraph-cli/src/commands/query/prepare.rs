@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn alias_parameters_keep_defaults_positionals_and_explicit_precedence() {
         let alias: OperatorAlias = yaml_serde::from_str(
-            "server: example\nquery: lookup\nargs: [name, enabled]\nparams:\n  name: default\n  limit: 4\n",
+            "target: example\nquery: lookup\nargs: [name, enabled]\nparams:\n  name: default\n  limit: 4\n",
         )
         .unwrap();
         let params = alias_params(

@@ -9,22 +9,25 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("omnigraph");
-    // A directory makes Cargo rerun this script when anything below it changes.
-    println!("cargo::rerun-if-changed={}", root.display());
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("Cargo sets CARGO_MANIFEST_DIR for build scripts");
+    let root = Path::new(&manifest).join("omnigraph");
+    // Keep both watching and generated includes relative to the compiling package:
+    // a shared target directory can reuse this executable from another checkout.
+    println!("cargo::rerun-if-changed=omnigraph");
     let mut files = Vec::new();
     collect(&root, None, &mut files);
     files.sort();
     assert!(
-        files.iter().any(|(path, _)| path == "SKILL.md"),
+        files.iter().any(|path| path == "SKILL.md"),
         "{} has no SKILL.md",
         root.display()
     );
     let mut table = String::from("&[\n");
-    for (path, source) in &files {
+    for path in &files {
         writeln!(
             table,
-            "    File {{ path: {path:?}, contents: include_bytes!({source:?}) }},"
+            "    File {{ path: {path:?}, contents: include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/omnigraph/\", {path:?})) }},"
         )
         .expect("writing to a String cannot fail");
     }
@@ -33,7 +36,7 @@ fn main() {
     std::fs::write(Path::new(&out).join("files.rs"), table).expect("write the skill table");
 }
 
-fn collect(dir: &Path, prefix: Option<&str>, files: &mut Vec<(String, String)>) {
+fn collect(dir: &Path, prefix: Option<&str>, files: &mut Vec<String>) {
     let entries = std::fs::read_dir(dir)
         .unwrap_or_else(|error| panic!("read skill directory {}: {error}", dir.display()));
     for entry in entries {
@@ -56,12 +59,7 @@ fn collect(dir: &Path, prefix: Option<&str>, files: &mut Vec<(String, String)>) 
         if kind.is_dir() {
             collect(&entry.path(), Some(&path), files);
         } else if kind.is_file() {
-            let source = entry
-                .path()
-                .into_os_string()
-                .into_string()
-                .unwrap_or_else(|source| panic!("skill source {source:?} is not UTF-8"));
-            files.push((path, source));
+            files.push(path);
         } else {
             panic!("skill path {path} is neither a file nor a directory");
         }
