@@ -3094,6 +3094,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "storage.rs: omnigraph_core::storage::StorageAdapter",
     "storage.rs: omnigraph_core::storage::StorageIoScope",
     "storage.rs: omnigraph_core::storage::StorageKind",
+    "storage.rs: omnigraph_core::storage::absolutize_lexically",
     "storage.rs: omnigraph_core::storage::join_uri",
     "storage.rs: omnigraph_core::storage::normalize_root_uri",
     "storage.rs: omnigraph_core::storage::redacted_storage_uri",
