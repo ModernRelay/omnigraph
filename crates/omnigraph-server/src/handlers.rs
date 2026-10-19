@@ -569,7 +569,6 @@ pub(crate) fn resolve_registered_graph(
     }
     Err(ApiError {
         completion_uncertain: false,
-        cause: None,
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: Some(ErrorCode::GraphUnavailable),
         message: message.into(),

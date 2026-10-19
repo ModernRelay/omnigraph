@@ -477,9 +477,6 @@ pub struct ApiError {
     message: Box<str>,
     details: Option<Box<ApiErrorDetails>>,
     completion_uncertain: bool,
-    /// The log-safe class of the engine failure this error maps, so a log
-    /// that reports the failure never needs its message.
-    cause: Option<redacted_cause::RedactedCause>,
 }
 
 #[derive(Debug)]
@@ -1042,7 +1039,6 @@ impl ApiError {
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::UNAUTHORIZED,
             code: Some(ErrorCode::Unauthorized),
             message: message.into().into_boxed_str(),
@@ -1053,7 +1049,6 @@ impl ApiError {
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::FORBIDDEN,
             code: Some(ErrorCode::Forbidden),
             message: message.into().into_boxed_str(),
@@ -1064,7 +1059,6 @@ impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::BAD_REQUEST,
             code: Some(ErrorCode::BadRequest),
             message: message.into().into_boxed_str(),
@@ -1090,7 +1084,6 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::NOT_FOUND,
             code: Some(ErrorCode::NotFound),
             message: message.into().into_boxed_str(),
@@ -1105,7 +1098,6 @@ impl ApiError {
     pub fn method_not_allowed(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::METHOD_NOT_ALLOWED,
             code: Some(ErrorCode::MethodNotAllowed),
             message: message.into().into_boxed_str(),
@@ -1116,7 +1108,6 @@ impl ApiError {
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
@@ -1130,7 +1121,6 @@ impl ApiError {
     fn unattached_cannot_publish(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::UnattachedCannotPublish),
             message: message.into().into_boxed_str(),
@@ -1141,7 +1131,6 @@ impl ApiError {
     fn unsupported_media_type(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             code: Some(ErrorCode::BadRequest),
             message: message.into().into_boxed_str(),
@@ -1152,7 +1141,6 @@ impl ApiError {
     pub(crate) fn range_not_satisfiable(start: u64, end: u64, length: u64) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::RANGE_NOT_SATISFIABLE,
             code: Some(ErrorCode::BadRequest),
             // Keep the pre-existing `OmniError` display spelling stable while
@@ -1176,7 +1164,6 @@ impl ApiError {
     pub(crate) fn blob_precondition_failed(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::PRECONDITION_FAILED,
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
@@ -1192,7 +1179,6 @@ impl ApiError {
     pub(crate) fn blob_write_precondition_failed(current_etag: Option<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::PRECONDITION_FAILED,
             code: Some(ErrorCode::Conflict),
             message: format!(
@@ -1209,7 +1195,6 @@ impl ApiError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: true,
-            cause: None,
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: Some(ErrorCode::Internal),
             message: message.into().into_boxed_str(),
@@ -1221,7 +1206,6 @@ impl ApiError {
     fn admission_closed() -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: Some(ErrorCode::ServiceUnavailable),
             message:
@@ -1253,7 +1237,6 @@ impl ApiError {
         let message = format!("external blob source '{uri}' is unavailable: {reason}");
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::FAILED_DEPENDENCY,
             code: None,
             message: message.into_boxed_str(),
@@ -1270,7 +1253,6 @@ impl ApiError {
     pub fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::TOO_MANY_REQUESTS,
             code: Some(ErrorCode::TooManyRequests),
             message: message.into().into_boxed_str(),
@@ -1302,7 +1284,6 @@ impl ApiError {
     fn merge_conflict(conflicts: Vec<api::MergeConflictOutput>) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: summarize_merge_conflicts(&conflicts).into_boxed_str(),
@@ -1316,7 +1297,6 @@ impl ApiError {
     ) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1329,7 +1309,6 @@ impl ApiError {
     fn read_set_conflict(message: String, details: api::ReadSetConflictOutput) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1340,7 +1319,6 @@ impl ApiError {
     fn key_conflict(message: String, details: api::KeyConflictOutput) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1351,7 +1329,6 @@ impl ApiError {
     fn resource_limit(message: String, details: api::ResourceLimitOutput) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code: Some(ErrorCode::BadRequest),
             message: message.into_boxed_str(),
@@ -1362,7 +1339,6 @@ impl ApiError {
     fn recovery_required(message: String, operation_id: String) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::SERVICE_UNAVAILABLE,
             // The admitted HTTP contract identifies this condition through
             // `recovery_required`; the top-level `code` remains unset.
@@ -1381,7 +1357,6 @@ impl ApiError {
     fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::PRECONDITION_FAILED,
             code: None,
             message: message.into_boxed_str(),
@@ -1396,7 +1371,6 @@ impl ApiError {
     fn change_feed_gap(cursor: Option<String>, first_unreadable_commit_id: String) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::GONE,
             code: None,
             message: format!("change feed gap at commit '{first_unreadable_commit_id}'")
@@ -1415,7 +1389,6 @@ impl ApiError {
     fn change_diff_refusal(message: String, details: api::ChangeDiffRefusalOutput) -> Self {
         Self {
             completion_uncertain: false,
-            cause: None,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1437,10 +1410,6 @@ impl ApiError {
 
     pub(crate) fn completion_uncertain(&self) -> bool {
         self.completion_uncertain
-    }
-
-    pub(crate) fn cause(&self) -> Option<redacted_cause::RedactedCause> {
-        self.cause
     }
 
     fn from_omni(err: OmniError) -> Self {
@@ -1687,7 +1656,16 @@ impl ApiError {
             }
             None => {}
         }
-        response.cause = Some(cause);
+        if response.completion_uncertain {
+            // The record of why a write may be contained: the failure's class
+            // and status, never its message, which can carry object URIs. It
+            // shares the request's span with the containment log.
+            tracing::warn!(
+                status = %response.status,
+                ?cause,
+                "engine failure without definite completion evidence"
+            );
+        }
         response
     }
 }

@@ -260,13 +260,11 @@ impl OperationRuntime {
                 // abandonment destroys the output before releasing its ownership.
                 // Uncertainty closes admission before its result is observable.
                 let owner = if result.uncertain {
-                    // The first record of why the process is being contained:
-                    // the failure's class and the status it answered, never
-                    // its message, which can carry object URIs.
+                    // The failure's class was logged in this request's span
+                    // when the engine error was mapped.
                     if let Err(error) = &result.result {
                         tracing::error!(
                             status = %error.status,
-                            cause = ?error.cause(),
                             "owned write ended without a definite outcome"
                         );
                     }
