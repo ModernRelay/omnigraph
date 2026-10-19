@@ -133,7 +133,8 @@ with the target's token. For direct storage the CLI decides itself
   With a bundle, nothing is allowed without an actor. With none, every action is
   allowed, with or without an actor. A graph the cluster does not apply refuses
   with `not_found`, and one it quarantined with `graph_unavailable`, as a server
-  refuses them.
+  refuses them. A graph two bundles bind, a ledger no server starts from, also
+  refuses with `graph_unavailable`.
 - A standalone graph carries no policy, so once its store opens every action is
   allowed, as direct writes do; its `graph_id` is `default`. A store that holds
   no graph refuses with `not_found`.
