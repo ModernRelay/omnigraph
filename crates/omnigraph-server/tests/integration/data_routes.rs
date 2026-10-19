@@ -5545,35 +5545,39 @@ async fn remote_branch_list_create_merge_flow_works() {
 async fn remote_branch_delete_flow_works() {
     let (_temp, app) = app_for_loaded_graph().await;
 
-    let create = BranchCreateRequest {
-        from: Some("main".to_string()),
-        name: "feature".to_string(),
-    };
-    let (create_status, _) = json_response(
-        &app,
-        Request::builder()
-            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/branches"))
-            .method(Method::POST)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&create).unwrap()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(create_status, StatusCode::OK);
+    // A branch may carry the name of a static route beside `{branch}`; the
+    // router matches that route first, and it deletes the branch it spells.
+    for name in ["feature", "merge", "diff", "merge-base"] {
+        let create = BranchCreateRequest {
+            from: Some("main".to_string()),
+            name: name.to_string(),
+        };
+        let (create_status, _) = json_response(
+            &app,
+            Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(g("/branches"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&create).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::OK, "{name}");
 
-    let (delete_status, delete_body) = json_response(
-        &app,
-        Request::builder()
-            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/branches/feature"))
-            .method(Method::DELETE)
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(delete_status, StatusCode::OK);
-    assert_eq!(delete_body["name"], "feature");
+        let (delete_status, delete_body) = json_response(
+            &app,
+            Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(g(&format!("/branches/{name}")))
+                .method(Method::DELETE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(delete_status, StatusCode::OK, "{name}: {delete_body}");
+        assert_eq!(delete_body["name"], name);
+    }
 
     let (list_status, list_body) = json_response(
         &app,

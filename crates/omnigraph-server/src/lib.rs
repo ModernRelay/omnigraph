@@ -2759,9 +2759,33 @@ pub fn build_app(state: AppState) -> Router {
             get(server_branch_list).post(server_branch_create),
         )
         .route("/branches/{branch}", delete(server_branch_delete))
-        .route("/branches/merge", post(server_branch_merge))
-        .route("/branches/diff", get(server_branch_diff))
-        .route("/branches/merge-base", get(server_merge_base))
+        // A branch may be named like a static route beside `{branch}`, which
+        // the router matches first, so each static route also deletes the
+        // branch it spells.
+        .route(
+            "/branches/merge",
+            post(server_branch_merge).delete(
+                |state, handle, ingress, actor: Option<Extension<AuthenticatedActor>>| {
+                    server_branch_delete_named(state, handle, ingress, actor, "merge".into())
+                },
+            ),
+        )
+        .route(
+            "/branches/diff",
+            get(server_branch_diff).delete(
+                |state, handle, ingress, actor: Option<Extension<AuthenticatedActor>>| {
+                    server_branch_delete_named(state, handle, ingress, actor, "diff".into())
+                },
+            ),
+        )
+        .route(
+            "/branches/merge-base",
+            get(server_merge_base).delete(
+                |state, handle, ingress, actor: Option<Extension<AuthenticatedActor>>| {
+                    server_branch_delete_named(state, handle, ingress, actor, "merge-base".into())
+                },
+            ),
+        )
         .route("/commits", get(server_commit_list))
         .route(
             "/commits/{commit_id}",

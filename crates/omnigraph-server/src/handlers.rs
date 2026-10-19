@@ -3042,11 +3042,25 @@ pub(crate) struct BranchPath {
 /// exist. The GQ statement `branch delete` on `POST /mutate` runs the same
 /// body.
 pub(crate) async fn server_branch_delete(
+    state: State<AppState>,
+    handle: Extension<GraphRequest>,
+    ingress: Extension<IngressLease>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Path(BranchPath { branch }): Path<BranchPath>,
+) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
+    server_branch_delete_named(state, handle, ingress, actor, branch).await
+}
+
+/// `DELETE` of a branch whose name is also a static segment beside
+/// `/branches/{branch}` (`merge`, `diff`, `merge-base`). The router matches
+/// the static route before the parameter, so each static route deletes the
+/// branch it spells; without that, such a branch could not be deleted.
+pub(crate) async fn server_branch_delete_named(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Path(BranchPath { branch }): Path<BranchPath>,
+    branch: String,
 ) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     branch_delete_body(&state, &handle, actor_ref, ingress, &branch).await?;
