@@ -2902,6 +2902,63 @@ fn a_policy_refused_served_load_reports_not_started() {
     );
 }
 
+/// An embedded load reports what the engine did rather than a prediction.
+/// Onto a branch that exists, `--from` forks nothing, so a refused payload ran
+/// nothing. Onto a missing branch the fork publishes before the payload is
+/// read, so the same refusal follows that publication and the branch stays.
+#[test]
+fn an_embedded_load_reports_its_fork_from_the_engine() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph = temp.path().join("graph.omni");
+    init_graph(&graph);
+    load_fixture(&graph);
+    output_success(
+        cli()
+            .args(["branch", "create", "feature", "--uri"])
+            .arg(&graph),
+    );
+    let rows = temp.path().join("rows.jsonl");
+    fs::write(&rows, "not valid graph NDJSON\n").unwrap();
+    let load = |branch: &str| {
+        cli()
+            .args(["load", "--mode", "append", "--data"])
+            .arg(&rows)
+            .args(["--branch", branch, "--from", "main", "--json"])
+            .arg(&graph)
+            .output()
+            .unwrap()
+    };
+    let branches = || {
+        parse_stdout_json(&output_success(
+            cli()
+                .args(["branch", "list", "--json", "--uri"])
+                .arg(&graph),
+        ))["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before = branches();
+
+    let existing = load("feature");
+    assert_eq!(existing.status.code(), Some(1), "{existing:?}");
+    assert_eq!(
+        parse_stdout_json(&existing)["outcome"],
+        json!({"execution":"not_started","effects":"none","action":"refresh"}),
+        "{existing:?}"
+    );
+    assert_eq!(branches(), before, "no fork onto an existing branch");
+
+    let forked = load("fresh");
+    assert_eq!(forked.status.code(), Some(2), "{forked:?}");
+    let body = parse_stdout_json(&forked);
+    assert_eq!(body["outcome"]["execution"], "unknown", "{body}");
+    assert_eq!(body["outcome"]["effects"], "unknown", "{body}");
+    assert!(branches().contains("fresh"), "the fork published");
+}
+
 /// Whole-command outcome classification needs real CLI processes and a wire
 /// census; row/error GQT expectations cannot observe exits or resubmission.
 #[test]
