@@ -139,7 +139,11 @@ with the target's token. For direct storage the CLI decides itself
   allowed, as direct writes do; its `graph_id` is `default`. A store that holds
   no graph refuses with `not_found`.
 
-`access` also accepts `--server`, `--store`, `--cluster` and `--profile`.
+An action listed for a branch is one the policy allows there, not one the
+branch supports: `schema_apply` on a branch other than `main` does not make
+schema apply possible there
+([learn your access](../operations/policy.md#learn-your-access)). `access` also
+accepts `--server`, `--store`, `--cluster` and `--profile`.
 
 ## Listing and editing targets
 
