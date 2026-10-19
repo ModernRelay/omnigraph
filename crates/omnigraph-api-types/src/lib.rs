@@ -2186,8 +2186,8 @@ pub struct ReadSetConflictOutput {
 }
 
 /// A strict insert rejected because `entity_id` already names an entity in the
-/// selected node or edge type. The refused rows wrote nothing; an earlier step
-/// of the same request, such as the branch a load forks, may already have
+/// selected node or edge type. The refused write changed nothing; an earlier
+/// step of the same request, such as the branch a load forks, may already have
 /// published, which the error's `outcome` states. Partial or ambiguous
 /// attempts surface `recovery_required` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
