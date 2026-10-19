@@ -137,6 +137,29 @@ pub enum FailedRequest {
     Ambiguous,
 }
 
+/// A log-safe name for a failed request's error: its object-store variant,
+/// never its message, which can carry object paths.
+pub fn request_error_class(error: &Error) -> &'static str {
+    use object_store::Error as Store;
+
+    match error {
+        Error::NotFound { .. } => "not_found",
+        Error::IO { source, .. } => match source.downcast_ref::<Store>() {
+            Some(Store::Generic { .. }) => "generic",
+            Some(Store::NotFound { .. }) => "not_found",
+            Some(Store::AlreadyExists { .. }) => "already_exists",
+            Some(Store::Precondition { .. }) => "precondition",
+            Some(Store::NotModified { .. }) => "not_modified",
+            Some(Store::PermissionDenied { .. }) => "permission_denied",
+            Some(Store::Unauthenticated { .. }) => "unauthenticated",
+            Some(Store::NotSupported { .. } | Store::NotImplemented { .. }) => "not_supported",
+            Some(_) => "object_store",
+            None => "io",
+        },
+        _ => "lance",
+    }
+}
+
 /// Classify a manifest put's failure by the typed error the store returned.
 ///
 /// A remote store's generic failure (a 5xx, a throttle, a timeout, a lost
@@ -245,6 +268,23 @@ mod tests {
                 FailedRequest::Ambiguous,
                 "{error}"
             );
+        }
+        // What a log records is the error's class, never its message.
+        let secret = "s3://bucket/root/__manifest/_versions/7.manifest";
+        for (error, class) in [
+            (generic("S3"), "generic"),
+            (Error::not_found(secret), "not_found"),
+            (
+                store_error(object_store::Error::PermissionDenied {
+                    path: secret.into(),
+                    source: std::io::Error::other("403").into(),
+                }),
+                "permission_denied",
+            ),
+            (Error::io(secret), "io"),
+        ] {
+            assert_eq!(request_error_class(&error), class, "{error}");
+            assert!(!request_error_class(&error).contains("bucket"));
         }
     }
 

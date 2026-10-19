@@ -19,7 +19,7 @@ use object_store::ObjectStore as RawObjectStore;
 
 use crate::manifest_request::{
     FailedRequest, MANIFEST_REQUEST_REISSUES, ManifestRequest, ManifestRequestAttempt,
-    ManifestRequestProbe, classify_failed_request, reissue_pause,
+    ManifestRequestProbe, classify_failed_request, reissue_pause, request_error_class,
 };
 use object_store::path::Path;
 use prost::Message;
@@ -390,7 +390,6 @@ impl IndexOriginCommitHandler {
                 Ok(location) => {
                     if reissues > 0 {
                         tracing::info!(
-                            base = %base_path,
                             version = manifest.version,
                             reissues,
                             "manifest request resolved by re-issue: the store holds this commit"
@@ -411,10 +410,9 @@ impl IndexOriginCommitHandler {
             }
             if reissues == MANIFEST_REQUEST_REISSUES {
                 tracing::error!(
-                    base = %base_path,
                     version = manifest.version,
                     reissues,
-                    error = %error,
+                    error_class = request_error_class(&error),
                     "manifest request outcome unknown after every re-issue; the version may still \
                      hold this commit"
                 );
@@ -423,10 +421,9 @@ impl IndexOriginCommitHandler {
             }
             reissues += 1;
             tracing::warn!(
-                base = %base_path,
                 version = manifest.version,
                 reissue = reissues,
-                error = %error,
+                error_class = request_error_class(&error),
                 "manifest request outcome unknown; re-issuing the identical conditional request"
             );
             tokio::time::sleep(reissue_pause(reissues)).await;
