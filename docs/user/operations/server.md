@@ -111,7 +111,7 @@ actions remain denied.
 ### Assert the actor
 
 A client that means to act as a particular actor sends
-`Omnigraph-Expect-Actor: <actor>` with any protected request, `/mcp` included.
+`Omnigraph-If-Actor: <actor>` with any protected request, `/mcp` included.
 The server compares it with the actor the credential resolved to, after
 authentication and the contract check and before graph lookup, body decoding
 or any effect (on `/mcp`, which has no contract check, after authentication and

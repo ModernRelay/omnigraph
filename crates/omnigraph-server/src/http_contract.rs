@@ -11,7 +11,7 @@ use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::{Content, Ref, RefOr};
 
 use crate::ApiError;
-use crate::api::{EXPECT_ACTOR_HEADER, ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
+use crate::api::{ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER, IF_ACTOR_HEADER};
 
 fn mismatch_message() -> String {
     format!(
@@ -76,7 +76,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     .parameters
                     .get_or_insert_with(Vec::new)
                     .push(parameter);
-                let mut expected_actor = Parameter::new(EXPECT_ACTOR_HEADER);
+                let mut expected_actor = Parameter::new(IF_ACTOR_HEADER);
                 expected_actor.parameter_in = ParameterIn::Header;
                 expected_actor.required = utoipa::openapi::Required::False;
                 expected_actor.schema = Some(Object::with_type(Type::String).into());
@@ -111,7 +111,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     });
                 if let RefOr::T(response) = response {
                     response.description.push_str(
-                        "; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
+                        "; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
                     );
                 }
                 let response = operation

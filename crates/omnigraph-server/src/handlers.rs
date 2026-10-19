@@ -450,7 +450,7 @@ pub(crate) async fn require_bearer_auth(
     Ok(next.run(request).await)
 }
 
-/// Refuse a request whose `omnigraph-expect-actor` header names another actor
+/// Refuse a request whose `omnigraph-if-actor` header names another actor
 /// than its credential resolved to. It runs after authentication and the
 /// contract check, before graph resolution or any body work, and can only
 /// narrow a request: a matching value changes nothing, and the header never
@@ -459,13 +459,13 @@ pub(crate) async fn require_expected_actor(
     request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
-    let mut values = request.headers().get_all(EXPECT_ACTOR_HEADER).iter();
+    let mut values = request.headers().get_all(IF_ACTOR_HEADER).iter();
     let Some(value) = values.next() else {
         return Ok(next.run(request).await);
     };
     if values.next().is_some() {
         return Err(ApiError::bad_request(format!(
-            "at most one {EXPECT_ACTOR_HEADER} header is allowed"
+            "at most one {IF_ACTOR_HEADER} header is allowed"
         )));
     }
     let expected = value
@@ -474,7 +474,7 @@ pub(crate) async fn require_expected_actor(
         .filter(|actor| !actor.is_empty() && actor.trim() == *actor)
         .ok_or_else(|| {
             ApiError::bad_request(format!(
-                "{EXPECT_ACTOR_HEADER} must name one actor, without surrounding whitespace"
+                "{IF_ACTOR_HEADER} must name one actor, without surrounding whitespace"
             ))
         })?;
     let resolved = request

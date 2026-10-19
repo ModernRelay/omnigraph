@@ -3616,7 +3616,7 @@ fn expecting(
         request = request.header("authorization", format!("Bearer {token}"));
     }
     for actor in expected {
-        request = request.header(omnigraph_server::api::EXPECT_ACTOR_HEADER, *actor);
+        request = request.header(omnigraph_server::api::IF_ACTOR_HEADER, *actor);
     }
     match body {
         Some(body) => request

@@ -5,7 +5,7 @@ use std::time::Duration;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use omnigraph_api_types::{
-    EXPECT_ACTOR_HEADER, ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER,
+    ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER, IF_ACTOR_HEADER,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
@@ -273,7 +273,7 @@ pub(crate) struct GraphHttpClient {
     /// Why this client's requests carry no credential, attached to a 401
     /// response so its refusal says how to bind one.
     missing_credential: Option<Box<MissingCredential>>,
-    /// The actor `--as` asserts, sent as `omnigraph-expect-actor` on every
+    /// The actor `--as` asserts, sent as `omnigraph-if-actor` on every
     /// data request, so the server refuses a credential that resolves to
     /// another actor before anything runs.
     expected_actor: Option<String>,
@@ -371,7 +371,7 @@ impl GraphHttpClient {
         drop(discovery);
         let mut request = request.header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT);
         if let Some(actor) = &self.expected_actor {
-            request = request.header(EXPECT_ACTOR_HEADER, actor);
+            request = request.header(IF_ACTOR_HEADER, actor);
         }
         let request = request.build()?;
         let bearer = request
