@@ -165,7 +165,9 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
 
 - The server binary is cluster-only and ledger v2 is the sole operational
   protocol. The library's `AppState::local` and `serve_local` serve one
-  standalone graph read-only on loopback and take no cluster admission.
+  standalone graph or one cluster read-only on loopback, and a read-only open
+  takes no cluster admission. Read-write stays refused until a write whose
+  outcome is unknown no longer stops the server.
   Server-owned apply activates schemas, queries, policies, provider/Blob bindings
   under existing writer admission.
   Runtime views share engine authority and retain immutable request bindings.

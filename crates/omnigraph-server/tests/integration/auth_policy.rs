@@ -369,6 +369,13 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         StatusCode::FORBIDDEN,
         "JWT must not inherit static no-policy read default"
     );
+    // The access route says the same: the credential resolves, and allows
+    // nothing with no branch named or on `main`.
+    let (status, body) = json_response(&app, get_request(&g("/access?branch=main"), &token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["actor"].is_string(), "{body}");
+    assert_eq!(body["graph_wide"], json!([]), "{body}");
+    assert_eq!(body["actions"], json!([]), "{body}");
     let (status, _) = json_response(
         &app,
         get_request(&g("/snapshot?branch=main"), "static-token"),
@@ -448,6 +455,7 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         (Method::GET, "/branches/merge-base"),
         (Method::GET, "/changes"),
         (Method::POST, "/changes/baseline"),
+        (Method::GET, "/access"),
     ] {
         for rejected in ["invalid.jwt.signature", &retired] {
             let response = app
@@ -640,7 +648,7 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         Vec::new(),
         vec![HeaderValue::from_static("0.11")],
         vec![HeaderValue::from_static("0.12")],
-        vec![HeaderValue::from_static("0.14")],
+        vec![HeaderValue::from_static("0.13")],
         vec![HeaderValue::from_str(&format!("{HTTP_API_CONTRACT}, {HTTP_API_CONTRACT}")).unwrap()],
         vec![
             HeaderValue::from_static(HTTP_API_CONTRACT),
@@ -748,7 +756,7 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         .clone()
         .oneshot(
             Request::post(g("/mutate"))
-                .header("Omnigraph-Http-Api", "0.13")
+                .header("Omnigraph-Http-Api", HTTP_API_CONTRACT)
                 .header("authorization", "Bearer demo-token")
                 .header("content-type", "application/json")
                 .body(Body::from(payload))
@@ -3781,21 +3789,6 @@ async fn expected_actor_header_narrows_a_request_and_never_supplies_an_actor() {
         "params": {"name": "Mina", "age": 28},
         "branch": "feature",
     });
-
-    // Public discovery attests the assertion, so a client sends it only to a
-    // server that enforces it.
-    let discovery = app
-        .clone()
-        .oneshot(Request::head("/healthz").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(
-        discovery
-            .headers()
-            .get(omnigraph_server::api::HTTP_API_ASSERTIONS_HEADER)
-            .unwrap(),
-        omnigraph_server::api::EXPECT_ACTOR_ASSERTION
-    );
 
     // A matching assertion changes nothing.
     let (status, body) = json_response(

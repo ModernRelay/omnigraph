@@ -96,7 +96,7 @@ revision. Retained roots, trust and storage format stay fixed. Removing a graph
 from desired configuration deletes its exact managed root, including all branches,
 retained history and managed Blob bytes. It does not follow external Blob
 references or delete peer roots. Adoption, missing-root recreation and catalog
-repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.13.
+repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.14.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
@@ -350,7 +350,7 @@ revision alone. Old-ID submission validates immutable input and returns the
 original record before graph closure; it cannot reinstall an old view. Boot
 digests remain boot facts. Explicit OIDC public-admission refresh is separate below.
 
-Protected graph and registry HTTP calls require the v0.13 contract header after
+Protected graph and registry HTTP calls require the v0.14 contract header after
 authentication and before graph resolution. CLI discovery and response validation
 are specified by [wire compatibility](versioning.md#wire-compatibility); the
 managed control-plane API and standard MCP/OAuth protocols are separate surfaces.
@@ -566,8 +566,7 @@ the generated token resolves to the actor, so the cluster's policy decides for
 it as a deployment's would. A graph the cluster binds no policy to is granted
 `read` alone, which is what a deployment's routes allow without a bundle, and
 the grant is installed on its engine as well, so an embedder holding the handle
-cannot write through it. `/readyz` and `/graphs` report the ledger revision
-served.
+cannot write through it. `/readyz` reports the ledger revision served.
 
 A read-only one captures one ledger revision without admission, opens every
 graph read-only, validates each against that revision through

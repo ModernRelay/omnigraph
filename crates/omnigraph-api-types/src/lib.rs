@@ -27,23 +27,18 @@ use utoipa::{IntoParams, ToSchema};
 /// re-exported so a wire consumer needs no second dependency for it.
 pub use omnigraph_compiler::settings;
 
-/// The single request/response discriminator for the v0.13 HTTP contract.
+/// The single request/response discriminator for the v0.14 HTTP contract.
 /// This is independent of the package version and graph-storage stamp.
 pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
 /// Exact header value; consumers must reject missing or repeated values.
-pub const HTTP_API_CONTRACT: &str = "0.13";
+pub const HTTP_API_CONTRACT: &str = "0.14";
 /// An optional request header naming the actor the caller expects its
 /// credential to resolve to. The server refuses a mismatch with
 /// [`ErrorCode::ActorMismatch`] before graph lookup or effects; a matching
-/// value changes nothing, so the header can only narrow a request.
+/// value changes nothing, so the header can only narrow a request. Contract
+/// 0.14 introduced it, so a server that speaks [`HTTP_API_CONTRACT`] enforces
+/// it and an older one refuses the request before reading the header.
 pub const EXPECT_ACTOR_HEADER: &str = "omnigraph-expect-actor";
-/// The response header naming, comma-separated, the request assertions a
-/// server enforces. The contract identifier does not attest them: a server
-/// built before an assertion existed ignores its header and omits it here, so
-/// a client sends an assertion only to a server that lists it.
-pub const HTTP_API_ASSERTIONS_HEADER: &str = "omnigraph-http-api-assertions";
-/// The [`HTTP_API_ASSERTIONS_HEADER`] entry for [`EXPECT_ACTOR_HEADER`].
-pub const EXPECT_ACTOR_ASSERTION: &str = "expect-actor";
 
 /// How a binary identifies its build: the one derivation the CLI's
 /// `omnigraph version`, the server's `/healthz` and its MCP server info all
@@ -1946,8 +1941,12 @@ pub struct AccessOutput {
     /// without authentication.
     pub actor: Option<String>,
     pub graph_id: String,
-    /// Actions allowed whatever the branch: the graph-scoped ones, and the
-    /// branch-scoped ones a rule allows on every branch.
+    /// Actions allowed with no branch named: the graph-scoped ones, and the
+    /// branch-scoped ones a single rule allows on every branch (a rule with no
+    /// branch scope, `branch_scope: any` or `target_branch_scope: any`).
+    /// Rules that cover every branch only together, one for protected
+    /// branches and one for the rest, allow each named branch but leave the
+    /// action out of this list; read `actions` for a branch.
     pub graph_wide: Vec<AccessAction>,
     /// The branch asked about, when one was.
     pub branch: Option<String>,
@@ -2131,7 +2130,8 @@ pub enum ErrorCode {
     TooManyRequests,
     /// 503: operation admission is closed; reconcile any earlier write.
     ServiceUnavailable,
-    /// 503: a known graph is unavailable. Does not authorize replay.
+    /// 503: a known graph is unavailable. The request did not start, so it
+    /// may be retried once the graph is served again.
     GraphUnavailable,
     Internal,
     /// CLI only: no target of that name is in the operator configuration.
@@ -2206,8 +2206,10 @@ pub struct ReadSetConflictOutput {
 }
 
 /// A strict insert rejected because `entity_id` already names an entity in the
-/// selected node or edge type. The operation is effect-free when this output is returned;
-/// partial or ambiguous attempts surface `recovery_required` instead.
+/// selected node or edge type. The refused rows wrote nothing; an earlier step
+/// of the same request, such as the branch a load forks, may already have
+/// published, which the error's `outcome` states. Partial or ambiguous
+/// attempts surface `recovery_required` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KeyConflictOutput {
     pub entity_kind: EntityKindOutput,

@@ -1790,6 +1790,84 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     );
 }
 
+/// Whether a load forked its branch is the engine's fact, not the route's. A
+/// branch deleted after the route authorized the load, while its body is still
+/// arriving, is forked by the load itself, and a refusal of the rows then
+/// follows that publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_that_forks_a_branch_deleted_during_its_body_reports_the_fork() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Arc::new(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    db.branch_create("feature").await.unwrap();
+    let state = AppState::new_multi(
+        vec![Arc::new(omnigraph_server::registry::GraphHandle {
+            key: omnigraph_server::identity::GraphKey::cluster(
+                omnigraph_server::graph_id::GraphId::try_from("default").unwrap(),
+            ),
+            uri: graph.to_string_lossy().to_string(),
+            engine: Arc::clone(&db),
+            policy: None,
+            queries: None,
+        })],
+        Vec::new(),
+        None,
+        omnigraph_server::workload::WorkloadController::new(1, 1_000_000),
+        None,
+    )
+    .unwrap();
+    let app = build_app(state);
+
+    // The route authorizes before it polls the body, so the first poll says
+    // the route has listed `feature`; the rows wait for the deletion.
+    let (polled, route_listed) = tokio::sync::oneshot::channel::<()>();
+    let (send_rows, rows) = tokio::sync::oneshot::channel::<Bytes>();
+    let body = Body::from_stream(futures::stream::unfold(
+        Some((polled, rows)),
+        |state| async move {
+            let (polled, rows) = state?;
+            let _ = polled.send(());
+            let rows = rows.await.ok()?;
+            Some((Ok::<_, Infallible>(rows), None))
+        },
+    ));
+    let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .method(Method::POST)
+        .uri(g("/load/ndjson?branch=feature&from=main&mode=append"))
+        .header("content-type", "application/x-ndjson")
+        .body(body)
+        .unwrap();
+    let load = tokio::spawn(async move { json_response(&app, request).await });
+    tokio::time::timeout(Duration::from_secs(10), route_listed)
+        .await
+        .expect("the route reads the body after authorizing")
+        .unwrap();
+    db.branch_delete("feature").await.unwrap();
+    // Bob is on main, so appending him to a fork of main is refused.
+    send_rows
+        .send(Bytes::from_static(
+            b"{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":26}}\n",
+        ))
+        .unwrap();
+    let (status, body) = load.await.unwrap();
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["key_conflict"].is_object(), "{body}");
+    assert_eq!(
+        body["outcome"],
+        json!({"execution": "unknown", "effects": "unknown", "action": "refresh"}),
+        "the fork published before the rows: {body}"
+    );
+    assert!(
+        db.branch_list()
+            .await
+            .unwrap()
+            .contains(&"feature".to_string()),
+        "the load forked `feature` again"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_existing_branch_skips_branch_create_policy_check() {
     let temp = init_loaded_graph().await;

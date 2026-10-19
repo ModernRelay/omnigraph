@@ -59,13 +59,13 @@ its error class, never by its message; see
 
 ## HTTP contract
 
-Upgrade the v0.13 CLI, server and HTTP integrations together. Every protected
-request requires exactly one `Omnigraph-Http-Api: 0.13`: graph, registry and
+Upgrade the CLI, server and HTTP integrations together. Every protected
+request requires exactly one `Omnigraph-Http-Api: 0.14`: graph, registry and
 cluster-deployment calls, including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
 duplicate, combined or unsupported values return `400 api_contract_mismatch`
 after authentication but before graph lookup, body decoding or execution. This
 HTTP identifier is separate from package/storage versions and grants no permission.
-The previous `0.12` value is refused; update integrations to the current routes,
+The previous `0.13` value is refused; update integrations to the current routes,
 request/response shapes and credentials before changing their header.
 
 Ordinary responses, including errors and streams, carry the same header. Check
@@ -113,14 +113,14 @@ actions remain denied.
 A client that means to act as a particular actor sends
 `Omnigraph-Expect-Actor: <actor>` with any protected request, `/mcp` included.
 The server compares it with the actor the credential resolved to, after
-authentication and the contract check (`/mcp` has none) and before graph
-lookup, body decoding or any effect: a match changes nothing, a mismatch is `412 actor_mismatch` with
-nothing run (a server without authentication resolves no actor), and a repeated
-or padded header is `400 bad_request`. The header only narrows a request; it
-never supplies the actor. Every response lists `expect-actor` in
-`Omnigraph-Http-Api-Assertions`, since a server that does not would ignore the
-header: the CLI sends it for `--as` on served writes and `cluster --server`
-commands only to a server that lists it, and otherwise refuses before sending.
+authentication and the contract check and before graph lookup, body decoding
+or any effect (on `/mcp`, which has no contract check, after authentication and
+before admission): a match changes nothing, a mismatch is `412 actor_mismatch`
+with nothing run (a server without authentication resolves no actor), and a
+repeated, padded or empty header is `400 bad_request`. The header only narrows
+a request; it never supplies the actor. Contract `0.14` introduced it, so a
+server that would ignore it refuses the request's contract first. The CLI sends
+it for `--as` on served writes and on served `cluster plan` and `cluster apply`.
 
 ### Signed data credentials
 
@@ -249,7 +249,7 @@ Change a managed graph's schema through `cluster apply --server URL --config DIR
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/query \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{
@@ -268,7 +268,7 @@ writes go to `/mutate` and may select a target `branch`.
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/queries/find_person \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{"params":{"name":"Ada"}}'
@@ -285,7 +285,7 @@ acting on:
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/mutate/if-graph-commit \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -H 'Omnigraph-If-Graph-Commit: <graph_commit_id>' \
