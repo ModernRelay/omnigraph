@@ -51,9 +51,9 @@ pub use graph_read::GraphReadAuthority;
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;
 pub use serve::{
-    AdmittedServingSnapshot, RootBoundServingSnapshot, ServingBlockedGraph, ServingGraph,
-    ServingPolicy, ServingQuery, ServingSnapshot, acquire_serving_admission,
-    admit_serving_snapshot, cluster_graph_ids, cluster_root_for_graph_uri,
+    AdmittedServingSnapshot, ClusterGraphLocation, RootBoundServingSnapshot, ServingBlockedGraph,
+    ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, acquire_serving_admission,
+    admit_serving_snapshot, cluster_graph_for_uri, cluster_graph_ids, cluster_root_for_graph_uri,
     read_deployment_serving_snapshot, read_root_bound_serving_snapshot,
     read_root_bound_serving_snapshot_from_storage, read_serving_snapshot,
     read_serving_snapshot_from_storage, resolve_graph_storage_uri,

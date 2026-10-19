@@ -430,6 +430,117 @@ fn served_graph(snapshot: &omnigraph_cluster::ServingSnapshot, graph: &str) -> R
     Ok(())
 }
 
+/// The id a standalone graph answers under, the reserved id a server gives
+/// the one graph it serves from a store.
+const STANDALONE_GRAPH_ID: &str = "default";
+
+/// A cluster graph's access: once the cluster serves `graph`, its applied
+/// `graph.{id}` bundle decides for `actor`, and a graph without one allows
+/// every action, with or without an actor, since no policy is installed to
+/// refuse one.
+async fn cluster_access(
+    cluster: &str,
+    graph: &str,
+    actor: Option<String>,
+    args: &AccessArgs,
+) -> Result<omnigraph_api_types::AccessOutput> {
+    let snapshot = crate::commands::control::read_serving_snapshot_or_report(cluster).await?;
+    served_graph(&snapshot, graph)?;
+    let binding = format!("graph.{graph}");
+    let bundles: Vec<_> = snapshot
+        .policies
+        .iter()
+        .filter(|policy| policy.applies_to.iter().any(|scope| scope == &binding))
+        .collect();
+    let engine = match bundles.as_slice() {
+        [] => None,
+        [bundle] => Some(omnigraph_policy::PolicyEngine::load_graph_from_source(
+            &bundle.source,
+            graph,
+        )?),
+        many => color_eyre::eyre::bail!(
+            "graph `{graph}` matches {} policy bundles; the cluster binds one per graph",
+            many.len()
+        ),
+    };
+    omnigraph_api_types::AccessOutput::evaluate(
+        actor.clone(),
+        graph.to_string(),
+        args.branch.clone(),
+        args.target_branch.clone(),
+        |access, branch, target_branch| -> Result<bool> {
+            let Some(engine) = &engine else {
+                return Ok(true);
+            };
+            let Some(actor) = actor.as_deref() else {
+                return Ok(false);
+            };
+            Ok(engine
+                .authorize(
+                    actor,
+                    &omnigraph_policy::PolicyRequest {
+                        action: access.into(),
+                        branch: branch.map(str::to_string),
+                        target_branch: target_branch.map(str::to_string),
+                    },
+                )?
+                .allowed)
+        },
+    )
+}
+
+/// A store's access, by the policy installed where it lives. A graph in a
+/// cluster's layout answers as `--cluster` answers for it. Any other store is
+/// a standalone graph, which carries no policy, and the engine allows every
+/// action on a handle without one; that answer holds only for a graph that
+/// opens, so the store opens first.
+async fn store_access(
+    uri: &str,
+    actor: Option<String>,
+    args: &AccessArgs,
+) -> Result<omnigraph_api_types::AccessOutput> {
+    let member = omnigraph_cluster::cluster_graph_for_uri(uri)
+        .await
+        .map_err(|diagnostic| {
+            color_eyre::eyre::eyre!(
+                "could not check cluster ownership for `{}`: {}",
+                diagnostic.path,
+                diagnostic.message
+            )
+        })?;
+    if let Some(member) = member {
+        return cluster_access(&member.root, &member.graph_id, actor, args).await;
+    }
+    require_standalone_graph(uri).await?;
+    omnigraph_api_types::AccessOutput::evaluate(
+        actor,
+        STANDALONE_GRAPH_ID.to_string(),
+        args.branch.clone(),
+        args.target_branch.clone(),
+        |_, _, _| Ok::<_, color_eyre::Report>(true),
+    )
+}
+
+/// Open a standalone graph read-only and let it go. Storage that reports
+/// what the open reads absent holds no graph, so that refuses as a missing
+/// graph; any other failure stays the open's own.
+async fn require_standalone_graph(uri: &str) -> Result<()> {
+    use omnigraph::error::{OmniError, StorageFailureKind};
+    match omnigraph::db::Omnigraph::open_read_only(uri).await {
+        Ok(_) => Ok(()),
+        Err(OmniError::Storage(failure)) if failure.kind == StorageFailureKind::NotFound => {
+            Err(CliRefusal::report(
+                ErrorCode::NotFound,
+                format!(
+                    "no graph at `{}`: {failure}",
+                    omnigraph::storage::redacted_storage_uri(uri)
+                ),
+            ))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// `access`: who the caller is at a target and what it may do there. A
 /// server decides through its access route; for direct storage the CLI
 /// evaluates the graph's installed policy for the declared actor, and a
@@ -513,59 +624,12 @@ pub(crate) async fn run_access(
                 "access on a cluster needs a graph: pass --graph ID, or give the target a default_graph",
             )
         })?;
-        let snapshot = crate::commands::control::read_serving_snapshot_or_report(cluster).await?;
-        served_graph(&snapshot, graph)?;
-        let binding = format!("graph.{graph}");
-        let bundles: Vec<_> = snapshot
-            .policies
-            .iter()
-            .filter(|policy| policy.applies_to.iter().any(|scope| scope == &binding))
-            .collect();
-        let engine = match bundles.as_slice() {
-            [] => None,
-            [bundle] => Some(omnigraph_policy::PolicyEngine::load_graph_from_source(
-                &bundle.source,
-                graph,
-            )?),
-            many => color_eyre::eyre::bail!(
-                "graph `{graph}` matches {} policy bundles; the cluster binds one per graph",
-                many.len()
-            ),
-        };
-        let access = AccessOutput::evaluate(
-            actor.clone(),
-            graph.to_string(),
-            args.branch.clone(),
-            args.target_branch.clone(),
-            |access, branch, target_branch| -> Result<bool> {
-                let Some(engine) = &engine else {
-                    return Ok(true);
-                };
-                let Some(actor) = actor.as_deref() else {
-                    return Ok(false);
-                };
-                Ok(engine
-                    .authorize(
-                        actor,
-                        &omnigraph_policy::PolicyRequest {
-                            action: access.into(),
-                            branch: branch.map(str::to_string),
-                            target_branch: target_branch.map(str::to_string),
-                        },
-                    )?
-                    .allowed)
-            },
-        )?;
-        ("direct", access)
-    } else if resolved.uri.is_some() {
-        let access = AccessOutput::evaluate(
-            actor.clone(),
-            "default".to_string(),
-            args.branch.clone(),
-            args.target_branch.clone(),
-            |_, _, _| Ok::<_, color_eyre::Report>(true),
-        )?;
-        ("direct", access)
+        (
+            "direct",
+            cluster_access(cluster, graph, actor, &args).await?,
+        )
+    } else if let Some(uri) = resolved.uri.as_deref() {
+        ("direct", store_access(uri, actor, &args).await?)
     } else {
         return Err(CliRefusal::report(
             ErrorCode::TargetUnknown,

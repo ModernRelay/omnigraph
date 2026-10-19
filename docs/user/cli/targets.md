@@ -126,12 +126,19 @@ with `--target-branch` too `branch_create` and `branch_merge` from one into the
 other. A server target asks the server's
 [access route](../operations/policy.md#learn-your-access) (`source: server`),
 with the target's token. For direct storage the CLI decides itself
-(`source: direct`) for the actor `--as` or `operator.actor` names: a cluster
-graph by its applied policy, which allows nothing without an actor, and a
-standalone graph, which carries no policy, allows every action, as direct writes
-do. A cluster graph the cluster does not apply refuses with `not_found`, and
-one it quarantined with `graph_unavailable`, as a server refuses them. It also
-accepts `--server`, `--store`, `--cluster` and `--profile`.
+(`source: direct`) for the actor `--as` or `operator.actor` names:
+
+- A cluster graph, addressed by its cluster or by its store
+  (`<root>/graphs/<id>.omni`), answers by the bundle the cluster applies to it.
+  With a bundle, nothing is allowed without an actor. With none, every action is
+  allowed, with or without an actor. A graph the cluster does not apply refuses
+  with `not_found`, and one it quarantined with `graph_unavailable`, as a server
+  refuses them.
+- A standalone graph carries no policy, so once its store opens every action is
+  allowed, as direct writes do; its `graph_id` is `default`. A store that holds
+  no graph refuses with `not_found`.
+
+`access` also accepts `--server`, `--store`, `--cluster` and `--profile`.
 
 ## Listing and editing targets
 
