@@ -447,7 +447,13 @@ impl IntentApiFixture {
                     }
                     reply
                 } else if discovery {
-                    IntentReply::json(200, serde_json::json!({"status":"ok"}))
+                    // A current server attests the request assertions it enforces.
+                    let mut reply = IntentReply::json(200, serde_json::json!({"status":"ok"}));
+                    reply.headers.push((
+                        omnigraph_api_types::HTTP_API_ASSERTIONS_HEADER.into(),
+                        omnigraph_api_types::EXPECT_ACTOR_ASSERTION.into(),
+                    ));
+                    reply
                 } else if request_line[0] == "GET"
                     && request_line[1] == "/v1/auth/session"
                     && let Some(session) = &session_response
