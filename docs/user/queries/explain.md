@@ -241,11 +241,21 @@ documents only before it) carry a pipeline `id` and `depends_on`, with
 `physical_plan` node ids; the engine refuses to lower a plan whose operator
 declares an emission other than the cut the document prints. Saved physical
 plans use a `bound_plan_version: 9` envelope whose `body` contains `plan` and
-`values`; version 7 records each aggregate's `distinct` flag, version 8
-types each node's ordering and declares ranked scans' eligibility and policy,
-and version 9 records each `AntiJoin`'s `strategy`. Older unversioned plans and
-unsupported versions are refused with a
-regeneration instruction, including plans without traversal nodes.
+`values`. Unversioned plans and other versions are refused with a regeneration
+instruction, including plans without traversal nodes.
+
+A nearest scan also reports `node` `ann_metrics` for each measured attempt:
+
+| `detail` key | Meaning |
+|---|---|
+| `id`, `rung`, `attempt` | the scan node, overfetch pass and zero-based position in that pass's `probes.attempts` list |
+| `counts` | available partition counts and prefilter loads, input rows, input batches and row IDs |
+| `cumulative_times_ns` | available index-open, partition-load/preparation, prefilter-wait, CPU-queue-wait, search, query-preparation, distance/top-k and result-materialization timings, plus prefilter load/input/build timings, in nanoseconds |
+
+Missing metrics are absent, not zero; an attempt without metrics has no row.
+Timings include waits, overlap and accumulate across concurrent partitions;
+their sum is not query latency. Diagnostics may vary on replay and do not
+change probe decisions, result ordering or replay policy.
 
 An `Aggregate` node's `aggregates` array aligns with `exprs`, with `null` for
 group keys. Each aggregate records its result `column`, `func`, declared `input`
@@ -257,9 +267,7 @@ Aggregate, Projection and MetadataCount also print `columns`, an ordered list
 such as `["total: F64?", "person: Person"]`. Names match executed result columns;
 `?` records declared nullability, so `count` is `I64?` even when execution
 returns no nulls. A node type names its complete projected object, excluding
-Blob and Vector properties. Saved version 1 through 5 plans must be regenerated
-for the current typed expression declarations, and version 6 to 8 plans for
-the fields versions 7 to 9 added.
+Blob and Vector properties.
 
 Expression-bearing plan fields have additive `typed_*` counterparts. Each
 expression tree records `op`, the existing GQ text in `gq`, its stored `type`,

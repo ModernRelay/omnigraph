@@ -112,6 +112,15 @@ captured once for an operation, including its retries and merge publication.
 A one-row keyed write costs about 1 to 3 KiB of row data from Arrow buffer
 rounding, so allowances below a few KiB refuse every write.
 
+Strict inserts and overwrite writes also pass `write_max_bytes` to Lance as
+the buffer accumulation target for each data-file writer. Lance divides it
+across top-level columns instead of using its default 8 MiB per column.
+This is a flush threshold, not a total memory cap: the incoming array can
+cross it, nested fields and encoding have additional working memory, and
+concurrent table writers each receive the target. Upserts and updates use
+Lance merge-insert, which does not expose this option and keeps its native
+buffering defaults. Row and Blob admission limits still apply to those writes.
+
 Neither byte setting has a fixed maximum. A lower environment value is a
 process default, so a request may still select any value of at least `1`.
 Raising `write_max_bytes` above the default admits a larger staged-write

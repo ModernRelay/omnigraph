@@ -736,14 +736,22 @@ absence); `Expand.versions` records every selected member's version, while the
 same fact printed for the reader.
 It is `pub` and `#[doc(hidden)]` for the replay tests
 ([testing.md](testing.md#plan-replay)): with the settings gone from the
-context, the memory limit on the plan and the snapshot pinned, rows and
-report are a function of the serialized bound plan and the snapshot, and a
-replay repeats the run's trace.
+context, the memory limit on the plan and the snapshot pinned, result rows,
+operator choices and adaptive search decisions are a function of the
+serialized bound plan and the snapshot, and a replay repeats those choices.
+Optional ANN diagnostics are observations of that run: elapsed timings and
+cache-dependent work can vary between replays and do not participate in
+plan decisions or deterministic trace comparisons.
 
 The report is also the `profile` surface
 ([explain.md](../user/queries/explain.md#profile)): `Executed::profile`
 writes each report row back as one row in the explain row schema, `tree`
 `profile`, `node` the plan node's kind, `detail` the row's own fields.
+Nearest scans additionally copy a bounded set of native counters and timers
+from the completed scan's execution summary into separate `ann_metrics`
+rows. Each row identifies its scan, overfetch rung and probe attempt; absent
+metrics stay absent. Timings are cumulative nanoseconds and may overlap,
+including across concurrent partitions. They are not additive query latency.
 
 The read engine's implementation is `Walk` in `engine/lower.rs`, with
 `Op = Arc<dyn ExecutionPlan>`. `sort_merge_join`, `hydrate_by_address`,

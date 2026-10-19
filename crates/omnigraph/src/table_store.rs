@@ -53,7 +53,7 @@ use lance_datafusion::exec::{
     ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
     collect_execution_metrics,
 };
-use lance_file::version::LanceFileVersion;
+use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
@@ -107,6 +107,19 @@ pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
 const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
 const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
 const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
+
+// Lance divides this per-writer accumulation allowance among top-level fields.
+// A complete input array can overshoot a column's threshold; nested leaves and
+// concurrent writers have independent queues. This is not an operation-wide
+// memory reservation. Keep copying slices so a small column cannot retain its
+// whole source batch. V2_2 does not enforce max_page_bytes in its encoder.
+fn budgeted_file_writer_options(write_budget: WriteBudget) -> FileWriterOptions {
+    FileWriterOptions {
+        data_cache_bytes: Some(write_budget.bytes()),
+        keep_original_array: Some(false),
+        max_page_bytes: None,
+    }
+}
 
 // Lance's ordinary Scanner stream executes SortExec with an unbounded memory
 // pool and spilling disabled. Every OmniGraph-ordered scan instead uses an
@@ -3365,6 +3378,7 @@ impl TableStore {
         let ds = Arc::new(ds);
         let params = WriteParams {
             mode: WriteMode::Append,
+            file_writer_options: Some(budgeted_file_writer_options(write_budget)),
             allow_external_blob_outside_bases: false,
             auto_cleanup: None,
             skip_auto_cleanup: true,
@@ -4645,7 +4659,8 @@ impl TableStore {
 
     /// Stage an overwrite from one batch; see [`Self::stage_overwrite_batches`].
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
-        self.stage_overwrite_batches(ds, vec![batch]).await
+        self.stage_overwrite_batches(ds, vec![batch], WriteBudget::default())
+            .await
     }
 
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments })
@@ -4664,6 +4679,7 @@ impl TableStore {
         &self,
         ds: &Dataset,
         batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
     ) -> Result<StagedWrite> {
         // Existing graph datasets retain stable row IDs through Overwrite;
         // keep the flag explicit at this write site too. This is not the
@@ -4695,6 +4711,7 @@ impl TableStore {
         } else {
             let params = WriteParams {
                 mode: WriteMode::Overwrite,
+                file_writer_options: Some(budgeted_file_writer_options(write_budget)),
                 enable_stable_row_ids: true,
                 allow_external_blob_outside_bases: true,
                 auto_cleanup: None,
