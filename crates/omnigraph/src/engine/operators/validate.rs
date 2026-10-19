@@ -153,6 +153,15 @@ impl ExecutionPlan for ValidateExec {
                             reserve.map_err(|error| memory.error(error))?;
                             Ok(Box::new(phase_memory))
                         };
+                    let mut admit_bytes = |bytes: usize| -> crate::error::Result<Box<dyn Send>> {
+                        let allocation = memory
+                            .child("load integer endpoint keys")
+                            .map_err(|error| memory.error(error))?;
+                        allocation
+                            .grow(bytes)
+                            .map_err(|error| memory.error(error))?;
+                        Ok(Box::new(allocation))
+                    };
                     let mut admit_reuse = || {
                         memory.admit_read_reuse().and_then(|admitted| {
                             LoadReadReuse::new(&judge.db, &judge.snapshot, admitted)
@@ -186,6 +195,7 @@ impl ExecutionPlan for ValidateExec {
                         &batches,
                         &mut LoadAdmission {
                             phase: Some(&mut admit_phase),
+                            bytes: Some(&mut admit_bytes),
                             reuse: Some(&mut admit_reuse),
                             removed: &mut admit_removed,
                             retained: &mut admit_retained,

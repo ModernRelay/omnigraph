@@ -320,10 +320,16 @@ fn endpoint_access_costs_the_consulted_table_and_index_coverage() {
     for (rows, coverage, usable, expected) in [
         (Some(100_000_000), Some((1, 1)), true, ValidateAccess::Probe),
         (Some(1_000), Some((1, 1)), true, ValidateAccess::Scan),
-        (Some(1_000), Some((0, 1)), true, ValidateAccess::Probe),
-        (Some(1_000), Some((1, 2)), true, ValidateAccess::Probe),
-        (Some(1_000), None, true, ValidateAccess::Probe),
-        (Some(1_000), Some((1, 1)), false, ValidateAccess::Probe),
+        (Some(1_000), Some((0, 1)), true, ValidateAccess::Scan),
+        (Some(1_000), Some((1, 2)), true, ValidateAccess::Scan),
+        (
+            Some(100_000_000),
+            Some((25, 26)),
+            true,
+            ValidateAccess::Probe,
+        ),
+        (Some(1_000), None, true, ValidateAccess::Scan),
+        (Some(1_000), Some((1, 1)), false, ValidateAccess::Scan),
         (None, Some((1, 1)), true, ValidateAccess::Probe),
     ] {
         let schema = parse_schema("node Person { id: String @key }").unwrap();
@@ -378,5 +384,22 @@ fn endpoint_access_costs_the_consulted_table_and_index_coverage() {
         assert!(document.contains("consulted_rows"), "{document}");
         assert!(document.contains("index_full_coverage"), "{document}");
         assert!(document.contains("probe_calls"), "{document}");
+        if usable && coverage.is_none_or(|(covered, total)| covered > 0 && covered < total) {
+            let stats: Vec<_> = explain
+                .statistics
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|stat| stat.statistic == "validate_access(edge_ri)")
+                .collect();
+            assert_eq!(stats.len(), 2);
+            for stat in stats {
+                let origin: serde_json::Value = serde_json::from_str(&stat.origin).unwrap();
+                assert_eq!(origin["index_coverage"], "partial");
+                assert_eq!(origin["index_full_coverage"], false);
+                assert_eq!(origin["probe_cost"], 90_000u64);
+                assert_eq!(origin["scan_cost"], rows.unwrap() + input_rows);
+            }
+        }
     }
 }

@@ -24,6 +24,7 @@
 //! live HEAD depending on the surface).
 
 mod kernels;
+mod key_set;
 pub(crate) mod load;
 
 use std::collections::{HashMap, HashSet};
@@ -45,6 +46,7 @@ use kernels::{
     match_unique_holders, orphans_in_delta, orphans_retained, partition_endpoints,
     unique_coalesced_dups, unique_committed_collisions, unique_image, unique_probe_keys,
 };
+use key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
 
 /// A single integrity violation, surface-neutral. Maps to the merge path's
 /// [`MergeConflict`] today via [`Violation::into_merge_conflict`]; a write-path
@@ -538,6 +540,53 @@ impl<'a> CommittedState<'a> {
         Ok(present)
     }
 
+    /// The committed `id`s of `table_key` that spell canonical integers, as one
+    /// probeable key set: `Probe` filters by `wanted`, `Scan` reads every id.
+    async fn existing_int_keys(
+        &self,
+        table_key: &str,
+        wanted: &[String],
+        system_columns: SystemColumns,
+        access: AccessPath,
+        admit: &mut load::ByteAdmission<'_>,
+    ) -> Result<(IntKeySet, Box<dyn Send>)> {
+        let ds = self.open(table_key).await?;
+        let bound = match &ds {
+            Some(ds) => {
+                let rows = ds.count_rows(None).await.map_err(OmniError::storage)?;
+                match access {
+                    AccessPath::Probe => rows.min(wanted.len()),
+                    AccessPath::Scan => rows,
+                }
+            }
+            None => 0,
+        };
+        let _input_memory = admit(key_bytes(bound).ok_or_else(|| integer_capacity_error(bound))?)?;
+        let mut keys = Vec::with_capacity(bound);
+        if let Some(ds) = ds.filter(|_| bound > 0) {
+            match access {
+                AccessPath::Probe => {
+                    let expr = col(system_columns.id)
+                        .in_list(wanted.iter().map(|k| lit(k.clone())).collect(), false);
+                    for batch in &scan_filtered(&ds, &[system_columns.id], expr).await? {
+                        push_int_ids(batch, system_columns.id, &mut keys, bound)?;
+                    }
+                }
+                AccessPath::Scan => {
+                    let mut stream = scan_bounded(&ds, &[system_columns.id]).await?;
+                    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+                        push_int_ids(&batch, system_columns.id, &mut keys, bound)?;
+                    }
+                }
+            }
+        }
+        let layout =
+            IntKeySetLayout::new(keys.len()).ok_or_else(|| integer_capacity_error(keys.len()))?;
+        let retained = admit(layout.retained_bytes)?;
+        let _scratch = admit(layout.scratch_bytes)?;
+        Ok((IntKeySet::build(&keys, layout), retained))
+    }
+
     /// Committed holders of the `columns` tuples in `table_key`, holder lists in
     /// scan order: `Probe` filters per [`UNIQUE_PROBE_CHUNK_KEYS`] chunk, `Scan`
     /// reads the id and group columns once; both match exact tuples in Rust.
@@ -834,6 +883,36 @@ pub(crate) async fn overwrite_removed_ids(
         }
     }
     Ok(removed)
+}
+
+/// A key count whose vectors cannot be addressed: the allocation ceiling as
+/// the limit, the keys' own bytes as the demand.
+fn integer_capacity_error(keys: usize) -> OmniError {
+    OmniError::resource_limit(
+        "query_memory_bytes",
+        isize::MAX as u64,
+        (keys as u64).saturating_mul(size_of::<i64>() as u64),
+    )
+}
+
+/// Every non-null canonical-integer value of `batch`'s `name` column, appended
+/// to `keys`; a value that is not a canonical integer is no id of an
+/// integer-keyed table and is skipped.
+fn push_int_ids(batch: &RecordBatch, name: &str, keys: &mut Vec<i64>, bound: usize) -> Result<()> {
+    let column = string_col(batch, name)?;
+    for row in 0..column.len() {
+        if !column.is_null(row) {
+            if let Some(key) = canonical_i64(column.value(row)) {
+                if keys.len() == bound {
+                    return Err(OmniError::manifest_internal(
+                        "integer endpoint scan exceeded its admitted row bound",
+                    ));
+                }
+                keys.push(key);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn string_col<'b>(batch: &'b RecordBatch, name: &str) -> Result<&'b StringArray> {

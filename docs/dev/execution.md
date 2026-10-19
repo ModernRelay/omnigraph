@@ -993,13 +993,24 @@ A `load csv` overwrite is the first write plan: the planner routes
 `Operation::Load` to the engine, which lowers `CsvSource → Validate →
 FragmentWrite` to `CsvSourceExec` (one reader over the captured source),
 `ValidateExec` (a pipeline breaker: one pass over the held delta extracts what
-every check needs, then the checks are judged in refusal order against the
-committed image under each check's access) and DataFusion's `DataSinkExec`
+the value, uniqueness and cardinality checks need, the endpoint check reads the
+held batches' endpoint columns in place against each endpoint table's committed
+key set, then the checks are judged in refusal order against the committed
+image under each check's access) and DataFusion's `DataSinkExec`
 over `LanceFragmentSink`, which stages the fragments through the mutation
 staging and never commits. The attempt then commits the staged transaction
 detached and publishes once, the epilogue every write shares. Append, merge
 and JSONL loads keep the keyed path below; every load operator runs one
 worker until the parallel source lands.
+
+Integer endpoint sets admit their input capacity, directory, retained keys,
+build offsets and parsed probe buffer to `query_memory_bytes` before allocation.
+The pinned dataset's row count bounds the scan input; each set stays charged
+while the other endpoint is built and both are probed. Empty edge input skips
+these sets. Optional statement read caches are released before integer endpoint
+checks so their reservation cannot crowd out mandatory set allocations.
+Buckets larger than 32 keys are sorted and searched by binary
+search, bounding lookup work even when integer keys share a hash prefix.
 
 Mutation insert/update and keyed Load retain the per-table limit of 8,192 rows.
 An immutable `WriteBudget` captures the session's `write_max_bytes` (default

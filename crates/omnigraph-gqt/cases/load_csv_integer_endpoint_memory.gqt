@@ -1,0 +1,84 @@
+# issue: none
+# notes: Both committed integer endpoint sets and their build buffers share the query
+# notes: allowance. One 65,536-key set fits 4 MiB; retaining it while building the other
+# notes: does not. Refusal preserves the edge, a 5 MiB retry replaces it, and
+# notes: a header-only overwrite keeps its empty-source refusal, without building sets.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person { id: I64 @key }
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 65536
+    commits: 16
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+
+--- csv original.csv
+from,to
+0,1
+
+--- mutate
+load csv "original.csv" into edge:Knows mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:Knows from Person: access scan
+load validate edge_ri edge:Knows to Person: access scan
+load executed: partitions 1 rows 1
+
+--- csv replacement.csv
+from,to
+0,65535
+
+--- mutate
+set query_memory_bytes = 4194304;
+load csv "replacement.csv" into edge:Knows mode overwrite header
+--- expect error: query_memory_bytes
+
+--- query
+query unchanged() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": 0, "b.id": 1}
+--- expect shape
+a.id: I64
+b.id: I64
+
+--- mutate
+set query_memory_bytes = 5242880;
+load csv "replacement.csv" into edge:Knows mode overwrite header
+--- expect ok
+
+--- query
+query replaced() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": 0, "b.id": 65535}
+--- expect shape
+a.id: I64
+b.id: I64
+
+--- csv empty.csv
+from,to
+
+--- mutate
+set query_memory_bytes = 4194304;
+load csv "empty.csv" into edge:Knows mode overwrite header
+--- expect error: the source holds no records
+
+--- query
+query empty_refusal_preserves_edges() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n": 1}
+--- expect shape
+n: I64
