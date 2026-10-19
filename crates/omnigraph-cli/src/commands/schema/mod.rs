@@ -49,6 +49,9 @@ pub(crate) async fn run_schema(
                 scope.graph,
                 uri,
                 "schema plan",
+                // `schema plan` takes one graph's storage: its flags refuse
+                // `--cluster` and `--graph`, so a root target is refused too.
+                false,
                 stderr,
             )
             .await?;

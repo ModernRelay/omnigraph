@@ -36,6 +36,7 @@ pub(crate) async fn run_lint(
                 scope.graph,
                 uri,
                 "lint",
+                true,
                 stderr,
             )
             .await?,
