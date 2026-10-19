@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Bytes, to_bytes};
-use axum::extract::{Path, Query, RawQuery, Request, State};
+use axum::extract::{RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
 use crate::api::InvokeStoredQueryRequest;
+use crate::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::handlers::{self, QueryNamePath};
 use crate::ingress::McpGraphRequest;
 use crate::serving::GraphRequest;
@@ -954,7 +955,7 @@ impl GraphTools {
                     Extension(handle),
                     Extension(input),
                     Some(Extension(actor)),
-                    Path(QueryNamePath { name: args.name }),
+                    ApiPath(QueryNamePath { name: args.name }),
                     HeaderMap::new(),
                     Bytes::from(body),
                 )
@@ -986,7 +987,7 @@ impl GraphTools {
                 let output = handlers::server_snapshot(
                     Extension(handle),
                     Some(Extension(actor)),
-                    Query(crate::api::SnapshotQuery {
+                    ApiQuery(crate::api::SnapshotQuery {
                         branch: args.branch,
                     }),
                 )
@@ -1006,7 +1007,7 @@ impl GraphTools {
                 let output = handlers::server_commit_list(
                     Extension(handle),
                     Some(Extension(actor)),
-                    Query(crate::api::CommitListQuery {
+                    ApiQuery(crate::api::CommitListQuery {
                         branch: args.branch,
                         unpublished: false,
                         unattached: false,
@@ -1023,7 +1024,7 @@ impl GraphTools {
                 let output = handlers::server_commit_show(
                     Extension(handle),
                     Some(Extension(actor)),
-                    Path(handlers::CommitPath {
+                    ApiPath(handlers::CommitPath {
                         commit_id: args.commit_id,
                     }),
                 )
@@ -1037,7 +1038,7 @@ impl GraphTools {
                 let output = handlers::server_commit_changes(
                     Extension(handle),
                     Some(Extension(actor)),
-                    Path(handlers::CommitPath {
+                    ApiPath(handlers::CommitPath {
                         commit_id: args.commit_id,
                     }),
                     RawQuery(query),
@@ -1122,7 +1123,7 @@ impl GraphTools {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    Json(request),
+                    ApiJson(request),
                 )
                 .await?;
                 bounded_result(&output.0)
@@ -1136,7 +1137,7 @@ impl GraphTools {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    Json(crate::api::BranchCreateRequest {
+                    ApiJson(crate::api::BranchCreateRequest {
                         from: args.from,
                         name: args.name,
                     }),
@@ -1153,7 +1154,7 @@ impl GraphTools {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    Path(handlers::BranchPath { branch: args.name }),
+                    ApiPath(handlers::BranchPath { branch: args.name }),
                 )
                 .await?;
                 bounded_result(&output.0)

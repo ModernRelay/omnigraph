@@ -71,7 +71,8 @@ and `policy`; a server target serves graph and served commands. `schema apply`,
 `schema upgrade-system-columns` and `upgrade` take only a direct graph target.
 A command that cannot use the selected target's kind refuses it with
 `target_kind_unsupported`, and refuses a profile of that kind too. `queries` and
-`policy` select their cluster by the same rules as every other command. `init`
+`policy` select their cluster by the same rules as every other command, and
+keep their explicit `--graph` filter: they ignore a target's `default_graph`. `init`
 and the `cluster` commands do not take `--target` yet.
 
 ## Credentials

@@ -2828,6 +2828,80 @@ fn remote_json_errors_preserve_server_codes_and_details() {
     );
 }
 
+/// A served load its policy refuses ran nothing, so it exits 1 with
+/// `not_started` whether or not `--from` would have forked its branch: the
+/// server authorizes the load, the fork included, before its write. An
+/// embedded write carries no cluster policy; `command_outcome`'s tests own
+/// the embedded projection of an engine policy refusal.
+#[test]
+fn a_policy_refused_served_load_reports_not_started() {
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
+    let rows = cluster.path().join("rows.jsonl");
+    fs::write(
+        &rows,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Refused\",\"age\":1}}\n",
+    )
+    .unwrap();
+    // act-bruno may change an unprotected branch but neither create a branch
+    // nor change `main`.
+    let load = |branch: &str| {
+        vec![
+            "load".to_string(),
+            "--mode".into(),
+            "append".into(),
+            "--data".into(),
+            rows.to_string_lossy().into_owned(),
+            "--branch".into(),
+            branch.into(),
+            "--from".into(),
+            "main".into(),
+            "--json".into(),
+        ]
+    };
+    let assert_refused = |arm: &str, output: &std::process::Output| {
+        assert_eq!(output.status.code(), Some(1), "{arm}: {output:?}");
+        let body = parse_stdout_json(output);
+        assert_eq!(body["code"], "forbidden", "{arm}: {body}");
+        assert_eq!(
+            body["outcome"],
+            json!({"execution":"not_started","effects":"none","action":"refresh"}),
+            "{arm}: {body}"
+        );
+    };
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-bruno":"bruno-token"}"#,
+        )],
+    );
+    let operator = KeyedServer::new(&server.base_url);
+    for branch in ["fresh", "main"] {
+        let output = cli()
+            .envs(operator.env("bruno-token"))
+            .args(load(branch))
+            .args(["--server", &server.base_url, "--graph", "knowledge"])
+            .output()
+            .unwrap();
+        assert_refused(&format!("served {branch}"), &output);
+    }
+    // The refused fork left no branch.
+    let branches = parse_stdout_json(&output_success(
+        cli()
+            .envs(operator.env("bruno-token"))
+            .args(["branch", "list", "--json"])
+            .args(["--server", &server.base_url, "--graph", "knowledge"]),
+    ));
+    assert!(
+        !branches["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "fresh"),
+        "{branches}"
+    );
+}
+
 /// Whole-command outcome classification needs real CLI processes and a wire
 /// census; row/error GQT expectations cannot observe exits or resubmission.
 #[test]
@@ -3637,7 +3711,8 @@ fn server_scope_refuses_a_non_server_scheme_issue_979() {
 fn as_on_a_served_write_asserts_the_actor() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
     use omnigraph_api_types::{
-        EXPECT_ACTOR_HEADER, HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
+        EXPECT_ACTOR_ASSERTION, EXPECT_ACTOR_HEADER, HTTP_API_ASSERTIONS_HEADER as ASSERTIONS,
+        HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
     };
 
     // A served write resolves its actor from the bearer token. `--as` rides
@@ -3658,7 +3733,10 @@ fn as_on_a_served_write_asserts_the_actor() {
         let server = IntentApiFixture::new(vec![
             IntentReply {
                 status: 200,
-                headers: vec![(HEADER.into(), CONTRACT.into())],
+                headers: vec![
+                    (HEADER.into(), CONTRACT.into()),
+                    (ASSERTIONS.into(), EXPECT_ACTOR_ASSERTION.into()),
+                ],
                 body: vec![],
             },
             IntentReply {
@@ -3692,6 +3770,31 @@ fn as_on_a_served_write_asserts_the_actor() {
             "{write:?}: {write_request:?}"
         );
         server.assert_complete();
+
+        // A server that does not list the assertion would ignore the header
+        // and run the write as the credential's actor, so nothing is sent.
+        let older = IntentApiFixture::new(vec![IntentReply {
+            status: 200,
+            headers: vec![(HEADER.into(), CONTRACT.into())],
+            body: vec![],
+        }]);
+        let output = cli()
+            .args(write)
+            .args(["--server", &older.origin, "--graph", "knowledge"])
+            .args(["--as", "act-nope", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{write:?}: {output:?}");
+        let error = parse_stdout_json(&output);
+        assert_eq!(error["code"], "api_contract_mismatch", "{write:?}: {error}");
+        assert_eq!(error["request_dispatched"], false, "{write:?}: {error}");
+        assert!(
+            error["error"].as_str().unwrap().contains("--as"),
+            "{write:?}: {error}"
+        );
+        let requests = older.requests();
+        assert_eq!(requests.len(), 1, "{write:?}: only discovery: {requests:?}");
+        older.assert_complete();
     }
 }
 
@@ -3699,7 +3802,7 @@ fn as_on_a_served_write_asserts_the_actor() {
 /// `--as` for them as it does for `mutate -e 'commit publish "<id>"'`. A
 /// publication records no publisher: the published commit keeps the actor
 /// and timestamp of the write that created it. The `commit` reads refuse
-/// `--as`; `as_on_a_served_write_is_rejected` owns the served refusal.
+/// `--as`; `as_on_a_served_write_asserts_the_actor` owns the served assertion.
 #[test]
 fn commit_publish_and_drop_take_as_on_a_direct_graph_issue_1023() {
     let temp = tempdir().unwrap();

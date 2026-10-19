@@ -117,6 +117,28 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
     }
 }
 
+/// Commands whose requests are observed without a classified outcome: a
+/// served cluster command reports its own failures, but a refused `--as`
+/// assertion still exits as the condition it is.
+pub(crate) fn observed_unclassified(cli: &Cli) -> bool {
+    matches!(&cli.command, Command::Cluster { .. })
+}
+
+/// Whether `error` is a refused `--as` assertion and nothing the command sent
+/// before it could have had effects. The server refuses the assertion before
+/// any effect whatever the method, so the refused request ran nothing.
+pub(crate) fn actor_assertion_refused(error: &Report, evidence: &Evidence) -> bool {
+    error
+        .downcast_ref::<RemoteErrorCli>()
+        .is_some_and(|remote| {
+            remote.status == StatusCode::PRECONDITION_FAILED
+                && remote.output.code == Some(ErrorCode::ActorMismatch)
+        })
+        && !evidence.writable_open
+        && (evidence.dispatched == 0
+            || (evidence.dispatched == 1 && evidence.last_request_effectful))
+}
+
 pub(crate) async fn observe<F: std::future::Future>(
     kind: CommandKind,
     future: F,
@@ -268,9 +290,9 @@ impl Failure {
         let precondition = error.downcast_ref::<PreconditionFailedCli>();
         let read = evidence.kind == CommandKind::Read;
         let engine_write = error.downcast_ref::<EngineWriteError>().is_some();
-        // An embedded write's own refusal, before any request and outside a
-        // compound write, says what the engine did.
-        let embedded = evidence.dispatched == 0 && !evidence.compound;
+        // An embedded write's own refusal, before any request, says what the
+        // engine did, projected with what the request path would know.
+        let embedded = evidence.dispatched == 0;
         let embedded_precondition =
             precondition.is_some_and(|value| value.http_status.is_none()) && embedded;
         // A refusal answers the whole command when its request was the
@@ -281,10 +303,7 @@ impl Failure {
                 && !evidence.writable_open);
         // A refused `--as` assertion is a condition the caller set, like a
         // graph-commit precondition: nothing ran.
-        let actor_mismatch = remote.is_some_and(|remote| {
-            remote.status == StatusCode::PRECONDITION_FAILED
-                && remote.output.code == Some(ErrorCode::ActorMismatch)
-        }) && single;
+        let actor_mismatch = actor_assertion_refused(&error, &evidence);
         let conditional = (precondition.is_some_and(|value| value.http_status == Some(412))
             && single)
             || embedded_precondition
@@ -333,17 +352,18 @@ impl Failure {
             let mut output = ErrorOutput::message(refusal.message.clone());
             output.code = Some(refusal.code);
             output
-        } else if engine_write {
-            let EngineWriteError(engine) = error
-                .downcast::<EngineWriteError>()
-                .expect("checked engine write error");
-            omnigraph_server::engine_error_output(engine)
         } else {
-            match error.downcast::<omnigraph::error::OmniError>() {
-                Ok(engine) => omnigraph_server::engine_error_output(engine),
-                // Keep the cause chain the stderr report used to print.
-                Err(error) => crate::error_output_of(&error)
-                    .unwrap_or_else(|| ErrorOutput::message(format!("{error:#}"))),
+            match error.downcast::<EngineWriteError>() {
+                Ok(EngineWriteError(engine)) => embedded_write_output(engine, evidence.compound),
+                Err(error) => match error.downcast::<omnigraph::error::OmniError>() {
+                    // A read changes nothing, so its error is never an unknown
+                    // outcome.
+                    Ok(engine) if read => omnigraph_server::engine_read_error_output(engine),
+                    Ok(engine) => omnigraph_server::engine_error_output(engine),
+                    // Keep the cause chain the stderr report used to print.
+                    Err(error) => crate::error_output_of(&error)
+                        .unwrap_or_else(|| ErrorOutput::message(format!("{error:#}"))),
+                },
             }
         };
         let served = served.or_else(|| output.outcome.filter(|_| engine_write && embedded));
@@ -400,6 +420,20 @@ impl Failure {
     }
 }
 
+/// An embedded write's own error, rendered as the request path renders it.
+/// A policy refusal precedes every publication of the write, a load's fork
+/// included, as the server's authorization precedes its owned write. Any
+/// other error of a compound write follows the fork that published.
+fn embedded_write_output(engine: omnigraph::error::OmniError, compound: bool) -> ErrorOutput {
+    if matches!(engine, omnigraph::error::OmniError::Policy(_)) {
+        omnigraph_server::engine_error_output_after(engine, false, false)
+    } else if compound {
+        omnigraph_server::engine_error_output_after(engine, true, true)
+    } else {
+        omnigraph_server::engine_error_output(engine)
+    }
+}
+
 /// The exit a failure's outcome selects: busy and safe to retry (75), a
 /// condition the caller set (4), effects unknown (2), or not started (1).
 fn exit_for(outcome: &OutcomeOutput, conditional: bool) -> i32 {
@@ -445,4 +479,71 @@ pub(crate) fn is_plain_refusal(output: &ErrorOutput) -> bool {
         && output.full_text_index_rebuild_required.is_none()
         && output.full_text_index_required.is_none()
         && output.diagnostic.is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omnigraph::error::OmniError;
+
+    fn embedded_write(compound: bool) -> Evidence {
+        Evidence {
+            kind: CommandKind::Write,
+            writable_open: true,
+            compound,
+            ..Evidence::default()
+        }
+    }
+
+    fn outcome(failure: &Failure) -> serde_json::Value {
+        serde_json::to_value(failure.output.outcome.as_ref().unwrap()).unwrap()
+    }
+
+    /// An embedded load's policy refusal ran nothing, its fork included: the
+    /// engine checks policy before any publication. Any other refusal of a
+    /// compound load follows the fork that published.
+    #[test]
+    fn an_embedded_compound_write_reports_what_the_engine_did() {
+        for compound in [false, true] {
+            let refused = Failure::classify(
+                EngineWriteError(OmniError::Policy("change denied".into())).into(),
+                embedded_write(compound),
+            );
+            assert_eq!(refused.exit, 1, "compound {compound}");
+            assert_eq!(refused.output.code, Some(ErrorCode::Forbidden));
+            assert_eq!(
+                outcome(&refused),
+                serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
+                "compound {compound}"
+            );
+        }
+        let alone = Failure::classify(
+            EngineWriteError(OmniError::manifest("not valid graph NDJSON")).into(),
+            embedded_write(false),
+        );
+        assert_eq!(outcome(&alone)["execution"], "not_started");
+        assert_eq!(alone.exit, 1);
+        let after_fork = Failure::classify(
+            EngineWriteError(OmniError::manifest("not valid graph NDJSON")).into(),
+            embedded_write(true),
+        );
+        assert_eq!(outcome(&after_fork)["execution"], "unknown");
+        assert_eq!(after_fork.exit, crate::EXIT_OUTCOME_UNKNOWN);
+    }
+
+    /// A read changes nothing, so an engine error is never an unknown outcome.
+    #[test]
+    fn an_embedded_read_error_keeps_its_own_code() {
+        let failure = Failure::classify(
+            OmniError::manifest_internal("historical published dataset version 1 was reclaimed")
+                .into(),
+            Evidence {
+                kind: CommandKind::Read,
+                ..Evidence::default()
+            },
+        );
+        assert_ne!(failure.output.code, Some(ErrorCode::OutcomeUnknown));
+        assert_eq!(outcome(&failure)["execution"], "not_started");
+        assert_eq!(failure.exit, 1);
+    }
 }

@@ -37,6 +37,13 @@ pub const HTTP_API_CONTRACT: &str = "0.13";
 /// [`ErrorCode::ActorMismatch`] before graph lookup or effects; a matching
 /// value changes nothing, so the header can only narrow a request.
 pub const EXPECT_ACTOR_HEADER: &str = "omnigraph-expect-actor";
+/// The response header naming, comma-separated, the request assertions a
+/// server enforces. The contract identifier does not attest them: a server
+/// built before an assertion existed ignores its header and omits it here, so
+/// a client sends an assertion only to a server that lists it.
+pub const HTTP_API_ASSERTIONS_HEADER: &str = "omnigraph-http-api-assertions";
+/// The [`HTTP_API_ASSERTIONS_HEADER`] entry for [`EXPECT_ACTOR_HEADER`].
+pub const EXPECT_ACTOR_ASSERTION: &str = "expect-actor";
 
 /// How a binary identifies its build: the one derivation the CLI's
 /// `omnigraph version`, the server's `/healthz` and its MCP server info all
@@ -1808,6 +1815,7 @@ pub struct IngestRequest {
 
 /// Query parameters for `POST /load/ndjson`.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GraphBatchLoadQuery {
     /// Target branch. Defaults to `main`. Without `from`, it must exist.
     pub branch: Option<String>,
@@ -1829,11 +1837,13 @@ pub struct ExportRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SnapshotQuery {
     pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct CommitListQuery {
     pub branch: Option<String>,
     /// `true` lists the unpublished commits whose recorded target is `branch`

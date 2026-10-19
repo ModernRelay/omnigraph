@@ -35,17 +35,16 @@ pub(crate) async fn run_queries(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let ClusterScope {
-        root: cluster,
-        default_graph,
-    } = require_cluster_scope(
+    // Root tools keep their explicit graph filter and ignore a target's
+    // default graph, so their all-graph and ambiguity behaviour holds.
+    let cluster = require_cluster_scope(
         scope.operator,
         scope.cluster,
         scope.profile,
         "queries",
         stderr,
     )?;
-    let graph = scope.graph.or(default_graph.as_deref());
+    let graph = scope.graph;
     match command {
         QueriesCommand::Validate { json } => {
             return execute_queries_validate(&cluster, graph, json, stdout).await;
@@ -66,17 +65,16 @@ pub(crate) async fn run_policy(
     // Policy tooling sources the Cedar bundle(s) from the cluster's
     // applied policies (RFC-011): --cluster <dir>, + the global --graph
     // to pick a graph's bundle when several apply.
-    let ClusterScope {
-        root: cluster,
-        default_graph,
-    } = require_cluster_scope(
+    // Root tools keep their explicit graph filter and ignore a target's
+    // default graph, so their all-graph and ambiguity behaviour holds.
+    let cluster = require_cluster_scope(
         scope.operator,
         scope.cluster,
         scope.profile,
         "policy",
         stderr,
     )?;
-    let graph = scope.graph.or(default_graph.as_deref());
+    let graph = scope.graph;
     let graph_id = match graph {
         Some(id) => graph_resource_id_for_selection(Some(id), ""),
         None => graph_resource_id_for_selection(None, "default"),
@@ -157,13 +155,6 @@ pub(crate) async fn run_graphs(
     Ok(Completion::success())
 }
 
-/// The cluster a control-plane tooling command (`policy`, `queries`) reads,
-/// and the graph its target names by default.
-struct ClusterScope {
-    root: String,
-    default_graph: Option<String>,
-}
-
 /// Resolve the cluster for a control-plane tooling command (`policy`,
 /// `queries`) through the one scope resolver, in the order every command
 /// resolves its address: `--target`, a complete address no other flag may add
@@ -178,7 +169,7 @@ fn require_cluster_scope(
     profile: Option<&str>,
     command: &str,
     stderr: &mut dyn Write,
-) -> Result<ClusterScope> {
+) -> Result<String> {
     let scope = crate::scope::resolve_scope(
         input.get(stderr)?,
         input.profile(),
@@ -200,12 +191,7 @@ fn require_cluster_scope(
              in ~/.omnigraph/config.yaml), select a cluster profile, or name a cluster-root target"
         );
     };
-    // A target's default graph applies; a profile's never has.
-    let default_graph = scope.target.and(scope.cluster_graph);
-    Ok(ClusterScope {
-        root,
-        default_graph,
-    })
+    Ok(root)
 }
 
 /// Read a cluster's serving snapshot for a control-plane tooling command,

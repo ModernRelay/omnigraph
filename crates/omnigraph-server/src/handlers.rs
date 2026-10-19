@@ -495,8 +495,9 @@ pub(crate) async fn require_expected_actor(
     Err(ApiError {
         completion_uncertain: false,
         owned_write: false,
+        compound: false,
         status: StatusCode::PRECONDITION_FAILED,
-        code: Some(ErrorCode::ActorMismatch),
+        code: ErrorCode::ActorMismatch,
         message: message.into_boxed_str(),
         details: None,
     })
@@ -622,8 +623,9 @@ pub(crate) fn resolve_registered_graph(
     Err(ApiError {
         completion_uncertain: false,
         owned_write: false,
+        compound: false,
         status: StatusCode::SERVICE_UNAVAILABLE,
-        code: Some(ErrorCode::GraphUnavailable),
+        code: ErrorCode::GraphUnavailable,
         message: message.into(),
         details: None,
     })
@@ -811,7 +813,7 @@ pub(crate) fn authorize_request(
 pub(crate) async fn server_snapshot(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Query(query): Query<SnapshotQuery>,
+    ApiQuery(query): ApiQuery<SnapshotQuery>,
 ) -> std::result::Result<Json<api::SnapshotOutput>, ApiError> {
     let branch = query.branch.unwrap_or_else(|| "main".to_string());
     authorize_request(
@@ -2207,7 +2209,7 @@ pub(crate) async fn server_invoke_query(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Path(QueryNamePath { name }): Path<QueryNamePath>,
+    ApiPath(QueryNamePath { name }): ApiPath<QueryNamePath>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
@@ -2250,7 +2252,7 @@ pub(crate) async fn server_invoke_query_if_graph_commit(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Path(QueryNamePath { name }): Path<QueryNamePath>,
+    ApiPath(QueryNamePath { name }): ApiPath<QueryNamePath>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
@@ -2475,13 +2477,17 @@ pub(crate) async fn server_schema_get(
     }))
 }
 
-/// Authorize one load target without touching request data.
+/// Authorize one load target without touching request data, and answer
+/// whether the load forks its branch: the fork publishes on its own, before
+/// the rows, so a refusal of the rows follows it. A branch deleted between this
+/// listing and the load's own would be forked unreported, the same window the
+/// `branch_create` decision here already accepts.
 async fn authorize_load_scope(
     handle: &GraphHandle,
     actor: Option<&AuthenticatedActor>,
     branch: &str,
     from: Option<&str>,
-) -> std::result::Result<(), ApiError> {
+) -> std::result::Result<bool, ApiError> {
     require_canonical_branches([Some(branch), from])?;
     let branch_exists = handle
         .engine
@@ -2520,7 +2526,8 @@ async fn authorize_load_scope(
             branch: Some(branch.to_string()),
             target_branch: None,
         },
-    )
+    )?;
+    Ok(!branch_exists)
 }
 
 /// JSON `POST /load`:
@@ -2535,17 +2542,13 @@ async fn run_json_load(
 ) -> std::result::Result<IngestOutput, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let from = request.from;
-    if from.is_some() {
-        // A missing branch is forked first, which publishes on its own.
-        crate::operations::mark_compound_write();
-    }
     let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.map(|actor| actor.actor_id.as_ref());
 
-    authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
+    let forks = authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
     let est_bytes = request.data.len() as u64;
     let admission = state
         .workload
@@ -2574,6 +2577,7 @@ async fn run_json_load(
         ))
     })
     .await
+    .map_err(|error| error.in_compound_write(forks))
 }
 
 #[utoipa::path(
@@ -2609,7 +2613,7 @@ pub(crate) async fn server_load(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<IngestRequest>,
+    ApiJson(request): ApiJson<IngestRequest>,
 ) -> std::result::Result<Json<IngestOutput>, ApiError> {
     Ok(Json(
         run_json_load(
@@ -2685,7 +2689,7 @@ pub(crate) async fn server_load_ndjson(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Query(query): Query<GraphBatchLoadQuery>,
+    ApiQuery(query): ApiQuery<GraphBatchLoadQuery>,
     request: Request,
 ) -> std::result::Result<Json<GraphBatchLoadOutput>, ApiError> {
     let ingress = request
@@ -2696,13 +2700,9 @@ pub(crate) async fn server_load_ndjson(
     let actor = actor.as_ref().map(|Extension(actor)| actor);
     let branch = query.branch.unwrap_or_else(|| "main".to_string());
     let from = query.from;
-    if from.is_some() {
-        // A missing branch is forked first, which publishes on its own.
-        crate::operations::mark_compound_write();
-    }
     let mode = query.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
 
-    authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
+    let forks = authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
 
     let content_type = request
         .headers()
@@ -2780,6 +2780,7 @@ pub(crate) async fn server_load_ndjson(
         )))
     })
     .await
+    .map_err(|error| error.in_compound_write(forks))
 }
 
 #[utoipa::path(
@@ -2867,7 +2868,7 @@ pub(crate) async fn server_branch_create(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<BranchCreateRequest>,
+    ApiJson(request): ApiJson<BranchCreateRequest>,
 ) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
     let from = request.from.unwrap_or_else(|| "main".to_string());
     branch_create_body(
@@ -2972,7 +2973,7 @@ pub(crate) async fn server_branch_delete(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Path(BranchPath { branch }): Path<BranchPath>,
+    ApiPath(BranchPath { branch }): ApiPath<BranchPath>,
 ) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     branch_delete_body(&state, &handle, actor_ref, ingress, &branch).await?;
@@ -3293,7 +3294,7 @@ async fn delete_merged_source_branch(
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Query(query): Query<CommitListQuery>,
+    ApiQuery(query): ApiQuery<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
     if query.unattached && query.unpublished {
         return Err(ApiError::bad_request(
@@ -3414,7 +3415,7 @@ pub(crate) struct CommitPath {
 pub(crate) async fn server_commit_show(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Path(CommitPath { commit_id }): Path<CommitPath>,
+    ApiPath(CommitPath { commit_id }): ApiPath<CommitPath>,
 ) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
@@ -3466,7 +3467,7 @@ pub(crate) async fn server_commit_publish(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Path(CommitPath { commit_id }): Path<CommitPath>,
+    ApiPath(CommitPath { commit_id }): ApiPath<CommitPath>,
 ) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     let session = state.session(&handle, None)?;
@@ -3516,7 +3517,7 @@ pub(crate) async fn server_commit_drop(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Path(CommitPath { commit_id }): Path<CommitPath>,
+    ApiPath(CommitPath { commit_id }): ApiPath<CommitPath>,
 ) -> std::result::Result<StatusCode, ApiError> {
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     let session = state.session(&handle, None)?;
@@ -4170,7 +4171,7 @@ pub(crate) fn parse_change_query(
 pub(crate) async fn server_commit_changes(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Path(CommitPath { commit_id }): Path<CommitPath>,
+    ApiPath(CommitPath { commit_id }): ApiPath<CommitPath>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::CommitChangesOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), COMMIT_CHANGES_PARAMS)?;
@@ -4766,7 +4767,7 @@ pub(crate) async fn server_changes_baseline(
     Extension(observer): Extension<operations::ReadObserver>,
     Extension(input): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<api::ChangeBaselineRequest>,
+    ApiJson(request): ApiJson<api::ChangeBaselineRequest>,
 ) -> std::result::Result<Response, ApiError> {
     let branch = requested_branch(request.branch.as_deref())?;
     authorize_request(
