@@ -339,7 +339,9 @@ fn scope_from_address(
             }
         }
         Address::Root(root) => {
-            if capability == Capability::Any {
+            // A data command that reads a root (`access`, through a cluster
+            // graph's applied policy) takes one; every other refuses it.
+            if capability == Capability::Any && !reads_root {
                 return Err(source.kind_refusal(format!(
                     "{source} resolves a cluster scope, which is not valid for graph data \
                      commands; run data commands through a server, or use --store <uri> \
@@ -739,12 +741,28 @@ mod tests {
                 &op,
                 ambient,
                 Capability::Any,
-                ScopeFlags { profile, ..flags() },
+                ScopeFlags {
+                    profile,
+                    reads_root: false,
+                    ..flags()
+                },
             )
             .unwrap_err()
             .to_string();
             assert!(err.contains("not valid for graph data commands"), "{err}");
         }
+        // A data command that reads a root, as `access` does, takes one.
+        let scope = resolve_scope(
+            &op,
+            None,
+            Capability::Any,
+            ScopeFlags {
+                profile: Some("admin"),
+                ..flags()
+            },
+        )
+        .unwrap();
+        assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
     }
 
     #[test]
@@ -958,6 +976,7 @@ mod tests {
             Capability::Any,
             ScopeFlags {
                 target: Some("ops"),
+                reads_root: false,
                 ..flags()
             },
         )

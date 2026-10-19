@@ -1675,6 +1675,15 @@
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
+              },
+              "omnigraph-http-api-assertions": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "expect-actor"
+                  ]
+                },
+                "description": "The request assertions this server enforces; a client sends omnigraph-expect-actor only when this lists expect-actor."
               }
             },
             "content": {
@@ -1696,6 +1705,15 @@
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
+              },
+              "omnigraph-http-api-assertions": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "expect-actor"
+                  ]
+                },
+                "description": "The request assertions this server enforces; a client sends omnigraph-expect-actor only when this lists expect-actor."
               }
             },
             "content": {
@@ -1717,6 +1735,15 @@
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
+              },
+              "omnigraph-http-api-assertions": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "expect-actor"
+                  ]
+                },
+                "description": "The request assertions this server enforces; a client sends omnigraph-expect-actor only when this lists expect-actor."
               }
             },
             "content": {
@@ -1738,6 +1765,15 @@
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
+              },
+              "omnigraph-http-api-assertions": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "expect-actor"
+                  ]
+                },
+                "description": "The request assertions this server enforces; a client sends omnigraph-expect-actor only when this lists expect-actor."
               }
             },
             "content": {
@@ -1765,6 +1801,15 @@
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
+              },
+              "omnigraph-http-api-assertions": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "expect-actor"
+                  ]
+                },
+                "description": "The request assertions this server enforces; a client sends omnigraph-expect-actor only when this lists expect-actor."
               }
             },
             "content": {
@@ -1786,6 +1831,15 @@
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
+              },
+              "omnigraph-http-api-assertions": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "expect-actor"
+                  ]
+                },
+                "description": "The request assertions this server enforces; a client sends omnigraph-expect-actor only when this lists expect-actor."
               }
             },
             "content": {
@@ -1807,6 +1861,15 @@
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
+              },
+              "omnigraph-http-api-assertions": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "expect-actor"
+                  ]
+                },
+                "description": "The request assertions this server enforces; a client sends omnigraph-expect-actor only when this lists expect-actor."
               }
             },
             "content": {

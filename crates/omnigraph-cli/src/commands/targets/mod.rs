@@ -453,7 +453,7 @@ pub(crate) async fn run_access(
     let resolved = crate::scope::resolve_scope(
         config,
         input.profile(),
-        crate::planes::Capability::Control,
+        crate::planes::Capability::Any,
         crate::scope::ScopeFlags {
             target: input.target(),
             profile: scope.profile,
@@ -462,6 +462,7 @@ pub(crate) async fn run_access(
             cluster: scope.cluster,
             graph: scope.graph,
             uri: None,
+            reads_root: true,
         },
     )?;
     let actor = scope
