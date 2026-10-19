@@ -2476,6 +2476,18 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "omnigraph-cluster/deployment/bootstrap_fault_tests.rs",
+        ".delete(",
+        1,
+        "test module compiled under its parent's cfg(test); forwards deletes under the owner's own lease directory",
+    ),
+    (
+        "omnigraph-cluster/deployment/bootstrap_fault_tests.rs",
+        ".delete_prefix(",
+        1,
+        "test module compiled under its parent's cfg(test); forwards deletes under the owner's own lease directory",
+    ),
+    (
+        "omnigraph-cluster/deployment/bootstrap_fault_tests.rs",
         ".write_bytes(",
         1,
         "test module compiled under its parent's cfg(test); writes fixtures",
@@ -2487,10 +2499,28 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         "test module compiled under its parent's cfg(test); writes fixtures",
     ),
     (
+        "omnigraph-cluster/lease.rs",
+        ".delete(",
+        1,
+        "an owner removes its own beat two sequence numbers back; beat keys are created once and never rewritten, and liveness reads the newest",
+    ),
+    (
         "omnigraph-cluster/state_lock.rs",
         ".delete(",
         2,
         "lock release on local roots, where an unlink completes before it returns and a dead process sends nothing late, and on Azure, whose admission wrapper excludes other owners",
+    ),
+    (
+        "omnigraph-cluster/state_lock.rs",
+        ".delete_prefix(",
+        1,
+        "removes a superseded owner's lease directory after takeover; its lock id is never reused and its fence latched before the claim",
+    ),
+    (
+        "omnigraph-cluster/state_lock.rs",
+        ".write_text(",
+        1,
+        "local takeover once the claim serialized successors; a local write completes before it returns and a dead process sends nothing late",
     ),
     (
         "omnigraph-cluster/store.rs",
@@ -2501,8 +2531,8 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
     (
         "omnigraph-cluster/store.rs",
         ".delete_prefix(",
-        1,
-        "deletes a removed graph's exact managed root after its ledger intent; a deleted root is never recreated or adopted",
+        2,
+        "deletes a removed graph's exact managed root after its ledger intent, which is never recreated or adopted; and a released lease's own heartbeats, under a lock id no successor watches",
     ),
     (
         "omnigraph-core/branch_control.rs",

@@ -164,8 +164,11 @@ between graph roots.
 - Apply refuses existing unmanaged roots and missing managed graphs that remain
   declared. Restore authoritative data to keep a missing graph, or remove its
   declaration to delete it; see [deployment boundaries](../clusters/index.md#deployment-boundaries).
-- A retained lock requires prior-owner and accepted-I/O quiescence, exclusion
-  of other admissions/unlocks, and its exact ID; follow
+- A server restarted after a crash takes over its predecessor's leased lock
+  once the predecessor's heartbeats have been silent for a lease and a half
+  (45 seconds by default). A lock with no lease (an older binary's, an Azure
+  root's) requires prior-owner and accepted-I/O quiescence, exclusion of other
+  admissions/unlocks, and its exact ID; follow
   [ownership transfer](../deployment.md#writer-topology).
 - Directory boot reads `cluster.yaml` to resolve storage, but served graph,
   query, and policy resources come from applied state. Submit configuration

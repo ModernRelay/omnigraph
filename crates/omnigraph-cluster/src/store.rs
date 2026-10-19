@@ -1090,6 +1090,16 @@ impl ClusterStore {
         }
     }
 
+    /// Best-effort removal of a stopped lease's beats before its release.
+    pub(crate) async fn remove_lease_dir(&self, dir: &str) {
+        // The error and the directory name storage paths, which logs never
+        // carry. Heartbeats left under a released lock's id are inert: no
+        // successor watches an id that no longer holds the lock.
+        if self.adapter.delete_prefix(dir).await.is_err() {
+            tracing::warn!("could not remove a released lease's heartbeats");
+        }
+    }
+
     pub(crate) async fn release_settled(&self, lock_id: &str) -> Result<(), Diagnostic> {
         // Permanently close graph/control adapters before the final lock write.
         // This private client can only execute the exact-owner release below;

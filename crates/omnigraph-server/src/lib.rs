@@ -3076,6 +3076,21 @@ async fn serve_config(
         .with_mcp_settings(mcp);
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
+    if let Some(admission) = retained_admission.as_ref() {
+        // A fenced lease means a successor may take over the cluster: this
+        // process stops writing and exits without releasing the lock. The
+        // watch holds no admission reference, so it never delays release.
+        let fence = admission.lease_fence();
+        let operations = operations.clone();
+        tokio::spawn(async move {
+            let fenced = fence.fenced().await;
+            error!(
+                ?fenced,
+                "cluster admission lease fenced; containing process"
+            );
+            operations.contain();
+        });
+    }
     let startup_owner = operations
         .own_startup()
         .map_err(|error| eyre!(error.message))?;

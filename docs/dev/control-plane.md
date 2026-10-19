@@ -282,7 +282,26 @@ acknowledgement is an error, while its delayed CAS cannot affect a successor.
 Local release uses awaited exact-owner deletion; automatic Azure release remains
 unqualified and its prior retained-lock shutdown behavior is unchanged. Older
 tools refuse the new released record. This supplies neither
-distributed fencing, generic runtime reuse nor crash recovery.
+distributed fencing nor generic runtime reuse.
+
+On local and S3 roots a held lock is version 3 and carries `lease_seconds`
+(`lease.rs`, `state_lock.rs`). Its owner creates
+`__cluster/lease/<lock_id>/beat-<seq>.json` put-if-absent every third of a
+lease, first before it admits work, and checks for
+`__cluster/lease/<lock_id>/superseded.json` before each beat. A timer of its
+own fences the owner two thirds of a lease after the send time of its last
+acknowledged beat, or at once on a claim: the server closes admission and
+exits 2 without releasing. A serving acquisition that finds a version-3 lock
+watches the beat listing on its own monotonic clock; a new beat refuses it,
+and a lease and a half of silence lets it create the claim, once, then replace
+`lock.json`: by if-match on S3, by overwrite on a local root, where the claim
+has serialized successors and a dead process sends nothing late. A clean
+release stops beating, deletes the lease directory, then releases as above.
+The lease coordinates liveness only; requests a dead owner sent before it
+fenced are fresh keys, conditional publications or audited mutable keys,
+which the storage-outcomes RFC (2026-10-19) argues cannot corrupt state.
+Version-1 locks from older binaries and Azure locks carry no lease and keep
+exact-ID unlock.
 
 Do not bypass the cluster API with direct filesystem writes, edit `state.json`, or derive a second mutable inventory. Content digests and live observations are recomputed from the declared and durable authorities.
 

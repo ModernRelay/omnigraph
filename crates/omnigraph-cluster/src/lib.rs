@@ -29,10 +29,18 @@ mod config;
 mod deployment;
 mod diff;
 mod graph_read;
+mod lease;
 mod serve;
 mod state_lock;
 mod store;
 mod types;
+pub use lease::{LeaseFence, LeaseFenced};
+/// The lease protocol's parts, for deterministic simulation of an owner's
+/// death and a successor's takeover.
+#[cfg(any(test, feature = "test-util"))]
+pub mod lease_protocol {
+    pub use crate::lease::{LeaseKeeper, Watch, lease_dir, watch_and_claim};
+}
 pub use admission::{
     ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission, acquire_graph_admission,
     canonical_graph_uri,

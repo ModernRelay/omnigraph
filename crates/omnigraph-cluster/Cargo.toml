@@ -32,6 +32,8 @@ time = { workspace = true }
 # StateLockGuard::drop on object-store backends (cluster commands always
 # run inside the caller's tokio runtime).
 tokio = { workspace = true }
+# The lease's fence and takeover records: lock ids and timing, never paths.
+tracing = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]

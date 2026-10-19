@@ -110,12 +110,19 @@ impl OperationRuntime {
         })
     }
 
-    pub(crate) fn contain_startup(&self) {
+    /// Contain the process for a reason outside any one operation: its
+    /// cluster admission lease fenced. Admission closes; known owners drain;
+    /// the process exits nonzero without releasing the lock.
+    pub(crate) fn contain(&self) {
         let mut state = locked(&self.inner.state);
         state.startup_uncertain = true;
         state.closed = true;
         drop(state);
         self.inner.changed.notify_waiters();
+    }
+
+    pub(crate) fn contain_startup(&self) {
+        self.contain();
     }
 
     /// Serialize synchronous graph admission/transition against process closure.
@@ -737,6 +744,19 @@ mod tests {
         assert!(abandoned.snapshot().startup_uncertain);
         assert!(!abandoned.wait_logical_owners().await);
         abandoned.fatal().await;
+        // A fenced lease contains a running process the same way: admission
+        // closes, the fail-stop path fires, and the epoch never reopens.
+        let fenced = OperationRuntime::new();
+        fenced.own_startup().unwrap().finish();
+        fenced.contain();
+        assert!(fenced.snapshot().closed);
+        assert!(!fenced.wait_logical_owners().await);
+        fenced.fatal().await;
+        assert!(
+            fenced
+                .while_open::<(), ApiError>(|| panic!("a fenced process admits nothing"))
+                .is_err()
+        );
         let completed = OperationRuntime::new();
         completed.own_startup().unwrap().finish();
         assert!(completed.wait_logical_owners().await);
