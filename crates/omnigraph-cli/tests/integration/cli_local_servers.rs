@@ -344,9 +344,11 @@ fn serve_refuses_what_it_cannot_serve_before_opening_anything() {
             &["serve", "--target", "remote", "--json"][..],
             "target_kind_unsupported",
         ),
+        // A cloud target cannot pin its storage settings yet, so it is no
+        // complete binding for any command.
         (
             &["serve", "--target", "cloud", "--json"][..],
-            "local_server_destination_unknown",
+            "target_invalid",
         ),
         (
             &["serve", "--target", "missing", "--json"][..],

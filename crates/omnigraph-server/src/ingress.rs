@@ -208,6 +208,7 @@ pub(crate) async fn admit(
         AdmissionClass::Read => {
             // Wrap before offering the owned result: even an unpolled oneshot
             // response must retain its graph through the stream's destruction.
+            // Its task also keeps the request's record of submitted writes.
             let response_observer = observer.clone();
             let response_input = lease.clone();
             let response_graph = graph.clone();
@@ -215,7 +216,7 @@ pub(crate) async fn admit(
             observer
                 .spawn_read((lease, graph, mcp_graph), async move {
                     Ok(observe_response(
-                        crate::operations::scope_request(next.run(request)).await,
+                        next.run(request).await,
                         response_observer,
                         response_input,
                         response_graph,

@@ -190,8 +190,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // writes; Blob get/stat are reads and never consume it, while Blob
         // put/clear are writes and do; commit list/show/changes and commit
         // publish/drop split the same way. Served writes
-        // resolve the actor from the bearer token
-        // (rejected downstream with its own message). On `direct`, full-text
+        // resolve the actor from the bearer token and send `--as` as the
+        // `omnigraph-expect-actor` assertion. On `direct`, full-text
         // rebuild attributes its graph publication; other maintenance verbs
         // record no actor. `control` refines per command:
         // Apply/upgrade attribute an actor; plan checks the intended actor
@@ -554,11 +554,11 @@ mod tests {
         // init) and of `control` (queries vs cluster). `graphs` is
         // registry-only and accepts neither --store nor --as.
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
-        // (command, [server, cluster, graph, store, as, profile])
+        // (command, [server, cluster, graph, store, as, profile, target])
         let rows = [
             (
                 parse(&["omnigraph", "query", "q"]),
-                [true, false, true, true, false, true],
+                [true, false, true, true, false, true, true],
             ),
             (
                 parse(&[
@@ -570,11 +570,11 @@ mod tests {
                     "readme",
                     "content",
                 ]),
-                [true, false, true, true, false, true],
+                [true, false, true, true, false, true, true],
             ),
             (
                 parse(&["omnigraph", "graphs", "list"]),
-                [true, false, false, false, false, true],
+                [true, false, false, false, false, true, true],
             ),
             // The change surfaces are ordinary data-plane verbs: served or
             // embedded, never cluster-addressed. Like every read, they reject
@@ -582,52 +582,52 @@ mod tests {
             // its token and an embedded read attributes none.
             (
                 parse(&["omnigraph", "commit", "changes", "some-commit"]),
-                [true, false, true, true, false, true],
+                [true, false, true, true, false, true, true],
             ),
             (
                 parse(&["omnigraph", "commit", "list"]),
-                [true, false, true, true, false, true],
+                [true, false, true, true, false, true, true],
             ),
             (
                 parse(&["omnigraph", "commit", "show", "some-commit"]),
-                [true, false, true, true, false, true],
+                [true, false, true, true, false, true, true],
             ),
             // `commit publish` and `commit drop` write, so a direct target
             // takes `--as` as every other direct write does.
             (
                 parse(&["omnigraph", "commit", "publish", "some-commit"]),
-                [true, false, true, true, true, true],
+                [true, false, true, true, true, true, true],
             ),
             (
                 parse(&["omnigraph", "commit", "drop", "some-commit"]),
-                [true, false, true, true, true, true],
+                [true, false, true, true, true, true, true],
             ),
             (
                 parse(&["omnigraph", "changes", "poll"]),
-                [true, false, true, true, false, true],
+                [true, false, true, true, false, true, true],
             ),
             (
                 parse(&["omnigraph", "changes", "baseline", "--out", "b.jsonl"]),
-                [true, false, true, true, false, true],
+                [true, false, true, true, false, true, true],
             ),
             (
                 parse(&["omnigraph", "schema", "apply", "--schema", "s.pg", "g.omni"]),
-                [false, false, false, true, true, true],
+                [false, false, false, true, true, true, true],
             ),
             (
                 parse(&["omnigraph", "optimize", "g.omni"]),
-                [false, true, true, true, false, true],
+                [false, true, true, true, false, true, true],
             ),
             (
                 parse(&["omnigraph", "rebuild-full-text-indexes", "g.omni"]),
-                [false, true, true, true, true, true],
+                [false, true, true, true, true, true, true],
             ),
             // `init` addresses its target positionally and never resolves a
             // scope — --store and --profile are rejected, not silently
             // ignored (unlike the other direct verbs).
             (
                 parse(&["omnigraph", "init", "--schema", "s.pg", "g.omni"]),
-                [false, false, false, false, false, false],
+                [false, false, false, false, false, false, false],
             ),
             // Plan checks the intended actor; other read-only control verbs
             // do not. Apply/upgrade attribute it. The cluster family accepts
@@ -635,23 +635,23 @@ mod tests {
             // selection or profile scope.
             (
                 parse(&["omnigraph", "queries", "list"]),
-                [false, true, true, false, false, true],
+                [false, true, true, false, false, true, true],
             ),
             (
                 parse(&["omnigraph", "cluster", "status", "--config", "."]),
-                [true, true, false, false, false, false],
+                [true, true, false, false, false, false, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "plan", "--config", "."]),
-                [true, false, false, false, true, false],
+                [true, false, false, false, true, false, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "apply", "--config", "."]),
-                [true, true, false, false, true, false],
+                [true, true, false, false, true, false, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "force-unlock", "lock-id"]),
-                [false, true, false, false, false, false],
+                [false, true, false, false, false, false, false],
             ),
             (
                 parse(&[
@@ -662,15 +662,15 @@ mod tests {
                     "file:///cluster",
                     "--writers-stopped",
                 ]),
-                [false, true, false, false, true, false],
+                [false, true, false, false, true, false, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "status", "--managed"]),
-                [false, false, false, false, false, false],
+                [false, false, false, false, false, false, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "plan", "--managed"]),
-                [false, false, false, false, false, false],
+                [false, false, false, false, false, false, false],
             ),
             (
                 parse(&[
@@ -681,15 +681,30 @@ mod tests {
                     "--plan",
                     "plan",
                 ]),
-                [false, false, false, false, false, false],
+                [false, false, false, false, false, false, false],
             ),
             (
                 parse(&["omnigraph", "version"]),
-                [false, false, false, false, false, false],
+                [false, false, false, false, false, false, false],
             ),
             (
                 parse(&["omnigraph", "skill", "export", "skills/omnigraph"]),
-                [false, false, false, false, false, false],
+                [false, false, false, false, false, false, false],
+            ),
+            // `login`, `logout` and `credential` act on a server target's
+            // credential; the `target` family reads and edits the file and
+            // selects no target.
+            (
+                parse(&["omnigraph", "login", "prod"]),
+                [false, false, false, false, false, false, true],
+            ),
+            (
+                parse(&["omnigraph", "credential", "get"]),
+                [false, false, false, false, false, false, true],
+            ),
+            (
+                parse(&["omnigraph", "target", "list"]),
+                [false, false, false, false, false, false, false],
             ),
         ];
         for (cmd, expected) in &rows {

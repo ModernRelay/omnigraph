@@ -18,8 +18,8 @@ omnigraph serve [--target NAME] [--write] [--reuse] [--port PORT] [--as ACTOR] [
 The target is `--target NAME`, else `defaults.target`. It must be a direct
 target whose `uri` is a local path or `file://` root: a standalone graph
 (`scope: graph`) or a cluster root (`scope: root`). A server target refuses with
-`target_kind_unsupported`, since that server already serves it; an `s3://` or
-`az://` root refuses with `local_server_destination_unknown`.
+`target_kind_unsupported`, since that server already serves it. An `s3://` or
+`az://` target is not yet a complete binding and refuses with `target_invalid`.
 
 ## Access and actor
 

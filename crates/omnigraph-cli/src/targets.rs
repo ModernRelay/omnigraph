@@ -68,8 +68,7 @@ pub(crate) struct TargetEntry {
     pub(crate) kind: TargetKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) scope: Option<TargetScope>,
-    /// A direct target's storage: an absolute path or a `file://`, `s3://`
-    /// or `az://` URI.
+    /// A direct target's storage: an absolute path or a `file://` URI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) uri: Option<String>,
     /// A server target's `http(s)://` URL or `unix:///absolute/path.sock`.
@@ -181,7 +180,7 @@ impl TargetEntry {
                     .endpoint
                     .clone()
                     .ok_or_else(|| invalid(name, "a server target needs `endpoint`"))?;
-                crate::graph_http::ServerTransport::parse(&endpoint)
+                crate::graph_http::ServerTransport::parse_endpoint(&endpoint)
                     .map_err(|error| invalid(name, error))?;
                 let auth = match (&self.credential, self.auth) {
                     (Some(owner), None) => {
@@ -222,13 +221,34 @@ impl TargetEntry {
 }
 
 /// A direct target's storage is written out in full, so the same entry names
-/// the same storage from every working directory.
+/// the same storage from every working directory and from any environment.
+/// Cloud storage is refused: its endpoint and account come from the
+/// environment when it is opened, and this format cannot pin them in the
+/// binding, so the entry would not be the complete address it claims.
 fn validate_storage_uri(uri: &str) -> std::result::Result<(), String> {
     if let Some((scheme, _)) = uri.split_once("://") {
         return match scheme {
-            "file" | "s3" | "az" => Ok(()),
+            "file" => {
+                let url = reqwest::Url::parse(uri)
+                    .map_err(|_| "`uri` is not a valid file:// URI".to_string())?;
+                if url.query().is_some() || url.fragment().is_some() {
+                    return Err("a file:// `uri` carries no query or fragment".to_string());
+                }
+                omnigraph::storage::normalize_root_uri(uri)
+                    .map(|_| ())
+                    .map_err(|_| {
+                        "a file:// `uri` names a local path, with no host other than localhost"
+                            .to_string()
+                    })
+            }
+            "s3" | "az" => Err(format!(
+                "a cloud target ({scheme}://) needs its storage endpoint and account pinned in \
+                 the binding, which this version cannot record, so the environment would still \
+                 choose where it points; address cloud storage directly with --store <uri> or \
+                 --cluster <uri>"
+            )),
             other => Err(format!(
-                "`uri` must be a file://, s3:// or az:// URI or an absolute path, not {other}://"
+                "`uri` must be an absolute path or a file:// URI, not {other}://"
             )),
         };
     }
@@ -236,7 +256,7 @@ fn validate_storage_uri(uri: &str) -> std::result::Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "`uri` must be an absolute path or a file://, s3:// or az:// URI, not `{uri}`"
+            "`uri` must be an absolute path or a file:// URI, not `{uri}`"
         ))
     }
 }
@@ -244,14 +264,18 @@ fn validate_storage_uri(uri: &str) -> std::result::Result<(), String> {
 impl TargetBinding {
     /// A digest of where the binding points and how it authenticates, which a
     /// client compares to notice that a target it remembered now names
-    /// something else. It holds no secret.
+    /// something else. It holds no secret. A direct target's storage is
+    /// digested in the normalized spelling the engine opens, so `/data/g` and
+    /// `file:///data/g` are one store.
     pub(crate) fn digest(&self) -> String {
+        let storage =
+            |uri: &str| omnigraph::storage::normalize_root_uri(uri).unwrap_or_else(|_| uri.into());
         let identity = match self {
             Self::DirectGraph { uri } => {
-                serde_json::json!({"kind":"direct","scope":"graph","uri":uri})
+                serde_json::json!({"kind":"direct","scope":"graph","uri":storage(uri)})
             }
             Self::DirectRoot { uri, .. } => {
-                serde_json::json!({"kind":"direct","scope":"root","uri":uri})
+                serde_json::json!({"kind":"direct","scope":"root","uri":storage(uri)})
             }
             Self::Server { endpoint, auth, .. } => serde_json::json!({
                 "kind":"server",
@@ -436,6 +460,21 @@ impl OperatorConfig {
         })
     }
 
+    /// Whether a token stored under `owner` applies anywhere: `owner` names a
+    /// `servers:` entry or is the credential owner of a server target.
+    pub(crate) fn declares_credential_owner(&self, owner: &str) -> bool {
+        self.servers.contains_key(owner)
+            || self.targets.iter().any(|(name, entry)| {
+                matches!(
+                    entry.binding(name),
+                    Ok(TargetBinding::Server {
+                        auth: ServerAuth::Token { owner: bound },
+                        ..
+                    }) if bound == owner
+                )
+            })
+    }
+
     /// Who holds the credential for a request: the deepest `servers:` entry
     /// or server target whose endpoint the request lies under. A request
     /// under no binding has no owner.
@@ -457,13 +496,13 @@ impl OperatorConfig {
 
 // ---- listing ----
 
-/// `target list --json`.
+/// `target list --json`. Aliases are not listed: they still name `servers:`
+/// entries, not targets.
 #[derive(Debug, Serialize)]
 pub(crate) struct TargetListOutput {
     pub(crate) protocol: u32,
     pub(crate) default_target: Option<String>,
     pub(crate) targets: Vec<TargetOutput>,
-    pub(crate) aliases: Vec<AliasOutput>,
 }
 
 /// One target as `target list` and `target show` print it. It never carries a
@@ -497,15 +536,6 @@ pub(crate) struct TargetOutput {
     pub(crate) error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct AliasOutput {
-    pub(crate) name: String,
-    pub(crate) server: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) graph: Option<String>,
-    pub(crate) query: String,
-}
-
 impl TargetOutput {
     pub(crate) fn of(name: &str, entry: &TargetEntry) -> Self {
         let mut output = Self {
@@ -531,7 +561,19 @@ impl TargetOutput {
                     });
                 }
             }
-            Err(error) => output.error = Some(error.to_string()),
+            Err(error) => {
+                // A binding refuses an address that holds a secret, so only
+                // an incomplete entry's address can hold one: print it
+                // without userinfo, query or fragment.
+                let redact = |value: &Option<String>| {
+                    value
+                        .as_deref()
+                        .map(omnigraph::storage::redacted_storage_uri)
+                };
+                output.root = redact(&entry.uri);
+                output.endpoint = redact(&entry.endpoint);
+                output.error = Some(error.to_string());
+            }
         }
         output
     }
@@ -545,16 +587,6 @@ pub(crate) fn list_output(config: &OperatorConfig) -> TargetListOutput {
             .targets
             .iter()
             .map(|(name, entry)| TargetOutput::of(name, entry))
-            .collect(),
-        aliases: config
-            .aliases
-            .iter()
-            .map(|(name, alias)| AliasOutput {
-                name: name.clone(),
-                server: alias.server.clone(),
-                graph: alias.graph.clone(),
-                query: alias.query.clone(),
-            })
             .collect(),
     }
 }
@@ -861,8 +893,9 @@ pub(crate) fn replace_file(path: &Path, text: &str) -> Result<()> {
 
 /// An exclusive advisory lock on `config.yaml.lock`, held across one edit's
 /// read, check and replace, so two edits never lose each other's entry. The
-/// lock file is a stable sibling, never removed. Unix only; elsewhere edits
-/// rely on the rename alone.
+/// lock file is a stable sibling, never removed. Unix only; elsewhere an edit
+/// refuses rather than run without the lock.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct ConfigEditLock {
     #[cfg(unix)]
     _file: std::fs::File,
@@ -891,7 +924,10 @@ impl ConfigEditLock {
         #[cfg(not(unix))]
         {
             let _ = config;
-            Ok(Self {})
+            Err(CliRefusal::report(
+                ErrorCode::ConfigNotEditable,
+                "the operator config cannot be edited safely here: this platform has no file lock to hold across the edit; edit the file by hand on this platform",
+            ))
         }
     }
 }

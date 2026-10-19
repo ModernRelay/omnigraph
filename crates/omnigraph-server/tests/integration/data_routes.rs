@@ -1721,6 +1721,73 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
         .unwrap();
     assert_eq!(head.graph_commit_id, receipt_commit_id);
     assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
+
+    // The fork publishes before the rows, so a typed refusal of the rows
+    // follows effects: the body says so, and the branch is there.
+    let refused = IngestRequest {
+        branch: Some("feature-refused".to_string()),
+        from: Some("main".to_string()),
+        mode: Some(LoadMode::Append),
+        data: r#"{"type":"Person","data":{"name":"Bob","age":26}}"#.to_string(),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/load"))
+            .method(Method::POST)
+            .header("authorization", "Bearer token-one")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&refused).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["key_conflict"].is_object(), "{body}");
+    assert_eq!(
+        body["outcome"],
+        json!({"execution": "unknown", "effects": "unknown", "action": "refresh"}),
+        "{body}"
+    );
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    assert!(
+        db.branch_list()
+            .await
+            .unwrap()
+            .contains(&"feature-refused".to_string())
+    );
+
+    // Onto a branch that exists, `from` forks nothing: the refused rows were
+    // the load's one publication, and it did not happen.
+    let unforked = IngestRequest {
+        branch: Some("feature-ingest".to_string()),
+        ..refused
+    };
+    let commits = db.list_commits(Some("feature-ingest")).await.unwrap().len();
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/load"))
+            .method(Method::POST)
+            .header("authorization", "Bearer token-one")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&unforked).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["key_conflict"].is_object(), "{body}");
+    assert_eq!(
+        body["outcome"],
+        json!({"execution": "not_started", "effects": "none", "action": "refresh"}),
+        "{body}"
+    );
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        db.list_commits(Some("feature-ingest")).await.unwrap().len(),
+        commits
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

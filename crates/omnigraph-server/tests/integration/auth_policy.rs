@@ -781,6 +781,133 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
     }
 }
 
+/// A request refused before any handler runs, because no route or method
+/// matches or its body, query string or path parameter does not decode,
+/// answers the error body every other refusal does.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_and_unrouted_requests_answer_the_error_body() {
+    use omnigraph_server::api::{
+        ErrorCode, OutcomeAction, OutcomeEffects, OutcomeExecution, OutcomeOutput,
+    };
+
+    let (temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let graph = graph_path(temp.path());
+    let before = manifest_dataset_version(&graph).await;
+    let request = |method: Method, path: &str, body: &'static str| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer demo-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let cases = [
+        // A body that is not JSON, and JSON of the wrong shape.
+        (
+            request(Method::POST, &g("/load"), "{"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/load"), r#"{"data":5}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/branches"), r#"{"name":5}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/changes/baseline"), "{"),
+            StatusCode::BAD_REQUEST,
+        ),
+        // Query strings that do not decode.
+        (
+            request(Method::GET, &g("/snapshot?branch=a&branch=b"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/load/ndjson?mode=sideways"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits?limit=many"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        // Path parameters that are not UTF-8.
+        (
+            request(Method::DELETE, &g("/branches/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::DELETE, &g("/commits/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/commits/%FF/publish"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits/%FF/changes"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, "/cluster/deployments/%FF", ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        // No route, inside and outside a graph, and a method a route does
+        // not serve.
+        (
+            Request::get("/no-such-route").body(Body::empty()).unwrap(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            request(Method::GET, &g("/no-such-route"), ""),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            request(Method::PUT, &g("/snapshot"), ""),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ];
+    for (request, status) in cases {
+        let what = format!("{} {}", request.method(), request.uri());
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status, "{what}");
+        assert_eq!(
+            response.headers()[HTTP_API_CONTRACT_HEADER],
+            HTTP_API_CONTRACT,
+            "{what}"
+        );
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            assert_eq!(response.headers()["allow"], "GET,HEAD", "{what}");
+        }
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("{what}: {}", String::from_utf8_lossy(&body)));
+        let code = match status {
+            StatusCode::NOT_FOUND => ErrorCode::NotFound,
+            StatusCode::METHOD_NOT_ALLOWED => ErrorCode::MethodNotAllowed,
+            _ => ErrorCode::BadRequest,
+        };
+        assert_eq!(error.code, Some(code), "{what}: {}", error.error);
+        assert_eq!(
+            error.outcome,
+            Some(OutcomeOutput {
+                execution: OutcomeExecution::NotStarted,
+                effects: OutcomeEffects::None,
+                action: OutcomeAction::Refresh,
+            }),
+            "{what}"
+        );
+    }
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn protected_routes_require_bearer_token() {
     let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
@@ -3655,6 +3782,21 @@ async fn expected_actor_header_narrows_a_request_and_never_supplies_an_actor() {
         "branch": "feature",
     });
 
+    // Public discovery attests the assertion, so a client sends it only to a
+    // server that enforces it.
+    let discovery = app
+        .clone()
+        .oneshot(Request::head("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        discovery
+            .headers()
+            .get(omnigraph_server::api::HTTP_API_ASSERTIONS_HEADER)
+            .unwrap(),
+        omnigraph_server::api::EXPECT_ACTOR_ASSERTION
+    );
+
     // A matching assertion changes nothing.
     let (status, body) = json_response(
         &app,
@@ -3737,8 +3879,12 @@ async fn expected_actor_header_narrows_a_request_and_never_supplies_an_actor() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_code(body, ErrorCode::ApiContractMismatch, "contract first");
 
-    // A repeated or padded assertion is malformed.
-    for expected in [&["act-bruno", "act-bruno"][..], &[" act-bruno"][..]] {
+    // A repeated, padded or empty assertion is malformed.
+    for expected in [
+        &["act-bruno", "act-bruno"][..],
+        &[" act-bruno"][..],
+        &[""][..],
+    ] {
         let (status, body) = json_response(
             &app,
             expecting(
@@ -3859,6 +4005,65 @@ async fn access_reports_the_callers_own_actions_as_routes_decide_them() {
     }
     let (status, _) = access(&app, "", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Each remaining action behind a scope only its own slot satisfies: a
+    // route that put the branch in the other slot would report otherwise.
+    let temp_slots = init_loaded_graph().await;
+    let slots_policy = temp_slots.path().join("policy.yaml");
+    fs::write(
+        &slots_policy,
+        r#"
+version: 1
+groups:
+  slots: [act-slots]
+protected_branches: [main]
+rules:
+  - id: query
+    allow:
+      actors: { group: slots }
+      actions: [invoke_query]
+  - id: apply-protected
+    allow:
+      actors: { group: slots }
+      actions: [schema_apply]
+      target_branch_scope: protected
+  - id: commits-unprotected
+    allow:
+      actors: { group: slots }
+      actions: [commit_publish, commit_drop]
+      target_branch_scope: unprotected
+  - id: fork-into-unprotected
+    allow:
+      actors: { group: slots }
+      actions: [branch_create]
+      target_branch_scope: unprotected
+"#,
+    )
+    .unwrap();
+    let slots = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph_path(temp_slots.path()).to_string_lossy().to_string(),
+            vec![("act-slots".to_string(), "slots-token".to_string())],
+            Some(&slots_policy),
+        )
+        .await
+        .unwrap(),
+    );
+    for (query, actions) in [
+        (
+            "?branch=main&target_branch=feature",
+            json!(["schema_apply", "branch_create"]),
+        ),
+        (
+            "?branch=feature&target_branch=main",
+            json!(["commit_publish", "commit_drop"]),
+        ),
+    ] {
+        let (status, body) = access(&slots, query, Some("slots-token")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(body["graph_wide"], json!(["invoke_query"]), "{query}");
+        assert_eq!(body["actions"], actions, "{query}");
+    }
 
     // Without a graph policy a static token only reads, as `authorize`
     // decides; without authentication every graph action is open.

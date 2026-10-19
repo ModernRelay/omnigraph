@@ -2030,12 +2030,22 @@ enum SnapshotRead {
 /// the commits: a refusal naming it is an answer for a commit written before.
 fn property_read(label: &str, property: &str, output: std::process::Output) -> SnapshotRead {
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains(property) && !stderr.contains(" was reclaimed") {
+        let refusal = refusal_text(&output);
+        if refusal.contains(property) && !refusal.contains(" was reclaimed") {
             return SnapshotRead::NoSuchProperty;
         }
     }
     snapshot_read(label, output)
+}
+
+/// A failed read's refusal: the `error` of the JSON failure on stdout, which a
+/// `--json` read writes, and whatever stderr carries.
+fn refusal_text(output: &std::process::Output) -> String {
+    let stdout = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .ok()
+        .and_then(|failure| failure["error"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    format!("{stdout}\n{}", String::from_utf8_lossy(&output.stderr))
 }
 
 fn snapshot_read(label: &str, output: std::process::Output) -> SnapshotRead {
@@ -2044,7 +2054,7 @@ fn snapshot_read(label: &str, output: std::process::Output) -> SnapshotRead {
         normalize_f32_and_nulls(&mut rows);
         return SnapshotRead::Rows(rows);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = refusal_text(&output);
     let reclaimed = stderr
         .split_once("historical published dataset version ")
         .and_then(|(_, rest)| rest.split_once(" was reclaimed"))

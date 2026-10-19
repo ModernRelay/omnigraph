@@ -5,7 +5,7 @@
 //! the existing `GraphClient` factories (`client.rs`) and the maintenance
 //! resolver (`helpers::resolve_storage_uri`) already consume. This is a
 //! translation layer that sits *in front* of those resolvers — it is purely
-//! additive: an explicit legacy address (`--uri`/`--target`/`--server`/
+//! additive: an explicit legacy address (a positional URI, `--server` or
 //! `--store`) wins and reproduces today's behavior exactly, so existing
 //! invocations are unaffected.
 //!
@@ -16,15 +16,17 @@
 
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
+use omnigraph_api_types::ErrorCode;
 
+use crate::helpers::CliRefusal;
 use crate::operator::{OperatorConfig, ScopeBinding};
 use crate::planes::Capability;
 
 pub(crate) const PROFILE_ENV: &str = "OMNIGRAPH_PROFILE";
 
 /// The effective addressing a command should use, in the terms the existing
-/// resolvers consume. Data/served verbs read `server`/`graph`/`uri`/`target`;
-/// maintenance verbs read `cluster`/`cluster_graph`.
+/// resolvers consume. Data/served verbs read `server`/`graph`/`uri`;
+/// maintenance and cluster tooling verbs read `cluster`/`cluster_graph`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResolvedScope {
     pub(crate) server: Option<String>,
@@ -32,6 +34,9 @@ pub(crate) struct ResolvedScope {
     pub(crate) uri: Option<String>,
     pub(crate) cluster: Option<String>,
     pub(crate) cluster_graph: Option<String>,
+    /// The named target the address came from (`--target` or
+    /// `defaults.target`), if one did.
+    pub(crate) target: Option<String>,
 }
 
 /// The raw addressing inputs for one command: the global scope flags plus the
@@ -46,6 +51,10 @@ pub(crate) struct ScopeFlags<'a> {
     pub(crate) cluster: Option<&'a str>,
     pub(crate) graph: Option<&'a str>,
     pub(crate) uri: Option<String>,
+    /// Whether the caller reads a cluster root (`cluster`/`cluster_graph`).
+    /// A caller that does not refuses a resolved root as the wrong kind of
+    /// address, so a root never reaches a resolver that would drop it.
+    pub(crate) reads_root: bool,
 }
 
 /// Resolve only from supplied values, without environment or I/O access.
@@ -90,7 +99,7 @@ pub(crate) fn resolve_scope(
         {
             bail!("--target and {other} are mutually exclusive — a target is a complete address");
         }
-        return scope_from_target(op, capability, name, flags.graph);
+        return scope_from_target(op, capability, flags.reads_root, name, flags.graph);
     }
 
     // 1a. `--cluster` is the cluster scope primitive (maintenance): resolve its
@@ -99,6 +108,7 @@ pub(crate) fn resolve_scope(
         return scope_from_binding(
             op,
             capability,
+            flags.reads_root,
             ScopeBinding::Cluster(cluster.to_string()),
             flags.graph.map(str::to_string),
             "--cluster",
@@ -142,12 +152,19 @@ pub(crate) fn resolve_scope(
             .graph
             .map(str::to_string)
             .or_else(|| profile.default_graph.clone());
-        return scope_from_binding(op, capability, binding, graph, &format!("profile '{name}'"));
+        return scope_from_binding(
+            op,
+            capability,
+            flags.reads_root,
+            binding,
+            graph,
+            &format!("profile '{name}'"),
+        );
     }
 
     // 3. The default target.
     if let Some(name) = op.default_target() {
-        return scope_from_target(op, capability, name, flags.graph);
+        return scope_from_target(op, capability, flags.reads_root, name, flags.graph);
     }
 
     // 4. Flat default server scope.
@@ -159,6 +176,7 @@ pub(crate) fn resolve_scope(
         return scope_from_binding(
             op,
             capability,
+            flags.reads_root,
             ScopeBinding::Server(server.to_string()),
             graph,
             "operator defaults",
@@ -171,6 +189,7 @@ pub(crate) fn resolve_scope(
         return scope_from_binding(
             op,
             capability,
+            flags.reads_root,
             ScopeBinding::Store(store.to_string()),
             flags.graph.map(str::to_string),
             "operator defaults",
@@ -182,103 +201,188 @@ pub(crate) fn resolve_scope(
     Ok(ResolvedScope::default())
 }
 
-/// A named target as the binding it names, with its default graph.
+/// Where a scope points once every name in it is resolved.
+enum Address {
+    /// A server name from `servers:` or a literal server URL.
+    Server(String),
+    /// A cluster's storage root.
+    Root(String),
+    /// One standalone graph's storage.
+    Store(String),
+}
+
+/// What supplied an address: a named target, or another scope input
+/// (`--cluster`, a profile, operator defaults) labelled for messages.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Target(&'a str),
+    Other(&'a str),
+}
+
+impl std::fmt::Display for Source<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Target(name) => write!(f, "target '{name}'"),
+            Self::Other(label) => f.write_str(label),
+        }
+    }
+}
+
+impl Source<'_> {
+    /// A refusal of the address's kind for this command. A target's carries
+    /// `target_kind_unsupported`; the older inputs keep their untyped refusal.
+    fn kind_refusal(self, message: String) -> color_eyre::Report {
+        match self {
+            Self::Target(_) => CliRefusal::report(ErrorCode::TargetKindUnsupported, message),
+            Self::Other(_) => eyre!(message),
+        }
+    }
+}
+
+/// A named target as the address it names, with its default graph. A target
+/// is complete: its URI or endpoint is used as written, never looked up as a
+/// name under `clusters:` or `servers:`.
 fn scope_from_target(
     op: &OperatorConfig,
     capability: Capability,
+    reads_root: bool,
     name: &str,
     graph: Option<&str>,
 ) -> Result<ResolvedScope> {
     use crate::targets::TargetBinding;
     let binding = op.target(name)?.binding(name)?;
-    let (binding, default_graph) = match binding {
-        TargetBinding::DirectGraph { uri } => (ScopeBinding::Store(uri), None),
-        TargetBinding::DirectRoot { uri, default_graph } => {
-            (ScopeBinding::Cluster(uri), default_graph)
-        }
+    let (address, default_graph) = match binding {
+        TargetBinding::DirectGraph { uri } => (Address::Store(uri), None),
+        TargetBinding::DirectRoot { uri, default_graph } => (Address::Root(uri), default_graph),
         TargetBinding::Server {
             endpoint,
             default_graph,
             ..
-        } => (ScopeBinding::Server(endpoint), default_graph),
+        } => (Address::Server(endpoint), default_graph),
     };
-    scope_from_binding(
-        op,
+    scope_from_address(
         capability,
-        binding,
+        reads_root,
+        address,
         graph.map(str::to_string).or(default_graph),
-        &format!("target '{name}'"),
+        Source::Target(name),
     )
 }
 
-/// Map a resolved binding to the effective tuple, enforcing scope × capability
-/// capability (RFC-011): a server scope is served (data only); a cluster scope
-/// is privileged direct (maintenance/control only); a store scope is direct
-/// (either).
+/// A profile's, `--cluster`'s or the operator defaults' binding as the address
+/// it names. A cluster value is a config name (resolved against `clusters:`)
+/// or a literal root: an `s3://`/`az://`/`file://` URI or a local cluster
+/// directory. Only a configured name is rewritten; anything else is passed
+/// through to the cluster-state resolver verbatim, so a bare directory path
+/// keeps working as it did for per-command `--cluster`.
 fn scope_from_binding(
     op: &OperatorConfig,
     capability: Capability,
+    reads_root: bool,
     binding: ScopeBinding,
     graph: Option<String>,
     source: &str,
 ) -> Result<ResolvedScope> {
-    match binding {
-        ScopeBinding::Server(server) => {
+    let address = match binding {
+        ScopeBinding::Server(server) => Address::Server(server),
+        ScopeBinding::Cluster(cluster) => Address::Root(
+            op.cluster_root(&cluster)
+                .map(str::to_string)
+                .unwrap_or(cluster),
+        ),
+        ScopeBinding::Store(uri) => Address::Store(uri),
+    };
+    scope_from_address(
+        capability,
+        reads_root,
+        address,
+        graph,
+        Source::Other(source),
+    )
+}
+
+/// Map a resolved address to the effective tuple, enforcing scope × capability
+/// (RFC-011): a server scope is served (data only); a cluster root is
+/// privileged direct (maintenance/control only, and only for a caller that
+/// reads a root); a store scope is direct (either); cluster tooling (control)
+/// reads a root and nothing else.
+fn scope_from_address(
+    capability: Capability,
+    reads_root: bool,
+    address: Address,
+    graph: Option<String>,
+    source: Source<'_>,
+) -> Result<ResolvedScope> {
+    let not_a_root = |what: &str| {
+        source.kind_refusal(format!(
+            "this command reads a cluster's applied state, but {source} is not a cluster root: \
+             it resolves {what}; pass --cluster <dir|uri>, select a cluster profile, or name a \
+             cluster-root target (`kind: direct`, `scope: root`)"
+        ))
+    };
+    let mut scope = match address {
+        Address::Server(server) => {
             if capability == Capability::Direct {
-                bail!(
+                return Err(source.kind_refusal(format!(
                     "this command needs direct storage access, but {source} resolves a \
                      server scope; name storage explicitly with --store <uri> (or \
                      --cluster <dir> --graph <id> for a managed graph)"
-                );
+                )));
             }
-            Ok(ResolvedScope {
+            if capability == Capability::Control {
+                return Err(not_a_root("a server scope"));
+            }
+            ResolvedScope {
                 server: Some(server),
                 graph,
                 ..Default::default()
-            })
+            }
         }
-        ScopeBinding::Cluster(cluster) => {
-            if capability == Capability::Any {
-                bail!(
+        Address::Root(root) => {
+            // A data command that reads a root (`access`, through a cluster
+            // graph's applied policy) takes one; every other refuses it.
+            if capability == Capability::Any && !reads_root {
+                return Err(source.kind_refusal(format!(
                     "{source} resolves a cluster scope, which is not valid for graph data \
                      commands; run data commands through a server, or use --store <uri> \
                      for ad-hoc direct access"
-                );
+                )));
             }
             if capability == Capability::Served {
-                bail!(
+                return Err(source.kind_refusal(format!(
                     "this command requires a server, but {source} resolves a cluster \
                      scope; address the server with --server <name|url> or --profile \
                      <name> (to enumerate a cluster's graphs: `omnigraph cluster status \
                      --config <dir>`)"
-                );
+                )));
             }
-            // A cluster value is a config name (resolved against `clusters:`)
-            // or a literal root: an `s3://`/`az://`/`file://` URI or a local cluster
-            // directory. Only a configured name is rewritten; anything else is
-            // passed through to the cluster-state resolver verbatim, so a bare
-            // directory path keeps working as it did for per-command `--cluster`.
-            let root = op
-                .cluster_root(&cluster)
-                .map(str::to_string)
-                .unwrap_or(cluster);
+            if !reads_root {
+                return Err(source.kind_refusal(format!(
+                    "this command addresses one standalone graph, but {source} resolves a \
+                     cluster root; name the graph's storage with --store <uri> or a direct \
+                     graph target (`kind: direct`, `scope: graph`)"
+                )));
+            }
             // A cluster holds many graphs; maintenance addresses one at a time.
             // When no `--graph`/`default_graph` is given, leave `cluster_graph`
             // empty and defer to the async storage-URI resolver (RFC-011 D7),
             // which enumerates the catalog: auto-use a sole graph, else error
             // and list the candidates.
-            Ok(ResolvedScope {
+            ResolvedScope {
                 cluster: Some(root),
                 cluster_graph: graph,
                 ..Default::default()
-            })
+            }
         }
-        ScopeBinding::Store(uri) => {
+        Address::Store(uri) => {
             if capability == Capability::Served {
-                bail!(
+                return Err(source.kind_refusal(format!(
                     "this command requires a server, but {source} resolves a store scope; \
                      address the server with --server <name|url> or --profile <name>"
-                );
+                )));
+            }
+            if capability == Capability::Control {
+                return Err(not_a_root("a store scope"));
             }
             if graph.is_some() {
                 bail!(
@@ -286,12 +390,16 @@ fn scope_from_binding(
                      a single graph"
                 );
             }
-            Ok(ResolvedScope {
+            ResolvedScope {
                 uri: Some(uri),
                 ..Default::default()
-            })
+            }
         }
+    };
+    if let Source::Target(name) = source {
+        scope.target = Some(name.to_string());
     }
+    Ok(scope)
 }
 
 #[cfg(test)]
@@ -311,6 +419,7 @@ mod tests {
             cluster: None,
             graph: None,
             uri: None,
+            reads_root: true,
         }
     }
 
@@ -632,12 +741,28 @@ mod tests {
                 &op,
                 ambient,
                 Capability::Any,
-                ScopeFlags { profile, ..flags() },
+                ScopeFlags {
+                    profile,
+                    reads_root: false,
+                    ..flags()
+                },
             )
             .unwrap_err()
             .to_string();
             assert!(err.contains("not valid for graph data commands"), "{err}");
         }
+        // A data command that reads a root, as `access` does, takes one.
+        let scope = resolve_scope(
+            &op,
+            None,
+            Capability::Any,
+            ScopeFlags {
+                profile: Some("admin"),
+                ..flags()
+            },
+        )
+        .unwrap();
+        assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
     }
 
     #[test]
@@ -741,6 +866,189 @@ mod tests {
         for ambient in [None, Some("")] {
             let scope = resolve_scope(&op, ambient, Capability::Any, flags()).unwrap();
             assert_eq!(scope, ResolvedScope::default());
+        }
+    }
+
+    fn refusal_code(error: &color_eyre::Report) -> Option<ErrorCode> {
+        error
+            .downcast_ref::<CliRefusal>()
+            .map(|refusal| refusal.code)
+    }
+
+    const ROOT_TARGETS: &str = "target_config_version: 1\nclusters:\n  /tmp/x/named:\n    root: /tmp/x/other\n  brain:\n    root: /tmp/x/brain\nservers:\n  prod:\n    url: https://x\nprofiles:\n  admin:\n    cluster: brain\n    default_graph: knowledge\n  served:\n    server: prod\ntargets:\n  ops:\n    kind: direct\n    scope: root\n    uri: /tmp/x/named\n    default_graph: knowledge\n  local:\n    kind: direct\n    scope: graph\n    uri: /tmp/x/graph.omni\n  remote:\n    kind: server\n    endpoint: https://remote.example\n    auth: anonymous\n";
+
+    #[test]
+    fn a_target_root_is_used_as_written_while_cluster_names_resolve() {
+        // A `clusters:` key spelled like a target's URI does not redirect the
+        // target: a target is a complete address. `--cluster` and a profile
+        // still name `clusters:` entries.
+        let op = cfg(ROOT_TARGETS);
+        let target = resolve_scope(
+            &op,
+            None,
+            Capability::Direct,
+            ScopeFlags {
+                target: Some("ops"),
+                ..flags()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            target,
+            ResolvedScope {
+                cluster: Some("/tmp/x/named".into()),
+                cluster_graph: Some("knowledge".into()),
+                target: Some("ops".into()),
+                ..Default::default()
+            }
+        );
+        let named = resolve_scope(
+            &op,
+            None,
+            Capability::Direct,
+            ScopeFlags {
+                cluster: Some("/tmp/x/named"),
+                ..flags()
+            },
+        )
+        .unwrap();
+        assert_eq!(named.cluster.as_deref(), Some("/tmp/x/other"));
+        assert_eq!(named.target, None);
+    }
+
+    #[test]
+    fn a_root_refuses_by_kind_where_the_command_reads_no_root() {
+        // `schema apply`, `upgrade` and the data commands address one graph:
+        // a resolved root refuses rather than being dropped on the way.
+        let op = cfg(ROOT_TARGETS);
+        let one_graph = |flags: ScopeFlags<'_>| {
+            resolve_scope(
+                &op,
+                None,
+                Capability::Direct,
+                ScopeFlags {
+                    reads_root: false,
+                    ..flags
+                },
+            )
+        };
+        let refused = one_graph(ScopeFlags {
+            target: Some("ops"),
+            ..flags()
+        })
+        .unwrap_err();
+        assert_eq!(
+            refusal_code(&refused),
+            Some(ErrorCode::TargetKindUnsupported)
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains("target 'ops' resolves a cluster root"),
+            "{refused}"
+        );
+        let refused = one_graph(ScopeFlags {
+            profile: Some("admin"),
+            ..flags()
+        })
+        .unwrap_err();
+        assert_eq!(refusal_code(&refused), None);
+        assert!(
+            refused
+                .to_string()
+                .contains("profile 'admin' resolves a cluster root"),
+            "{refused}"
+        );
+        assert_eq!(
+            one_graph(ScopeFlags {
+                target: Some("local"),
+                ..flags()
+            })
+            .unwrap()
+            .uri
+            .as_deref(),
+            Some("/tmp/x/graph.omni")
+        );
+        // A data command refuses a root target by the same code.
+        let refused = resolve_scope(
+            &op,
+            None,
+            Capability::Any,
+            ScopeFlags {
+                target: Some("ops"),
+                reads_root: false,
+                ..flags()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal_code(&refused),
+            Some(ErrorCode::TargetKindUnsupported)
+        );
+    }
+
+    #[test]
+    fn cluster_tooling_resolves_only_a_root_by_the_same_rules() {
+        let op = cfg(&format!("{ROOT_TARGETS}defaults:\n  target: ops\n"));
+        let control = |ambient: Option<&str>, flags: ScopeFlags<'_>| {
+            resolve_scope(&op, ambient, Capability::Control, flags)
+        };
+        let default = control(None, flags()).unwrap();
+        assert_eq!(default.cluster.as_deref(), Some("/tmp/x/named"));
+        assert_eq!(default.target.as_deref(), Some("ops"));
+        // An explicit cluster profile wins over the default target, and keeps
+        // its root; it is not a target.
+        let profile = control(
+            None,
+            ScopeFlags {
+                profile: Some("admin"),
+                ..flags()
+            },
+        )
+        .unwrap();
+        assert_eq!(profile.cluster.as_deref(), Some("/tmp/x/brain"));
+        assert_eq!(profile.target, None);
+        // An ambient profile beside `defaults.target` is a conflict, as for
+        // every other command.
+        let refused = control(Some("admin"), flags()).unwrap_err();
+        assert!(
+            refused.to_string().contains("OMNIGRAPH_PROFILE"),
+            "{refused}"
+        );
+        // An explicit profile or target that names no root refuses; it never
+        // falls through to the default target.
+        let refused = control(
+            None,
+            ScopeFlags {
+                profile: Some("served"),
+                ..flags()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("profile 'served' is not a cluster root"),
+            "{refused}"
+        );
+        for name in ["remote", "local"] {
+            let refused = control(
+                None,
+                ScopeFlags {
+                    target: Some(name),
+                    ..flags()
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                refusal_code(&refused),
+                Some(ErrorCode::TargetKindUnsupported),
+                "{name}"
+            );
+            assert!(
+                refused.to_string().contains("not a cluster root"),
+                "{refused}"
+            );
         }
     }
 }

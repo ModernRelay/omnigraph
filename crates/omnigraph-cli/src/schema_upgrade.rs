@@ -25,13 +25,9 @@ pub(crate) async fn run(
             cluster: None,
             graph: None,
             uri,
+            reads_root: false,
         },
     )?;
-    if target.cluster.is_some() {
-        bail!(
-            "schema upgrade-system-columns refuses cluster-managed graphs; a qualified cluster upgrade operation is required"
-        );
-    }
     let uri = resolve_local_uri(target.uri, "schema upgrade-system-columns")?;
     let uri = omnigraph::storage::normalize_root_uri(&uri)?;
     if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri)

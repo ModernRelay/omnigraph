@@ -35,13 +35,9 @@ pub(crate) async fn run(
             cluster: None,
             graph: None,
             uri,
+            reads_root: false,
         },
     )?;
-    if target.cluster.is_some() {
-        bail!(
-            "upgrade refuses cluster-managed graphs; a qualified cluster upgrade operation is required"
-        );
-    }
     let uri = resolve_local_uri(target.uri, "upgrade")?;
     let uri = omnigraph::storage::normalize_root_uri(&uri)?;
     let uri = if omnigraph::storage::storage_kind_for_uri(&uri)?

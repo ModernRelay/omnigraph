@@ -1,63 +1,98 @@
 //! Local account, profile and version reports.
 
+use crate::commands::targets::LoginKey;
 use crate::output::write_json;
 use color_eyre::eyre::Result;
 use serde::Serialize;
 use std::io::Write;
 
 pub(crate) fn finish_login(
-    server: &str,
+    key: &LoginKey,
     credentials_path: &std::path::Path,
     declared: bool,
     json: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    if json {
-        write_json(
-            &serde_json::json!({
-                "server": server,
-                "credentials_path": credentials_path.display().to_string(),
-                "declared": declared,
-            }),
-            stdout,
-        )?;
-    } else {
-        writeln!(
-            stdout,
-            "stored credential for '{server}' in {}",
-            credentials_path.display()
-        )?;
-    }
-    if !declared {
-        writeln!(
-            stderr,
-            "note: '{server}' is not declared under servers: in the operator config; the token applies once you add `servers:\n  {server}:\n    url: <server url>` to ~/.omnigraph/config.yaml"
-        )?;
+    let path = credentials_path.display().to_string();
+    match key {
+        LoginKey::Server(server) => {
+            if json {
+                write_json(
+                    &serde_json::json!({
+                        "server": server,
+                        "credentials_path": path,
+                        "declared": declared,
+                    }),
+                    stdout,
+                )?;
+            } else {
+                writeln!(stdout, "stored credential for '{server}' in {path}")?;
+            }
+            if !declared {
+                writeln!(
+                    stderr,
+                    "note: '{server}' is not declared under servers: in the operator config; the token applies once you add `servers:\n  {server}:\n    url: <server url>` to ~/.omnigraph/config.yaml"
+                )?;
+            }
+        }
+        LoginKey::Target { target, owner } => {
+            if json {
+                write_json(
+                    &serde_json::json!({
+                        "target": target,
+                        "owner": owner,
+                        "credentials_path": path,
+                        "declared": declared,
+                    }),
+                    stdout,
+                )?;
+            } else {
+                writeln!(
+                    stdout,
+                    "stored credential `{owner}` for target '{target}' in {path}"
+                )?;
+            }
+        }
     }
     Ok(())
 }
 
 pub(crate) fn finish_logout(
-    server: &str,
+    key: &LoginKey,
     credentials_path: &std::path::Path,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<()> {
-    if json {
-        write_json(
-            &serde_json::json!({
-                "server": server,
-                "credentials_path": credentials_path.display().to_string(),
-            }),
-            stdout,
-        )?;
-    } else {
-        writeln!(
-            stdout,
-            "removed credential for '{server}' from {}",
-            credentials_path.display()
-        )?;
+    let path = credentials_path.display().to_string();
+    match key {
+        LoginKey::Server(server) => {
+            if json {
+                write_json(
+                    &serde_json::json!({"server": server, "credentials_path": path}),
+                    stdout,
+                )?;
+            } else {
+                writeln!(stdout, "removed credential for '{server}' from {path}")?;
+            }
+        }
+        LoginKey::Target { target, owner } => {
+            if json {
+                write_json(
+                    &serde_json::json!({
+                        "target": target,
+                        "owner": owner,
+                        "credentials_path": path,
+                    }),
+                    stdout,
+                )?;
+            } else {
+                writeln!(
+                    stdout,
+                    "removed credential `{owner}` for target '{target}' from {path}"
+                )?;
+            }
+        }
     }
     Ok(())
 }

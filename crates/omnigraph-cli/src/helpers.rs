@@ -840,6 +840,7 @@ pub(crate) async fn resolve_maintenance_uri(
             cluster,
             graph,
             uri: cli_uri,
+            reads_root: true,
         },
     )?;
     resolve_storage_uri(
