@@ -62,7 +62,7 @@ pub(crate) async fn run_policy(
     let policies = read_cluster_policies(&binding).await?;
     match command {
         PolicyCommand::Validate {} => {
-            let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+            let bundle = select_cluster_policy(cluster, &policies, graph)?;
             let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
             writeln!(
                 stdout,
@@ -72,7 +72,7 @@ pub(crate) async fn run_policy(
             )?;
         }
         PolicyCommand::Test { tests } => {
-            let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+            let bundle = select_cluster_policy(cluster, &policies, graph)?;
             let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
             let tests = PolicyTestConfig::load(&tests)?;
             engine.run_tests(&tests)?;
@@ -84,7 +84,7 @@ pub(crate) async fn run_policy(
             branch,
             target_branch,
         } => {
-            let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+            let bundle = select_cluster_policy(cluster, &policies, graph)?;
             let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
             let request = PolicyRequest {
                 action,

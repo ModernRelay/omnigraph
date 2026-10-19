@@ -463,11 +463,15 @@ async fn reprove_named_branch_heads(store: &TableStore, snapshot: &Snapshot) -> 
     let Some(branch) = snapshot.graph_branch() else {
         return Ok(());
     };
+    // Reprove authority with fresh metadata while retaining the captured
+    // provider registry; the data session may contain an earlier page's view.
+    let control_session =
+        crate::lance_access::statement_session(store.session().store_registry(), 0, 0);
     let fresh = crate::db::manifest::ManifestCoordinator::snapshot_at_with_session(
         store.root_uri(),
         Some(branch),
         snapshot.graph_manifest_version(),
-        &store.session(),
+        &control_session,
     )
     .await?;
     if fresh.graph_head(Some(branch)) != snapshot.graph_head(Some(branch)) {

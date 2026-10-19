@@ -207,12 +207,12 @@ pub(crate) enum GraphClient {
     Embedded {
         uri: String,
         actor: Option<String>,
-        binding: CapturedStorageBinding,
+        binding: Box<CapturedStorageBinding>,
     },
     /// Remote HTTP server. The actor is resolved server-side from the
     /// token; the client never sets identity.
     Remote {
-        http: GraphHttpClient,
+        http: Box<GraphHttpClient>,
         base_url: String,
         token: Option<String>,
         response_limit: Option<usize>,
@@ -260,7 +260,7 @@ impl GraphClient {
         catalogue: bool,
     ) -> Result<Self> {
         Ok(Self::Remote {
-            http: GraphHttpClient::managed(endpoint)?,
+            http: Box::new(GraphHttpClient::managed(endpoint)?),
             base_url,
             token: Some(token),
             response_limit: Some(8 * 1024 * 1024),
@@ -279,7 +279,7 @@ impl GraphClient {
         };
         let token = crate::targets::resolve_server_token(input, auth, endpoint)?;
         Ok(Self::Remote {
-            http: GraphHttpClient::server_target(input, target)?,
+            http: Box::new(GraphHttpClient::server_target(input, target)?),
             base_url: endpoint.clone(),
             token,
             response_limit: None,
@@ -304,7 +304,7 @@ impl GraphClient {
                 Ok(Self::Embedded {
                     uri: binding.uri().to_owned(),
                     actor,
-                    binding,
+                    binding: Box::new(binding),
                 })
             }
             TargetBinding::Server { endpoint, auth, .. } => {
@@ -317,7 +317,7 @@ impl GraphClient {
                 let token =
                     crate::targets::resolve_server_token_for(input, auth, endpoint, &base_url)?;
                 Ok(Self::Remote {
-                    http: GraphHttpClient::server_target(input, target)?,
+                    http: Box::new(GraphHttpClient::server_target(input, target)?),
                     base_url,
                     token,
                     response_limit: None,
@@ -345,7 +345,7 @@ impl GraphClient {
         Self::Embedded {
             uri,
             actor,
-            binding,
+            binding: Box::new(binding),
         }
     }
 

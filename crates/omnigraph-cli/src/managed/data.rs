@@ -401,7 +401,7 @@ async fn resolve_with_acquisition(
     api: impl AsyncFn(&Context) -> Result<Api>,
 ) -> Result<GraphClient> {
     let mut resolved = resolve_context(cli, context, store);
-    let expected = if matches!(&resolved, Ok(_)) {
+    let expected = if resolved.is_ok() {
         let expected = identity(context).await?;
         if expected.as_ref().is_some_and(|id| {
             load_credential(store, context)

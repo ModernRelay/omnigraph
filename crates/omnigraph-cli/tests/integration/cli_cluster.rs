@@ -3388,7 +3388,9 @@ fn managed_invalid_acknowledgements_keep_request_identity_in_json_and_human_outp
     for (command, mut body, field) in [
         ("apply", managed_delivery("queued"), "/data/preview_id"),
         ("apply", managed_delivery("queued"), "/meta/cluster_id"),
+        ("apply", managed_delivery("queued"), "/meta/incarnation"),
         ("plan", managed_preview("ready"), "/data/revision"),
+        ("plan", managed_preview("ready"), "/meta/incarnation"),
     ] {
         *body.pointer_mut(field).unwrap() = serde_json::json!("foreign");
         for json in [false, true] {

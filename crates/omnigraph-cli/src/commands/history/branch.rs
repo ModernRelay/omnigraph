@@ -92,7 +92,6 @@ pub(crate) async fn run_branch(
             )
             .await?;
             let into = resolve_branch(into, None, "main");
-            if !dry_run {}
             let payload = client
                 .branch_merge(
                     &source,

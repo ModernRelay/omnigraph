@@ -2082,7 +2082,7 @@ pub(crate) async fn preflight_deployment_at(
         .unwrap_or_else(|| format!("sha256:{}", sha256_hex(b"")));
     let input_digest = bundle.input_digest()?;
     let prepared = prepare_deployment(
-        &store,
+        store,
         bundle,
         caller,
         (state, cas),

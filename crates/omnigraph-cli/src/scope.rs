@@ -295,6 +295,13 @@ pub(crate) fn report(
     Ok(())
 }
 
+/// Convert the validated CLI destination into the storage layer's captured binding.
+pub(crate) fn capture_storage_binding(
+    target: &ResolvedTarget,
+) -> Result<omnigraph::storage::CapturedStorageBinding> {
+    target.storage()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,11 +556,4 @@ mod tests {
             assert!(selected(&args, &input, dir.path()).is_ok(), "{args:?}");
         }
     }
-}
-
-/// Convert the validated CLI destination into the storage layer's captured binding.
-pub(crate) fn capture_storage_binding(
-    target: &ResolvedTarget,
-) -> Result<omnigraph::storage::CapturedStorageBinding> {
-    target.storage()
 }

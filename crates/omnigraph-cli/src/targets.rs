@@ -705,7 +705,7 @@ fn server_bindings(config: &OperatorConfig) -> Vec<ServerBinding<'_>> {
             Some(ServerBinding {
                 label: name,
                 owner,
-                base: RequestTarget::of(&endpoint, &endpoint).ok()?,
+                base: RequestTarget::of(endpoint, endpoint).ok()?,
             })
         })
         .collect()
@@ -844,14 +844,15 @@ impl TargetOutput {
     pub(crate) fn of(name: &str, entry: &TargetEntry, base: &Path) -> Self {
         let binding = entry.binding_at(name, base);
         let mut safe_entry = entry.clone();
-        for value in [
+        for raw in [
             &mut safe_entry.uri,
             &mut safe_entry.endpoint,
             &mut safe_entry.api,
-        ] {
-            if let Some(raw) = value {
-                *raw = omnigraph::storage::redacted_storage_uri(raw);
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *raw = omnigraph::storage::redacted_storage_uri(raw);
         }
         if let Some(
             StorageProvider::S3 { endpoint, .. } | StorageProvider::Azure { endpoint, .. },

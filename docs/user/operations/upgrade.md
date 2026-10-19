@@ -284,11 +284,11 @@ jq -c 'if has("id") then . else .id = .data.id | del(.data.id) end' \
 # New binary (schema.pg endpoint constraints use @src and @dst)
 omnigraph init --schema schema.pg s3://bucket/graph-new.omni
 omnigraph load --mode overwrite --data graph-current.jsonl \
-  s3://bucket/graph-new.omni
+  --target s3://bucket/graph-new.omni
 
 # Verify with the new binary
-omnigraph snapshot s3://bucket/graph-new.omni --json
-omnigraph schema show s3://bucket/graph-new.omni
+omnigraph snapshot --target s3://bucket/graph-new.omni --json
+omnigraph schema show --target s3://bucket/graph-new.omni
 ```
 
 For another branch:
@@ -299,7 +299,7 @@ jq -c 'if has("id") then . else .id = .data.id | del(.data.id) end' \
   review.jsonl > review-current.jsonl
 omnigraph init --schema schema.pg s3://bucket/graph-review-new.omni
 omnigraph load --mode overwrite --data review-current.jsonl \
-  s3://bucket/graph-review-new.omni
+  --target s3://bucket/graph-review-new.omni
 ```
 
 ## Verify before cutover
