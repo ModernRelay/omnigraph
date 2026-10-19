@@ -174,6 +174,16 @@ in addition to the versions selected by the policy.
 Historical table lifetimes participate even after a type is dropped or its
 name is re-added under a new identity. Blob sidecars follow their parent data
 file's reachability.
+
+`omnigraph cleanup` is the only cleanup to run against a graph root. Lance's
+own cleanup (`cleanup_old_versions`, and every vacuum or retention tool built
+on it) does not trace the detached commits OmniGraph's table versions are: on
+Lance 13 it keeps those versions' manifests and deletes every data file of
+theirs older than seven days, which leaves the graph commits that pin them
+opening but unreadable. The same holds for the graph's catalog dataset, whose
+unpublished proposals and unattached snapshots are detached versions. Treat
+any such run as data loss and restore from backup.
+
 A table version no graph commit ever named is unpublished staging: a write
 in flight, or one that failed before its publication. Unless a native tag
 protects it, it is deleted when the branch incarnation and graph head its

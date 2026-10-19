@@ -7982,6 +7982,107 @@ async fn rfc_detached_only_detached_commit_never_triggers_auto_cleanup() {
     );
 }
 
+/// Detached-only RFC §Garbage collection, probe 1b: stock cleanup is
+/// destructive on a graph table. Lance 13 never reads a `d{n}.manifest`, so no
+/// detached commit's files count as referenced, and since lance#8944 it lists
+/// `data/` through `max(retained-manifest floor, now − 7 days)` and deletes
+/// every listed file no attached manifest references (`unverified` mode). A
+/// graph table's one attached version is its `v1` create, so a stock run of
+/// any policy keeps every detached manifest and deletes every detached data
+/// file older than a week; the pins that name those versions then open and
+/// fail to read. Lance 11 listed `data/` only below the retained floor, which
+/// `v1` set above every detached file, so the same run left them alone
+/// (`_indices/` has always been listed whole). This is why the engine never
+/// calls stock cleanup on a graph table (`forbidden_apis.rs`) and why an
+/// external Lance cleanup of a graph root is a data-loss path. Both halves are
+/// pinned: the seven-day floor keeps a fresh detached file, and nothing keeps
+/// an aged one.
+#[tokio::test]
+async fn stock_cleanup_sweeps_a_week_old_detached_data_file_lance_13() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    rfc0067_create(uri).await;
+    let base = rfc0067_pinned(uri, 1).await;
+    let aged = rfc_detached_only_append(&base, &["c1"]).await;
+    let fresh = rfc_detached_only_append(&aged, &["d1"]).await;
+    let aged_version = aged.version().version;
+    let fresh_version = fresh.version().version;
+    assert!(lance_table::format::is_detached_version(aged_version));
+    assert!(lance_table::format::is_detached_version(fresh_version));
+
+    let data_dir = dir.path().join("t.lance").join("data");
+    let aged_file = rfc_detached_only_fragment_files(&aged, 1);
+    let fresh_file = rfc_detached_only_fragment_files(&fresh, 2);
+    assert_eq!((aged_file.len(), fresh_file.len()), (1, 1));
+    let aged_file = data_dir.join(&aged_file[0]);
+    let fresh_file = data_dir.join(&fresh_file[0]);
+    assert!(aged_file.is_file() && fresh_file.is_file());
+    // Age the first detached commit's data file past Lance's unverified
+    // threshold (`UNVERIFIED_THRESHOLD_DAYS`, seven); the local store reports
+    // the file's mtime as `last_modified`.
+    std::fs::File::options()
+        .write(true)
+        .open(&aged_file)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .unwrap();
+
+    let head = rfc0067_head(uri).await;
+    assert_eq!(
+        head.version().version,
+        1,
+        "the graph-table shape: v1 is the only attached version"
+    );
+    assert_eq!(head.list_detached_manifests().await.unwrap().len(), 2);
+    let removed = cleanup_old_versions(&head, CleanupPolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        (removed.old_versions, removed.data_files_removed),
+        (0, 1),
+        "no attached version is old, yet one data file is swept: the aged \
+         detached commit's, which no attached manifest references"
+    );
+    assert!(
+        !aged_file.exists(),
+        "the week-old detached data file is deleted as unverified"
+    );
+    assert!(
+        fresh_file.is_file(),
+        "the fresh detached data file survives on the seven-day floor alone"
+    );
+    assert_eq!(
+        head.list_detached_manifests().await.unwrap().len(),
+        2,
+        "stock cleanup never traces a detached manifest, so it deletes neither"
+    );
+    let aged = rfc0067_pinned(uri, aged_version).await;
+    assert!(
+        rfc_detached_only_scan_rows(&aged).await.is_err(),
+        "the aged detached version still opens but its rows are gone"
+    );
+    let fresh = rfc0067_pinned(uri, fresh_version).await;
+    assert!(
+        rfc_detached_only_scan_rows(&fresh).await.is_err(),
+        "the chain above the swept file is unreadable too: the fresh manifest \
+         lists the aged fragment by its own file"
+    );
+    let v1 = rfc0067_pinned(uri, 1).await;
+    assert_eq!(
+        rfc_detached_only_scan_rows(&v1).await.unwrap(),
+        2,
+        "control: the attached create's rows are untouched"
+    );
+}
+
+async fn rfc_detached_only_scan_rows(ds: &Dataset) -> lance::Result<usize> {
+    let mut scanner = ds.scan();
+    scanner.project(&["id"]).unwrap();
+    let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+    Ok(batches.iter().map(|batch| batch.num_rows()).sum())
+}
+
 /// Detached-only RFC §Garbage collection, probe 2: a detached manifest lists
 /// every fragment of its version by its own file, so marking a version's
 /// files needs no walk of the chain behind it.
