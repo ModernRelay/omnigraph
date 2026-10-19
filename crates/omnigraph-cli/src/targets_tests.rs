@@ -544,6 +544,30 @@ fn a_binding_digest_names_where_a_target_points_and_nothing_else() {
     assert_eq!(direct("/data/g"), direct("file:///data/g"));
     assert_eq!(direct("/data/g"), direct("/data/g/"));
     assert_ne!(direct("/data/g"), direct("/data/h"));
+    // A server endpoint is digested as requests are matched to it.
+    let server = |endpoint: &str| {
+        entry(&format!(
+            r#"{{"kind":"server","endpoint":"{endpoint}","auth":"anonymous"}}"#
+        ))
+        .binding("s")
+        .unwrap()
+        .digest()
+    };
+    for spelling in [
+        "https://h.example/",
+        "https://h.example:443",
+        "https://H.example",
+    ] {
+        assert_eq!(server("https://h.example"), server(spelling), "{spelling}");
+    }
+    assert_ne!(
+        server("https://h.example"),
+        server("https://h.example:8443")
+    );
+    assert_ne!(
+        server("https://h.example"),
+        server("https://h.example/base")
+    );
     let listing = list_output(&config);
     assert_eq!(listing.default_target.as_deref(), Some("staging"));
     let local = listing.targets.iter().find(|t| t.name == "local").unwrap();

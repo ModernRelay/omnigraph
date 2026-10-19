@@ -5816,6 +5816,14 @@ fn targets_address_commands_and_carry_only_their_owners_token() {
         ],
         true,
     );
+    // `schema plan` takes one graph's storage and refuses `--cluster` and
+    // `--graph`, so it refuses a root target rather than opening the root.
+    refuse_root(
+        &[
+            "schema", "plan", "--target", "ops", "--schema", &schema, "--json",
+        ],
+        true,
+    );
     refuse_root(&["upgrade", "--target", "ops", "--check", "--json"], false);
     refuse_root(
         &[

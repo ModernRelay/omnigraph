@@ -277,9 +277,14 @@ impl TargetBinding {
             Self::DirectRoot { uri, .. } => {
                 serde_json::json!({"kind":"direct","scope":"root","uri":storage(uri)})
             }
+            // An endpoint is digested as requests are matched to it, so
+            // `https://h`, `https://h/`, `https://h:443` and `https://H` are
+            // one binding.
             Self::Server { endpoint, auth, .. } => serde_json::json!({
                 "kind":"server",
-                "endpoint":endpoint,
+                "endpoint": RequestTarget::of(endpoint, endpoint)
+                    .map(|target| target.canonical())
+                    .unwrap_or_else(|_| endpoint.clone()),
                 "credential": match auth {
                     ServerAuth::Token { owner } => serde_json::Value::String(owner.clone()),
                     ServerAuth::Anonymous => serde_json::Value::Null,
