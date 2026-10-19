@@ -56,6 +56,7 @@ pub mod migrations;
 // `LanceNamespace` impls are retained only to validate the contract in tests.
 #[cfg(any(test, feature = "test-util"))]
 pub mod namespace;
+pub mod pending;
 pub mod publisher;
 #[cfg(feature = "test-util")]
 pub mod read_executor;

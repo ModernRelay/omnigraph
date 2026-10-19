@@ -27,6 +27,7 @@ impl RedactedCause {
             OmniError::Completion { .. } => "Completion",
             OmniError::Compiler(_) => "Compiler",
             OmniError::Storage(_) => "Storage",
+            OmniError::PublicationPending { .. } => "PublicationPending",
             OmniError::HistoricalVersionReclaimed { .. } => "HistoricalVersionReclaimed",
             OmniError::FullTextIndexRebuildRequired { .. } => "FullTextIndexRebuildRequired",
             OmniError::FullTextIndexRequired { .. } => "FullTextIndexRequired",

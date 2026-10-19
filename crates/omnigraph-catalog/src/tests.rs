@@ -14778,6 +14778,8 @@ struct ManifestRequestFault {
     fault: ManifestFault,
     fired: Arc<std::sync::atomic::AtomicBool>,
     manifest_puts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Cleared when the store starts answering again.
+    failing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ManifestRequestFault {
@@ -14786,7 +14788,13 @@ impl ManifestRequestFault {
             fault,
             fired: Arc::default(),
             manifest_puts: Arc::default(),
+            failing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
+    }
+
+    fn heal(&self) {
+        self.failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -14854,7 +14862,9 @@ impl object_store::ObjectStore for ManifestRequestFaultStore {
                 self.original.put_opts(location, payload, options).await?;
                 Err(ambiguous_store_error("connection reset after the request"))
             }
-            ManifestFault::EveryManifestPut if numbered_manifest => {
+            ManifestFault::EveryManifestPut
+                if numbered_manifest && self.fault.failing.load(Ordering::SeqCst) =>
+            {
                 Err(ambiguous_store_error("503 Service Unavailable"))
             }
             ManifestFault::LandsLate if first(numbered_manifest) => {
@@ -15045,4 +15055,141 @@ async fn manifest_create_without_a_definite_answer_stays_in_doubt_issue_1067() {
         1 + crate::manifest_request::MANIFEST_REQUEST_REISSUES as usize,
         "the original request and every re-issue"
     );
+}
+
+/// A publication whose manifest request no re-issue settles is pending on
+/// its branch: the next write to the branch is refused with nothing written
+/// while the store stays silent, and once the store answers, resolution
+/// re-issues the identical commit and it lands, exactly once.
+#[tokio::test]
+async fn pending_publication_blocks_its_branch_until_the_store_answers_issue_1067() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    ManifestCoordinator::init(&uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let before = open_manifest_dataset(&uri, None).await.unwrap();
+    let fault = ManifestRequestFault::new(ManifestFault::EveryManifestPut);
+    let probes = || crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(fault.clone())),
+        ..Default::default()
+    };
+    let publisher = GraphNamespacePublisher::new(&uri, None);
+    let intent = lineage_intent(None, None);
+    let error = crate::instrumentation::with_query_io_probes(
+        probes(),
+        publisher.publish(&[], &HashMap::new(), Some(&intent)),
+    )
+    .await
+    .expect_err("no manifest create succeeds");
+    assert!(error.is_manifest_publish_in_doubt(), "{error:?}");
+    let pending = crate::pending::pending_on(&before).expect("the publication is pending");
+    assert_eq!(pending.graph_commit_id, intent.graph_commit_id);
+    assert_eq!(pending.version, before.version().version + 1);
+
+    let refused = crate::instrumentation::with_query_io_probes(
+        probes(),
+        publisher.publish(&[], &HashMap::new(), Some(&lineage_intent(None, None))),
+    )
+    .await
+    .expect_err("the branch refuses writes while its publication is pending");
+    assert!(
+        matches!(
+            refused,
+            OmniError::PublicationPending {
+                graph_commit_id: Some(ref id),
+                ..
+            } if *id == intent.graph_commit_id
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        open_manifest_dataset(&uri, None)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        before.version().version,
+        "nothing was written"
+    );
+
+    fault.heal();
+    assert_eq!(
+        crate::pending::resolve(&pending, before.version().version).await,
+        crate::pending::Resolution::Committed
+    );
+    assert!(crate::pending::pending_on(&before).is_none());
+    let landed = open_manifest_dataset(&uri, None).await.unwrap();
+    assert_eq!(landed.version().version, before.version().version + 1);
+    assert_eq!(
+        read_manifest_rows(&landed)
+            .await
+            .unwrap()
+            .head
+            .graph_commit_id,
+        intent.graph_commit_id,
+        "the pending write is the one that landed"
+    );
+    crate::instrumentation::with_query_io_probes(
+        probes(),
+        publisher.publish(&[], &HashMap::new(), Some(&lineage_intent(None, None))),
+    )
+    .await
+    .expect("the branch accepts writes again");
+    assert_eq!(
+        open_manifest_dataset(&uri, None)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        before.version().version + 2
+    );
+}
+
+/// A pending publication whose version another commit took can no longer
+/// land: resolution reads the version back, reports it lost, and releases
+/// the branch.
+#[tokio::test]
+async fn pending_publication_lost_to_another_commit_releases_its_branch_issue_1067() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    ManifestCoordinator::init(&uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let before = open_manifest_dataset(&uri, None).await.unwrap();
+    let fault = ManifestRequestFault::new(ManifestFault::EveryManifestPut);
+    let publisher = GraphNamespacePublisher::new(&uri, None);
+    let intent = lineage_intent(None, None);
+    crate::instrumentation::with_query_io_probes(
+        crate::instrumentation::QueryIoProbes {
+            manifest_wrapper: Some(Arc::new(fault.clone())),
+            ..Default::default()
+        },
+        publisher.publish(&[], &HashMap::new(), Some(&intent)),
+    )
+    .await
+    .expect_err("no manifest create succeeds");
+    let pending = crate::pending::pending_on(&before).expect("the publication is pending");
+
+    // Another writer, outside this process's registry, takes the version.
+    let mut rows = read_manifest_rows(&before).await.unwrap();
+    rows.head.graph_commit_id = format!("fixture-{}", ulid::Ulid::new());
+    super::commit::overwrite(before.clone(), &rows, None)
+        .await
+        .unwrap();
+    let latest = open_manifest_dataset(&uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(latest, pending.version);
+    assert_eq!(
+        crate::pending::resolve(&pending, latest).await,
+        crate::pending::Resolution::Lost
+    );
+    assert!(crate::pending::pending_on(&before).is_none());
+    publisher
+        .publish(&[], &HashMap::new(), Some(&lineage_intent(None, None)))
+        .await
+        .expect("the branch accepts writes again");
 }

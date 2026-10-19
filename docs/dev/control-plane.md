@@ -240,10 +240,18 @@ its read-back cannot settle reaches the logical operation owner as uncertain.
 
 Refs, version hints, cluster control objects, unknown paths, if-match
 replacements and recursive deletes remain conservative. A cancelled or
-ambiguous request sticks even if a higher layer consumes the error, and the
-scope logs its key and error. Rename also accounts for removal of its source.
-Single-attempt conditional conflicts and a delete answered "not found" are
-settled refusals.
+ambiguous request leaves its key unsettled even if a higher layer consumes the
+error, and the scope logs its key and error. A later request to that key, or a
+recursive delete over it, is refused before it is sent; other keys are
+unaffected. The scope remembers at most `MAX_UNSETTLED_KEYS` (4096) keys and
+past that refuses every mutation. Rename also accounts for removal of its
+source. Single-attempt conditional conflicts and a delete answered "not found"
+are settled refusals. `forbidden_apis.rs`
+(`mutable_key_requests_are_registered_issue_1067`) registers every
+unconditional request to a reused key in the engine, core, catalog, storage,
+cluster, server and Azure admission crates with why its late landing is
+harmless; a new one fails the guard until it is argued or made conditional or
+fresh.
 
 An unacknowledged manifest write may land after Lance reads it back as absent
 and attempts to delete its transaction file. One sticky flag therefore
@@ -257,13 +265,16 @@ replacing the scope is not permission to delete them. Definite conditional
 conflicts do not set the hold. A successful multipart abort does not clear a
 hold from an earlier unacknowledged completion.
 
-Scoped clients disable both transport and Lance AIMD retries, and local Lance
-uses its object-store file provider so direct file writes cannot bypass the
-scope. Embedded defaults and Azure serving clients are unchanged; the
+Scoped stores hold two clients. Reads and fresh immutable writes go to one
+with Lance's own bounded transport and AIMD retries; conditional requests and
+mutable keys go to one that makes a single attempt, so their owners see every
+attempt. Scoped control adapters keep three read retries within three minutes.
+Local Lance uses its object-store file provider so direct file writes cannot
+bypass the scope. Embedded defaults and Azure serving clients are unchanged; the
 automatic scoped shutdown path applies only to local and S3 roots.
 
-Only unique admission, successful startup and unpoisoned settlement permit final
-release. Original adapters remain permanently closed; a private single-attempt
+Only unique admission, successful startup, no pending publication and no
+unsettled key permit final release. Original adapters remain permanently closed; a private single-attempt
 client performs only exact-owner lock release under the same shutdown deadline.
 S3 release CAS writes a unique version-2 released marker at the existing key;
 ordinary acquisition CAS replaces it with a fresh held owner. Lost release
@@ -426,10 +437,14 @@ results occupy one observed delivery slot until consumed or dropped. A known
 write retains its reservations in that slot: consuming it releases write
 capacity before the handler responds, while abandoning it destroys the output
 before releasing ownership. A read
-error or panic does not trigger write uncertainty. A write panic or explicitly
-indeterminate owned completion closes admission for every graph and signals the
-same bounded process shutdown, retaining
-unresolved reservations until exit. The engine's completion evidence decides:
+error or panic does not trigger write uncertainty. An owned write whose outcome is unknown for a storage reason the engine scopes,
+a publication in doubt (pending on its branch, `omnigraph_catalog::pending`) or
+an opaque storage or I/O failure (whose mutable keys the scope holds unsettled),
+reports its outcome and releases its reservations; admission stays open. A
+write panic, a lost owner, `RecoveryRequired`, an opaque DataFusion failure or
+an uncertain deployment activation closes admission for every graph and
+signals the same bounded process shutdown, retaining unresolved reservations
+until exit. The engine's completion evidence decides:
 a failure it proves left the graph unchanged, before any effect or after
 detached effects no manifest names (`BeforeEffect`, `Unpublished`), is
 not itself a reason for logical containment, whatever status it maps to,

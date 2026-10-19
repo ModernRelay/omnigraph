@@ -86,6 +86,10 @@ pub fn manifest_request_reissues() -> usize {
     omnigraph_core::manifest_request::MANIFEST_REQUEST_REISSUES as usize
 }
 
+/// Publications whose manifest request got no definite answer; see
+/// `omnigraph_catalog::pending`.
+pub use omnigraph_catalog::pending::{pending_publications, resolve_pending_publications};
+
 /// The Lance-realm object-store seam; see `lance_access::object_store_seam`.
 #[cfg(feature = "dst")]
 pub use lance_access::object_store_seam;

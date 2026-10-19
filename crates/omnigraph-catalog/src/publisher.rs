@@ -56,7 +56,7 @@ use super::{
 };
 use crate::seams::{contention, decide_seam, fail};
 
-/// Retries around the version CAS of `commit::overwrite`, whose own Lance
+/// Retries around the version CAS of `commit::overwrite_reissuable`, whose own Lance
 /// retries are 0 (a rebase would be transparent merge, wrong for OCC); each
 /// attempt re-runs `load_publish_state` and the expected-version pre-check.
 const PUBLISHER_RETRY_BUDGET: u32 = 5;
@@ -1067,10 +1067,12 @@ impl GraphNamespacePublisher {
         rows: &ManifestRows,
         cold: Option<&crate::state::LineageRegistry>,
     ) -> std::result::Result<Dataset, PublishAttemptFailure> {
-        fail(&PUBLISH_PRE_MERGE).map_err(PublishAttemptFailure::BeforeAck)?;
-        let (new_dataset, batch) = commit::overwrite(dataset, rows, cold)
+        fail(&PUBLISH_PRE_MERGE).map_err(|error| PublishAttemptFailure::BeforeAck(error, None))?;
+        let (new_dataset, batch) = commit::overwrite_reissuable(dataset, rows, cold)
             .await
-            .map_err(PublishAttemptFailure::BeforeAck)?;
+            .map_err(|failure| {
+                PublishAttemptFailure::BeforeAck(failure.error, failure.pending.map(Box::new))
+            })?;
         // The commit is durable and the graph is published; a failure here
         // models the acknowledgement being lost after that (RFC 0067), so
         // the publish loop's ambiguity arm reads the manifest back rather
@@ -1122,7 +1124,7 @@ impl GraphNamespacePublisher {
     }
 }
 
-/// The conflict vocabulary of the `__manifest` version CAS (`commit::overwrite`,
+/// The conflict vocabulary of the `__manifest` version CAS (`commit::overwrite_reissuable`,
 /// a zero-retry Lance commit): the attempted version already exists, so this
 /// attempt landed nothing. Lance reports that as `CommitConflict`,
 /// `RetryableCommitConflict` or `TooMuchWriteContention`; each becomes the typed
@@ -1165,8 +1167,9 @@ fn publish_outcome_in_doubt(
 enum PublishAttemptFailure {
     /// Before the acknowledgement. `commit::overwrite` marks the error
     /// `Unpublished` when no request for the version can land, and leaves an
-    /// opaque error without evidence when one may have.
-    BeforeAck(OmniError),
+    /// opaque error without evidence, with what re-issuing it takes, when one
+    /// may have.
+    BeforeAck(OmniError, Option<Box<crate::pending::PendingPublication>>),
     /// After the acknowledgement: the version is durable and only the result
     /// was lost.
     AfterAck(OmniError),
@@ -1483,6 +1486,21 @@ impl GraphNamespacePublisher {
             } = loaded;
             let native_branch = dataset.manifest().branch.clone();
 
+            // A publication pending on this branch may still land at the next
+            // version: settle it first, or refuse with nothing written.
+            if let Some(pending) = crate::pending::pending_on(&dataset) {
+                match crate::pending::resolve(&pending, dataset.version().version).await {
+                    crate::pending::Resolution::Pending => {
+                        return Err(crate::pending::refusal(&pending));
+                    }
+                    _ if attempt < PUBLISHER_RETRY_BUDGET => continue,
+                    _ => return Err(crate::pending::refusal(&pending)),
+                }
+            }
+            if crate::pending::full() {
+                return Err(crate::pending::registry_full());
+            }
+
             self.check_publish_precondition(&dataset, &head, precondition)
                 .await?;
 
@@ -1679,8 +1697,8 @@ impl GraphNamespacePublisher {
                     // lost. Either way a version that may hold this commit is
                     // read back.
                     let after_ack = matches!(failure, PublishAttemptFailure::AfterAck(_));
-                    let err = match failure {
-                        PublishAttemptFailure::BeforeAck(err) => {
+                    let (err, pending) = match failure {
+                        PublishAttemptFailure::BeforeAck(err, pending) => {
                             if attempt < PUBLISHER_RETRY_BUDGET
                                 && is_retryable_publish_conflict(&err)
                             {
@@ -1689,9 +1707,17 @@ impl GraphNamespacePublisher {
                             if err.completion_evidence().is_some() || !err.outcome_opaque() {
                                 return Err(err);
                             }
-                            err
+                            (err, pending)
                         }
-                        PublishAttemptFailure::AfterAck(err) => err,
+                        PublishAttemptFailure::AfterAck(err) => (err, None),
+                    };
+                    // A version the read-back cannot settle is pending on its
+                    // branch until the store answers a re-issue.
+                    let in_doubt = |err: OmniError, cause: &dyn std::fmt::Display| {
+                        if let Some(pending) = pending.clone() {
+                            crate::pending::register(*pending);
+                        }
+                        publish_outcome_in_doubt(&err, &next.head.graph_commit_id, cause)
                     };
                     if lineage.is_none() {
                         // Without a lineage intent the attempted rows keep the
@@ -1699,11 +1725,7 @@ impl GraphNamespacePublisher {
                         return Err(err.with_completion_evidence(CompletionEvidence::Uncertain));
                     }
                     if let Err(readback_err) = fail(&PUBLISH_READ_BACK) {
-                        return Err(publish_outcome_in_doubt(
-                            &err,
-                            &next.head.graph_commit_id,
-                            readback_err,
-                        ));
+                        return Err(in_doubt(err, &readback_err));
                     }
                     match dataset.checkout_version(new_manifest_version).await {
                         Ok(reloaded) => match read_manifest_rows(&reloaded).await {
@@ -1728,17 +1750,15 @@ impl GraphNamespacePublisher {
                                     });
                                 }
                                 if rows.head.graph_commit_id == next.head.graph_commit_id {
-                                    return Err(publish_outcome_in_doubt(
-                                        &err,
-                                        &next.head.graph_commit_id,
-                                        "attempted commit identity has inconsistent lineage",
+                                    return Err(in_doubt(
+                                        err,
+                                        &"attempted commit identity has inconsistent lineage",
                                     ));
                                 }
                                 if after_ack {
-                                    return Err(publish_outcome_in_doubt(
-                                        &err,
-                                        &next.head.graph_commit_id,
-                                        "the acknowledged version holds another commit",
+                                    return Err(in_doubt(
+                                        err,
+                                        &"the acknowledged version holds another commit",
                                     ));
                                 }
                                 // This exact version belongs to a different
@@ -1748,21 +1768,13 @@ impl GraphNamespacePublisher {
                                 return Err(err);
                             }
                             Err(scan_err) => {
-                                return Err(publish_outcome_in_doubt(
-                                    &err,
-                                    &next.head.graph_commit_id,
-                                    scan_err,
-                                ));
+                                return Err(in_doubt(err, &scan_err));
                             }
                         },
                         // Absent is not final: a request that may have
                         // landed can still land after this read.
                         Err(readback_err) => {
-                            return Err(publish_outcome_in_doubt(
-                                &err,
-                                &next.head.graph_commit_id,
-                                readback_err,
-                            ));
+                            return Err(in_doubt(err, &readback_err));
                         }
                     }
                 }

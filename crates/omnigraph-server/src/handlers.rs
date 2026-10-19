@@ -569,6 +569,7 @@ pub(crate) fn resolve_registered_graph(
     }
     Err(ApiError {
         completion_uncertain: false,
+        scoped_unknown: false,
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: Some(ErrorCode::GraphUnavailable),
         message: message.into(),
@@ -3203,7 +3204,7 @@ pub(crate) async fn server_branch_merge(
                 match delete_merged_source_branch(&handle, actor.as_ref(), &request.source).await {
                     Ok(()) => (Some(true), None),
                     Err(error) => {
-                        uncertain = error.completion_uncertain();
+                        uncertain = error.contains_process();
                         (Some(false), Some(error.into_output()))
                     }
                 }

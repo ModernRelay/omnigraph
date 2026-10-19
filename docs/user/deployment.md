@@ -94,14 +94,13 @@ stream producers for at most `--shutdown-grace-seconds` (else
 A thread enforces the deadline even if the runtime stalls. Signal handling starts
 after configuration loading, before graph opening. Disconnected work remains in
 the wait; a graph finishing startup during shutdown cannot become available.
-A panic or uncertain startup/write completion closes admission for every graph
-and starts the same shutdown without renewing its deadline. Once HTTP connections
-and other known logical owners finish, it exits 2 immediately; the watchdog is
-the upper bound. Unresolved reservations stay charged until exit. This contains
-the process; it does not prove native I/O settled or the engine can be reused.
-A failure proven to leave the graph unchanged keeps admission open once its
-storage requests settle; see [storage failures](operations/storage-failures.md).
-Status alone proves nothing; an unsettled publication or unclassified failure fails closed.
+A panic, or an uncertain outcome the engine cannot scope to one write or branch,
+closes admission for every graph and starts the same shutdown without renewing
+its deadline; a storage failure alone never does ([storage failures](operations/storage-failures.md)).
+Once HTTP connections and other known logical owners finish, it exits 2
+immediately; the watchdog is the upper bound. Unresolved reservations stay
+charged until exit. This contains the process; it does not prove native I/O
+settled or the engine can be reused.
 A clean native shutdown exits 0. Set the orchestrator's own
 termination grace longer than this value; a cutoff is crash-equivalent for the
 work it interrupts, and the next open recovers it as after any crash.
@@ -116,9 +115,8 @@ uses a conditional marker, so a lost release response cannot delete a later
 owner's lock. A nonclean exit is still a reason to inspect the original outcome,
 not to replay writes. Azure keeps its existing shutdown behavior: even a clean
 exit retains admission and requires the independent Azure recovery procedure.
-The server's storage clients disable hidden mutation retries; if
-`OBJECT_STORE_CLIENT_MAX_RETRIES` is set, it must be `0`. An ambiguous storage
-failure stops new writes rather than allowing a later success to hide it.
+If `OBJECT_STORE_CLIENT_MAX_RETRIES` is set, it must be `0` ([retries](operations/storage-failures.md#retries)).
+A clean shutdown that leaves a publication pending or a reused key unsettled retains admission.
 Other direct writers still follow the [ownership-transfer procedure](#writer-topology).
 
 ## Admission limits

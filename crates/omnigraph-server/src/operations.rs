@@ -259,15 +259,18 @@ impl OperationRuntime {
                 // Consumption releases admission before the handler can respond;
                 // abandonment destroys the output before releasing its ownership.
                 // Uncertainty closes admission before its result is observable.
+                // The failure's class was logged in this request's span
+                // when the engine error was mapped.
+                if let Err(error) = &result.result
+                    && error.completion_uncertain()
+                {
+                    tracing::error!(
+                        status = %error.status,
+                        contained = result.uncertain,
+                        "owned write ended without a definite outcome"
+                    );
+                }
                 let owner = if result.uncertain {
-                    // The failure's class was logged in this request's span
-                    // when the engine error was mapped.
-                    if let Err(error) = &result.result {
-                        tracing::error!(
-                            status = %error.status,
-                            "owned write ended without a definite outcome"
-                        );
-                    }
                     owner.finish(true);
                     None
                 } else {
@@ -364,10 +367,11 @@ pub(crate) struct OwnedResult<T> {
 }
 
 impl<T> From<Result<T, ApiError>> for OwnedResult<T> {
+    /// An unknown outcome the engine scopes to its storage keys and branch
+    /// is reported, not contained; every other uncertain completion contains
+    /// the process.
     fn from(result: Result<T, ApiError>) -> Self {
-        let uncertain = result
-            .as_ref()
-            .is_err_and(|error| error.completion_uncertain());
+        let uncertain = result.as_ref().is_err_and(|error| error.contains_process());
         Self { result, uncertain }
     }
 }
@@ -786,7 +790,10 @@ mod tests {
     #[tokio::test]
     async fn typed_engine_uncertainty_controls_capacity_independently_of_status() {
         use omnigraph::error::OmniError;
-        for (error, uncertain) in [
+        // (error, it contains the process). An unknown storage outcome, a
+        // publication in doubt or an opaque storage or I/O failure, is
+        // scoped to its keys and branch and does not contain.
+        for (error, contained) in [
             (
                 OmniError::Io(std::io::Error::other("schema read failed")).before_effect(),
                 false,
@@ -802,7 +809,7 @@ mod tests {
             ),
             (
                 OmniError::manifest_publish_in_doubt("uncertain publication").before_effect(),
-                true,
+                false,
             ),
             (
                 OmniError::RecoveryRequired {
@@ -814,7 +821,7 @@ mod tests {
             ),
             (
                 OmniError::Io(std::io::Error::other("I/O completion failure")),
-                true,
+                false,
             ),
             (OmniError::DataFusion("execution failure".into()), true),
             (
@@ -827,7 +834,7 @@ mod tests {
             (OmniError::manifest_internal("internal failure"), true),
             (
                 OmniError::manifest_publish_in_doubt("publication acknowledgement unavailable"),
-                true,
+                false,
             ),
             (OmniError::manifest("invalid request"), false),
             (OmniError::manifest_conflict("authority conflict"), false),
@@ -849,10 +856,10 @@ mod tests {
                 })
                 .unwrap();
             assert!(response.result().await.is_err());
-            assert_eq!(runtime.wait_logical_owners().await, !uncertain);
-            assert_eq!(runtime.snapshot().closed, uncertain);
-            assert_eq!(runtime.snapshot().uncertain_writes, usize::from(uncertain));
-            assert_eq!(releases.load(Ordering::SeqCst), usize::from(!uncertain));
+            assert_eq!(runtime.wait_logical_owners().await, !contained);
+            assert_eq!(runtime.snapshot().closed, contained);
+            assert_eq!(runtime.snapshot().uncertain_writes, usize::from(contained));
+            assert_eq!(releases.load(Ordering::SeqCst), usize::from(!contained));
         }
     }
 
@@ -860,36 +867,68 @@ mod tests {
     /// effects are detached versions no manifest names) is a 500 the caller
     /// can act on, not an unknown outcome: admission stays open, the
     /// reservation is released and nothing contains the process. The same
-    /// error without that evidence still fails closed.
+    /// error without that evidence reports an unknown outcome scoped to its
+    /// storage keys and branch, which does not contain either; an unknown
+    /// outcome the engine does not scope still contains.
     #[tokio::test]
     async fn definite_unpublished_storage_failure_keeps_admission_open_issue_1067() {
         use omnigraph::error::{CompletionEvidence, OmniError};
-        for (error, uncertain) in [
+        // (error, its outcome is unknown, it contains the process, status)
+        for (error, uncertain, contained, status) in [
             (
                 OmniError::Io(std::io::Error::other("detached manifest put failed")).unpublished(),
                 false,
+                false,
+                StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
                 OmniError::manifest_internal("table reached commit without a staged transaction")
                     .unpublished(),
                 false,
+                false,
+                StatusCode::INTERNAL_SERVER_ERROR,
             ),
+            // An unknown storage outcome is scoped to its keys and branch:
+            // reported, never contained.
             (
                 OmniError::Io(std::io::Error::other("detached manifest put failed")),
                 true,
+                false,
+                StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
                 OmniError::manifest_publish_in_doubt("manifest publish outcome is in doubt")
                     .unpublished(),
                 true,
+                false,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            // A write refused because its branch has a pending publication
+            // did nothing.
+            (
+                OmniError::PublicationPending {
+                    branch: None,
+                    graph_commit_id: Some("01J".to_string()),
+                },
+                false,
+                false,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            // An unknown outcome the engine does not scope still contains.
+            (
+                OmniError::DataFusion("execution failed".to_string()),
+                true,
+                true,
+                StatusCode::BAD_REQUEST,
             ),
         ] {
             let message = error.to_string();
             let evidence = error.completion_evidence();
             let api = ApiError::from_omni(error);
-            assert_eq!(api.status(), StatusCode::INTERNAL_SERVER_ERROR, "{message}");
+            assert_eq!(api.status(), status, "{message}");
             assert_eq!(api.completion_uncertain(), uncertain, "{message}");
-            if !uncertain {
+            assert_eq!(api.contains_process(), contained, "{message}");
+            if !uncertain && status == StatusCode::INTERNAL_SERVER_ERROR {
                 assert_eq!(evidence, Some(CompletionEvidence::Unpublished));
             }
             let runtime = OperationRuntime::new();
@@ -900,16 +939,16 @@ mod tests {
                 })
                 .unwrap();
             assert!(response.result().await.is_err());
-            assert_eq!(runtime.wait_logical_owners().await, !uncertain, "{message}");
-            assert_eq!(runtime.snapshot().closed, uncertain, "{message}");
+            assert_eq!(runtime.wait_logical_owners().await, !contained, "{message}");
+            assert_eq!(runtime.snapshot().closed, contained, "{message}");
             assert_eq!(
                 runtime.snapshot().uncertain_writes,
-                usize::from(uncertain),
+                usize::from(contained),
                 "{message}"
             );
             assert_eq!(
                 releases.load(Ordering::SeqCst),
-                usize::from(!uncertain),
+                usize::from(!contained),
                 "{message}"
             );
         }

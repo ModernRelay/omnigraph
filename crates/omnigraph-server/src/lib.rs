@@ -477,6 +477,12 @@ pub struct ApiError {
     message: Box<str>,
     details: Option<Box<ApiErrorDetails>>,
     completion_uncertain: bool,
+    /// The outcome is unknown only for storage requests whose uncertainty
+    /// the engine scopes to their own keys and branch: a publication in
+    /// doubt, which is pending on its branch, or an opaque storage failure,
+    /// whose mutable keys the storage scope holds unsettled. Such an error
+    /// reports its unknown outcome but does not contain the process.
+    scoped_unknown: bool,
 }
 
 #[derive(Debug)]
@@ -1039,6 +1045,7 @@ impl ApiError {
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::UNAUTHORIZED,
             code: Some(ErrorCode::Unauthorized),
             message: message.into().into_boxed_str(),
@@ -1049,6 +1056,7 @@ impl ApiError {
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::FORBIDDEN,
             code: Some(ErrorCode::Forbidden),
             message: message.into().into_boxed_str(),
@@ -1059,6 +1067,7 @@ impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::BAD_REQUEST,
             code: Some(ErrorCode::BadRequest),
             message: message.into().into_boxed_str(),
@@ -1084,6 +1093,7 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::NOT_FOUND,
             code: Some(ErrorCode::NotFound),
             message: message.into().into_boxed_str(),
@@ -1098,6 +1108,7 @@ impl ApiError {
     pub fn method_not_allowed(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::METHOD_NOT_ALLOWED,
             code: Some(ErrorCode::MethodNotAllowed),
             message: message.into().into_boxed_str(),
@@ -1108,6 +1119,7 @@ impl ApiError {
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
@@ -1121,6 +1133,7 @@ impl ApiError {
     fn unattached_cannot_publish(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::UnattachedCannotPublish),
             message: message.into().into_boxed_str(),
@@ -1131,6 +1144,7 @@ impl ApiError {
     fn unsupported_media_type(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             code: Some(ErrorCode::BadRequest),
             message: message.into().into_boxed_str(),
@@ -1141,6 +1155,7 @@ impl ApiError {
     pub(crate) fn range_not_satisfiable(start: u64, end: u64, length: u64) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::RANGE_NOT_SATISFIABLE,
             code: Some(ErrorCode::BadRequest),
             // Keep the pre-existing `OmniError` display spelling stable while
@@ -1164,6 +1179,7 @@ impl ApiError {
     pub(crate) fn blob_precondition_failed(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::PRECONDITION_FAILED,
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
@@ -1179,6 +1195,7 @@ impl ApiError {
     pub(crate) fn blob_write_precondition_failed(current_etag: Option<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::PRECONDITION_FAILED,
             code: Some(ErrorCode::Conflict),
             message: format!(
@@ -1195,6 +1212,7 @@ impl ApiError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: true,
+            scoped_unknown: false,
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: Some(ErrorCode::Internal),
             message: message.into().into_boxed_str(),
@@ -1206,6 +1224,7 @@ impl ApiError {
     fn admission_closed() -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: Some(ErrorCode::ServiceUnavailable),
             message:
@@ -1237,6 +1256,7 @@ impl ApiError {
         let message = format!("external blob source '{uri}' is unavailable: {reason}");
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::FAILED_DEPENDENCY,
             code: None,
             message: message.into_boxed_str(),
@@ -1253,6 +1273,7 @@ impl ApiError {
     pub fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::TOO_MANY_REQUESTS,
             code: Some(ErrorCode::TooManyRequests),
             message: message.into().into_boxed_str(),
@@ -1284,6 +1305,7 @@ impl ApiError {
     fn merge_conflict(conflicts: Vec<api::MergeConflictOutput>) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: summarize_merge_conflicts(&conflicts).into_boxed_str(),
@@ -1297,6 +1319,7 @@ impl ApiError {
     ) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1309,6 +1332,7 @@ impl ApiError {
     fn read_set_conflict(message: String, details: api::ReadSetConflictOutput) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1319,6 +1343,7 @@ impl ApiError {
     fn key_conflict(message: String, details: api::KeyConflictOutput) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1329,6 +1354,7 @@ impl ApiError {
     fn resource_limit(message: String, details: api::ResourceLimitOutput) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code: Some(ErrorCode::BadRequest),
             message: message.into_boxed_str(),
@@ -1339,6 +1365,7 @@ impl ApiError {
     fn recovery_required(message: String, operation_id: String) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::SERVICE_UNAVAILABLE,
             // The admitted HTTP contract identifies this condition through
             // `recovery_required`; the top-level `code` remains unset.
@@ -1357,6 +1384,7 @@ impl ApiError {
     fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::PRECONDITION_FAILED,
             code: None,
             message: message.into_boxed_str(),
@@ -1371,6 +1399,7 @@ impl ApiError {
     fn change_feed_gap(cursor: Option<String>, first_unreadable_commit_id: String) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::GONE,
             code: None,
             message: format!("change feed gap at commit '{first_unreadable_commit_id}'")
@@ -1389,6 +1418,7 @@ impl ApiError {
     fn change_diff_refusal(message: String, details: api::ChangeDiffRefusalOutput) -> Self {
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status: StatusCode::CONFLICT,
             code: Some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
@@ -1412,9 +1442,31 @@ impl ApiError {
         self.completion_uncertain
     }
 
+    /// Whether this error's unknown outcome leaves the process's own state
+    /// unproven, so the process must be contained: an uncertain completion
+    /// the engine does not scope to its storage keys and branch.
+    pub(crate) fn contains_process(&self) -> bool {
+        self.completion_uncertain && !self.scoped_unknown
+    }
+
+    /// A write to a branch whose publication is pending refused before any
+    /// effect; the caller may retry once storage answers.
+    fn publication_pending(message: String) -> Self {
+        Self {
+            completion_uncertain: false,
+            scoped_unknown: false,
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: Some(ErrorCode::ServiceUnavailable),
+            message: message.into_boxed_str(),
+            details: None,
+        }
+    }
+
     fn from_omni(err: OmniError) -> Self {
         let cause = redacted_cause::RedactedCause::of(&err);
         let (err, evidence) = err.into_completion_evidence();
+        let storage_outcome = err.is_manifest_publish_in_doubt()
+            || matches!(&err, OmniError::Storage(_) | OmniError::Io(_));
         // Keep completion classification separate from HTTP status. Generic
         // DataFusion erases plan-vs-execution provenance: if an owned write
         // unexpectedly returns it, contain the epoch until typed engine
@@ -1612,6 +1664,9 @@ impl ApiError {
             }
             err @ OmniError::BlobIntegrity { .. } => Self::internal(err.to_string()),
             OmniError::Storage(failure) => Self::internal(failure.message),
+            err @ OmniError::PublicationPending { .. } => {
+                Self::publication_pending(err.to_string())
+            }
             OmniError::RetryableCommitConflict(message) => {
                 Self::conflict(format!("retryable storage commit conflict: {message}"))
             }
@@ -1656,13 +1711,15 @@ impl ApiError {
             }
             None => {}
         }
+        response.scoped_unknown = response.completion_uncertain && storage_outcome;
         if response.completion_uncertain {
-            // The record of why a write may be contained: the failure's class
-            // and status, never its message, which can carry object URIs. It
-            // shares the request's span with the containment log.
+            // The record of a write's unknown outcome: the failure's class
+            // and status, and whether its uncertainty is scoped to its keys
+            // and branch, never its message, which can carry object URIs.
             tracing::warn!(
                 status = %response.status,
                 ?cause,
+                scoped = response.scoped_unknown,
                 "engine failure without definite completion evidence"
             );
         }
@@ -3034,6 +3091,7 @@ async fn serve_config(
         startup_owner.finish();
         result
     });
+    let resolver = tokio::spawn(resolve_pending_publications_until_stopped());
     let mut shutdown_rx = shutdown_rx;
     let served = axum::serve(listener, build_app(state))
         .with_graceful_shutdown(async move {
@@ -3060,6 +3118,16 @@ async fn serve_config(
     }
     served?;
     startup_result.wrap_err("graph startup owner failed")??;
+    // A publication still pending can land after this process stops, so it
+    // gets one last attempt before the storage scope closes; one that stays
+    // pending keeps the cluster admission.
+    resolver.abort();
+    let pending = omnigraph::resolve_pending_publications().await;
+    if pending > 0 {
+        return Err(eyre!(
+            "{pending} publication(s) still pending on storage; retaining cluster admission"
+        ));
+    }
     if let Some(owner) = retained_admission {
         if owner.canonical_root().starts_with("az://") {
             // Azure keeps its existing stopped-process boundary until its
@@ -3087,6 +3155,34 @@ async fn serve_config(
             .map_err(|error| eyre!("clean cluster release refused: {error:?}"))?;
     }
     Ok(())
+}
+
+/// The shortest and longest pause between attempts to settle pending
+/// publications. Each attempt re-issues a pending commit's manifest request
+/// once, and a branch with a pending publication refuses writes until it
+/// settles, so the pause starts short and backs off while storage stays
+/// unanswering.
+const PENDING_RESOLVE_PAUSE: (std::time::Duration, std::time::Duration) = (
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(60),
+);
+
+async fn resolve_pending_publications_until_stopped() {
+    let (shortest, longest) = PENDING_RESOLVE_PAUSE;
+    let mut pause = shortest;
+    loop {
+        tokio::time::sleep(pause).await;
+        if omnigraph::pending_publications() == 0 {
+            pause = shortest;
+            continue;
+        }
+        let remaining = omnigraph::resolve_pending_publications().await;
+        pause = if remaining == 0 {
+            shortest
+        } else {
+            (pause * 2).min(longest)
+        };
+    }
 }
 
 /// Load a graph-scoped policy bundle from either source kind.
