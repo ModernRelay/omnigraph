@@ -212,6 +212,36 @@ fn named_expr<'e>(returns: &'e [IRProjection], key: &'e IRExpr) -> &'e IRExpr {
     }
 }
 
+/// Every full-text call the query writes reads its property's index at the
+/// pinned snapshot, so the plan records that index's coverage, and the
+/// coverage holds a segment (full or partial; an untrained declaration
+/// carries the analyzer too). Replay re-derives every recorded coverage from
+/// the pinned dataset, so a saved plan can neither omit the fact nor claim a
+/// segment the snapshot lacks.
+fn check_full_text_indexes(
+    plan: &PhysicalPlan,
+    input: &AcceptInput<'_>,
+    budget: &mut Budget,
+) -> Result<(), ValidationError> {
+    let targets = crate::optimizer::full_text_targets(input.ir);
+    budget.visit(u64::try_from(targets.len()).unwrap_or(u64::MAX))?;
+    for (type_name, property) in targets {
+        let key = Assumptions::full_text_key(&format!("node:{type_name}"), &property);
+        match plan.assumptions().full_text.get(&key) {
+            Some(FullTextCoverage::Full | FullTextCoverage::Partial) => {}
+            recorded => {
+                return Err(ValidationError::violated(
+                    "prerequisite",
+                    format!(
+                        "a full-text call reads the index of `{type_name}.{property}` under recorded coverage {recorded:?}; it needs a recorded index segment"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The ranked scans of the plan with their ids.
 fn ranked_scans(plan: &PhysicalPlan) -> Vec<(NodeId, &str, &RankedAccess)> {
     plan.live()
@@ -255,6 +285,7 @@ impl Requirements {
             }
         }
         let top = pipeline(plan, plan.root(), budget)?;
+        check_full_text_indexes(plan, input, budget)?;
         self.check_search(plan)?;
         self.check_row_cuts(plan, budget)?;
         self.check_returns(plan, &top, budget)?;

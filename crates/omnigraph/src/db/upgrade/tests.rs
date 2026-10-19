@@ -1499,6 +1499,148 @@ async fn a_staged_schema_object_at_the_root_refuses_before_the_contract_is_read(
     }
 }
 
+/// Accepted bounds keep their recorded representation and endpoint meaning.
+/// Ordinary open and the old-root upgrade validate through the same matcher.
+#[tokio::test]
+async fn accepted_range_contracts_keep_their_complete_historical_shape() {
+    use crate::db::schema_state::{render_schema_contract, validate_schema_contract_row};
+    use ConstraintBound::{Float, Integer};
+    use omnigraph_compiler::schema::ast::{Constraint, ConstraintBound, SchemaDecl};
+    use omnigraph_compiler::schema::parser::parse_schema;
+    use omnigraph_compiler::{SchemaIdentityDomain, compile_schema_shape, initialize_schema_ir};
+
+    let source = |value: &str, other: &str| {
+        format!(
+            "node Counter {{ value: U64? other: I64? \
+             @range(value, {value}) @range(other, {other}) }}"
+        )
+    };
+    // Build the accepted bounds as typed values, independently of either
+    // parser interpretation. The stored Float is exactly what overflow kept.
+    let lower = |value| (Some(value), None);
+    let upper = |value| (None, Some(value));
+    for (label, text, bounds, valid) in [
+        (
+            "historical upper-only and overflowing integer",
+            source("..9223372036854775808", "..10"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            true,
+        ),
+        (
+            "historical negative overflow",
+            source("-9223372036854775809..", "..10"),
+            [
+                lower(Float(-9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            true,
+        ),
+        (
+            "current upper-only",
+            source("..9223372036854775807", "..10"),
+            [upper(Integer(i64::MAX)), upper(Integer(10))],
+            true,
+        ),
+        (
+            "hybrid endpoint interpretation",
+            source("..9223372036854775808", "..10"),
+            [
+                upper(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            false,
+        ),
+        (
+            "unrelated bound drift",
+            source("..9223372036854775808", "..10"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(11)),
+            ],
+            false,
+        ),
+        (
+            "unrelated property drift",
+            source("..9223372036854775808", "..10").replace("value: U64", "value: U32"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            false,
+        ),
+        (
+            "malformed range",
+            source("..", "..10"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            false,
+        ),
+    ] {
+        let mut schema = parse_schema("node Counter { value: U64? other: I64? }").unwrap();
+        let SchemaDecl::Node(node) = &mut schema.declarations[0] else {
+            unreachable!();
+        };
+        node.constraints = ["value", "other"]
+            .into_iter()
+            .zip(bounds)
+            .map(|(property, (min, max))| Constraint::Range {
+                property: property.into(),
+                min,
+                max,
+            })
+            .collect();
+        node.source_constraints = node.constraints.clone();
+        let shape = compile_schema_shape(&schema).unwrap();
+        let domain = SchemaIdentityDomain::from_ulid(ulid::Ulid::from(77u128));
+        let ir = initialize_schema_ir(domain, &shape).unwrap().schema_ir;
+        let contract = render_schema_contract(&ir, &text).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ObjectStorageAdapter::local();
+        let root = dir.path().to_str().unwrap();
+        for damage in ["none", "hash", "domain"] {
+            let mut row = contract.clone();
+            match damage {
+                "hash" => row.head.schema_ir_hash = format!("sha256:{}", "a".repeat(64)),
+                "domain" => {
+                    row.head.schema_identity_domain =
+                        SchemaIdentityDomain::from_ulid(ulid::Ulid::from(78u128))
+                            .as_str()
+                            .to_string();
+                }
+                _ => {}
+            }
+            write_root_schema(dir.path(), &row);
+            let before = root_objects(dir.path());
+            let opened = validate_schema_contract_row(&row);
+            let upgraded = root_schema::load_validated_schema_contract(
+                root,
+                &storage,
+                Bounds::SERVED.root_object_bytes,
+            )
+            .await;
+            let accepted = valid && damage == "none";
+            assert_eq!(opened.is_ok(), accepted, "{label}, {damage}: {opened:?}");
+            assert_eq!(
+                upgraded.is_ok(),
+                accepted,
+                "{label}, {damage}: {upgraded:?}"
+            );
+            if accepted {
+                assert_eq!(opened.unwrap().0, ir, "{label}");
+                let loaded = upgraded.unwrap();
+                assert_eq!(loaded.ir, ir, "{label}");
+                assert_eq!(loaded.row, contract, "{label}");
+            }
+            assert_eq!(root_objects(dir.path()), before, "{label}, {damage}");
+        }
+    }
+}
+
 /// Every way `load_validated_schema_contract` refuses the three root objects,
 /// one case per arm, each reported as the unsupported source with the loader's
 /// own words.

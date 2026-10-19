@@ -58,6 +58,12 @@ decide_seam! {
     pub static CLEANUP_SWEEP_PRE_FILE_DELETE = ("cleanup.sweep_pre_file_delete", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// After the files only a table's dead stagings reference are deleted and
+    /// before the first of their manifests is.
+    pub static CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE = ("cleanup.sweep_pre_dead_manifest_delete", Unreachable, [Fail]);
+}
+
 /// Requests the run made, for the two ceilings in `maintenance.rs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CollectorCost {
@@ -319,6 +325,7 @@ pub(crate) async fn sweep_table(
     let dead = plan.dead_stagings();
     if !dead.is_empty() {
         stats.bytes_removed += delete_paths(&store, &base, &plan.dead_paths).await?;
+        fail(&CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE)?;
     }
     for version in dead {
         let manifest = naming.manifest_path(&base, version);

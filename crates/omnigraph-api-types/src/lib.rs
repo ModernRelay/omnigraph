@@ -1840,6 +1840,61 @@ pub struct SnapshotQuery {
     pub branch: Option<String>,
 }
 
+/// Query parameters for `GET /graphs/{graph_id}/access`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct AccessQuery {
+    /// A branch whose actions to report, by name; it need not exist.
+    pub branch: Option<String>,
+    /// With `branch`, the branch `branch_create` would create and
+    /// `branch_merge` would merge into, by name.
+    pub target_branch: Option<String>,
+}
+
+/// A graph action a policy decides, as the access route reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessAction {
+    Read,
+    Export,
+    Change,
+    SchemaApply,
+    BranchCreate,
+    BranchDelete,
+    BranchMerge,
+    CommitPublish,
+    CommitDrop,
+    InvokeQuery,
+}
+
+/// What the caller's own credential may do on one graph, by the graph's
+/// installed policy. It names actions, never the rules that allow them, and
+/// says nothing about any other actor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AccessOutput {
+    /// The actor the credential resolves to. Absent only on a server that runs
+    /// without authentication.
+    pub actor: Option<String>,
+    pub graph_id: String,
+    /// Actions allowed with no branch named: the graph-scoped ones, and the
+    /// branch-scoped ones a single rule allows on every branch (a rule with no
+    /// branch scope, `branch_scope: any` or `target_branch_scope: any`).
+    /// Rules that cover every branch only together, one for protected
+    /// branches and one for the rest, allow each named branch but leave the
+    /// action out of this list; read `actions` for a branch.
+    pub graph_wide: Vec<AccessAction>,
+    /// The branch asked about, when one was.
+    pub branch: Option<String>,
+    /// The target branch asked about, when one was.
+    pub target_branch: Option<String>,
+    /// With `branch`, the actions allowed on it, including `branch_delete`,
+    /// `commit_publish`, `commit_drop` and `schema_apply` with it as their
+    /// target. With `target_branch` as well, also `branch_create` and
+    /// `branch_merge` from `branch` into it. Empty without `branch`.
+    pub actions: Vec<AccessAction>,
+}
+
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct CommitListQuery {
     pub branch: Option<String>,
@@ -2114,6 +2169,17 @@ pub struct FullTextIndexRebuildRequiredOutput {
     pub reason: String,
 }
 
+/// A full-text call read a declared full-text index that has no segment at
+/// the query's snapshot (HTTP 409), so no segment carries its analyzer. This
+/// is not a retryable conflict: an operator builds the branch's index
+/// (`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes
+/// --branch` elsewhere). Historical snapshots stay unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FullTextIndexRequiredOutput {
+    /// The index's property as `Type.property`.
+    pub index: String,
+}
+
 /// A source position: 1-based line and column (in characters) and the byte
 /// offset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -2277,6 +2343,11 @@ pub struct ErrorOutput {
     /// preserves the closed [`ErrorCode`] contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_index_rebuild_required: Option<FullTextIndexRebuildRequiredOutput>,
+    /// Set with HTTP 409 when a full-text call reads a declared index that
+    /// has no segment at the query's snapshot. Building the index clears it;
+    /// retrying does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text_index_required: Option<FullTextIndexRequiredOutput>,
     /// Set for a refused query: the diagnostics contract's code, position or
     /// stage, expectation and fix. `error` keeps the one-line rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2304,6 +2375,7 @@ impl ErrorOutput {
             change_diff_refusal: None,
             branch_start_refusal: None,
             full_text_index_rebuild_required: None,
+            full_text_index_required: None,
             diagnostic: None,
         }
     }

@@ -1,0 +1,163 @@
+# issue: none
+# traversal: auto
+# notes: An edge file loaded onto integer-keyed node types is checked against the committed
+# notes: ids as integers, on the scan path (small indexed table) and the probe path (large
+# notes: table) alike: a present id passes, an absent integer refuses, and a spelling that is
+# notes: not an integer's canonical decimal (`007`, `01`) names no node even when the integer
+# notes: it reads as is present. The first orphan in row order refuses (row two's dst before row
+# notes: three's src), src before dst within a row, and append gives the same message as overwrite
+# notes: for the absent integer and for the padded spelling; a refused load leaves no rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Small { id: I64 @key }
+node Large { id: I64 @key }
+edge SmallLink: Small -> Small
+edge LargeLink: Large -> Large
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Small
+    rows: 8
+    commits: 1
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+  - kind: node
+    name: Large
+    rows: 64
+    commits: 1
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+
+--- csv links.csv
+from,to
+0,1
+7,6
+
+--- mutate
+load csv "links.csv" into edge:SmallLink mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:SmallLink from Small: access scan
+load validate edge_ri edge:SmallLink to Small: access scan
+load executed: partitions 1 rows 2
+
+--- csv large_links.csv
+from,to
+0,63
+63,32
+
+--- mutate
+load csv "large_links.csv" into edge:LargeLink mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:LargeLink from Large: access probe
+load validate edge_ri edge:LargeLink to Large: access probe
+load executed: partitions 1 rows 2
+
+--- csv absent_dst.csv
+from,to
+0,1
+7,8
+
+--- mutate
+load csv "absent_dst.csv" into edge:SmallLink mode overwrite header
+--- expect error: '8' not found in Small
+
+--- mutate
+load csv "absent_dst.csv" into edge:SmallLink mode append header
+--- expect error: '8' not found in Small
+
+--- csv absent_both.csv
+from,to
+9,8
+
+--- mutate
+load csv "absent_both.csv" into edge:SmallLink mode overwrite header
+--- expect error: '9' not found in Small
+
+--- csv absent_twice.csv
+from,to
+7,8
+9,6
+
+--- mutate
+load csv "absent_twice.csv" into edge:SmallLink mode overwrite header
+--- expect error: '8' not found in Small
+
+--- csv absent_large.csv
+from,to
+63,64
+
+--- mutate
+load csv "absent_large.csv" into edge:LargeLink mode overwrite header
+--- expect error: '64' not found in Large
+
+--- csv padded_small.csv
+from,to
+007,1
+
+--- mutate
+load csv "padded_small.csv" into edge:SmallLink mode overwrite header
+--- expect error: '007' not found in Small
+
+--- mutate
+load csv "padded_small.csv" into edge:SmallLink mode append header
+--- expect error: '007' not found in Small
+
+--- csv padded_large.csv
+from,to
+01,2
+
+--- mutate
+load csv "padded_large.csv" into edge:LargeLink mode overwrite header
+--- expect error: '01' not found in Large
+
+--- query
+query small_rows() { match { $a: Small $a smallLink $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": 0, "b.id": 1}
+{"a.id": 7, "b.id": 6}
+--- expect shape
+a.id: I64
+b.id: I64
+
+--- query
+query large_rows() { match { $a: Large $a largeLink $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": 0, "b.id": 63}
+{"a.id": 63, "b.id": 32}
+--- expect shape
+a.id: I64
+b.id: I64
+--- load generate: v1 seed: 43 mode: append
+tables:
+  - kind: node
+    name: Large
+    rows: 1
+    commits: 1
+    columns:
+      id: {kind: ordinal, start: 64, step: 1}
+--- expect ok
+
+--- mutate
+load csv "absent_large.csv" into edge:LargeLink mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:LargeLink from Large: access probe
+load validate edge_ri edge:LargeLink to Large: access probe
+load executed: partitions 1 rows 1
+
+--- query
+query across_fragments() { match { $a: Large $a largeLink $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": 63, "b.id": 64}
+--- expect shape
+a.id: I64
+b.id: I64

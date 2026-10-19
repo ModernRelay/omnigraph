@@ -161,6 +161,62 @@ async fn failed_mutation_leaves_target_unchanged() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
+/// A storage failure while a mutation stages its files is a definite
+/// failure: the error keeps its storage cause and carries `Unpublished`, the
+/// graph is unchanged, and the next write on the same handle publishes. The
+/// fault is real backend I/O, a file planted where the table's `data/`
+/// directory goes.
+#[tokio::test]
+async fn storage_failure_while_staging_is_definite_issue_1067() {
+    use omnigraph::error::CompletionEvidence;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = session(Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap());
+    let person = snapshot_main(&db)
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .dataset_path
+        .clone();
+    let data_blocker = dir.path().join(person.trim_start_matches('/')).join("data");
+    if data_blocker.is_dir() {
+        std::fs::remove_dir(&data_blocker).expect("an empty table has no data files yet");
+    }
+    std::fs::write(&data_blocker, b"not a directory").unwrap();
+
+    let error = mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "stranded")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.storage_failure().is_some(),
+        "the staged data-file write fails in storage: {error:?}"
+    );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Unpublished),
+        "a storage failure before publication is definite: {error:?}"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, 0);
+
+    std::fs::remove_file(&data_blocker).unwrap();
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after")], &[("$age", 31)]),
+    )
+    .await
+    .expect("the next write on the same handle publishes");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
 /// Mutation text the parser refuses keeps its diagnostic through the engine
 /// door, as read text does: the code and the position survive, and nothing
 /// is published.

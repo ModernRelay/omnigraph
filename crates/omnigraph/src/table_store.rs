@@ -826,10 +826,12 @@ async fn commit_detached(
     if let Some(affected_rows) = affected_rows {
         builder = builder.with_affected_rows(affected_rows);
     }
+    // A detached commit is unreachable until a manifest names it, so its
+    // failure is definite for the graph whatever its storage cause.
     builder
         .execute(transaction)
         .await
-        .map_err(OmniError::storage)
+        .map_err(|error| OmniError::storage(error).unpublished())
 }
 
 /// The columns of `columns` that hold no full-text segment once `effect`
@@ -2958,7 +2960,7 @@ impl TableStore {
         let uncommitted = DeleteBuilder::from_expr(Arc::new(ds.clone()), filter)
             .execute_uncommitted()
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
 
         if uncommitted.num_deleted_rows == 0 {
             return Ok(None);
@@ -3067,7 +3069,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
         // After the write succeeds, so a failed write never inflates the probe.
         crate::instrumentation::record_stage_append(appended_rows);
         let mut new_fragments = match &transaction.operation {
@@ -3370,7 +3372,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
         if transaction.read_version != expected_read_version {
             return Err(OmniError::manifest_internal(format!(
                 "{context} wrote against version {}, expected {expected_read_version}",
@@ -3957,7 +3959,7 @@ impl TableStore {
         let uncommitted = job
             .execute_uncommitted(stream)
             .await
-            .map_err(OmniError::lance_stream)?;
+            .map_err(|error| OmniError::lance_stream(error).unpublished())?;
         // After the write succeeds, so a failed write never inflates the probe.
         crate::instrumentation::record_stage_merge_insert(merged_rows);
         // Operation::Update { removed_fragment_ids, updated_fragments, new_fragments, .. } —
@@ -4473,7 +4475,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
         if transaction.read_version != 0 {
             return Err(OmniError::manifest_internal(format!(
                 "stage_create resolved '{}' at existing version {}; expected an absent dataset",
@@ -4821,7 +4823,7 @@ impl TableStore {
                 .with_params(&params)
                 .execute_uncommitted(batches)
                 .await
-                .map_err(OmniError::storage)?;
+                .map_err(|error| OmniError::storage(error).unpublished())?;
             let new_fragments = match &transaction.operation {
                 Operation::Overwrite { fragments, .. } => fragments.clone(),
                 other => {

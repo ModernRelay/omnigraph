@@ -24,7 +24,7 @@ use crate::db::{Omnigraph, Snapshot};
 use crate::loader::LoadMode;
 use crate::loader::read_reuse::LoadReadReuse;
 use crate::storage_layer::{DeletedIdBudget, WriteBudget};
-use crate::validate::load::{LoadAdmission, LoadPhase, judge_load};
+use crate::validate::load::{LoadAdmission, LoadPhase, int_keyed, judge_load};
 use omnigraph_compiler::ir::ValidateCheck;
 
 /// The `validated_rows` metric: the delta rows the operator judged.
@@ -153,6 +153,15 @@ impl ExecutionPlan for ValidateExec {
                             reserve.map_err(|error| memory.error(error))?;
                             Ok(Box::new(phase_memory))
                         };
+                    let mut admit_bytes = |bytes: usize| -> crate::error::Result<Box<dyn Send>> {
+                        let allocation = memory
+                            .child("load integer endpoint keys")
+                            .map_err(|error| memory.error(error))?;
+                        allocation
+                            .grow(bytes)
+                            .map_err(|error| memory.error(error))?;
+                        Ok(Box::new(allocation))
+                    };
                     let mut admit_reuse = || {
                         memory.admit_read_reuse().and_then(|admitted| {
                             LoadReadReuse::new(&judge.db, &judge.snapshot, admitted)
@@ -186,6 +195,7 @@ impl ExecutionPlan for ValidateExec {
                         &batches,
                         &mut LoadAdmission {
                             phase: Some(&mut admit_phase),
+                            bytes: Some(&mut admit_bytes),
                             reuse: Some(&mut admit_reuse),
                             removed: &mut admit_removed,
                             retained: &mut admit_retained,
@@ -304,11 +314,9 @@ fn admit_validation(
                 }
             }
         }
-        if judge
-            .checks
-            .iter()
-            .any(|spec| matches!(spec.check, ValidateCheck::EdgeRi { .. }))
-        {
+        if judge.checks.iter().any(|spec| {
+            matches!(&spec.check, ValidateCheck::EdgeRi { node_type, .. } if !int_keyed(&judge.catalog, node_type))
+        }) {
             let src_bytes = string_payload_bytes(column(sc.src)?);
             let dst_bytes = string_payload_bytes(column(sc.dst)?);
             memory.entries::<(String, String, String)>(rows)?;

@@ -528,13 +528,19 @@ carried stored external reference the policy refuses fails as
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |
-| Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone |
+| Mutation, load, Blob write or merge fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob and merge writers mark the steps between, so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape; the publisher alone reports an outcome it could not read back as in doubt |
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
 | A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
 | A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
 | `commit publish` of an unpublished commit whose target head moved past its captured parent, or whose target incarnation is retired | `PreconditionFailed` naming the captured parent and the current head, or not found; the proposal stays retained until `cleanup` releases its expired tag |
 | `commit publish` or `commit drop` of a published commit id | Publish answers the established published commit; drop is a conflict |
 | A proposal tag's creation or deletion reports an ambiguous result | The tag is read back: a matching tag is success, a differing tag an integrity error, an unavailable readback `manifest_publish_in_doubt` |
+
+The `Unpublished` annotations cover the named writer envelopes and the table
+store's staged-write and detached-commit sites. Other opaque schema and maintenance
+preparation errors without completion evidence remain uncertain. A
+post-publication `RecoveryRequired` or an uncertain publication is never
+changed into definite non-publication by these annotations.
 
 An acknowledgement is returned only after the manifest commit is durable and
 visible; for a write `as commit`, after the proposal tag is durable and the

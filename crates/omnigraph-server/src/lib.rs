@@ -124,6 +124,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_graphs_list,
         handlers::server_graphs_discovery,
         handlers::server_snapshot,
+        handlers::server_access,
         handlers::server_blob_get,
         handlers::server_blob_head,
         handlers::server_blob_put,
@@ -494,6 +495,7 @@ enum ApiErrorDetails {
     ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
     BranchStartRefusal(api::BranchStartRefusalOutput),
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
+    FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
 }
 
@@ -1541,6 +1543,16 @@ impl ApiError {
                 )));
                 response
             }
+            error @ OmniError::FullTextIndexRequired { .. } => {
+                let mut response = Self::conflict(error.to_string());
+                let OmniError::FullTextIndexRequired { index } = error else {
+                    unreachable!()
+                };
+                response.details = Some(Box::new(ApiErrorDetails::FullTextIndexRequired(
+                    api::FullTextIndexRequiredOutput { index },
+                )));
+                response
+            }
             // Caller-side continuation fault (decode, checksum, or scope). The
             // "change cursor rejected: " prefix is a stable contract so raw
             // HTTP clients can tell it from a genuine retention gap.
@@ -1699,8 +1711,15 @@ impl ApiError {
             OmniError::Completion { .. } => unreachable!("completion evidence was unwrapped"),
         };
         response.completion_uncertain |= uncertain;
+        // The engine's evidence is the authority: a definite failure, before
+        // any effect or after detached effects no manifest names, keeps the
+        // process serving whatever status it maps to. Without evidence the
+        // status-class default above stands, which fails closed for a 500.
         match evidence {
-            Some(omnigraph::error::CompletionEvidence::BeforeEffect) => {
+            Some(
+                omnigraph::error::CompletionEvidence::BeforeEffect
+                | omnigraph::error::CompletionEvidence::Unpublished,
+            ) => {
                 response.completion_uncertain = false;
             }
             Some(omnigraph::error::CompletionEvidence::Uncertain) => {
@@ -1821,6 +1840,9 @@ impl ApiError {
                 ApiErrorDetails::FullTextIndexRebuildRequired(value) => {
                     output.full_text_index_rebuild_required = Some(value)
                 }
+                ApiErrorDetails::FullTextIndexRequired(value) => {
+                    output.full_text_index_required = Some(value)
+                }
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
             }
         }
@@ -1876,6 +1898,28 @@ mod api_error_tests {
         let ordinary: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(ordinary.code, Some(ErrorCode::Conflict));
         assert!(ordinary.full_text_index_rebuild_required.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_full_text_index_with_no_segment_returns_required_conflict() {
+        let response = ApiError::from_omni(OmniError::FullTextIndexRequired {
+            index: "Doc.title".into(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
+        assert!(error.error.contains("has no segment"), "{}", error.error);
+        assert!(
+            error.error.contains("rebuild-full-text-indexes"),
+            "{}",
+            error.error
+        );
+        assert_eq!(error.full_text_index_required.unwrap().index, "Doc.title");
+        assert!(error.full_text_index_rebuild_required.is_none());
     }
 
     #[tokio::test]
@@ -2827,6 +2871,7 @@ pub fn build_app(state: AppState) -> Router {
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
+        .route("/access", get(server_access))
         // Register HEAD explicitly. Axum's GET fallback would invoke the GET
         // handler and could begin payload work before stripping the body; the
         // dedicated handler makes the zero-payload-read contract structural.

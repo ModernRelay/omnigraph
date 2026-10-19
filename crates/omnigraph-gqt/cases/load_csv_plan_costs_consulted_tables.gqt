@@ -25,7 +25,7 @@ tables:
       id: {kind: key, prefix: p-, width: 4}
   - kind: node
     name: Large
-    rows: 1024
+    rows: 96
     commits: 1
     columns:
       id: {kind: key, prefix: p-, width: 4}

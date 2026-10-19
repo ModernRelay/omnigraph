@@ -109,6 +109,14 @@ helper takes a seam declaring exactly its effect, that production code under
 it) arms it; a crossing never counts as arming. `scripts/seam_corpus.py`
 lists every seam with where it is declared and which cases cover it.
 
+The collector retry owners in `failpoints.rs` exercise each sweep window
+on file, RustFS/S3 and Azurite. The between-manifests fixture also reopens
+through `open_with_io_scope`, covering served file I/O's separate Lance
+provider. The DST dead-staging pin exercises the census, hunt and fleet
+constructors; its maintenance sensitivity owner requires a failed deferred
+cleanup retry to fail the universe. Neither local emulators nor shared-memory
+DST qualify live Azure lease loss or delayed accepted writes.
+
 When adding a new writer, update all of these layers. See [recovery.md](recovery.md).
 
 ### Blob behavior
@@ -209,7 +217,11 @@ are not generic native settlement. Server `boot_settings` exercises authenticate
 submission, parked requests, caller disconnect, pre-effect refusal, durable
 acceptance before completion, activation-in-progress observation and exact receipt
 access after management handoff. It also holds a merge across served schema
-planning to prove preview does not wait for the graph gate. In-source
+planning to prove preview does not wait for the graph gate, and its
+`owned_shutdown` journeys own process containment: a panic or an uncertain
+owned write exits 2 and retains the lock, while a proven unpublished staging
+failure with settled storage I/O is a 500 the server keeps serving through,
+with a clean SIGTERM still releasing the lock. In-source
 `deployment` tests suspend observer read futures across owner start, finish and complete
 turnover, exercising bounded re-observation for aggregate and exact status.
 CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
