@@ -1227,6 +1227,226 @@
         ]
       }
     },
+    "/graphs/{graph_id}/access": {
+      "get": {
+        "tags": [
+          "access"
+        ],
+        "summary": "What the caller's own credential may do on this graph.",
+        "description": "Evaluates the graph's installed policy for the resolved actor once per\naction, with each action's branch and target branch shaped as the route\nthat performs it shapes them. It needs no graph action itself, reads no\ngraph data, and never checks whether a named branch exists.",
+        "operationId": "cluster_getAccess",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "A branch whose actions to report, by name; it need not exist.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target_branch",
+            "in": "query",
+            "description": "With `branch`, the branch `branch_create` would create and\n`branch_merge` would merge into, by name.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.14"
+              ]
+            }
+          },
+          {
+            "name": "omnigraph-expect-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The actions the caller's credential may take",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An unknown or repeated parameter, a target branch without a branch, or a branch name that is not canonical; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-expect-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The installed policy could not be evaluated",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/blob": {
       "get": {
         "tags": [
@@ -10336,6 +10556,71 @@
   },
   "components": {
     "schemas": {
+      "AccessAction": {
+        "type": "string",
+        "description": "A graph action a policy decides, as the access route reports it.",
+        "enum": [
+          "read",
+          "export",
+          "change",
+          "schema_apply",
+          "branch_create",
+          "branch_delete",
+          "branch_merge",
+          "commit_publish",
+          "commit_drop",
+          "invoke_query"
+        ]
+      },
+      "AccessOutput": {
+        "type": "object",
+        "description": "What the caller's own credential may do on one graph, by the graph's\ninstalled policy. It names actions, never the rules that allow them, and\nsays nothing about any other actor.",
+        "required": [
+          "graph_id",
+          "graph_wide",
+          "actions"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessAction"
+            },
+            "description": "With `branch`, the actions allowed on it, including `branch_delete`,\n`commit_publish`, `commit_drop` and `schema_apply` with it as their\ntarget. With `target_branch` as well, also `branch_create` and\n`branch_merge` from `branch` into it. Empty without `branch`."
+          },
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The actor the credential resolves to. Absent only on a server that runs\nwithout authentication."
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch asked about, when one was."
+          },
+          "graph_id": {
+            "type": "string"
+          },
+          "graph_wide": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessAction"
+            },
+            "description": "Actions allowed with no branch named: the graph-scoped ones, and the\nbranch-scoped ones a single rule allows on every branch (a rule with no\nbranch scope, `branch_scope: any` or `target_branch_scope: any`).\nRules that cover every branch only together, one for protected\nbranches and one for the rest, allow each named branch but leave the\naction out of this list; read `actions` for a branch."
+          },
+          "target_branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The target branch asked about, when one was."
+          }
+        }
+      },
       "ApplicabilityOutput": {
         "type": "string",
         "description": "Whether a suggested source edit can be applied mechanically.",
