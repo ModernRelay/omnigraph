@@ -2,7 +2,7 @@
 name: omnigraph
 description: Operate OmniGraph graphs and deployments. Use for `.pg` schemas, `.gq` queries, OmniGraph CLI commands, `file://`/`s3://`/`az://` graph URIs, `cluster.yaml`, operator config, bearer-authenticated servers, graph-backed knowledge or memory, Blob values, embeddings, branches, commits, and change feeds. Apply especially before schema changes, bulk loads, and retries after uncertain remote outcomes.
 license: MIT (see LICENSE at repo root)
-compatibility: Covers the current OmniGraph CLI and server, using HTTP contract 0.13. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
+compatibility: Covers the current OmniGraph CLI and server, using HTTP contract 0.14. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
   author: ModernRelay
   version: "0.14.0"
@@ -15,7 +15,7 @@ This skill captures the operational rules for working with a locally or remotely
 
 Check `omnigraph version` and the command's `--help` before using these
 instructions. This skill tracks the current CLI/server contract, including
-`Omnigraph-Http-Api: 0.13`; the released 0.12 contract is unsupported. The engine
+`Omnigraph-Http-Api: 0.14`; the released 0.13 contract is unsupported. The engine
 reports `internal-schema 16 (serves v14 to v16)`: the storage format it
 writes, then the range it serves. New graphs use `__id`/`__src`/`__dst` system columns; a graph
 that already spells them `id`/`src`/`dst` keeps its physical columns. A
@@ -166,7 +166,7 @@ single source of truth.
 
 Notation: `<x>` required · `[x]` optional · `<a|b>` choice · `…` repeatable.
 
-**Global addressing flags**: `--as <actor>` (direct-engine writes, `rebuild-full-text-indexes`, and `cluster apply`/`upgrade-ledger`; a served write takes its actor from the bearer token and treats `--as` as an assertion the server checks, refusing a mismatch with `actor_mismatch` and exit 4; read verbs reject it), `--server <name|url>`, `--cluster <dir|uri>` (cluster-managed storage, primarily for maintenance), `--graph <id>` (selects within a `--server` or `--cluster` scope; required for managed queries, mutations, loads and commit reads), `--profile <name>` (`$OMNIGRAPH_PROFILE`), `--store <uri>`, `--direct` (ignore managed context for data commands). Commands with an open positional slot also accept `file://`, `s3://`, or preview `az://` directly. `--config <dir>` selects source/context folders for `cluster`, `organization` and `use`. Output: `--json`, or read queries take `--format <json|jsonl|csv|kv|table>` (`arrow` is listed but always fails in 0.12.0). **Write guards:** `--yes` skips non-local confirmation for destructive writes; `--quiet` suppresses the resolved-target echo.
+**Global addressing flags**: `--as <actor>` (direct-engine writes, `rebuild-full-text-indexes`, and a direct `cluster apply`/`upgrade-ledger`; a served write, `cluster plan --server` or `cluster apply --server` takes its actor from the bearer token and treats `--as` as an assertion the server checks, refusing a mismatch with `actor_mismatch` and exit 4; read verbs reject it), `--server <name|url>`, `--cluster <dir|uri>` (cluster-managed storage, primarily for maintenance), `--graph <id>` (selects within a `--server` or `--cluster` scope; required for managed queries, mutations, loads and commit reads), `--profile <name>` (`$OMNIGRAPH_PROFILE`), `--store <uri>`, `--direct` (ignore managed context for data commands). Commands with an open positional slot also accept `file://`, `s3://`, or preview `az://` directly. `--config <dir>` selects source/context folders for `cluster`, `organization` and `use`. Output: `--json`, or read queries take `--format <json|jsonl|csv|kv|table>` (`arrow` is listed but always fails in 0.12.0). **Write guards:** `--yes` skips non-local confirmation for destructive writes; `--quiet` suppresses the resolved-target echo.
 
 **Data plane** — `any` (served via `--server`/`--profile`, or direct via `--store`/URI):
 - `query` `<name>` — a **served stored query** by name (via `--server`/`--profile`); or ad-hoc `[<name>] (--query <f.gq> | -e '<GQ>')` where `<name>` picks which query in the source. `[--params <json> | --params-file <p>] [--branch <b> | --snapshot <id>] [--format <fmt> | --json]`. No positional URI — address via `--server`/`--store`/`--profile`.

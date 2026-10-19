@@ -1350,19 +1350,7 @@ impl GraphClient {
                 let data = std::fs::read_to_string(data)?;
                 let session = Self::open_write_session(uri, settings, stderr).await?;
                 // A missing branch is forked first, which publishes on its
-                // own, so a later refusal follows an effect. Read the branch
-                // list as the server's load does, so the two report alike.
-                if from.is_some()
-                    && !session
-                        .db()
-                        .branch_list()
-                        .await
-                        .engine_write()?
-                        .iter()
-                        .any(|name| name == branch)
-                {
-                    crate::command_outcome::compound();
-                }
+                // own; the engine marks a later refusal as following it.
                 let receipt = session
                     .load_graph_batch_as_with_receipt(
                         branch,
@@ -2953,7 +2941,7 @@ mod tests {
             (200, vec![]),
             (200, vec![(HEADER.into(), "0.11".into())]),
             (200, vec![(HEADER.into(), "0.12".into())]),
-            (200, vec![(HEADER.into(), "0.14".into())]),
+            (200, vec![(HEADER.into(), "0.13".into())]),
             (
                 200,
                 vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],

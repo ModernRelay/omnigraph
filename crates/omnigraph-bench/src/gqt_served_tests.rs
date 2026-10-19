@@ -643,7 +643,7 @@ mod measured_http {
 
     const TOKEN: &str = "served-token-must-not-be-retained";
     const CONTRACT_HEADER: &str = "omnigraph-http-api";
-    const CONTRACT: &str = "0.13";
+    const CONTRACT: &str = "0.14";
     type Events = Arc<Mutex<Vec<String>>>;
 
     #[derive(Clone, Copy)]

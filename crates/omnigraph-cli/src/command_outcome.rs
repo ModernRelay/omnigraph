@@ -35,7 +35,6 @@ pub(crate) struct Evidence {
     kind: CommandKind,
     dispatched: usize,
     writable_open: bool,
-    compound: bool,
     last_request_effectful: bool,
     http_status: Option<u16>,
     retry_after: Option<String>,
@@ -212,13 +211,6 @@ pub(crate) fn writable_open() {
     update(|state| state.writable_open = true);
 }
 
-/// The command runs an engine write that may publish more than once, as a
-/// load that forks its branch does, so its refusal may follow an earlier
-/// publication.
-pub(crate) fn compound() {
-    update(|state| state.compound = true);
-}
-
 /// An embedded engine write's own error. The engine refuses with a typed,
 /// settled error before it publishes and marks a publication in doubt, so
 /// this error carries what the write did, unlike any error after it.
@@ -337,7 +329,7 @@ impl Failure {
             output
         } else {
             match error.downcast::<EngineWriteError>() {
-                Ok(EngineWriteError(engine)) => embedded_write_output(engine, evidence.compound),
+                Ok(EngineWriteError(engine)) => embedded_write_output(engine),
                 Err(error) => match error.downcast::<omnigraph::error::OmniError>() {
                     // A read changes nothing, so its error is never an unknown
                     // outcome.
@@ -404,14 +396,16 @@ impl Failure {
 }
 
 /// An embedded write's own error, rendered as the request path renders it.
-/// A policy refusal precedes every publication of the write, a load's fork
-/// included, as the server's authorization precedes its owned write. Any
-/// other error of a compound write follows the fork that published.
-fn embedded_write_output(engine: omnigraph::error::OmniError, compound: bool) -> ErrorOutput {
-    if matches!(engine, omnigraph::error::OmniError::Policy(_)) {
-        omnigraph_server::engine_error_output_after(engine, false, false)
-    } else if compound {
-        omnigraph_server::engine_error_output_after(engine, true, true)
+/// A policy refusal precedes the write's publications, as the server's
+/// authorization precedes its owned write. The engine marks every error that
+/// follows an earlier publication of the same write, such as the fork a load
+/// makes of a missing branch, and such an error follows that publication.
+fn embedded_write_output(engine: omnigraph::error::OmniError) -> ErrorOutput {
+    use omnigraph::error::{CompletionEvidence, OmniError};
+    if matches!(engine, OmniError::Policy(_)) {
+        omnigraph_server::engine_error_output_after(engine, false)
+    } else if engine.completion_evidence() == Some(CompletionEvidence::PartlyPublished) {
+        omnigraph_server::engine_error_output_after(engine, true)
     } else {
         omnigraph_server::engine_error_output(engine)
     }
@@ -469,11 +463,10 @@ mod tests {
     use super::*;
     use omnigraph::error::OmniError;
 
-    fn embedded_write(compound: bool) -> Evidence {
+    fn embedded_write() -> Evidence {
         Evidence {
             kind: CommandKind::Write,
             writable_open: true,
-            compound,
             ..Evidence::default()
         }
     }
@@ -483,35 +476,43 @@ mod tests {
     }
 
     /// An embedded load's policy refusal ran nothing, its fork included: the
-    /// engine checks policy before any publication. Any other refusal of a
-    /// compound load follows the fork that published.
+    /// engine checks policy before any publication. An error the engine marks
+    /// as following an earlier publication, as a load's refusal after its
+    /// fork is, follows that publication, whatever its kind.
     #[test]
     fn an_embedded_compound_write_reports_what_the_engine_did() {
-        for compound in [false, true] {
-            let refused = Failure::classify(
-                EngineWriteError(OmniError::Policy("change denied".into())).into(),
-                embedded_write(compound),
-            );
-            assert_eq!(refused.exit, 1, "compound {compound}");
-            assert_eq!(refused.output.code, Some(ErrorCode::Forbidden));
-            assert_eq!(
-                outcome(&refused),
-                serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
-                "compound {compound}"
-            );
-        }
+        let refused = Failure::classify(
+            EngineWriteError(OmniError::Policy("change denied".into())).into(),
+            embedded_write(),
+        );
+        assert_eq!(refused.exit, 1);
+        assert_eq!(refused.output.code, Some(ErrorCode::Forbidden));
+        assert_eq!(
+            outcome(&refused),
+            serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
+        );
         let alone = Failure::classify(
             EngineWriteError(OmniError::manifest("not valid graph NDJSON")).into(),
-            embedded_write(false),
+            embedded_write(),
         );
         assert_eq!(outcome(&alone)["execution"], "not_started");
         assert_eq!(alone.exit, 1);
-        let after_fork = Failure::classify(
-            EngineWriteError(OmniError::manifest("not valid graph NDJSON")).into(),
-            embedded_write(true),
-        );
-        assert_eq!(outcome(&after_fork)["execution"], "unknown");
-        assert_eq!(after_fork.exit, crate::EXIT_OUTCOME_UNKNOWN);
+        // A refusal says what to read again; an untyped error must be
+        // reconciled against the graph.
+        for (after_fork, action) in [
+            (OmniError::manifest("not valid graph NDJSON"), "reconcile"),
+            (OmniError::key_conflict("node:Person", "Bob"), "refresh"),
+            (OmniError::Policy("change denied".into()), "refresh"),
+        ] {
+            let message = after_fork.to_string();
+            let failure = Failure::classify(
+                EngineWriteError(after_fork.after_earlier_publication()).into(),
+                embedded_write(),
+            );
+            assert_eq!(outcome(&failure)["execution"], "unknown", "{message}");
+            assert_eq!(outcome(&failure)["action"], action, "{message}");
+            assert_eq!(failure.exit, crate::EXIT_OUTCOME_UNKNOWN, "{message}");
+        }
     }
 
     /// A read changes nothing, so an engine error is never an unknown outcome.

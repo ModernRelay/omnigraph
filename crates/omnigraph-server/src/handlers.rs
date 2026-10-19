@@ -2477,17 +2477,15 @@ pub(crate) async fn server_schema_get(
     }))
 }
 
-/// Authorize one load target without touching request data, and answer
-/// whether the load forks its branch: the fork publishes on its own, before
-/// the rows, so a refusal of the rows follows it. A branch deleted between this
-/// listing and the load's own would be forked unreported, the same window the
-/// `branch_create` decision here already accepts.
+/// Authorize one load target without touching request data. Whether the load
+/// forks its branch is the engine's to say: it lists the branches again when
+/// it runs, and marks every failure after its fork.
 async fn authorize_load_scope(
     handle: &GraphHandle,
     actor: Option<&AuthenticatedActor>,
     branch: &str,
     from: Option<&str>,
-) -> std::result::Result<bool, ApiError> {
+) -> std::result::Result<(), ApiError> {
     require_canonical_branches([Some(branch), from])?;
     let branch_exists = handle
         .engine
@@ -2527,7 +2525,7 @@ async fn authorize_load_scope(
             target_branch: None,
         },
     )?;
-    Ok(!branch_exists)
+    Ok(())
 }
 
 /// JSON `POST /load`:
@@ -2548,7 +2546,7 @@ async fn run_json_load(
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.map(|actor| actor.actor_id.as_ref());
 
-    let forks = authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
+    authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
     let est_bytes = request.data.len() as u64;
     let admission = state
         .workload
@@ -2577,7 +2575,6 @@ async fn run_json_load(
         ))
     })
     .await
-    .map_err(|error| error.in_compound_write(forks))
 }
 
 #[utoipa::path(
@@ -2702,7 +2699,7 @@ pub(crate) async fn server_load_ndjson(
     let from = query.from;
     let mode = query.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
 
-    let forks = authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
+    authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
 
     let content_type = request
         .headers()
@@ -2780,7 +2777,6 @@ pub(crate) async fn server_load_ndjson(
         )))
     })
     .await
-    .map_err(|error| error.in_compound_write(forks))
 }
 
 #[utoipa::path(
