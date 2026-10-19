@@ -526,7 +526,12 @@ async fn store_access(
             )
         })?;
     if let Some(member) = member {
-        return cluster_access(&member.root, &member.graph_id, actor, args).await;
+        // The member's root is its cluster's storage: the applied ledger
+        // there decides, whatever an unapplied `storage:` in its
+        // `cluster.yaml` names.
+        let snapshot =
+            crate::commands::control::read_storage_snapshot_or_report(&member.root).await?;
+        return snapshot_access(&snapshot, &member.graph_id, actor, args);
     }
     require_standalone_graph(uri).await?;
     omnigraph_api_types::AccessOutput::evaluate(

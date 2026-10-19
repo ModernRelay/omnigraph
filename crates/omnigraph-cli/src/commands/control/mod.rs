@@ -201,12 +201,35 @@ fn require_cluster_scope(
 pub(crate) async fn read_serving_snapshot_or_report(
     cluster: &str,
 ) -> Result<omnigraph_cluster::ServingSnapshot> {
+    if cluster.contains("://") {
+        return read_storage_snapshot_or_report(cluster).await;
+    }
+    report_snapshot(
+        cluster,
+        omnigraph_cluster::read_serving_snapshot(cluster).await,
+    )
+}
+
+/// Read the applied revision where a cluster's storage is, a root found by
+/// its layout rather than named by configuration, so no `cluster.yaml`
+/// beside it can point the read at another root.
+pub(crate) async fn read_storage_snapshot_or_report(
+    root: &str,
+) -> Result<omnigraph_cluster::ServingSnapshot> {
+    report_snapshot(
+        root,
+        omnigraph_cluster::read_serving_snapshot_from_storage(root).await,
+    )
+}
+
+fn report_snapshot(
+    cluster: &str,
+    snapshot: std::result::Result<
+        omnigraph_cluster::ServingSnapshot,
+        Vec<omnigraph_cluster::Diagnostic>,
+    >,
+) -> Result<omnigraph_cluster::ServingSnapshot> {
     let diagnostic_cluster = omnigraph::storage::redacted_storage_uri(cluster);
-    let snapshot = if cluster.contains("://") {
-        omnigraph_cluster::read_serving_snapshot_from_storage(cluster).await
-    } else {
-        omnigraph_cluster::read_serving_snapshot(cluster).await
-    };
     snapshot.map_err(|diagnostics| {
         color_eyre::eyre::eyre!(
             "cluster `{diagnostic_cluster}` is not servable:\n  {}",

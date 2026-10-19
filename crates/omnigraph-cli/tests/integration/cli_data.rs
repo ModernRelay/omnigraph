@@ -6208,6 +6208,25 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
             .args(["--as", "act-bruno", "--branch", "main", "--json"]),
     ));
     assert_eq!(by_store, main, "{by_store}");
+    // An unapplied `storage:` in the cluster's configuration does not move
+    // the store's answer to another root: the applied ledger decides.
+    let config = cluster.path().join("cluster.yaml");
+    let applied = fs::read_to_string(&config).unwrap();
+    let elsewhere = tempdir().unwrap();
+    fs::write(
+        &config,
+        format!("storage: {}\n{applied}", elsewhere.path().display()),
+    )
+    .unwrap();
+    let after_edit = parse_stdout_json(&output_success(
+        cli()
+            .arg("access")
+            .arg("--store")
+            .arg(cluster.path().join("graphs").join("knowledge.omni"))
+            .args(["--as", "act-bruno", "--branch", "main", "--json"]),
+    ));
+    assert_eq!(after_edit, main, "{after_edit}");
+    fs::write(&config, applied).unwrap();
 
     // A store that holds no graph has no policy to report.
     let temp = tempdir().unwrap();
