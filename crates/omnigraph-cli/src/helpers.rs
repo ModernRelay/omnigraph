@@ -822,6 +822,11 @@ pub(crate) fn resolve_local_uri(cli_uri: Option<String>, operation: &str) -> Res
 /// capability (so a server scope is rejected, a cluster scope is allowed when the
 /// verb opts into cluster addressing), then mapped to a storage URI by
 /// `resolve_storage_uri`.
+///
+/// `reads_root` is the verb's own answer to whether it addresses a cluster
+/// root, the same answer `planes::accepts_cluster_addressing` gives its
+/// flags: a verb that refuses `--cluster` and `--graph` refuses a root target
+/// too, rather than opening the root its flags cannot finish.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_maintenance_uri(
     input: &InvocationConfig,
@@ -831,6 +836,7 @@ pub(crate) async fn resolve_maintenance_uri(
     graph: Option<&str>,
     cli_uri: Option<String>,
     operation: &str,
+    reads_root: bool,
     stderr: &mut dyn Write,
 ) -> Result<String> {
     let scope = scope::resolve_scope(
@@ -845,7 +851,7 @@ pub(crate) async fn resolve_maintenance_uri(
             cluster,
             graph,
             uri: cli_uri,
-            reads_root: true,
+            reads_root,
         },
     )?;
     resolve_storage_uri(

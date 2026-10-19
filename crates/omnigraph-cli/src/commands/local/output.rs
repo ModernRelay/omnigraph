@@ -261,7 +261,7 @@ impl VersionOutput {
             protocols: ProtocolsOutput {
                 target: crate::targets::TARGET_PROTOCOL,
                 credential: crate::targets::TARGET_PROTOCOL,
-                access: crate::targets::TARGET_PROTOCOL,
+                access: crate::targets::ACCESS_PROTOCOL,
                 serve: crate::commands::serve::SERVE_PROTOCOL,
                 local_server_record: crate::local_servers::RECORD_FORMAT,
             },

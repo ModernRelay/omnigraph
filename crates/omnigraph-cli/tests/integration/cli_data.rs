@@ -5816,6 +5816,14 @@ fn targets_address_commands_and_carry_only_their_owners_token() {
         ],
         true,
     );
+    // `schema plan` takes one graph's storage and refuses `--cluster` and
+    // `--graph`, so it refuses a root target rather than opening the root.
+    refuse_root(
+        &[
+            "schema", "plan", "--target", "ops", "--schema", &schema, "--json",
+        ],
+        true,
+    );
     refuse_root(&["upgrade", "--target", "ops", "--check", "--json"], false);
     refuse_root(
         &[
@@ -6124,9 +6132,10 @@ fn login_and_credential_get_follow_the_target_credential_owner() {
 }
 
 /// `access` says what the caller may do: a cluster graph's applied policy
-/// decides for the declared actor, a standalone graph without a policy allows
-/// everything, and a server answers through its access route with the target's
-/// token.
+/// decides for the declared actor, whether the cluster or the graph's store
+/// is addressed, a standalone graph without a policy allows everything once it
+/// opens, a store that holds no graph refuses, and a server answers through
+/// its access route with the target's token.
 #[test]
 fn access_reports_what_the_caller_may_do_at_a_target() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
@@ -6189,9 +6198,32 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
         refusal["error"].as_str().unwrap().contains("knowledge"),
         "{refusal}"
     );
+    // The same graph addressed by its store answers from the cluster's
+    // policy, exactly as the cluster address does.
+    let by_store = parse_stdout_json(&output_success(
+        cli()
+            .arg("access")
+            .arg("--store")
+            .arg(cluster.path().join("graphs").join("knowledge.omni"))
+            .args(["--as", "act-bruno", "--branch", "main", "--json"]),
+    ));
+    assert_eq!(by_store, main, "{by_store}");
+
+    // A store that holds no graph has no policy to report.
+    let temp = tempdir().unwrap();
+    let missing = output_failure(
+        cli()
+            .arg("access")
+            .arg("--store")
+            .arg(temp.path().join("absent.omni"))
+            .args(["--branch", "main", "--json"]),
+    );
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+    let refusal = parse_stdout_json(&missing);
+    assert_eq!(refusal["code"], "not_found", "{refusal}");
+    assert_eq!(refusal["outcome"]["execution"], "not_started", "{refusal}");
 
     // A standalone graph without a policy allows every action.
-    let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
     let home = tempdir().unwrap();
@@ -6228,6 +6260,7 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
     ));
     assert_eq!(local["target"], "local");
     assert_eq!(local["source"], "direct");
+    assert_eq!(local["graph_id"], "default", "{local}");
     for action in [
         "read",
         "change",
@@ -6240,6 +6273,29 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
             "{action}: {local}"
         );
     }
+    // The text names the target branch for the actions decided into it.
+    let text = output_success(cli().env("OMNIGRAPH_HOME", home.path()).args([
+        "access",
+        "--target",
+        "local",
+        "--branch",
+        "main",
+        "--target-branch",
+        "feature",
+    ]));
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        text.contains("\nfrom main into feature: branch_create, branch_merge\n"),
+        "{text}"
+    );
+    let on_main = text
+        .lines()
+        .find(|line| line.starts_with("on main: "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        on_main.contains("change") && !on_main.contains("branch_create"),
+        "{text}"
+    );
 
     // A server target asks its access route, with the target's token.
     let report = parse_stdout_json(&output_success(
