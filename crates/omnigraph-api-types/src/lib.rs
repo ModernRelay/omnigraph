@@ -1808,6 +1808,7 @@ pub struct IngestRequest {
 
 /// Query parameters for `POST /load/ndjson`.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GraphBatchLoadQuery {
     /// Target branch. Defaults to `main`. Without `from`, it must exist.
     pub branch: Option<String>,
@@ -1829,11 +1830,13 @@ pub struct ExportRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SnapshotQuery {
     pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct CommitListQuery {
     pub branch: Option<String>,
     /// `true` lists the unpublished commits whose recorded target is `branch`

@@ -12,49 +12,25 @@ use tracing::Instrument;
 
 use crate::ApiError;
 
-/// What the request being served has done that an error it returns
-/// afterwards may follow.
-#[derive(Default)]
-struct RequestWrites {
-    /// It submitted an owned write. An error it returns afterwards, from the
-    /// write or from anything the handler does after it, may follow effects.
-    submitted: std::cell::Cell<bool>,
-    /// Its operation may publish more than once, as a load that forks its
-    /// branch does, so a typed refusal of a later step may follow an earlier
-    /// publication.
-    compound: std::cell::Cell<bool>,
-}
-
 tokio::task_local! {
-    static REQUEST_WRITES: RequestWrites;
+    /// Whether the request being served has submitted an owned write. An
+    /// error it returns afterwards, from the write or from anything the
+    /// handler does after it, may follow effects.
+    static SUBMITTED_WRITE: std::cell::Cell<bool>;
 }
 
-/// Serve one request with its own record of the writes it submitted.
+/// Serve one request with its own record of whether it submitted a write.
 pub(crate) async fn scope_request<F: Future>(request: F) -> F::Output {
-    REQUEST_WRITES
-        .scope(RequestWrites::default(), request)
+    SUBMITTED_WRITE
+        .scope(std::cell::Cell::new(false), request)
         .await
 }
 
 /// Whether the request being served has submitted an owned write; false
 /// outside a served request.
 pub(crate) fn request_submitted_write() -> bool {
-    REQUEST_WRITES
-        .try_with(|writes| writes.submitted.get())
-        .unwrap_or(false)
-}
-
-/// Record that the request being served runs an operation that may publish
-/// more than once.
-pub(crate) fn mark_compound_write() {
-    let _ = REQUEST_WRITES.try_with(|writes| writes.compound.set(true));
-}
-
-/// Whether the request being served runs an operation that may publish more
-/// than once; false outside a served request.
-pub(crate) fn request_compound_write() -> bool {
-    REQUEST_WRITES
-        .try_with(|writes| writes.compound.get())
+    SUBMITTED_WRITE
+        .try_with(std::cell::Cell::get)
         .unwrap_or(false)
 }
 
@@ -285,7 +261,7 @@ impl OperationRuntime {
             }
             state.active_writes += 1;
         }
-        let _ = REQUEST_WRITES.try_with(|writes| writes.submitted.set(true));
+        let _ = SUBMITTED_WRITE.try_with(|submitted| submitted.set(true));
         let owner = WriteOwner {
             inner: Arc::clone(&self.inner),
             reservation: Some(Box::new(reservation)),
@@ -459,6 +435,10 @@ impl ReadObserver {
     /// Descendants of this observer may finish after admission closes; no new
     /// observer or queue entry is acquired here. Native tails outside the
     /// engine future remain outside this logical ownership boundary.
+    ///
+    /// The task serves a request, or a part of one such as an MCP tool call,
+    /// so it keeps its own record of the writes that request submits, and an
+    /// error leaving it carries that record to the waiter.
     pub(crate) fn spawn_read<T, R, F>(self, reservation: R, operation: F) -> OwnedReadResponse<T>
     where
         T: Send + 'static,
@@ -471,11 +451,16 @@ impl ReadObserver {
             async move {
                 let _observer = self;
                 let _reservation = reservation;
-                #[allow(clippy::redundant_async_block)] // Catch completed future Drop panics too.
-                let result = AssertUnwindSafe(async move { operation.await })
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
+                let result = scope_request(async move {
+                    // Catch completed future Drop panics too.
+                    #[allow(clippy::redundant_async_block)]
+                    let result = AssertUnwindSafe(async move { operation.await })
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
+                    result.map_err(ApiError::with_request_facts)
+                })
+                .await;
                 // No result history: an absent waiter drops the result here.
                 let _ = sender.send(result);
             }

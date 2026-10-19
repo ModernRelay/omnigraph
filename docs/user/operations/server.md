@@ -339,11 +339,12 @@ resume cursor ([Changes, Diffs and Change Feeds](../branching/changes.md)).
 
 ## Errors and retries
 
-Every error body carries a `code`, its structured details and an `outcome`
-(`execution`, `effects`, `action`); a write whose completion the server could not
-settle is `outcome_unknown` with `execution: unknown`. Admission limits use `429`
-with `Retry-After`; size limits use `413`, and blocked graphs or closed admission
-use `503`. Admitted writes continue after disconnect. See [failure outcomes](troubleshooting.md#failed-data-write-commands).
+Every error body, an unknown route's and a malformed request's included, carries
+a `code`, its structured details and an `outcome` (`execution`, `effects`,
+`action`; see [failure outcomes](troubleshooting.md#failed-data-write-commands)).
+A write the server could not settle is `outcome_unknown`. Admission limits use
+`429` with `Retry-After`, size limits `413`, and blocked graphs or closed
+admission `503`. Admitted writes continue after disconnect.
 
 For TLS, secrets, storage credentials, container examples and Azure admission,
 see [Deployment](../deployment.md).

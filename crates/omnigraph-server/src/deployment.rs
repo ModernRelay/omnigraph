@@ -6,11 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::{Arc, Mutex as SyncMutex, PoisonError};
 
-use axum::{
-    Extension, Json,
-    extract::{Path, State},
-    http::StatusCode,
-};
+use axum::{Extension, Json, extract::State, http::StatusCode};
 use omnigraph_cluster::{
     CapturedDeployment, DeploymentCaller, DeploymentLookup, DeploymentStatus,
     GraphDeploymentResult, IdentityAuthorization,
@@ -20,6 +16,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 use tokio::time::{Duration, Instant};
 use utoipa::ToSchema;
 
+use crate::extract::ApiPath;
 use crate::operations::{OperationRuntime, OwnedResponse, OwnedResult};
 use crate::workload::IngressLease;
 use crate::{
@@ -194,7 +191,7 @@ fn observation_changed() -> ApiError {
         "deployment ownership changed during observation; repeat this status request",
     );
     error.status = StatusCode::SERVICE_UNAVAILABLE;
-    error.code = None;
+    error.code = crate::api::ErrorCode::ServiceUnavailable;
     error
 }
 
@@ -331,7 +328,7 @@ pub(crate) async fn status(
 pub(crate) async fn lookup(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<Json<DeploymentResponse>, ApiError> {
     let owner = admission(&state)?;
     let identity = IdentityAuthorization::authenticated(actor.actor_id_str()).map_err(refusal)?;
@@ -1023,6 +1020,11 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("repeat this status request")
+            );
+            assert_eq!(body["code"], "service_unavailable");
+            assert_eq!(
+                body["outcome"],
+                serde_json::json!({"execution": "not_started", "effects": "none", "action": "retry"})
             );
             assert!(body.get("deployment").is_none());
             assert!(body.get("active").is_none());

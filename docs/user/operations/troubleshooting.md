@@ -1,11 +1,13 @@
 # Troubleshooting
 
 CLI failures include a human-readable message. Add `--json` where supported to
-receive structured fields suitable for automation. Application-generated HTTP
-errors use a JSON body with `error`, an optional broad `code`, and optional
-details for conflicts, limits, Blob ranges, external sources, or recovery.
-Router, method, media-type, malformed-body, and extractor rejections may be
-plain responses, including 404, 405, 415, or 422.
+receive structured fields suitable for automation. Every HTTP error the server
+answers, an unknown route, a method the route does not serve and a malformed
+body, query string or path parameter included, uses a JSON body with `error`,
+`code`, `outcome` and optional details for conflicts, limits, Blob ranges,
+external sources, or recovery. A malformed request is `400`, a body without a
+JSON content type `415`. MCP tool calls report errors in their own result shapes
+([MCP](mcp.md#results-and-errors)).
 
 Do not parse human-readable error text when a structured field is present.
 
@@ -67,15 +69,23 @@ the same way. See [Diagnostics](../queries/diagnostics.md).
 ## Failed data-write commands
 
 Every server error body, and every CLI data-write failure, carries an `outcome`:
-`execution` is `not_started` or `unknown`, `effects` is `none` or `unknown`, and
-`action` is `retry`, `refresh`, `recover` or `reconcile`. The server states it
-for the request it answered: only a write whose completion it could not settle
-is `unknown`, with `code: outcome_unknown`; a refusal, a lost conflict or a read
-failure is `not_started`. The CLI reports the server's outcome when that request
-was the command's only effectful one, and otherwise its own account of the whole
-command, so a lost response is `unknown` with `reconcile`. JSON mode writes the
-failure to stdout; human mode prints the `outcome` line on stderr. HTTP failures
-also retain `http_status` and, when present, the original `retry_after` string.
+`execution` is `not_started` or `unknown`, `effects` is `none` or `unknown` to
+match, and `action` is `retry`, `refresh`, `recover` or `reconcile`. The server
+decides it for the request it answered by the first row that matches:
+
+| Error | `execution` | `action` |
+|---|---|---|
+| Any error before the request submitted a write | `not_started` | `recover` for a recovery intent or index rebuild; `retry` for `429` or `503`; else `refresh` |
+| A write whose completion the server could not settle; `code` becomes `outcome_unknown` unless the action is `recover` | `unknown` | `reconcile`, or `recover` |
+| A refusal after an earlier step of the write published, such as a load that forked its missing branch; `code` is kept | `unknown` | `refresh` |
+| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), or a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a resource limit, an external Blob source, a query diagnostic) | `not_started` | `retry` for `429`, else `refresh` |
+| Any other error after a write, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
+
+The CLI reports the server's outcome when that request was the command's only
+effectful one, and otherwise its own account of the whole command, so a lost
+response is `unknown` with `reconcile`. JSON mode writes the failure to stdout;
+human mode prints the `outcome` line on stderr. HTTP failures also retain
+`http_status` and, when present, the original `retry_after` string.
 
 This includes `commit publish` and `commit drop`, as well as their `mutate`
 statement forms. If a response or result output is lost, inspect the commit's

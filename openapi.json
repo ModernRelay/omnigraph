@@ -5284,10 +5284,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -5314,10 +5311,7 @@
             "description": "Commits per page of the branch's history, 1 to 1000; the page names\nthe head it resolved and a `next_page_token`. Without `limit` and\n`page_token` the whole history is listed. Refused with `unpublished`\nor `unattached`; above 1000 the request fails with 413.",
             "required": false,
             "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "maximum": 1000,
               "minimum": 1
             }
@@ -5328,10 +5322,7 @@
             "description": "Opaque continuation from the preceding page of this listing, sent with\nthe same `branch`; 100 commits per page unless `limit` is set. Later\npages answer for the head the first page resolved.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -7601,10 +7592,7 @@
             "description": "Target branch. Defaults to `main`. Without `from`, it must exist.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -7613,10 +7601,7 @@
             "description": "Parent branch used to create a missing target branch.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -7625,14 +7610,7 @@
             "description": "How existing entities are handled. Defaults to `merge`.",
             "required": false,
             "schema": {
-              "oneOf": [
-                {
-                  "type": "null"
-                },
-                {
-                  "$ref": "#/components/schemas/LoadMode"
-                }
-              ]
+              "$ref": "#/components/schemas/LoadMode"
             }
           },
           {
@@ -10016,10 +9994,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
