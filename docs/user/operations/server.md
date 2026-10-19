@@ -218,6 +218,7 @@ endpoint, its tools, settings and limits.
 | `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history (paged with `limit` and `page_token`), per-commit changes, and the unpublished commits of a branch (`GET /commits?unpublished=true`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
 | `/graphs/{id}/changes`, `/diff` | Poll a branch feed, establish a baseline, or diff two points (branches or commit ids) |
 | `/graphs/{id}/schema` | Show the accepted schema |
+| `GET /graphs/{id}/access` | The caller's own actor and the actions its credential allows; see [Learn your access](policy.md#learn-your-access) |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
 
 `/query` also serves `branch list`, the branch reads (`branch diff`, `branch merge-base`, `branch merge … dry run`), `show`, and [explain](../queries/explain.md).
