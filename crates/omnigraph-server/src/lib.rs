@@ -64,7 +64,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
@@ -2758,33 +2758,14 @@ pub fn build_app(state: AppState) -> Router {
             "/branches",
             get(server_branch_list).post(server_branch_create),
         )
-        .route("/branches/{branch}", delete(server_branch_delete))
-        // A branch may be named like a static route beside `{branch}`, which
-        // the router matches first, so each static route also deletes the
-        // branch it spells.
+        // One route owns `/branches/{name}`: the branch actions `merge`,
+        // `diff` and `merge-base` share its shape, so it dispatches them by
+        // name and method, and DELETE of any name deletes that branch.
         .route(
-            "/branches/merge",
-            post(server_branch_merge).delete(
-                |state, handle, ingress, actor: Option<Extension<AuthenticatedActor>>| {
-                    server_branch_delete_named(state, handle, ingress, actor, "merge".into())
-                },
-            ),
-        )
-        .route(
-            "/branches/diff",
-            get(server_branch_diff).delete(
-                |state, handle, ingress, actor: Option<Extension<AuthenticatedActor>>| {
-                    server_branch_delete_named(state, handle, ingress, actor, "diff".into())
-                },
-            ),
-        )
-        .route(
-            "/branches/merge-base",
-            get(server_merge_base).delete(
-                |state, handle, ingress, actor: Option<Extension<AuthenticatedActor>>| {
-                    server_branch_delete_named(state, handle, ingress, actor, "merge-base".into())
-                },
-            ),
+            "/branches/{branch}",
+            post(server_branch_post)
+                .get(server_branch_get)
+                .delete(server_branch_delete),
         )
         .route("/commits", get(server_commit_list))
         .route(

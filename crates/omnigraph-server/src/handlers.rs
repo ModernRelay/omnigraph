@@ -3017,6 +3017,57 @@ pub(crate) struct BranchPath {
     pub(crate) branch: String,
 }
 
+/// The branch actions whose names share `/branches/{branch}`: the router
+/// matches one route for the whole shape, so a branch named like an action
+/// is still a branch for DELETE, and the actions keep their URLs.
+const BRANCH_ACTIONS: [(&str, &str); 3] =
+    [("merge", "POST"), ("diff", "GET"), ("merge-base", "GET")];
+
+/// `POST /branches/{branch}`: only the `merge` action.
+pub(crate) async fn server_branch_post(
+    State(state): State<AppState>,
+    Path(BranchPath { branch }): Path<BranchPath>,
+    request: Request,
+) -> Response {
+    match branch.as_str() {
+        "merge" => axum::handler::Handler::call(server_branch_merge, request, state).await,
+        _ => branch_method_not_allowed(&branch),
+    }
+}
+
+/// `GET /branches/{branch}` (and HEAD): only the `diff` and `merge-base`
+/// actions.
+pub(crate) async fn server_branch_get(
+    State(state): State<AppState>,
+    Path(BranchPath { branch }): Path<BranchPath>,
+    request: Request,
+) -> Response {
+    match branch.as_str() {
+        "diff" => axum::handler::Handler::call(server_branch_diff, request, state).await,
+        "merge-base" => axum::handler::Handler::call(server_merge_base, request, state).await,
+        _ => branch_method_not_allowed(&branch),
+    }
+}
+
+/// 405 for a method `/branches/{branch}` does not serve for `branch`, with
+/// the methods it does serve: DELETE for every name, plus the action's own.
+fn branch_method_not_allowed(branch: &str) -> Response {
+    let mut allow = vec!["DELETE"];
+    for (name, method) in BRANCH_ACTIONS {
+        if name == branch {
+            allow.push(method);
+            if method == "GET" {
+                allow.push("HEAD");
+            }
+        }
+    }
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(axum::http::header::ALLOW, allow.join(", "))],
+    )
+        .into_response()
+}
+
 #[utoipa::path(
     delete,
     path = "/branches/{branch}",
@@ -3042,25 +3093,11 @@ pub(crate) struct BranchPath {
 /// exist. The GQ statement `branch delete` on `POST /mutate` runs the same
 /// body.
 pub(crate) async fn server_branch_delete(
-    state: State<AppState>,
-    handle: Extension<GraphRequest>,
-    ingress: Extension<IngressLease>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Path(BranchPath { branch }): Path<BranchPath>,
-) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
-    server_branch_delete_named(state, handle, ingress, actor, branch).await
-}
-
-/// `DELETE` of a branch whose name is also a static segment beside
-/// `/branches/{branch}` (`merge`, `diff`, `merge-base`). The router matches
-/// the static route before the parameter, so each static route deletes the
-/// branch it spells; without that, such a branch could not be deleted.
-pub(crate) async fn server_branch_delete_named(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    branch: String,
+    Path(BranchPath { branch }): Path<BranchPath>,
 ) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     branch_delete_body(&state, &handle, actor_ref, ingress, &branch).await?;

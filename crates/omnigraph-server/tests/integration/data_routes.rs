@@ -5578,6 +5578,32 @@ async fn remote_branch_delete_flow_works() {
         assert_eq!(delete_status, StatusCode::OK, "{name}: {delete_body}");
         assert_eq!(delete_body["name"], name);
     }
+    // Any other method and name answers 405, naming what that name serves.
+    for (method, name, allow) in [
+        (Method::POST, "feature", "DELETE"),
+        (Method::GET, "feature", "DELETE"),
+        (Method::GET, "merge", "DELETE, POST"),
+        (Method::POST, "diff", "DELETE, GET, HEAD"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .uri(g(&format!("/branches/{name}")))
+                    .method(method.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {name}"
+        );
+        assert_eq!(response.headers()["allow"], allow, "{method} {name}");
+    }
 
     let (list_status, list_body) = json_response(
         &app,
