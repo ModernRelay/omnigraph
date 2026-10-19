@@ -24,7 +24,7 @@ use crate::db::{Omnigraph, Snapshot};
 use crate::loader::LoadMode;
 use crate::loader::read_reuse::LoadReadReuse;
 use crate::storage_layer::{DeletedIdBudget, WriteBudget};
-use crate::validate::load::{LoadAdmission, LoadPhase, judge_load};
+use crate::validate::load::{LoadAdmission, LoadPhase, int_keyed, judge_load};
 use omnigraph_compiler::ir::ValidateCheck;
 
 /// The `validated_rows` metric: the delta rows the operator judged.
@@ -314,11 +314,9 @@ fn admit_validation(
                 }
             }
         }
-        if judge
-            .checks
-            .iter()
-            .any(|spec| matches!(spec.check, ValidateCheck::EdgeRi { .. }))
-        {
+        if judge.checks.iter().any(|spec| {
+            matches!(&spec.check, ValidateCheck::EdgeRi { node_type, .. } if !int_keyed(&judge.catalog, node_type))
+        }) {
             let src_bytes = string_payload_bytes(column(sc.src)?);
             let dst_bytes = string_payload_bytes(column(sc.dst)?);
             memory.entries::<(String, String, String)>(rows)?;

@@ -500,7 +500,7 @@ impl EndpointKeys {
     }
 }
 
-fn int_keyed(catalog: &Catalog, node_type: &str) -> bool {
+pub(crate) fn int_keyed(catalog: &Catalog, node_type: &str) -> bool {
     catalog
         .node_types
         .get(node_type)
