@@ -549,10 +549,14 @@ An operation's actor is fixed where trust is established:
 - **Served access.** The server resolves the actor from the bearer credential,
   and `--as` becomes an assertion. The CLI sends `omnigraph-expect-actor:
   <actor>`, and the server compares it with the resolved actor after
-  authentication and the contract-header check, before graph lookup, body
-  decoding or effects. A mismatch is `412 actor_mismatch`: a condition the
-  caller set did not hold, and nothing ran. A duplicate or malformed header is
-  `400 bad_request`. Without `--as` the CLI sends no header: `operator.actor`
+  authentication and the contract-header check (on `/mcp`, which has no
+  contract check, after authentication and before admission), before graph
+  lookup, body decoding or effects. A mismatch is `412 actor_mismatch`: a
+  condition the caller set did not hold, and nothing ran. A duplicate, padded,
+  empty or malformed header is `400 bad_request`. The header arrives with the
+  contract bump in [HTTP API](#http-api), so a server that would ignore it
+  refuses the request's contract first; no separate capability header
+  advertises it. Without `--as` the CLI sends no header: `operator.actor`
   names the direct actor and is not asserted against servers, whose tokens may
   resolve to other names. The refusal of `--as` on served writes, and its stale
   help text, go.
@@ -594,10 +598,23 @@ Every failure, from a server or from the CLI, has one shape: today's
   only data writes.
 - **A write has three results.** It is committed, not committed, or of unknown
   outcome, the same on every surface, as
-  [#1067](https://github.com/ModernRelay/omnigraph/issues/1067) proposes. A server reports unknown only when it could not settle
-  the attempt itself, and then as `outcome_unknown`, never as a plain
-  `internal`. `outcome.check` carries what a later read needs to settle it: the
-  branch, its head before the write and the attempt's transaction id.
+  [#1067](https://github.com/ModernRelay/omnigraph/issues/1067) proposes. A server that could not settle the attempt itself
+  answers `outcome_unknown`, never a plain `internal`. Every other error keeps
+  its code, and its outcome follows from what the server knows:
+
+  | Error | `execution` / `effects` | `action` |
+  |---|---|---|
+  | Before the request submitted a write | `not_started` / `none` | `retry` when busy or unavailable, `recover` when something must be rebuilt, else `refresh` |
+  | A refusal the write met before it started (authentication, contract, actor assertion, policy, admission, a precondition), or a typed refusal of its one publication | `not_started` / `none` | `refresh`, `retry` when busy |
+  | Any of those after an earlier publication of the same operation, such as the fork a load makes before its rows, which the engine marks on its error | `unknown` / `unknown` | `refresh` |
+  | Any other error after a write | `unknown` / `unknown` | `reconcile` |
+  | An attempt the server could not settle (`outcome_unknown`) | `unknown` / `unknown` | `reconcile`, `recover` when recovery is required |
+
+  `outcome.check` carries what a later read needs to settle an unknown write:
+  the branch, its head before the write and the attempt's transaction id. It
+  arrives with the attempt identity of
+  [cross-process writes](#cross-process-writes); until then a caller settles
+  from the branch it sent and that branch's head.
 
   ```json
   {"error":"the write may have published","code":"outcome_unknown",
@@ -1059,6 +1076,14 @@ Exact signatures are settled in the implementation PR; the contract is:
 ```rust
 pub enum LocalAccess { ReadOnly, ReadWrite }
 
+/// An absolute root on this machine's file system. A URI, `file://` included,
+/// is refused until a binding carries the caller's resolved storage settings.
+pub struct LocalBinding { /* … */ }
+
+impl LocalBinding {
+    pub fn local(path: impl AsRef<Path>) -> Result<LocalBinding, LocalOpenError>;
+}
+
 pub enum LocalScope {
     /// A standalone graph, served under the route id `default`.
     Graph(LocalBinding),
@@ -1077,11 +1102,21 @@ pub struct LocalOptions {
 pub struct LocalCredential { /* … */ }
 
 pub enum LocalOpenError {
+    /// `ReadWrite` until a write whose outcome is unknown no longer stops
+    /// the server; tests open it inside `with_local_read_write`.
+    ReadWriteUnavailable,
     ActorRequired,
-    ActorViewsReadOnly,
-    Admission(ClusterDiagnostic),
+    /// The root is a graph inside a cluster: serve the cluster.
+    ClusterGraph { root: String, cluster: String },
+    Root(String),
     Open(OmniError),
-    Policy(PolicyError),
+    Policy(String),
+    /// The cluster refused admission or its applied state, with its code.
+    Cluster { code: String, message: String },
+    Serving(String),
+    /// A read-write open failed after taking serving admission, which stays
+    /// held as `lock_id`.
+    AdmissionRetained { lock_id: String, message: String },
 }
 
 /// `Uncertain` when the process stopped with an unknown outcome; callers exit 2.
@@ -1092,11 +1127,26 @@ impl AppState {
         -> Result<(AppState, LocalCredential), LocalOpenError>;
 }
 
+/// Registers the shutdown signals and builds the router, so a signal that
+/// arrives after the caller announces readiness stops the server cleanly.
+pub fn start_local(
+    state: AppState,
+    listener: tokio::net::TcpListener,
+    extend: impl FnOnce(Router) -> Router,
+) -> Result<LocalServing>;
+
+impl LocalServing {
+    pub async fn serve(self) -> Result<ServeOutcome>;
+    /// Stop without serving: drain, then release any serving admission.
+    pub async fn release(self) -> Result<ServeOutcome>;
+}
+
+/// `start_local`, then `LocalServing::serve`.
 pub async fn serve_local(
     state: AppState,
     listener: tokio::net::TcpListener,
     extend: impl FnOnce(Router) -> Router,
-) -> ServeOutcome;
+) -> Result<ServeOutcome>;
 
 /// The restricted server subscriber `init_tracing` installs, on a chosen writer.
 pub fn install_log_subscriber<W>(writer: W)
@@ -1104,18 +1154,21 @@ where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static;
 ```
 
-`LocalBinding` is the direct binding RFC 0059's resolver captured: the
-canonical root and its storage provider settings, so catalog, admission and
-Lance access use one destination and no ambient variable redirects them. It is
-never a bare URI string.
+`LocalBinding` is the direct binding RFC 0059's resolver captured, so catalog,
+admission and Lance access use one destination and no ambient variable
+redirects them. It is never a bare URI string. Phase 3 binds a local file
+system root only; a remote root waits for a binding that carries the
+resolver's storage provider settings.
 
 For a standalone graph, `AppState::local`:
 
 1. Classifies the root with `cluster_root_for_graph_uri`, the rule direct CLI
-   commands use; a root inside a cluster becomes `LocalScope::Cluster`.
+   commands use, and refuses a root inside a cluster with `ClusterGraph`: the
+   caller names `LocalScope::Cluster` itself, so a graph open never widens into
+   a cluster open.
 2. Opens read-only with `Omnigraph::open_read_only`, or read-write with
-   `Omnigraph::open`, refusing `ReadWrite` without an actor or on a graph with
-   actor views.
+   `Omnigraph::open`, refusing `ReadWrite` without an actor; actor views keep a
+   graph read-only once `ReadWrite` is available.
 3. Generates a 32-byte token and keeps only its SHA-256 hash.
 4. Builds the policy as a structured `PolicyConfig` with
    `PolicyCompiler::compile` followed by the kind-alignment validation the
@@ -1134,9 +1187,13 @@ For a standalone graph, `AppState::local`:
 For a cluster it builds the serving projection the deployment builds, from the
 same applied state, with the generated token as the only credential, resolving
 to the local server's actor, and enables MCP ad-hoc reads as for a graph.
-Read-only opens every graph through `graph_read.rs` without admission and adds
-the generated `forbid` for write actions; read-write acquires admission with
-`ClusterAdmissionPurpose::Serve`, as the deployment does. Neither mounts
+Read-only captures one ledger revision for the life of the process, opens
+every graph against it through `graph_read.rs` without admission and adds the
+generated `forbid` for write actions; a later apply is served by the next
+start. Read-write acquires admission with `ClusterAdmissionPurpose::Serve`, as
+the deployment does. A graph the cluster binds no policy to gets a generated
+policy granting `read` alone, installed on its engine too. Either refuses when
+no graph opens, `/readyz` reports the captured revision, and neither mounts
 deployment routes.
 
 Read-only holds in three independent places: `ingress::admit` refuses every
@@ -1169,8 +1226,10 @@ The existing convenience constructors stay until
 | `outcome` on every error body | [Outcomes and refusals](#outcomes-and-refusals); the existing fields keep their meaning |
 | `ErrorCode` | Grows to the one registry; OpenAPI lists every code with the statuses servers send it under |
 
-The HTTP contract version moves once for all four, with `openapi.json`
-regenerated through the server's OpenAPI test. Servers keep accepting exactly
+The HTTP contract version moves once for all four, from `0.13` to `0.14`,
+with `openapi.json` regenerated through the server's OpenAPI test. The bump
+lands with the actor header, whose silent loss on an older server is the one
+that matters, and the other three ride it in the same release. Servers keep accepting exactly
 one version. A client that talks to deployments of several versions, as a
 manager of long-lived deployments does, reads each one's version from
 `/healthz`, which needs no header and names it, and speaks that version to it.
@@ -1823,3 +1882,12 @@ changes and pointing at this RFC.
   never upgrades another process's. Links carry the operator home's digest, so
   a link from another home is refused. The MCP bridge is bound to its graph,
   and every local server enables ad-hoc MCP reads.
+- 2026-10-19: Aligned with the phase 1 and phase 3 implementations and their
+  reviews. The actor header rides the contract bump to `0.14` rather than a
+  capability response header, and `/mcp` compares it after authentication
+  alone. Rule 6 states the outcome table the server implements: a typed
+  refusal keeps its code, an earlier publication of the same operation is the
+  engine's mark on its error, and `outcome.check` waits for an attempt id. The
+  local embedding API names `LocalBinding::local`, `ReadWriteUnavailable`,
+  `start_local` and `LocalServing::release`, refuses a graph inside a cluster
+  instead of promoting it, and binds local roots only.
