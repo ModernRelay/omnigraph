@@ -148,8 +148,9 @@ request: each target's address, `default_graph`, `auth` (`token` or
 `anonymous`), `credential` owner and `binding`, a digest of where the target
 points and how it authenticates, which changes when either does; a direct
 target's storage is digested in its normalized spelling, so `/data/g` and
-`file:///data/g` digest alike. A direct target carries `local_servers`, empty
-today. An incomplete entry is listed with its `error`, and its address without
+`file:///data/g` digest alike. A direct target carries `local_servers`, the
+live local servers of its destination, absent when their records cannot be read
+safely. An incomplete entry is listed with its `error`, and its address without
 user, password, query or fragment. Aliases are not listed, since they still name
 `servers:` entries. `target show` prints one target in the same shape.
 

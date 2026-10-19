@@ -57,7 +57,7 @@ prints the exact flags of the installed binary.
 | `target` | `list` `show` `add` `remove` | List and edit the named targets in the operator config |
 | `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
 | `credential` | `get` | Hand a server target's stored token to a pipe, never a terminal |
-| `serve` | — | Serve a direct target on loopback to clients of the same account, read-only unless `--write` |
+| `serve` | — | Serve a direct target on loopback to clients of this account, read-only for now (`--write` refuses); a deployment remains `omnigraph-server` |
 | `profile` | `list` `show` | Inspect operator profiles |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |

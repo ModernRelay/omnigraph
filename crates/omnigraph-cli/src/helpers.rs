@@ -437,6 +437,10 @@ pub(crate) fn apply_bearer_token(
 pub(crate) struct CliRefusal {
     pub(crate) code: omnigraph_api_types::ErrorCode,
     pub(crate) message: String,
+    /// The outcome a command whose failures `command_outcome` does not
+    /// classify states for this refusal; a classified command's evidence
+    /// decides its outcome instead.
+    pub(crate) outcome: Option<omnigraph_api_types::OutcomeOutput>,
 }
 
 impl CliRefusal {
@@ -447,6 +451,7 @@ impl CliRefusal {
         Self {
             code,
             message: message.into(),
+            outcome: None,
         }
         .into()
     }

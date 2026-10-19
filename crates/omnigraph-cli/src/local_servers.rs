@@ -19,9 +19,13 @@ use omnigraph_api_types::ErrorCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::commands::local::output::InternalSchemaOutput;
 use crate::helpers::CliRefusal;
 
-/// The records format this CLI reads and writes.
+/// The records format this CLI reads and writes. A reader ignores a record of
+/// another format, which hides that live server from it, and ignores fields
+/// it does not know; so a field a reader can do without joins the current
+/// format, and only a change an old reader would misread takes a new one.
 pub(crate) const RECORD_FORMAT: u32 = 1;
 
 /// Overrides the records directory for an isolated environment, such as a
@@ -283,6 +287,11 @@ pub(crate) struct CliIdentity {
     pub(crate) channel: Option<String>,
     pub(crate) commit: Option<String>,
     pub(crate) http_contract: String,
+    /// The storage formats it writes and serves, as `version --json` reports
+    /// them. A record without them, which a reader of the same format still
+    /// counts as live, names no formats a reuse could match.
+    #[serde(default)]
+    pub(crate) internal_schema: Option<InternalSchemaOutput>,
 }
 
 impl CliIdentity {
@@ -295,6 +304,7 @@ impl CliIdentity {
             channel: omnigraph_api_types::build::RELEASE_CHANNEL.map(str::to_string),
             commit: omnigraph_api_types::build::SOURCE_COMMIT.map(str::to_string),
             http_contract: omnigraph_api_types::HTTP_API_CONTRACT.to_string(),
+            internal_schema: Some(InternalSchemaOutput::current()),
         }
     }
 }

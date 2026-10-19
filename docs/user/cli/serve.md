@@ -57,14 +57,17 @@ standalone graph, the target's `default_graph` for a cluster root, which may be
 absent). `binding` is the digest of the target's binding. `omnigraph version
 --json` reports this line's version as `protocols.serve`.
 
-A start that fails before its ready line leaves no record and exits 1; a
-refusal names its `code`, on stdout under `--json`.
+A start that fails before its ready line leaves no record and exits 1. Under
+`--json` a refusal prints its `code` on stdout with an `outcome` of
+`not_started` and no effects; its `action` is `retry` for
+`local_server_starting` and `refresh` otherwise.
 
 ## Records and reuse
 
 Every running local server has a record: a JSON file, readable only by its
 account, naming its id, URL, token, scope, root, access, actor, process id and
-the CLI that started it. A same-account client attaches by reading it.
+the CLI that started it, with the HTTP contract it speaks and the storage
+formats it writes and serves. A same-account client attaches by reading it.
 Records live in a directory only the account may use:
 
 | Platform | Directory |
@@ -98,7 +101,7 @@ exits 0, unless that server cannot serve what this start asks for:
 |---|---|
 | `local_server_access_mismatch` | `--write` asks for a read-write server and the live one is read-only |
 | `local_server_actor_mismatch` | The live server of a cluster root acts as another actor |
-| `local_server_cli_incompatible` | The live server speaks another HTTP contract than this CLI |
+| `local_server_cli_incompatible` | The live server speaks another HTTP contract, or writes or serves other storage formats, than this CLI |
 
 Starts of one destination are serialized: a start waits up to 60 seconds for
 another start of it to publish its record, then refuses with

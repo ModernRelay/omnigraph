@@ -217,7 +217,7 @@ accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
 **Local** (no graph):
 - `alias <name> [args…]` — invoke an operator alias's bound stored read query; `[--params … | --params-file <p>] [--format <fmt> | --json]` (server/graph/query come from the binding)
 - `embed (--seed <embed.yaml> | --input <raw.jsonl> --output <out.jsonl> --spec <spec.json>) [--reembed-all | --clean] [--type <T>…] [--select "<Type>:<field>=<value>"]`
-- `login <server> [--token <t>]` (prefer piping the token on stdin) · `logout <server>` · `login --api <origin>` / `logout --api <origin>` (managed session) · `target <list | show <name> | add <name> | remove <name>>` (`add` reads the entry as JSON on stdin) · `credential get --target <name>` (a server target's token, to a pipe only) · `access [--target <name>] [--branch <b> [--target-branch <t>]] [--json]` (your actor and the actions the graph's policy grants) · `serve [--target <name>] [--write] [--reuse] [--port <p>] [--json]` (a direct target on loopback for this account; read-only unless `--write`) · `login --target <name>` · `profile <list | show [<name>]>` · `skill <export <dir> [--force] [--json] | show [<path>]>` · `version [--json]`
+- `login <server> [--token <t>]` (prefer piping the token on stdin) · `logout <server>` · `login --api <origin>` / `logout --api <origin>` (managed session) · `target <list | show <name> | add <name> | remove <name>>` (`add` reads the entry as JSON on stdin) · `credential get --target <name>` (a server target's token, to a pipe only) · `access [--target <name>] [--branch <b> [--target-branch <t>]] [--json]` (your actor and the actions the graph's policy grants) · `serve [--target <name>] [--write] [--reuse] [--port <p>] [--json]` (a direct target on loopback for this account, read-only for now: `--write` refuses) · `login --target <name>` · `profile <list | show [<name>]>` · `skill <export <dir> [--force] [--json] | show [<path>]>` · `version [--json]`
 
 Managed folders can select an Intent API with `login --api` and `use`; implicit
 `query`, `mutate`, `load`, `commit list`/`show` and `graphs list` then acquire
@@ -282,7 +282,7 @@ Direct `init`/`load` and **`cluster apply`** write storage without an HTTP serve
 
 ### Deployment & access
 
-- **Cluster deployment — the only way to serve.** A `cluster.yaml` declares the
+- **Cluster deployment — the only way to serve others.** A `cluster.yaml` declares the
   whole deployment (graphs, schemas, stored queries, policies, optional S3/Azure
   `storage:` root); `omnigraph cluster apply` converges it and
   `omnigraph-server --cluster .` (or `--cluster s3://bucket/prefix`,
@@ -293,7 +293,10 @@ Direct `init`/`load` and **`cluster apply`** write storage without an HTTP serve
   See `references/cluster.md`.
 - **Direct / embedded access — no server.** Address a graph's storage directly
   with `--store <file://|s3://|az:// uri>` or a positional URI for one-off CLI ops.
-  There is **no single-graph server mode** — the server is cluster-only.
+  `omnigraph-server` is cluster-only. `omnigraph serve --target <name>` is a
+  loopback server for this account alone over a direct target (a standalone
+  graph or a cluster root), read-only for now; a deployment remains
+  `omnigraph-server`.
 
 ### The two config surfaces
 

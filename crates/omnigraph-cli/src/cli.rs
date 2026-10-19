@@ -299,8 +299,9 @@ pub(crate) enum Command {
         command: TargetCommand,
     },
     /// Make a direct target reachable over HTTP and /mcp for you: one local
-    /// server on loopback per destination, with a generated token, read-only
-    /// unless --write. With --json, stdout carries one ready line.
+    /// server on loopback per destination, for this account, with a generated
+    /// token, read-only for now (--write refuses). With --json, stdout carries
+    /// one ready line. A deployment that serves others is omnigraph-server.
     Serve(ServeArgs),
     /// Say who you are at a target and what you may do there: the actions
     /// the graph's policy grants your credential, graph-wide and on a branch.
