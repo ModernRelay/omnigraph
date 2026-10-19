@@ -175,7 +175,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Any => true,
             Direct | Control => graph_ok,
             Served => graph_ok,
-            Local => false,
+            // `mcp` binds its bridge to one graph of its target.
+            Local => matches!(cmd, Command::Mcp(_)),
         },
         // `direct` refines per command: the maintenance verbs (optimize/
         // repair/cleanup/schema plan/lint) resolve their target through
@@ -239,8 +240,10 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                         command: SchemaCommand::Apply { .. }
                     }
             ),
-            // `serve` names the actor its local server acts as.
-            Local => matches!(cmd, Command::Serve(_)),
+            // `serve` names the actor its local server acts as, and so does
+            // `mcp` for a direct target; to a server target it is the
+            // assertion every relayed request carries.
+            Local => matches!(cmd, Command::Serve(_) | Command::Mcp(_)),
             Served => false,
         },
         // A profile is consumed wherever scope resolution runs: the data/
@@ -270,6 +273,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     | Command::Logout { .. }
                     | Command::Credential { .. }
                     | Command::Serve(_)
+                    | Command::Mcp(_)
             ),
         },
     }
@@ -340,6 +344,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Target { .. }
         | Command::Credential { .. }
         | Command::Serve(_)
+        | Command::Mcp(_)
         | Command::Use { .. }
         | Command::Profile { .. }
         | Command::Skill { .. }
@@ -365,6 +370,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Credential { .. } => "credential get",
         Command::Access(_) => "access",
         Command::Serve(_) => "serve",
+        Command::Mcp(_) => "mcp",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",
@@ -535,7 +541,10 @@ fn remediation(capability: Capability, cmd: &Command) -> &'static str {
             }
             _ => " It operates on a cluster.",
         },
-        Capability::Local => " It does not address a graph.",
+        Capability::Local => match cmd {
+            Command::Mcp(_) => " Name the target with --target <name>.",
+            _ => " It does not address a graph.",
+        },
         Capability::Served => " Address the server with --server <name|url> or --profile <name>.",
         Capability::Any => "",
     }
@@ -705,6 +714,12 @@ mod tests {
             (
                 parse(&["omnigraph", "target", "list"]),
                 [false, false, false, false, false, false, false],
+            ),
+            // `mcp` relays to one target's graph, as an actor for a direct
+            // target and as an assertion to a server.
+            (
+                parse(&["omnigraph", "mcp"]),
+                [false, false, true, false, true, false, true],
             ),
         ];
         for (cmd, expected) in &rows {

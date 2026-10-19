@@ -7,6 +7,8 @@ mod cli_cluster_e2e;
 mod cli_data;
 #[cfg(unix)]
 mod cli_local_servers;
+#[cfg(unix)]
+mod cli_mcp;
 mod cli_queries;
 mod cli_schema_config;
 mod crossversion_upgrade;

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
 pub(crate) use crate::commands::local::{ProfileCommand, SkillCommand};
+pub(crate) use crate::commands::mcp::McpArgs;
 pub(crate) use crate::commands::serve::ServeArgs;
 pub(crate) use crate::commands::targets::{AccessArgs, CredentialCommand, TargetCommand};
 pub(crate) use crate::managed::args::{
@@ -302,6 +303,12 @@ pub(crate) enum Command {
     /// server on loopback per destination, with a generated token, read-only
     /// unless --write. With --json, stdout carries one ready line.
     Serve(ServeArgs),
+    /// Speak MCP over stdio for an agent that starts its tools as child
+    /// processes, relayed to a target's /mcp: a direct target through its
+    /// local server, a server target with its stored token. Bound to one
+    /// graph (--graph, else the target's default); lists and admits only
+    /// read-only tools.
+    Mcp(McpArgs),
     /// Say who you are at a target and what you may do there: the actions
     /// the graph's policy grants your credential, graph-wide and on a branch.
     Access(AccessArgs),

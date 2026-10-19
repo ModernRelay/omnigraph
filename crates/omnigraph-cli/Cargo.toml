@@ -30,7 +30,7 @@ sha2 = { workspace = true }
 axum = { workspace = true }
 ulid = { workspace = true }
 yaml_serde = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-std", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "process"] }
 reqwest = { workspace = true, features = ["blocking", "stream"] }
 futures = { workspace = true }
 tempfile = { workspace = true }

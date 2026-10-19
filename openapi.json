@@ -15020,7 +15020,8 @@
           "local_server_access_mismatch",
           "local_server_cli_incompatible",
           "local_server_records_unsafe",
-          "local_server_read_write_unavailable"
+          "local_server_read_write_unavailable",
+          "mcp_target_lost"
         ]
       },
       "ErrorOutput": {

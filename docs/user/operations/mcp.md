@@ -3,7 +3,8 @@
 `omnigraph-server` serves the Model Context Protocol at `/mcp`, so Claude,
 ChatGPT, Cursor and other MCP clients can work with a graph with a URL and the
 caller's own credential. It is the only OmniGraph MCP implementation; it
-replaces the `@modernrelay/omnigraph-mcp` npm package.
+replaces the `@modernrelay/omnigraph-mcp` npm package. An agent that starts
+its tools as commands reaches it through [`omnigraph mcp`](#agents-over-stdio).
 
 Every tool calls the same handler as its HTTP route, under the same actor and
 the same [policy](policy.md) action. A tool appearing in the list is not
@@ -60,6 +61,87 @@ behind a load balancer without OIDC, needs that name listed.
 With OIDC, a browser `Origin` must be the resource identifier's origin. Without
 OIDC there is no origin to allow, so a request carrying any `Origin` is refused
 with 403. Native clients send no `Origin`.
+
+## Agents over stdio
+
+An agent that starts its tools as child processes, instead of connecting to a
+URL, runs `omnigraph mcp`. It speaks MCP over stdio and relays every message
+to a target's `/mcp`:
+
+```json
+{"command": "omnigraph", "args": ["mcp", "--target", "local"]}
+```
+
+```text
+omnigraph mcp [--target NAME] [--graph GRAPH_ID] [--as ACTOR]
+```
+
+The target is `--target NAME`, else `defaults.target`; see
+[named targets](../cli/targets.md). The agent's configuration names only the
+target, and the token stays inside the bridge:
+
+| Target | Relayed to | Token |
+|---|---|---|
+| direct, `scope: graph` or `scope: root` | its [local server](../cli/serve.md), reached as `omnigraph serve --target NAME --reuse` reaches it | the local server's generated token |
+| server | the endpoint's `/mcp` | the credential owner's, from `OMNIGRAPH_TOKEN_<OWNER>` or the credentials file |
+
+For a direct target the bridge reuses the destination's live local server, or
+hosts one for as long as it runs. A hosted server is recorded like any other,
+so `target list` names it and another client can attach to it. Closing the
+bridge's stdin, `SIGTERM` or Ctrl-C stops it gracefully and removes its record;
+a reused server keeps running. `--as` names the local server's actor, as for
+`serve`, and a cluster root requires one.
+
+For a server target, `--as` is an assertion every relayed request carries as
+`omnigraph-expect-actor`: the server refuses a token that resolves to another
+actor with 412 `actor_mismatch`. `/mcp` needs a credential, so an anonymous
+target refuses with `credential_anonymous` and a missing token with
+`credential_missing`.
+
+### One graph, read-only
+
+A bridge serves one graph: `--graph`, else the target's `default_graph`. A
+standalone graph's local server serves it as `default`. A target with neither
+refuses with `bad_request`. A tool that takes `graph` gets the bridge's graph
+when the call omits it. A call or a resource URI naming another graph is
+answered with JSON-RPC error `-32602` and never sent. `graphs` and
+`omnigraph://graphs` list only the bridge's graph, and the `initialize`
+instructions name it.
+
+`tools/list` lists only the tools the server annotates `readOnlyHint: true`.
+A call to any other tool is answered with error `-32602`, even from a server
+with `--mcp-allow-writes`: writes through the bridge are not available yet. A
+local server always lists the ad-hoc `read` tool. The bridge adds no tool, and
+every call it admits reaches the server's handler and its refusals.
+
+### Framing and failures
+
+Each line on stdin is one JSON-RPC message, sent as one `POST`, and each
+answer is one line on stdout, which carries nothing else; logs, the local
+server's included, go to stderr. A batch, a JSON array, is answered with error
+`-32600`. Requests carry `MCP-Protocol-Version` with the version `initialize`
+negotiated, or the one the request names in its `_meta`.
+
+Requests are relayed concurrently, at most 32 at a time, and answered as they
+complete, so a fast request is not held behind a slow one. At 32 the bridge
+stops reading stdin until one completes. `initialize`, notifications and the
+agent's own responses keep their order: nothing after one is read until it is
+delivered, so the handshake and its protocol version precede every later
+request. `notifications/cancelled` drops the named request's exchange, which is
+how the stateless endpoint learns of a cancellation, and that request gets no
+answer; the notification itself is not forwarded, since the endpoint ignores
+it. When stdin closes, the requests in flight are answered, for up to 45
+seconds, before the bridge exits 0.
+
+A request the server answers with no JSON-RPC message, such as a refusal
+before the MCP layer, or one that fails or runs past 45 seconds, is answered
+with error `-32000` and its id; `data` carries the `http_status` and `body` the
+server answered with. After a 401 or a refused connection the bridge resolves
+its target once more, attaching to a restarted local server or reading the
+token again, and resends; requests lost together resolve once between them.
+When a resent request fails as well, the bridge answers every pending request
+with error `-32000` and exits 1 with `error[mcp_target_lost]` on stderr. A
+refusal before relaying exits 1 with `error[<code>]: <message>` on stderr.
 
 ## Settings
 

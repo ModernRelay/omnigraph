@@ -114,6 +114,7 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
         | Command::Profile { .. }
         | Command::Skill { .. }
         | Command::Serve(_)
+        | Command::Mcp(_)
         | Command::Version { .. } => None,
     }
 }

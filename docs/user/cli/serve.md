@@ -4,7 +4,9 @@
 clients running as the same account on the same machine: an editor, a notebook
 or another tool that speaks the [HTTP API](../operations/server.md). It is a
 local server for you, not a deployment; to serve others, run
-[`omnigraph-server`](../operations/server.md) from a cluster.
+[`omnigraph-server`](../operations/server.md) from a cluster. An agent that
+starts its tools as commands reaches the same local server through
+[`omnigraph mcp`](../operations/mcp.md#agents-over-stdio).
 
 ```bash
 omnigraph serve --target local --json

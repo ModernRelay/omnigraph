@@ -2177,6 +2177,10 @@ pub enum ErrorCode {
     LocalServerRecordsUnsafe,
     /// CLI only: a read-write local server is not available yet.
     LocalServerReadWriteUnavailable,
+    /// CLI only: `mcp` lost its target: a relayed message was refused its
+    /// credential or reached no server again after the bridge resolved the
+    /// target once more.
+    McpTargetLost,
 }
 
 /// Structured details for a publisher-level OCC failure. Surfaces alongside

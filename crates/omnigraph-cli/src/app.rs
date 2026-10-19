@@ -395,6 +395,17 @@ async fn run(
                 return Ok(completion);
             }
         }
+        Command::Mcp(args) => {
+            return commands::mcp::run_mcp(
+                &operator,
+                cli.as_actor.as_deref(),
+                cli.graph.as_deref(),
+                args,
+                stdout,
+                stderr,
+            )
+            .await;
+        }
         Command::Access(args) => {
             commands::targets::run_access(
                 &operator,
