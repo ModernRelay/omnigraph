@@ -179,7 +179,8 @@ impl RequestTarget {
 
     /// The endpoint and path this target is matched by, in one spelling:
     /// the host as the URL parser folds it, the default port filled in and
-    /// no trailing slash.
+    /// no trailing slash. A socket path is spelled by its bytes in hex, so
+    /// two paths a lossy display would print alike stay apart.
     pub(crate) fn canonical(&self) -> String {
         let path = self.segments.join("/");
         match &self.endpoint {
@@ -188,7 +189,16 @@ impl RequestTarget {
                 None => format!("{scheme}://{host}/{path}"),
             },
             #[cfg(unix)]
-            Endpoint::Unix(socket) => format!("unix:{}:/{path}", socket.display()),
+            Endpoint::Unix(socket) => {
+                use std::os::unix::ffi::OsStrExt;
+                let bytes: String = socket
+                    .as_os_str()
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                format!("unix:{bytes}:/{path}")
+            }
         }
     }
 }

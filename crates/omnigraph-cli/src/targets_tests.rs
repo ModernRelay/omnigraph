@@ -568,6 +568,13 @@ fn a_binding_digest_names_where_a_target_points_and_nothing_else() {
         server("https://h.example"),
         server("https://h.example/base")
     );
+    // Two socket paths that differ only in bytes no display can print are
+    // two bindings.
+    #[cfg(unix)]
+    assert_ne!(
+        server("unix:///tmp/%FE.sock"),
+        server("unix:///tmp/%FF.sock")
+    );
     let listing = list_output(&config);
     assert_eq!(listing.default_target.as_deref(), Some("staging"));
     let local = listing.targets.iter().find(|t| t.name == "local").unwrap();
