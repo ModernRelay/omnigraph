@@ -1,5 +1,5 @@
 //! `omnigraph serve` for you: one direct target served on loopback to clients
-//! of the same account, read-only unless `--write`, as one local server per
+//! of the same account, read-only for now, as one local server per
 //! destination.
 //!
 //! The local server answers through `omnigraph_server::start_local`, behind a
@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use clap::Args;
 use color_eyre::Result;
-use omnigraph_api_types::ErrorCode;
+use omnigraph_api_types::{
+    ErrorCode, OutcomeAction, OutcomeEffects, OutcomeExecution, OutcomeOutput,
+};
 use omnigraph_server::{
     AppState, LocalAccess, LocalBinding, LocalOpenError, LocalOptions, LocalScope, ProcessDefaults,
     ServeOutcome,
@@ -22,6 +24,7 @@ use omnigraph_server::{
 use serde::Serialize;
 
 use crate::app::Completion;
+use crate::commands::local::output::InternalSchemaOutput;
 use crate::helpers::CliRefusal;
 use crate::local_servers::{CliIdentity, Destination, RECORD_FORMAT, Record, Records};
 use crate::operator::InvocationConfig;
@@ -35,8 +38,9 @@ const ELECTION_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Args)]
 pub(crate) struct ServeArgs {
-    /// Serve read-write: changes, branch controls and commit controls, as
-    /// the actor `--as` or `operator.actor` names.
+    /// Ask for a read-write local server, acting as the actor `--as` or
+    /// `operator.actor` names. Not available yet: it refuses with
+    /// local_server_read_write_unavailable.
     #[arg(long)]
     pub(crate) write: bool,
     /// Attach to the live local server for this destination instead of
@@ -153,7 +157,50 @@ fn check_reuse(record: &Record, args: &ServeArgs, scope: &str, actor: Option<&st
             ),
         ));
     }
+    // The live server opened its graphs with its own build. A client reusing
+    // it gets that build's storage behavior, the formats it opens and the
+    // stamp its publications write, so any difference from this CLI's refuses,
+    // as does a record that names no formats.
+    let formats = InternalSchemaOutput::current();
+    if record.cli.internal_schema != Some(formats) {
+        return Err(CliRefusal::report(
+            ErrorCode::LocalServerCliIncompatible,
+            format!(
+                "the live local server for {} reports {}, and this CLI reports {}",
+                record.root,
+                record
+                    .cli
+                    .internal_schema
+                    .map_or_else(|| "no storage formats".to_string(), |theirs| theirs.line()),
+                formats.line()
+            ),
+        ));
+    }
     Ok(())
+}
+
+/// Every refusal `serve` returns precedes any use of the local server: no
+/// client holds its token before its record is published, and a start that
+/// fails after the server started releases it first. So a refusal ran
+/// nothing and changed nothing, and only `local_server_starting` is worth
+/// repeating unchanged. A refusal wrapped by a release that was not clean is
+/// not the whole failure and states no outcome.
+fn with_refusal_outcome(mut error: color_eyre::Report) -> color_eyre::Report {
+    if error.chain().nth(1).is_some() {
+        return error;
+    }
+    if let Some(refusal) = error.downcast_mut::<CliRefusal>() {
+        refusal.outcome = Some(OutcomeOutput {
+            execution: OutcomeExecution::NotStarted,
+            effects: OutcomeEffects::None,
+            action: if refusal.code == ErrorCode::LocalServerStarting {
+                OutcomeAction::Retry
+            } else {
+                OutcomeAction::Refresh
+            },
+        });
+    }
+    error
 }
 
 /// End a local server that never served, so a cluster's serving admission is
@@ -174,6 +221,19 @@ async fn release_unserved(
 }
 
 pub(crate) async fn run_serve(
+    input: &InvocationConfig,
+    as_actor: Option<&str>,
+    args: ServeArgs,
+    stdout_is_terminal: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Completion> {
+    serve(input, as_actor, args, stdout_is_terminal, stdout, stderr)
+        .await
+        .map_err(with_refusal_outcome)
+}
+
+async fn serve(
     input: &InvocationConfig,
     as_actor: Option<&str>,
     args: ServeArgs,
@@ -361,5 +421,40 @@ pub(crate) async fn run_serve(
     match outcome? {
         ServeOutcome::Clean => Ok(Completion::success()),
         ServeOutcome::Uncertain => Ok(Completion::exit(crate::EXIT_OUTCOME_UNKNOWN)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refusal ran nothing, and only a start still in progress is worth
+    /// repeating unchanged. A refusal wrapped by an unclean release states no
+    /// outcome.
+    #[test]
+    fn a_serve_refusal_states_that_nothing_ran() {
+        let outcome = |error: color_eyre::Report| {
+            crate::error_output_of(&with_refusal_outcome(error)).and_then(|output| output.outcome)
+        };
+        let refusal = |code| CliRefusal::report(code, "refused");
+        assert_eq!(
+            outcome(refusal(ErrorCode::LocalServerExists)),
+            Some(OutcomeOutput {
+                execution: OutcomeExecution::NotStarted,
+                effects: OutcomeEffects::None,
+                action: OutcomeAction::Refresh,
+            })
+        );
+        assert_eq!(
+            outcome(refusal(ErrorCode::LocalServerStarting)).map(|outcome| outcome.action),
+            Some(OutcomeAction::Retry)
+        );
+        assert_eq!(
+            outcome(
+                refusal(ErrorCode::LocalServerRecordsUnsafe)
+                    .wrap_err("the local server's start failed, and its admission was retained")
+            ),
+            None
+        );
     }
 }

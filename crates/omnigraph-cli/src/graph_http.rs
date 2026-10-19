@@ -176,6 +176,21 @@ impl RequestTarget {
     pub(crate) fn depth(&self) -> usize {
         self.segments.len()
     }
+
+    /// The endpoint and path this target is matched by, in one spelling:
+    /// the host as the URL parser folds it, the default port filled in and
+    /// no trailing slash.
+    pub(crate) fn canonical(&self) -> String {
+        let path = self.segments.join("/");
+        match &self.endpoint {
+            Endpoint::Tcp { scheme, host, port } => match port {
+                Some(port) => format!("{scheme}://{host}:{port}/{path}"),
+                None => format!("{scheme}://{host}/{path}"),
+            },
+            #[cfg(unix)]
+            Endpoint::Unix(socket) => format!("unix:{}:/{path}", socket.display()),
+        }
+    }
 }
 
 /// `unix:///absolute/path.sock`: no host, port, user, query or fragment, and

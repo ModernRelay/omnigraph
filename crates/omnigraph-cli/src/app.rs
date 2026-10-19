@@ -297,6 +297,7 @@ pub(crate) fn error_output_of(error: &color_eyre::Report) -> Option<ErrorOutput>
     if let Some(refusal) = error.downcast_ref::<crate::helpers::CliRefusal>() {
         let mut output = ErrorOutput::message(refusal.message.clone());
         output.code = Some(refusal.code);
+        output.outcome = refusal.outcome;
         return Some(output);
     }
     let diagnostic = if let Some(engine) = error.downcast_ref::<omnigraph::error::OmniError>() {

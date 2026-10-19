@@ -611,7 +611,7 @@ disarms the watchdog; that release waits for every other clone of the state.
 Dropping an unserved `LocalServing` keeps the admission. Neither checks a
 request's `Host` or `Origin`: a caller a browser can reach adds that guard in
 `extend` (an exact loopback `Host`, a refused `Origin`, no CORS header and
-`Cross-Origin-Resource-Policy: same-origin`), as `omnigraph serve` does.
+`Cross-Origin-Resource-Policy: same-origin`).
 `install_log_subscriber(writer)` installs the `init_tracing` filter on another
 writer.
 

@@ -190,6 +190,12 @@ impl LocalServer {
     }
 }
 
+/// The outcome of every `serve` refusal but `local_server_starting`, which
+/// says to retry.
+fn not_started() -> Value {
+    json!({"execution": "not_started", "effects": "none", "action": "refresh"})
+}
+
 fn json_of(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
@@ -272,10 +278,12 @@ fn a_read_only_local_server_serves_its_target_behind_the_loopback_guard() {
     assert_eq!(status, 403, "{body}");
     assert!(body.contains("read-only"), "{body}");
 
-    // One local server per destination.
+    // One local server per destination. A refusal ran nothing.
     let refused = fixture.run(&["serve", "--target", "local", "--json"]);
     assert_eq!(refused.status.code(), Some(1));
-    assert_eq!(json_of(&refused)["code"], "local_server_exists");
+    let refused = json_of(&refused);
+    assert_eq!(refused["code"], "local_server_exists");
+    assert_eq!(refused["outcome"], not_started());
     let reused = fixture.run(&["serve", "--target", "local", "--reuse", "--json"]);
     assert!(reused.status.success(), "{reused:?}");
     let reused = json_of(&reused);
@@ -286,6 +294,40 @@ fn a_read_only_local_server_serves_its_target_behind_the_loopback_guard() {
         "serve", "--target", "local", "--reuse", "--write", "--as", "act-me", "--json",
     ]);
     assert_eq!(json_of(&refused)["code"], "local_server_access_mismatch");
+
+    // The record names the HTTP contract and storage formats of the CLI that
+    // started it, and a reuse by a CLI that differs in either refuses.
+    let version = json_of(&fixture.run(&["version", "--json"]));
+    let original = std::fs::read(record_path(&server)).unwrap();
+    let started: Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(started["cli"]["http_contract"], version["http_contract"]);
+    assert_eq!(
+        started["cli"]["internal_schema"],
+        version["internal_schema"]
+    );
+    let writes = version["internal_schema"]["writes"].as_u64().unwrap();
+    for (field, value) in [
+        ("http_contract", json!("0.0")),
+        (
+            "internal_schema",
+            json!({"writes": writes + 1, "serves": version["internal_schema"]["serves"]}),
+        ),
+        ("internal_schema", Value::Null),
+    ] {
+        let mut altered = started.clone();
+        if value.is_null() {
+            altered["cli"].as_object_mut().unwrap().remove(field);
+        } else {
+            altered["cli"][field] = value;
+        }
+        std::fs::write(record_path(&server), serde_json::to_vec(&altered).unwrap()).unwrap();
+        let refused = fixture.run(&["serve", "--target", "local", "--reuse", "--json"]);
+        assert_eq!(refused.status.code(), Some(1), "{field}: {refused:?}");
+        let refused = json_of(&refused);
+        assert_eq!(refused["code"], "local_server_cli_incompatible", "{field}");
+        assert_eq!(refused["outcome"], not_started(), "{field}");
+    }
+    std::fs::write(record_path(&server), &original).unwrap();
 
     // The target listing names it.
     let listing = json_of(&fixture.run(&["target", "list", "--json"]));
@@ -358,7 +400,9 @@ fn serve_refuses_what_it_cannot_serve_before_opening_anything() {
     ] {
         let refused = fixture.run(args);
         assert_eq!(refused.status.code(), Some(1), "{args:?}: {refused:?}");
-        assert_eq!(json_of(&refused)["code"], code, "{args:?}: {refused:?}");
+        let refused = json_of(&refused);
+        assert_eq!(refused["code"], code, "{args:?}: {refused}");
+        assert_eq!(refused["outcome"], not_started(), "{args:?}: {refused}");
     }
     assert!(
         !Path::new(&fixture.records).exists()
@@ -367,6 +411,36 @@ fn serve_refuses_what_it_cannot_serve_before_opening_anything() {
                 .all(|entry| !entry.unwrap().path().to_string_lossy().ends_with(".json")),
         "a refused start leaves no record"
     );
+
+    // No start reached the records directory, so none exists: no local server
+    // has run, and the listing says so.
+    assert!(!fixture.records.exists());
+    let local_servers = |listing: &Value| {
+        listing["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| target["name"] == "local")
+            .unwrap()
+            .get("local_servers")
+            .cloned()
+    };
+    let listing = json_of(&fixture.run(&["target", "list", "--json"]));
+    assert_eq!(local_servers(&listing), Some(json!([])), "{listing}");
+    // A directory others can read is unsafe: the listing cannot know, so it
+    // omits the field, and a start refuses before serving.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir(&fixture.records).unwrap();
+        std::fs::set_permissions(&fixture.records, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let listing = json_of(&fixture.run(&["target", "list", "--json"]));
+    assert_eq!(local_servers(&listing), None, "{listing}");
+    let refused = fixture.run(&["serve", "--target", "local", "--json"]);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let refused = json_of(&refused);
+    assert_eq!(refused["code"], "local_server_records_unsafe", "{refused}");
+    assert_eq!(refused["outcome"], not_started(), "{refused}");
 }
 
 #[test]

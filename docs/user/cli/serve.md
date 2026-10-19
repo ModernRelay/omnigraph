@@ -59,14 +59,17 @@ standalone graph, the target's `default_graph` for a cluster root, which may be
 absent). `binding` is the digest of the target's binding. `omnigraph version
 --json` reports this line's version as `protocols.serve`.
 
-A start that fails before its ready line leaves no record and exits 1; a
-refusal names its `code`, on stdout under `--json`.
+A start that fails before its ready line leaves no record and exits 1. Under
+`--json` a refusal prints its `code` on stdout with an `outcome` of
+`not_started` and no effects; its `action` is `retry` for
+`local_server_starting` and `refresh` otherwise.
 
 ## Records and reuse
 
 Every running local server has a record: a JSON file, readable only by its
 account, naming its id, URL, token, scope, root, access, actor, process id and
-the CLI that started it. A same-account client attaches by reading it.
+the CLI that started it, with the HTTP contract it speaks and the storage
+formats it writes and serves. A same-account client attaches by reading it.
 Records live in a directory only the account may use:
 
 | Platform | Directory |
@@ -79,11 +82,16 @@ refuses there with `local_server_records_unsafe`.
 
 `OMNIGRAPH_LOCAL_SERVERS_DIR` names another directory. A directory another
 account owns, or one with group or other access, refuses with
-`local_server_records_unsafe`. `omnigraph version --json` reports the record
-format as `protocols.local_server_record`.
+`local_server_records_unsafe`. So does a machine whose host identifier cannot be
+read (`gethostuuid` on macOS, `/etc/machine-id` or `/var/lib/dbus/machine-id` on
+Linux): a record names its machine, so that a home directory shared with
+another machine never sends a client to that machine's port or removes its
+record. `omnigraph version --json` reports the record format as
+`protocols.local_server_record`.
 
 Each record is held by its process for as long as it runs. A record whose
 process is gone, killed included, is not live: readers ignore it and remove it.
+A record without its lock file is not live either, and readers leave it.
 
 There is at most one live local server per destination, which is the target's
 scope and its root on this machine. A second start for the same destination
@@ -95,7 +103,7 @@ exits 0, unless that server cannot serve what this start asks for:
 |---|---|
 | `local_server_access_mismatch` | `--write` asks for a read-write server and the live one is read-only |
 | `local_server_actor_mismatch` | The live server of a cluster root acts as another actor |
-| `local_server_cli_incompatible` | The live server speaks another HTTP contract than this CLI |
+| `local_server_cli_incompatible` | The live server speaks another HTTP contract, or writes or serves other storage formats, than this CLI |
 
 Starts of one destination are serialized: a start waits up to 60 seconds for
 another start of it to publish its record, then refuses with

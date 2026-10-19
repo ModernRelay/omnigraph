@@ -11,8 +11,9 @@
 The cluster control plane manages a whole deployment —
 graphs, schemas, stored queries, Cedar policies — as **declared files in one
 directory**, converged Terraform-style. It is the **only way to serve** a
-graph (the server is cluster-only); the data-plane operations in the other
-references work against the cluster's graphs unchanged.
+graph to others (`omnigraph-server` is cluster-only; `omnigraph serve` serves a
+direct target on loopback to this account alone); the data-plane operations in
+the other references work against the cluster's graphs unchanged.
 
 ## The model
 

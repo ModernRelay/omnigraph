@@ -63,6 +63,7 @@ pub(crate) async fn run_optimize(
         scope.graph,
         uri,
         "optimize",
+        true,
         stderr,
     )
     .await?;
@@ -89,6 +90,7 @@ pub(crate) async fn run_full_text_rebuild(
         scope.graph,
         uri,
         "rebuild-full-text-indexes",
+        true,
         stderr,
     )
     .await?;
@@ -138,6 +140,7 @@ pub(crate) async fn run_repair(
         scope.graph,
         uri,
         "repair",
+        true,
         stderr,
     )
     .await?;
@@ -183,6 +186,7 @@ pub(crate) async fn run_cleanup(
         scope.graph,
         uri,
         "cleanup",
+        true,
         stderr,
     )
     .await?;

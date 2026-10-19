@@ -1879,6 +1879,13 @@ impl AccessAction {
         AccessAction::CommitDrop,
         AccessAction::InvokeQuery,
     ];
+
+    /// Whether the report decides this action from `branch` into
+    /// `target_branch` (`branch_create`, `branch_merge`), rather than on
+    /// `branch` alone.
+    pub fn is_transition(self) -> bool {
+        access_slot(self.into()) == Some(AccessSlot::Transition)
+    }
 }
 
 /// Where the access report puts a named branch for an action: the slot of
@@ -3215,6 +3222,14 @@ mod tests {
                 "{access:?} is reported but has no slot"
             );
         }
+        let transitions: Vec<AccessAction> = AccessAction::ALL
+            .into_iter()
+            .filter(|access| access.is_transition())
+            .collect();
+        assert_eq!(
+            transitions,
+            [AccessAction::BranchCreate, AccessAction::BranchMerge]
+        );
     }
 
     #[test]

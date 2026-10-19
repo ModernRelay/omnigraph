@@ -67,8 +67,9 @@ When a command names no address and no profile, `defaults.target` applies.
 
 A direct graph target serves graph commands and direct maintenance; a
 cluster-root target serves direct maintenance as `--cluster` does, and `queries`
-and `policy`; a server target serves graph and served commands. `schema apply`,
-`schema upgrade-system-columns` and `upgrade` take only a direct graph target.
+and `policy`; a server target serves graph and served commands. `schema plan`,
+`schema apply`, `schema upgrade-system-columns` and `upgrade` take only a direct
+graph target.
 A command that cannot use the selected target's kind refuses it with
 `target_kind_unsupported`, and refuses a profile of that kind too. `queries` and
 `policy` select their cluster by the same rules as every other command, and
@@ -126,11 +127,23 @@ with `--target-branch` too `branch_create` and `branch_merge` from one into the
 other. A server target asks the server's
 [access route](../operations/policy.md#learn-your-access) (`source: server`),
 with the target's token. For direct storage the CLI decides itself
-(`source: direct`) for the actor `--as` or `operator.actor` names: a cluster
-graph by its applied policy, which allows nothing without an actor, and a
-standalone graph, which carries no policy, allows every action, as direct writes
-do. A cluster graph the cluster does not apply refuses with `not_found`, and
-one it quarantined with `graph_unavailable`, as a server refuses them. It also
+(`source: direct`) for the actor `--as` or `operator.actor` names:
+
+- A cluster graph, addressed by its cluster or by its store
+  (`<root>/graphs/<id>.omni`), answers by the bundle the cluster applies to it.
+  With a bundle, nothing is allowed without an actor. With none, every action is
+  allowed, with or without an actor. A graph the cluster does not apply refuses
+  with `not_found`, and one it quarantined with `graph_unavailable`, as a server
+  refuses them. A graph two bundles bind, a ledger no server starts from, also
+  refuses with `graph_unavailable`.
+- A standalone graph carries no policy, so once its store opens every action is
+  allowed, as direct writes do; its `graph_id` is `default`. A store that holds
+  no graph refuses with `not_found`.
+
+An action listed for a branch is one the policy allows there, not one the
+branch supports: `schema_apply` on a branch other than `main` does not make
+schema apply possible there
+([learn your access](../operations/policy.md#learn-your-access)). `access` also
 accepts `--server`, `--store`, `--cluster` and `--profile`.
 
 ## Listing and editing targets
@@ -148,8 +161,9 @@ request: each target's address, `default_graph`, `auth` (`token` or
 `anonymous`), `credential` owner and `binding`, a digest of where the target
 points and how it authenticates, which changes when either does; a direct
 target's storage is digested in its normalized spelling, so `/data/g` and
-`file:///data/g` digest alike. A direct target carries `local_servers`, empty
-today. An incomplete entry is listed with its `error`, and its address without
+`file:///data/g` digest alike. A direct target carries `local_servers`, the
+live local servers of its destination, absent when their records cannot be read
+safely. An incomplete entry is listed with its `error`, and its address without
 user, password, query or fragment. Aliases are not listed, since they still name
 `servers:` entries. `target show` prints one target in the same shape.
 
