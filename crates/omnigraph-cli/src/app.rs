@@ -43,7 +43,8 @@ pub(crate) fn sync_dir(_dir: &std::path::Path) -> io::Result<()> {
 }
 
 /// Invoke the CLI without installing process hooks or terminating the caller.
-/// Clap keeps its original output stream and exit status for help and refusals.
+/// Clap keeps its original output stream for help and refusals; a refused
+/// command line exits 64.
 pub async fn run_from<I, T>(args: I) -> Result<Completion>
 where
     I: IntoIterator<Item = T>,
@@ -84,7 +85,12 @@ async fn execute(
     let ParsedInvocation {
         cli, mut machine, ..
     } = parsed;
-    let observe = command_outcome::kind(&cli);
+    let kind = command_outcome::kind(&cli);
+    // A served cluster command reports its own failures; its requests are
+    // observed only so that a refused `--as` assertion exits as a condition.
+    let observe = kind.or_else(|| {
+        command_outcome::observed_unclassified(&cli).then_some(command_outcome::CommandKind::Write)
+    });
     // Rendering runs inside observation. The completion path retains that
     // same evidence when flushing, including after a dispatched write.
     // The legacy dispatch future contains every command variant. Keep that
@@ -103,12 +109,20 @@ async fn execute(
     } else {
         (admission::scope(invocation).await, None)
     };
-    finish(result, evidence, machine, stdout, stderr)
+    let (evidence, observed) = if kind.is_some() {
+        (evidence, None)
+    } else {
+        (None, evidence)
+    };
+    finish(result, evidence, observed, machine, stdout, stderr)
 }
 
+/// `evidence` classifies a data command's failure; `observed` only decides
+/// whether another command's refused `--as` assertion exits 4.
 fn finish(
     result: Result<Completion>,
     evidence: Option<command_outcome::Evidence>,
+    observed: Option<command_outcome::Evidence>,
     machine: Option<MachineErrors>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -186,6 +200,9 @@ fn finish(
         }
         return Ok(Completion::exit(failure.exit));
     }
+    let actor_refused = observed
+        .as_ref()
+        .is_some_and(|observed| command_outcome::actor_assertion_refused(&error, observed));
     if let Some(output) = error_output_of(&error) {
         let refusal = RemoteRefusalOutput {
             output: &output,
@@ -203,10 +220,18 @@ fn finish(
                     writeln!(stderr, "{}", render_diagnostic(&output, diagnostic))?;
                     stderr.flush()?;
                 }
+                None if actor_refused => {
+                    writeln!(stderr, "{}", output.error)?;
+                    stderr.flush()?;
+                }
                 None => return Err(error),
             },
         }
-        return Ok(Completion::exit(1));
+        return Ok(Completion::exit(if actor_refused {
+            EXIT_PRECONDITION_FAILED
+        } else {
+            1
+        }));
     }
     if let Some(contract) = error.downcast_ref::<graph_http::ApiContractError>() {
         match machine {
@@ -346,12 +371,12 @@ async fn run(
         Command::Login {
             name, token, json, ..
         } => {
-            let name = commands::targets::login_owner(&operator, name, stderr)?;
-            commands::local::run_login(&operator, name, token, json, input.reader, stdout, stderr)?;
+            let key = commands::targets::login_owner(&operator, name, stderr)?;
+            commands::local::run_login(&operator, key, token, json, input.reader, stdout, stderr)?;
         }
         Command::Logout { name, json, .. } => {
-            let name = commands::targets::login_owner(&operator, name, stderr)?;
-            commands::local::run_logout(&operator, name, json, stdout)?;
+            let key = commands::targets::login_owner(&operator, name, stderr)?;
+            commands::local::run_logout(&operator, key, json, stdout)?;
         }
         Command::Target { command } => {
             commands::targets::run_target(&operator, command, input.reader, stdout, stderr)?

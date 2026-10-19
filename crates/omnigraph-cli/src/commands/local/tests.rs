@@ -22,7 +22,7 @@ fn login_reads_one_line_and_explicit_token_does_not_read_stdin() {
     let mut stderr = Vec::new();
     run_login(
         &operator,
-        "prod".into(),
+        LoginKey::Server("prod".into()),
         None,
         true,
         &mut stdin,
@@ -51,7 +51,7 @@ fn login_reads_one_line_and_explicit_token_does_not_read_stdin() {
     }
     run_login(
         &operator,
-        "prod".into(),
+        LoginKey::Server("prod".into()),
         Some(" explicit-token ".into()),
         false,
         &mut Unreadable,
@@ -80,7 +80,7 @@ fn invalid_login_input_precedes_config_and_keeps_credentials_unchanged() {
         let mut stderr = Vec::new();
         let error = run_login(
             &operator,
-            "prod".into(),
+            LoginKey::Server("prod".into()),
             None,
             false,
             &mut Cursor::new(bytes),
@@ -104,7 +104,7 @@ fn login_and_logout_output_failures_preserve_the_completed_credential_change() {
     for json in [false, true] {
         let error = run_login(
             &operator,
-            "prod".into(),
+            LoginKey::Server("prod".into()),
             Some("stored".into()),
             json,
             &mut io::empty(),
@@ -122,7 +122,13 @@ fn login_and_logout_output_failures_preserve_the_completed_credential_change() {
                 .as_deref(),
             Some("stored")
         );
-        let error = run_logout(&operator, "prod".into(), json, &mut ClosedOutput).unwrap_err();
+        let error = run_logout(
+            &operator,
+            LoginKey::Server("prod".into()),
+            json,
+            &mut ClosedOutput,
+        )
+        .unwrap_err();
         assert_eq!(
             error.downcast_ref::<io::Error>().unwrap().kind(),
             io::ErrorKind::BrokenPipe

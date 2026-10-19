@@ -2828,6 +2828,80 @@ fn remote_json_errors_preserve_server_codes_and_details() {
     );
 }
 
+/// A served load its policy refuses ran nothing, so it exits 1 with
+/// `not_started` whether or not `--from` would have forked its branch: the
+/// server authorizes the load, the fork included, before its write. An
+/// embedded write carries no cluster policy; `command_outcome`'s tests own
+/// the embedded projection of an engine policy refusal.
+#[test]
+fn a_policy_refused_served_load_reports_not_started() {
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
+    let rows = cluster.path().join("rows.jsonl");
+    fs::write(
+        &rows,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Refused\",\"age\":1}}\n",
+    )
+    .unwrap();
+    // act-bruno may change an unprotected branch but neither create a branch
+    // nor change `main`.
+    let load = |branch: &str| {
+        vec![
+            "load".to_string(),
+            "--mode".into(),
+            "append".into(),
+            "--data".into(),
+            rows.to_string_lossy().into_owned(),
+            "--branch".into(),
+            branch.into(),
+            "--from".into(),
+            "main".into(),
+            "--json".into(),
+        ]
+    };
+    let assert_refused = |arm: &str, output: &std::process::Output| {
+        assert_eq!(output.status.code(), Some(1), "{arm}: {output:?}");
+        let body = parse_stdout_json(output);
+        assert_eq!(body["code"], "forbidden", "{arm}: {body}");
+        assert_eq!(
+            body["outcome"],
+            json!({"execution":"not_started","effects":"none","action":"refresh"}),
+            "{arm}: {body}"
+        );
+    };
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-bruno":"bruno-token"}"#,
+        )],
+    );
+    let operator = KeyedServer::new(&server.base_url);
+    for branch in ["fresh", "main"] {
+        let output = cli()
+            .envs(operator.env("bruno-token"))
+            .args(load(branch))
+            .args(["--server", &server.base_url, "--graph", "knowledge"])
+            .output()
+            .unwrap();
+        assert_refused(&format!("served {branch}"), &output);
+    }
+    // The refused fork left no branch.
+    let branches = parse_stdout_json(&output_success(
+        cli()
+            .envs(operator.env("bruno-token"))
+            .args(["branch", "list", "--json"])
+            .args(["--server", &server.base_url, "--graph", "knowledge"]),
+    ));
+    assert!(
+        !branches["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "fresh"),
+        "{branches}"
+    );
+}
+
 /// Whole-command outcome classification needs real CLI processes and a wire
 /// census; row/error GQT expectations cannot observe exits or resubmission.
 #[test]
@@ -3637,7 +3711,8 @@ fn server_scope_refuses_a_non_server_scheme_issue_979() {
 fn as_on_a_served_write_asserts_the_actor() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
     use omnigraph_api_types::{
-        EXPECT_ACTOR_HEADER, HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
+        EXPECT_ACTOR_ASSERTION, EXPECT_ACTOR_HEADER, HTTP_API_ASSERTIONS_HEADER as ASSERTIONS,
+        HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
     };
 
     // A served write resolves its actor from the bearer token. `--as` rides
@@ -3658,7 +3733,10 @@ fn as_on_a_served_write_asserts_the_actor() {
         let server = IntentApiFixture::new(vec![
             IntentReply {
                 status: 200,
-                headers: vec![(HEADER.into(), CONTRACT.into())],
+                headers: vec![
+                    (HEADER.into(), CONTRACT.into()),
+                    (ASSERTIONS.into(), EXPECT_ACTOR_ASSERTION.into()),
+                ],
                 body: vec![],
             },
             IntentReply {
@@ -3692,6 +3770,31 @@ fn as_on_a_served_write_asserts_the_actor() {
             "{write:?}: {write_request:?}"
         );
         server.assert_complete();
+
+        // A server that does not list the assertion would ignore the header
+        // and run the write as the credential's actor, so nothing is sent.
+        let older = IntentApiFixture::new(vec![IntentReply {
+            status: 200,
+            headers: vec![(HEADER.into(), CONTRACT.into())],
+            body: vec![],
+        }]);
+        let output = cli()
+            .args(write)
+            .args(["--server", &older.origin, "--graph", "knowledge"])
+            .args(["--as", "act-nope", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{write:?}: {output:?}");
+        let error = parse_stdout_json(&output);
+        assert_eq!(error["code"], "api_contract_mismatch", "{write:?}: {error}");
+        assert_eq!(error["request_dispatched"], false, "{write:?}: {error}");
+        assert!(
+            error["error"].as_str().unwrap().contains("--as"),
+            "{write:?}: {error}"
+        );
+        let requests = older.requests();
+        assert_eq!(requests.len(), 1, "{write:?}: only discovery: {requests:?}");
+        older.assert_complete();
     }
 }
 
@@ -3699,7 +3802,7 @@ fn as_on_a_served_write_asserts_the_actor() {
 /// `--as` for them as it does for `mutate -e 'commit publish "<id>"'`. A
 /// publication records no publisher: the published commit keeps the actor
 /// and timestamp of the write that created it. The `commit` reads refuse
-/// `--as`; `as_on_a_served_write_is_rejected` owns the served refusal.
+/// `--as`; `as_on_a_served_write_asserts_the_actor` owns the served assertion.
 #[test]
 fn commit_publish_and_drop_take_as_on_a_direct_graph_issue_1023() {
     let temp = tempdir().unwrap();
@@ -5570,10 +5673,12 @@ fn targets_address_commands_and_carry_only_their_owners_token() {
             "target_config_version: 1\ndefaults:\n  target: local\ntargets:\n  \
              local:\n    kind: direct\n    scope: graph\n    uri: '{}'\n  \
              served:\n    kind: server\n    endpoint: '{}'\n    credential: served-owner\n    default_graph: knowledge\n  \
-             open:\n    kind: server\n    endpoint: '{}'\n    auth: anonymous\n    default_graph: knowledge\n",
+             open:\n    kind: server\n    endpoint: '{}'\n    auth: anonymous\n    default_graph: knowledge\n  \
+             ops:\n    kind: direct\n    scope: root\n    uri: '{}'\n    default_graph: knowledge\n",
             graph.to_string_lossy(),
             served.origin,
-            open.origin
+            open.origin,
+            temp.path().join("cluster").to_string_lossy(),
         ),
     )
     .unwrap();
@@ -5639,6 +5744,48 @@ fn targets_address_commands_and_carry_only_their_owners_token() {
         String::from_utf8_lossy(&refused.stderr).contains("--target"),
         "{refused:?}"
     );
+
+    // A command that addresses one standalone graph refuses a cluster-root
+    // target by its kind, named or as the default, rather than dropping it.
+    let schema = temp.path().join("unused.pg");
+    fs::write(&schema, "node Thing {\n  name: String @key\n}\n").unwrap();
+    let schema = schema.to_string_lossy().into_owned();
+    // `upgrade` and `schema upgrade-system-columns` report no outcome yet.
+    let refuse_root = |args: &[&str], outcome: bool| {
+        let refused = output_failure(cli_home().args(args));
+        assert_eq!(refused.status.code(), Some(1), "{args:?}: {refused:?}");
+        let body = parse_stdout_json(&refused);
+        assert_eq!(body["code"], "target_kind_unsupported", "{args:?}: {body}");
+        if outcome {
+            assert_eq!(body["outcome"]["execution"], "not_started", "{body}");
+        }
+    };
+    refuse_root(
+        &[
+            "schema", "apply", "--target", "ops", "--schema", &schema, "--json",
+        ],
+        true,
+    );
+    refuse_root(&["upgrade", "--target", "ops", "--check", "--json"], false);
+    refuse_root(
+        &[
+            "schema",
+            "upgrade-system-columns",
+            "--target",
+            "ops",
+            "--check",
+            "--json",
+        ],
+        false,
+    );
+    let config = fs::read_to_string(home.path().join("config.yaml")).unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        config.replace("  target: local\n", "  target: ops\n"),
+    )
+    .unwrap();
+    refuse_root(&["schema", "apply", "--schema", &schema, "--json"], true);
+    assert!(!temp.path().join("cluster").exists());
 }
 
 /// `target add` and `remove` change one entry's lines, keep the rest of the
@@ -5690,6 +5837,7 @@ fn target_commands_edit_one_entry_and_keep_the_rest_of_the_file() {
         .collect();
     assert_eq!(names, ["local", "staging"]);
     assert_eq!(listing["targets"][0]["local_servers"], json!([]));
+    assert!(listing.get("aliases").is_none(), "{listing}");
     assert!(
         listing["targets"][1]["binding"]
             .as_str()
@@ -5717,10 +5865,37 @@ fn target_commands_edit_one_entry_and_keep_the_rest_of_the_file() {
             "target_invalid",
         ),
         (&["remove", "missing", "--json"][..], None, "target_unknown"),
+        // An endpoint holds no secret and is a whole server URL; a cloud
+        // store cannot be pinned, so neither is a complete binding.
+        (
+            &["add", "leaky", "--json"][..],
+            Some(
+                r#"{"kind":"server","endpoint":"https://user:secret-token@h.example/g","auth":"anonymous"}"#,
+            ),
+            "target_invalid",
+        ),
+        (
+            &["add", "hostless", "--json"][..],
+            Some(r#"{"kind":"server","endpoint":"https://","auth":"anonymous"}"#),
+            "target_invalid",
+        ),
+        (
+            &["add", "cloud", "--json"][..],
+            Some(r#"{"kind":"direct","scope":"graph","uri":"s3://bucket/graph"}"#),
+            "target_invalid",
+        ),
     ] {
+        let before = fs::read_to_string(&path).unwrap();
         let refused = target(args, stdin);
         assert_eq!(refused.status.code(), Some(1), "{args:?}: {refused:?}");
         assert_eq!(json(&refused)["code"], code, "{args:?}: {refused:?}");
+        for stream in [&refused.stdout, &refused.stderr] {
+            assert!(
+                !String::from_utf8_lossy(stream).contains("secret-token"),
+                "{args:?}: {refused:?}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "{args:?}");
     }
 
     // The default target cannot be removed.
@@ -5808,9 +5983,30 @@ fn login_and_credential_get_follow_the_target_credential_owner() {
         command
     };
 
-    output_success(run(&["login", "--target", "staging", "--json"]).write_stdin("stored-token\n"));
+    // The target binds its owner to its endpoint, so the owner is declared
+    // and no `servers:` entry is suggested: one would bind it twice.
+    let login = output_success(
+        run(&["login", "--target", "staging", "--json"]).write_stdin("stored-token\n"),
+    );
+    let report = parse_stdout_json(&login);
+    assert_eq!(report["target"], "staging", "{report}");
+    assert_eq!(report["owner"], "staging-owner", "{report}");
+    assert_eq!(report["declared"], true, "{report}");
+    assert!(report.get("server").is_none(), "{report}");
+    assert!(
+        !String::from_utf8_lossy(&login.stderr).contains("servers:"),
+        "{login:?}"
+    );
     let credentials = fs::read_to_string(home.path().join("credentials")).unwrap();
     assert!(credentials.contains("[staging-owner]"), "{credentials}");
+    // So is the owner named directly.
+    let direct =
+        output_success(run(&["login", "staging-owner", "--json"]).write_stdin("stored-token\n"));
+    assert_eq!(parse_stdout_json(&direct)["declared"], true);
+    assert!(
+        !String::from_utf8_lossy(&direct.stderr).contains("servers:"),
+        "{direct:?}"
+    );
 
     let got = parse_stdout_json(&output_success(&mut run(&[
         "credential",
@@ -5857,7 +6053,11 @@ fn login_and_credential_get_follow_the_target_credential_owner() {
     let refused = output_failure(&mut run(&["credential", "get", "--json"]));
     assert_eq!(parse_stdout_json(&refused)["code"], "target_unknown");
 
-    output_success(&mut run(&["logout", "--target", "staging", "--json"]));
+    let logout = parse_stdout_json(&output_success(&mut run(&[
+        "logout", "--target", "staging", "--json",
+    ])));
+    assert_eq!(logout["target"], "staging", "{logout}");
+    assert_eq!(logout["owner"], "staging-owner", "{logout}");
     let refused = output_failure(&mut run(&[
         "credential",
         "get",

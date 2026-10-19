@@ -97,11 +97,47 @@ fn an_entry_is_a_complete_binding_only_when_its_fields_make_one() {
             "kind: server\nendpoint: https://x\nauth: anonymous\ndefault_graph: 'a/b'",
             "graph",
         ),
+        // An endpoint is a whole server URL that holds no secret.
+        (
+            "kind: server\nendpoint: 'https://user:secret-token@h.example/g'\nauth: anonymous",
+            "no user or password",
+        ),
+        (
+            "kind: server\nendpoint: 'https://h.example/g?access=secret-token'\nauth: anonymous",
+            "no query",
+        ),
+        (
+            "kind: server\nendpoint: 'https://'\nauth: anonymous",
+            "invalid server address",
+        ),
+        // Cloud storage takes its endpoint and account from the environment,
+        // which this format cannot pin, so a cloud target is incomplete.
+        (
+            "kind: direct\nscope: graph\nuri: s3://bucket/graph",
+            "cloud target",
+        ),
+        (
+            "kind: direct\nscope: root\nuri: az://container/root",
+            "cloud target",
+        ),
+        (
+            "kind: direct\nscope: graph\nuri: 'file:///data/g?secret-token'",
+            "no query",
+        ),
     ] {
         let entry: TargetEntry = yaml_serde::from_str(entry).unwrap();
         let refused = entry.binding("t").unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::TargetInvalid), "{refused}");
         assert!(refused.to_string().contains(why), "{why}: {refused}");
+        assert!(!refused.to_string().contains("secret-token"), "{refused}");
+    }
+    // A unix socket endpoint is a server address too.
+    #[cfg(unix)]
+    {
+        let entry: TargetEntry =
+            yaml_serde::from_str("kind: server\nendpoint: unix:///run/og.sock\nauth: anonymous")
+                .unwrap();
+        entry.binding("t").unwrap();
     }
     // An incomplete entry does not block the others, and an unknown field
     // refuses the file.
@@ -239,6 +275,7 @@ fn flags<'a>() -> ScopeFlags<'a> {
         cluster: None,
         graph: None,
         uri: None,
+        reads_root: true,
     }
 }
 
@@ -251,6 +288,7 @@ fn a_target_resolves_to_the_address_its_binding_names() {
         ResolvedScope {
             server: Some("https://staging.example".into()),
             graph: Some("knowledge".into()),
+            target: Some("staging".into()),
             ..Default::default()
         }
     );
@@ -280,6 +318,7 @@ fn a_target_resolves_to_the_address_its_binding_names() {
         .unwrap(),
         ResolvedScope {
             uri: Some("file:///data/graph.omni".into()),
+            target: Some("local".into()),
             ..Default::default()
         }
     );
@@ -296,6 +335,7 @@ fn a_target_resolves_to_the_address_its_binding_names() {
         ResolvedScope {
             cluster: Some("/data/cluster".into()),
             cluster_graph: Some("knowledge".into()),
+            target: Some("ops".into()),
             ..Default::default()
         }
     );
@@ -491,6 +531,19 @@ fn a_binding_digest_names_where_a_target_points_and_nothing_else() {
             .digest(),
         digest("staging")
     );
+    // A direct target's storage is digested as the engine opens it, so two
+    // spellings of one store are one binding.
+    let direct = |uri: &str| {
+        entry(&format!(
+            r#"{{"kind":"direct","scope":"graph","uri":"{uri}"}}"#
+        ))
+        .binding("d")
+        .unwrap()
+        .digest()
+    };
+    assert_eq!(direct("/data/g"), direct("file:///data/g"));
+    assert_eq!(direct("/data/g"), direct("/data/g/"));
+    assert_ne!(direct("/data/g"), direct("/data/h"));
     let listing = list_output(&config);
     assert_eq!(listing.default_target.as_deref(), Some("staging"));
     let local = listing.targets.iter().find(|t| t.name == "local").unwrap();
@@ -502,4 +555,26 @@ fn a_binding_digest_names_where_a_target_points_and_nothing_else() {
         .unwrap();
     assert_eq!(staging.auth, Some("token"));
     assert!(staging.local_servers.is_none());
+}
+
+#[test]
+fn a_listing_holds_no_secret_and_no_alias() {
+    // An incomplete entry is listed with its error, its address without the
+    // secret a complete binding would refuse.
+    let config = parse(&format!(
+        "{TARGETS}  leaky:\n    kind: server\n    endpoint: 'https://user:secret-token@h.example/g?k=secret-token'\n    auth: anonymous\naliases:\n  who:\n    server: dev\n    query: q\nservers:\n  dev:\n    url: https://dev.example\n"
+    ))
+    .unwrap();
+    let listing = serde_json::to_value(list_output(&config)).unwrap();
+    let text = listing.to_string();
+    assert!(!text.contains("secret-token"), "{text}");
+    let leaky = listing["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|target| target["name"] == "leaky")
+        .unwrap();
+    assert!(leaky["error"].is_string(), "{leaky}");
+    assert!(leaky["binding"].is_null(), "{leaky}");
+    assert!(listing.get("aliases").is_none(), "{listing}");
 }

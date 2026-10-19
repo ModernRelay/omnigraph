@@ -244,21 +244,43 @@ pub(crate) fn credential_owner(config: &OperatorConfig, name: &str) -> Result<(S
     }
 }
 
-/// The name `login`/`logout` store under: the server name given, or the
+/// The name `login`/`logout` store a token under.
+pub(crate) enum LoginKey {
+    /// A server name given on the command line.
+    Server(String),
+    /// The `--target` server target and its credential owner.
+    Target { target: String, owner: String },
+}
+
+impl LoginKey {
+    /// The credentials-file section the token is stored under.
+    pub(crate) fn owner(&self) -> &str {
+        match self {
+            Self::Server(name) => name,
+            Self::Target { owner, .. } => owner,
+        }
+    }
+}
+
+/// The key `login`/`logout` store under: the server name given, or the
 /// `--target` server target's credential owner.
 pub(crate) fn login_owner(
     input: &InvocationConfig,
     name: Option<String>,
     stderr: &mut dyn Write,
-) -> Result<String> {
+) -> Result<LoginKey> {
     if let Some(name) = name {
-        return Ok(name);
+        return Ok(LoginKey::Server(name));
     }
     let target = input
         .target()
         .expect("clap requires a server name or --target");
     let config = input.get(stderr)?;
-    credential_owner(config, target).map(|(owner, _)| owner)
+    let (owner, _) = credential_owner(config, target)?;
+    Ok(LoginKey::Target {
+        target: target.to_string(),
+        owner,
+    })
 }
 
 #[derive(Serialize)]

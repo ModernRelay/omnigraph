@@ -5,7 +5,8 @@ use std::time::Duration;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use omnigraph_api_types::{
-    EXPECT_ACTOR_HEADER, ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER,
+    EXPECT_ACTOR_ASSERTION, EXPECT_ACTOR_HEADER, ErrorCode, HTTP_API_ASSERTIONS_HEADER,
+    HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
@@ -68,6 +69,30 @@ impl ServerTransport {
                 }
             },
         }
+    }
+
+    /// A server endpoint as a named target records it: an address
+    /// [`ServerTransport::parse`] accepts that is a whole URL, with no userinfo,
+    /// query or fragment, so the file never holds a secret and the endpoint
+    /// derives the request target its credential is bound to. A literal
+    /// `--server` URL and a `servers:` url are not held to this.
+    pub(crate) fn parse_endpoint(endpoint: &str) -> Result<RequestTarget> {
+        Self::parse(endpoint)?;
+        let url = Url::parse(endpoint).map_err(|_| {
+            color_eyre::eyre::eyre!(
+                "invalid server address: a server address is {SERVER_ADDRESS_SHAPES}"
+            )
+        })?;
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!(
+                "a server endpoint carries no user or password; name the token's `credential` \
+                 owner instead"
+            );
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            bail!("a server endpoint carries no query or fragment");
+        }
+        RequestTarget::of(endpoint, endpoint)
     }
 
     /// The URL a request composed under this root is sent to.
@@ -240,6 +265,17 @@ impl ApiContractError {
         }
     }
 
+    fn assertion_unsupported(status: StatusCode) -> Self {
+        Self {
+            error: format!(
+                "the server does not list {EXPECT_ACTOR_ASSERTION} in {HTTP_API_ASSERTIONS_HEADER}, so it would ignore --as; this request was not sent; upgrade the server or drop --as"
+            ),
+            code: ErrorCode::ApiContractMismatch,
+            http_status: Some(status.as_u16()),
+            request_dispatched: false,
+        }
+    }
+
     fn response(status: StatusCode) -> Self {
         Self {
             error: format!(
@@ -368,6 +404,11 @@ impl GraphHttpClient {
         if !discovery.status().is_success() || !has_contract(&discovery) {
             return Err(ApiContractError::discovery(Some(discovery.status())).into());
         }
+        // An assertion the server would ignore is never sent: the request
+        // would run as the credential's actor whatever `--as` says.
+        if self.expected_actor.is_some() && !enforces(&discovery, EXPECT_ACTOR_ASSERTION) {
+            return Err(ApiContractError::assertion_unsupported(discovery.status()).into());
+        }
         drop(discovery);
         let mut request = request.header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT);
         if let Some(actor) = &self.expected_actor {
@@ -396,6 +437,18 @@ impl GraphHttpClient {
         }
         Ok(response)
     }
+}
+
+/// Whether `response` lists `assertion` among the request assertions its
+/// server enforces.
+fn enforces(response: &Response, assertion: &str) -> bool {
+    response
+        .headers()
+        .get_all(HTTP_API_ASSERTIONS_HEADER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|entry| entry.trim() == assertion)
 }
 
 fn has_contract(response: &Response) -> bool {

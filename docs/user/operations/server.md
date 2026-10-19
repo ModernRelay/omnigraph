@@ -113,14 +113,14 @@ actions remain denied.
 A client that means to act as a particular actor sends
 `Omnigraph-Expect-Actor: <actor>` with any protected request, `/mcp` included.
 The server compares it with the actor the credential resolved to, after
-authentication and the contract check and before graph lookup, body decoding
-or any effect:
-
-a match changes nothing, a mismatch is `412 actor_mismatch` with nothing run (a
-server without authentication resolves no actor), and a repeated or padded
-header is `400 bad_request`. The header only narrows a request; it never
-supplies the actor. The CLI sends it for `--as` on served writes and `cluster
---server` commands.
+authentication and the contract check (`/mcp` has none) and before graph
+lookup, body decoding or any effect: a match changes nothing, a mismatch is `412 actor_mismatch` with
+nothing run (a server without authentication resolves no actor), and a repeated
+or padded header is `400 bad_request`. The header only narrows a request; it
+never supplies the actor. Every response lists `expect-actor` in
+`Omnigraph-Http-Api-Assertions`, since a server that does not would ignore the
+header: the CLI sends it for `--as` on served writes and `cluster --server`
+commands only to a server that lists it, and otherwise refuses before sending.
 
 ### Signed data credentials
 
@@ -340,11 +340,12 @@ resume cursor ([Changes, Diffs and Change Feeds](../branching/changes.md)).
 
 ## Errors and retries
 
-Every error body carries a `code`, its structured details and an `outcome`
-(`execution`, `effects`, `action`); a write whose completion the server could not
-settle is `outcome_unknown` with `execution: unknown`. Admission limits use `429`
-with `Retry-After`; size limits use `413`, and blocked graphs or closed admission
-use `503`. Admitted writes continue after disconnect. See [failure outcomes](troubleshooting.md#failed-data-write-commands).
+Every error body, an unknown route's and a malformed request's included, carries
+a `code`, its structured details and an `outcome` (`execution`, `effects`,
+`action`; see [failure outcomes](troubleshooting.md#failed-data-write-commands)).
+A write the server could not settle is `outcome_unknown`. Admission limits use
+`429` with `Retry-After`, size limits `413`, and blocked graphs or closed
+admission `503`. Admitted writes continue after disconnect.
 
 For TLS, secrets, storage credentials, container examples and Azure admission,
 see [Deployment](../deployment.md).
