@@ -6265,6 +6265,29 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
             "{action}: {local}"
         );
     }
+    // The text names the target branch for the actions decided into it.
+    let text = output_success(cli().env("OMNIGRAPH_HOME", home.path()).args([
+        "access",
+        "--target",
+        "local",
+        "--branch",
+        "main",
+        "--target-branch",
+        "feature",
+    ]));
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        text.contains("\nfrom main into feature: branch_create, branch_merge\n"),
+        "{text}"
+    );
+    let on_main = text
+        .lines()
+        .find(|line| line.starts_with("on main: "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        on_main.contains("change") && !on_main.contains("branch_create"),
+        "{text}"
+    );
 
     // A server target asks its access route, with the target's token.
     let report = parse_stdout_json(&output_success(

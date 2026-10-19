@@ -661,7 +661,7 @@ pub(crate) async fn run_access(
     if args.json {
         return write_json(&report, stdout);
     }
-    let names = |actions: &[omnigraph_api_types::AccessAction]| -> String {
+    let names = |actions: &[&omnigraph_api_types::AccessAction]| -> String {
         let names: Vec<String> = actions
             .iter()
             .map(|action| {
@@ -683,9 +683,22 @@ pub(crate) async fn run_access(
         report.access.actor.as_deref().unwrap_or("(none)")
     )?;
     writeln!(stdout, "graph: {} ({source})", report.access.graph_id)?;
-    writeln!(stdout, "graph-wide: {}", names(&report.access.graph_wide))?;
+    let graph_wide: Vec<_> = report.access.graph_wide.iter().collect();
+    writeln!(stdout, "graph-wide: {}", names(&graph_wide))?;
     if let Some(branch) = &report.access.branch {
-        writeln!(stdout, "on {branch}: {}", names(&report.access.actions))?;
+        let (transitions, on_branch): (Vec<_>, Vec<_>) = report
+            .access
+            .actions
+            .iter()
+            .partition(|action| action.is_transition());
+        writeln!(stdout, "on {branch}: {}", names(&on_branch))?;
+        if let Some(target_branch) = &report.access.target_branch {
+            writeln!(
+                stdout,
+                "from {branch} into {target_branch}: {}",
+                names(&transitions)
+            )?;
+        }
     }
     Ok(())
 }
