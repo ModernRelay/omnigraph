@@ -30,8 +30,8 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-planner` | In-source optimizer/cost tests and `tests/integration/query_plan.rs`, `tests/integration/registry.rs`, `tests/integration/lower_walk.rs`; plan assertions over real snapshots live in GQT | `PlanSource` fixtures for metadata and refusal states |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
 | `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, core, catalog, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |
-| `omnigraph-core` | In-file `#[cfg(test)]` tests (62 today) of the error type, branch names, branch control, Lance clone, metadata, full-text compatibility and instrumentation | Module-local fixtures |
-| `omnigraph-catalog` | In-source tests (52 today): `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
+| `omnigraph-core` | In-file `#[cfg(test)]` tests of the error type, branch names, branch control, Lance clone, metadata, full-text compatibility and instrumentation | Module-local fixtures |
+| `omnigraph-catalog` | In-source tests: `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
@@ -140,7 +140,7 @@ Run this first for every Lance change:
 cargo test -p omnigraph-engine --test lance_surface_guards
 ```
 
-The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, the stock-cleanup sweep of week-old detached files that makes the engine collector mandatory, index coverage and segment ownership, stable row IDs, vector ordering fences, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and replace its negative guard with the native behavior the caller now requires. A persisted layout still needs its own format decision.
+The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, the stock-cleanup sweep of old files used only by detached versions (with the attached manifest timestamp preceding the file and the file preceding the seven-day cutoff), index coverage and segment ownership, stable row IDs, native V2 vector ordering, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and replace its negative guard with the native behavior the caller now requires. A persisted layout still needs its own format decision.
 
 Qualify a dependency bump in both debug and release profiles: upstream unstable
 capabilities can have different gates under `debug_assertions`. Run the native

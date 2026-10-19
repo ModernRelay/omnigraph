@@ -3701,21 +3701,9 @@ query scalars() {
     assert_eq!(scalars().await, unchanged_scalars);
 }
 
-/// MR-920 regression: two sequential `update T set {f:v} where x=y`
-/// invocations against the same row must both succeed. Pre-fix, the
-/// second one failed with `Ambiguous merge inserts are prohibited:
-/// multiple source rows match the same target row on (id = "Alice")`
-/// even though the scan returned exactly one row.
-///
-/// Root cause hypothesis (per MR-920): Lance's
-/// `processed_row_ids: Mutex<HashSet<u64>>`
-/// (`src/dataset/write/merge_insert.rs:2099`) double-processes the
-/// same target row_id against datasets previously rewritten by
-/// merge_insert. `SourceDedupeBehavior::FirstSeen` makes Lance skip
-/// rather than error.
-///
-/// Companion to `consistency.rs::load_merge_repeated_against_overlapping_keys_succeeds`
-/// (PR #98 / Window 1 of the bug class via the load surface).
+/// Two sequential updates to one row must both succeed and retain the second
+/// value. This preserves the mutation regression for lance-format/lance#6877
+/// alongside the repeated merge-load owner in `consistency.rs`.
 #[tokio::test]
 async fn second_sequential_update_on_same_row_succeeds() {
     let dir = tempfile::tempdir().unwrap();

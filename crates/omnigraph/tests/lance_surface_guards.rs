@@ -4936,15 +4936,15 @@ async fn fts_prefilter_changes_unindexed_scores_and_postfilter_keeps_them() {
     );
 }
 
-// --- Guard: late-hydrated KNN ordering by file format --------------------
+// --- Guard: parallel late-hydrated KNN preserves global order -----------
 //
 // Lance 13 carries sorted KNN candidate metadata through V2 row-stream payload
 // hydration, so the final merge preserves global order with parallel output.
-// Legacy V1 TakeExec still drops that metadata and needs one output partition.
-// Pin both paths with full payloads, stable row IDs and multiple output batches.
+// Pin the graph's V2_2 format with full payloads, stable row IDs and multiple
+// output batches.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn flat_knn_late_payload_order_tracks_file_format() {
+async fn flat_knn_v2_late_payload_preserves_order() {
     use arrow_array::types::{Float32Type, Int32Type};
     use datafusion::physical_plan::ExecutionPlanProperties;
 
@@ -4953,88 +4953,64 @@ async fn flat_knn_late_payload_order_tracks_file_format() {
     const ROWS_PER_FRAGMENT: usize = 5_000;
     const K: usize = 8_193;
 
-    for file_format in [LanceFileVersion::V2_2, LanceFileVersion::Legacy] {
-        let legacy = file_format == LanceFileVersion::Legacy;
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().join("flat_knn_global_order.lance");
-        let uri = uri.to_str().unwrap();
-        let dataset = linear_vector_dataset_with_format(
-            uri,
-            FRAGMENTS * ROWS_PER_FRAGMENT,
-            DIMENSION,
-            ROWS_PER_FRAGMENT,
-            file_format,
-        )
-        .await;
-        assert_eq!(
-            dataset.fragments().len(),
-            FRAGMENTS,
-            "the guard needs four independently scheduled scan partitions"
-        );
-        let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("flat_knn_global_order.lance");
+    let uri = uri.to_str().unwrap();
+    let dataset = linear_vector_dataset_with_format(
+        uri,
+        FRAGMENTS * ROWS_PER_FRAGMENT,
+        DIMENSION,
+        ROWS_PER_FRAGMENT,
+        LanceFileVersion::V2_2,
+    )
+    .await;
+    assert_eq!(
+        dataset.fragments().len(),
+        FRAGMENTS,
+        "the guard needs four independently scheduled scan partitions"
+    );
+    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
 
-        let mut parallel = dataset.scan();
-        parallel.nearest("vector", &query, K).unwrap();
-        parallel.use_index(false);
-        parallel.target_parallelism(8);
-        let parallel_plan = parallel.create_plan().await.unwrap();
-        assert!(
-            parallel_plan.properties().partitioning.partition_count() > 1,
-            "{file_format:?}: the guard must exercise parallel late hydration"
-        );
-        if legacy {
-            assert!(
-                parallel_plan.output_ordering().is_none(),
-                "Lance now preserves legacy V1 KNN ordering through late payload hydration; \
-                 remove the remaining target_parallelism(1) compatibility fence"
-            );
-            parallel.target_parallelism(1);
-            let fenced_plan = parallel.create_plan().await.unwrap();
+    let mut parallel = dataset.scan();
+    parallel.nearest("vector", &query, K).unwrap();
+    parallel.use_index(false);
+    parallel.target_parallelism(8);
+    let parallel_plan = parallel.create_plan().await.unwrap();
+    assert!(
+        parallel_plan.properties().partitioning.partition_count() > 1,
+        "the guard must exercise parallel late hydration"
+    );
+    assert!(
+        parallel_plan.output_ordering().is_some(),
+        "V2 late payload hydration must retain KNN ordering for the final merge"
+    );
+
+    // Repeated execution catches reordering across output batches, including
+    // optimizer changes above the plan node whose properties we checked.
+    for iteration in 0..10 {
+        let mut scanner = dataset.scan();
+        scanner.nearest("vector", &query, K).unwrap();
+        scanner.use_index(false);
+        scanner.target_parallelism(8);
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), K, "iteration {iteration}");
+
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        for position in 0..K {
             assert_eq!(
-                fenced_plan.properties().partitioning.partition_count(),
-                1,
-                "legacy hydration needs no scheduling-ordered final coalesce"
-            );
-        } else {
-            assert!(
-                parallel_plan.output_ordering().is_some(),
-                "V2 late payload hydration must retain KNN ordering for the final merge"
+                ids.value(position),
+                position as i32,
+                "flat KNN lost exact global order at result {position}, iteration {iteration}"
             );
         }
-
-        // Repeated execution catches reordering across output batches, including
-        // optimizer changes above the plan node whose properties we checked.
-        for iteration in 0..10 {
-            let mut scanner = dataset.scan();
-            scanner.nearest("vector", &query, K).unwrap();
-            scanner.use_index(false);
-            scanner.target_parallelism(if legacy { 1 } else { 8 });
-            let batch = scanner.try_into_batch().await.unwrap();
-            assert_eq!(
-                batch.num_rows(),
-                K,
-                "{file_format:?}, iteration {iteration}"
+        let distances = batch["_distance"].as_primitive::<Float32Type>();
+        for pair in distances.values().windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "flat KNN results must be globally sorted at iteration {iteration}: {} before {}",
+                pair[0],
+                pair[1]
             );
-
-            let ids = batch["id"].as_primitive::<Int32Type>();
-            for position in 0..K {
-                assert_eq!(
-                    ids.value(position),
-                    position as i32,
-                    "{file_format:?}: flat KNN lost exact global order at result {position}, \
-                     iteration {iteration}"
-                );
-            }
-            let distances = batch["_distance"].as_primitive::<Float32Type>();
-            for pair in distances.values().windows(2) {
-                assert!(
-                    pair[0] <= pair[1],
-                    "{file_format:?}: flat KNN results must be globally sorted at iteration \
-                     {iteration}: {} before {}",
-                    pair[0],
-                    pair[1]
-                );
-            }
         }
     }
 }
@@ -6581,7 +6557,15 @@ async fn stock_lance_nested_clone_preserves_inherited_index_base_issue_7840() {
         second.manifest().base_paths[&preserved.base_id.unwrap()].path,
         root.uri()
     );
-    let mut scanner = second.scan();
+    // A fresh session must resolve the inherited index's original base from
+    // persisted metadata, without either clone's cached index handle.
+    let cold = DatasetBuilder::from_uri(uri)
+        .with_branch("second", Some(second.version().version))
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    let mut scanner = cold.scan();
     scanner.filter("value = 1").unwrap();
     assert!(
         scanner
@@ -6590,7 +6574,15 @@ async fn stock_lance_nested_clone_preserves_inherited_index_base_issue_7840() {
             .unwrap()
             .contains("ScalarIndexQuery")
     );
-    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 1);
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch["id"].as_string::<i32>().value(0), "alice");
+    assert_eq!(
+        batch["value"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .value(0),
+        1
+    );
 }
 
 /// Runtime guard — the rrf prefilter gate's linchpin (PR #587): BM25 scores
@@ -7987,46 +7979,110 @@ async fn rfc_detached_only_detached_commit_never_triggers_auto_cleanup() {
 /// detached commit's files count as referenced, and since lance#8944 it lists
 /// `data/` through `max(retained-manifest floor, now − 7 days)` and deletes
 /// every listed file no attached manifest references (`unverified` mode). A
-/// graph table's one attached version is its `v1` create, so a stock run of
-/// any policy keeps every detached manifest and deletes every detached data
-/// file older than a week; the pins that name those versions then open and
-/// fail to read. Lance 11 listed `data/` only below the retained floor, which
-/// `v1` set above every detached file, so the same run left them alone
-/// (`_indices/` has always been listed whole). This is why the engine never
-/// calls stock cleanup on a graph table (`forbidden_apis.rs`) and why an
-/// external Lance cleanup of a graph root is a data-loss path. Both halves are
-/// pinned: the seven-day floor keeps a fresh detached file, and nothing keeps
-/// an aged one.
+/// graph table's one attached version is its `v1` create, so stock default
+/// cleanup keeps every detached manifest but deletes week-old data files used
+/// only by detached versions. Their pins still open but fail to read, including
+/// a recent descendant that reuses an aged file. Lance 11 listed `data/` only
+/// below the retained floor, which the `v1` create sets earlier than its detached
+/// files, so the same run left them alone (`_indices/` has always been listed
+/// whole). This is why the engine never calls stock cleanup on a graph table
+/// (`forbidden_apis.rs`) and why an external Lance cleanup of a graph root is a
+/// data-loss path. Both halves are pinned: the seven-day floor keeps a fresh
+/// detached-only file, while an aged one is swept despite its detached readers.
 #[tokio::test]
 async fn stock_cleanup_sweeps_a_week_old_detached_data_file_lance_13() {
+    use std::time::{Duration, SystemTime};
+
+    const DAY: u64 = 24 * 60 * 60;
+    let now = SystemTime::now();
+    let retained_time = now - Duration::from_secs(10 * DAY);
+    let aged_file_time = now - Duration::from_secs(8 * DAY);
+    let verification_cutoff = now - Duration::from_secs(7 * DAY);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("t.lance");
     let uri = uri.to_str().unwrap();
-    rfc0067_create(uri).await;
+    let created = rfc0067_create(uri).await;
+    // Cleanup derives its listing floor from the manifest's embedded commit
+    // timestamp, not the manifest file's mtime. Model an old attached create
+    // followed by a newer detached write, and cold-open the rewritten bytes.
+    let mut manifest = created.manifest().clone();
+    assert!(manifest.index_section.is_none());
+    let transaction = created.read_transaction().await.unwrap();
+    let inline_transaction = manifest.transaction_section.map(|_| {
+        lance_table::format::Transaction::from(
+            transaction
+                .as_ref()
+                .expect("an inline transaction section must decode"),
+        )
+    });
+    manifest.set_timestamp(
+        retained_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
+    let store = created.object_store(None).await.unwrap();
+    lance_table::io::commit::write_manifest_file_to_path(
+        &store,
+        &mut manifest,
+        None,
+        &created.manifest_location().path,
+        inline_transaction,
+    )
+    .await
+    .unwrap();
+    drop(created);
     let base = rfc0067_pinned(uri, 1).await;
+    assert_eq!(
+        base.manifest().timestamp(),
+        chrono::DateTime::<chrono::Utc>::from(retained_time),
+        "the cold open must observe the old embedded commit timestamp"
+    );
+    assert_eq!(
+        base.read_transaction().await.unwrap(),
+        transaction,
+        "rewriting the timestamp must preserve the original transaction"
+    );
     let aged = rfc_detached_only_append(&base, &["c1"]).await;
     let fresh = rfc_detached_only_append(&aged, &["d1"]).await;
     let aged_version = aged.version().version;
     let fresh_version = fresh.version().version;
     assert!(lance_table::format::is_detached_version(aged_version));
     assert!(lance_table::format::is_detached_version(fresh_version));
+    assert!(
+        fresh.manifest().timestamp() > chrono::DateTime::<chrono::Utc>::from(verification_cutoff),
+        "the descendant whose reads fail after cleanup is recent"
+    );
 
     let data_dir = dir.path().join("t.lance").join("data");
+    let protected_file = rfc_detached_only_fragment_files(&base, 0);
     let aged_file = rfc_detached_only_fragment_files(&aged, 1);
     let fresh_file = rfc_detached_only_fragment_files(&fresh, 2);
-    assert_eq!((aged_file.len(), fresh_file.len()), (1, 1));
+    assert_eq!(
+        (protected_file.len(), aged_file.len(), fresh_file.len()),
+        (1, 1, 1)
+    );
+    let protected_file = data_dir.join(&protected_file[0]);
     let aged_file = data_dir.join(&aged_file[0]);
     let fresh_file = data_dir.join(&fresh_file[0]);
-    assert!(aged_file.is_file() && fresh_file.is_file());
-    // Age the first detached commit's data file past Lance's unverified
-    // threshold (`UNVERIFIED_THRESHOLD_DAYS`, seven); the local store reports
-    // the file's mtime as `last_modified`.
-    std::fs::File::options()
-        .write(true)
-        .open(&aged_file)
-        .unwrap()
-        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
-        .unwrap();
+    assert!(fresh_file.is_file());
+    // Both aged files are newer than the retained manifest floor but older
+    // than the seven-day threshold. Lance 11's listing misses both; Lance 13
+    // lists both, and only the attached reference protects the original file.
+    for file in [&protected_file, &aged_file] {
+        assert!(file.is_file());
+        std::fs::File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(aged_file_time))
+            .unwrap();
+        let modified = std::fs::metadata(file).unwrap().modified().unwrap();
+        assert!(retained_time < modified);
+        assert!(modified < verification_cutoff);
+    }
+    let fresh_modified = std::fs::metadata(&fresh_file).unwrap().modified().unwrap();
+    assert!(verification_cutoff < fresh_modified);
 
     let head = rfc0067_head(uri).await;
     assert_eq!(
@@ -8034,6 +8090,7 @@ async fn stock_cleanup_sweeps_a_week_old_detached_data_file_lance_13() {
         1,
         "the graph-table shape: v1 is the only attached version"
     );
+    assert_eq!(head.manifest().timestamp(), base.manifest().timestamp());
     assert_eq!(head.list_detached_manifests().await.unwrap().len(), 2);
     let removed = cleanup_old_versions(&head, CleanupPolicy::default())
         .await
@@ -8041,12 +8098,16 @@ async fn stock_cleanup_sweeps_a_week_old_detached_data_file_lance_13() {
     assert_eq!(
         (removed.old_versions, removed.data_files_removed),
         (0, 1),
-        "no attached version is old, yet one data file is swept: the aged \
+        "the only attached version is retained, yet one data file is swept: the aged \
          detached commit's, which no attached manifest references"
     );
     assert!(
         !aged_file.exists(),
         "the week-old detached data file is deleted as unverified"
+    );
+    assert!(
+        protected_file.is_file(),
+        "the equally old original data file is protected by the attached manifest"
     );
     assert!(
         fresh_file.is_file(),

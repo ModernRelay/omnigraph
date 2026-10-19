@@ -1,6 +1,5 @@
-//! Source validation at Lance's public shallow-clone commit boundary.
+//! Scoped clone-source location reuse and local manifest identity normalization.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,17 +7,13 @@ use futures::stream::BoxStream;
 use lance::Dataset;
 use lance::io::ObjectStore;
 use lance_core::{Error, Result};
-use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
-use lance_table::format::pb::{FragmentReuseIndexDetails, transaction};
-use lance_table::format::{BasePath, IndexMetadata, Manifest, Transaction};
+use lance_table::format::{IndexMetadata, Manifest, Transaction};
 use lance_table::io::commit::{
     CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
     PredecessorIdentity,
 };
-use lance_table::io::manifest::read_manifest_indexes;
 use object_store::ObjectStore as RawObjectStore;
 use object_store::path::Path;
-use prost::Message;
 
 #[cfg(test)]
 pub(crate) use tests::fresh_dataset;
@@ -28,64 +23,25 @@ tokio::task_local! {
 }
 
 struct CloneContext {
-    operation: transaction::Clone,
-    target: Path,
+    source_branch: Option<String>,
     source: Path,
+    source_version: u64,
     source_location: ManifestLocation,
-    source_indices: Vec<IndexMetadata>,
-    expected_bases: HashMap<u32, BasePath>,
-    new_base_id: u32,
 }
 
 impl CloneContext {
-    async fn capture(source: &Dataset, branch: &str, source_version: u64) -> Result<Self> {
-        lance::dataset::refs::check_valid_branch(branch)?;
+    fn capture(source: &Dataset, source_version: u64) -> Result<Self> {
         if source.version().version != source_version {
             return Err(Error::invalid_input(format!(
                 "clone source version changed: expected {source_version}, got {}",
                 source.version().version,
             )));
         }
-        let source_indices = if source.manifest().index_section.is_some() {
-            let store = source.object_store(None).await?;
-            read_manifest_indexes(&store, source.manifest_location(), source.manifest()).await?
-        } else {
-            Vec::new()
-        };
-        for index in &source_indices {
-            validate_fragment_reuse(source, index).await?;
-        }
-        let new_base_id = match source.manifest().base_paths.keys().max() {
-            Some(id) => id
-                .checked_add(1)
-                .ok_or_else(|| Error::invalid_input("clone base ID overflow"))?,
-            None => 0,
-        };
-        let operation = transaction::Clone {
-            is_shallow: true,
-            ref_name: source.manifest().branch.clone(),
-            ref_version: source_version,
-            ref_path: source.uri().to_string(),
-            branch_name: Some(branch.to_string()),
-        };
-        let mut expected_bases = source.manifest().base_paths.clone();
-        expected_bases.insert(
-            new_base_id,
-            BasePath::new(
-                new_base_id,
-                operation.ref_path.clone(),
-                operation.ref_name.clone(),
-                true,
-            ),
-        );
         Ok(Self {
-            operation,
-            target: source.branch_location().find_branch(Some(branch))?.path,
+            source_branch: source.manifest().branch.clone(),
             source: source.branch_location().path,
+            source_version,
             source_location: source.manifest_location().clone(),
-            source_indices,
-            expected_bases,
-            new_base_id,
         })
     }
 
@@ -93,9 +49,9 @@ impl CloneContext {
     /// Lance still reads the source bytes and verifies existence before ref publication.
     fn main_source_location(&self, base_path: &Path, version: u64) -> Option<ManifestLocation> {
         let location = &self.source_location;
-        (self.operation.ref_name.is_none()
+        (self.source_branch.is_none()
             && self.source == *base_path
-            && self.operation.ref_version == version
+            && self.source_version == version
             && location.version == version
             && !lance_table::format::is_detached_version(version)
             && location.naming_scheme == ManifestNamingScheme::V2
@@ -104,128 +60,10 @@ impl CloneContext {
             && location.e_tag.is_some())
         .then(|| location.clone())
     }
-
-    fn validate(
-        &self,
-        manifest: &Manifest,
-        indices: Option<&[IndexMetadata]>,
-        base_path: &Path,
-        transaction: &Transaction,
-    ) -> Result<()> {
-        let transaction = transaction.as_pb();
-        if base_path != &self.target
-            || transaction.read_version != self.operation.ref_version
-            || transaction.operation.as_ref()
-                != Some(&transaction::Operation::Clone(self.operation.clone()))
-            || manifest.branch != self.operation.branch_name
-            || manifest.base_paths != self.expected_bases
-        {
-            return Err(Error::invalid_input(
-                "shallow clone does not match its captured source and target",
-            ));
-        }
-        let Some(indices) = indices else {
-            return if self.source_indices.is_empty() {
-                Ok(())
-            } else {
-                Err(Error::invalid_input(
-                    "shallow clone lost its captured index metadata",
-                ))
-            };
-        };
-        if indices.len() != self.source_indices.len() {
-            return Err(Error::invalid_input(
-                "shallow clone index inventory changed",
-            ));
-        }
-        for (index, source) in indices.iter().zip(&self.source_indices) {
-            let expected_base = source.base_id.or(Some(self.new_base_id));
-            if index.base_id != expected_base {
-                return Err(Error::invalid_input(format!(
-                    "shallow clone index {} has an unexpected base ID",
-                    index.uuid
-                )));
-            }
-            let mut comparable = index.clone();
-            comparable.base_id = source.base_id;
-            if comparable != *source {
-                return Err(Error::invalid_input(format!(
-                    "shallow clone changed metadata of index {} beyond its base ID",
-                    index.uuid
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
-// Native Lance preserves inherited index origins, including external FRI details.
-// It does not validate a legacy external payload before publishing a clone, so
-// check its actual range and decoded content here without rewriting the artifact.
-async fn validate_fragment_reuse(source: &Dataset, index: &IndexMetadata) -> Result<()> {
-    let Some(details) = index
-        .index_details
-        .as_ref()
-        .filter(|details| details.type_url.ends_with("FragmentReuseIndexDetails"))
-    else {
-        return Ok(());
-    };
-    let details = details.to_msg::<FragmentReuseIndexDetails>()?;
-    match details.content {
-        Some(Content::Inline(_)) => Ok(()),
-        Some(Content::External(external)) => {
-            let directory = match index.base_id {
-                None => source.indices_dir(),
-                Some(base_id) => {
-                    let base = source.manifest().base_paths.get(&base_id).ok_or_else(|| {
-                        Error::index(format!(
-                            "fragment-reuse index {} refers to missing base {base_id}",
-                            index.uuid
-                        ))
-                    })?;
-                    let path = base.extract_path(source.session().store_registry())?;
-                    if base.is_dataset_root {
-                        path.join("_indices")
-                    } else {
-                        path
-                    }
-                }
-            };
-            let path = directory.join(index.uuid.to_string()).join(external.path);
-            let store = source.object_store(index.base_id).await?;
-            let reader = store.open(&path).await?;
-            let range = fragment_reuse_range(external.offset, external.size, reader.size().await?)?;
-            let bytes = reader.get_range(range).await?;
-            let inline = InlineContent::decode(bytes)?;
-            lance_table::system_index::frag_reuse::FragReuseIndexDetails::try_from(inline)?;
-            Ok(())
-        }
-        None => Err(Error::index("fragment-reuse index details have no content")),
-    }
-}
-
-fn fragment_reuse_range(
-    offset: u64,
-    size: u64,
-    file_size: usize,
-) -> Result<std::ops::Range<usize>> {
-    let end = offset
-        .checked_add(size)
-        .ok_or_else(|| Error::index("fragment-reuse detail range overflows"))?;
-    let start = usize::try_from(offset)
-        .map_err(|_| Error::index("fragment-reuse detail offset is not addressable"))?;
-    let end = usize::try_from(end)
-        .map_err(|_| Error::index("fragment-reuse detail end is not addressable"))?;
-    if end > file_size {
-        return Err(Error::index(format!(
-            "fragment-reuse detail range ends at {end}, beyond file length {file_size}"
-        )));
-    }
-    Ok(start..end)
 }
 
 #[derive(Debug)]
-struct ClonePreflightCommitHandler {
+struct ManifestLocationCommitHandler {
     inner: Arc<dyn CommitHandler>,
     reuse_main_source_location: bool,
     normalize_local_discovery_etag: bool,
@@ -250,39 +88,8 @@ fn normalize_local_discovery_etag(location: &mut ManifestLocation) {
     }
 }
 
-impl ClonePreflightCommitHandler {
-    fn validate_clone(
-        &self,
-        manifest: &Manifest,
-        indices: Option<&[IndexMetadata]>,
-        base_path: &Path,
-        transaction: Option<&Transaction>,
-    ) -> Result<()> {
-        match transaction {
-            Some(transaction) if matches!(transaction.as_pb().operation.as_ref(), Some(transaction::Operation::Clone(operation)) if operation.is_shallow) => {
-                CLONE_CONTEXT
-                    .try_with(|context| context.validate(manifest, indices, base_path, transaction))
-                    .map_err(|_| {
-                        Error::invalid_input("shallow clone has no scoped source-index context")
-                    })?
-            }
-            _ => {
-                if CLONE_CONTEXT
-                    .try_with(|context| context.target == *base_path)
-                    .unwrap_or(false)
-                {
-                    return Err(Error::invalid_input(
-                        "scoped shallow clone has no matching inline transaction",
-                    ));
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
 pub fn wrap_commit_handler(inner: Arc<dyn CommitHandler>) -> Arc<dyn CommitHandler> {
-    Arc::new(ClonePreflightCommitHandler {
+    Arc::new(ManifestLocationCommitHandler {
         inner,
         reuse_main_source_location: false,
         normalize_local_discovery_etag: false,
@@ -317,7 +124,7 @@ pub async fn configured_commit_handler(
         matches!(url.scheme(), "file" | "file-object-store")
             || (cfg!(windows) && url.scheme().len() == 1)
     });
-    Ok(Arc::new(ClonePreflightCommitHandler {
+    Ok(Arc::new(ManifestLocationCommitHandler {
         inner: lance_table::io::commit::commit_handler_from_url(uri, params).await?,
         reuse_main_source_location,
         normalize_local_discovery_etag,
@@ -339,14 +146,14 @@ pub async fn create_branch(
     branch: &str,
     source_version: u64,
 ) -> Result<Dataset> {
-    let context = CloneContext::capture(source, branch, source_version).await?;
+    let context = CloneContext::capture(source, source_version)?;
     CLONE_CONTEXT
         .scope(context, source.create_branch(branch, source_version, None))
         .await
 }
 
 #[async_trait]
-impl CommitHandler for ClonePreflightCommitHandler {
+impl CommitHandler for ManifestLocationCommitHandler {
     fn is_version_not_found_definitive(&self) -> bool {
         self.inner.is_version_not_found_definitive()
     }
@@ -438,12 +245,6 @@ impl CommitHandler for ClonePreflightCommitHandler {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
-        self.validate_clone(
-            manifest,
-            indices.as_deref(),
-            base_path,
-            transaction.as_ref(),
-        )?;
         self.inner
             .commit(
                 manifest,
@@ -493,12 +294,6 @@ impl CommitHandler for ClonePreflightCommitHandler {
         transaction: Option<Transaction>,
         predecessor: &PredecessorIdentity,
     ) -> std::result::Result<ManifestLocation, CommitError> {
-        self.validate_clone(
-            manifest,
-            indices.as_deref(),
-            base_path,
-            transaction.as_ref(),
-        )?;
         self.inner
             .commit_after(
                 manifest,
@@ -751,9 +546,7 @@ mod tests {
         assert!(error.to_string().contains("configured resolver"));
         let dir = tempfile::tempdir().unwrap();
         let mut source = fresh_dataset(dir.path().join("init.lance").to_str().unwrap()).await;
-        let context = CloneContext::capture(&source, "child", source.version().version)
-            .await
-            .unwrap();
+        let context = CloneContext::capture(&source, source.version().version).unwrap();
         let location = source.manifest_location();
         assert!(
             context
@@ -837,11 +630,6 @@ mod tests {
                 assert_eq!(discovered.e_tag.as_ref(), Some(published));
             }
         }
-        let index = second.load_indices().await.unwrap()[0].clone();
-        assert_eq!(
-            second.manifest().base_paths[&index.base_id.unwrap()].path,
-            source.uri()
-        );
         let mut scan = second.scan();
         scan.filter("value = 1").unwrap();
         assert!(
@@ -853,25 +641,17 @@ mod tests {
         assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
     }
     use super::*;
-    use arrow_array::{FixedSizeListArray, Float32Array};
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use futures::TryStreamExt;
     use lance::dataset::builder::DatasetBuilder;
     use lance::dataset::{WriteMode, WriteParams};
     use lance::index::DatasetIndexExt;
-    use lance::index::vector::VectorIndexParams;
     use lance::session::Session;
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
-    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
-    use lance_linalg::distance::MetricType;
+    use lance_index::scalar::ScalarIndexParams;
     use object_store::ObjectStoreExt;
     pub(crate) async fn fresh_dataset(uri: &str) -> Dataset {
-        fresh_dataset_with_stable_row_ids(uri, true).await
-    }
-
-    async fn fresh_dataset_with_stable_row_ids(uri: &str, stable_row_ids: bool) -> Dataset {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("value", DataType::Int32, false),
@@ -887,7 +667,7 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let params = WriteParams {
             mode: WriteMode::Create,
-            enable_stable_row_ids: stable_row_ids,
+            enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             ..Default::default()
         };
@@ -919,184 +699,6 @@ mod tests {
             .await
             .unwrap();
     }
-    #[tokio::test]
-    async fn second_and_third_generation_clone_preserves_inherited_and_local_index_bases() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().join("guard24.lance");
-        let uri = uri.to_str().unwrap();
-        let mut ds = fresh_dataset(uri).await;
-        ds.create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
-            .replace(true)
-            .await
-            .unwrap();
-        let mut ds = engine_open(uri).await;
-        let root_indices = ds.load_indices().await.unwrap();
-        assert_eq!(root_indices.len(), 1);
-        let inherited_uuid = root_indices[0].uuid;
-        assert_eq!(root_indices[0].base_id, None);
-
-        let version = ds.version().version;
-        let mut feature = create_branch(&mut ds, "feature", version).await.unwrap();
-        append_guard_row(&mut feature, "carol", 3).await;
-        feature
-            .create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
-            .replace(true)
-            .await
-            .unwrap();
-        let feature_indices = feature.load_indices().await.unwrap();
-        assert_eq!(feature_indices.len(), 2);
-        let inherited = feature_indices
-            .iter()
-            .find(|index| index.uuid == inherited_uuid)
-            .unwrap();
-        let inherited_base = inherited
-            .base_id
-            .expect("first clone redirects its inherited index");
-        let local = feature_indices
-            .iter()
-            .find(|index| index.uuid != inherited_uuid)
-            .unwrap();
-        assert_eq!(
-            local.base_id, None,
-            "newly built index belongs to feature's own tree"
-        );
-        let local_uuid = local.uuid;
-        let feature_version = feature.version().version;
-        let mut experiment = create_branch(&mut feature, "experiment", feature_version)
-            .await
-            .unwrap();
-
-        async fn indexed_rows(dataset: &Dataset, filter: &str) -> Vec<(String, i32)> {
-            let mut scanner = dataset.scan();
-            scanner.filter(filter).unwrap();
-            let plan = scanner.explain_plan(true).await.unwrap();
-            assert!(
-                plan.contains("ScalarIndexQuery"),
-                "regression must open the index: {plan}"
-            );
-            let batches: Vec<RecordBatch> = scanner
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
-            let mut rows = Vec::new();
-            for batch in batches {
-                let ids = batch
-                    .column_by_name("id")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                let values = batch
-                    .column_by_name("value")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap();
-                rows.extend(
-                    (0..batch.num_rows())
-                        .map(|row| (ids.value(row).to_string(), values.value(row))),
-                );
-            }
-            rows.sort_unstable();
-            rows
-        }
-
-        let reopened = DatasetBuilder::from_uri(uri)
-            .with_session(Arc::new(Session::default()))
-            .load()
-            .await
-            .unwrap()
-            .checkout_branch("experiment")
-            .await
-            .unwrap();
-        for dataset in [&experiment, &reopened] {
-            let indices = dataset.load_indices().await.unwrap();
-            assert_eq!(indices.len(), 2);
-            let inherited = indices
-                .iter()
-                .find(|index| index.uuid == inherited_uuid)
-                .unwrap();
-            assert_eq!(inherited.base_id, Some(inherited_base));
-            assert_eq!(
-                dataset.manifest().base_paths[&inherited_base].path,
-                feature.manifest().base_paths[&inherited_base].path,
-            );
-            let local = indices
-                .iter()
-                .find(|index| index.uuid == local_uuid)
-                .unwrap();
-            let local_base = local
-                .base_id
-                .expect("second clone redirects feature's local index");
-            assert_ne!(local_base, inherited_base);
-            let local_path = &dataset.manifest().base_paths[&local_base];
-            assert!(local_path.is_dataset_root);
-            assert_eq!(local_path.path, feature.uri());
-            assert_eq!(
-                indexed_rows(dataset, "value = 1").await,
-                vec![("alice".to_string(), 1)]
-            );
-            assert_eq!(
-                indexed_rows(dataset, "id = 'carol'").await,
-                vec![("carol".to_string(), 3)]
-            );
-        }
-        let experiment_indices = experiment.load_indices().await.unwrap();
-        let version = experiment.version().version;
-        let third = create_branch(&mut experiment, "third", version)
-            .await
-            .unwrap();
-        let third_reopened = DatasetBuilder::from_uri(uri)
-            .with_session(Arc::new(Session::default()))
-            .load()
-            .await
-            .unwrap()
-            .checkout_branch("third")
-            .await
-            .unwrap();
-        for dataset in [&third, &third_reopened] {
-            let indices = dataset.load_indices().await.unwrap();
-            assert_eq!(indices.len(), experiment_indices.len());
-            for source_index in experiment_indices.iter() {
-                let inherited = indices
-                    .iter()
-                    .find(|index| index.uuid == source_index.uuid)
-                    .unwrap();
-                assert!(source_index.base_id.is_some());
-                assert_eq!(inherited.base_id, source_index.base_id);
-                let base = source_index.base_id.unwrap();
-                assert_eq!(
-                    dataset.manifest().base_paths[&base],
-                    experiment.manifest().base_paths[&base]
-                );
-            }
-            assert_eq!(
-                indexed_rows(dataset, "value = 1").await,
-                vec![("alice".to_string(), 1)]
-            );
-            assert_eq!(
-                indexed_rows(dataset, "id = 'carol'").await,
-                vec![("carol".to_string(), 3)]
-            );
-        }
-        append_guard_row(&mut experiment, "dave", 4).await;
-        let after_append = DatasetBuilder::from_uri(uri)
-            .with_session(Arc::new(Session::default()))
-            .load()
-            .await
-            .unwrap()
-            .checkout_branch("experiment")
-            .await
-            .unwrap();
-        assert_eq!(
-            indexed_rows(&after_append, "id = 'dave'").await,
-            vec![("dave".to_string(), 4)]
-        );
-    }
-
     async fn engine_open(uri: &str) -> Dataset {
         crate::instrumentation::open_dataset(
             uri,
@@ -1119,63 +721,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clone_context_is_required_and_bound_before_manifest_publication() {
+    async fn source_version_mismatch_refuses_before_native_create() {
         let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().join("scoped.lance");
-        let uri = uri.to_str().unwrap();
-        let mut source = indexed_source(uri).await;
+        let uri = dir.path().join("versioned.lance");
+        let mut source = fresh_dataset(uri.to_str().unwrap()).await;
         let version = source.version().version;
-        let missing = source
-            .create_branch("missing", version, None)
+        let error = create_branch(&mut source, "refused", version + 1)
             .await
             .unwrap_err();
-        assert!(
-            missing
-                .to_string()
-                .contains("no scoped source-index context"),
-            "{missing}"
-        );
-        let context = CloneContext::capture(&source, "expected", version)
-            .await
-            .unwrap();
-        let mismatched = CLONE_CONTEXT
-            .scope(context, source.create_branch("wrong", version, None))
-            .await
-            .unwrap_err();
-        assert!(
-            mismatched
-                .to_string()
-                .contains("does not match its captured source and target"),
-            "{mismatched}"
-        );
+        assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(source.list_branches().await.unwrap().is_empty());
+        let target = source
+            .branch_location()
+            .find_branch(Some("refused"))
+            .unwrap();
+        assert!(!std::path::Path::new(&target.uri).exists());
         assert_eq!(source.version().version, version);
-        for branch in ["missing", "wrong"] {
-            assert!(source.checkout_branch(branch).await.is_err());
-        }
-        assert!(CLONE_CONTEXT.try_with(|_| ()).is_err());
-        let good = create_branch(&mut source, "good", version).await.unwrap();
-        assert_eq!(good.count_rows(None).await.unwrap(), 2);
-        assert!(CLONE_CONTEXT.try_with(|_| ()).is_err());
     }
 
     #[tokio::test]
-    async fn concurrent_clone_contexts_keep_each_source_index_origin() {
+    async fn concurrent_clone_contexts_keep_each_source_location() {
         async fn branch_twice(uri: String) -> Dataset {
-            let mut source = indexed_source(&uri).await;
-            let source_index = source.load_indices().await.unwrap()[0].uuid;
+            let mut source = fresh_dataset(&uri).await;
+            append_guard_row(&mut source, &uri, 3).await;
             let version = source.version().version;
             let mut first = create_branch(&mut source, "first", version).await.unwrap();
             tokio::task::yield_now().await;
             let version = first.version().version;
             let second = create_branch(&mut first, "second", version).await.unwrap();
-            let index = second.load_indices().await.unwrap()[0].clone();
-            assert_eq!(index.uuid, source_index);
-            assert_eq!(
-                second.manifest().base_paths[&index.base_id.unwrap()].path,
-                source.uri()
-            );
             assert!(CLONE_CONTEXT.try_with(|_| ()).is_err());
+            let mut scan = second.scan();
+            scan.filter("value = 3").unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                uri
+            );
             second
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1185,25 +773,18 @@ mod tests {
             tokio::spawn(branch_twice(left_uri)),
             tokio::spawn(branch_twice(right_uri))
         );
-        let left = left.unwrap();
-        let right = right.unwrap();
-        assert_ne!(
-            left.load_indices().await.unwrap()[0].uuid,
-            right.load_indices().await.unwrap()[0].uuid
-        );
+        assert_ne!(left.unwrap().uri(), right.unwrap().uri());
     }
 
     #[tokio::test]
-    async fn source_capture_reads_only_index_metadata_and_append_cost_is_unchanged() {
+    async fn source_capture_performs_no_io_and_append_cost_is_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let empty_uri = dir.path().join("empty.lance");
         fresh_dataset(empty_uri.to_str().unwrap()).await;
         let empty = engine_open(empty_uri.to_str().unwrap()).await;
         let store = empty.object_store(None).await.unwrap();
         store.io_stats_incremental();
-        CloneContext::capture(&empty, "child", empty.version().version)
-            .await
-            .unwrap();
+        CloneContext::capture(&empty, empty.version().version).unwrap();
         let empty_capture = store.io_stats_incremental();
         assert_eq!(empty_capture.read_iops, 0, "{empty_capture:?}");
         assert_eq!(empty_capture.write_iops, 0, "{empty_capture:?}");
@@ -1212,13 +793,11 @@ mod tests {
         let indexed = indexed_source(indexed_uri.to_str().unwrap()).await;
         let store = indexed.object_store(None).await.unwrap();
         store.io_stats_incremental();
-        CloneContext::capture(&indexed, "child", indexed.version().version)
-            .await
-            .unwrap();
+        CloneContext::capture(&indexed, indexed.version().version).unwrap();
         let indexed_capture = store.io_stats_incremental();
         assert_eq!(
-            indexed_capture.read_iops, 1,
-            "small indexed manifest capture: {indexed_capture:?}"
+            indexed_capture.read_iops, 0,
+            "capture must not inspect index metadata: {indexed_capture:?}"
         );
         assert_eq!(indexed_capture.write_iops, 0, "{indexed_capture:?}");
 
@@ -1266,30 +845,6 @@ mod tests {
         assert_eq!(engine_clone_cost.write_iops, raw_clone_cost.write_iops);
         assert_eq!(raw_child.count_rows(None).await.unwrap(), 3);
         assert_eq!(engine_child.count_rows(None).await.unwrap(), 3);
-        for source in [&mut raw, &mut engine] {
-            source
-                .create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
-                .replace(true)
-                .await
-                .unwrap();
-        }
-        for branch in ["first", "second"] {
-            let raw_store = raw.object_store(None).await.unwrap();
-            let engine_store = engine.object_store(None).await.unwrap();
-            raw_store.io_stats_incremental();
-            engine_store.io_stats_incremental();
-            let version = raw.version().version;
-            raw = raw.create_branch(branch, version, None).await.unwrap();
-            let raw_clone_cost = raw_store.io_stats_incremental();
-            let version = engine.version().version;
-            engine = create_branch(&mut engine, branch, version).await.unwrap();
-            let engine_clone_cost = engine_store.io_stats_incremental();
-            assert!(raw_clone_cost.write_iops > 0, "{raw_clone_cost:?}");
-            assert_eq!(
-                engine_clone_cost.write_iops, raw_clone_cost.write_iops,
-                "{branch}: raw={raw_clone_cost:?}, engine={engine_clone_cost:?}"
-            );
-        }
         assert!(CLONE_CONTEXT.try_with(|_| ()).is_err());
     }
 
@@ -1301,9 +856,7 @@ mod tests {
         let mut source = fresh_dataset(uri).await;
         let version = source.version().version;
         let base = source.branch_location().path;
-        let mut context = CloneContext::capture(&source, "child", version)
-            .await
-            .unwrap();
+        let mut context = CloneContext::capture(&source, version).unwrap();
         let original = context.source_location.clone();
         assert!(context.main_source_location(&base, version).is_some());
         assert!(
@@ -1326,7 +879,7 @@ mod tests {
         assert!(context.main_source_location(&base, version).is_none());
         context.source_location = original.clone();
         for native in ["legacy", "feature.01ARZ3NDEKTSV4RRFFQ69G5FAV"] {
-            context.operation.ref_name = Some(native.to_string());
+            context.source_branch = Some(native.to_string());
             assert!(context.main_source_location(&base, version).is_none());
         }
         let store = source.object_store(None).await.unwrap();
@@ -1336,368 +889,5 @@ mod tests {
             .unwrap_err();
         assert!(error.is_not_found(), "{error:?}");
         assert!(source.list_branches().await.unwrap().is_empty());
-    }
-
-    async fn external_fragment_reuse_source(
-        uri: &str,
-        payload: Vec<u8>,
-        offset: u64,
-        size: u64,
-    ) -> Dataset {
-        // Legacy FRI translates row addresses. Stable IDs plus a BTree index
-        // are incompatible with it in Lance 13, even when the history is empty.
-        // Keep this native-format compatibility fixture on ordinary row addresses;
-        // production graph tables retain stable IDs and never enable deferred remap.
-        let mut source = fresh_dataset_with_stable_row_ids(uri, false).await;
-        source
-            .create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
-            .replace(true)
-            .await
-            .unwrap();
-        let mut metadata = source.load_indices().await.unwrap()[0].clone();
-        metadata.uuid = "27a30b70-7fb8-4ee3-a731-35a1bcff9260".parse().unwrap();
-        metadata.name = lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME.to_string();
-        metadata.fields.clear();
-        metadata.covering_fields.clear();
-        metadata.dataset_version = source.version().version;
-        metadata.index_version = 0;
-        metadata.base_id = None;
-        metadata.files = None;
-        let external = lance_table::format::pb::ExternalFile {
-            path: "details.binpb".to_string(),
-            offset,
-            size,
-        };
-        let proto = FragmentReuseIndexDetails {
-            content: Some(Content::External(external)),
-        };
-        let details = Arc::make_mut(metadata.index_details.as_mut().unwrap());
-        details.type_url = "type.googleapis.com/lance.table.FragmentReuseIndexDetails".to_string();
-        details.value = proto.encode_to_vec();
-        let path = source
-            .indices_dir()
-            .join(metadata.uuid.to_string())
-            .join("details.binpb");
-        source
-            .object_store(None)
-            .await
-            .unwrap()
-            .inner
-            .put_opts(&path, payload.into(), object_store::PutOptions::default())
-            .await
-            .unwrap();
-        let source = Dataset::commit(
-            uri,
-            lance::dataset::transaction::Operation::CreateIndex {
-                new_indices: vec![metadata],
-                removed_indices: vec![],
-            },
-            Some(source.version().version),
-            source.store_params().cloned(),
-            None,
-            source.session().clone(),
-            false,
-        )
-        .await
-        .unwrap();
-        assert!(!source.manifest().uses_stable_row_ids());
-        assert_eq!(
-            (source.manifest().reader_feature_flags | source.manifest().writer_feature_flags)
-                & lance_table::feature_flags::FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
-            0,
-            "the fixture must not depend on debug-only stable-ID fragment reuse"
-        );
-        source
-    }
-
-    #[tokio::test]
-    async fn external_fragment_reuse_preserves_local_and_inherited_origins() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().join("external-fri.lance");
-        let uri = uri.to_str().unwrap();
-        let inline = InlineContent {
-            legacy_versions: vec![
-                lance_table::format::pb::fragment_reuse_index_details::Version {
-                    dataset_version: 1,
-                    groups: vec![],
-                },
-            ],
-            transitions: vec![],
-        };
-        let payload = inline.encode_to_vec();
-        let payload_size = u64::try_from(payload.len()).unwrap();
-        let mut raw = external_fragment_reuse_source(uri, payload, 0, payload_size).await;
-        let version = raw.version().version;
-        let stock_first = raw
-            .create_branch("stock_first", version, None)
-            .await
-            .unwrap();
-        let mut local = engine_open(uri).await;
-        let mut inherited = engine_open(stock_first.uri()).await;
-        for (source, branch) in [
-            (&mut local, "local_origin"),
-            (&mut inherited, "inherited_origin"),
-        ] {
-            let source_indices = read_manifest_indexes(
-                &source.object_store(None).await.unwrap(),
-                source.manifest_location(),
-                source.manifest(),
-            )
-            .await
-            .unwrap();
-            let source_fri = source_indices
-                .iter()
-                .find(|index| {
-                    index.name == lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME
-                })
-                .unwrap();
-            assert!(matches!(
-                source_fri
-                    .index_details
-                    .as_ref()
-                    .unwrap()
-                    .to_msg::<FragmentReuseIndexDetails>()
-                    .unwrap()
-                    .content,
-                Some(Content::External(_))
-            ));
-            let version = source.version().version;
-            let child = create_branch(source, branch, version).await.unwrap();
-            let cold = DatasetBuilder::from_uri(uri)
-                .with_session(Arc::new(Session::default()))
-                .load()
-                .await
-                .unwrap()
-                .checkout_branch(branch)
-                .await
-                .unwrap();
-            for dataset in [&child, &cold] {
-                let store = dataset.object_store(None).await.unwrap();
-                let indices =
-                    read_manifest_indexes(&store, dataset.manifest_location(), dataset.manifest())
-                        .await
-                        .unwrap();
-                let fri = indices
-                    .iter()
-                    .find(|index| index.uuid == source_fri.uuid)
-                    .unwrap();
-                let proto = fri
-                    .index_details
-                    .as_ref()
-                    .unwrap()
-                    .to_msg::<FragmentReuseIndexDetails>()
-                    .unwrap();
-                assert!(matches!(proto.content, Some(Content::External(_))));
-                assert_eq!(fri.index_details, source_fri.index_details);
-                let base = fri.base_id.unwrap();
-                assert_eq!(dataset.manifest().base_paths[&base].path, raw.uri());
-                let loaded = lance::index::frag_reuse::load_frag_reuse_index_details(dataset, fri)
-                    .await
-                    .unwrap();
-                assert_eq!(loaded.versions.len(), 1);
-                assert_eq!(loaded.versions[0].dataset_version, 1);
-                let mut scanner = dataset.scan();
-                scanner.filter("value = 1").unwrap();
-                assert!(
-                    scanner
-                        .explain_plan(true)
-                        .await
-                        .unwrap()
-                        .contains("ScalarIndexQuery")
-                );
-                assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 1);
-            }
-            let original = read_manifest_indexes(
-                &source.object_store(None).await.unwrap(),
-                source.manifest_location(),
-                source.manifest(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                original
-                    .iter()
-                    .find(|index| index.uuid == source_fri.uuid)
-                    .unwrap(),
-                source_fri
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn malformed_external_fragment_reuse_refuses_before_native_create() {
-        for (label, payload, offset, size) in [
-            ("malformed", vec![0xff], 0, 1),
-            ("overflow", vec![0], u64::MAX, 1),
-            ("truncated", vec![0], 0, 2),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let uri = dir.path().join(format!("{label}.lance"));
-            let uri = uri.to_str().unwrap();
-            external_fragment_reuse_source(uri, payload, offset, size).await;
-            let mut source = engine_open(uri).await;
-            let version = source.version().version;
-            assert!(
-                create_branch(&mut source, "refused", version)
-                    .await
-                    .is_err()
-            );
-            assert!(source.list_branches().await.unwrap().is_empty());
-            let target = source
-                .branch_location()
-                .find_branch(Some("refused"))
-                .unwrap();
-            assert!(!std::path::Path::new(&target.uri).exists());
-            assert_eq!(source.version().version, version);
-        }
-    }
-
-    #[test]
-    fn fragment_reuse_ranges_validate_file_bounds_before_reading() {
-        assert_eq!(fragment_reuse_range(2, 3, 5).unwrap(), 2..5);
-        assert_eq!(fragment_reuse_range(5, 0, 5).unwrap(), 5..5);
-        assert!(fragment_reuse_range(2, 4, 5).is_err());
-        assert!(fragment_reuse_range(u64::MAX, 1, usize::MAX).is_err());
-    }
-
-    #[tokio::test]
-    async fn inherited_full_text_and_vector_indexes_survive_two_forks_and_cold_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().join("search.lance");
-        let uri = uri.to_str().unwrap();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("text", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
-                false,
-            ),
-        ]));
-        let vectors = FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            2,
-            Arc::new(Float32Array::from(
-                (0..256)
-                    .flat_map(|row| [row as f32, 0.0])
-                    .collect::<Vec<_>>(),
-            )),
-            None,
-        )
-        .unwrap();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(
-                    (0..256).map(|row| format!("row-{row}")).collect::<Vec<_>>(),
-                )),
-                Arc::new(StringArray::from(
-                    (0..256)
-                        .map(|row| if row == 0 { "needle" } else { "other" })
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(vectors),
-            ],
-        )
-        .unwrap();
-        let mut source = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            uri,
-            Some(WriteParams {
-                mode: WriteMode::Create,
-                enable_stable_row_ids: true,
-                data_storage_version: Some(LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        source
-            .create_index_builder(
-                &["text"],
-                IndexType::Inverted,
-                &InvertedIndexParams::default(),
-            )
-            .replace(true)
-            .await
-            .unwrap();
-        source
-            .create_index_builder(
-                &["vector"],
-                IndexType::Vector,
-                &VectorIndexParams::ivf_flat(1, MetricType::L2),
-            )
-            .replace(true)
-            .await
-            .unwrap();
-        let original = source.load_indices().await.unwrap();
-        let mut source = engine_open(uri).await;
-        let version = source.version().version;
-        let mut first = create_branch(&mut source, "first", version).await.unwrap();
-        let version = first.version().version;
-        let second = create_branch(&mut first, "second", version).await.unwrap();
-        let cold = DatasetBuilder::from_uri(uri)
-            .with_session(Arc::new(Session::default()))
-            .load()
-            .await
-            .unwrap()
-            .checkout_branch("second")
-            .await
-            .unwrap();
-        for dataset in [&second, &cold] {
-            let indices = dataset.load_indices().await.unwrap();
-            assert_eq!(indices.len(), original.len());
-            for index in indices.iter() {
-                assert!(original.iter().any(|original| original.uuid == index.uuid));
-                assert_eq!(
-                    dataset.manifest().base_paths[&index.base_id.unwrap()].path,
-                    source.uri()
-                );
-            }
-            let mut text = dataset.scan();
-            text.project(&["id"]).unwrap();
-            text.full_text_search(
-                FullTextSearchQuery::new("needle".to_string())
-                    .with_column("text".to_string())
-                    .unwrap(),
-            )
-            .unwrap();
-            let text_plan = text.explain_plan(true).await.unwrap();
-            assert!(
-                text_plan.contains("MatchQuery:") && !text_plan.contains("FlatMatchQuery"),
-                "{text_plan}"
-            );
-            let result = text.try_into_batch().await.unwrap();
-            assert_eq!(result.num_rows(), 1);
-            assert_eq!(
-                result
-                    .column_by_name("id")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap()
-                    .value(0),
-                "row-0"
-            );
-            let mut vector = dataset.scan();
-            vector.project(&["id"]).unwrap();
-            vector
-                .nearest("vector", &Float32Array::from(vec![0.0, 0.0]), 1)
-                .unwrap();
-            let vector_plan = vector.explain_plan(true).await.unwrap();
-            assert!(vector_plan.contains("ANNIvf"), "{vector_plan}");
-            let result = vector.try_into_batch().await.unwrap();
-            assert_eq!(result.num_rows(), 1);
-            assert_eq!(
-                result
-                    .column_by_name("id")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap()
-                    .value(0),
-                "row-0"
-            );
-        }
     }
 }

@@ -328,11 +328,6 @@ impl ScanTuning<'_> {
         self
     }
 
-    pub(crate) fn target_parallelism(&mut self, target_parallelism: usize) -> &mut Self {
-        self.scanner.target_parallelism(target_parallelism);
-        self
-    }
-
     pub(crate) fn blob_handling(&mut self, blob_handling: BlobHandling) -> &mut Self {
         self.scanner.blob_handling(blob_handling);
         self
@@ -3614,11 +3609,7 @@ impl TableStore {
             builder.use_index(false);
         }
         builder.conflict_retries(0);
-        // FirstSeen works around Lance #6877.  The batch entry point proves
-        // source-id uniqueness; the streaming entry point accepts only a
-        // trusted exact-id-PK graph dataset and also rejects duplicates within
-        // each physical record batch.
-        builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+        builder.source_dedupe_behavior(SourceDedupeBehavior::Fail);
         let uncommitted = builder
             .try_build()
             .map_err(OmniError::lance_internal)?
@@ -3923,12 +3914,7 @@ impl TableStore {
         }
         let merged_rows = batch.num_rows() as u64;
 
-        // Precondition for the FirstSeen workaround below: every call path that
-        // reaches stage_merge_insert (load, MutationStaging::finalize,
-        // branch_merge::publish_rewritten_merge_table) must hand in a source
-        // batch that is unique by `key_columns`. Without this check,
-        // `SourceDedupeBehavior::FirstSeen` would silently collapse genuine
-        // duplicates instead of erroring.
+        // Reject duplicate source keys before Lance stages any files.
         check_batch_unique_by_keys(&batch, &key_columns, "stage_merge_insert")?;
 
         let ds = Arc::new(ds);
@@ -3936,22 +3922,7 @@ impl TableStore {
             MergeInsertBuilder::try_new(ds, key_columns).map_err(OmniError::lance_internal)?;
         builder.when_matched(when_matched);
         builder.when_not_matched(when_not_matched);
-        // Workaround for a Lance bug class where sequential merge_insert calls
-        // against rows previously rewritten by merge_insert produce a spurious
-        // "Ambiguous merge inserts: multiple source rows match the same target
-        // row on (id = ...)" error. Lance's `processed_row_ids:
-        // Mutex<HashSet<u64>>` (lance-6.0.1 `src/dataset/write/merge_insert.rs`)
-        // double-processes the same source/target match against datasets
-        // previously rewritten by merge_insert, and the default
-        // `SourceDedupeBehavior::Fail` errors on the second insertion; FirstSeen
-        // makes Lance skip the duplicate match instead. Correctness-preserving
-        // because every call path pre-dedupes the source batch by id or surfaces
-        // a real source dup via `check_batch_unique_by_keys` above (load:
-        // `enforce_unique_constraints_intra_batch`; mutate:
-        // `MutationStaging::finalize`; branch-merge: the `OrderedTableCursor`
-        // walk in `exec/merge.rs`). Retire when upstream Lance fixes the bug
-        // class. Tracked at MR-957; upstream: lance-format/lance#6877.
-        builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+        builder.source_dedupe_behavior(SourceDedupeBehavior::Fail);
         let job = builder.try_build().map_err(OmniError::lance_internal)?;
         let schema = batch.schema();
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
@@ -7113,9 +7084,8 @@ fn staged_keyed_merge_result(
     ))
 }
 
-/// Precondition guard for `stage_merge_insert`, whose `FirstSeen` dedupe (Lance
-/// `processed_row_ids` bug MR-957) would also silently collapse genuine
-/// duplicate source keys. Single-column string keys only; anything else errors.
+/// Validate a staged merge's source keys before I/O. Single-column string keys
+/// only; unsupported key shapes and duplicate keys fail explicitly.
 // Staged-write helper retained alongside the sealed storage surface; no
 #[allow(dead_code)]
 fn check_batch_unique_by_keys(

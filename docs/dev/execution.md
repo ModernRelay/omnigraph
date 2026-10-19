@@ -952,10 +952,11 @@ verdict with the counts it read and each probe attempt per overfetch rung
 
 Lance 13 V2 row-stream payload hydration preserves input order and the valid
 prefixes of its ordering metadata. `WorkMemory` uses that metadata for the final
-sorted merge, so nearest keeps parallel output on V2. Legacy V1 `TakeExec`
-still loses the metadata; nearest requests one output partition for that format.
-`lance_surface_guards.rs::flat_knn_late_payload_order_tracks_file_format` pins
-both paths, and `search.rs` owns the engine's complete ranked-result check.
+sorted merge, so nearest keeps parallel output. Supported graph writers and
+upgrade sources use V2_2 data files.
+`lance_surface_guards.rs::flat_knn_v2_late_payload_preserves_order` pins native
+ordering through payload hydration, and `search.rs` owns the engine's complete
+ranked-result check.
 
 ## Mutations
 

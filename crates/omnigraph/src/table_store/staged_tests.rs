@@ -523,12 +523,20 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
 
 #[tokio::test]
 async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
+    use lance::index::DatasetIndexExt;
+    use lance_core::utils::address::RowAddress;
+
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
-    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
+    // Carol keeps the original indexed fragment live after Alice is rewritten.
+    // With Alice alone the old fragment disappears and Lance can use a flat scan.
+    let ds = TableStore::write_dataset(
+        &uri,
+        person_pk_batch(&[("alice", Some(30)), ("carol", Some(28))]),
+    )
+    .await
+    .unwrap();
     let staged_index = store
         .stage_create_indices(
             &ds,
@@ -544,6 +552,14 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
         .await
         .unwrap();
     let base_version = ds.version().version;
+    let original_indices = ds.load_indices().await.unwrap();
+    assert_eq!(original_indices.len(), 1);
+    let original_id_index = &original_indices[0];
+    assert_eq!(
+        original_id_index.fields,
+        [ds.schema().field("id").unwrap().id]
+    );
+    let original_coverage = original_id_index.fragment_bitmap.as_ref().unwrap();
 
     let probes = MergeWriteProbes::default();
     let staged = with_merge_write_probes(
@@ -580,7 +596,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
 
     let error = store
         .stage_keyed_write(
-            ds,
+            ds.clone(),
             "Person",
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::KnownPresentUpdate,
@@ -595,6 +611,69 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
         base_version,
         "staging a missing known-present id must not advance HEAD"
     );
+
+    // Keep the original BTREE after committing a row rewrite. Its stable-row-ID
+    // posting still names Alice while Alice now lives in an uncovered fragment.
+    // The indexed candidate and uncovered tail must not both reach the merge:
+    // Lance #6877 used to mistake those for ambiguous duplicate source rows.
+    // Native duplicate matching stays strict; no index rebuild may hide it.
+    assert!(ds.manifest.uses_stable_row_ids());
+    let rewritten = store.commit_staged(Arc::new(ds), staged).await.unwrap();
+    assert!(store.has_btree_index(&rewritten, "id").await.unwrap());
+    let retained_indices = rewritten.load_indices().await.unwrap();
+    assert_eq!(retained_indices.len(), 1);
+    assert_eq!(retained_indices[0].uuid, original_id_index.uuid);
+    assert_eq!(
+        retained_indices[0].fragment_bitmap.as_ref(),
+        Some(original_coverage)
+    );
+    let mut current_alice = rewritten.scan();
+    current_alice
+        .with_row_address()
+        .use_scalar_index(false)
+        .filter_expr(ident("id").eq(lit("alice")));
+    let current_alice = current_alice.try_into_batch().await.unwrap();
+    assert_eq!(current_alice.num_rows(), 1);
+    let address = current_alice
+        .column_by_name("_rowaddr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert!(
+        !original_coverage.contains(RowAddress::from(address).fragment_id()),
+        "the rewritten row must remain outside the retained BTREE's fragment coverage"
+    );
+    let repeated = store
+        .stage_keyed_write(
+            rewritten.clone(),
+            "Person",
+            person_pk_batch(&[("alice", Some(42))]),
+            KeyedWriteSemantics::KnownPresentUpdate,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
+        )
+        .await
+        .expect("a repeated update must accept one source row with a stale id BTREE");
+    assert!(
+        matches!(
+            &repeated.transaction.operation,
+            Operation::Update {
+                inserted_rows_filter: None,
+                ..
+            }
+        ),
+        "the repeated update must exercise Lance's indexed v1 route"
+    );
+    let repeated = store
+        .commit_staged(Arc::new(rewritten), repeated)
+        .await
+        .unwrap();
+    let batches = store.scan_batches(&repeated).await.unwrap();
+    assert_eq!(collect_ids(&batches), vec!["alice", "carol"]);
+    assert_eq!(collect_age_for_id(&batches, "alice"), Some(42));
+    assert_eq!(collect_age_for_id(&batches, "carol"), Some(28));
 
     let uncovered_uri = format!("{}/uncovered-people.lance", dir.path().to_str().unwrap());
     let uncovered =

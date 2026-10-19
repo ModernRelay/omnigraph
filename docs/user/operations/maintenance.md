@@ -177,12 +177,15 @@ file's reachability.
 
 `omnigraph cleanup` is the only cleanup to run against a graph root. Lance's
 own cleanup (`cleanup_old_versions`, and every vacuum or retention tool built
-on it) does not trace the detached commits OmniGraph's table versions are: on
-Lance 13 it keeps those versions' manifests and deletes every data file of
-theirs older than seven days, which leaves the graph commits that pin them
-opening but unreadable. The same holds for the graph's catalog dataset, whose
-unpublished proposals and unattached snapshots are detached versions. Treat
-any such run as data loss and restore from backup.
+on it) does not trace OmniGraph's detached table versions. On Lance 13 it can
+delete files used only by detached versions once those files are older than
+seven days, leaving the manifests present but affected snapshots unreadable.
+This can affect the current graph or a recent commit that inherits an old file;
+files shared with retained attached versions remain protected. The same risk
+applies to the graph's catalog dataset, whose unpublished proposals and
+unattached snapshots are detached versions. If an external cleanup has run,
+stop writes and check for missing files; restore the whole root from a verified
+backup if data was deleted.
 
 A table version no graph commit ever named is unpublished staging: a write
 in flight, or one that failed before its publication. Unless a native tag
