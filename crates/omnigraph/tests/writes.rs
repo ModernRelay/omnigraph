@@ -2721,8 +2721,8 @@ query del_age_then_name($threshold: I32, $name: String) {
 
 /// `insert Person 'X'; update Person where name='X' set age=...` — both
 /// ops produce content on `node:Person` and coalesce into one
-/// `stage_merge_insert` at end-of-query. The accumulator's last-write-wins
-/// dedupe (during `MutationStaging::stage_all`) ensures the update's value
+/// `stage_keyed_write` at end-of-query. The accumulator's last-write-wins
+/// dedupe (during `prepare_pending_table`) ensures the update's value
 /// wins. Single Lance commit per table per query.
 #[tokio::test]
 async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {

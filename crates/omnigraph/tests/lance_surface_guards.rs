@@ -2493,7 +2493,7 @@ async fn _compile_uncommitted_full_table_vector_index_shape() -> lance::Result<(
 // --- Guard 8b: MergeInsertJob::execute_uncommitted returns
 //     UncommittedMergeInsert { transaction, affected_rows, stats, inserted_rows_filter } ---
 //
-// `TableStore::stage_merge_insert` has the same staged commit contract as
+// `TableStore::stage_keyed_write` has the same staged commit contract as
 // delete: the Lance transaction and `affected_rows` metadata must travel
 // together into `commit_staged`.
 #[allow(

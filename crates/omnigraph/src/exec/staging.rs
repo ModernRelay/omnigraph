@@ -1097,16 +1097,6 @@ impl StagedMutation {
     }
 }
 
-/// Walk `batches` in reverse, tracking seen `id` values; for each row
-/// whose id we have NOT seen yet, mark it as a keeper. After the walk,
-/// take the kept rows in forward (input) order and concat into one batch.
-///
-/// Result: a deduped batch where each `id` appears at most once, with
-/// the LAST occurrence's column values. Required by `stage_merge_insert`,
-/// which needs unique source keys (Lance's `MergeInsertBuilder` produces
-/// arbitrary results on duplicates).
-///
-/// `batches` must be non-empty and all share `schema` (caller enforces).
 /// Compare two schemas for the purposes of `MutationStaging::append_batch`'s
 /// accumulator-compatibility check. We treat schemas as compatible if
 /// they have the same field names and data types in the same order.
@@ -1125,6 +1115,11 @@ fn schemas_compatible(a: &SchemaRef, b: &SchemaRef) -> bool {
     true
 }
 
+/// Fold pending upserts to unique ids before `stage_keyed_write`, which
+/// rejects duplicate source ids. Walking backwards keeps the last occurrence's
+/// values; the result retains input order among the surviving rows.
+///
+/// `batches` must be non-empty and all share `schema` (caller enforces).
 fn dedupe_merge_batches_by_id(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,

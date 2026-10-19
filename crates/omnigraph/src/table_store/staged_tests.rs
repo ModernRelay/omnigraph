@@ -1,24 +1,15 @@
 #![cfg(test)]
 
-//! Primitive-level tests for `TableStore`'s staged-write API. These
-//! exercise `stage_append`, `stage_merge_insert`, `scan_with_staged`,
-//! and `count_rows_with_staged` directly against a Lance dataset — no
-//! Omnigraph engine involved. The engine-level use of these primitives
-//! is exercised by `tests/writes.rs`.
+//! Primitive-level tests for `TableStore`'s staged-write API. These exercise
+//! `stage_append`, `stage_keyed_write`, `scan_with_staged`, and
+//! `count_rows_with_staged` directly against a Lance dataset. Public engine
+//! writes are covered by `tests/writes.rs`.
 //!
-//! Test surface here:
-//! 1. `stage_append` + `scan_with_staged` shows committed + staged data
-//!    without duplicates.
-//! 2. `stage_merge_insert` of a row that supersedes a committed fragment
-//!    surfaces only the rewritten row, not both, via the
-//!    `removed_fragment_ids` dedup contract.
-//! 3. **Documented contract**: chained `stage_merge_insert` calls on
-//!    the same dataset whose source rows share keys produce duplicate
-//!    rows in `scan_with_staged`. The engine's accumulator dedupes by
-//!    id at finalize time so this primitive-level pitfall doesn't
-//!    surface in production paths; this test pins the primitive's
-//!    behavior so a future change either (a) preserves it or
-//!    (b) consciously fixes it (and updates this test).
+//! Staged scans compose committed and staged fragments without exposing both
+//! a superseded fragment and its rewrite. Independently staged keyed writes
+//! still see only their committed parent, so overlapping keys across stages
+//! appear twice. The engine's pending-table accumulator combines upserts by key
+//! before staging once per table; the primitive tests retain this limitation.
 
 use crate::error::{OmniError, StorageFailureKind};
 use crate::instrumentation::{MergeWriteProbes, with_merge_write_probes};
@@ -32,9 +23,9 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{ident, lit};
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::dataset::DeleteBuilder;
 use lance::dataset::transaction::{Operation, UpdateMode};
 use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilterBuilder;
-use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance_table::format::Fragment;
 use omnigraph_compiler::SYSTEM_COLUMNS_LEGACY;
@@ -405,13 +396,13 @@ async fn stage_append_is_visible_via_scan_with_staged() {
 }
 
 #[tokio::test]
-async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
+async fn stage_keyed_upsert_dedupes_superseded_committed_fragment() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     // Seed: alice age 30 in one committed fragment.
-    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
         .await
         .unwrap();
 
@@ -419,12 +410,13 @@ async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
     // Operation::Update whose removed_fragment_ids excludes the committed
     // fragment that contained the old alice.
     let staged = store
-        .stage_merge_insert(
+        .stage_keyed_write(
             ds.clone(),
-            person_batch(&[("alice", Some(31))]),
-            vec!["id".to_string()],
-            WhenMatched::UpdateAll,
-            WhenNotMatched::InsertAll,
+            "Person",
+            person_pk_batch(&[("alice", Some(31))]),
+            KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1456,7 +1448,7 @@ fn proven_insert_delta_scan_never_enables_strict_batch_size() {
         .split_once("pub async fn scan_proven_insert_delta_bounded(")
         .unwrap()
         .1
-        .split_once("/// Stage a merge_insert (upsert)")
+        .split_once("pub async fn commit_staged(")
         .unwrap()
         .0;
     assert!(
@@ -1754,9 +1746,8 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
 /// row-ID index (prefilter, vector search). With the slice threaded
 /// through, the second call offsets by the first call's row count.
 ///
-/// This is what enables the engine's multi-statement `insert Knows ...;
-/// insert Knows ...` (multiple appends to the same edge table) under
-/// the D₂′ rule.
+/// This pins the test-only append primitive's provisional identity. Production
+/// mutations combine pending inserts before staging a keyed table write.
 #[tokio::test]
 async fn chained_stage_appends_have_distinct_row_ids() {
     let dir = tempfile::tempdir().unwrap();
@@ -1874,25 +1865,26 @@ async fn stage_append_then_commit_persists_data() {
     assert_eq!(collect_ids(&batches), vec!["alice", "bob"]);
 }
 
-/// `stage_merge_insert` + `commit_staged` round-trip: after commit, the
+/// `stage_keyed_write` + `commit_staged` round-trip: after commit, the
 /// merged view (existing alice updated + new bob inserted) is visible.
 #[tokio::test]
-async fn stage_merge_insert_then_commit_persists_merged_view() {
+async fn stage_keyed_upsert_then_commit_persists_merged_view() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
-    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
         .await
         .unwrap();
 
     let staged = store
-        .stage_merge_insert(
+        .stage_keyed_write(
             ds.clone(),
-            person_batch(&[("alice", Some(31)), ("bob", Some(25))]),
-            vec!["id".to_string()],
-            WhenMatched::UpdateAll,
-            WhenNotMatched::InsertAll,
+            "Person",
+            person_pk_batch(&[("alice", Some(31)), ("bob", Some(25))]),
+            KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1902,6 +1894,8 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
     let reopened = Dataset::open(&uri).await.unwrap();
     let batches = store.scan_batches(&reopened).await.unwrap();
     assert_eq!(collect_ids(&batches), vec!["alice", "bob"]);
+    assert_eq!(collect_age_for_id(&batches, "alice"), Some(31));
+    assert_eq!(collect_age_for_id(&batches, "bob"), Some(25));
 
     // Confirm alice was updated to age=31, not duplicated.
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1909,18 +1903,18 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
 }
 
 #[tokio::test]
-async fn stage_merge_insert_commit_rebases_over_disjoint_committed_delete() {
+async fn known_present_update_commit_rebases_over_disjoint_committed_delete() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
-    let ds = TableStore::write_dataset(&uri, numbered_person_batch(0..100))
-        .await
-        .unwrap();
+    let seed = numbered_person_batch(0..100);
+    let seed = RecordBatch::try_new(person_pk_schema(), seed.columns().to_vec()).unwrap();
+    let ds = TableStore::write_dataset(&uri, seed).await.unwrap();
     let update_ids: Vec<String> = (0..10).map(|i| format!("p{i}")).collect();
     let update_ages: Vec<Option<i32>> = (0..10).map(|i| Some(1000 + i)).collect();
     let update_batch = RecordBatch::try_new(
-        person_schema(),
+        person_pk_schema(),
         vec![
             Arc::new(StringArray::from(update_ids)),
             Arc::new(Int32Array::from(update_ages)),
@@ -1929,12 +1923,13 @@ async fn stage_merge_insert_commit_rebases_over_disjoint_committed_delete() {
     .unwrap();
 
     let staged = store
-        .stage_merge_insert(
+        .stage_keyed_write(
             ds.clone(),
+            "Person",
             update_batch,
-            vec!["id".to_string()],
-            WhenMatched::UpdateAll,
-            WhenNotMatched::DoNothing,
+            KeyedWriteSemantics::KnownPresentUpdate,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -2192,39 +2187,32 @@ async fn scan_with_staged_with_filter_returns_matching_staged_rows() {
     );
 }
 
-/// **Documented contract** (see `stage_merge_insert` doc): chained
-/// `stage_merge_insert` calls on the same table whose source rows share
-/// keys cannot dedupe across stages. Each call's `MergeInsertBuilder` runs
-/// against the committed view; neither sees the other's staged fragments.
-/// The combined `scan_with_staged` therefore returns the shared key
-/// twice.
-///
-/// The engine's mutation path enforces D₂′ (per touched table: all
-/// stage_append OR exactly one stage_merge_insert) at parse time so this
-/// scenario is unreachable through public APIs. This test pins the
-/// primitive behavior — if a future change makes the primitive itself
-/// dedupe across stages (e.g. via a Lance API extension or in-memory
-/// pre-merge), update this assertion.
+/// Independently staged keyed upserts cannot dedupe across stages: both
+/// `MergeInsertBuilder`s read the same committed parent. The engine avoids
+/// this by combining pending upserts by id before one keyed stage per table.
+/// Retain the primitive limitation here so callers do not assume that
+/// `scan_with_staged` implements inter-stage key supersession.
 #[tokio::test]
-async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior() {
+async fn chained_keyed_upserts_with_shared_key_document_duplicate_behavior() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     // Seed empty (an unrelated row keeps the schema unambiguous).
-    let ds = TableStore::write_dataset(&uri, person_batch(&[("seed", Some(0))]))
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("seed", Some(0))]))
         .await
         .unwrap();
 
     // Op-1: stage merge_insert of alice. Against committed view: alice
     // doesn't exist, so this lands as a fresh insert into Operation::Update.new_fragments.
     let staged_1 = store
-        .stage_merge_insert(
+        .stage_keyed_write(
             ds.clone(),
-            person_batch(&[("alice", Some(30))]),
-            vec!["id".to_string()],
-            WhenMatched::UpdateAll,
-            WhenNotMatched::InsertAll,
+            "Person",
+            person_pk_batch(&[("alice", Some(30))]),
+            KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -2234,19 +2222,20 @@ async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior
     // Lance produces another fresh insert. Op-2 has no knowledge of
     // op-1's staged fragments.
     let staged_2 = store
-        .stage_merge_insert(
+        .stage_keyed_write(
             ds.clone(),
-            person_batch(&[("alice", Some(31))]),
-            vec!["id".to_string()],
-            WhenMatched::UpdateAll,
-            WhenNotMatched::InsertAll,
+            "Person",
+            person_pk_batch(&[("alice", Some(31))]),
+            KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
 
     // scan_with_staged sees committed (seed) + op-1.new (alice age=30) +
-    // op-2.new (alice age=31). Alice appears twice — the documented
-    // contract violation that D₂′ prevents at the engine layer.
+    // op-2.new (alice age=31). Alice appears twice; the engine's pending-table
+    // accumulator resolves this overlap before staging.
     let batches = store
         .scan_with_staged(&ds, &[staged_1, staged_2], None, None)
         .await
@@ -2255,14 +2244,8 @@ async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior
     let alice_count = ids.iter().filter(|id| *id == "alice").count();
     assert_eq!(
         alice_count, 2,
-        "chained stage_merge_insert with shared key produces duplicates — \
-         this is the contract documented on stage_merge_insert. If you're \
-         here because this assertion failed: either (a) the primitive was \
-         improved to dedupe across stages (good — update to assert == 1) \
-         or (b) something subtler broke (investigate before changing the \
-         assertion). The engine's MutationStaging accumulator dedupes by \
-         id at finalize time so this primitive-level pitfall doesn't \
-         surface in production paths — see exec/staging.rs."
+        "independently staged keyed upserts do not resolve overlapping keys; \
+         MutationStaging must combine pending upserts before staging"
     );
 }
 

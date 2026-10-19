@@ -272,41 +272,6 @@ impl WrappingObjectStore for RangeMemoWrapper {
     }
 }
 
-/// Stacks two store wrappers, `outer` over `inner`, into one
-/// [`WrappingObjectStore`] slot.
-#[derive(Debug)]
-pub struct StackedWrapper {
-    outer: Arc<dyn WrappingObjectStore>,
-    inner: Arc<dyn WrappingObjectStore>,
-}
-
-impl StackedWrapper {
-    pub fn new(
-        outer: Arc<dyn WrappingObjectStore>,
-        inner: Arc<dyn WrappingObjectStore>,
-    ) -> Arc<Self> {
-        Arc::new(Self { outer, inner })
-    }
-}
-
-impl WrappingObjectStore for StackedWrapper {
-    fn wrap(&self, store_prefix: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
-        self.outer
-            .wrap(store_prefix, self.inner.wrap(store_prefix, original))
-    }
-
-    fn wrap_paginated(
-        &self,
-        store_prefix: &str,
-        original: Arc<dyn PaginatedListStore>,
-    ) -> Option<Arc<dyn PaginatedListStore>> {
-        self.outer.wrap_paginated(
-            store_prefix,
-            self.inner.wrap_paginated(store_prefix, original)?,
-        )
-    }
-}
-
 struct RangeMemoStore {
     memo: Arc<RangeReadMemo>,
     store_prefix: String,
@@ -472,6 +437,7 @@ impl ObjectStore for RangeMemoStore {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use lance_io::object_store::ChainedWrappingObjectStore;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
 
@@ -664,7 +630,9 @@ mod tests {
     }
 
     impl WrappingObjectStore for PaginationWrapper {
-        fn wrap(&self, _: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        fn wrap(&self, store_prefix: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            assert_eq!(store_prefix, "test");
+            self.calls.lock().unwrap().push(self.name);
             original
         }
 
@@ -708,11 +676,16 @@ mod tests {
                     .wrap_paginated("test", Arc::clone(&original))
                     .unwrap();
                 assert!(Arc::ptr_eq(&original, &passed));
-                let stacked = StackedWrapper::new(
-                    wrapper("outer", outer_allows),
+                let chained = ChainedWrappingObjectStore::new(vec![
                     wrapper("inner", inner_allows),
-                );
-                let result = stacked.wrap_paginated("test", Arc::clone(&original));
+                    wrapper("outer", outer_allows),
+                ]);
+                let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                let wrapped = chained.wrap("test", Arc::clone(&store));
+                assert!(Arc::ptr_eq(&store, &wrapped));
+                assert_eq!(*calls.lock().unwrap(), vec!["inner", "outer"]);
+                calls.lock().unwrap().clear();
+                let result = chained.wrap_paginated("test", Arc::clone(&original));
                 assert_eq!(result.is_some(), inner_allows && outer_allows);
                 if let Some(result) = result {
                     assert!(Arc::ptr_eq(&original, &result));
