@@ -3833,8 +3833,8 @@ mod local_serving {
         access: omnigraph_server::LocalAccess,
         cluster: bool,
     ) -> (AppState, String) {
-        let binding = omnigraph_server::LocalBinding::from_root(root.to_str().unwrap()).unwrap();
-        let (state, credential) = AppState::local(
+        let binding = omnigraph_server::LocalBinding::local(root).unwrap();
+        let (state, credential) = omnigraph_server::with_local_read_write(AppState::local(
             if cluster {
                 omnigraph_server::LocalScope::Cluster(binding)
             } else {
@@ -3845,7 +3845,7 @@ mod local_serving {
                 actor: Some("act-local".into()),
                 process_defaults: omnigraph_server::ProcessDefaults::default(),
             },
-        )
+        ))
         .await
         .unwrap();
         (state, credential.reveal())
@@ -3892,7 +3892,7 @@ mod local_serving {
         };
         let mode = std::env::var(MODE).unwrap();
         omnigraph_server::install_log_subscriber(std::io::stderr);
-        let (state, token) = if mode == "cluster" {
+        let (state, token) = if mode == "cluster" || mode == "release" {
             local_state_of(&root, omnigraph_server::LocalAccess::ReadWrite, true).await
         } else {
             local_state(&graph_path(&root), omnigraph_server::LocalAccess::ReadWrite).await
@@ -3912,6 +3912,13 @@ mod local_serving {
             router.route("/extended", axum::routing::get(|| async { "extended" }))
         })
         .unwrap();
+        if mode == "release" {
+            // The caller fails before serving and stops the server instead.
+            assert!(root.join("__cluster/lock.json").exists());
+            let outcome = serving.release().await;
+            fs::write(root.join("outcome"), format!("{outcome:?}")).unwrap();
+            std::process::exit(i32::from(outcome.is_err()));
+        }
         fs::write(root.join("listening.tmp"), format!("{address}\n{token}")).unwrap();
         fs::rename(root.join("listening.tmp"), root.join("listening")).unwrap();
         println!("{BEGIN}");
@@ -4134,6 +4141,55 @@ mod local_serving {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller_uncertain() {
         serve_local_runs_the_lifecycle_and_leaves_stdout_to_its_caller("uncertain").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_stops_an_unserved_local_server_and_frees_its_cluster() {
+        let temp = local_cluster_dir().await;
+        let root = temp.path();
+        let mut child = ContainedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "local_serving::local_server_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(ROOT, root)
+                .env(MODE, "release")
+                .env_remove("RUST_LOG")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut stderr = child.0.stderr.take().unwrap();
+        let stderr = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "an unserved local server did not release within its process bound"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stderr = stderr.join().unwrap();
+        assert_eq!(status.code(), Some(0), "{stderr}");
+        assert_eq!(
+            fs::read_to_string(root.join("outcome")).unwrap(),
+            "Ok(Clean)"
+        );
+        assert!(!root.join("__cluster/lock.json").exists());
+        // The next serving owner is admitted.
+        let _owner = local_state_of(root, omnigraph_server::LocalAccess::ReadWrite, true).await;
+        assert!(root.join("__cluster/lock.json").exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

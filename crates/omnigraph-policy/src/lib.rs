@@ -623,10 +623,11 @@ impl PolicyEngine {
 
     /// The same engine with every action in `actions` forbidden to every
     /// actor, whatever its rules permit: a Cedar `forbid` overrides every
-    /// `permit`. A denial it decides names `rule_id`.
+    /// `permit`. A denial it decides names `rule_id`, which may also name one
+    /// of its rules: a `forbid` and a `permit` never share a Cedar id.
     pub fn forbidding(mut self, rule_id: &str, actions: &[PolicyAction]) -> Result<Self> {
         for action in actions {
-            let policy_id = PolicyId::new(format!("{rule_id}:{}", action.as_str()));
+            let policy_id = PolicyId::new(format!("forbid:{rule_id}:{}", action.as_str()));
             let source = format!(
                 "forbid (principal, action == Omnigraph::Action::{}, resource);",
                 cedar_literal(action.as_str())
@@ -911,7 +912,7 @@ fn compile_policies(
 
     for rule in &config.rules {
         for action in &rule.allow.actions {
-            let policy_id = PolicyId::new(format!("{}:{}", rule.id, action.as_str()));
+            let policy_id = PolicyId::new(format!("permit:{}:{}", rule.id, action.as_str()));
             let source = compile_policy_source(rule, action, graph_id);
             let policy = Policy::parse(Some(policy_id.clone()), source.as_str())?;
             policy_to_rule.insert(policy_id.to_string(), rule.id.clone());
@@ -1281,7 +1282,7 @@ version: 1
 groups:
   team: [act-me]
 rules:
-  - id: everything
+  - id: read-only
     allow:
       actors: { group: team }
       actions: [read, change]
@@ -1292,6 +1293,7 @@ rules:
             branch: Some("main".into()),
             target_branch: None,
         };
+        // The forbid takes the id of the rule permitting what it forbids.
         let engine = PolicyEngine::load_graph_from_source(yaml, "g1")
             .unwrap()
             .forbidding(

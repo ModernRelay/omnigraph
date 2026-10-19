@@ -5931,6 +5931,7 @@ dependencies = [
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-policy",
+ "omnigraph-server",
  "omnigraph-skill",
  "p256",
  "rand 0.9.4",

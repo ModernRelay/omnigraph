@@ -16,6 +16,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use omnigraph::db::Omnigraph;
 use omnigraph::error::OmniError;
+use omnigraph::storage::StorageKind;
 use omnigraph_policy::{
     PolicyAction, PolicyActorSelector, PolicyAllowRule, PolicyBranchScope, PolicyConfig,
     PolicyEngine, PolicyRule,
@@ -33,21 +34,71 @@ use crate::{
 pub enum LocalAccess {
     /// Reads and exports only; every write route refuses before its body.
     ReadOnly,
-    /// Also changes, branch controls and unpublished-commit controls.
+    /// Also changes, branch controls and unpublished-commit controls. Not
+    /// available yet: [`AppState::local`] refuses it with
+    /// [`LocalOpenError::ReadWriteUnavailable`] while a write whose outcome
+    /// is unknown still stops the server that ran it.
     ReadWrite,
 }
 
-/// The destination a local server opens, captured once by its caller.
+#[cfg(any(test, feature = "test-util"))]
+tokio::task_local! {
+    static READ_WRITE_FOR_TESTS: ();
+}
+
+/// Run `future` with read-write local servers available to the
+/// [`AppState::local`] calls it makes on its own task. Tests only: the
+/// read-write path exists before its availability, and a build with this
+/// feature still refuses read-write everywhere outside this scope.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn with_local_read_write<F: std::future::Future>(future: F) -> F::Output {
+    READ_WRITE_FOR_TESTS.scope((), future).await
+}
+
+/// Whether this call may open a read-write local server.
+fn read_write_available() -> bool {
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        READ_WRITE_FOR_TESTS.try_with(|_| ()).is_ok()
+    }
+    #[cfg(not(any(test, feature = "test-util")))]
+    {
+        false
+    }
+}
+
+/// The destination a local server opens, captured once by its caller: a root
+/// on this machine's file system.
+///
+/// A remote root's endpoint and credentials would come from the process
+/// environment when it opens, which a captured binding must not depend on,
+/// so a local server serves local roots only until a binding carries the
+/// storage settings its caller resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalBinding {
     root: String,
 }
 
 impl LocalBinding {
-    /// A binding for a graph root the caller resolved, normalized as the
-    /// engine normalizes roots.
-    pub fn from_root(root: &str) -> Result<Self, LocalOpenError> {
-        let root = omnigraph::storage::normalize_root_uri(root)
+    /// A binding for the root at `path`, made absolute and normalized as the
+    /// engine normalizes roots. A URI, `file://` included, is refused: pass
+    /// the path it names.
+    pub fn local(path: impl AsRef<std::path::Path>) -> Result<Self, LocalOpenError> {
+        let path = path.as_ref();
+        let text = path.to_str().ok_or_else(|| {
+            LocalOpenError::Root(format!("{} is not a UTF-8 path", path.display()))
+        })?;
+        if text.contains("://") {
+            return Err(LocalOpenError::Root(format!(
+                "a local server serves a root on this machine's file system, not {text}"
+            )));
+        }
+        let absolute = std::path::absolute(path)
+            .map_err(|error| LocalOpenError::Root(format!("{}: {error}", path.display())))?;
+        let absolute = absolute.to_str().ok_or_else(|| {
+            LocalOpenError::Root(format!("{} is not a UTF-8 path", absolute.display()))
+        })?;
+        let root = omnigraph::storage::normalize_root_uri(absolute)
             .map_err(|error| LocalOpenError::Root(error.to_string()))?;
         Ok(Self { root })
     }
@@ -97,6 +148,11 @@ impl fmt::Debug for LocalCredential {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LocalOpenError {
+    /// `ReadWrite` is not available yet; serve read-only.
+    #[error(
+        "a read-write local server is not available yet: a write whose outcome is unknown would stop it; serve read-only"
+    )]
+    ReadWriteUnavailable,
     /// `ReadWrite` needs an actor to attribute writes to, and a cluster's
     /// policy needs one to decide for.
     #[error("this local server needs an actor: pass --as or set operator.actor")]
@@ -119,6 +175,11 @@ pub enum LocalOpenError {
     /// The cluster's applied state could not be served.
     #[error("{0}")]
     Serving(String),
+    /// A read-write local server's graphs could not be served after it took
+    /// the cluster's serving admission. An open may have reached storage, so
+    /// the admission stays held as `lock_id` until it is force-unlocked.
+    #[error("{message}; the cluster's serving admission stays held as lock {lock_id}")]
+    AdmissionRetained { lock_id: String, message: String },
 }
 
 impl LocalOpenError {
@@ -295,15 +356,19 @@ impl AppState {
     /// For a standalone graph it refuses a root inside a cluster, takes no
     /// admission, and installs a generated policy on the engine as well as at
     /// the HTTP layer. For a cluster the cluster's applied policy decides for
-    /// the actor; read-only captures one ledger revision and opens every
-    /// graph read-only against it without admission, with every write
-    /// forbidden in each policy, while read-write takes the cluster's
-    /// serving admission. Read-only holds in ingress, in `/mcp` and in every
-    /// engine writer.
+    /// the actor, and a graph it binds no policy to grants `read` alone;
+    /// read-only captures one ledger revision and opens every graph
+    /// read-only against it without admission, with every write forbidden
+    /// in each policy, while read-write takes the cluster's serving
+    /// admission. Either refuses when no graph opens. Read-only holds in
+    /// ingress, in `/mcp` and in every engine writer.
     pub async fn local(
         scope: LocalScope,
         options: LocalOptions,
     ) -> Result<(AppState, LocalCredential), LocalOpenError> {
+        if options.access == LocalAccess::ReadWrite && !read_write_available() {
+            return Err(LocalOpenError::ReadWriteUnavailable);
+        }
         match scope {
             LocalScope::Graph(binding) => local_graph(binding, options).await,
             LocalScope::Cluster(binding) => local_cluster(binding, options).await,
@@ -365,13 +430,16 @@ async fn local_graph(
     Ok((state, LocalCredential(token)))
 }
 
-/// The storage-root URI cluster readers take: a local root is spelled with
-/// `file://`, since a bare path names a configuration directory there.
-fn cluster_storage_uri(root: &str) -> String {
-    if root.contains("://") {
-        root.to_string()
-    } else {
-        format!("file://{root}")
+/// The storage-root URI cluster readers take: a local root is spelled as a
+/// `file://` URL, since a bare path names a configuration directory there.
+fn cluster_storage_uri(root: &str) -> Result<String, LocalOpenError> {
+    match omnigraph::storage::storage_kind_for_uri(root)
+        .map_err(|error| LocalOpenError::Root(error.to_string()))?
+    {
+        StorageKind::Local => url::Url::from_file_path(root)
+            .map(String::from)
+            .map_err(|()| LocalOpenError::Root(format!("{root} is not an absolute path"))),
+        StorageKind::S3 | StorageKind::Azure => Ok(root.to_string()),
     }
 }
 
@@ -380,58 +448,22 @@ async fn local_cluster(
     options: LocalOptions,
 ) -> Result<(AppState, LocalCredential), LocalOpenError> {
     let actor = options.actor.ok_or(LocalOpenError::ActorRequired)?;
-    let root = cluster_storage_uri(binding.root());
+    let root = cluster_storage_uri(binding.root())?;
     let token = generate_token();
-    let tokens = vec![(actor, token.clone())];
-    let state = match options.access {
-        LocalAccess::ReadOnly => local_cluster_read_only(&root, binding.root(), tokens).await?,
+    let tokens = vec![(actor.clone(), token.clone())];
+    let (state, witness) = match options.access {
+        LocalAccess::ReadOnly => {
+            local_cluster_read_only(&root, binding.root(), &actor, tokens).await?
+        }
         LocalAccess::ReadWrite => {
-            // The serving owner's admission, held as a deployment holds it
-            // and released by `serve_local` after a clean drain.
-            let admitted = omnigraph_cluster::admit_serving_snapshot(&root)
-                .await
-                .map_err(LocalOpenError::cluster)?;
-            let (snapshot, _, admission) = admitted.into_parts();
-            let config = match crate::settings::settings_from_snapshot(
-                Path::new(binding.root()),
-                None,
-                false,
-                false,
-                snapshot,
-            ) {
-                Ok(config) => config,
-                Err(error) => {
-                    return Err(LocalOpenError::serving(
-                        crate::settings::release_settings_refusal(error, admission).await,
-                    ));
-                }
-            };
-            let ServerConfigMode::Multi {
-                graphs,
-                config_path,
-                server_policy,
-                catalogue_policy,
-            } = config.mode;
-            let (state, prepared) = crate::prepare_multi_graph_state(
-                graphs,
-                tokens,
-                server_policy.as_ref(),
-                config_path,
-                admission,
-            )
-            .await
-            .map_err(LocalOpenError::serving)?;
-            state.set_catalogue_policy(
-                crate::load_catalogue_policy(catalogue_policy.as_ref())
-                    .map_err(LocalOpenError::serving)?,
-            );
-            crate::finish_graph_startup(state.clone(), prepared, false)
-                .await
-                .map_err(LocalOpenError::serving)?;
-            state
+            local_cluster_read_write(&root, binding.root(), &actor, tokens).await?
         }
     };
+    // `/readyz` and `/graphs` report the revision served, as a deployment's do.
+    let draining = Arc::clone(&state.draining);
+    let grace = state.shutdown_grace;
     let state = state
+        .with_boot_witness(witness, draining, grace)
         .with_process_defaults(options.process_defaults)
         .with_mcp_settings(McpSettings {
             allow_adhoc: true,
@@ -442,33 +474,153 @@ async fn local_cluster(
     Ok((state, LocalCredential(token)))
 }
 
-/// A cluster's applied state, served without admission: one ledger revision
-/// is captured, every graph opens read-only and is validated against it, and
-/// every policy forbids writes.
-async fn local_cluster_read_only(
-    root: &str,
+/// What a local server of a cluster serves, projected from one snapshot.
+struct LocalClusterSettings {
+    graphs: Vec<crate::GraphStartupConfig>,
+    config_path: std::path::PathBuf,
+    server_policy: Option<crate::PolicySource>,
+    catalogue_policy: Option<crate::PolicySource>,
+    require_all_graphs: bool,
+    witness: crate::BootWitness,
+}
+
+/// Project `snapshot` as a deployment's boot does. A graph the cluster binds
+/// no policy to gets the grant a deployment without one gives its actors,
+/// `read` alone, so its engine refuses every write as its routes do.
+fn local_cluster_settings(
     config_dir: &str,
-    tokens: Vec<(String, String)>,
-) -> Result<AppState, LocalOpenError> {
-    let snapshot = omnigraph_cluster::read_serving_snapshot_from_storage(root)
-        .await
-        .map_err(LocalOpenError::cluster)?;
-    let state_cas = snapshot.state_cas.clone();
+    actor: &str,
+    snapshot: omnigraph_cluster::ServingSnapshot,
+) -> color_eyre::Result<LocalClusterSettings> {
     let config = crate::settings::settings_from_snapshot(
         Path::new(config_dir),
         None,
         false,
         false,
         snapshot,
-    )
-    .map_err(LocalOpenError::serving)?;
+    )?;
     let ServerConfigMode::Multi {
-        graphs,
+        mut graphs,
         config_path,
         server_policy,
         catalogue_policy,
     } = config.mode;
-    let server_policy = server_policy
+    let unbound = unbound_graph_policy(actor)?;
+    for cfg in &mut graphs {
+        if cfg.policy.is_none() && cfg.startup_failure.is_none() {
+            cfg.policy = Some(crate::PolicySource::Inline(unbound.clone()));
+        }
+    }
+    Ok(LocalClusterSettings {
+        graphs,
+        config_path,
+        server_policy,
+        catalogue_policy,
+        require_all_graphs: config.require_all_graphs,
+        witness: config.witness,
+    })
+}
+
+/// The policy source of a graph the cluster binds no policy to: `read` on
+/// every branch for `actor`, what a deployment's routes grant an
+/// authenticated actor without a bundle.
+fn unbound_graph_policy(actor: &str) -> color_eyre::Result<String> {
+    let config = PolicyConfig {
+        version: 1,
+        groups: [(LOCAL_GROUP.to_string(), vec![actor.to_string()])].into(),
+        protected_branches: Vec::new(),
+        rules: local_rule(
+            "local-read",
+            vec![PolicyAction::Read],
+            Some(PolicyBranchScope::Any),
+            None,
+        )
+        .into_iter()
+        .collect(),
+    };
+    Ok(yaml_serde::to_string(&config)?)
+}
+
+/// A cluster's applied state, served under its serving admission as a
+/// deployment serves it.
+async fn local_cluster_read_write(
+    root: &str,
+    config_dir: &str,
+    actor: &str,
+    tokens: Vec<(String, String)>,
+) -> Result<(AppState, crate::BootWitness), LocalOpenError> {
+    // The serving owner's admission, held as a deployment holds it and
+    // released after a clean drain by `LocalServing::serve`, or by
+    // `LocalServing::release` when it never serves.
+    let admitted = omnigraph_cluster::admit_serving_snapshot(root)
+        .await
+        .map_err(LocalOpenError::cluster)?;
+    let (snapshot, _, admission) = admitted.into_parts();
+    let lock_id = admission.as_ref().map(|owner| owner.lock_id().to_owned());
+    // No graph storage is reached before the first graph opens, so a
+    // refusal until then releases the admission, as a refused settings
+    // preflight does.
+    let held = admission.clone();
+    let prepared = async {
+        let settings = local_cluster_settings(config_dir, actor, snapshot)?;
+        let catalogue_policy = crate::load_catalogue_policy(settings.catalogue_policy.as_ref())?;
+        let (state, prepared) = crate::prepare_multi_graph_state(
+            settings.graphs,
+            tokens,
+            settings.server_policy.as_ref(),
+            settings.config_path,
+            admission,
+        )
+        .await?;
+        state.set_catalogue_policy(catalogue_policy);
+        Ok::<_, color_eyre::Report>((
+            state,
+            prepared,
+            settings.require_all_graphs,
+            settings.witness,
+        ))
+    }
+    .await;
+    let (state, prepared, require_all_graphs, witness) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Err(LocalOpenError::serving(
+                crate::settings::release_settings_refusal(error, held).await,
+            ));
+        }
+    };
+    drop(held);
+    // An open may have reached storage, so a failed startup keeps the
+    // admission and names its lock.
+    crate::finish_graph_startup(state.clone(), prepared, require_all_graphs)
+        .await
+        .map_err(|error| match lock_id {
+            Some(lock_id) => LocalOpenError::AdmissionRetained {
+                lock_id,
+                message: format!("{error:#}"),
+            },
+            None => LocalOpenError::serving(error),
+        })?;
+    Ok((state, witness))
+}
+
+/// A cluster's applied state, served without admission: one ledger revision
+/// is captured, every graph opens read-only and is validated against it, and
+/// every policy forbids writes.
+async fn local_cluster_read_only(
+    root: &str,
+    config_dir: &str,
+    actor: &str,
+    tokens: Vec<(String, String)>,
+) -> Result<(AppState, crate::BootWitness), LocalOpenError> {
+    let snapshot = omnigraph_cluster::read_serving_snapshot_from_storage(root)
+        .await
+        .map_err(LocalOpenError::cluster)?;
+    let state_cas = snapshot.state_cas.clone();
+    let settings =
+        local_cluster_settings(config_dir, actor, snapshot).map_err(LocalOpenError::serving)?;
+    let server_policy = settings
+        .server_policy
         .as_ref()
         .map(|source| {
             let policy = match source {
@@ -479,8 +631,13 @@ async fn local_cluster_read_only(
         })
         .transpose()
         .map_err(|error| LocalOpenError::Policy(error.to_string()))?;
-    let mut entries = Vec::with_capacity(graphs.len());
-    for cfg in graphs {
+    let catalogue_policy = crate::load_catalogue_policy(settings.catalogue_policy.as_ref())
+        .and_then(|policy| policy.map(forbid_writes).transpose())
+        .map_err(|error| LocalOpenError::Policy(error.to_string()))?;
+    let configured = settings.graphs.len();
+    let mut entries = Vec::with_capacity(configured);
+    let mut failures = Vec::new();
+    for cfg in settings.graphs {
         let key = GraphKey::cluster(
             GraphId::try_from(cfg.graph_id.clone())
                 .map_err(|error| LocalOpenError::Serving(error.to_string()))?,
@@ -505,28 +662,58 @@ async fn local_cluster_read_only(
             // revision or none.
             Err(diagnostic) => return Err(LocalOpenError::cluster(vec![diagnostic])),
         };
-        let entry =
+        let opened =
             match crate::prepare_single_graph(cfg, None, GraphOpenAccess::ReadOnly(authority)) {
-                Ok(prepared) => match crate::open_prepared_graph(prepared).await {
-                    Ok(opened) => GraphEntry::ready(opened.handle),
-                    Err(error) => crate::blocked_startup_graph(key, uri, error),
-                },
-                Err(error) => crate::blocked_startup_graph(key, uri, error),
+                Ok(prepared) => crate::open_prepared_graph(prepared).await,
+                Err(error) => Err(error),
             };
-        entries.push(entry);
+        if let Err(error) = &opened {
+            failures.push(format!("graph '{}': {error:#}", key.graph_id));
+        }
+        entries.push(read_only_entry(key, uri, opened)?);
+    }
+    // As a deployment's startup refuses: when no graph opens, and when any
+    // fails while every graph is required.
+    if (configured > 0 && failures.len() == configured)
+        || (settings.require_all_graphs && !failures.is_empty())
+    {
+        return Err(LocalOpenError::Serving(format!(
+            "{} of {configured} graphs could not be served: {}",
+            failures.len(),
+            failures.join("; ")
+        )));
     }
     let state = AppState::new_multi_entries(
         entries,
         tokens,
         server_policy,
         workload::WorkloadController::from_env(),
-        Some(config_path),
+        Some(settings.config_path),
     )
     .map_err(|error| LocalOpenError::Serving(error.to_string()))?;
-    state.set_catalogue_policy(
-        crate::load_catalogue_policy(catalogue_policy.as_ref()).map_err(LocalOpenError::serving)?,
-    );
-    Ok(state)
+    state.set_catalogue_policy(catalogue_policy);
+    Ok((state, settings.witness))
+}
+
+/// The entry for a graph opened read-only. A graph that fails to open is
+/// blocked, as normal serving blocks it, unless the cluster refused the
+/// revision captured for it: then the whole server refuses, since it serves
+/// one revision or none. A schema drifted from its achieved contract stays
+/// that one graph's block.
+fn read_only_entry(
+    key: GraphKey,
+    uri: String,
+    opened: Result<crate::OpenedGraph, crate::GraphOpenFailure>,
+) -> Result<GraphEntry, LocalOpenError> {
+    match opened {
+        Ok(opened) => Ok(GraphEntry::ready(opened.handle)),
+        Err(mut error) => match error.cluster_refusal.take() {
+            Some(refusal) if refusal.code != "applied_schema_drift" => {
+                Err(LocalOpenError::cluster(vec![refusal]))
+            }
+            _ => Ok(crate::blocked_startup_graph(key, uri, error)),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -604,6 +791,208 @@ mod tests {
                 LocalClass::Never => {}
             }
         }
+    }
+
+    #[test]
+    fn a_local_binding_is_absolute_and_its_cluster_uri_names_it() {
+        let cwd = std::env::current_dir().unwrap();
+        for spelling in ["relative/cluster", "a local cluster"] {
+            let binding = LocalBinding::local(spelling).unwrap();
+            assert_eq!(Path::new(binding.root()), cwd.join(spelling));
+            let uri = cluster_storage_uri(binding.root()).unwrap();
+            assert!(uri.starts_with("file:///"), "{uri}");
+            assert_eq!(
+                omnigraph::storage::normalize_root_uri(&uri).unwrap(),
+                binding.root()
+            );
+        }
+    }
+
+    /// A ledger that moves between a read-only open's capture and its
+    /// validation refuses the whole server; a graph whose schema drifted
+    /// from its achieved contract is blocked alone.
+    #[tokio::test]
+    async fn a_read_only_open_refuses_a_moved_revision_and_blocks_a_drifted_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = "node Person { name: String @key }\n";
+        std::fs::write(dir.path().join("people.pg"), schema).unwrap();
+        std::fs::write(
+            dir.path().join("cluster.yaml"),
+            "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n",
+        )
+        .unwrap();
+        let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+        let applied = omnigraph_cluster::apply_deployment(dir.path(), None, &caller, |_, _, _| {})
+            .await
+            .unwrap();
+        assert!(
+            matches!(applied, omnigraph_cluster::DeploymentLookup::Complete { ref result } if result.converged),
+            "{applied:?}"
+        );
+        let root = dir.path().to_str().unwrap();
+        let status = omnigraph_cluster::deployment_status(root, None, &caller)
+            .await
+            .unwrap();
+        if let Some(lock_id) = status.lock_id {
+            omnigraph_cluster::force_unlock_storage_root(root, &lock_id)
+                .await
+                .unwrap();
+        }
+        let snapshot = omnigraph_cluster::read_serving_snapshot_from_storage(
+            &cluster_storage_uri(root).unwrap(),
+        )
+        .await
+        .unwrap();
+        let state_cas = snapshot.state_cas.clone();
+        let ServerConfigMode::Multi { graphs, .. } =
+            crate::settings::settings_from_snapshot(dir.path(), None, false, false, snapshot)
+                .unwrap()
+                .mode;
+        let cfg = graphs.into_iter().next().unwrap();
+        let key = GraphKey::cluster(GraphId::try_from("knowledge").unwrap());
+        let uri = omnigraph::storage::normalize_root_uri(&cfg.uri).unwrap();
+        let open = |cfg, authority| async move {
+            let prepared =
+                crate::prepare_single_graph(cfg, None, GraphOpenAccess::ReadOnly(authority))
+                    .unwrap();
+            crate::open_prepared_graph(prepared).await
+        };
+
+        let authority = omnigraph_cluster::GraphReadAuthority::capture(&uri, state_cas.as_deref())
+            .await
+            .unwrap()
+            .unwrap();
+        let state_path = dir.path().join("__cluster/state.json");
+        let before = std::fs::read(&state_path).unwrap();
+        let mut moved: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        moved["state_revision"] = serde_json::json!(moved["state_revision"].as_u64().unwrap() + 1);
+        std::fs::write(&state_path, serde_json::to_vec(&moved).unwrap()).unwrap();
+        let Err(failure) = open(cfg.clone(), authority).await else {
+            panic!("a moved revision must not validate");
+        };
+        assert_eq!(
+            failure.cluster_refusal.as_ref().map(|d| d.code.as_str()),
+            Some("cluster_read_revision_changed")
+        );
+        match read_only_entry(key.clone(), uri.clone(), Err(failure)) {
+            Err(LocalOpenError::Cluster { code, .. }) => {
+                assert_eq!(code, "cluster_read_revision_changed")
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a moved revision must refuse the whole server"),
+        }
+
+        std::fs::write(&state_path, &before).unwrap();
+        std::fs::remove_dir_all(&uri).unwrap();
+        drop(Omnigraph::init(&uri, schema).await.unwrap());
+        let authority = omnigraph_cluster::GraphReadAuthority::capture(&uri, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let Err(failure) = open(cfg, authority).await else {
+            panic!("a drifted schema must not validate");
+        };
+        assert_eq!(
+            failure.cluster_refusal.as_ref().map(|d| d.code.as_str()),
+            Some("applied_schema_drift")
+        );
+        assert!(matches!(
+            read_only_entry(key, uri, Err(failure)),
+            Ok(GraphEntry::Blocked(_))
+        ));
+    }
+
+    #[test]
+    fn a_local_binding_is_an_absolute_path_and_never_a_uri() {
+        let binding = LocalBinding::local("relative/graph.omni").unwrap();
+        assert!(
+            std::path::Path::new(binding.root()).is_absolute(),
+            "{binding:?}"
+        );
+        assert!(
+            binding.root().ends_with("relative/graph.omni"),
+            "{binding:?}"
+        );
+        for uri in [
+            "s3://bucket/graph",
+            "az://container/graph",
+            "file:///tmp/graph",
+        ] {
+            assert!(
+                matches!(LocalBinding::local(uri), Err(LocalOpenError::Root(_))),
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_write_opens_only_inside_the_test_scope() {
+        let options = || LocalOptions {
+            access: LocalAccess::ReadWrite,
+            actor: Some("act-me".into()),
+            process_defaults: ProcessDefaults::default(),
+        };
+        let scope = || LocalScope::Graph(LocalBinding::local("/nonexistent/graph.omni").unwrap());
+        assert!(matches!(
+            AppState::local(scope(), options()).await,
+            Err(LocalOpenError::ReadWriteUnavailable)
+        ));
+        // Inside the scope the gate passes and the open itself fails.
+        let opened = with_local_read_write(AppState::local(scope(), options())).await;
+        assert!(
+            !matches!(opened, Err(LocalOpenError::ReadWriteUnavailable)),
+            "{:?}",
+            opened.err()
+        );
+    }
+
+    /// The engine refuses a write the HTTP layer never sees: an embedder
+    /// holding a read-only local server's graph handle cannot change it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_only_local_servers_engine_refuses_a_direct_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("graph.omni");
+        std::fs::create_dir_all(&root).unwrap();
+        Omnigraph::init(
+            root.to_str().unwrap(),
+            "node Person {\n    name: String @key\n}\n",
+        )
+        .await
+        .unwrap();
+        let (state, _) = AppState::local(
+            LocalScope::Graph(LocalBinding::local(&root).unwrap()),
+            LocalOptions {
+                access: LocalAccess::ReadOnly,
+                actor: Some("act-me".into()),
+                process_defaults: ProcessDefaults::default(),
+            },
+        )
+        .await
+        .ok()
+        .unwrap();
+        let key = GraphKey::cluster(GraphId::try_from("default").unwrap());
+        let crate::registry::RegistryLookup::Ready(view) = state.routing.registry.get(&key) else {
+            panic!("the local graph is served");
+        };
+        let session = omnigraph::Session::from_defaults(
+            view.handle().engine.clone(),
+            omnigraph::settings::SessionSettings::default(),
+        );
+        let mut params: omnigraph_compiler::ParamMap = Default::default();
+        params.insert(
+            "name".to_string(),
+            omnigraph_compiler::Literal::String("Direct".to_string()),
+        );
+        let refused = session
+            .mutate_as(
+                "main",
+                "query add($name: String) { insert Person { name: $name } }",
+                "add",
+                &params,
+                Some("act-me"),
+            )
+            .await;
+        assert!(matches!(refused, Err(OmniError::Policy(_))), "{refused:?}");
     }
 
     #[test]

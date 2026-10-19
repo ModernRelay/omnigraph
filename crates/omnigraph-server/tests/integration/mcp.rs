@@ -1451,15 +1451,15 @@ async fn a_local_server_reads_ad_hoc_and_lists_write_tools_only_when_it_writes()
         omnigraph_server::LocalAccess::ReadOnly,
         omnigraph_server::LocalAccess::ReadWrite,
     ] {
-        let binding = omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap();
-        let (state, credential) = AppState::local(
+        let binding = omnigraph_server::LocalBinding::local(&graph).unwrap();
+        let (state, credential) = omnigraph_server::with_local_read_write(AppState::local(
             omnigraph_server::LocalScope::Graph(binding),
             omnigraph_server::LocalOptions {
                 access,
                 actor: Some("act-local".into()),
                 process_defaults: omnigraph_server::ProcessDefaults::default(),
             },
-        )
+        ))
         .await
         .ok()
         .unwrap();

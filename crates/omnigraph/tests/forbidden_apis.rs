@@ -4842,8 +4842,10 @@ fn test_util_pin_follows_local_features_and_inherited_aliases() {
 const SPLIT_CRATE_PACKAGES: &[&str] = &["omnigraph-core", "omnigraph-catalog"];
 
 /// Crates outside the split whose own `test-util` gates a test seam
-/// (`omnigraph-cluster`: `read_serving_snapshot_with_display_root`).
-const TEST_UTIL_SEAM_PACKAGES: &[&str] = &["omnigraph-cluster"];
+/// (`omnigraph-cluster`: `read_serving_snapshot_with_display_root`;
+/// `omnigraph-server`: `with_local_read_write`, the scope that opens a
+/// read-write local server before its availability).
+const TEST_UTIL_SEAM_PACKAGES: &[&str] = &["omnigraph-cluster", "omnigraph-server"];
 
 #[test]
 fn test_util_pin_covers_the_cluster_seam() {

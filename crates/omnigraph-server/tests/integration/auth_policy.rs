@@ -3929,15 +3929,15 @@ async fn local_app(
     access: omnigraph_server::LocalAccess,
     actor: Option<&str>,
 ) -> (axum::Router, String) {
-    let binding = omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap();
-    let (state, credential) = AppState::local(
+    let binding = omnigraph_server::LocalBinding::local(graph).unwrap();
+    let (state, credential) = omnigraph_server::with_local_read_write(AppState::local(
         omnigraph_server::LocalScope::Graph(binding),
         omnigraph_server::LocalOptions {
             access,
             actor: actor.map(str::to_string),
             process_defaults: omnigraph_server::ProcessDefaults::default(),
         },
-    )
+    ))
     .await
     .unwrap();
     (build_app(state), credential.reveal())
@@ -4017,16 +4017,33 @@ async fn a_read_only_local_server_reads_and_refuses_every_write_before_its_body(
 async fn a_read_write_local_server_acts_as_its_actor_and_grants_no_more() {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
-    let refused = AppState::local(
-        omnigraph_server::LocalScope::Graph(
-            omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap(),
+    // Read-write is not available yet: only the test scope opens it.
+    let gated = AppState::local(
+        omnigraph_server::LocalScope::Graph(omnigraph_server::LocalBinding::local(&graph).unwrap()),
+        omnigraph_server::LocalOptions {
+            access: omnigraph_server::LocalAccess::ReadWrite,
+            actor: Some("act-local".into()),
+            process_defaults: omnigraph_server::ProcessDefaults::default(),
+        },
+    )
+    .await
+    .err()
+    .expect("read-write is gated");
+    assert!(
+        matches!(
+            gated,
+            omnigraph_server::LocalOpenError::ReadWriteUnavailable
         ),
+        "{gated}"
+    );
+    let refused = omnigraph_server::with_local_read_write(AppState::local(
+        omnigraph_server::LocalScope::Graph(omnigraph_server::LocalBinding::local(&graph).unwrap()),
         omnigraph_server::LocalOptions {
             access: omnigraph_server::LocalAccess::ReadWrite,
             actor: None,
             process_defaults: omnigraph_server::ProcessDefaults::default(),
         },
-    )
+    ))
     .await
     .err()
     .expect("a read-write local server without an actor is refused");
@@ -4092,16 +4109,16 @@ async fn a_local_server_refuses_a_graph_inside_a_cluster() {
         omnigraph_server::LocalAccess::ReadOnly,
         omnigraph_server::LocalAccess::ReadWrite,
     ] {
-        let refused = AppState::local(
+        let refused = omnigraph_server::with_local_read_write(AppState::local(
             omnigraph_server::LocalScope::Graph(
-                omnigraph_server::LocalBinding::from_root(graph.to_str().unwrap()).unwrap(),
+                omnigraph_server::LocalBinding::local(&graph).unwrap(),
             ),
             omnigraph_server::LocalOptions {
                 access,
                 actor: Some("act-local".into()),
                 process_defaults: omnigraph_server::ProcessDefaults::default(),
             },
-        )
+        ))
         .await
         .err()
         .expect("a graph inside a cluster is refused");
@@ -4122,17 +4139,56 @@ async fn local_cluster_state(
     access: omnigraph_server::LocalAccess,
     actor: Option<&str>,
 ) -> Result<(AppState, String), omnigraph_server::LocalOpenError> {
-    let binding = omnigraph_server::LocalBinding::from_root(root.to_str().unwrap()).unwrap();
-    AppState::local(
+    let binding = omnigraph_server::LocalBinding::local(root).unwrap();
+    omnigraph_server::with_local_read_write(AppState::local(
         omnigraph_server::LocalScope::Cluster(binding),
         omnigraph_server::LocalOptions {
             access,
             actor: actor.map(str::to_string),
             process_defaults: omnigraph_server::ProcessDefaults::default(),
         },
-    )
+    ))
     .await
     .map(|(state, credential)| (state, credential.reveal()))
+}
+
+/// `path`, an absolute path, spelled relative to the current directory.
+fn relative_to_current_dir(path: &std::path::Path) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap();
+    let mut relative = cwd
+        .components()
+        .skip(1)
+        .map(|_| "..")
+        .collect::<std::path::PathBuf>();
+    relative.push(path.strip_prefix("/").unwrap());
+    relative
+}
+
+/// `/readyz` reports the ledger revision of `root`'s applied snapshot.
+async fn assert_ready_reports_the_applied_revision(app: &axum::Router, root: &std::path::Path) {
+    let snapshot = omnigraph_cluster::read_serving_snapshot(root)
+        .await
+        .unwrap();
+    assert!(snapshot.state_revision > 0);
+    let (status, ready) = json_response(app, get_request("/readyz", "")).await;
+    assert_eq!(status, StatusCode::OK, "{ready}");
+    assert_eq!(ready["state_revision"], snapshot.state_revision, "{ready}");
+    assert_eq!(ready["state_cas"], json!(snapshot.state_cas), "{ready}");
+    assert_eq!(
+        ready["booted_serving_digest"],
+        json!(snapshot.config_digest),
+        "{ready}"
+    );
+}
+
+fn knowledge_handle(state: &AppState) -> Arc<omnigraph_server::GraphHandle> {
+    let key = omnigraph_server::GraphKey::cluster(
+        omnigraph_server::GraphId::try_from("knowledge").unwrap(),
+    );
+    match state.routing().registry.get(&key) {
+        omnigraph_server::registry::RegistryLookup::Ready(view) => Arc::clone(view.handle()),
+        _ => panic!("knowledge is not serving"),
+    }
 }
 
 fn knowledge_policy(state: &AppState) -> Arc<omnigraph_policy::PolicyEngine> {
@@ -4190,6 +4246,7 @@ async fn a_read_only_local_cluster_server_applies_the_clusters_policy_and_forbid
     assert_eq!(change.matched_rule_id.as_deref(), Some("local-read-only"));
 
     let app = build_app(state);
+    assert_ready_reports_the_applied_revision(&app, temp.path()).await;
     let (status, body) = json_response(&app, get_request("/graphs", &token)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["graphs"][0]["graph_id"], "knowledge", "{body}");
@@ -4234,9 +4291,12 @@ async fn a_read_write_local_cluster_server_holds_admission_and_writes_as_its_act
     .await
     .unwrap();
     assert!(temp.path().join("__cluster/lock.json").exists());
-    // One serving owner at a time; a read-only consumer may still read.
+    // One serving owner at a time; a read-only consumer may still read. A
+    // relative spelling of the root names the same cluster in both modes.
+    let relative = relative_to_current_dir(temp.path());
+    assert!(relative.is_relative());
     let refused = local_cluster_state(
-        temp.path(),
+        &relative,
         omnigraph_server::LocalAccess::ReadWrite,
         Some("act-local"),
     )
@@ -4248,7 +4308,7 @@ async fn a_read_write_local_cluster_server_holds_admission_and_writes_as_its_act
         "{refused}"
     );
     let (reader, reader_token) = local_cluster_state(
-        temp.path(),
+        &relative,
         omnigraph_server::LocalAccess::ReadOnly,
         Some("act-local"),
     )
@@ -4269,6 +4329,7 @@ async fn a_read_write_local_cluster_server_holds_admission_and_writes_as_its_act
     );
 
     let app = build_app(state);
+    assert_ready_reports_the_applied_revision(&app, temp.path()).await;
     let insert = json!({"query": "query add() { insert Person { name: \"Ada\" } }"});
     let (status, body) = json_response(
         &app,
@@ -4306,4 +4367,89 @@ async fn a_read_write_local_cluster_server_holds_admission_and_writes_as_its_act
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// A graph the cluster binds no policy to is granted what a deployment's
+/// routes grant without one, `read` alone, and its engine refuses a write
+/// as those routes do, in both modes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_cluster_server_grants_only_read_on_a_graph_without_a_policy() {
+    let temp = converged_cluster_dir("").await;
+    for access in [
+        omnigraph_server::LocalAccess::ReadOnly,
+        omnigraph_server::LocalAccess::ReadWrite,
+    ] {
+        let (state, token) = local_cluster_state(temp.path(), access, Some("act-local"))
+            .await
+            .unwrap();
+        let engine = omnigraph::Session::from_defaults(
+            Arc::clone(&knowledge_handle(&state).engine),
+            omnigraph::settings::SessionSettings::default(),
+        );
+        let written = engine
+            .mutate_as(
+                "main",
+                "query add() { insert Person { name: \"Ada\" } }",
+                "add",
+                &Default::default(),
+                Some("act-local"),
+            )
+            .await;
+        match written {
+            Err(OmniError::Policy(_)) => {}
+            Err(other) => panic!("{access:?}: expected a policy refusal, got {other:?}"),
+            Ok(_) => panic!("{access:?}: the engine wrote without a granting policy"),
+        }
+        let app = build_app(state);
+        let read = json!({"query": "query people() { match { $p: Person } return { $p.name } }"});
+        let (status, body) = json_response(
+            &app,
+            local_request(
+                Method::POST,
+                "/graphs/knowledge/query",
+                &token,
+                read.to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{access:?}: {body}");
+    }
+}
+
+/// A local server of a cluster serves no graph or none: when every graph
+/// fails to open it refuses, and a read-write one names the admission it
+/// keeps, since an open may have reached storage.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_cluster_server_refuses_when_no_graph_opens() {
+    let temp = local_cluster_dir().await;
+    fs::remove_dir_all(temp.path().join("graphs/knowledge.omni")).unwrap();
+    let refused = local_cluster_state(
+        temp.path(),
+        omnigraph_server::LocalAccess::ReadOnly,
+        Some("act-local"),
+    )
+    .await
+    .err()
+    .expect("a read-only local server with no graph open is refused");
+    assert!(
+        matches!(&refused, omnigraph_server::LocalOpenError::Serving(message) if message.contains("knowledge")),
+        "{refused}"
+    );
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+
+    let refused = local_cluster_state(
+        temp.path(),
+        omnigraph_server::LocalAccess::ReadWrite,
+        Some("act-local"),
+    )
+    .await
+    .err()
+    .expect("a read-write local server with no graph open is refused");
+    let lock: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("__cluster/lock.json")).unwrap())
+            .unwrap();
+    assert!(
+        matches!(&refused, omnigraph_server::LocalOpenError::AdmissionRetained { lock_id, .. } if lock.to_string().contains(lock_id.as_str())),
+        "{refused}: {lock}"
+    );
 }
