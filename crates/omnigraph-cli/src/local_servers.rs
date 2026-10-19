@@ -5,7 +5,8 @@
 //! A record's `.lock` is held by its local server for its whole life; a reader
 //! that can take it has found a dead server. Liveness never consults the
 //! process ID. A record from another machine (a home shared over a network) is
-//! ignored and never touched. A destination's `.start` lock orders local server
+//! ignored and never touched, so a machine whose host identifier cannot be
+//! read refuses its records. A destination's `.start` lock orders local server
 //! starts for that destination on one machine; it is not writer fencing.
 
 use std::fs::{File, OpenOptions};
@@ -175,8 +176,9 @@ fn open_file(path: &Path, create: bool) -> Result<File> {
 }
 
 /// The platform's host identifier, so a record written on another machine
-/// sharing this home is recognised and left alone.
-pub(crate) fn machine_id() -> String {
+/// sharing this home is recognised and left alone; `None` when the platform
+/// reports none.
+fn host_id() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let mut id = [0u8; 16];
@@ -186,7 +188,7 @@ pub(crate) fn machine_id() -> String {
         };
         // SAFETY: gethostuuid writes exactly 16 bytes into `id`.
         if unsafe { libc::gethostuuid(id.as_mut_ptr(), &timeout) } == 0 {
-            return id.iter().map(|byte| format!("{byte:02X}")).collect();
+            return Some(id.iter().map(|byte| format!("{byte:02X}")).collect());
         }
     }
     #[cfg(target_os = "linux")]
@@ -195,12 +197,25 @@ pub(crate) fn machine_id() -> String {
             if let Ok(id) = std::fs::read_to_string(path) {
                 let id = id.trim();
                 if !id.is_empty() {
-                    return id.to_string();
+                    return Some(id.to_string());
                 }
             }
         }
     }
-    "unknown".to_string()
+    None
+}
+
+/// The machine whose records a reader or writer may touch. Without a host
+/// identifier, this machine's records cannot be told from another machine's
+/// in a shared home, which would then be reaped or reused, so records refuse.
+fn this_machine(host: Option<String>) -> Result<String> {
+    host.map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            unsafe_records(
+                "this machine's host identifier cannot be read, so its records cannot be told from another machine's",
+            )
+        })
 }
 
 /// What a local server serves, identified by everything that selects its
@@ -320,27 +335,33 @@ pub(crate) struct HeldLock {
 
 impl Records {
     pub(crate) fn open() -> Result<Self> {
-        let dir = records_dir()?;
+        Self::open_at(records_dir()?, host_id())
+    }
+
+    /// The records directory `dir` for a start on the machine `host` names,
+    /// refused before anything is created when `host` names none.
+    fn open_at(dir: PathBuf, host: Option<String>) -> Result<Self> {
+        let machine = this_machine(host)?;
         ensure_dir(&dir)?;
-        Ok(Self {
-            dir,
-            machine: machine_id(),
-        })
+        Ok(Self { dir, machine })
     }
 
     /// The records directory for a reader, which creates nothing: `None`
     /// when no local server has written it yet.
     pub(crate) fn existing() -> Result<Option<Self>> {
-        let dir = records_dir()?;
+        Self::existing_at(records_dir()?, host_id())
+    }
+
+    /// A missing directory holds no record to tell apart, so only a directory
+    /// that exists refuses a missing host identifier.
+    fn existing_at(dir: PathBuf, host: Option<String>) -> Result<Option<Self>> {
         match std::fs::symlink_metadata(&dir) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             _ => {}
         }
         ensure_dir(&dir)?;
-        Ok(Some(Self {
-            dir,
-            machine: machine_id(),
-        }))
+        let machine = this_machine(host)?;
+        Ok(Some(Self { dir, machine }))
     }
 
     pub(crate) fn machine(&self) -> &str {
@@ -400,8 +421,8 @@ impl Records {
     }
 
     /// Every live record of this machine. A dead record (its lock free) is
-    /// removed; a record from another machine or of an unknown format is
-    /// ignored and kept.
+    /// removed; a record from another machine, of an unknown format or
+    /// without its lock file is ignored and kept.
     pub(crate) fn live_records(&self) -> Result<Vec<Record>> {
         let mut live = Vec::new();
         let entries = std::fs::read_dir(&self.dir)
@@ -421,7 +442,10 @@ impl Records {
             if record.format != RECORD_FORMAT || record.machine != self.machine {
                 continue;
             }
-            let Ok(lock) = open_file(&self.lock_path(&record.id), true) else {
+            // Only a record's owner creates its lock. A lock created here
+            // would be a new file whose lock proves nothing, while the owner
+            // may still hold the old one under a path since unlinked.
+            let Ok(lock) = open_file(&self.lock_path(&record.id), false) else {
                 continue;
             };
             match lock.try_lock() {
@@ -474,13 +498,7 @@ mod tests {
     fn a_record_is_live_while_its_lock_is_held_and_removed_after() {
         let dir = tempfile::tempdir().unwrap();
         let records_dir = dir.path().join("servers");
-        let records = {
-            ensure_dir(&records_dir).unwrap();
-            Records {
-                dir: records_dir.clone(),
-                machine: machine_id(),
-            }
-        };
+        let records = Records::open_at(records_dir, Some("this-machine".into())).unwrap();
         let graph = dir.path().join("g.omni");
         std::fs::create_dir(&graph).unwrap();
         let destination = Destination::of("graph", graph.to_str().unwrap()).unwrap();
@@ -518,6 +536,15 @@ mod tests {
         records.publish(&foreign).unwrap();
         assert_eq!(records.live_records().unwrap().len(), 1);
         assert!(records.record_path("01FOREIGN").exists());
+        // A record without its lock file is not live. A reader neither
+        // creates the lock nor removes the record: its owner may still hold
+        // a lock whose path was unlinked.
+        let mut unlocked = record.clone();
+        unlocked.id = "01UNLOCKED".into();
+        records.publish(&unlocked).unwrap();
+        assert_eq!(records.live_records().unwrap().len(), 1);
+        assert!(records.record_path("01UNLOCKED").exists());
+        assert!(!records.lock_path("01UNLOCKED").exists());
         // Released, the record is dead and removed by the next reader.
         drop(held);
         assert!(records.live(&destination).unwrap().is_none());
@@ -546,15 +573,78 @@ mod tests {
         );
     }
 
+    /// Without a host identifier this machine's records cannot be told from
+    /// another machine's in a shared home, so records refuse rather than reap
+    /// or reuse one.
+    #[test]
+    fn records_refuse_a_machine_without_a_host_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let records_dir = dir.path().join("servers");
+        for host in [None, Some(String::new()), Some(" \n".to_string())] {
+            let refused = Records::open_at(records_dir.clone(), host.clone())
+                .err()
+                .expect("a start without a host identifier refuses");
+            assert_eq!(
+                refused.downcast_ref::<CliRefusal>().unwrap().code,
+                ErrorCode::LocalServerRecordsUnsafe
+            );
+            assert!(!records_dir.exists(), "a refused start creates nothing");
+            // A missing directory holds no record to tell apart.
+            assert!(
+                Records::existing_at(records_dir.clone(), host)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        // A directory a shared home holds: here, a record whose lock this
+        // machine can take, as another machine's lock is invisible to it.
+        let elsewhere = Records::open_at(records_dir.clone(), Some("unknown".into())).unwrap();
+        let graph = dir.path().join("g.omni");
+        std::fs::create_dir(&graph).unwrap();
+        let destination = Destination::of("graph", graph.to_str().unwrap()).unwrap();
+        let record = Record {
+            format: RECORD_FORMAT,
+            id: "01ELSEWHERE".into(),
+            machine: elsewhere.machine().to_string(),
+            root: destination.root.clone(),
+            destination: destination.digest.clone(),
+            scope: "graph".into(),
+            binding: "sha256:b".into(),
+            graph_id: Some("default".into()),
+            url: "http://127.0.0.1:1".into(),
+            token: "t".into(),
+            access: "read_only".into(),
+            actor: Some("default".into()),
+            pid: 1,
+            started_at: "now".into(),
+            cli: CliIdentity::current(),
+        };
+        drop(elsewhere.hold(&record.id).unwrap());
+        elsewhere.publish(&record).unwrap();
+        for host in [None, Some(String::new())] {
+            for refused in [
+                Records::existing_at(records_dir.clone(), host.clone())
+                    .err()
+                    .expect("a reader without a host identifier refuses"),
+                Records::open_at(records_dir.clone(), host)
+                    .err()
+                    .expect("a start without a host identifier refuses"),
+            ] {
+                assert_eq!(
+                    refused.downcast_ref::<CliRefusal>().unwrap().code,
+                    ErrorCode::LocalServerRecordsUnsafe
+                );
+            }
+        }
+        assert!(elsewhere.record_path(&record.id).exists());
+        assert!(elsewhere.lock_path(&record.id).exists());
+    }
+
     #[test]
     fn a_second_start_waits_for_the_first_and_finds_its_record() {
         let dir = tempfile::tempdir().unwrap();
-        let records_dir = dir.path().join("servers");
-        ensure_dir(&records_dir).unwrap();
-        let records = Records {
-            dir: records_dir,
-            machine: machine_id(),
-        };
+        let records =
+            Records::open_at(dir.path().join("servers"), Some("this-machine".into())).unwrap();
         let graph = dir.path().join("g.omni");
         std::fs::create_dir(&graph).unwrap();
         let destination = Destination::of("graph", graph.to_str().unwrap()).unwrap();
