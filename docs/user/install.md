@@ -127,7 +127,7 @@ prints:
 ```text
 omnigraph 0.14.0-edge+9c2b367
 internal-schema 16 (serves v14 to v16)
-http-contract 0.13
+http-contract 0.14
 commit 9c2b3679e8f66062252e7ed6270a9478b4b77413
 ```
 
@@ -138,7 +138,7 @@ commit 9c2b3679e8f66062252e7ed6270a9478b4b77413
   "version": "0.14.0-edge+9c2b367",
   "channel": "edge",
   "commit": "9c2b3679e8f66062252e7ed6270a9478b4b77413",
-  "http_contract": "0.13",
+  "http_contract": "0.14",
   "internal_schema": {
     "writes": 16,
     "serves": [14, 16]

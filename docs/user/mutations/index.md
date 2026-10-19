@@ -227,7 +227,7 @@ branch, `load csv` as `query_name`, loaded node and edge counts, and the commit.
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/mutate \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{"query":"load csv \"s3://imports/person.csv\" into node:Person mode append delimiter \"|\" header","branch":"main"}'
