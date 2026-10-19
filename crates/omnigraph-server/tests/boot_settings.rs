@@ -3833,8 +3833,8 @@ mod local_serving {
         access: omnigraph_server::LocalAccess,
         cluster: bool,
     ) -> (AppState, String) {
-        let binding = omnigraph_server::LocalBinding::from_root(root.to_str().unwrap()).unwrap();
-        let (state, credential) = AppState::local(
+        let binding = omnigraph_server::LocalBinding::local(root).unwrap();
+        let (state, credential) = omnigraph_server::with_local_read_write(AppState::local(
             if cluster {
                 omnigraph_server::LocalScope::Cluster(binding)
             } else {
@@ -3845,7 +3845,7 @@ mod local_serving {
                 actor: Some("act-local".into()),
                 process_defaults: omnigraph_server::ProcessDefaults::default(),
             },
-        )
+        ))
         .await
         .unwrap();
         (state, credential.reveal())

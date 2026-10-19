@@ -17,6 +17,10 @@ default = []
 # Enables the AWS Secrets Manager bearer-token source. Off by default — on-prem
 # and local-dev builds don't pay the AWS SDK compile cost.
 aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
+# Test-only: `local::with_local_read_write`, the scope inside which
+# `AppState::local` opens a read-write local server. Enabled from
+# [dev-dependencies] only, including this crate's own.
+test-util = []
 
 [dependencies]
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.14.0" }
@@ -57,6 +61,8 @@ aws-config = { version = "1", optional = true, default-features = false, feature
 aws-sdk-secretsmanager = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 
 [dev-dependencies]
+# This crate's integration tests reach the `test-util` read-write scope.
+omnigraph-server = { path = ".", features = ["test-util"] }
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", features = ["failpoints"] }
 omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.14.0", features = ["test-util", "failpoints"] }
 tempfile = { workspace = true }

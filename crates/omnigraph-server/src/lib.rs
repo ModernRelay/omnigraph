@@ -33,6 +33,8 @@ pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, AuthenticatedActor, GraphKey, ResolvedActor, Scope, TenantId};
+#[cfg(any(test, feature = "test-util"))]
+pub use local::with_local_read_write;
 pub use local::{
     LocalAccess, LocalBinding, LocalCredential, LocalOpenError, LocalOptions, LocalScope,
 };
