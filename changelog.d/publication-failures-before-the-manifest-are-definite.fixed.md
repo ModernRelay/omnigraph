@@ -5,6 +5,6 @@
   dropped acknowledgement ends as a committed write or a definite conflict.
   Only a request that no re-issue settles is still reported in doubt. The log
   of a contained write now names the failure's class. See
-  [shutdown and writer ownership][publication-failures-definite].
+  [storage failures][publication-failures-definite].
 
-[publication-failures-definite]: ../docs/user/deployment.md#writer-topology
+[publication-failures-definite]: ../docs/user/operations/storage-failures.md
