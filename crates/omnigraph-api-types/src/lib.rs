@@ -1952,7 +1952,8 @@ pub enum ErrorCode {
     TooManyRequests,
     /// 503: operation admission is closed; reconcile any earlier write.
     ServiceUnavailable,
-    /// 503: a known graph is unavailable. Does not authorize replay.
+    /// 503: a known graph is unavailable. The request did not start, so it
+    /// may be retried once the graph is served again.
     GraphUnavailable,
     Internal,
 }
@@ -1980,8 +1981,10 @@ pub struct ReadSetConflictOutput {
 }
 
 /// A strict insert rejected because `entity_id` already names an entity in the
-/// selected node or edge type. The operation is effect-free when this output is returned;
-/// partial or ambiguous attempts surface `recovery_required` instead.
+/// selected node or edge type. The refused rows wrote nothing; an earlier step
+/// of the same request, such as the branch a load forks, may already have
+/// published, which the error's `outcome` states. Partial or ambiguous
+/// attempts surface `recovery_required` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KeyConflictOutput {
     pub entity_kind: EntityKindOutput,

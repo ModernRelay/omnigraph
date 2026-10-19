@@ -15,7 +15,11 @@
   answers `400`. CLI data-write failures print the same `outcome` field in
   place of `command_outcome`, taking the server's when its request was the
   command's only effectful one. Update clients that read `command_outcome`,
-  or that told those errors apart by a missing `code` or a `422`. See
+  or that told those errors apart by a missing `code` or a `422`. In
+  `openapi.json`, the optional query parameters of `GET /snapshot`,
+  `GET /commits` and `POST /load/ndjson` are declared as their plain type
+  (`string`, `integer` or `LoadMode`) instead of a union with `null`; they stay
+  optional, so regenerate clients built from the earlier description. See
   [failed data-write commands][error-outcome-guide].
 
 [error-outcome-guide]: ../docs/user/operations/troubleshooting.md#failed-data-write-commands
