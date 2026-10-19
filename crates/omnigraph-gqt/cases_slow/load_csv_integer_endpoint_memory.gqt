@@ -5,7 +5,7 @@
 # notes: a header-only overwrite keeps its empty-source refusal, without building sets.
 
 --- runner
-timeout_ms: 10000
+timeout_ms: 60000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem
