@@ -11,7 +11,9 @@ const STORAGE_MESSAGE_PREFIX: &str = "storage: ";
 ///
 /// `BeforeEffect` and `Unpublished` are definite: a caller deciding whether the
 /// write may have become graph-visible can treat either as "it did not".
-/// `Uncertain` is sticky through every composition.
+/// `PartlyPublished` says the graph did move, by an earlier step of the same
+/// operation, and outlives both. `Uncertain` is sticky through every
+/// composition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionEvidence {
     /// The owning operation has not attempted any durable effect.
@@ -22,6 +24,11 @@ pub enum CompletionEvidence {
     /// did not move and the collector reclaims the effect once its recorded
     /// authority is gone.
     Unpublished,
+    /// An earlier step of the owning operation published, such as the branch
+    /// a load forks before its rows, and a later step failed. The failure's
+    /// own type says what that later step did; the operation as a whole is
+    /// neither unstarted nor unpublished.
+    PartlyPublished,
     /// The owning operation cannot establish settled completion.
     Uncertain,
 }
@@ -564,10 +571,13 @@ impl OmniError {
     /// is known. An inner refusal alone cannot certify a compound operation.
     pub fn with_completion_evidence(self, evidence: CompletionEvidence) -> Self {
         let (source, existing) = self.into_completion_evidence();
-        let evidence = if existing == Some(CompletionEvidence::Uncertain) {
-            CompletionEvidence::Uncertain
-        } else {
-            evidence
+        let evidence = match (existing, evidence) {
+            (Some(CompletionEvidence::Uncertain), _) => CompletionEvidence::Uncertain,
+            (Some(CompletionEvidence::PartlyPublished), CompletionEvidence::Uncertain) => {
+                CompletionEvidence::Uncertain
+            }
+            (Some(CompletionEvidence::PartlyPublished), _) => CompletionEvidence::PartlyPublished,
+            (_, evidence) => evidence,
         };
         Self::Completion {
             evidence,
@@ -615,15 +625,25 @@ impl OmniError {
 
     /// Remove a sub-operation's definite proof (no effect, or no
     /// publication) when composing it after earlier durable work that may
-    /// have published. Never erase explicit uncertainty or recovery evidence.
+    /// have published. Never erase explicit uncertainty, recovery evidence or
+    /// a recorded earlier publication.
     pub fn without_pre_effect_evidence(self) -> Self {
         let (source, evidence) = self.into_completion_evidence();
         match evidence {
-            Some(CompletionEvidence::Uncertain) => {
-                source.with_completion_evidence(CompletionEvidence::Uncertain)
-            }
+            Some(
+                evidence @ (CompletionEvidence::Uncertain | CompletionEvidence::PartlyPublished),
+            ) => source.with_completion_evidence(evidence),
             _ => source,
         }
+    }
+
+    /// Compose a step's failure after an earlier step of the same operation
+    /// published: its own no-effect or no-publication proof no longer covers
+    /// the operation, which is [`CompletionEvidence::PartlyPublished`] unless
+    /// its completion is already uncertain.
+    pub fn after_earlier_publication(self) -> Self {
+        self.without_pre_effect_evidence()
+            .with_completion_evidence(CompletionEvidence::PartlyPublished)
     }
 
     pub fn completion_evidence(&self) -> Option<CompletionEvidence> {
@@ -634,10 +654,11 @@ impl OmniError {
             source,
         } = current
         {
-            if *next == CompletionEvidence::Uncertain {
-                evidence = Some(CompletionEvidence::Uncertain);
-            } else if evidence.is_none() {
-                evidence = Some(*next);
+            match (*next, evidence) {
+                (_, Some(CompletionEvidence::Uncertain)) => {}
+                (CompletionEvidence::Uncertain | CompletionEvidence::PartlyPublished, _)
+                | (_, None) => evidence = Some(*next),
+                _ => {}
             }
             current = source;
         }
@@ -1444,6 +1465,66 @@ mod tests {
             None,
             "composition after earlier published work drops the definite proof"
         );
+    }
+
+    /// A step that fails after an earlier step of the same operation
+    /// published says so: the mark outlives the step's own definite proofs,
+    /// which no longer cover the operation, keeps the typed cause, and never
+    /// hides uncertainty.
+    #[test]
+    fn an_earlier_publication_outlives_definite_evidence_and_never_hides_uncertainty() {
+        let refused = || OmniError::key_conflict("node:Person", "Bob");
+        let marked = refused().before_effect().after_earlier_publication();
+        assert_eq!(
+            marked.completion_evidence(),
+            Some(CompletionEvidence::PartlyPublished)
+        );
+        assert_eq!(marked.to_string(), refused().to_string());
+        for composed in [
+            refused().after_earlier_publication().before_effect(),
+            refused().after_earlier_publication().unpublished(),
+            refused()
+                .after_earlier_publication()
+                .without_pre_effect_evidence(),
+            OmniError::Io(std::io::Error::other("row write failed"))
+                .unpublished()
+                .after_earlier_publication()
+                .unpublished(),
+            // Wrappers built directly: an inner earlier publication outranks
+            // an outer definite claim.
+            OmniError::Completion {
+                evidence: CompletionEvidence::BeforeEffect,
+                source: Box::new(refused().after_earlier_publication()),
+            },
+        ] {
+            let message = composed.to_string();
+            assert_eq!(
+                composed.completion_evidence(),
+                Some(CompletionEvidence::PartlyPublished),
+                "{message}"
+            );
+        }
+        let (cause, evidence) = marked.into_completion_evidence();
+        assert_eq!(evidence, Some(CompletionEvidence::PartlyPublished));
+        assert!(matches!(cause, OmniError::KeyConflict { .. }));
+
+        for uncertain in [
+            OmniError::manifest_publish_in_doubt("rows publish in doubt")
+                .after_earlier_publication(),
+            refused()
+                .with_completion_evidence(CompletionEvidence::Uncertain)
+                .after_earlier_publication(),
+            refused()
+                .after_earlier_publication()
+                .with_completion_evidence(CompletionEvidence::Uncertain),
+        ] {
+            let message = uncertain.to_string();
+            assert_eq!(
+                uncertain.completion_evidence(),
+                Some(CompletionEvidence::Uncertain),
+                "{message}"
+            );
+        }
     }
 
     fn supported_stream_failures() -> Vec<OmniError> {

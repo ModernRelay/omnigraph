@@ -2902,6 +2902,63 @@ fn a_policy_refused_served_load_reports_not_started() {
     );
 }
 
+/// An embedded load reports what the engine did rather than a prediction.
+/// Onto a branch that exists, `--from` forks nothing, so a refused payload ran
+/// nothing. Onto a missing branch the fork publishes before the payload is
+/// read, so the same refusal follows that publication and the branch stays.
+#[test]
+fn an_embedded_load_reports_its_fork_from_the_engine() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph = temp.path().join("graph.omni");
+    init_graph(&graph);
+    load_fixture(&graph);
+    output_success(
+        cli()
+            .args(["branch", "create", "feature", "--uri"])
+            .arg(&graph),
+    );
+    let rows = temp.path().join("rows.jsonl");
+    fs::write(&rows, "not valid graph NDJSON\n").unwrap();
+    let load = |branch: &str| {
+        cli()
+            .args(["load", "--mode", "append", "--data"])
+            .arg(&rows)
+            .args(["--branch", branch, "--from", "main", "--json"])
+            .arg(&graph)
+            .output()
+            .unwrap()
+    };
+    let branches = || {
+        parse_stdout_json(&output_success(
+            cli()
+                .args(["branch", "list", "--json", "--uri"])
+                .arg(&graph),
+        ))["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before = branches();
+
+    let existing = load("feature");
+    assert_eq!(existing.status.code(), Some(1), "{existing:?}");
+    assert_eq!(
+        parse_stdout_json(&existing)["outcome"],
+        json!({"execution":"not_started","effects":"none","action":"refresh"}),
+        "{existing:?}"
+    );
+    assert_eq!(branches(), before, "no fork onto an existing branch");
+
+    let forked = load("fresh");
+    assert_eq!(forked.status.code(), Some(2), "{forked:?}");
+    let body = parse_stdout_json(&forked);
+    assert_eq!(body["outcome"]["execution"], "unknown", "{body}");
+    assert_eq!(body["outcome"]["effects"], "unknown", "{body}");
+    assert!(branches().contains("fresh"), "the fork published");
+}
+
 /// Whole-command outcome classification needs real CLI processes and a wire
 /// census; row/error GQT expectations cannot observe exits or resubmission.
 #[test]
@@ -3148,7 +3205,7 @@ fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
         (200, vec![]),
         (403, vec![(HEADER.into(), "0.11".into())]),
         (200, vec![(HEADER.into(), "0.12".into())]),
-        (200, vec![(HEADER.into(), "0.14".into())]),
+        (200, vec![(HEADER.into(), "0.13".into())]),
         (
             503,
             vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],
@@ -3711,8 +3768,7 @@ fn server_scope_refuses_a_non_server_scheme_issue_979() {
 fn as_on_a_served_write_asserts_the_actor() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
     use omnigraph_api_types::{
-        EXPECT_ACTOR_ASSERTION, EXPECT_ACTOR_HEADER, HTTP_API_ASSERTIONS_HEADER as ASSERTIONS,
-        HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
+        EXPECT_ACTOR_HEADER, HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
     };
 
     // A served write resolves its actor from the bearer token. `--as` rides
@@ -3733,10 +3789,7 @@ fn as_on_a_served_write_asserts_the_actor() {
         let server = IntentApiFixture::new(vec![
             IntentReply {
                 status: 200,
-                headers: vec![
-                    (HEADER.into(), CONTRACT.into()),
-                    (ASSERTIONS.into(), EXPECT_ACTOR_ASSERTION.into()),
-                ],
+                headers: vec![(HEADER.into(), CONTRACT.into())],
                 body: vec![],
             },
             IntentReply {
@@ -3771,11 +3824,12 @@ fn as_on_a_served_write_asserts_the_actor() {
         );
         server.assert_complete();
 
-        // A server that does not list the assertion would ignore the header
-        // and run the write as the credential's actor, so nothing is sent.
+        // A server on the contract before the header would ignore it and run
+        // the write as the credential's actor; discovery refuses its contract,
+        // so nothing is sent.
         let older = IntentApiFixture::new(vec![IntentReply {
             status: 200,
-            headers: vec![(HEADER.into(), CONTRACT.into())],
+            headers: vec![(HEADER.into(), "0.13".into())],
             body: vec![],
         }]);
         let output = cli()
@@ -3788,10 +3842,6 @@ fn as_on_a_served_write_asserts_the_actor() {
         let error = parse_stdout_json(&output);
         assert_eq!(error["code"], "api_contract_mismatch", "{write:?}: {error}");
         assert_eq!(error["request_dispatched"], false, "{write:?}: {error}");
-        assert!(
-            error["error"].as_str().unwrap().contains("--as"),
-            "{write:?}: {error}"
-        );
         let requests = older.requests();
         assert_eq!(requests.len(), 1, "{write:?}: only discovery: {requests:?}");
         older.assert_complete();
