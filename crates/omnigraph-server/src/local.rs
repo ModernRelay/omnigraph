@@ -459,7 +459,7 @@ async fn local_cluster(
             local_cluster_read_write(&root, binding.root(), &actor, tokens).await?
         }
     };
-    // `/readyz` and `/graphs` report the revision served, as a deployment's do.
+    // `/readyz` reports the revision served, as a deployment's does.
     let draining = Arc::clone(&state.draining);
     let grace = state.shutdown_grace;
     let state = state
