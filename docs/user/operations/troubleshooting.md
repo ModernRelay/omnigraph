@@ -4,7 +4,7 @@ CLI failures include a human-readable message. Add `--json` where supported to
 receive structured fields suitable for automation. Every HTTP error the server
 answers, an unknown route, a method the route does not serve and a malformed
 body, query string or path parameter included, uses a JSON body with `error`,
-`code`, `outcome` and optional details for conflicts, limits, Blob ranges,
+`code`, `disposition` and optional details for conflicts, limits, Blob ranges,
 external sources, or recovery. A malformed request is `400`, a body without a
 JSON content type `415`. MCP tool calls report errors in their own result shapes
 ([MCP](mcp.md#results-and-errors)).
@@ -33,7 +33,7 @@ means the data request was not sent. HTTP discovery refusals retain their status
 | 413 | Request or operation exceeded a bounded resource limit | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
 | 416 | Blob byte range is outside the value | Use the returned length to choose a valid range |
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
-| 429 | Server or per-actor admission limit reached | Use the whole-command outcome below before retrying; preserve `Retry-After` |
+| 429 | Server or per-actor admission limit reached | Use the whole-command disposition below before retrying; preserve `Retry-After` |
 | 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery, change-route or streamed-response failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path; see below |
 | 503 | Admission is closed, or a published schema change requires completion | Inspect the structured error; generic 503 is not permission to repeat a write |
 
@@ -68,24 +68,31 @@ the same way. See [Diagnostics](../queries/diagnostics.md).
 
 ## Failed data-write commands
 
-Every server error body, and every CLI data-write failure, carries an `outcome`:
-`execution` is `not_started` or `unknown`, `effects` is `none` or `unknown` to
-match, and `action` is `retry`, `refresh`, `recover` or `reconcile`. The server
-decides it for the request it answered by the first row that matches:
+Every server error body, and every CLI data-write failure, carries a
+`disposition`: `effects` is `none`, `partial` or `unknown`, and `action` is
+`fix`, `refresh`, `retry`, `recover` or `reconcile`. The server decides it for
+the request it answered by the first row that matches:
 
-| Error | `execution` | `action` |
+| Error | `effects` | `action` |
 |---|---|---|
-| Any error before the request submitted a write | `not_started` | `recover` for a recovery intent or index rebuild; `retry` for `429` or `503`; else `refresh` |
+| Any error before the request submitted a write | `none` | the refusal's own |
 | A write whose completion the server could not settle; `code` becomes `outcome_unknown` unless the action is `recover` | `unknown` | `reconcile`, or `recover` |
-| A refusal after an earlier step of the write published, such as a load that forked its missing branch; `code` is kept | `unknown` | `refresh` |
-| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), or a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a resource limit, an external Blob source, a query diagnostic) | `not_started` | `retry` for `429`, else `refresh` |
+| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), or a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a resource limit, an external Blob source, a query diagnostic) | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
 | Any other error after a write, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
 
-The CLI reports the server's outcome when that request was the command's only
-effectful one, and otherwise its own account of the whole command, so a lost
-response is `unknown` with `reconcile`. JSON mode writes the failure to stdout;
-human mode prints the `outcome` line on stderr. HTTP failures also retain
-`http_status` and, when present, the original `retry_after` string.
+A refusal's own action follows its code: `recover` for a recovery intent or a
+full-text index to build, `retry` for `too_many_requests`,
+`service_unavailable` and `graph_unavailable`, `fix` for `unauthorized`,
+`bad_request`, `api_contract_mismatch`, `actor_mismatch`, `not_found`,
+`method_not_allowed` and `unattached_cannot_publish`, and `refresh` for the
+rest: `forbidden`, `precondition_failed`, `conflict`, `external_blob_source`,
+`change_feed_gap` and `internal`.
+
+The CLI reports the server's disposition when that request was the command's
+only effectful one, and otherwise its own account of the whole command, so a
+lost response is `unknown` with `reconcile`. JSON mode writes the failure to
+stdout; human mode prints the `disposition` line on stderr. HTTP failures also
+retain `http_status` and, when present, the original `retry_after` string.
 
 This includes `commit publish` and `commit drop`, as well as their `mutate`
 statement forms. If a response or result output is lost, inspect the commit's
@@ -93,7 +100,7 @@ current state before another attempt; an output failure does not undo the write.
 The same applies to `load`, `blob put`, `blob clear` and `schema apply`: a closed
 output pipe or failed result flush can follow a successful write. The CLI exits with a failure
 and does not repeat the operation. If stdout cannot carry a JSON failure, stderr
-reports the undelivered diagnostic and its outcome.
+reports the undelivered diagnostic and its disposition.
 
 | CLI exit | What to do |
 |---:|---|
@@ -103,8 +110,8 @@ reports the undelivered diagnostic and its outcome.
 | 1 | Inspect the action and details. A conflict, resource limit, unavailable server, incomplete response or lost connection does not by itself permit repeating the write. |
 
 A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
-`api_contract_mismatch` exits 1 with `execution: not_started`, `effects: none`
-and `action: refresh`. The server answers these before it admits the write:
+`api_contract_mismatch` exits 1 with `effects: none`, and `action: refresh` for
+the policy denial and `fix` for the others. The server answers these before it admits the write:
 bearer authentication, then the API contract header, then policy. Fix the
 credential, the policy grant or the client before running the command again.
 When the CLI sent no credential, the refusal also carries `missing_credential`:
@@ -115,13 +122,16 @@ The status counts only with its matching `code` in a response that carries the
 server's API contract header: a bare `403` from a proxy stays `unknown` with
 `reconcile`, and a refusal that also reports recovery work stays `recover`.
 
-`refresh` means inspect current inputs and correct the command; it does not grant
-automatic replay. `recover` means finish the reported recovery obligation.
+`fix` means correct the credential, input, path or client; sent unchanged, the
+command fails the same way. `refresh` means read the current state and decide
+again; it does not grant automatic replay. `partial` effects mean an earlier
+step stands although the failing one wrote nothing; read the target before
+deciding. `recover` means finish the reported recovery obligation.
 `reconcile` means establish the original operation's outcome before another
 attempt. Only `retry` with exit 75 grants the bounded retry described above; the
 CLI performs no automatic retry.
 
-The outcome covers the entire command. A later refused subrequest cannot undo
+The disposition covers the entire command. A later refused subrequest cannot undo
 an earlier branch creation, load or publication. Embedded load conflicts and
 conditional mismatches remain exit 1: writable open can complete earlier work.
 Disconnecting an admitted HTTP write does not cancel it: the server keeps
@@ -133,7 +143,7 @@ outcome unknown. There is no durable request-result lookup in this release.
 A `409` is not one universal retry signal:
 
 - A read-set or version conflict means another writer changed an input. Inspect
-  the whole-command outcome and re-read before deciding on a new operation.
+  the whole-command disposition and re-read before deciding on a new operation.
 - A key conflict means strict insertion found an existing ID. Change the ID or
   use merge/upsert semantics; repeating the strict insert is not useful.
 - A merge conflict requires an explicit resolution on one branch before

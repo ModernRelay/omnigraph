@@ -1419,8 +1419,8 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
     assert_eq!(refusal["status"], 409, "{refused}");
     assert!(refusal["error"]["key_conflict"].is_object(), "{refused}");
     assert_eq!(
-        refusal["error"]["outcome"],
-        json!({"execution": "unknown", "effects": "unknown", "action": "refresh"}),
+        refusal["error"]["disposition"],
+        json!({"effects": "partial", "action": "refresh"}),
         "{refused}"
     );
     let branches = call(&app, "secret", "branches_list", json!({"graph":"default"})).await;

@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use color_eyre::Report;
 use omnigraph_api_types::{
-    ErrorCode, ErrorOutput, OutcomeAction as Action, OutcomeEffects as Effects,
-    OutcomeExecution as Execution, OutcomeOutput,
+    DispositionAction as Action, DispositionEffects as Effects, DispositionOutput, ErrorCode,
+    ErrorOutput,
 };
 use reqwest::StatusCode;
 use serde::Serialize;
@@ -145,8 +145,8 @@ pub(crate) fn writable_open() {
 }
 
 /// The failure the CLI prints for a data write: the server's error body, its
-/// `outcome` reconciled with what this command's own requests show, and the
-/// transport facts beside it.
+/// `disposition` reconciled with what this command's own requests show, and
+/// the transport facts beside it.
 #[derive(Debug, Serialize)]
 pub(crate) struct Failure {
     #[serde(flatten)]
@@ -165,11 +165,11 @@ pub(crate) struct Failure {
 }
 
 impl Failure {
-    /// The whole command's outcome, which `classify` always sets.
-    pub(crate) fn outcome(&self) -> OutcomeOutput {
+    /// The whole command's disposition, which `classify` always sets.
+    pub(crate) fn disposition(&self) -> DispositionOutput {
         self.output
-            .outcome
-            .expect("a classified failure carries its outcome")
+            .disposition
+            .expect("a classified failure carries its disposition")
     }
 
     pub(crate) fn classify(error: Report, evidence: Evidence) -> Self {
@@ -204,16 +204,16 @@ impl Failure {
             evidence.retry_after
         };
         let missing_credential = remote.and_then(|remote| remote.missing_credential.clone());
-        // A server states the outcome of the one request it answered; that is
-        // the whole command's outcome only when that request was the
-        // command's sole effectful one.
+        // A server states the disposition of the one request it answered; that
+        // is the whole command's only when that request was the command's sole
+        // effectful one.
         let served = remote
             .filter(|_| single)
-            .and_then(|remote| remote.output.outcome)
+            .and_then(|remote| remote.output.disposition)
             .or_else(|| {
                 precondition
                     .filter(|_| single)
-                    .and_then(|value| value.output.outcome)
+                    .and_then(|value| value.output.disposition)
             });
         let output = if let Some(remote) = remote {
             remote.output.clone()
@@ -240,6 +240,8 @@ impl Failure {
             || output.full_text_index_required.is_some()
         {
             Action::Recover
+        } else if let Some(action) = admission {
+            action
         } else if not_started
             || output.precondition_failure.is_some()
             || output.blob_precondition_failure.is_some()
@@ -251,16 +253,16 @@ impl Failure {
             || !output.merge_conflicts.is_empty()
             || output.diagnostic.is_some()
         {
-            Action::Refresh
+            // A refusal of the request itself is fixed; any other is read
+            // again first.
+            match output.code.map(ErrorCode::action) {
+                Some(Action::Fix) => Action::Fix,
+                _ => Action::Refresh,
+            }
         } else {
             Action::Reconcile
         };
-        let outcome = served.unwrap_or(OutcomeOutput {
-            execution: if not_started {
-                Execution::NotStarted
-            } else {
-                Execution::Unknown
-            },
+        let disposition = served.unwrap_or(DispositionOutput {
             effects: if not_started {
                 Effects::None
             } else {
@@ -269,7 +271,7 @@ impl Failure {
             action,
         });
         let mut output = output;
-        output.outcome = Some(outcome);
+        output.disposition = Some(disposition);
         Self {
             output,
             http_status,
@@ -288,16 +290,17 @@ impl Failure {
 }
 
 /// The typed refusals the server sends before it admits a write, each code
-/// under its own status. A busy actor may retry the whole command; failed
-/// authentication, an unsupported contract, a refused `--as` assertion or a
-/// policy denial needs a changed credential, client or grant first.
+/// under its own status, and what each asks for. A busy actor may retry the
+/// whole command; failed authentication, an unsupported contract or a refused
+/// `--as` assertion needs a fixed credential or client, and a policy denial a
+/// changed grant.
 fn admission_refusal(status: StatusCode, code: Option<&ErrorCode>) -> Option<Action> {
     match (status, code?) {
-        (StatusCode::TOO_MANY_REQUESTS, ErrorCode::TooManyRequests) => Some(Action::Retry),
-        (StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized)
-        | (StatusCode::BAD_REQUEST, ErrorCode::ApiContractMismatch)
-        | (StatusCode::PRECONDITION_FAILED, ErrorCode::ActorMismatch)
-        | (StatusCode::FORBIDDEN, ErrorCode::Forbidden) => Some(Action::Refresh),
+        (StatusCode::TOO_MANY_REQUESTS, code @ ErrorCode::TooManyRequests)
+        | (StatusCode::UNAUTHORIZED, code @ ErrorCode::Unauthorized)
+        | (StatusCode::BAD_REQUEST, code @ ErrorCode::ApiContractMismatch)
+        | (StatusCode::PRECONDITION_FAILED, code @ ErrorCode::ActorMismatch)
+        | (StatusCode::FORBIDDEN, code @ ErrorCode::Forbidden) => Some(code.action()),
         _ => None,
     }
 }

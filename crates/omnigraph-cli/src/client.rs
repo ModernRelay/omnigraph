@@ -3392,17 +3392,17 @@ mod tests {
         assert_eq!(compound.exit, 1);
         assert_eq!(single.exit, 75);
         assert_eq!(
-            serde_json::to_value(compound).unwrap()["outcome"],
+            serde_json::to_value(compound).unwrap()["disposition"],
             json!({
-                "execution":"unknown", "effects":"unknown", "action":"reconcile"
+                "effects":"unknown", "action":"reconcile"
             })
         );
         let single = serde_json::to_value(single).unwrap();
         assert_eq!(single["retry_after"], "Wed, 21 Oct 2026 07:28:00 GMT");
         assert_eq!(
-            single["outcome"],
+            single["disposition"],
             json!({
-                "execution":"not_started", "effects":"none", "action":"retry"
+                "effects":"none", "action":"retry"
             })
         );
         // A later read's typed refusal cannot erase an earlier successful
@@ -3417,21 +3417,21 @@ mod tests {
             let compound = attempt(true, read_refusal, kind).await;
             assert_eq!(compound.exit, 1);
             assert_eq!(
-                serde_json::to_value(compound).unwrap()["outcome"]["effects"],
+                serde_json::to_value(compound).unwrap()["disposition"]["effects"],
                 "unknown"
             );
         }
         let conditional = attempt(false, false, Refusal::Condition).await;
         assert_eq!(conditional.exit, 4);
         assert_eq!(
-            serde_json::to_value(conditional).unwrap()["outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"})
+            serde_json::to_value(conditional).unwrap()["disposition"],
+            json!({"effects":"none","action":"refresh"})
         );
         let denied = attempt(false, false, Refusal::Denied).await;
         assert_eq!(denied.exit, 1);
         assert_eq!(
-            serde_json::to_value(denied).unwrap()["outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"})
+            serde_json::to_value(denied).unwrap()["disposition"],
+            json!({"effects":"none","action":"refresh"})
         );
     }
 

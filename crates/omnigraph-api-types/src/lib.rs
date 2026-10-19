@@ -1190,11 +1190,14 @@ pub struct ChangeBaselineRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeErrorOutput {
     pub error: String,
+    /// The failure's registry code, as on [`ErrorOutput`].
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = ErrorCode, required = true)]
     pub code: Option<ErrorCode>,
-    /// Whether the operation ran and what to do next, as on [`ErrorOutput`].
+    /// What the request did and what to do next, as on [`ErrorOutput`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<OutcomeOutput>,
+    #[schema(value_type = DispositionOutput, required = true)]
+    pub disposition: Option<DispositionOutput>,
     /// Set when a requested limit exceeds a public ceiling, or a single change
     /// exceeds the poll's own byte ceiling.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2013,6 +2016,36 @@ pub enum ErrorCode {
     Internal,
 }
 
+impl ErrorCode {
+    /// What a refusal with this code asks of its caller. A server's
+    /// disposition takes it unless the error names something to recover, or
+    /// the request's effects are unknown and must be reconciled first.
+    pub const fn action(self) -> DispositionAction {
+        match self {
+            Self::TooManyRequests | Self::ServiceUnavailable | Self::GraphUnavailable => {
+                DispositionAction::Retry
+            }
+            Self::RecoveryRequired => DispositionAction::Recover,
+            Self::OutcomeUnknown => DispositionAction::Reconcile,
+            // The request itself is wrong; no state it could read changes that.
+            Self::Unauthorized
+            | Self::BadRequest
+            | Self::ApiContractMismatch
+            | Self::ActorMismatch
+            | Self::NotFound
+            | Self::MethodNotAllowed
+            | Self::UnattachedCannotPublish => DispositionAction::Fix,
+            // The state the request met refused it, or the server failed.
+            Self::Forbidden
+            | Self::PreconditionFailed
+            | Self::Conflict
+            | Self::ExternalBlobSource
+            | Self::ChangeFeedGap
+            | Self::Internal => DispositionAction::Refresh,
+        }
+    }
+}
+
 /// Structured details for a publisher-level OCC failure. Surfaces alongside
 /// HTTP 409 when a write was rejected because the caller's pre-write view of
 /// one backing dataset's published version was stale relative to the current
@@ -2038,7 +2071,7 @@ pub struct ReadSetConflictOutput {
 /// A strict insert rejected because `entity_id` already names an entity in the
 /// selected node or edge type. The refused write changed nothing; an earlier
 /// step of the same request, such as the branch a load forks, may already have
-/// published, which the error's `outcome` states. Partial or ambiguous
+/// published, which the error's `disposition` states. Partial or ambiguous
 /// attempts surface `recovery_required` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KeyConflictOutput {
@@ -2069,8 +2102,7 @@ pub struct BlobRangeOutput {
 }
 
 /// Structured details for an allowed external Blob source that could not be
-/// probed or read. The top-level `code` remains optional so this additive
-/// detail can roll out without extending the closed [`ErrorCode`] enum.
+/// probed or read, sent with [`ErrorCode::ExternalBlobSource`].
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExternalBlobSourceOutput {
     /// Normalized, credential-free URI spelling (or a redacted placeholder).
@@ -2108,9 +2140,8 @@ pub struct PreconditionFailureOutput {
 }
 
 /// A change continuation can no longer be reconstructed from retained history
-/// (HTTP 410). Recovery is the baseline handshake; retrying the same cursor
-/// cannot succeed. `code` stays unset: this structured detail is the
-/// machine-readable discriminator, as with `external_blob_source`.
+/// (HTTP 410), sent with [`ErrorCode::ChangeFeedGap`]. Recovery is the
+/// baseline handshake; retrying the same cursor cannot succeed.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeFeedGapOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2263,43 +2294,42 @@ impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
     }
 }
 
-/// Whether a refused or failed operation ran, whether it changed anything,
-/// and what its caller should do next. A server states it on every error
-/// response, computed where that knowledge is; a client that lost the response
-/// knows less, and says so.
+/// What a refused or failed request did and what its caller should do next.
+/// A server states it on every error response, computed where that knowledge
+/// is; a client that lost the response knows less, and says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct OutcomeOutput {
-    pub execution: OutcomeExecution,
-    pub effects: OutcomeEffects,
-    pub action: OutcomeAction,
+pub struct DispositionOutput {
+    pub effects: DispositionEffects,
+    pub action: DispositionAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum OutcomeExecution {
+pub enum DispositionEffects {
     /// The operation took no effect: it was refused, or lost to another before
     /// anything it staged became reachable.
-    NotStarted,
-    /// The operation may have taken effect.
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum OutcomeEffects {
     None,
+    /// An earlier step of the same operation published, as the branch a load
+    /// forks before its data does, and the failing step was refused before it
+    /// wrote anything. Read the target to see what the earlier step left.
+    Partial,
+    /// The operation may have taken effect; the server cannot say.
     Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum OutcomeAction {
+pub enum DispositionAction {
+    /// Correct the request first: its credential, input, path or client.
+    /// Sent again unchanged, it fails the same way.
+    Fix,
+    /// Read the current state, then decide whether and how to send the
+    /// request again; the state it met refused it.
+    Refresh,
     /// Repeat the same request later, honoring `Retry-After` when present.
     Retry,
-    /// Read the current state, then decide; repeating unchanged will fail the
-    /// same way.
-    Refresh,
-    /// Resolve the durable recovery intent the error names first.
+    /// Resolve what the error names first: a durable recovery intent, or a
+    /// full-text index to build.
     Recover,
     /// Find out whether the operation took effect before writing again.
     Reconcile,
@@ -2308,12 +2338,16 @@ pub enum OutcomeAction {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
+    /// The failure's registry code. Servers set it on every error response; it
+    /// is absent only from a body built outside a server.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = ErrorCode, required = true)]
     pub code: Option<ErrorCode>,
-    /// Whether the operation ran and what to do next. Servers set it on every
-    /// error response; it is absent only from a body built outside a server.
+    /// What the request did and what to do next. Servers set it on every error
+    /// response; it is absent only from a body built outside a server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<OutcomeOutput>,
+    #[schema(value_type = DispositionOutput, required = true)]
+    pub disposition: Option<DispositionOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_conflicts: Vec<MergeConflictOutput>,
     /// Set when the conflict is a publisher CAS rejection. The caller's
@@ -2337,18 +2371,16 @@ pub struct ErrorOutput {
     /// `start..end` is half-open and `length` is the selected Blob length.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob_range: Option<BlobRangeOutput>,
-    /// Set with HTTP 424 when an external Blob URI passed admission policy but
-    /// its source could not be probed or read. This optional detail is the
-    /// machine-readable discriminator; `code` is omitted.
+    /// Set with HTTP 424 and `external_blob_source` when an external Blob URI
+    /// passed admission policy but its source could not be probed or read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_blob_source: Option<ExternalBlobSourceOutput>,
     /// Set when an overlapping durable recovery intent must be resolved before
     /// retry. Its dataset effects may or may not have started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_required: Option<RecoveryRequiredOutput>,
-    /// Set when a mutation's graph-commit precondition failed
-    /// (HTTP 412). Like `recovery_required`, this structured field carries
-    /// the machine-readable meaning and `code` is omitted.
+    /// Set with HTTP 412 and `precondition_failed` when a mutation's
+    /// graph-commit precondition failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precondition_failure: Option<PreconditionFailureOutput>,
     /// Set with HTTP 412 when a Blob write's `If-Match` did not hold for the
@@ -2387,7 +2419,7 @@ impl ErrorOutput {
         Self {
             error: error.into(),
             code: None,
-            outcome: None,
+            disposition: None,
             merge_conflicts: Vec::new(),
             published_dataset_version_conflict: None,
             read_set_conflict: None,

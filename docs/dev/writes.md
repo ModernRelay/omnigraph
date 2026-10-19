@@ -533,7 +533,7 @@ before it stages anything; a load's implicit fork checks `branch_create` before
 the fork, and nothing after it checks policy. A refusal that follows an effect
 answers a success with details instead, as the source deletion of
 `branch merge --delete-branch` does. The CLI relies on this order: it reports
-those three refusals as `not_started` with no effects. `ApiError::from_omni`
+those three refusals with `effects: none`. `ApiError::from_omni`
 cannot tell an early `OmniError::Policy` from a late one, so an `enforce` call
 after a durable effect would make that report wrong. The server's
 `auth_policy::signed_identities_obey_current_policy_and_attribute_writes` and

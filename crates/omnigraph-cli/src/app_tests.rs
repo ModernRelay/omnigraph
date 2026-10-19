@@ -154,8 +154,8 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
         let failure = serde_json::to_value(&undelivered.failure).unwrap();
         assert_eq!(
-            failure["outcome"],
-            json!({"execution": "unknown", "effects": "unknown", "action": "reconcile"}),
+            failure["disposition"],
+            json!({"effects": "unknown", "action": "reconcile"}),
             "{fault:?}: {failure}"
         );
         assert_eq!(undelivered.failure.exit, 1);
@@ -186,8 +186,8 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         assert_eq!(completion.code(), 1);
         let failure: Value = serde_json::from_slice(&stdout).unwrap();
         assert_eq!(
-            failure["outcome"],
-            json!({"execution": "not_started", "effects": "none", "action": "refresh"}),
+            failure["disposition"],
+            json!({"effects": "none", "action": "refresh"}),
             "{fault:?}: {failure}"
         );
         assert!(stderr.is_empty());
@@ -219,8 +219,8 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
         let failure = serde_json::to_value(&undelivered.failure).unwrap();
         assert_eq!(
-            failure["outcome"],
-            json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"})
+            failure["disposition"],
+            json!({"effects":"unknown", "action":"reconcile"})
         );
         assert_eq!(stdout, receipt);
     }
@@ -240,8 +240,8 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
     let failure = serde_json::to_value(&undelivered.failure).unwrap();
     assert_eq!(failure["error"], "response lost after dispatch");
     assert_eq!(
-        failure["outcome"],
-        json!({"execution": "unknown", "effects": "unknown", "action": "reconcile"})
+        failure["disposition"],
+        json!({"effects": "unknown", "action": "reconcile"})
     );
     assert_eq!(
         undelivered
@@ -252,7 +252,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         io::ErrorKind::BrokenPipe
     );
     assert!(stdout.is_empty());
-    assert!(String::from_utf8_lossy(&stderr.bytes).contains("outcome:"));
+    assert!(String::from_utf8_lossy(&stderr.bytes).contains("disposition:"));
 }
 
 #[tokio::test]
@@ -303,7 +303,7 @@ async fn delivered_refusals_keep_their_exit_status_when_unused_stdout_cannot_flu
         assert!(stdout.bytes.is_empty());
         let diagnostic = String::from_utf8(stderr).unwrap();
         assert_eq!(diagnostic.matches(message).count(), 1);
-        assert_eq!(diagnostic.matches("outcome:").count(), 1);
+        assert_eq!(diagnostic.matches("disposition:").count(), 1);
         if expected == 75 {
             assert!(diagnostic.contains("Retry-After: 3"));
         }
@@ -603,8 +603,8 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                     let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
                     let failure = serde_json::to_value(&undelivered.failure).unwrap();
                     assert_eq!(
-                        failure["outcome"],
-                        json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"})
+                        failure["disposition"],
+                        json!({"effects":"unknown", "action":"reconcile"})
                     );
                     assert_eq!(
                         undelivered
@@ -696,8 +696,8 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
     assert_eq!(completion.code(), 1);
     let failure: Value = serde_json::from_slice(&stdout).unwrap();
     assert_eq!(
-        failure["outcome"],
-        json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+        failure["disposition"],
+        json!({"effects":"none", "action":"refresh"})
     );
     assert!(server.requests().is_empty());
     server.assert_complete();
@@ -827,8 +827,8 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
     let failure: Value = serde_json::from_slice(&stdout).unwrap();
     assert_eq!(failure["error"], "cannot read stdin: input disappeared");
     assert_eq!(
-        failure["outcome"],
-        json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+        failure["disposition"],
+        json!({"effects":"none", "action":"refresh"})
     );
     assert!(stderr.is_empty());
     assert!(server.requests().is_empty());
@@ -887,8 +887,8 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
                 let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
                 let failure = serde_json::to_value(&undelivered.failure).unwrap();
                 assert_eq!(
-                    failure["outcome"],
-                    json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"})
+                    failure["disposition"],
+                    json!({"effects":"unknown", "action":"reconcile"})
                 );
                 assert_eq!(
                     undelivered
@@ -973,8 +973,8 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
     );
     let failure: Value = serde_json::from_slice(&stdout).unwrap();
     assert_eq!(
-        failure["outcome"],
-        json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+        failure["disposition"],
+        json!({"effects":"none", "action":"refresh"})
     );
     assert_eq!(
         client
@@ -1158,7 +1158,7 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
                 io::ErrorKind::BrokenPipe
             );
             let stderr = String::from_utf8_lossy(&stderr);
-            assert!(!stderr.contains("\"outcome\"") && !stderr.contains("outcome: {"));
+            assert!(!stderr.contains("\"disposition\"") && !stderr.contains("disposition: {"));
             assert_eq!(
                 client
                     .snapshot("main")
@@ -1290,7 +1290,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let message = format!("{error:#}");
             assert!(message.contains(id), "{message}");
             assert!(message.contains(lock), "{message}");
-            assert!(!message.contains("\"outcome\""));
+            assert!(!message.contains("\"disposition\""));
             let receipt = omnigraph_cluster::deployment_status(root, Some(id), &caller)
                 .await
                 .unwrap()

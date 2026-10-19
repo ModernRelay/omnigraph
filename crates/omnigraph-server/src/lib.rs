@@ -483,8 +483,7 @@ pub struct ApiError {
     /// Set once the error follows an owned write, the only place an operation
     /// can have had effects: it came back through the owned-write boundary,
     /// or the request that raised it had submitted one. Errors of reads and
-    /// refusals before admission never set it, so their outcome is always
-    /// "not started".
+    /// refusals before admission never set it, so they never have effects.
     owned_write: bool,
     /// Set when an earlier step of the error's operation publishes on its own,
     /// as the fork a load makes of a missing branch does, so a refusal of a
@@ -1477,18 +1476,22 @@ impl ApiError {
         self
     }
 
-    /// Whether the operation ran and what its caller should do next.
+    /// What the operation did and what its caller should do next.
     ///
     /// Before a request submits an owned write nothing it does has effects, so
-    /// every error there took no effect. Once it has, an error may follow
-    /// effects: an uncertain completion may have published, and every error of
-    /// a compound operation follows its earlier step, such as the branch a
-    /// load forks before its rows. Otherwise only the refusals a write meets
-    /// before it starts (authentication, the contract, the actor assertion,
-    /// policy, admission capacity, a request precondition) and the typed
-    /// refusals an engine gives before its one publication took none.
-    fn outcome(&self) -> api::OutcomeOutput {
-        use api::{OutcomeAction, OutcomeEffects, OutcomeExecution};
+    /// every error there took none. Once it has, an error may follow effects:
+    /// an uncertain completion may have published, and every error of a
+    /// compound operation follows its earlier step, such as the branch a load
+    /// forks before its rows. Otherwise only the refusals a write meets before
+    /// it starts (authentication, the contract, the actor assertion, policy,
+    /// admission capacity, a request precondition) and the typed refusals an
+    /// engine gives before its one publication took none; after an earlier
+    /// step published, those refusals leave that step's effects alone.
+    ///
+    /// The action is what the failing step asks of its caller, unless its
+    /// effects are unknown, which must be reconciled first.
+    fn disposition(&self) -> api::DispositionOutput {
+        use api::{DispositionAction, DispositionEffects};
         let details = self.details.as_deref();
         // Something must be resolved or rebuilt before the operation can run.
         let recovery = matches!(
@@ -1499,79 +1502,51 @@ impl ApiError {
                     | ApiErrorDetails::FullTextIndexRequired(_)
             )
         );
-        let retry = matches!(
-            self.code,
-            ErrorCode::TooManyRequests
-                | ErrorCode::ServiceUnavailable
-                | ErrorCode::GraphUnavailable
-        );
-        let not_started = |action| api::OutcomeOutput {
-            execution: OutcomeExecution::NotStarted,
-            effects: OutcomeEffects::None,
-            action,
-        };
-        let unknown = |action| api::OutcomeOutput {
-            execution: OutcomeExecution::Unknown,
-            effects: OutcomeEffects::Unknown,
-            action,
-        };
-        if !self.owned_write {
-            return not_started(if recovery {
-                OutcomeAction::Recover
-            } else if retry {
-                OutcomeAction::Retry
-            } else {
-                OutcomeAction::Refresh
-            });
-        }
-        if self.completion_uncertain {
-            return unknown(if recovery {
-                OutcomeAction::Recover
-            } else {
-                OutcomeAction::Reconcile
-            });
-        }
-        let refused_before_start =
-            matches!(
-                self.code,
-                ErrorCode::Unauthorized
-                    | ErrorCode::ApiContractMismatch
-                    | ErrorCode::ActorMismatch
-                    | ErrorCode::Forbidden
-                    | ErrorCode::PreconditionFailed
-                    | ErrorCode::TooManyRequests
-            ) || matches!(details, Some(ApiErrorDetails::BlobPreconditionFailure(_)));
-        // An engine refuses with a typed reason before it publishes, so a
-        // single publication refused that way did not happen.
-        let typed_refusal = matches!(
-            details,
-            Some(
-                ApiErrorDetails::MergeConflicts(_)
-                    | ApiErrorDetails::PublishedDatasetVersionConflict(_)
-                    | ApiErrorDetails::ReadSetConflict(_)
-                    | ApiErrorDetails::KeyConflict(_)
-                    | ApiErrorDetails::ResourceLimit(_)
-                    | ApiErrorDetails::ExternalBlobSource(_)
-                    | ApiErrorDetails::Diagnostic(_)
-            )
-        );
-        // A refusal says what to read again; anything else must be reconciled
-        // against the graph.
-        let refused = (refused_before_start || typed_refusal) && !recovery;
-        if refused && !self.compound {
-            return not_started(if self.code == ErrorCode::TooManyRequests {
-                OutcomeAction::Retry
-            } else {
-                OutcomeAction::Refresh
-            });
-        }
-        unknown(if recovery {
-            OutcomeAction::Recover
-        } else if refused {
-            OutcomeAction::Refresh
+        let step = if recovery {
+            DispositionAction::Recover
         } else {
-            OutcomeAction::Reconcile
-        })
+            self.code.action()
+        };
+        let effects = if !self.owned_write {
+            DispositionEffects::None
+        } else if self.completion_uncertain {
+            DispositionEffects::Unknown
+        } else {
+            let refused_before_start =
+                matches!(
+                    self.code,
+                    ErrorCode::Unauthorized
+                        | ErrorCode::ApiContractMismatch
+                        | ErrorCode::ActorMismatch
+                        | ErrorCode::Forbidden
+                        | ErrorCode::PreconditionFailed
+                        | ErrorCode::TooManyRequests
+                ) || matches!(details, Some(ApiErrorDetails::BlobPreconditionFailure(_)));
+            // An engine refuses with a typed reason before it publishes, so a
+            // single publication refused that way did not happen.
+            let typed_refusal = matches!(
+                details,
+                Some(
+                    ApiErrorDetails::MergeConflicts(_)
+                        | ApiErrorDetails::PublishedDatasetVersionConflict(_)
+                        | ApiErrorDetails::ReadSetConflict(_)
+                        | ApiErrorDetails::KeyConflict(_)
+                        | ApiErrorDetails::ResourceLimit(_)
+                        | ApiErrorDetails::ExternalBlobSource(_)
+                        | ApiErrorDetails::Diagnostic(_)
+                )
+            );
+            match (refused_before_start || typed_refusal) && !recovery {
+                true if self.compound => DispositionEffects::Partial,
+                true => DispositionEffects::None,
+                false => DispositionEffects::Unknown,
+            }
+        };
+        let action = match effects {
+            DispositionEffects::Unknown if !recovery => DispositionAction::Reconcile,
+            _ => step,
+        };
+        api::DispositionOutput { effects, action }
     }
 
     pub(crate) fn completion_uncertain(&self) -> bool {
@@ -1921,19 +1896,20 @@ impl ApiError {
 
     /// The output of an error whose facts are final.
     fn into_judged_output(self) -> ErrorOutput {
-        let outcome = self.outcome();
+        let disposition = self.disposition();
         let mut output = ErrorOutput::message(self.message);
         // A write the server could not settle is named by what the caller
         // must do about it, whatever failed underneath; a recovery intent
         // keeps its own code.
         output.code = Some(
-            if outcome.action == api::OutcomeAction::Reconcile && self.completion_uncertain {
+            if disposition.action == api::DispositionAction::Reconcile && self.completion_uncertain
+            {
                 ErrorCode::OutcomeUnknown
             } else {
                 self.code
             },
         );
-        output.outcome = Some(outcome);
+        output.disposition = Some(disposition);
         if let Some(details) = self.details {
             match *details {
                 ApiErrorDetails::MergeConflicts(value) => output.merge_conflicts = value,
@@ -1986,7 +1962,7 @@ pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
 /// whatever its cause, and keeps its own code. When the engine says an earlier
 /// step of the same operation published, as the fork a load makes of a
 /// missing branch does, even a refusal of a later step follows a publication;
-/// a fork is itself a write, so that changes the outcome only together with
+/// a fork is itself a write, so that changes the disposition only together with
 /// `after_write`.
 pub fn engine_error_output_after(error: OmniError, after_write: bool) -> api::ErrorOutput {
     let mut error = ApiError::from_omni(error);
@@ -2166,18 +2142,22 @@ mod api_error_tests {
 
     #[tokio::test]
     async fn an_error_after_a_write_reports_what_it_may_have_done() {
-        use api::{OutcomeAction, OutcomeEffects, OutcomeExecution, OutcomeOutput};
-        let not_started = |action| {
-            Some(OutcomeOutput {
-                execution: OutcomeExecution::NotStarted,
-                effects: OutcomeEffects::None,
+        use api::{DispositionAction, DispositionEffects, DispositionOutput};
+        let none = |action| {
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action,
+            })
+        };
+        let partial = |action| {
+            Some(DispositionOutput {
+                effects: DispositionEffects::Partial,
                 action,
             })
         };
         let unknown = |action| {
-            Some(OutcomeOutput {
-                execution: OutcomeExecution::Unknown,
-                effects: OutcomeEffects::Unknown,
+            Some(DispositionOutput {
+                effects: DispositionEffects::Unknown,
                 action,
             })
         };
@@ -2185,14 +2165,14 @@ mod api_error_tests {
         // Before any write, nothing took effect.
         let error = output_of(ApiError::internal("read failed")).await;
         assert_eq!(error.code, Some(ErrorCode::Internal));
-        assert_eq!(error.outcome, not_started(OutcomeAction::Refresh));
+        assert_eq!(error.disposition, none(DispositionAction::Refresh));
         for error in [
             ApiError::too_many_requests("busy"),
             ApiError::admission_closed(),
         ] {
             assert_eq!(
-                output_of(error).await.outcome,
-                not_started(OutcomeAction::Retry)
+                output_of(error).await.disposition,
+                none(DispositionAction::Retry)
             );
         }
 
@@ -2200,12 +2180,12 @@ mod api_error_tests {
         // caller must do, whatever failed underneath.
         let error = output_of(ApiError::internal("publish in doubt").after_owned_write()).await;
         assert_eq!(error.code, Some(ErrorCode::OutcomeUnknown));
-        assert_eq!(error.outcome, unknown(OutcomeAction::Reconcile));
+        assert_eq!(error.disposition, unknown(DispositionAction::Reconcile));
 
         // An untyped error after a write may follow its publication.
         let error = output_of(ApiError::conflict("lost the publish").after_owned_write()).await;
         assert_eq!(error.code, Some(ErrorCode::Conflict));
-        assert_eq!(error.outcome, unknown(OutcomeAction::Reconcile));
+        assert_eq!(error.disposition, unknown(DispositionAction::Reconcile));
         // A typed refusal comes before the one publication it refuses, but
         // may follow an earlier publication of a compound operation.
         let refused = || {
@@ -2220,8 +2200,8 @@ mod api_error_tests {
         };
         let lost = || refused().after_owned_write();
         assert_eq!(
-            output_of(lost()).await.outcome,
-            not_started(OutcomeAction::Refresh)
+            output_of(lost()).await.disposition,
+            none(DispositionAction::Refresh)
         );
         let compound = |mut error: ApiError| {
             error.compound = true;
@@ -2229,7 +2209,7 @@ mod api_error_tests {
         };
         let error = output_of(compound(lost())).await;
         assert_eq!(error.code, Some(ErrorCode::Conflict));
-        assert_eq!(error.outcome, unknown(OutcomeAction::Refresh));
+        assert_eq!(error.disposition, partial(DispositionAction::Refresh));
         // The engine's mark of an earlier publication is that fact.
         let marked = ApiError::from_omni(
             OmniError::key_conflict("node:Person", "Alice").after_earlier_publication(),
@@ -2238,17 +2218,17 @@ mod api_error_tests {
         assert!(marked.compound && !marked.completion_uncertain);
         let error = output_of(marked).await;
         assert_eq!(error.code, Some(ErrorCode::Conflict));
-        assert_eq!(error.outcome, unknown(OutcomeAction::Refresh));
+        assert_eq!(error.disposition, partial(DispositionAction::Refresh));
 
         // Refusals a write meets before it starts took no effect, unless an
         // earlier step of the operation published.
         let error = output_of(ApiError::forbidden("denied").after_owned_write()).await;
-        assert_eq!(error.outcome, not_started(OutcomeAction::Refresh));
+        assert_eq!(error.disposition, none(DispositionAction::Refresh));
         let error = output_of(ApiError::too_many_requests("busy").after_owned_write()).await;
-        assert_eq!(error.outcome, not_started(OutcomeAction::Retry));
+        assert_eq!(error.disposition, none(DispositionAction::Retry));
         let error = output_of(compound(ApiError::forbidden("denied").after_owned_write())).await;
         assert_eq!(error.code, Some(ErrorCode::Forbidden));
-        assert_eq!(error.outcome, unknown(OutcomeAction::Refresh));
+        assert_eq!(error.disposition, partial(DispositionAction::Refresh));
 
         // Without the owned-write mark, a request that submitted a write
         // still counts its later errors as after it.
@@ -2262,7 +2242,7 @@ mod api_error_tests {
             output_of(ApiError::internal("receipt failed")).await
         })
         .await;
-        assert_eq!(error.outcome, unknown(OutcomeAction::Reconcile));
+        assert_eq!(error.disposition, unknown(DispositionAction::Reconcile));
 
         // Both facts cross the task boundary of an owned read, as an MCP tool
         // call's error does on its way to the response built in another task.
@@ -2283,7 +2263,7 @@ mod api_error_tests {
             .unwrap_err();
         let error = output_of(error).await;
         assert_eq!(error.code, Some(ErrorCode::Conflict));
-        assert_eq!(error.outcome, unknown(OutcomeAction::Refresh));
+        assert_eq!(error.disposition, partial(DispositionAction::Refresh));
         let writes = runtime.clone();
         let error = runtime
             .try_observe()
@@ -2300,23 +2280,142 @@ mod api_error_tests {
             .unwrap_err();
         let error = output_of(error).await;
         assert_eq!(error.code, Some(ErrorCode::OutcomeUnknown));
-        assert_eq!(error.outcome, unknown(OutcomeAction::Reconcile));
+        assert_eq!(error.disposition, unknown(DispositionAction::Reconcile));
+    }
+
+    /// Each class of refusal asks its caller for one thing. Before any write
+    /// none of them took effect; after one, a refusal of the failing step
+    /// leaves only an earlier step's effects, and any other error must be
+    /// reconciled unless it names something to recover.
+    #[tokio::test]
+    async fn each_refusal_class_names_its_effects_and_action() {
+        use api::{DispositionAction as Action, DispositionEffects as Effects};
+        let recovery = || {
+            ApiError::from_omni(OmniError::RecoveryRequired {
+                operation_id: "01JTESTRECOVERY".to_string(),
+                reason: "pending recovery intent".to_string(),
+            })
+        };
+        let key_conflict = || ApiError::from_omni(OmniError::key_conflict("node:Person", "Alice"));
+        let resource_limit = || {
+            ApiError::from_omni(OmniError::ResourceLimitExceeded {
+                resource: "keyed write entities for node:Person".to_string(),
+                limit: 1,
+                actual: 2,
+            })
+        };
+        let cases: [(&str, fn() -> ApiError, Action); 10] = [
+            (
+                "unauthorized",
+                || ApiError::unauthorized("no token"),
+                Action::Fix,
+            ),
+            (
+                "bad request",
+                || ApiError::bad_request("malformed"),
+                Action::Fix,
+            ),
+            (
+                "not found",
+                || ApiError::not_found("no such branch"),
+                Action::Fix,
+            ),
+            (
+                "method",
+                || ApiError::method_not_allowed("not served"),
+                Action::Fix,
+            ),
+            ("resource limit", resource_limit, Action::Fix),
+            ("policy", || ApiError::forbidden("denied"), Action::Refresh),
+            ("key conflict", key_conflict, Action::Refresh),
+            (
+                "busy",
+                || ApiError::too_many_requests("busy"),
+                Action::Retry,
+            ),
+            ("closed", ApiError::admission_closed, Action::Retry),
+            ("recovery", recovery, Action::Recover),
+        ];
+        for (name, error, action) in cases {
+            let before = output_of(error()).await.disposition.unwrap();
+            assert_eq!(
+                (before.effects, before.action),
+                (Effects::None, action),
+                "{name}"
+            );
+        }
+        // After a write, a refusal of the failing step names its own action
+        // and, after an earlier publication, partial effects.
+        for (name, error, effects, action) in [
+            (
+                "policy",
+                ApiError::forbidden("denied"),
+                Effects::None,
+                Action::Refresh,
+            ),
+            ("limit", resource_limit(), Effects::None, Action::Fix),
+            (
+                "busy",
+                ApiError::too_many_requests("busy"),
+                Effects::None,
+                Action::Retry,
+            ),
+        ] {
+            let after = output_of(error.after_owned_write())
+                .await
+                .disposition
+                .unwrap();
+            assert_eq!((after.effects, after.action), (effects, action), "{name}");
+        }
+        for (name, error, action) in [
+            ("conflict", key_conflict(), Action::Refresh),
+            ("limit", resource_limit(), Action::Fix),
+        ] {
+            let mut error = error.after_owned_write();
+            error.compound = true;
+            let after = output_of(error).await.disposition.unwrap();
+            assert_eq!(
+                (after.effects, after.action),
+                (Effects::Partial, action),
+                "{name}"
+            );
+        }
+        // Effects nobody can name are reconciled, unless recovery comes first.
+        for (name, error, action) in [
+            ("untyped", ApiError::not_found("gone"), Action::Reconcile),
+            ("uncertain", ApiError::internal("lost"), Action::Reconcile),
+            ("recovery", recovery(), Action::Recover),
+        ] {
+            let after = output_of(error.after_owned_write())
+                .await
+                .disposition
+                .unwrap();
+            assert_eq!(
+                (after.effects, after.action),
+                (Effects::Unknown, action),
+                "{name}"
+            );
+        }
     }
 
     #[test]
     fn an_embedded_engine_error_reports_what_a_served_request_would() {
-        use api::{OutcomeAction, OutcomeEffects, OutcomeExecution, OutcomeOutput};
-        let not_started = |action| {
-            Some(OutcomeOutput {
-                execution: OutcomeExecution::NotStarted,
-                effects: OutcomeEffects::None,
+        use api::{DispositionAction, DispositionEffects, DispositionOutput};
+        let none = |action| {
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action,
+            })
+        };
+        let partial = |action| {
+            Some(DispositionOutput {
+                effects: DispositionEffects::Partial,
                 action,
             })
         };
         let unknown = |action| {
-            Some(OutcomeOutput {
-                execution: OutcomeExecution::Unknown,
-                effects: OutcomeEffects::Unknown,
+            Some(DispositionOutput {
+                effects: DispositionEffects::Unknown,
                 action,
             })
         };
@@ -2330,7 +2429,7 @@ mod api_error_tests {
             engine_error_output_after(reclaimed().after_earlier_publication(), false),
         ] {
             assert_eq!(read.code, Some(ErrorCode::Internal));
-            assert_eq!(read.outcome, not_started(OutcomeAction::Refresh));
+            assert_eq!(read.disposition, none(DispositionAction::Refresh));
         }
         for write in [
             engine_error_output_after(reclaimed(), true),
@@ -2338,7 +2437,7 @@ mod api_error_tests {
             engine_error_output(reclaimed()),
         ] {
             assert_eq!(write.code, Some(ErrorCode::OutcomeUnknown));
-            assert_eq!(write.outcome, unknown(OutcomeAction::Reconcile));
+            assert_eq!(write.disposition, unknown(DispositionAction::Reconcile));
         }
 
         // A typed refusal of the write's one publication did not start it;
@@ -2350,11 +2449,11 @@ mod api_error_tests {
         ];
         for refusal in refusals {
             let code = engine_error_output_after(refusal(), false).code;
-            for (after_write, compound, outcome) in [
-                (false, false, not_started(OutcomeAction::Refresh)),
-                (false, true, not_started(OutcomeAction::Refresh)),
-                (true, false, not_started(OutcomeAction::Refresh)),
-                (true, true, unknown(OutcomeAction::Refresh)),
+            for (after_write, compound, disposition) in [
+                (false, false, none(DispositionAction::Refresh)),
+                (false, true, none(DispositionAction::Refresh)),
+                (true, false, none(DispositionAction::Refresh)),
+                (true, true, partial(DispositionAction::Refresh)),
             ] {
                 let error = if compound {
                     refusal().after_earlier_publication()
@@ -2363,7 +2462,7 @@ mod api_error_tests {
                 };
                 let output = engine_error_output_after(error, after_write);
                 assert_eq!(output.code, code, "{after_write} {compound}");
-                assert_eq!(output.outcome, outcome, "{after_write} {compound}");
+                assert_eq!(output.disposition, disposition, "{after_write} {compound}");
             }
         }
     }
@@ -2481,8 +2580,8 @@ mod api_error_tests {
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, Some(ErrorCode::RecoveryRequired));
         assert_eq!(
-            error.outcome.map(|outcome| outcome.action),
-            Some(api::OutcomeAction::Recover)
+            error.disposition.map(|disposition| disposition.action),
+            Some(api::DispositionAction::Recover)
         );
         assert_eq!(
             error.recovery_required.unwrap().operation_id,

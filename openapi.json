@@ -11204,7 +11204,9 @@
         "type": "object",
         "description": "Error envelope for the read-only change surfaces (`…/changes`,\n`…/changes/baseline`, `…/commits/{commit_id}/changes`): a wire-compatible\nprojection of [`ErrorOutput`] restricted to the graph-vocabulary details\nthose routes can produce after their error projection. The write-path\nconflict shapes (key / published-dataset-version / merge / read-set) are\nstructurally absent because change routes cannot produce them. Servers\nserialize [`ErrorOutput`]; every field a change route can populate appears\nhere with the same name and meaning, and absent optionals are wire-compatible.",
         "required": [
-          "error"
+          "error",
+          "code",
+          "disposition"
         ],
         "properties": {
           "change_diff_refusal": {
@@ -11230,28 +11232,15 @@
             ]
           },
           "code": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ErrorCode"
-              }
-            ]
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "The failure's registry code, as on [`ErrorOutput`]."
+          },
+          "disposition": {
+            "$ref": "#/components/schemas/DispositionOutput",
+            "description": "What the request did and what to do next, as on [`ErrorOutput`]."
           },
           "error": {
             "type": "string"
-          },
-          "outcome": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/OutcomeOutput",
-                "description": "Whether the operation ran and what to do next, as on [`ErrorOutput`]."
-              }
-            ]
           },
           "recovery_required": {
             "oneOf": [
@@ -11279,7 +11268,7 @@
       },
       "ChangeFeedGapOutput": {
         "type": "object",
-        "description": "A change continuation can no longer be reconstructed from retained history\n(HTTP 410). Recovery is the baseline handshake; retrying the same cursor\ncannot succeed. `code` stays unset: this structured detail is the\nmachine-readable discriminator, as with `external_blob_source`.",
+        "description": "A change continuation can no longer be reconstructed from retained history\n(HTTP 410), sent with [`ErrorCode::ChangeFeedGap`]. Recovery is the\nbaseline handshake; retrying the same cursor cannot succeed.",
         "required": [
           "first_unreadable_commit_id"
         ],
@@ -11753,6 +11742,40 @@
           }
         }
       },
+      "DispositionAction": {
+        "type": "string",
+        "enum": [
+          "fix",
+          "refresh",
+          "retry",
+          "recover",
+          "reconcile"
+        ]
+      },
+      "DispositionEffects": {
+        "type": "string",
+        "enum": [
+          "none",
+          "partial",
+          "unknown"
+        ]
+      },
+      "DispositionOutput": {
+        "type": "object",
+        "description": "What a refused or failed request did and what its caller should do next.\nA server states it on every error response, computed where that knowledge\nis; a client that lost the response knows less, and says so.",
+        "required": [
+          "effects",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/DispositionAction"
+          },
+          "effects": {
+            "$ref": "#/components/schemas/DispositionEffects"
+          }
+        }
+      },
       "EntityChangeOutput": {
         "type": "object",
         "description": "One entity change. Cause is stated once on the enclosing block, never here.\nAn insert carries only `after`, an update exact `before` and `after`, a\ndelete only `before`.",
@@ -11831,7 +11854,9 @@
       "ErrorOutput": {
         "type": "object",
         "required": [
-          "error"
+          "error",
+          "code",
+          "disposition"
         ],
         "properties": {
           "blob_precondition_failure": {
@@ -11879,14 +11904,8 @@
             ]
           },
           "code": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ErrorCode"
-              }
-            ]
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "The failure's registry code. Servers set it on every error response; it\nis absent only from a body built outside a server."
           },
           "diagnostic": {
             "oneOf": [
@@ -11899,6 +11918,10 @@
               }
             ]
           },
+          "disposition": {
+            "$ref": "#/components/schemas/DispositionOutput",
+            "description": "What the request did and what to do next. Servers set it on every error\nresponse; it is absent only from a body built outside a server."
+          },
           "error": {
             "type": "string"
           },
@@ -11909,7 +11932,7 @@
               },
               {
                 "$ref": "#/components/schemas/ExternalBlobSourceOutput",
-                "description": "Set with HTTP 424 when an external Blob URI passed admission policy but\nits source could not be probed or read. This optional detail is the\nmachine-readable discriminator; `code` is omitted."
+                "description": "Set with HTTP 424 and `external_blob_source` when an external Blob URI\npassed admission policy but its source could not be probed or read."
               }
             ]
           },
@@ -11952,17 +11975,6 @@
               "$ref": "#/components/schemas/MergeConflictOutput"
             }
           },
-          "outcome": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/OutcomeOutput",
-                "description": "Whether the operation ran and what to do next. Servers set it on every\nerror response; it is absent only from a body built outside a server."
-              }
-            ]
-          },
           "precondition_failure": {
             "oneOf": [
               {
@@ -11970,7 +11982,7 @@
               },
               {
                 "$ref": "#/components/schemas/PreconditionFailureOutput",
-                "description": "Set when a mutation's graph-commit precondition failed\n(HTTP 412). Like `recovery_required`, this structured field carries\nthe machine-readable meaning and `code` is omitted."
+                "description": "Set with HTTP 412 and `precondition_failed` when a mutation's\ngraph-commit precondition failed."
               }
             ]
           },
@@ -12042,7 +12054,7 @@
       },
       "ExternalBlobSourceOutput": {
         "type": "object",
-        "description": "Structured details for an allowed external Blob source that could not be\nprobed or read. The top-level `code` remains optional so this additive\ndetail can roll out without extending the closed [`ErrorCode`] enum.",
+        "description": "Structured details for an allowed external Blob source that could not be\nprobed or read, sent with [`ErrorCode::ExternalBlobSource`].",
         "required": [
           "uri",
           "reason"
@@ -12492,7 +12504,7 @@
       },
       "KeyConflictOutput": {
         "type": "object",
-        "description": "A strict insert rejected because `entity_id` already names an entity in the\nselected node or edge type. The refused write changed nothing; an earlier\nstep of the same request, such as the branch a load forks, may already have\npublished, which the error's `outcome` states. Partial or ambiguous\nattempts surface `recovery_required` instead.",
+        "description": "A strict insert rejected because `entity_id` already names an entity in the\nselected node or edge type. The refused write changed nothing; an earlier\nstep of the same request, such as the branch a load forks, may already have\npublished, which the error's `disposition` states. Partial or ambiguous\nattempts surface `recovery_required` instead.",
         "required": [
           "entity_kind",
           "type_name"
@@ -12594,49 +12606,6 @@
           },
           "type_name": {
             "type": "string"
-          }
-        }
-      },
-      "OutcomeAction": {
-        "type": "string",
-        "enum": [
-          "retry",
-          "refresh",
-          "recover",
-          "reconcile"
-        ]
-      },
-      "OutcomeEffects": {
-        "type": "string",
-        "enum": [
-          "none",
-          "unknown"
-        ]
-      },
-      "OutcomeExecution": {
-        "type": "string",
-        "enum": [
-          "not_started",
-          "unknown"
-        ]
-      },
-      "OutcomeOutput": {
-        "type": "object",
-        "description": "Whether a refused or failed operation ran, whether it changed anything,\nand what its caller should do next. A server states it on every error\nresponse, computed where that knowledge is; a client that lost the response\nknows less, and says so.",
-        "required": [
-          "execution",
-          "effects",
-          "action"
-        ],
-        "properties": {
-          "action": {
-            "$ref": "#/components/schemas/OutcomeAction"
-          },
-          "effects": {
-            "$ref": "#/components/schemas/OutcomeEffects"
-          },
-          "execution": {
-            "$ref": "#/components/schemas/OutcomeExecution"
           }
         }
       },

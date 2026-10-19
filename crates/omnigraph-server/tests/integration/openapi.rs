@@ -1379,6 +1379,44 @@ fn error_output_schema_has_expected_fields() {
     let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("error"));
     assert!(props.contains_key("code"));
+    // A server sends the message, the code and the disposition on every error,
+    // never null.
+    for name in ["ErrorOutput", "ChangeErrorOutput"] {
+        let body = &doc["components"]["schemas"][name];
+        let required: HashSet<&str> = body["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            required,
+            HashSet::from(["error", "code", "disposition"]),
+            "{name}"
+        );
+        assert_eq!(
+            body["properties"]["code"]["$ref"], "#/components/schemas/ErrorCode",
+            "{name}"
+        );
+        assert_eq!(
+            body["properties"]["disposition"]["$ref"], "#/components/schemas/DispositionOutput",
+            "{name}"
+        );
+        assert!(body["properties"].get("outcome").is_none(), "{name}");
+    }
+    let disposition = &doc["components"]["schemas"]["DispositionOutput"];
+    assert_eq!(
+        disposition["required"],
+        serde_json::json!(["effects", "action"])
+    );
+    assert_eq!(
+        doc["components"]["schemas"]["DispositionEffects"]["enum"],
+        serde_json::json!(["none", "partial", "unknown"])
+    );
+    assert_eq!(
+        doc["components"]["schemas"]["DispositionAction"]["enum"],
+        serde_json::json!(["fix", "refresh", "retry", "recover", "reconcile"])
+    );
     assert!(props.contains_key("merge_conflicts"));
     assert!(props.contains_key("published_dataset_version_conflict"));
     assert!(props.contains_key("read_set_conflict"));
@@ -1479,7 +1517,7 @@ fn change_error_output_schema_matches_every_change_route_detail() {
     for field in [
         "error",
         "code",
-        "outcome",
+        "disposition",
         "resource_limit",
         "recovery_required",
         "change_feed_gap",

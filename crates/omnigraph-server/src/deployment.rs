@@ -1023,8 +1023,8 @@ mod tests {
             );
             assert_eq!(body["code"], "service_unavailable");
             assert_eq!(
-                body["outcome"],
-                serde_json::json!({"execution": "not_started", "effects": "none", "action": "retry"})
+                body["disposition"],
+                serde_json::json!({"effects": "none", "action": "retry"})
             );
             assert!(body.get("deployment").is_none());
             assert!(body.get("active").is_none());

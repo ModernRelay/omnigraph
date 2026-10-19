@@ -801,9 +801,8 @@ fn parity_load() {
     for (arm, output) in [("local", &l), ("remote", &r)] {
         assert_eq!(output.status.code(), Some(1), "{arm}: {output:?}");
         let output = parse_stdout_json(output);
-        assert_eq!(output["outcome"]["execution"], "unknown", "{arm}");
-        assert_eq!(output["outcome"]["effects"], "unknown", "{arm}");
-        assert_ne!(output["outcome"]["action"], "retry", "{arm}");
+        assert_eq!(output["disposition"]["effects"], "unknown", "{arm}");
+        assert_ne!(output["disposition"]["action"], "retry", "{arm}");
     }
     let (l, r) = p.run(&["branch", "list", "--json"]);
     assert_parity("compound load retained the created branch", &l, &r);
@@ -1376,7 +1375,7 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
             serde_json::json!({}),
             "{arm}: a null cell has no validator"
         );
-        assert_eq!(refused["outcome"]["action"], "refresh", "{arm}");
+        assert_eq!(refused["disposition"]["action"], "refresh", "{arm}");
     }
     assert_eq!(local["error"], remote["error"]);
 
@@ -1389,10 +1388,7 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
     let (local, remote) = p.run(&with("put", &["--file", oversized.to_str().unwrap()]));
     assert_eq!(local.status.code(), remote.status.code());
     assert_eq!(parse_stdout_json(&local), parse_stdout_json(&remote));
-    assert_eq!(
-        parse_stdout_json(&local)["outcome"]["execution"],
-        "not_started"
-    );
+    assert_eq!(parse_stdout_json(&local)["disposition"]["effects"], "none");
 }
 
 // ---- error parity: exit codes must match for shared failure cases ----

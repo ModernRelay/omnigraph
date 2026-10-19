@@ -1745,8 +1745,8 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["key_conflict"].is_object(), "{body}");
     assert_eq!(
-        body["outcome"],
-        json!({"execution": "unknown", "effects": "unknown", "action": "refresh"}),
+        body["disposition"],
+        json!({"effects": "partial", "action": "refresh"}),
         "{body}"
     );
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
@@ -1779,8 +1779,8 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["key_conflict"].is_object(), "{body}");
     assert_eq!(
-        body["outcome"],
-        json!({"execution": "not_started", "effects": "none", "action": "refresh"}),
+        body["disposition"],
+        json!({"effects": "none", "action": "refresh"}),
         "{body}"
     );
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
@@ -1855,8 +1855,8 @@ async fn a_load_that_forks_a_branch_deleted_during_its_body_reports_the_fork() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["key_conflict"].is_object(), "{body}");
     assert_eq!(
-        body["outcome"],
-        json!({"execution": "unknown", "effects": "unknown", "action": "refresh"}),
+        body["disposition"],
+        json!({"effects": "partial", "action": "refresh"}),
         "the fork published before the rows: {body}"
     );
     assert!(
@@ -3811,7 +3811,7 @@ const SHOW_AT_WRITE_DOOR: &str = "statement 'show merge_lineage' is a read; use 
 const SHOW_COLUMNS: [&str; 5] = ["name", "value", "default", "source", "scope"];
 
 /// Every settings refusal is `ApiError::bad_request`: the message, the code,
-/// the outcome of a refusal, and nothing else in the body.
+/// the disposition of a refusal, and nothing else in the body.
 fn assert_settings_refusal(status: StatusCode, body: &Value, error: &str) {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(
@@ -3819,7 +3819,7 @@ fn assert_settings_refusal(status: StatusCode, body: &Value, error: &str) {
         &json!({
             "error": error,
             "code": "bad_request",
-            "outcome": {"execution": "not_started", "effects": "none", "action": "refresh"},
+            "disposition": {"effects": "none", "action": "fix"},
         })
     );
 }
@@ -3852,7 +3852,7 @@ async fn assert_unknown_settings_field(app: &axum::Router, request: Request<Body
     let error = body["error"].as_str().unwrap_or_default();
     assert!(error.contains("unknown field"), "{error}");
     assert_eq!(body.as_object().unwrap().len(), 3, "{body}");
-    assert_eq!(body["outcome"]["execution"], "not_started", "{body}");
+    assert_eq!(body["disposition"]["effects"], "none", "{body}");
 }
 
 fn show_row(name: &str, value: &str, default: &str, source: &str, scope: &str) -> Value {

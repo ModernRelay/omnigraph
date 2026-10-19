@@ -795,7 +795,7 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_and_unrouted_requests_answer_the_error_body() {
     use omnigraph_server::api::{
-        ErrorCode, OutcomeAction, OutcomeEffects, OutcomeExecution, OutcomeOutput,
+        DispositionAction, DispositionEffects, DispositionOutput, ErrorCode,
     };
 
     let (temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
@@ -904,11 +904,10 @@ async fn malformed_and_unrouted_requests_answer_the_error_body() {
         };
         assert_eq!(error.code, Some(code), "{what}: {}", error.error);
         assert_eq!(
-            error.outcome,
-            Some(OutcomeOutput {
-                execution: OutcomeExecution::NotStarted,
-                effects: OutcomeEffects::None,
-                action: OutcomeAction::Refresh,
+            error.disposition,
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action: DispositionAction::Fix,
             }),
             "{what}"
         );
