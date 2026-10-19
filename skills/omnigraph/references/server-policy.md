@@ -44,6 +44,7 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `GET /graphs/{id}/changes`, `POST /graphs/{id}/changes/baseline` | Poll a feed or capture a baseline |
 | `/graphs/{id}/schema` | Read the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot |
+| `GET /graphs/{id}/access` | The caller's actor and allowed actions (`?branch=`, `&target_branch=`); check before a write instead of learning from a 403 |
 
 Every request to a graph, registry or deployment route must carry exactly one
 `Omnigraph-Http-Api: 0.14` header; a missing, repeated or other value is
