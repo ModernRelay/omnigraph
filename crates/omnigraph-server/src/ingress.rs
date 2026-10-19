@@ -125,7 +125,7 @@ pub(crate) async fn admit(
     // engine policy that would refuse it again.
     if matches!(class, AdmissionClass::Write) && state.is_read_only_local() {
         return Err(ApiError::forbidden(
-            "this local server is read-only; start it with --write to change the graph",
+            "this local server is read-only, and a read-write local server is not available yet",
         ));
     }
     let graph = parts.extensions.get::<GraphRequest>().cloned();

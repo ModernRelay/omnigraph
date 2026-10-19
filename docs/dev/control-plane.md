@@ -576,7 +576,7 @@ nothing to stdout, disarms the watchdog when it returns, and reports
 and a state `AppState::local` did not build. They do not check a request's
 `Host` or `Origin`: a caller a browser can reach adds that guard in `extend`
 (an exact loopback `Host`, a refused `Origin`, no CORS header and
-`Cross-Origin-Resource-Policy: same-origin`), as `omnigraph serve` does.
+`Cross-Origin-Resource-Policy: same-origin`).
 `install_log_subscriber(writer)` installs the `init_tracing` filter on another
 writer.
 

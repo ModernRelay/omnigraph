@@ -3672,10 +3672,10 @@ async fn a_read_only_local_server_reads_and_refuses_every_write_before_its_body(
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
         assert_eq!(body["code"], "forbidden", "{method} {path}: {body}");
-        assert!(
-            body["error"].as_str().unwrap().contains("read-only"),
-            "{method} {path}: {body}"
-        );
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("read-only"), "{method} {path}: {body}");
+        // Read-write is not available yet, so the refusal names no way to it.
+        assert!(!error.contains("--write"), "{method} {path}: {body}");
     }
     // A local server owns no cluster deployment.
     for (method, path) in [
