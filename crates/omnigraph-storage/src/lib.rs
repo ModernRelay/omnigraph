@@ -18,7 +18,7 @@ use url::Url;
 use thiserror::Error;
 
 mod scoped;
-pub use scoped::StorageIoScope;
+pub use scoped::{OWNED_STORE_NAME, StorageIoScope};
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 

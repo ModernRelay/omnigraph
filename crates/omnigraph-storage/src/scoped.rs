@@ -272,23 +272,28 @@ fn is_uuid(text: &str) -> bool {
             .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// The `store` of every error the scope returns for a request it refuses
+/// before sending it. A caller may read such an error as definite: no copy of
+/// the request can land.
+pub const OWNED_STORE_NAME: &str = "owned storage";
+
 fn closed_error() -> object_store::Error {
     object_store::Error::Generic {
-        store: "owned storage",
+        store: OWNED_STORE_NAME,
         source: std::io::Error::other("storage mutation admission is closed").into(),
     }
 }
 
 fn uncertain_error() -> object_store::Error {
     object_store::Error::Generic {
-        store: "owned storage",
+        store: OWNED_STORE_NAME,
         source: std::io::Error::other("a prior storage mutation has an uncertain outcome").into(),
     }
 }
 
 fn transaction_file_held_error() -> object_store::Error {
     object_store::Error::Generic {
-        store: "owned storage",
+        store: OWNED_STORE_NAME,
         source: std::io::Error::other(
             "a manifest write with an unknown outcome may name this transaction file; it stays until cleanup from a replacement scope",
         )

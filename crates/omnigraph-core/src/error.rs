@@ -599,7 +599,7 @@ impl OmniError {
 
     /// Whether the type of this failure leaves open what happened to the
     /// graph. These are the failures a transport can only call internal.
-    fn outcome_opaque(&self) -> bool {
+    pub fn outcome_opaque(&self) -> bool {
         matches!(
             self.without_evidence(),
             Self::Storage(_)

@@ -232,8 +232,11 @@ Late fresh files remain unreachable and a conditional create cannot replace
 an existing publication. Such requests settle at the physical scope after
 an error or cancellation, including multipart uploads. This does not prove
 that a graph publication failed: the catalogue still owns the outcome of an
-unacknowledged numbered-manifest publication, and its uncertainty reaches the
-logical operation owner independently of the storage scope.
+unacknowledged numbered-manifest publication. The commit handler every
+dataset uses re-issues an ambiguous manifest request until the store answers
+it and records whether a request was sent; the publisher marks a failure with
+no request sent, or one the store refused, `Unpublished`, and only an outcome
+its read-back cannot settle reaches the logical operation owner as uncertain.
 
 Refs, version hints, cluster control objects, unknown paths, if-match
 replacements and recursive deletes remain conservative. A cancelled or
@@ -431,7 +434,9 @@ a failure it proves left the graph unchanged, before any effect or after
 detached effects no manifest names (`BeforeEffect`, `Unpublished`), is
 not itself a reason for logical containment, whatever status it maps to,
 including a 500. Mutation, load, Blob write and merge mark opaque errors (storage, I/O, DataFusion, internal) at their pre-publication
-steps, alongside the table store's staged-write and detached-commit sites.
+steps, alongside the table store's staged-write and detached-commit sites,
+and the publisher marks every failure whose manifest request cannot land.
+A contained write logs the failure's redacted class before admission closes.
 A typed refusal keeps its shape. Other opaque schema and maintenance
 preparation errors without completion evidence still fail closed as uncertain. Proven publication followed by
 `RecoveryRequired`, and uncertain publication itself, are never downgraded.

@@ -12,7 +12,7 @@
 pub(crate) use omnigraph_core::dst_ids;
 pub(crate) use omnigraph_core::{
     branch_control, branch_names, dataset_index, error, handle_cache, instrumentation,
-    lance_access, lance_clone, metadata, seams, staging, storage,
+    lance_access, lance_clone, manifest_request, metadata, seams, staging, storage,
 };
 pub mod commit_graph;
 

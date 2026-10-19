@@ -100,8 +100,13 @@ and other known logical owners finish, it exits 2 immediately; the watchdog is
 the upper bound. Unresolved reservations stay charged until exit. This contains
 the process; it does not prove native I/O settled or the engine can be reused.
 A failure proven to leave the graph unchanged can keep admission open when its
-physical storage requests have also settled. Error status or category alone
-proves nothing; uncertain publication and unclassified failures still fail closed.
+physical storage requests have also settled. That includes a publication that
+failed before its manifest request was sent, such as a throttled transaction-file
+put, and one the store refused outright. A manifest request whose answer was
+lost is re-issued unchanged until the store answers it, so a dropped
+acknowledgement ends as a committed write or a definite conflict. Error status
+or category alone proves nothing; a publication no re-issue settles and
+unclassified failures still fail closed, and the log names the failure's class.
 A clean native shutdown exits 0. Set the orchestrator's own
 termination grace longer than this value; a cutoff is crash-equivalent for the
 work it interrupts, and the next open recovers it as after any crash.

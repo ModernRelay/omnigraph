@@ -16,6 +16,11 @@ use lance_table::io::commit::{
 };
 use lance_table::io::manifest::read_manifest_indexes;
 use object_store::ObjectStore as RawObjectStore;
+
+use crate::manifest_request::{
+    FailedRequest, MANIFEST_REQUEST_REISSUES, ManifestRequest, ManifestRequestAttempt,
+    ManifestRequestProbe, classify_failed_request, reissue_pause,
+};
 use object_store::path::Path;
 use prost::Message;
 
@@ -241,16 +246,21 @@ fn fragment_reuse_range(
     Ok(start..end)
 }
 
+/// The commit handler OmniGraph installs on every dataset it opens or
+/// creates. It preserves index origins across a shallow clone, and it resolves
+/// the manifest request of every commit (`manifest_request`).
 #[derive(Debug)]
 struct IndexOriginCommitHandler {
     inner: Arc<dyn CommitHandler>,
     reuse_main_source_location: bool,
+    probe: Option<ManifestRequestProbe>,
 }
 
 pub fn wrap_commit_handler(inner: Arc<dyn CommitHandler>) -> Arc<dyn CommitHandler> {
     Arc::new(IndexOriginCommitHandler {
         inner,
         reuse_main_source_location: false,
+        probe: None,
     })
 }
 
@@ -259,8 +269,36 @@ pub async fn configured_commit_handler(
     params: &Option<lance::io::ObjectStoreParams>,
     existing: Option<Arc<dyn CommitHandler>>,
 ) -> Result<Arc<dyn CommitHandler>> {
-    if let Some(handler) = existing {
-        return Ok(wrap_commit_handler(handler));
+    Ok(Arc::new(
+        configured_handler(uri, params, existing, None).await?,
+    ))
+}
+
+/// The configured handler for one commit of `dataset`, recording what its
+/// manifest requests establish in `probe`. Pass it to that commit's
+/// `CommitBuilder::with_commit_handler`; the dataset keeps its own handler.
+pub async fn probed_commit_handler(
+    dataset: &Dataset,
+    probe: ManifestRequestProbe,
+) -> Result<Arc<dyn CommitHandler>> {
+    let params = dataset.store_params().cloned();
+    Ok(Arc::new(
+        configured_handler(dataset.uri(), &params, None, Some(probe)).await?,
+    ))
+}
+
+async fn configured_handler(
+    uri: &str,
+    params: &Option<lance::io::ObjectStoreParams>,
+    existing: Option<Arc<dyn CommitHandler>>,
+    probe: Option<ManifestRequestProbe>,
+) -> Result<IndexOriginCommitHandler> {
+    if let Some(inner) = existing {
+        return Ok(IndexOriginCommitHandler {
+            inner,
+            reuse_main_source_location: false,
+            probe,
+        });
     }
     let reuse_main_source_location = url::Url::parse(uri).map_or(true, |url| {
         matches!(
@@ -278,10 +316,11 @@ pub async fn configured_commit_handler(
                 | "goosefs"
         )
     });
-    Ok(Arc::new(IndexOriginCommitHandler {
+    Ok(IndexOriginCommitHandler {
         inner: lance_table::io::commit::commit_handler_from_url(uri, params).await?,
         reuse_main_source_location,
-    }))
+        probe,
+    })
 }
 
 pub async fn write_params(
@@ -303,6 +342,96 @@ pub async fn create_branch(
     CLONE_CONTEXT
         .scope(context, source.create_branch(branch, source_version, None))
         .await
+}
+
+impl IndexOriginCommitHandler {
+    /// Send the commit's manifest put-if-absent until the store answers it.
+    ///
+    /// A version the store holds goes back to Lance as a conflict, which Lance
+    /// reads back by its complete transaction: this commit's own earlier
+    /// request is then a success, another commit's a conflict. An ambiguous
+    /// failure is re-issued with the same manifest and the same precondition,
+    /// so at most one copy applies, and the key's next definite answer
+    /// settles every earlier request for it. A request still ambiguous after
+    /// the last re-issue goes back to Lance as it failed, recorded as
+    /// unresolved for the committer.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_manifest_request(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &Path,
+        object_store: &ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        let attempt = self.probe.as_ref().map(ManifestRequestProbe::attempt);
+        let finish = |attempt: Option<ManifestRequestAttempt>, outcome| {
+            if let Some(attempt) = attempt {
+                attempt.finish(outcome);
+            }
+        };
+        let mut reissues = 0;
+        loop {
+            let result = self
+                .inner
+                .commit(
+                    manifest,
+                    indices.clone(),
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction.clone(),
+                )
+                .await;
+            let error = match result {
+                Ok(location) => {
+                    if reissues > 0 {
+                        tracing::info!(
+                            base = %base_path,
+                            version = manifest.version,
+                            reissues,
+                            "manifest request resolved by re-issue: the store holds this commit"
+                        );
+                    }
+                    finish(attempt, ManifestRequest::Landed);
+                    return Ok(location);
+                }
+                Err(CommitError::CommitConflict) => {
+                    finish(attempt, ManifestRequest::Held);
+                    return Err(CommitError::CommitConflict);
+                }
+                Err(CommitError::OtherError(error)) => error,
+            };
+            if reissues == 0 && classify_failed_request(&error) == FailedRequest::Refused {
+                finish(attempt, ManifestRequest::Refused);
+                return Err(CommitError::OtherError(error));
+            }
+            if reissues == MANIFEST_REQUEST_REISSUES {
+                tracing::error!(
+                    base = %base_path,
+                    version = manifest.version,
+                    reissues,
+                    error = %error,
+                    "manifest request outcome unknown after every re-issue; the version may still \
+                     hold this commit"
+                );
+                finish(attempt, ManifestRequest::Unresolved);
+                return Err(CommitError::OtherError(error));
+            }
+            reissues += 1;
+            tracing::warn!(
+                base = %base_path,
+                version = manifest.version,
+                reissue = reissues,
+                error = %error,
+                "manifest request outcome unknown; re-issuing the identical conditional request"
+            );
+            tokio::time::sleep(reissue_pause(reissues)).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -414,17 +543,16 @@ impl CommitHandler for IndexOriginCommitHandler {
                 indices
             }
         };
-        self.inner
-            .commit(
-                manifest,
-                indices,
-                base_path,
-                object_store,
-                manifest_writer,
-                naming_scheme,
-                transaction,
-            )
-            .await
+        self.resolve_manifest_request(
+            manifest,
+            indices,
+            base_path,
+            object_store,
+            manifest_writer,
+            naming_scheme,
+            transaction,
+        )
+        .await
     }
 
     async fn delete(&self, base_path: &Path) -> Result<()> {
@@ -467,6 +595,146 @@ mod tests {
         ) -> std::result::Result<ManifestLocation, CommitError> {
             Err(Error::io("configured commit").into())
         }
+    }
+
+    /// A backend that answers each manifest commit with the next scripted
+    /// result and counts the requests it was sent.
+    #[derive(Debug)]
+    struct ScriptedBackend {
+        answers: std::sync::Mutex<std::collections::VecDeque<Answer>>,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Answer {
+        Landed,
+        Held,
+        Ambiguous,
+        Refused,
+    }
+
+    impl ScriptedBackend {
+        fn new(answers: &[Answer]) -> Self {
+            Self {
+                answers: std::sync::Mutex::new(answers.iter().copied().collect()),
+                sent: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CommitHandler for ScriptedBackend {
+        async fn resolve_version_location(
+            &self,
+            _base_path: &Path,
+            _version: u64,
+            _object_store: &dyn RawObjectStore,
+        ) -> Result<ManifestLocation> {
+            Err(Error::io("scripted resolver"))
+        }
+
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            _indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            _object_store: &ObjectStore,
+            _writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            _transaction: Option<Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let answer = self.answers.lock().unwrap().pop_front().expect("scripted");
+            let store_error = |store: &'static str| {
+                CommitError::OtherError(
+                    object_store::Error::Generic {
+                        store,
+                        source: std::io::Error::other("scripted").into(),
+                    }
+                    .into(),
+                )
+            };
+            match answer {
+                Answer::Landed => Ok(ManifestLocation {
+                    version: manifest.version,
+                    path: naming_scheme.manifest_path(base_path, manifest.version),
+                    size: None,
+                    naming_scheme,
+                    e_tag: None,
+                }),
+                Answer::Held => Err(CommitError::CommitConflict),
+                Answer::Ambiguous => Err(store_error("S3")),
+                Answer::Refused => Err(store_error("LocalFileSystem")),
+            }
+        }
+    }
+
+    /// Run one manifest commit through the configured handler over `answers`;
+    /// returns whether it succeeded, how many requests were sent and what the
+    /// probe recorded.
+    async fn resolve(answers: &[Answer]) -> (bool, usize, ManifestRequest) {
+        let directory = tempfile::tempdir().unwrap();
+        let dataset = fresh_dataset(directory.path().to_str().unwrap()).await;
+        let backend = Arc::new(ScriptedBackend::new(answers));
+        let probe = ManifestRequestProbe::new();
+        let handler = IndexOriginCommitHandler {
+            inner: backend.clone(),
+            reuse_main_source_location: false,
+            probe: Some(probe.clone()),
+        };
+        let mut manifest = dataset.manifest().clone();
+        manifest.version += 1;
+        let store = dataset.object_store(None).await.unwrap();
+        let result = handler
+            .commit(
+                &mut manifest,
+                None,
+                &dataset.branch_location().path,
+                &store,
+                lance_table::io::commit::write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await;
+        (
+            result.is_ok(),
+            backend.sent.load(std::sync::atomic::Ordering::SeqCst),
+            probe.outcome(),
+        )
+    }
+
+    /// The handler re-issues an ambiguous manifest request until the store
+    /// answers it; a definite refusal, a held version and a landed manifest
+    /// end it at once; and a request no answer settles stays unresolved.
+    #[tokio::test]
+    async fn manifest_request_is_re_issued_until_the_store_answers_issue_1067() {
+        use Answer::*;
+        assert_eq!(resolve(&[Landed]).await, (true, 1, ManifestRequest::Landed));
+        assert_eq!(
+            resolve(&[Ambiguous, Ambiguous, Landed]).await,
+            (true, 3, ManifestRequest::Landed),
+            "a re-issue the store applies is this commit"
+        );
+        assert_eq!(
+            resolve(&[Ambiguous, Held]).await,
+            (false, 2, ManifestRequest::Held),
+            "a held version goes to Lance's read-back, which tells this commit from another"
+        );
+        assert_eq!(
+            resolve(&[Refused]).await,
+            (false, 1, ManifestRequest::Refused),
+            "a definite refusal is not re-issued"
+        );
+        assert_eq!(
+            resolve(&[Ambiguous, Refused, Landed]).await,
+            (true, 3, ManifestRequest::Landed),
+            "after an ambiguous request, a refusal does not settle the key"
+        );
+        let unanswered = [Ambiguous; 1 + MANIFEST_REQUEST_REISSUES as usize];
+        assert_eq!(
+            resolve(&unanswered).await,
+            (false, unanswered.len(), ManifestRequest::Unresolved)
+        );
     }
 
     #[tokio::test]

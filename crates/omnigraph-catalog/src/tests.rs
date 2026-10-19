@@ -14754,3 +14754,295 @@ async fn proposal_reader_reads_are_independent_of_the_unattached_population() {
         );
     }
 }
+
+/// What [`ManifestRequestFault`] does to the publication requests of
+/// `__manifest`. Every other request passes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestFault {
+    /// The `_transactions/*.txn` put fails before Lance sends the manifest:
+    /// a file is planted where `__manifest/_transactions/` goes, because
+    /// Lance writes a local transaction file past the object store.
+    TransactionPut,
+    /// The first numbered manifest create is applied, then answered by a
+    /// lost acknowledgement.
+    LostAcknowledgement,
+    /// Every numbered manifest create fails unapplied with an ambiguous error.
+    EveryManifestPut,
+    /// The first numbered manifest create fails at once, and its request is
+    /// applied 50 ms later, after the client gave up on it.
+    LandsLate,
+}
+
+#[derive(Debug, Clone)]
+struct ManifestRequestFault {
+    fault: ManifestFault,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+    manifest_puts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ManifestRequestFault {
+    fn new(fault: ManifestFault) -> Self {
+        Self {
+            fault,
+            fired: Arc::default(),
+            manifest_puts: Arc::default(),
+        }
+    }
+}
+
+impl lance::io::WrappingObjectStore for ManifestRequestFault {
+    fn wrap(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(ManifestRequestFaultStore {
+            original,
+            fault: self.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ManifestRequestFaultStore {
+    original: Arc<dyn object_store::ObjectStore>,
+    fault: ManifestRequestFault,
+}
+
+impl std::fmt::Display for ManifestRequestFaultStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "manifest request fault over {}", self.original)
+    }
+}
+
+fn ambiguous_store_error(text: &str) -> object_store::Error {
+    // A remote store's generic failure: the request may have applied.
+    object_store::Error::Generic {
+        store: "S3",
+        source: Box::new(std::io::Error::other(text.to_string())),
+    }
+}
+
+#[async_trait]
+impl object_store::ObjectStore for ManifestRequestFaultStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        use std::sync::atomic::Ordering;
+
+        let parts: Vec<_> = location.parts().collect();
+        let [.., directory, name] = parts.as_slice() else {
+            return self.original.put_opts(location, payload, options).await;
+        };
+        let transaction = directory.as_ref() == "_transactions";
+        let numbered_manifest = directory.as_ref() == "_versions"
+            && name.as_ref().ends_with(".manifest")
+            && !name.as_ref().starts_with('d')
+            && matches!(options.mode, object_store::PutMode::Create);
+        if numbered_manifest {
+            self.fault.manifest_puts.fetch_add(1, Ordering::SeqCst);
+        }
+        let first = |hit: bool| hit && !self.fault.fired.swap(true, Ordering::SeqCst);
+        match self.fault.fault {
+            ManifestFault::TransactionPut if first(transaction) => Err(ambiguous_store_error(
+                "<Code>SlowDown</Code><Message>Please reduce your request rate.</Message>",
+            )),
+            ManifestFault::LostAcknowledgement if first(numbered_manifest) => {
+                self.original.put_opts(location, payload, options).await?;
+                Err(ambiguous_store_error("connection reset after the request"))
+            }
+            ManifestFault::EveryManifestPut if numbered_manifest => {
+                Err(ambiguous_store_error("503 Service Unavailable"))
+            }
+            ManifestFault::LandsLate if first(numbered_manifest) => {
+                let original = Arc::clone(&self.original);
+                let location = location.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    // The abandoned request reaches the store; a re-issue
+                    // that won the key makes it fail its precondition.
+                    let _ = original.put_opts(&location, payload, options).await;
+                });
+                Err(ambiguous_store_error("request timed out"))
+            }
+            _ => self.original.put_opts(location, payload, options).await,
+        }
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.original.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.original.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.original.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.original.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.original.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.original.copy_opts(from, to, options).await
+    }
+}
+
+/// Publish one lineage commit through `fault` on `__manifest`; returns the
+/// result and the `__manifest` version before and after.
+async fn publish_through(
+    fault: ManifestFault,
+) -> (Result<PublishOutcome>, u64, u64, ManifestRequestFault) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    ManifestCoordinator::init(&uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let before = open_manifest_dataset(&uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let transactions = dir.path().join("__manifest/_transactions");
+    let parked = dir.path().join("__manifest/_transactions.parked");
+    if fault == ManifestFault::TransactionPut {
+        std::fs::rename(&transactions, &parked).unwrap();
+        std::fs::write(&transactions, b"not a directory").unwrap();
+    }
+    let fault = ManifestRequestFault::new(fault);
+    let probes = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(fault.clone())),
+        ..Default::default()
+    };
+    let publisher = GraphNamespacePublisher::new(&uri, None);
+    let result = crate::instrumentation::with_query_io_probes(
+        probes,
+        publisher.publish(&[], &HashMap::new(), Some(&lineage_intent(None, None))),
+    )
+    .await;
+    if fault.fault == ManifestFault::TransactionPut {
+        std::fs::remove_file(&transactions).unwrap();
+        std::fs::rename(&parked, &transactions).unwrap();
+    }
+    // The late landing, if any, has had its chance before the version is read.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let after = open_manifest_dataset(&uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    drop(dir);
+    (result, before, after, fault)
+}
+
+/// A publication whose transaction file put fails never sent its manifest:
+/// the failure is definite, `Unpublished`, and not a publication in doubt.
+/// This is the store answer a quiet bucket gave a single served mutate on
+/// 2026-10-19; the server contained itself on the in-doubt answer it got.
+#[tokio::test]
+async fn transaction_file_failure_before_the_manifest_is_unpublished_issue_1067() {
+    let (result, before, after, fault) = publish_through(ManifestFault::TransactionPut).await;
+    let error = result.expect_err("the transaction file put fails");
+    assert!(
+        !error.is_manifest_publish_in_doubt(),
+        "no manifest request was sent: {error}"
+    );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(crate::error::CompletionEvidence::Unpublished),
+        "{error:?}"
+    );
+    assert!(error.storage_failure().is_some(), "{error:?}");
+    assert_eq!(after, before, "nothing published");
+    assert_eq!(
+        fault
+            .manifest_puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the manifest was never sent"
+    );
+}
+
+/// A manifest create the store applied and whose answer was lost is
+/// re-issued unchanged; the re-issue finds the version held, Lance reads it
+/// back as this commit, and the publication succeeds once.
+#[tokio::test]
+async fn lost_manifest_acknowledgement_resolves_by_re_issue_issue_1067() {
+    let (result, before, after, fault) = publish_through(ManifestFault::LostAcknowledgement).await;
+    result.expect("the re-issued request reads back as this commit");
+    assert_eq!(after, before + 1, "exactly one version published");
+    assert_eq!(
+        fault
+            .manifest_puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the original request and one re-issue"
+    );
+}
+
+/// A manifest request abandoned after an ambiguous answer, which reaches the
+/// store later, is settled by the re-issue: whichever copy lands first is
+/// this commit, and the other fails its precondition.
+#[tokio::test]
+async fn abandoned_manifest_create_that_lands_late_publishes_once_issue_1067() {
+    let (result, before, after, _) = publish_through(ManifestFault::LandsLate).await;
+    result.expect("the re-issue or the late original is this commit");
+    assert_eq!(after, before + 1, "exactly one version published");
+}
+
+/// A store that answers no manifest create definitively leaves the version
+/// open to a late landing: after every re-issue the publication is in doubt,
+/// never `Unpublished`.
+#[tokio::test]
+async fn manifest_create_without_a_definite_answer_stays_in_doubt_issue_1067() {
+    let (result, before, after, fault) = publish_through(ManifestFault::EveryManifestPut).await;
+    let error = result.expect_err("no manifest create succeeds");
+    assert!(error.is_manifest_publish_in_doubt(), "{error:?}");
+    assert_eq!(
+        error.completion_evidence(),
+        Some(crate::error::CompletionEvidence::Uncertain),
+        "{error:?}"
+    );
+    assert_eq!(after, before, "nothing published");
+    assert_eq!(
+        fault
+            .manifest_puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1 + crate::manifest_request::MANIFEST_REQUEST_REISSUES as usize,
+        "the original request and every re-issue"
+    );
+}
