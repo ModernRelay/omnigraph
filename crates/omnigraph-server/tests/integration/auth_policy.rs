@@ -3683,6 +3683,65 @@ async fn access_reports_the_callers_own_actions_as_routes_decide_them() {
     let (status, _) = access(&app, "", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
+    // Each remaining action behind a scope only its own slot satisfies: a
+    // route that put the branch in the other slot would report otherwise.
+    let temp_slots = init_loaded_graph().await;
+    let slots_policy = temp_slots.path().join("policy.yaml");
+    fs::write(
+        &slots_policy,
+        r#"
+version: 1
+groups:
+  slots: [act-slots]
+protected_branches: [main]
+rules:
+  - id: query
+    allow:
+      actors: { group: slots }
+      actions: [invoke_query]
+  - id: apply-protected
+    allow:
+      actors: { group: slots }
+      actions: [schema_apply]
+      target_branch_scope: protected
+  - id: commits-unprotected
+    allow:
+      actors: { group: slots }
+      actions: [commit_publish, commit_drop]
+      target_branch_scope: unprotected
+  - id: fork-into-unprotected
+    allow:
+      actors: { group: slots }
+      actions: [branch_create]
+      target_branch_scope: unprotected
+"#,
+    )
+    .unwrap();
+    let slots = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph_path(temp_slots.path()).to_string_lossy().to_string(),
+            vec![("act-slots".to_string(), "slots-token".to_string())],
+            Some(&slots_policy),
+        )
+        .await
+        .unwrap(),
+    );
+    for (query, actions) in [
+        (
+            "?branch=main&target_branch=feature",
+            json!(["schema_apply", "branch_create"]),
+        ),
+        (
+            "?branch=feature&target_branch=main",
+            json!(["commit_publish", "commit_drop"]),
+        ),
+    ] {
+        let (status, body) = access(&slots, query, Some("slots-token")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(body["graph_wide"], json!(["invoke_query"]), "{query}");
+        assert_eq!(body["actions"], actions, "{query}");
+    }
+
     // Without a graph policy a static token only reads, as `authorize`
     // decides; without authentication every graph action is open.
     let temp = init_loaded_graph().await;

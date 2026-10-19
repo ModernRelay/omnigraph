@@ -168,16 +168,25 @@ curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.13" \
   "https://graph.example/graphs/knowledge/access?branch=feature&target_branch=main"
 ```
 
+With the example graph policy above, `act-alice` gets:
+
 ```json
-{"actor":"act-bruno","graph_id":"knowledge","graph_wide":["read"],
- "branch":"feature","target_branch":"main","actions":["read","change"]}
+{"actor":"act-alice","graph_id":"knowledge","graph_wide":["read","invoke_query"],
+ "branch":"feature","target_branch":"main","actions":["read"]}
 ```
 
-- `graph_wide` lists the actions allowed whatever the branch: `invoke_query`,
-  and the branch-scoped actions a rule allows on every branch.
+- `graph_wide` is the decision with no branch named: `invoke_query`, and an
+  action a rule allows with `branch_scope: any`. Rules that cover every branch
+  only together, one for protected branches and one for the rest, allow each
+  named branch but not the decision without one, so read `actions` for a
+  branch. `read` here also decides the reads that name no branch: listing
+  branches, the schema, `show` and commit lookups.
 - With `branch`, `actions` lists the actions allowed on it: `read`, `export`
   and `change`, and `branch_delete`, `commit_publish`, `commit_drop` and
-  `schema_apply` with that branch as their target.
+  `schema_apply` with that branch as their target. Schema apply and the
+  system-column upgrade target `main` only, and a storage upgrade authorizes
+  each live branch, so `schema_apply` on another branch does not make schema
+  apply possible there.
 - With `target_branch` as well, `actions` also lists `branch_create` from
   `branch` into the target and `branch_merge` of `branch` into it.
 
