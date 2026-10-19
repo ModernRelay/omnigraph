@@ -165,12 +165,13 @@ struct ClusterScope {
 }
 
 /// Resolve the cluster for a control-plane tooling command (`policy`,
-/// `queries`), in the order every command resolves its address: `--target`,
-/// a complete address no other flag may add to; `--cluster`, where a
-/// configured name (`clusters:` in operator config) is rewritten to its root
-/// and a literal dir / `s3://`/`az://`/`file://` root is passed through; a
-/// `--profile`/`OMNIGRAPH_PROFILE` cluster binding; then `defaults.target`.
-/// No omnigraph.yaml.
+/// `queries`) through the one scope resolver, in the order every command
+/// resolves its address: `--target`, a complete address no other flag may add
+/// to; `--cluster`, where a configured name (`clusters:` in operator config) is
+/// rewritten to its root and a literal dir / `s3://`/`az://`/`file://` root is
+/// passed through; a `--profile`/`OMNIGRAPH_PROFILE` binding; then
+/// `defaults.target`. Only a cluster root serves; any other address refuses
+/// by kind. No omnigraph.yaml.
 fn require_cluster_scope(
     input: &operator::InvocationConfig,
     cluster: Option<&str>,
@@ -178,63 +179,33 @@ fn require_cluster_scope(
     command: &str,
     stderr: &mut dyn Write,
 ) -> Result<ClusterScope> {
-    let op = input.get(stderr)?;
-    if let Some(name) = input.target() {
-        if let Some(other) = cluster
-            .map(|_| "--cluster")
-            .or(profile.map(|_| "--profile"))
-        {
-            bail!("--target and {other} are mutually exclusive — a target is a complete address");
-        }
-        return cluster_of_target(op, name, command);
-    }
-    let resolve_name = |name: &str| ClusterScope {
-        root: op
-            .cluster_root(name)
-            .map(str::to_string)
-            .unwrap_or_else(|| name.to_string()),
-        default_graph: None,
+    let scope = crate::scope::resolve_scope(
+        input.get(stderr)?,
+        input.profile(),
+        crate::planes::Capability::Control,
+        crate::scope::ScopeFlags {
+            target: input.target(),
+            profile,
+            store: None,
+            server: None,
+            cluster,
+            graph: None,
+            uri: None,
+            reads_root: true,
+        },
+    )?;
+    let Some(root) = scope.cluster else {
+        bail!(
+            "`{command}` needs a cluster — pass --cluster <dir|uri> (or a name from `clusters:` \
+             in ~/.omnigraph/config.yaml), select a cluster profile, or name a cluster-root target"
+        );
     };
-    if let Some(cluster) = cluster {
-        return Ok(resolve_name(cluster));
-    }
-    // A cluster profile (flag, else OMNIGRAPH_PROFILE) binds the cluster too.
-    let profile_name = profile.or_else(|| input.profile().filter(|name| !name.is_empty()));
-    if let Some(name) = profile_name {
-        let profile = op.profile(name).ok_or_else(|| {
-            color_eyre::eyre::eyre!("unknown profile '{name}' (not defined under `profiles:`)")
-        })?;
-        if let crate::operator::ScopeBinding::Cluster(cluster) = profile.binding(name)? {
-            return Ok(resolve_name(&cluster));
-        }
-    }
-    if let Some(name) = op.default_target() {
-        return cluster_of_target(op, name, command);
-    }
-    bail!(
-        "`{command}` needs a cluster — pass --cluster <dir|uri> (or a name from `clusters:` \
-         in ~/.omnigraph/config.yaml), select a cluster profile, or name a cluster-root target"
-    )
-}
-
-/// A named target's cluster, which only a direct cluster-root target names.
-fn cluster_of_target(
-    op: &operator::OperatorConfig,
-    name: &str,
-    command: &str,
-) -> Result<ClusterScope> {
-    match op.target(name)?.binding(name)? {
-        crate::targets::TargetBinding::DirectRoot { uri, default_graph } => Ok(ClusterScope {
-            root: uri,
-            default_graph,
-        }),
-        _ => Err(crate::helpers::CliRefusal::report(
-            omnigraph_api_types::ErrorCode::TargetKindUnsupported,
-            format!(
-                "`{command}` reads a cluster's applied state; target '{name}' is not a cluster root (`kind: direct`, `scope: root`)"
-            ),
-        )),
-    }
+    // A target's default graph applies; a profile's never has.
+    let default_graph = scope.target.and(scope.cluster_graph);
+    Ok(ClusterScope {
+        root,
+        default_graph,
+    })
 }
 
 /// Read a cluster's serving snapshot for a control-plane tooling command,

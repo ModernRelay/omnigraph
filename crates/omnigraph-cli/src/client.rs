@@ -380,6 +380,7 @@ impl GraphClient {
                 cluster: None,
                 graph: None,
                 uri: None,
+                reads_root: false,
             },
         )?;
         let Some(server) = scope.server.as_deref() else {
@@ -447,6 +448,7 @@ impl GraphClient {
                 cluster: None,
                 graph,
                 uri,
+                reads_root: false,
             },
         )?;
         // The no-graph probe and eventual request use one acquired credential.
@@ -524,6 +526,7 @@ impl GraphClient {
                 cluster: None,
                 graph,
                 uri,
+                reads_root: false,
             },
         )?;
         Self::resolve_with_policy_scope(input, operator, scope, cli_as).await

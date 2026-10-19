@@ -4,8 +4,8 @@ use clap::Subcommand;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum TargetCommand {
-    /// List the targets and aliases in the operator configuration, without
-    /// secrets and without a network request.
+    /// List the targets in the operator configuration, without secrets and
+    /// without a network request.
     List {
         #[arg(long)]
         json: bool,
@@ -28,7 +28,7 @@ pub(crate) enum TargetCommand {
         json: bool,
     },
     /// Remove one target. Refuses the default target; its stored credential
-    /// stays until `omnigraph logout --target NAME`.
+    /// stays until `omnigraph logout OWNER`.
     Remove {
         /// Target name.
         name: String,

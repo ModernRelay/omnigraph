@@ -5570,10 +5570,12 @@ fn targets_address_commands_and_carry_only_their_owners_token() {
             "target_config_version: 1\ndefaults:\n  target: local\ntargets:\n  \
              local:\n    kind: direct\n    scope: graph\n    uri: '{}'\n  \
              served:\n    kind: server\n    endpoint: '{}'\n    credential: served-owner\n    default_graph: knowledge\n  \
-             open:\n    kind: server\n    endpoint: '{}'\n    auth: anonymous\n    default_graph: knowledge\n",
+             open:\n    kind: server\n    endpoint: '{}'\n    auth: anonymous\n    default_graph: knowledge\n  \
+             ops:\n    kind: direct\n    scope: root\n    uri: '{}'\n    default_graph: knowledge\n",
             graph.to_string_lossy(),
             served.origin,
-            open.origin
+            open.origin,
+            temp.path().join("cluster").to_string_lossy(),
         ),
     )
     .unwrap();
@@ -5639,6 +5641,48 @@ fn targets_address_commands_and_carry_only_their_owners_token() {
         String::from_utf8_lossy(&refused.stderr).contains("--target"),
         "{refused:?}"
     );
+
+    // A command that addresses one standalone graph refuses a cluster-root
+    // target by its kind, named or as the default, rather than dropping it.
+    let schema = temp.path().join("unused.pg");
+    fs::write(&schema, "node Thing {\n  name: String @key\n}\n").unwrap();
+    let schema = schema.to_string_lossy().into_owned();
+    // `upgrade` and `schema upgrade-system-columns` report no outcome yet.
+    let refuse_root = |args: &[&str], outcome: bool| {
+        let refused = output_failure(cli_home().args(args));
+        assert_eq!(refused.status.code(), Some(1), "{args:?}: {refused:?}");
+        let body = parse_stdout_json(&refused);
+        assert_eq!(body["code"], "target_kind_unsupported", "{args:?}: {body}");
+        if outcome {
+            assert_eq!(body["outcome"]["execution"], "not_started", "{body}");
+        }
+    };
+    refuse_root(
+        &[
+            "schema", "apply", "--target", "ops", "--schema", &schema, "--json",
+        ],
+        true,
+    );
+    refuse_root(&["upgrade", "--target", "ops", "--check", "--json"], false);
+    refuse_root(
+        &[
+            "schema",
+            "upgrade-system-columns",
+            "--target",
+            "ops",
+            "--check",
+            "--json",
+        ],
+        false,
+    );
+    let config = fs::read_to_string(home.path().join("config.yaml")).unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        config.replace("  target: local\n", "  target: ops\n"),
+    )
+    .unwrap();
+    refuse_root(&["schema", "apply", "--schema", &schema, "--json"], true);
+    assert!(!temp.path().join("cluster").exists());
 }
 
 /// `target add` and `remove` change one entry's lines, keep the rest of the
@@ -5690,6 +5734,7 @@ fn target_commands_edit_one_entry_and_keep_the_rest_of_the_file() {
         .collect();
     assert_eq!(names, ["local", "staging"]);
     assert_eq!(listing["targets"][0]["local_servers"], json!([]));
+    assert!(listing.get("aliases").is_none(), "{listing}");
     assert!(
         listing["targets"][1]["binding"]
             .as_str()
@@ -5717,10 +5762,37 @@ fn target_commands_edit_one_entry_and_keep_the_rest_of_the_file() {
             "target_invalid",
         ),
         (&["remove", "missing", "--json"][..], None, "target_unknown"),
+        // An endpoint holds no secret and is a whole server URL; a cloud
+        // store cannot be pinned, so neither is a complete binding.
+        (
+            &["add", "leaky", "--json"][..],
+            Some(
+                r#"{"kind":"server","endpoint":"https://user:secret-token@h.example/g","auth":"anonymous"}"#,
+            ),
+            "target_invalid",
+        ),
+        (
+            &["add", "hostless", "--json"][..],
+            Some(r#"{"kind":"server","endpoint":"https://","auth":"anonymous"}"#),
+            "target_invalid",
+        ),
+        (
+            &["add", "cloud", "--json"][..],
+            Some(r#"{"kind":"direct","scope":"graph","uri":"s3://bucket/graph"}"#),
+            "target_invalid",
+        ),
     ] {
+        let before = fs::read_to_string(&path).unwrap();
         let refused = target(args, stdin);
         assert_eq!(refused.status.code(), Some(1), "{args:?}: {refused:?}");
         assert_eq!(json(&refused)["code"], code, "{args:?}: {refused:?}");
+        for stream in [&refused.stdout, &refused.stderr] {
+            assert!(
+                !String::from_utf8_lossy(stream).contains("secret-token"),
+                "{args:?}: {refused:?}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "{args:?}");
     }
 
     // The default target cannot be removed.
@@ -5808,9 +5880,30 @@ fn login_and_credential_get_follow_the_target_credential_owner() {
         command
     };
 
-    output_success(run(&["login", "--target", "staging", "--json"]).write_stdin("stored-token\n"));
+    // The target binds its owner to its endpoint, so the owner is declared
+    // and no `servers:` entry is suggested: one would bind it twice.
+    let login = output_success(
+        run(&["login", "--target", "staging", "--json"]).write_stdin("stored-token\n"),
+    );
+    let report = parse_stdout_json(&login);
+    assert_eq!(report["target"], "staging", "{report}");
+    assert_eq!(report["owner"], "staging-owner", "{report}");
+    assert_eq!(report["declared"], true, "{report}");
+    assert!(report.get("server").is_none(), "{report}");
+    assert!(
+        !String::from_utf8_lossy(&login.stderr).contains("servers:"),
+        "{login:?}"
+    );
     let credentials = fs::read_to_string(home.path().join("credentials")).unwrap();
     assert!(credentials.contains("[staging-owner]"), "{credentials}");
+    // So is the owner named directly.
+    let direct =
+        output_success(run(&["login", "staging-owner", "--json"]).write_stdin("stored-token\n"));
+    assert_eq!(parse_stdout_json(&direct)["declared"], true);
+    assert!(
+        !String::from_utf8_lossy(&direct.stderr).contains("servers:"),
+        "{direct:?}"
+    );
 
     let got = parse_stdout_json(&output_success(&mut run(&[
         "credential",
@@ -5857,7 +5950,11 @@ fn login_and_credential_get_follow_the_target_credential_owner() {
     let refused = output_failure(&mut run(&["credential", "get", "--json"]));
     assert_eq!(parse_stdout_json(&refused)["code"], "target_unknown");
 
-    output_success(&mut run(&["logout", "--target", "staging", "--json"]));
+    let logout = parse_stdout_json(&output_success(&mut run(&[
+        "logout", "--target", "staging", "--json",
+    ])));
+    assert_eq!(logout["target"], "staging", "{logout}");
+    assert_eq!(logout["owner"], "staging-owner", "{logout}");
     let refused = output_failure(&mut run(&[
         "credential",
         "get",

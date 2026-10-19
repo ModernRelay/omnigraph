@@ -70,6 +70,30 @@ impl ServerTransport {
         }
     }
 
+    /// A server endpoint as a named target records it: an address
+    /// [`ServerTransport::parse`] accepts that is a whole URL, with no userinfo,
+    /// query or fragment, so the file never holds a secret and the endpoint
+    /// derives the request target its credential is bound to. A literal
+    /// `--server` URL and a `servers:` url are not held to this.
+    pub(crate) fn parse_endpoint(endpoint: &str) -> Result<RequestTarget> {
+        Self::parse(endpoint)?;
+        let url = Url::parse(endpoint).map_err(|_| {
+            color_eyre::eyre::eyre!(
+                "invalid server address: a server address is {SERVER_ADDRESS_SHAPES}"
+            )
+        })?;
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!(
+                "a server endpoint carries no user or password; name the token's `credential` \
+                 owner instead"
+            );
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            bail!("a server endpoint carries no query or fragment");
+        }
+        RequestTarget::of(endpoint, endpoint)
+    }
+
     /// The URL a request composed under this root is sent to.
     fn http_url(&self, composed: &str) -> Result<Url> {
         let composed = Url::parse(composed)?;

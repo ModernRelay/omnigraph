@@ -346,12 +346,12 @@ async fn run(
         Command::Login {
             name, token, json, ..
         } => {
-            let name = commands::targets::login_owner(&operator, name, stderr)?;
-            commands::local::run_login(&operator, name, token, json, input.reader, stdout, stderr)?;
+            let key = commands::targets::login_owner(&operator, name, stderr)?;
+            commands::local::run_login(&operator, key, token, json, input.reader, stdout, stderr)?;
         }
         Command::Logout { name, json, .. } => {
-            let name = commands::targets::login_owner(&operator, name, stderr)?;
-            commands::local::run_logout(&operator, name, json, stdout)?;
+            let key = commands::targets::login_owner(&operator, name, stderr)?;
+            commands::local::run_logout(&operator, key, json, stdout)?;
         }
         Command::Target { command } => {
             commands::targets::run_target(&operator, command, input.reader, stdout, stderr)?

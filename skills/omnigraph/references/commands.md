@@ -350,7 +350,7 @@ Distinct from `lint`, which validates authoring source. See
 echo "$TOKEN" | omnigraph login <server>   # store a bearer token in ~/.omnigraph/credentials (0600)
 echo "$TOKEN" | omnigraph login --target <name>  # store it for a server target's credential owner
 omnigraph logout <server>                  # remove it (idempotent)
-omnigraph target list --json               # named targets and aliases, no secrets, no network
+omnigraph target list --json               # named targets, no secrets, no network
 echo '{"kind":"server","endpoint":"https://g.example","credential":"g"}' | omnigraph target add g --json
 omnigraph credential get --target g --json # the target's token, to a pipe only
 omnigraph login --api <origin>             # managed Intent API session (OS keychain)

@@ -21,7 +21,7 @@ targets:
   ops:
     kind: direct
     scope: root
-    uri: s3://company-data/omnigraph
+    uri: /srv/omnigraph/cluster
     default_graph: knowledge
   staging:
     kind: server
@@ -39,29 +39,40 @@ targets:
 
 | Kind | Fields |
 |---|---|
-| `direct` with `scope: graph` | `uri`: an absolute path or a `file://`, `s3://` or `az://` URI of one standalone graph |
-| `direct` with `scope: root` | `uri` of a cluster's storage root; optional `default_graph` |
-| `server` | `endpoint`: an `http://`, `https://` or `unix:///path.sock` address; `credential: OWNER` or `auth: anonymous`; optional `default_graph` |
+| `direct` with `scope: graph` | `uri`: an absolute path or a `file://` URI of one standalone graph |
+| `direct` with `scope: root` | `uri`: an absolute path or a `file://` URI of a cluster's storage root; optional `default_graph` |
+| `server` | `endpoint`: an `http://`, `https://` or `unix:///path.sock` address with no user, password, query or fragment; `credential: OWNER` or `auth: anonymous`; optional `default_graph` |
 
 An unknown field, an unsupported `target_config_version` or a malformed name
 refuses the whole file. An incomplete entry refuses only when a command selects
 it (`target_invalid`), so it never blocks another target.
 
+A direct target cannot name cloud storage (`s3://`, `az://`) yet. Its endpoint
+and account come from the environment when the store opens, and this format
+cannot pin them in the binding, so such an entry refuses with `target_invalid`
+rather than name a destination the environment still chooses. Address cloud
+storage with `--store` or `--cluster`.
+
 ## Selecting a target
 
 `--target NAME` is a complete address: it refuses `--server`, `--store`,
-`--cluster`, `--profile` and a positional URI beside it. `--graph` still selects
-a graph within a server or cluster-root target, overriding its `default_graph`.
+`--cluster`, `--profile` and a positional URI beside it, and its `uri` or
+`endpoint` is used as written, never looked up under `clusters:` or `servers:`.
+`--graph` still selects a graph within a server or cluster-root target,
+overriding its `default_graph`.
 When a command names no address and no profile, `defaults.target` applies.
 `defaults.target` refuses beside `defaults.server`, `defaults.store` or
 `defaults.default_graph`, and, for a command that names no address, beside a set
 `OMNIGRAPH_PROFILE`.
 
 A direct graph target serves graph commands and direct maintenance; a
-cluster-root target serves direct maintenance as `--cluster` does; a server
-target serves graph and served commands. A command that cannot use the selected
-kind refuses, as it does for a profile of that kind. `init` and the `cluster`
-commands do not take `--target` yet.
+cluster-root target serves direct maintenance as `--cluster` does, and `queries`
+and `policy`; a server target serves graph and served commands. `schema apply`,
+`schema upgrade-system-columns` and `upgrade` take only a direct graph target.
+A command that cannot use the selected target's kind refuses it with
+`target_kind_unsupported`, and refuses a profile of that kind too. `queries` and
+`policy` select their cluster by the same rules as every other command. `init`
+and the `cluster` commands do not take `--target` yet.
 
 ## Credentials
 
@@ -79,6 +90,10 @@ entry's `url`.
 echo "$TOKEN" | omnigraph login --target staging   # store under the target's owner
 omnigraph logout --target staging
 ```
+
+With `--json` they report the target and its owner,
+`{"target":"staging","owner":"staging","credentials_path":"…","declared":true}`
+(`logout` omits `declared`).
 
 `omnigraph credential get --target NAME --json` (else the default target)
 hands the token to another program, as `gh auth token` does:
@@ -102,12 +117,15 @@ echo '{"kind":"server","endpoint":"https://staging.example","credential":"stagin
 omnigraph target remove staging --json
 ```
 
-`target list` prints every target and alias without a secret and without a
-network request: each target's address, `default_graph`, `auth` (`token` or
+`target list` prints every target without a secret and without a network
+request: each target's address, `default_graph`, `auth` (`token` or
 `anonymous`), `credential` owner and `binding`, a digest of where the target
-points and how it authenticates, which changes when either does. A direct target
-carries `local_servers`, empty today. An incomplete entry is listed with its
-`error`. `target show` prints one target in the same shape.
+points and how it authenticates, which changes when either does; a direct
+target's storage is digested in its normalized spelling, so `/data/g` and
+`file:///data/g` digest alike. A direct target carries `local_servers`, empty
+today. An incomplete entry is listed with its `error`, and its address without
+user, password, query or fragment. Aliases are not listed, since they still name
+`servers:` entries. `target show` prints one target in the same shape.
 
 `target add NAME` reads one entry as JSON on stdin, with the fields the file
 holds. It refuses a name that exists (`target_exists`) and an entry that is not a
@@ -120,8 +138,10 @@ comments included. They add `target_config_version: 1` when the file lacks it,
 never change `defaults.target` and never store a secret. Each holds an exclusive
 lock on `config.yaml.lock` while it edits, checks that the edited file loads with
 exactly the expected targets and every other key unchanged, and replaces the file
-by rename. A file it cannot edit that way, such as one whose `targets` is a flow
-mapping or indented with tabs, refuses with `config_not_editable`; edit it by hand.
+by rename. Off Unix there is no such lock, so both refuse with
+`config_not_editable`; edit the file by hand on that platform. A file it cannot
+edit that way, such as one whose `targets` is a flow mapping or indented with
+tabs, refuses with `config_not_editable`; edit it by hand.
 
 Each refusal carries its `code`, and the `target` and `credential` commands
 report an `outcome` of `not_started`, except an edit that fails after it

@@ -1,5 +1,6 @@
 //! Local credentials, profile inspection and bundled utilities.
 
+use crate::commands::targets::LoginKey;
 use crate::embed::EmbedArgs;
 use crate::helpers::normalize_bearer_token;
 use crate::operator::InvocationConfig;
@@ -14,7 +15,7 @@ pub(crate) use args::{ProfileCommand, SkillCommand};
 
 pub(crate) fn run_login(
     operator: &InvocationConfig,
-    name: String,
+    key: LoginKey,
     token: Option<String>,
     json: bool,
     stdin: &mut dyn Read,
@@ -26,29 +27,39 @@ pub(crate) fn run_login(
         None => crate::input::read_line(stdin)?,
     };
     let Some(token) = normalize_bearer_token(Some(token)) else {
+        let command = match &key {
+            LoginKey::Server(name) => name.clone(),
+            LoginKey::Target { target, .. } => format!("--target {target}"),
+        };
         bail!(
-            "no token provided: pass --token <TOKEN> or pipe it on stdin (echo $TOKEN | omnigraph login {name})"
+            "no token provided: pass --token <TOKEN> or pipe it on stdin (echo $TOKEN | omnigraph login {command})"
         );
     };
-    let declared = operator.get(stderr)?.servers.contains_key(&name);
+    // A target's owner is bound to its endpoint by the target itself; a
+    // server name is declared when a `servers:` entry or a server target
+    // binds it.
+    let declared = match &key {
+        LoginKey::Server(name) => operator.get(stderr)?.declares_credential_owner(name),
+        LoginKey::Target { .. } => true,
+    };
     let path = operator
         .credentials_path()
         .ok_or_else(|| eyre!("no home directory resolvable for the credentials file"))?;
-    crate::operator::rewrite_credentials_at(&path, &name, Some(&token))?;
-    output::finish_login(&name, &path, declared, json, stdout, stderr)
+    crate::operator::rewrite_credentials_at(&path, key.owner(), Some(&token))?;
+    output::finish_login(&key, &path, declared, json, stdout, stderr)
 }
 
 pub(crate) fn run_logout(
     operator: &InvocationConfig,
-    name: String,
+    key: LoginKey,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<()> {
     let path = operator
         .credentials_path()
         .ok_or_else(|| eyre!("no home directory resolvable for the credentials file"))?;
-    crate::operator::rewrite_credentials_at(&path, &name, None)?;
-    output::finish_logout(&name, &path, json, stdout)
+    crate::operator::rewrite_credentials_at(&path, key.owner(), None)?;
+    output::finish_logout(&key, &path, json, stdout)
 }
 
 pub(crate) fn run_profile(

@@ -1306,8 +1306,11 @@ fn queries_list_prints_registered_query() {
         home.path().join("config.yaml"),
         format!(
             "target_config_version: 1\ndefaults:\n  target: ops\ntargets:\n  ops:\n    kind: direct\n    scope: root\n    uri: '{}'\n  \
-             remote:\n    kind: server\n    endpoint: https://graphs.example\n    auth: anonymous\n",
-            cluster.path().display()
+             remote:\n    kind: server\n    endpoint: https://graphs.example\n    auth: anonymous\n\
+             servers:\n  prod:\n    url: https://prod.example\n\
+             profiles:\n  ambient:\n    server: prod\n  admin:\n    cluster: '{}'\n",
+            cluster.path().display(),
+            cluster.path().join("elsewhere").display(),
         ),
     )
     .unwrap();
@@ -1339,6 +1342,41 @@ fn queries_list_prints_registered_query() {
         stderr_string(&refused).contains("not a cluster root"),
         "{refused:?}"
     );
+
+    // The cluster is selected by the rules every command uses. An ambient
+    // profile beside `defaults.target` is a conflict, not a silent winner.
+    let refused = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_PROFILE", "admin")
+            .args(["queries", "list"]),
+    );
+    assert!(
+        stderr_string(&refused).contains("OMNIGRAPH_PROFILE"),
+        "{refused:?}"
+    );
+    // An explicit profile that names no cluster refuses; it never falls
+    // through to the default target.
+    let refused = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["queries", "list", "--profile", "ambient"]),
+    );
+    let stderr = stderr_string(&refused);
+    assert!(
+        stderr.contains("profile 'ambient' is not a cluster root"),
+        "{refused:?}"
+    );
+    assert!(!stderr.contains("find_person"), "{refused:?}");
+    // An explicit cluster profile wins over the default target.
+    let refused = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["queries", "list", "--profile", "admin"]),
+    );
+    assert!(stderr_string(&refused).contains("elsewhere"), "{refused:?}");
 }
 
 #[test]
