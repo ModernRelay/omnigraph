@@ -566,8 +566,7 @@ the generated token resolves to the actor, so the cluster's policy decides for
 it as a deployment's would. A graph the cluster binds no policy to is granted
 `read` alone, which is what a deployment's routes allow without a bundle, and
 the grant is installed on its engine as well, so an embedder holding the handle
-cannot write through it. `/readyz` and `/graphs` report the ledger revision
-served.
+cannot write through it. `/readyz` reports the ledger revision served.
 
 A read-only one captures one ledger revision without admission, opens every
 graph read-only, validates each against that revision through
