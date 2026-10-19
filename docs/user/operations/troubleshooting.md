@@ -21,21 +21,27 @@ means the data request was not sent. HTTP discovery refusals retain their status
 
 ## HTTP errors
 
+Each `code` is sent under one status, which `ErrorCode` in `openapi.json` names
+beside the code's meaning.
+
 | Status | Meaning | Usual action |
 |---:|---|---|
 | 400 | Invalid request, query, schema, configuration, or external-Blob policy, including an update that must carry a stored external Blob reference the policy does not admit | Correct the request; retrying unchanged will fail again. For a stored reference, assign that property in the same update (a new value or null), or admit its base in the policy |
 | 401 | Missing or invalid bearer token | Supply a token configured by the server. The CLI sends a token only to the server it is keyed to; see [server credentials](../cli/index.md#use-a-server) |
 | 403 | The resolved actor is not authorized | Change policy or use an authorized identity |
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
+| 405 | The path is served, but not with this method (`method_not_allowed`) | Use a method the `Allow` header lists |
+| 408 | The request body did not arrive before its deadline (`request_timeout`) | Send the request again; nothing was admitted |
 | 409 | Concurrent change, duplicate ID, merge conflict, existing resource, or incompatible full-text index | Inspect structured details; not every conflict is retryable |
 | 410 | Required change-feed history was reclaimed | Capture and durably install a new baseline, then resume from its terminal cursor |
-| 412 | Blob entity-tag or graph-commit precondition failed | Refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit |
-| 413 | Request or operation exceeded a bounded resource limit | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
-| 416 | Blob byte range is outside the value | Use the returned length to choose a valid range |
+| 412 | Blob entity-tag or graph-commit precondition failed (`precondition_failed`), or `actor_mismatch` | Refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit |
+| 413 | Request or operation exceeded a bounded resource limit (`payload_too_large`) | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
+| 415 | The body's content type is not one the route accepts (`unsupported_media_type`) | Send JSON with `Content-Type: application/json`, or the type the route names |
+| 416 | Blob byte range is outside the value (`range_not_satisfiable`) | Use the returned length to choose a valid range |
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
 | 429 | Server or per-actor admission limit reached | Use the whole-command disposition below before retrying; preserve `Retry-After` |
 | 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery, change-route or streamed-response failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path; see below |
-| 503 | Admission is closed, or a published schema change requires completion | Inspect the structured error; generic 503 is not permission to repeat a write |
+| 503 | Admission is closed or the graph is not served (`service_unavailable`, `graph_unavailable`, both with `Retry-After`), or a published schema change requires completion (`recovery_required`) | Inspect the structured error; generic 503 is not permission to repeat a write |
 
 A `GET` or `HEAD /blob` 500 logs `error_kind="blob_pre_header_internal"` with a
 `stage`. `target` is a failure resolving a snapshot target for a policy-gated
@@ -82,11 +88,13 @@ the request it answered by the first row that matches:
 
 A refusal's own action follows its code: `recover` for a recovery intent or a
 full-text index to build, `retry` for `too_many_requests`,
-`service_unavailable` and `graph_unavailable`, `fix` for `unauthorized`,
-`bad_request`, `api_contract_mismatch`, `actor_mismatch`, `not_found`,
-`method_not_allowed` and `unattached_cannot_publish`, and `refresh` for the
-rest: `forbidden`, `precondition_failed`, `conflict`, `external_blob_source`,
-`change_feed_gap` and `internal`.
+`service_unavailable`, `graph_unavailable` and `request_timeout`, `fix` for
+`unauthorized`, `bad_request`, `api_contract_mismatch`, `actor_mismatch`,
+`not_found`, `method_not_allowed`, `unattached_cannot_publish`,
+`payload_too_large`, `unsupported_media_type` and `range_not_satisfiable`, and
+`refresh` for the rest: `forbidden`, `precondition_failed`, `conflict`,
+`external_blob_source`, `change_feed_gap` and `internal`. A write the server
+could not settle answers `500`.
 
 The CLI reports the server's disposition when that request was the command's
 only effectful one, and otherwise its own account of the whole command, so a

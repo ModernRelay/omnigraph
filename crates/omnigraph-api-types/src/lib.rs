@@ -1966,55 +1966,149 @@ pub struct ReadinessOutput {
     pub shutdown_grace_seconds: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    Unauthorized,
-    Forbidden,
-    BadRequest,
-    /// 400: the request lacks the exact supported HTTP contract header.
-    /// Authentication and contract admission precede graph access and effects.
-    ApiContractMismatch,
-    /// 412: the request's `omnigraph-expect-actor` header names another actor
-    /// than its credential resolves to. Nothing ran.
-    ActorMismatch,
-    /// A write whose completion the server could not settle: it may or may not
-    /// have published. Read the target before writing again; never replay the
-    /// write blindly.
-    OutcomeUnknown,
-    /// 412: a mutation's graph-commit precondition no longer holds; see
-    /// `precondition_failure`.
-    PreconditionFailed,
-    /// 503: an overlapping durable recovery intent must be resolved first; see
-    /// `recovery_required`.
-    RecoveryRequired,
-    /// 424: an admitted external Blob source could not be probed or read; see
-    /// `external_blob_source`.
-    ExternalBlobSource,
-    /// 410: retained history can no longer reconstruct a change continuation;
-    /// see `change_feed_gap`.
-    ChangeFeedGap,
-    NotFound,
-    /// 405 Method Not Allowed — the route exists but the active server
-    /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
-    /// mode). Distinct from 404 so clients can tell "wrong context" from
-    /// "no such resource."
-    MethodNotAllowed,
-    Conflict,
-    /// 409: the commit is an unattached snapshot, a kind that never
-    /// publishes. Distinct from `conflict`, the authority-moved refusal of a
-    /// publishable proposal.
-    UnattachedCannotPublish,
-    /// 429 Too Many Requests — per-actor admission cap exceeded.
-    /// Clients should respect the `Retry-After` header.
-    TooManyRequests,
-    /// 503: operation admission is closed; reconcile any earlier write.
-    ServiceUnavailable,
-    /// 503: a known graph is unavailable. The request did not start, so it
-    /// may be retried once the graph is served again.
-    GraphUnavailable,
-    Internal,
+/// Declares [`ErrorCode`] from one list: each code's wire name, the HTTP
+/// status a server sends it under, and its documentation. The published
+/// description and every server's status come from this list, so a code
+/// cannot be sent under a status its documentation does not name.
+macro_rules! error_codes {
+    ($( $(#[doc = $doc:literal])+ $code:ident = $name:literal, $status:expr; )+) => {
+        /// The registry of error codes. A server sends each code under the one
+        /// HTTP status the list names; a code with none never appears in an
+        /// HTTP response.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum ErrorCode {
+            $( $(#[doc = $doc])+ #[serde(rename = $name)] $code, )+
+        }
+
+        impl ErrorCode {
+            /// Every code, in registry order.
+            pub const ALL: &'static [ErrorCode] = &[$(ErrorCode::$code),+];
+
+            /// The code's wire spelling.
+            pub const fn as_str(self) -> &'static str {
+                match self { $(ErrorCode::$code => $name,)+ }
+            }
+
+            /// The HTTP status a server answers this code with, or `None` for
+            /// a code no HTTP response carries.
+            pub const fn http_status(self) -> Option<u16> {
+                match self { $(ErrorCode::$code => $status,)+ }
+            }
+
+            /// What the code means, as its registry entry documents it.
+            pub fn description(self) -> String {
+                let doc: &'static [&'static str] = match self { $(ErrorCode::$code => &[$($doc),+],)+ };
+                doc.iter().map(|line| line.trim()).collect::<Vec<_>>().join(" ")
+            }
+        }
+    };
 }
+
+error_codes! {
+    /// The request carries no credential the server accepts: a bearer token
+    /// is missing, unknown or expired. Supply one the server is configured
+    /// to verify.
+    Unauthorized = "unauthorized", Some(401);
+    /// The credential's actor may not do this: policy denies the action, or
+    /// the action needs a policy permit the server has not been given.
+    Forbidden = "forbidden", Some(403);
+    /// The request is malformed or invalid: a body, query string, path
+    /// parameter or header that does not decode, a query the compiler
+    /// refuses (see `diagnostic`), or a value refused before any effect.
+    BadRequest = "bad_request", Some(400);
+    /// The request lacks exactly one `Omnigraph-Http-Api` header naming the
+    /// contract this server speaks. Authentication and this check precede
+    /// graph access and effects.
+    ApiContractMismatch = "api_contract_mismatch", Some(400);
+    /// The request's `Omnigraph-Expect-Actor` header names another actor
+    /// than its credential resolves to. Nothing ran.
+    ActorMismatch = "actor_mismatch", Some(412);
+    /// A write whose completion the server could not settle: it may or may
+    /// not have published. Read the target before writing again; never
+    /// replay the write blindly. An MCP write call that was cancelled or
+    /// passed its deadline answers it too.
+    OutcomeUnknown = "outcome_unknown", Some(500);
+    /// A request precondition no longer holds: the branch head moved past
+    /// `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's
+    /// `If-Match` names a value the cell no longer holds (a write's
+    /// `blob_precondition_failure` names the current one). Nothing was
+    /// written.
+    PreconditionFailed = "precondition_failed", Some(412);
+    /// An overlapping durable recovery intent must be resolved first; see
+    /// `recovery_required`.
+    RecoveryRequired = "recovery_required", Some(503);
+    /// An admitted external Blob source could not be probed or read; see
+    /// `external_blob_source`.
+    ExternalBlobSource = "external_blob_source", Some(424);
+    /// Retained history can no longer reconstruct a change continuation; see
+    /// `change_feed_gap`. Resume from a new baseline.
+    ChangeFeedGap = "change_feed_gap", Some(410);
+    /// The graph, branch, commit, query, entity or route the request names
+    /// does not exist, or the caller may not learn that it does.
+    NotFound = "not_found", Some(404);
+    /// The request path is served, but not with the request's method.
+    MethodNotAllowed = "method_not_allowed", Some(405);
+    /// The request body did not arrive before its deadline; nothing was
+    /// admitted.
+    RequestTimeout = "request_timeout", Some(408);
+    /// The request conflicts with the graph's current state: a concurrent
+    /// change, an existing id, a merge conflict, an index that must be built
+    /// first, or a commit that cannot be diffed. The details say which.
+    Conflict = "conflict", Some(409);
+    /// The commit is an unattached snapshot, a kind that never publishes.
+    /// Distinct from `conflict`, the authority-moved refusal of a publishable
+    /// proposal.
+    UnattachedCannotPublish = "unattached_cannot_publish", Some(409);
+    /// The request body, or the work it asks for, exceeds a bounded limit;
+    /// `resource_limit` names the limit when it is the operation's. Split or
+    /// reduce the request.
+    PayloadTooLarge = "payload_too_large", Some(413);
+    /// The request body's content type is not one the route accepts.
+    UnsupportedMediaType = "unsupported_media_type", Some(415);
+    /// The requested Blob byte range lies outside the value; see
+    /// `blob_range`.
+    RangeNotSatisfiable = "range_not_satisfiable", Some(416);
+    /// Admission capacity is exhausted: an actor's, the server's, or the MCP
+    /// endpoint's concurrent tool calls. Nothing started; retry after
+    /// `Retry-After`.
+    TooManyRequests = "too_many_requests", Some(429);
+    /// Operation admission is closed, or a deployment observation raced an
+    /// owner change. Nothing started; retry after `Retry-After`, reconciling
+    /// any earlier write first.
+    ServiceUnavailable = "service_unavailable", Some(503);
+    /// A known graph is not being served. The request did not start, so it
+    /// may be retried once the graph is served again.
+    GraphUnavailable = "graph_unavailable", Some(503);
+    /// The server failed. An error before any write took no effect; see the
+    /// server log.
+    Internal = "internal", Some(500);
+}
+
+impl utoipa::PartialSchema for ErrorCode {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        let mut description = String::from(
+            "The registry of error codes. A server sends each code under the HTTP status named \
+             with it; a code without one never appears in an HTTP response.\n",
+        );
+        for code in Self::ALL {
+            let status = code
+                .http_status()
+                .map_or_else(|| "no HTTP status".to_string(), |status| status.to_string());
+            description.push_str(&format!(
+                "\n- `{}` ({status}): {}",
+                code.as_str(),
+                code.description()
+            ));
+        }
+        ObjectBuilder::new()
+            .schema_type(Type::String)
+            .description(Some(description))
+            .enum_values(Some(Self::ALL.iter().map(|code| code.as_str())))
+            .into()
+    }
+}
+
+impl ToSchema for ErrorCode {}
 
 impl ErrorCode {
     /// What a refusal with this code asks of its caller. A server's
@@ -2027,6 +2121,7 @@ impl ErrorCode {
             }
             Self::RecoveryRequired => DispositionAction::Recover,
             Self::OutcomeUnknown => DispositionAction::Reconcile,
+            Self::RequestTimeout => DispositionAction::Retry,
             // The request itself is wrong; no state it could read changes that.
             Self::Unauthorized
             | Self::BadRequest
@@ -2034,7 +2129,10 @@ impl ErrorCode {
             | Self::ActorMismatch
             | Self::NotFound
             | Self::MethodNotAllowed
-            | Self::UnattachedCannotPublish => DispositionAction::Fix,
+            | Self::UnattachedCannotPublish
+            | Self::PayloadTooLarge
+            | Self::UnsupportedMediaType
+            | Self::RangeNotSatisfiable => DispositionAction::Fix,
             // The state the request met refused it, or the server failed.
             Self::Forbidden
             | Self::PreconditionFailed
@@ -3069,6 +3167,51 @@ pub struct GraphDiscoveryResponse {
 
 #[cfg(test)]
 mod tests {
+    /// Every code says what it means and whether a server sends it, under
+    /// which status; one that no HTTP response carries names the surface that
+    /// sends it. The published enum lists every code once, in its wire
+    /// spelling, beside its status.
+    #[test]
+    fn every_error_code_documents_its_status() {
+        use super::ErrorCode;
+        use utoipa::openapi::RefOr;
+        use utoipa::openapi::schema::Schema;
+
+        let mut names = std::collections::BTreeSet::new();
+        for code in ErrorCode::ALL {
+            assert!(names.insert(code.as_str()), "{code:?} listed twice");
+            assert_eq!(
+                serde_json::to_value(code).unwrap(),
+                serde_json::json!(code.as_str())
+            );
+            let description = code.description();
+            assert!(description.len() > 20, "{code:?}: {description}");
+            match code.http_status() {
+                Some(status) => assert!((400..600).contains(&status), "{code:?}: {status}"),
+                None => assert!(
+                    description.starts_with("MCP only:") || description.starts_with("CLI only"),
+                    "{code:?} has no HTTP status, so it names the surface that sends it: \
+                     {description}"
+                ),
+            }
+        }
+        let RefOr::T(Schema::Object(schema)) = <ErrorCode as utoipa::PartialSchema>::schema()
+        else {
+            panic!("ErrorCode is a string enum");
+        };
+        assert_eq!(schema.enum_values.unwrap().len(), ErrorCode::ALL.len());
+        let description = schema.description.unwrap();
+        for code in ErrorCode::ALL {
+            let status = code
+                .http_status()
+                .map_or_else(|| "no HTTP status".to_string(), |status| status.to_string());
+            assert!(
+                description.contains(&format!("- `{}` ({status}): ", code.as_str())),
+                "{description}"
+            );
+        }
+    }
+
     #[test]
     fn edge_builds_report_a_prerelease_naming_their_commit() {
         use super::build::versioned;

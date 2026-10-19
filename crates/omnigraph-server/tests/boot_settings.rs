@@ -1891,7 +1891,8 @@ mod owned_shutdown {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(!response.headers().contains_key("retry-after"));
+            // An unavailable graph asks for a retry, and says when.
+            assert_eq!(response.headers()["retry-after"], "60");
             let unknown = client
                 .get(format!("http://{address}/graphs/unknown/snapshot"))
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)

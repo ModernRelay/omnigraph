@@ -372,7 +372,7 @@ impl Refusal {
     async fn resource_error(self) -> ErrorData {
         match self {
             Refusal::Api(error) => {
-                let status = error.status;
+                let status = error.status();
                 let body = api_failure(error).await.structured_content;
                 if status == StatusCode::NOT_FOUND {
                     ErrorData::resource_not_found("resource not found", body)

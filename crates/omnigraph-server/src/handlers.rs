@@ -152,15 +152,13 @@ pub(crate) async fn server_ready(
         (status = 200, description = "List of registered graphs", body = GraphListResponse),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 405, description = "Method not allowed (single-graph mode)", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
 /// List every graph currently registered with this server.
 ///
-/// Multi-graph mode only. In single mode, the route returns 405 — there's
-/// no registry to enumerate. Cedar-gated by the server-level policy via
-/// the `graph_list` action against `Omnigraph::Server::"root"`.
+/// Cedar-gated by the server-level policy via the `graph_list` action
+/// against `Omnigraph::Server::"root"`.
 ///
 /// Order: alphabetical by `graph_id` (server-sorted so clients see
 /// deterministic output across requests).
@@ -492,15 +490,7 @@ pub(crate) async fn require_expected_actor(
             "the server runs without authentication and resolves no actor, not the expected '{expected}'"
         ),
     };
-    Err(ApiError {
-        completion_uncertain: false,
-        owned_write: false,
-        compound: false,
-        status: StatusCode::PRECONDITION_FAILED,
-        code: ErrorCode::ActorMismatch,
-        message: message.into_boxed_str(),
-        details: None,
-    })
+    Err(ApiError::new(ErrorCode::ActorMismatch, message))
 }
 
 /// Routing middleware (RFC-011 cluster-only). Resolves the active graph
@@ -620,15 +610,7 @@ pub(crate) fn resolve_registered_graph(
     if !listable {
         return Err(ApiError::not_found("graph not found"));
     }
-    Err(ApiError {
-        completion_uncertain: false,
-        owned_write: false,
-        compound: false,
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        code: ErrorCode::GraphUnavailable,
-        message: message.into(),
-        details: None,
-    })
+    Err(ApiError::new(ErrorCode::GraphUnavailable, message))
 }
 
 pub(crate) fn log_policy_decision(
@@ -1554,7 +1536,7 @@ fn map_blob_read_error(error: OmniError) -> ApiError {
 /// describes the server's own refusal and holds no engine text, so the
 /// response is returned as built.
 fn log_blob_transport_internal(refused: &ApiError) {
-    if refused.status == StatusCode::INTERNAL_SERVER_ERROR {
+    if refused.status() == StatusCode::INTERNAL_SERVER_ERROR {
         error!(
             error_kind = "blob_pre_header_internal",
             stage = "transport",
@@ -1572,7 +1554,7 @@ fn redact_blob_api_error(
     stage: &'static str,
     cause: Option<RedactedCause>,
 ) -> ApiError {
-    if mapped.status == StatusCode::INTERNAL_SERVER_ERROR {
+    if mapped.status() == StatusCode::INTERNAL_SERVER_ERROR {
         error!(
             error_kind = "blob_pre_header_internal",
             stage,
@@ -4017,7 +3999,7 @@ mod blob_error_tests {
             .await
             .unwrap_err();
         assert_ne!(
-            unarmed.status,
+            unarmed.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "unarmed, the request reads `__history`, finds no such commit and is refused"
         );

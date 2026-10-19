@@ -1365,7 +1365,7 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
     );
     let (local, remote) = (parse_stdout_json(&local), parse_stdout_json(&remote));
     for (arm, refused) in [("local", &local), ("remote", &remote)] {
-        assert_eq!(refused["code"], "conflict", "{arm}: {refused}");
+        assert_eq!(refused["code"], "precondition_failed", "{arm}: {refused}");
         assert!(
             refused.get("precondition_failure").is_none(),
             "{arm}: {refused}"

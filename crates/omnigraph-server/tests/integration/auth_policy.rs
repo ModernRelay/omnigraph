@@ -641,9 +641,8 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         "params": {"name": "contract-write", "age": 27}
     })
     .to_string();
-    let expected_message = format!(
-        "exactly one {HTTP_API_CONTRACT_HEADER} header with value {HTTP_API_CONTRACT} is required"
-    );
+    let expected_message =
+        format!("exactly one Omnigraph-Http-Api header with value {HTTP_API_CONTRACT} is required");
     let cases = [
         Vec::new(),
         vec![HeaderValue::from_static("0.11")],

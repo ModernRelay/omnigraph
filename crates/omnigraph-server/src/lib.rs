@@ -474,8 +474,8 @@ struct OpenedGraph {
 /// [`api::ErrorOutput`] remains the wire contract.
 #[derive(Debug)]
 pub struct ApiError {
-    status: StatusCode,
-    /// Every error the server answers names its registry code.
+    /// Every error the server answers names its registry code, and answers
+    /// under that code's one HTTP status.
     code: ErrorCode,
     message: Box<str>,
     details: Option<Box<ApiErrorDetails>>,
@@ -1048,214 +1048,132 @@ fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerToken
 }
 
 impl ApiError {
-    pub fn unauthorized(message: impl Into<String>) -> Self {
+    /// An error with `code` and no details, answered under the code's HTTP
+    /// status. A definite refusal: nothing it reports may have taken effect
+    /// unless it returns through an owned write.
+    pub(crate) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
+            code,
+            message: message.into().into_boxed_str(),
+            details: None,
             completion_uncertain: false,
             owned_write: false,
             compound: false,
-            status: StatusCode::UNAUTHORIZED,
-            code: ErrorCode::Unauthorized,
-            message: message.into().into_boxed_str(),
-            details: None,
         }
+    }
+
+    fn with_details(mut self, details: ApiErrorDetails) -> Self {
+        self.details = Some(Box::new(details));
+        self
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Unauthorized, message)
     }
 
     pub fn forbidden(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::FORBIDDEN,
-            code: ErrorCode::Forbidden,
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::Forbidden, message)
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::BAD_REQUEST,
-            code: ErrorCode::BadRequest,
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::BadRequest, message)
     }
 
+    /// Axum uses `JsonRejection` for data and syntax failures (400, and 422
+    /// for a serde data-shape failure, which OmniGraph answers as its typed
+    /// 400), a body over its limit (413), and a missing or wrong JSON
+    /// `Content-Type` (415). Each keeps its own code and status.
     fn json_rejection(context: &str, rejection: JsonRejection) -> Self {
-        let status = match rejection.status() {
-            // Axum classifies serde data-shape failures as 422. OmniGraph's
-            // documented request-contract refusal is the typed 400 lane.
-            StatusCode::UNPROCESSABLE_ENTITY => StatusCode::BAD_REQUEST,
-            status => status,
+        let code = match rejection.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => ErrorCode::PayloadTooLarge,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => ErrorCode::UnsupportedMediaType,
+            _ => ErrorCode::BadRequest,
         };
-        let mut error = Self::bad_request(format!("{context}: {}", rejection.body_text()));
-        // Axum uses JsonRejection for data/syntax failures (400), a body-limit
-        // failure (413), and a missing/wrong JSON Content-Type (415). Keep the
-        // transport status while projecting every case into ErrorOutput.
-        error.status = status;
-        error
+        Self::new(code, format!("{context}: {}", rejection.body_text()))
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::NOT_FOUND,
-            code: ErrorCode::NotFound,
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::NotFound, message)
     }
 
     /// HTTP 405 Method Not Allowed: the path is routed but does not serve the
     /// request's method, which a client can tell from "no such resource".
     pub fn method_not_allowed(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::METHOD_NOT_ALLOWED,
-            code: ErrorCode::MethodNotAllowed,
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::MethodNotAllowed, message)
     }
 
     pub fn conflict(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::Conflict, message)
     }
 
     /// HTTP 409 with [`ErrorCode::UnattachedCannotPublish`]: a publish
     /// addressed an unattached snapshot, a kind that never publishes; no
     /// durable effect happened.
     fn unattached_cannot_publish(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::CONFLICT,
-            code: ErrorCode::UnattachedCannotPublish,
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::UnattachedCannotPublish, message)
     }
 
     fn unsupported_media_type(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            code: ErrorCode::BadRequest,
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::UnsupportedMediaType, message)
     }
 
     pub(crate) fn range_not_satisfiable(start: u64, end: u64, length: u64) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::RANGE_NOT_SATISFIABLE,
-            code: ErrorCode::BadRequest,
-            // Keep the pre-existing `OmniError` display spelling stable while
-            // adding the structured wire fields below.
-            message: format!(
+        // Keep the pre-existing `OmniError` display spelling stable while
+        // adding the structured wire fields below.
+        Self::new(
+            ErrorCode::RangeNotSatisfiable,
+            format!(
                 "blob range [{start}, {end}) is not satisfiable for a value of length {length}"
-            )
-            .into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::BlobRange(api::BlobRangeOutput {
-                start,
-                end,
-                length,
-            }))),
-        }
+            ),
+        )
+        .with_details(ApiErrorDetails::BlobRange(api::BlobRangeOutput {
+            start,
+            end,
+            length,
+        }))
     }
 
-    /// HTTP 412 for a Blob representation validator mismatch. This is distinct
-    /// from the graph-commit write precondition below: it retains the existing
-    /// closed [`ErrorCode::Conflict`] signal and has no write-precondition
-    /// details because no mutation was attempted.
+    /// HTTP 412 for a Blob read whose `If-Match` names no current
+    /// representation. It has no write-precondition details because no write
+    /// was attempted.
     pub(crate) fn blob_precondition_failed(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::PRECONDITION_FAILED,
-            code: ErrorCode::Conflict,
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::PreconditionFailed, message)
     }
 
     /// HTTP 412 for a Blob write whose `If-Match` did not hold. The
     /// `blob_precondition_failure` detail carries the cell's current
-    /// validator, and the response repeats it in `ETag` when there is one.
-    /// It keeps the closed [`ErrorCode::Conflict`] signal and never the
-    /// graph-commit `precondition_failure` detail.
+    /// validator, and the response repeats it in `ETag` when there is one;
+    /// it never carries the graph-commit `precondition_failure` detail.
     pub(crate) fn blob_write_precondition_failed(current_etag: Option<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::PRECONDITION_FAILED,
-            code: ErrorCode::Conflict,
-            message: format!(
+        Self::new(
+            ErrorCode::PreconditionFailed,
+            format!(
                 "Blob write precondition failed; the cell's current validator is {}",
                 current_etag.as_deref().unwrap_or("<none>")
-            )
-            .into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::BlobPreconditionFailure(
-                api::BlobPreconditionFailureOutput { current_etag },
-            ))),
-        }
+            ),
+        )
+        .with_details(ApiErrorDetails::BlobPreconditionFailure(
+            api::BlobPreconditionFailureOutput { current_etag },
+        ))
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: true,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: ErrorCode::Internal,
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        let mut error = Self::new(ErrorCode::Internal, message);
+        error.completion_uncertain = true;
+        error
     }
 
     /// Refusal before an operation acquires ownership in a closed runtime.
     fn admission_closed() -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: ErrorCode::ServiceUnavailable,
-            message:
-                "server operation admission is closed; reconcile any prior write before retrying"
-                    .into(),
-            details: None,
-        }
+        Self::new(
+            ErrorCode::ServiceUnavailable,
+            "server operation admission is closed; reconcile any prior write before retrying",
+        )
     }
 
-    /// The HTTP status this error maps to. Test-only: production reads the
-    /// status through `IntoResponse`.
-    #[cfg(test)]
+    /// The HTTP status this error answers with: its code's.
     pub(crate) fn status(&self) -> StatusCode {
-        self.status
+        status_of(self.code)
     }
 
     /// The human-readable message body, used by tests to assert the wire
@@ -1270,17 +1188,9 @@ impl ApiError {
     /// `external_blob_source` detail.
     fn external_blob_source(uri: String, reason: String) -> Self {
         let message = format!("external blob source '{uri}' is unavailable: {reason}");
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::FAILED_DEPENDENCY,
-            code: ErrorCode::ExternalBlobSource,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::ExternalBlobSource(
-                api::ExternalBlobSourceOutput { uri, reason },
-            ))),
-        }
+        Self::new(ErrorCode::ExternalBlobSource, message).with_details(
+            ApiErrorDetails::ExternalBlobSource(api::ExternalBlobSourceOutput { uri, reason }),
+        )
     }
 
     /// HTTP 429 Too Many Requests — actor exceeded their per-actor
@@ -1288,15 +1198,7 @@ impl ApiError {
     /// `Retry-After` header. Mapped from `RejectReason::InFlightCountExceeded`
     /// and `RejectReason::ByteBudgetExceeded`.
     pub fn too_many_requests(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::TOO_MANY_REQUESTS,
-            code: ErrorCode::TooManyRequests,
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::TooManyRequests, message)
     }
 
     /// Convert a `WorkloadController` rejection into the matching
@@ -1321,132 +1223,65 @@ impl ApiError {
     }
 
     fn merge_conflict(conflicts: Vec<api::MergeConflictOutput>) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
-            message: summarize_merge_conflicts(&conflicts).into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::MergeConflicts(conflicts))),
-        }
+        Self::conflict(summarize_merge_conflicts(&conflicts))
+            .with_details(ApiErrorDetails::MergeConflicts(conflicts))
     }
 
     fn published_dataset_version_conflict(
         message: String,
         details: api::PublishedDatasetVersionConflictOutput,
     ) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::PublishedDatasetVersionConflict(
-                details,
-            ))),
-        }
+        Self::conflict(message)
+            .with_details(ApiErrorDetails::PublishedDatasetVersionConflict(details))
     }
 
     fn read_set_conflict(message: String, details: api::ReadSetConflictOutput) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::ReadSetConflict(details))),
-        }
+        Self::conflict(message).with_details(ApiErrorDetails::ReadSetConflict(details))
     }
 
     fn key_conflict(message: String, details: api::KeyConflictOutput) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::KeyConflict(details))),
-        }
+        Self::conflict(message).with_details(ApiErrorDetails::KeyConflict(details))
     }
 
+    /// HTTP 413: the operation exceeds a bounded resource, with the
+    /// `resource_limit` detail naming it.
     fn resource_limit(message: String, details: api::ResourceLimitOutput) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            code: ErrorCode::BadRequest,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::ResourceLimit(details))),
-        }
+        Self::new(ErrorCode::PayloadTooLarge, message)
+            .with_details(ApiErrorDetails::ResourceLimit(details))
     }
 
     fn recovery_required(message: String, operation_id: String) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: ErrorCode::RecoveryRequired,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::RecoveryRequired(
-                api::RecoveryRequiredOutput { operation_id },
-            ))),
-        }
+        Self::new(ErrorCode::RecoveryRequired, message).with_details(
+            ApiErrorDetails::RecoveryRequired(api::RecoveryRequiredOutput { operation_id }),
+        )
     }
 
     /// HTTP 412 Precondition Failed — an
     /// `Omnigraph-If-Graph-Commit` graph-head precondition no longer holds,
     /// with the `precondition_failure` detail.
     fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::PRECONDITION_FAILED,
-            code: ErrorCode::PreconditionFailed,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::PreconditionFailure(details))),
-        }
+        Self::new(ErrorCode::PreconditionFailed, message)
+            .with_details(ApiErrorDetails::PreconditionFailure(details))
     }
 
     /// HTTP 410 Gone — retained history can no longer reconstruct a change
     /// continuation, with the `change_feed_gap` detail; the baseline
     /// handshake is the only recovery.
     fn change_feed_gap(cursor: Option<String>, first_unreadable_commit_id: String) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::GONE,
-            code: ErrorCode::ChangeFeedGap,
-            message: format!("change feed gap at commit '{first_unreadable_commit_id}'")
-                .into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::ChangeFeedGap(
-                api::ChangeFeedGapOutput {
-                    cursor,
-                    first_unreadable_commit_id,
-                },
-            ))),
-        }
+        Self::new(
+            ErrorCode::ChangeFeedGap,
+            format!("change feed gap at commit '{first_unreadable_commit_id}'"),
+        )
+        .with_details(ApiErrorDetails::ChangeFeedGap(api::ChangeFeedGapOutput {
+            cursor,
+            first_unreadable_commit_id,
+        }))
     }
 
     /// HTTP 409 Conflict — a well-formed entity-diff request this commit
     /// cannot satisfy (parentless genesis or an unprovable schema boundary).
     fn change_diff_refusal(message: String, details: api::ChangeDiffRefusalOutput) -> Self {
-        Self {
-            completion_uncertain: false,
-            owned_write: false,
-            compound: false,
-            status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::ChangeDiffRefusal(details))),
-        }
+        Self::conflict(message).with_details(ApiErrorDetails::ChangeDiffRefusal(details))
     }
 
     /// A refused query: HTTP 400 with the one-line message, plus the
@@ -1853,18 +1688,22 @@ fn format_key_conflict(
     )
 }
 
-/// Constant `Retry-After` value (seconds) emitted on 429 responses.
+/// Constant `Retry-After` value (seconds) emitted on every 429 and every 503
+/// whose action is `retry`.
 const RETRY_AFTER_SECONDS: &str = "60";
+
+/// The one HTTP status a code is answered under. A code no HTTP response
+/// carries belongs to MCP results, which never become a response; reaching
+/// one here is a server failure.
+fn status_of(code: ErrorCode) -> StatusCode {
+    code.http_status()
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut headers = axum::http::HeaderMap::new();
-        if self.code == ErrorCode::TooManyRequests {
-            headers.insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
-            );
-        }
         if let Some(ApiErrorDetails::BlobPreconditionFailure(failure)) = self.details.as_deref()
             && let Some(etag) = failure
                 .current_etag
@@ -1873,8 +1712,26 @@ impl IntoResponse for ApiError {
         {
             headers.insert(axum::http::header::ETAG, etag);
         }
-        let status = self.status;
-        (status, headers, Json(self.into_output())).into_response()
+        let output = self.into_output();
+        // The answered code fixes the status: a write the server could not
+        // settle answers 500 whatever failed underneath.
+        let status = output
+            .code
+            .map_or(StatusCode::INTERNAL_SERVER_ERROR, status_of);
+        if output
+            .disposition
+            .is_some_and(|disposition| disposition.action == api::DispositionAction::Retry)
+            && matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            )
+        {
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
+            );
+        }
+        (status, headers, Json(output)).into_response()
     }
 }
 
@@ -2283,6 +2140,92 @@ mod api_error_tests {
         assert_eq!(error.disposition, unknown(DispositionAction::Reconcile));
     }
 
+    /// Every error answers under its code's one status, a write the server
+    /// could not settle under 500 whatever failed underneath, and every 429
+    /// or 503 that asks for a retry says when.
+    #[tokio::test]
+    async fn the_answered_code_fixes_the_status_and_retry_after() {
+        let answer = |error: ApiError| async move {
+            let response = error.into_response();
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .map(|value| value.to_str().unwrap().to_string());
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            (status, output.code.unwrap(), retry_after)
+        };
+        let retry = Some(RETRY_AFTER_SECONDS.to_string());
+        for (error, status, code, retry_after) in [
+            (
+                ApiError::too_many_requests("busy"),
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::TooManyRequests,
+                retry.clone(),
+            ),
+            (
+                ApiError::admission_closed(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::ServiceUnavailable,
+                retry.clone(),
+            ),
+            (
+                ApiError::new(ErrorCode::GraphUnavailable, "graph is loading"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::GraphUnavailable,
+                retry.clone(),
+            ),
+            // A recovery intent is resolved, not waited out.
+            (
+                ApiError::from_omni(OmniError::RecoveryRequired {
+                    operation_id: "01JTESTRECOVERY".to_string(),
+                    reason: "pending recovery intent".to_string(),
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::RecoveryRequired,
+                None,
+            ),
+            // Closed admission after a write must be reconciled first.
+            (
+                ApiError::admission_closed().after_owned_write(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::ServiceUnavailable,
+                None,
+            ),
+            (
+                ApiError::new(ErrorCode::RequestTimeout, "too slow"),
+                StatusCode::REQUEST_TIMEOUT,
+                ErrorCode::RequestTimeout,
+                None,
+            ),
+            (
+                ApiError::unsupported_media_type("not JSON"),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                ErrorCode::UnsupportedMediaType,
+                None,
+            ),
+            (
+                ApiError::from_omni(OmniError::DataFusion("bad plan".into())),
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                None,
+            ),
+            (
+                ApiError::from_omni(OmniError::DataFusion("lost".into())).after_owned_write(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::OutcomeUnknown,
+                None,
+            ),
+        ] {
+            let answered = answer(error).await;
+            assert_eq!(answered, (status, code, retry_after));
+            assert_eq!(Some(status.as_u16()), code.http_status(), "{code:?}");
+        }
+    }
+
     /// Each class of refusal asks its caller for one thing. Before any write
     /// none of them took effect; after one, a refusal of the failing step
     /// leaves only an earlier step's effects, and any other error must be
@@ -2304,7 +2247,7 @@ mod api_error_tests {
                 actual: 2,
             })
         };
-        let cases: [(&str, fn() -> ApiError, Action); 10] = [
+        let cases: [(&str, fn() -> ApiError, Action); 14] = [
             (
                 "unauthorized",
                 || ApiError::unauthorized("no token"),
@@ -2326,6 +2269,26 @@ mod api_error_tests {
                 Action::Fix,
             ),
             ("resource limit", resource_limit, Action::Fix),
+            (
+                "range",
+                || ApiError::range_not_satisfiable(4, 9, 8),
+                Action::Fix,
+            ),
+            (
+                "media type",
+                || ApiError::unsupported_media_type("not JSON"),
+                Action::Fix,
+            ),
+            (
+                "blob precondition",
+                || ApiError::blob_write_precondition_failed(None),
+                Action::Refresh,
+            ),
+            (
+                "body deadline",
+                || ApiError::new(ErrorCode::RequestTimeout, "too slow"),
+                Action::Retry,
+            ),
             ("policy", || ApiError::forbidden("denied"), Action::Refresh),
             ("key conflict", key_conflict, Action::Refresh),
             (
@@ -2632,7 +2595,7 @@ mod api_error_tests {
             .await
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert_eq!(error.code, Some(ErrorCode::PayloadTooLarge));
         let details = error.resource_limit.expect("structured resource limit");
         assert_eq!(details.resource, "keyed write entities for node:Person");
         assert_eq!(details.limit, 8192);
@@ -2653,7 +2616,7 @@ mod api_error_tests {
             .await
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert_eq!(error.code, Some(ErrorCode::RangeNotSatisfiable));
         assert_eq!(
             error.error,
             "blob range [4, 9) is not satisfiable for a value of length 8"
@@ -2672,7 +2635,7 @@ mod api_error_tests {
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, Some(ErrorCode::Internal));
 
-        // A Blob write's failed If-Match: 412 under the closed conflict code,
+        // A Blob write's failed If-Match: 412 under the precondition code,
         // the current validator in the detail and in `ETag`, and never the
         // graph-commit precondition detail.
         for current in [Some("\"current\""), None] {
@@ -2692,7 +2655,7 @@ mod api_error_tests {
                 .await
                 .unwrap();
             let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-            assert_eq!(error.code, Some(ErrorCode::Conflict));
+            assert_eq!(error.code, Some(ErrorCode::PreconditionFailed));
             assert!(error.precondition_failure.is_none());
             assert_eq!(
                 error

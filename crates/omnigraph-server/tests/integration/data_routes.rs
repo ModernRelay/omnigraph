@@ -224,7 +224,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
     );
     let output: ErrorOutput =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(output.code, Some(ErrorCode::Conflict));
+    assert_eq!(output.code, Some(ErrorCode::PreconditionFailed));
 
     for (range, expected_range, expected) in [
         ("bytes=1-4", "bytes 1-4/11", &b"ello"[..]),
@@ -486,7 +486,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         error.code,
-        Some(omnigraph_server::api::ErrorCode::BadRequest)
+        Some(omnigraph_server::api::ErrorCode::RangeNotSatisfiable)
     );
     let range = error
         .blob_range
@@ -684,7 +684,7 @@ async fn blob_put_and_delete_return_exact_receipts_and_blob_preconditions() {
     let (_temp, app) = app_for_blob_http_data(BLOB_HTTP_DATA).await;
     let precondition_failure = |body: &[u8]| {
         let output: Value = serde_json::from_slice(body).unwrap();
-        assert_eq!(output["code"], "conflict", "{output}");
+        assert_eq!(output["code"], "precondition_failed", "{output}");
         assert!(output.get("precondition_failure").is_none(), "{output}");
         output["blob_precondition_failure"].clone()
     };

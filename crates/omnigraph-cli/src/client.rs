@@ -2820,7 +2820,8 @@ fn verified_blob_precondition(error: color_eyre::eyre::Report) -> color_eyre::ey
         Ok(remote)
             if remote.status == StatusCode::PRECONDITION_FAILED
                 && remote.output.blob_precondition_failure.is_some()
-                && remote.output.code == Some(omnigraph_api_types::ErrorCode::Conflict)
+                && remote.output.code
+                    == Some(omnigraph_api_types::ErrorCode::PreconditionFailed)
                 && crate::command_outcome::single_request()
                 && {
                     let mut rest = remote.output.clone();

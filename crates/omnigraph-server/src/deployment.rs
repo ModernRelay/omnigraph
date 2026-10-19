@@ -187,12 +187,10 @@ fn refusal(error: omnigraph_cluster::Diagnostic) -> ApiError {
 }
 
 fn observation_changed() -> ApiError {
-    let mut error = ApiError::conflict(
+    ApiError::new(
+        crate::api::ErrorCode::ServiceUnavailable,
         "deployment ownership changed during observation; repeat this status request",
-    );
-    error.status = StatusCode::SERVICE_UNAVAILABLE;
-    error.code = crate::api::ErrorCode::ServiceUnavailable;
-    error
+    )
 }
 
 fn uncertain(message: impl Into<String>) -> ApiError {
