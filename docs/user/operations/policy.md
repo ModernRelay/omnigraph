@@ -157,6 +157,54 @@ before activating matching HTTP and engine permissions. Later requests use the
 new rules. Cluster management policy changes take effect in the same deployment;
 a newly granted administrator cannot authorize that grant.
 
+## Learn your access
+
+`GET /graphs/{graph_id}/access` tells the caller what its own credential may do
+on a graph, so a client can show only the actions it is allowed instead of
+learning them from a refusal:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.14" \
+  "https://graph.example/graphs/knowledge/access?branch=feature&target_branch=main"
+```
+
+With the example graph policy above, `act-alice` gets:
+
+```json
+{"actor":"act-alice","graph_id":"knowledge","graph_wide":["read","invoke_query"],
+ "branch":"feature","target_branch":"main","actions":["read"]}
+```
+
+- `graph_wide` is the decision with no branch named: `invoke_query`, and an
+  action one rule allows on every branch, with no branch scope, `branch_scope:
+  any` or `target_branch_scope: any`. Rules that cover every branch only
+  together, one for protected branches and one for the rest, allow each named
+  branch but not the decision without one, so read `actions` for a branch.
+  `read` here also decides the reads that name no branch: listing branches, the
+  schema, `show` and `commit show`. A commit list authorizes `read` on its
+  branch, `main` when the query names none.
+- With `branch`, `actions` lists the actions allowed on it: `read`, `export`
+  and `change`, and `branch_delete`, `commit_publish`, `commit_drop` and
+  `schema_apply` with that branch as their target. Schema apply and the
+  system-column upgrade target `main` only, and a storage upgrade authorizes
+  each live branch, so `schema_apply` on another branch does not make schema
+  apply possible there.
+- With `target_branch` as well, `actions` also lists `branch_create` from
+  `branch` into the target and `branch_merge` of `branch` into it.
+
+The route evaluates the installed policy for the caller's resolved actor, each
+action shaped as the route that performs it shapes it, so it answers exactly as
+those routes decide. It needs no action of its own, reads no graph data, and
+judges branches by name without checking that they exist. It names actions,
+never the rules behind them, and reveals nothing about other actors. A static
+token on a graph without a policy gets `read` alone, and a signed data
+credential without one nothing, as those routes decide; a server without
+authentication allows every graph action and reports no `actor`. The MCP
+`access` tool returns the same body.
+
+It reports policy actions, not actor views, so a view can still refuse a
+`change` the policy allows.
+
 ## Actor identity
 
 For HTTP requests, the server maps the bearer token to an actor. Headers,
