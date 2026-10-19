@@ -330,6 +330,13 @@ pub fn normalize_root_uri(uri: &str) -> Result<String> {
     Ok(omnigraph_storage::normalize_root_uri(uri)?)
 }
 
+/// Make a local path absolute and fold its `.` and `..` components, without
+/// touching the file system.
+#[doc(hidden)]
+pub fn absolutize_lexically(path: std::path::PathBuf) -> Result<std::path::PathBuf> {
+    Ok(omnigraph_storage::absolutize_lexically(path)?)
+}
+
 /// What the storage seam holds: a decorator over the adapter a handle is
 /// about to use. The trait itself only asks for a wrapper. The harness's
 /// decorator builds its failing adapter once and hands back the same `Arc` on
