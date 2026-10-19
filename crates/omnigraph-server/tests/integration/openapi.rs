@@ -1696,6 +1696,7 @@ fn error_code_schema_has_expected_variants() {
             "local_server_access_mismatch",
             "local_server_cli_incompatible",
             "local_server_records_unsafe",
+            "local_server_read_write_unavailable",
         ]),
         "ErrorCode must match the closed HTTP contract, including its \
          explicit API admission and graph availability refusals",

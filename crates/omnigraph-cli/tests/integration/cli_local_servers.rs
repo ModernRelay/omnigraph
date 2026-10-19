@@ -13,8 +13,6 @@ use tempfile::{TempDir, tempdir};
 
 use crate::support::*;
 
-const INSERT: &str = "query add($name: String) { insert Person { name: $name, age: 30 } }";
-
 /// A graph, an operator home naming it as target `local`, and a records
 /// directory of its own.
 struct Fixture {
@@ -306,39 +304,26 @@ fn a_read_only_local_server_serves_its_target_behind_the_loopback_guard() {
     assert_eq!(listing["targets"][0]["local_servers"], json!([]));
 }
 
+/// Read-write local servers are not available yet: `--write` refuses, after
+/// the actor check, and leaves no server and no record behind.
 #[test]
-fn a_read_write_local_server_writes_as_its_actor_and_reuse_keeps_that_actor() {
+fn a_read_write_local_server_is_refused_until_it_is_available() {
     let fixture = fixture_with_graph();
     let refused = fixture.run(&["serve", "--target", "local", "--write", "--json"]);
     assert_eq!(refused.status.code(), Some(1));
     assert_eq!(json_of(&refused)["code"], "actor_required");
 
-    let server = fixture.serve(&["--target", "local", "--write", "--as", "act-me"]);
-    assert_eq!(server.line["access"], "read_write");
-    assert_eq!(server.line["actor"], "act-me");
-    let body = json!({"query": INSERT, "params": {"name": "Zoe"}}).to_string();
-    let (status, response) = server.authorized("POST", "/graphs/default/mutate", &body);
-    assert_eq!(status, 200, "{response}");
-    let (status, commits) = server.authorized("GET", "/graphs/default/commits?branch=main", "");
-    assert_eq!(status, 200, "{commits}");
-    let commits: Value = serde_json::from_str(&commits).unwrap();
-    assert_eq!(commits["commits"][0]["actor_id"], "act-me", "{commits}");
-
     let refused = fixture.run(&[
-        "serve",
-        "--target",
-        "local",
-        "--reuse",
-        "--write",
-        "--as",
-        "someone-else",
-        "--json",
+        "serve", "--target", "local", "--write", "--as", "act-me", "--json",
     ]);
-    assert_eq!(json_of(&refused)["code"], "local_server_actor_mismatch");
-    // A read-only reuse of a standalone graph does not compare actors.
-    let reused = fixture.run(&["serve", "--target", "local", "--reuse", "--json"]);
-    assert_eq!(json_of(&reused)["actor"], "act-me");
-    assert!(server.stop().success());
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert_eq!(
+        json_of(&refused)["code"],
+        "local_server_read_write_unavailable",
+        "{refused:?}"
+    );
+    let listing = json_of(&fixture.run(&["target", "list", "--json"]));
+    assert_eq!(listing["targets"][0]["local_servers"], json!([]));
 }
 
 #[test]

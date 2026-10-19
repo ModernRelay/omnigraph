@@ -156,6 +156,23 @@ fn check_reuse(record: &Record, args: &ServeArgs, scope: &str, actor: Option<&st
     Ok(())
 }
 
+/// End a local server that never served, so a cluster's serving admission is
+/// not stranded behind a failed start, and return the failure that ended it.
+async fn release_unserved(
+    serving: omnigraph_server::LocalServing,
+    error: color_eyre::Report,
+) -> color_eyre::Report {
+    match serving.release().await {
+        Ok(ServeOutcome::Clean) => error,
+        Ok(ServeOutcome::Uncertain) => {
+            error.wrap_err("the local server's start failed, and its admission was retained")
+        }
+        Err(release) => error.wrap_err(format!(
+            "the local server's start failed, and releasing it failed: {release}"
+        )),
+    }
+}
+
 pub(crate) async fn run_serve(
     input: &InvocationConfig,
     as_actor: Option<&str>,
@@ -248,7 +265,7 @@ pub(crate) async fn run_serve(
     // serving admission, and nothing after it may fail without releasing it.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
     let port = listener.local_addr()?.port();
-    let local_binding = LocalBinding::from_root(&destination.root)
+    let local_binding = LocalBinding::local(&destination.path)
         .map_err(|error| color_eyre::eyre::eyre!("{error}"))?;
     let scope = match scope_name {
         "graph" => LocalScope::Graph(local_binding),
@@ -266,6 +283,10 @@ pub(crate) async fn run_serve(
     )
     .await
     .map_err(|error| match error {
+        LocalOpenError::ReadWriteUnavailable => CliRefusal::report(
+            ErrorCode::LocalServerReadWriteUnavailable,
+            error.to_string(),
+        ),
         LocalOpenError::ActorRequired => {
             CliRefusal::report(ErrorCode::ActorRequired, error.to_string())
         }
@@ -280,7 +301,10 @@ pub(crate) async fn run_serve(
         guard::loopback_only(router, port)
     })?;
     let id = ulid::Ulid::new().to_string();
-    let liveness = records.hold(&id)?;
+    let liveness = match records.hold(&id) {
+        Ok(liveness) => liveness,
+        Err(error) => return Err(release_unserved(serving, error).await),
+    };
     let record = Record {
         format: RECORD_FORMAT,
         id: id.clone(),
@@ -302,7 +326,7 @@ pub(crate) async fn run_serve(
     };
     if let Err(error) = records.publish(&record) {
         records.remove(&id);
-        return Err(error);
+        return Err(release_unserved(serving, error).await);
     }
     drop(election);
 
@@ -328,7 +352,7 @@ pub(crate) async fn run_serve(
     if let Err(error) = announced {
         // A caller that cannot read the line cannot use the server.
         records.remove(&id);
-        return Err(error);
+        return Err(release_unserved(serving, error).await);
     }
 
     let outcome = serving.serve().await;

@@ -8,7 +8,6 @@ local server for you, not a deployment; to serve others, run
 
 ```bash
 omnigraph serve --target local --json
-omnigraph serve --target local --write --as act-me --json
 omnigraph serve --target ops --as act-me --json
 ```
 
@@ -24,28 +23,22 @@ target whose `uri` is a local path or `file://` root: a standalone graph
 
 ## Access and actor
 
-A local server is read-only unless `--write`. A read-only one opens its graphs
-read-only and refuses every change, branch control and commit control with 403
-`forbidden` before reading the request body. A read-write one serves changes,
-branch controls and commit controls, and records each commit's actor.
+A local server is read-only: it opens its graphs read-only, and its engine and
+its HTTP layer both refuse every change, branch control and commit control, the
+HTTP layer with 403 `forbidden` before reading the request body. `--write` is
+not available yet and refuses with `local_server_read_write_unavailable`, after
+the actor check: a write whose outcome is unknown would still stop the server,
+taking the graph away from its clients. Write through the CLI's direct commands
+meanwhile.
 
-The actor is `--as ACTOR`, else `operator.actor`:
-
-| Target | Read-only | `--write` |
-|---|---|---|
-| Standalone graph | The actor if one is set, else `default` | Requires an actor |
-| Cluster root | Requires an actor | Requires an actor |
-
-A missing actor refuses with `actor_required`. A standalone graph's local
-server allows exactly what its access names, for its one actor. A cluster
-root's local server applies the cluster's own policies, stored queries,
-embedding-provider bindings and external-Blob rules to its actor, as a
-deployment of that cluster would. A read-write one takes the cluster's serving
-admission, so it refuses while a deployment serves the cluster, and that
-deployment refuses while it runs. A read-write local server of a standalone
-graph does not fence another process writing the same graph; keep one writer
-per graph. No `/cluster/*` route is served, so schema and deployment changes
-stay with `cluster apply`.
+The actor is `--as ACTOR`, else `operator.actor`. A standalone graph acts as
+that actor, or as `default` when none is set; a cluster root requires one, and
+a missing actor refuses with `actor_required`. A cluster root's local server
+applies the cluster's own policies, stored queries, embedding-provider bindings
+and external-Blob rules to its actor, as a deployment of that cluster would,
+and takes no cluster admission, so `cluster apply` can run beside it. No
+`/cluster/*` route is served, so schema and deployment changes stay with
+`cluster apply`.
 
 ## Starting and readiness
 
@@ -99,7 +92,7 @@ exits 0, unless that server cannot serve what this start asks for:
 | Code | When |
 |---|---|
 | `local_server_access_mismatch` | `--write` asks for a read-write server and the live one is read-only |
-| `local_server_actor_mismatch` | The live server acts as another actor: always for a cluster root, and for a standalone graph under `--write` |
+| `local_server_actor_mismatch` | The live server of a cluster root acts as another actor |
 | `local_server_cli_incompatible` | The live server speaks another HTTP contract than this CLI |
 
 Starts of one destination are serialized: a start waits up to 60 seconds for
@@ -124,7 +117,3 @@ No response carries a CORS header, and every response carries
 
 `SIGTERM` or Ctrl-C stops the local server: it stops admitting requests, lets
 admitted work finish within the shutdown grace, removes its record and exits 0.
-If a write's completion is unknown at shutdown, it exits 2 without claiming
-success; read the commit list before retrying that write. A read-write local
-server of a cluster root keeps the cluster's serving admission in that case, as
-a deployment does.

@@ -2127,6 +2127,8 @@ pub enum ErrorCode {
     /// CLI only: the local server records directory has an unsafe owner,
     /// mode or file.
     LocalServerRecordsUnsafe,
+    /// CLI only: a read-write local server is not available yet.
+    LocalServerReadWriteUnavailable,
 }
 
 /// Structured details for a publisher-level OCC failure. Surfaces alongside

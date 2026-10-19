@@ -209,8 +209,10 @@ pub(crate) fn machine_id() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Destination {
     pub(crate) scope: &'static str,
-    /// The canonical root, for display and for opening.
+    /// The canonical root, for display and for the record.
     pub(crate) root: String,
+    /// The same root as a path, for opening.
+    pub(crate) path: PathBuf,
     pub(crate) digest: String,
 }
 
@@ -249,6 +251,7 @@ impl Destination {
         Ok(Self {
             scope,
             root,
+            path: canonical,
             digest,
         })
     }
