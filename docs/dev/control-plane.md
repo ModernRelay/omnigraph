@@ -237,8 +237,10 @@ dataset uses re-issues an ambiguous manifest request until the store answers
 it and records whether a request was sent; the publisher marks a failure with
 no request sent, or one the store refused, `Unpublished`, and only an outcome
 its read-back cannot settle reaches the logical operation owner as uncertain.
-For the task whose request no re-issue settled, the handler reports a missing
-version as not definitive, so Lance's read-back keeps the attempt's
+Lance deletes an attempt's transaction file only when the handler calls a
+missing version definitive, and only the commit's own request record may say
+so: the catalog's per-commit handler answers from its probe, and a dataset's
+shared handler never does. A manifest that lands late therefore finds its
 transaction file on every open path; the transaction-delete hold below is the
 served process's second line.
 
@@ -277,8 +279,8 @@ Local Lance uses its object-store file provider so direct file writes cannot
 bypass the scope. Embedded defaults and Azure serving clients are unchanged; the
 automatic scoped shutdown path applies only to local and S3 roots.
 
-Only unique admission, successful startup, no pending publication and no
-unsettled key permit final release. Original adapters remain permanently closed; a private single-attempt
+Only unique admission, successful startup and no unsettled key permit final
+release. Original adapters remain permanently closed; a private single-attempt
 client performs only exact-owner lock release under the same shutdown deadline.
 S3 release CAS writes a unique version-2 released marker at the existing key;
 ordinary acquisition CAS replaces it with a fresh held owner. Lost release
@@ -461,7 +463,8 @@ write retains its reservations in that slot: consuming it releases write
 capacity before the handler responds, while abandoning it destroys the output
 before releasing ownership. A read
 error or panic does not trigger write uncertainty. An owned write whose outcome is unknown for a storage reason the engine scopes,
-a publication in doubt (pending on its branch, `omnigraph_catalog::pending`) or
+a publication in doubt (its version is created only if absent, so a late
+landing precedes the branch's next publication or never happens) or
 an opaque storage or I/O failure (whose mutable keys the scope holds unsettled),
 reports its outcome and releases its reservations; admission stays open. A
 write panic, a lost owner, `RecoveryRequired`, an opaque DataFusion failure or

@@ -75,71 +75,17 @@ pub(crate) enum Placement {
 /// retries never commit a detached version at all.
 const DETACHED_VERSION_RETRIES: u32 = 20;
 
-/// [`overwrite_reissuable`] with its error alone.
-#[cfg(test)]
-pub(crate) async fn overwrite(
-    dataset: Dataset,
-    rows: &ManifestRows,
-    cold: Option<&LineageRegistry>,
-) -> Result<(Dataset, RecordBatch)> {
-    overwrite_reissuable(dataset, rows, cold)
-        .await
-        .map_err(|failure| failure.error)
-}
-
-/// A linear commit that failed, with what re-issuing it takes when its
-/// manifest request may still land.
-pub(crate) struct LinearCommitFailure {
-    pub(crate) error: OmniError,
-    pub(crate) pending: Option<crate::pending::PendingPublication>,
-}
-
 /// Write `rows` as the hot row set of `dataset`'s version + 1, and `cold` as
 /// a cold fragment of that version. The schema metadata carries over from
 /// `dataset`, a served stamp, and the new version is stamped with the format
 /// this binary writes: a branch below it takes the current stamp in the CAS
 /// that writes its first rows. Returns the hot batch beside the new version.
-///
-/// A failure keeps the base and the exact transaction of a commit whose
-/// manifest request may have applied, so the publisher can register it
-/// pending.
-pub(crate) async fn overwrite_reissuable(
+pub(crate) async fn overwrite(
     dataset: Dataset,
     rows: &ManifestRows,
     cold: Option<&LineageRegistry>,
-) -> std::result::Result<(Dataset, RecordBatch), LinearCommitFailure> {
-    let probe = ManifestRequestProbe::new();
-    let reissue = std::sync::Mutex::new(None);
-    match overwrite_probed(
-        dataset,
-        rows,
-        cold,
-        Placement::Linear,
-        probe.clone(),
-        Some(&reissue),
-    )
-    .await
-    {
-        Ok(committed) => Ok(committed),
-        Err(error) if probe.outcome().may_have_landed() => Err(LinearCommitFailure {
-            error,
-            pending: reissue
-                .into_inner()
-                .unwrap()
-                .map(
-                    |(base, transaction): (Dataset, _)| crate::pending::PendingPublication {
-                        version: base.version().version + 1,
-                        base,
-                        transaction,
-                        graph_commit_id: rows.head.graph_commit_id.clone(),
-                    },
-                ),
-        }),
-        Err(error) => Err(LinearCommitFailure {
-            error: error.unpublished(),
-            pending: None,
-        }),
-    }
+) -> Result<(Dataset, RecordBatch)> {
+    overwrite_placed(dataset, rows, cold, Placement::Linear).await
 }
 
 /// Write `rows` as the hot row set of a detached version of `dataset`'s
@@ -161,7 +107,7 @@ async fn overwrite_placed(
     placement: Placement,
 ) -> Result<(Dataset, RecordBatch)> {
     let probe = ManifestRequestProbe::new();
-    overwrite_probed(dataset, rows, cold, placement, probe.clone(), None)
+    overwrite_probed(dataset, rows, cold, placement, probe.clone())
         .await
         .map_err(|error| {
             // Every failure before the conditional manifest create, and one
@@ -182,7 +128,6 @@ async fn overwrite_probed(
     cold: Option<&LineageRegistry>,
     placement: Placement,
     probe: ManifestRequestProbe,
-    reissue: Option<&std::sync::Mutex<Option<(Dataset, lance::dataset::transaction::Transaction)>>>,
 ) -> Result<(Dataset, RecordBatch)> {
     guard_row_layout(&dataset)?;
     let mut metadata = dataset.schema().metadata.clone();
@@ -231,9 +176,6 @@ async fn overwrite_probed(
     let handler = crate::lance_clone::probed_commit_handler(&dataset, probe)
         .await
         .map_err(OmniError::storage)?;
-    if let Some(slot) = reissue {
-        *slot.lock().unwrap() = Some((dataset.as_ref().clone(), transaction.clone()));
-    }
     let builder = match placement {
         Placement::Linear => CommitBuilder::new(dataset).with_max_retries(0),
         Placement::Detached { properties } => {

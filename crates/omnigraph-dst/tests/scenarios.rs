@@ -6383,16 +6383,7 @@ async fn dst_publication_requests_get_a_definite_outcome_issue_1067() {
             outcome, expected,
             "case {n} ({target:?}, {mode:?}): {result:?}"
         );
-        if outcome == Outcome::InDoubt {
-            // The publication is pending on its branch; storage answers
-            // again, and resolution completes it before the next write.
-            assert_eq!(
-                omnigraph::resolve_pending_publications().await,
-                0,
-                "case {n}"
-            );
-        }
-        let landed = usize::from(outcome != Outcome::Unpublished);
+        let landed = usize::from(outcome == Outcome::Committed);
         assert_eq!(
             count_rows(&db, "node:Person").await,
             persons + landed,
@@ -6511,76 +6502,4 @@ fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
             );
         });
     }
-}
-
-/// A publication no re-issue settles is pending on its branch: the next
-/// write to that branch is refused with nothing written while storage stays
-/// silent, and reads keep serving. Once storage answers, resolution
-/// completes the pending write exactly once, and the branch publishes again.
-#[tokio::test]
-#[serial]
-async fn dst_pending_publication_completes_once_storage_answers_issue_1067() {
-    use omnigraph::error::OmniError;
-    use omnigraph_dst::lance_faults::{
-        PublicationFault, PublicationFaultMode, PublicationTarget, set_publication_fault,
-    };
-
-    omnigraph_dst::lance_faults::install();
-    let root = "shared-memory://dst-pending-publication";
-    let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-    let db = session(
-        Omnigraph::init_with_storage(root, TEST_SCHEMA, storage, InitOptions::default())
-            .await
-            .expect("init"),
-    );
-    db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
-        .await
-        .expect("fixtures");
-    let persons = count_rows(&db, "node:Person").await;
-    let commits = db.list_commits(None).await.unwrap().len();
-    let fault = PublicationFault::new(
-        PublicationTarget::ManifestVersion,
-        PublicationFaultMode::Unanswered,
-        usize::MAX,
-    );
-    set_publication_fault(Some(fault.clone()));
-    let insert = async |name: &'static str| {
-        mutate_main(
-            &db,
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", name)], &[("$age", 1)]),
-        )
-        .await
-    };
-    let pending = insert("Pending")
-        .await
-        .expect_err("storage answers nothing");
-    assert!(pending.is_manifest_publish_in_doubt(), "{pending:?}");
-    let refused = insert("Refused").await.expect_err("the branch is pending");
-    assert!(
-        matches!(
-            refused.into_completion_evidence().0,
-            OmniError::PublicationPending { .. }
-        ),
-        "the next write is refused with nothing written"
-    );
-    assert_eq!(
-        count_rows(&db, "node:Person").await,
-        persons,
-        "reads keep serving"
-    );
-    assert_eq!(
-        omnigraph::resolve_pending_publications().await,
-        1,
-        "nothing settles while storage is silent"
-    );
-
-    fault.heal();
-    assert_eq!(omnigraph::resolve_pending_publications().await, 0);
-    set_publication_fault(None);
-    assert_eq!(count_rows(&db, "node:Person").await, persons + 1);
-    assert_eq!(db.list_commits(None).await.unwrap().len(), commits + 1);
-    insert("After").await.expect("the branch publishes again");
-    assert_eq!(count_rows(&db, "node:Person").await, persons + 2);
 }

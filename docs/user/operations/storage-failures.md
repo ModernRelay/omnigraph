@@ -25,24 +25,16 @@ back: it holds either this commit, and the write succeeds, or another commit,
 and the write meets an ordinary conflict. A dropped acknowledgement therefore
 ends as a committed write or a definite conflict, never a duplicate.
 
-## Pending publications
+## Unknown publications
 
-A manifest request that no re-issue settles leaves its write's outcome unknown,
-and its publication pending on its branch:
-
-- That write answers 500 (`outcome_unknown` on MCP).
-- The branch's later writes answer 503 `service_unavailable`, naming the
-  pending graph commit, with nothing written.
-- Reads, other branches and other graphs keep serving.
-- The server re-issues the pending commit every 5 to 60 seconds. Once storage
-  answers, the pending write either completes or is proven to have lost to
-  another commit, and the branch accepts writes again.
-
-Until then a read that does not show the write is not proof that it failed, so
-do not repeat it; retry the refused writes once the branch accepts writes. A
-clean shutdown gives every pending publication one more attempt and retains
-admission if one stays pending. One process holds at most 64 pending
-publications; past that every publication is refused.
+A manifest request that no re-issue settles leaves its write's outcome unknown.
+The write answers 500 (`outcome_unknown` on MCP), and the server keeps serving.
+Each manifest version is created only if absent, so the request lands before
+the branch's next publication or never: the branch's next write either finds
+it and builds on it, or takes that version first, after which the late request
+can no longer land. A read that does not show the write is therefore not proof
+that it failed until another commit follows its base; read the branch's
+commits before repeating it.
 
 ## Retries
 
@@ -61,7 +53,7 @@ admission.
 A panic, a lost write owner, a publication adopted in storage but not in
 memory (`RecoveryRequired`), an opaque execution failure, or an uncertain
 startup or deployment activation still closes admission for every graph and
-exits 2. Their effects are not scoped to one write or branch.
+exits 2. Their effects are not scoped to one write's storage keys.
 
 ## Restart after a failure
 
@@ -98,14 +90,12 @@ No storage-failure log carries an error's message, which can name storage
 paths; each records the failure's class.
 
 - `engine failure without definite completion evidence`: the failure's class,
-  and whether its uncertainty is scoped to its keys and branch.
+  and whether its uncertainty is scoped to its storage keys.
 - `owned write ended without a definite outcome`: the write's status, and
   whether it contained the process.
 - `manifest request outcome unknown; re-issuing the identical conditional
   request`, for each re-issue, and
   `manifest request outcome unknown after every re-issue` when none settles.
-- `publication pending` when a publication becomes pending on its branch, and
-  `pending publication resolved` when storage answers.
 - `took over a silent owner's cluster lock` when a restarted server takes over
   its predecessor's lock, and an error when an owner's lease lapses or another
   server claims it.

@@ -94,7 +94,7 @@ stream producers for at most `--shutdown-grace-seconds` (else
 A thread enforces the deadline even if the runtime stalls. Signal handling starts
 after configuration loading, before graph opening. Disconnected work remains in
 the wait; a graph finishing startup during shutdown cannot become available.
-A panic, or an uncertain outcome the engine cannot scope to one write or branch,
+A panic, or an uncertain outcome the engine cannot scope to one write's keys,
 closes admission for every graph and starts the same shutdown without renewing
 its deadline; a storage failure alone never does ([storage failures](operations/storage-failures.md)).
 Once HTTP connections and other known logical owners finish, it exits 2
@@ -118,7 +118,7 @@ owner's lock. A nonclean exit is still a reason to inspect the original outcome,
 not to replay writes. Azure keeps its existing shutdown behavior: even a clean
 exit retains admission and requires the independent Azure recovery procedure.
 If `OBJECT_STORE_CLIENT_MAX_RETRIES` is set, it must be `0` ([retries](operations/storage-failures.md#retries)).
-A clean shutdown that leaves a publication pending or a reused key unsettled retains admission.
+A clean shutdown that leaves a reused key unsettled retains admission.
 Other direct writers still follow the [ownership-transfer procedure](#writer-topology).
 
 ## Admission limits

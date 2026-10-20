@@ -478,10 +478,12 @@ pub struct ApiError {
     details: Option<Box<ApiErrorDetails>>,
     completion_uncertain: bool,
     /// The outcome is unknown only for storage requests whose uncertainty
-    /// the engine scopes to their own keys and branch: a publication in
-    /// doubt, which is pending on its branch, or an opaque storage failure,
-    /// whose mutable keys the storage scope holds unsettled. Such an error
-    /// reports its unknown outcome but does not contain the process.
+    /// is scoped to their own keys: a publication in doubt, whose late
+    /// landing its version key fences (the version is created only if
+    /// absent, so it lands before the branch's next publication or never),
+    /// or an opaque storage failure, whose mutable keys the storage scope
+    /// holds unsettled. Such an error reports its unknown outcome but does
+    /// not contain the process.
     scoped_unknown: bool,
 }
 
@@ -1463,22 +1465,9 @@ impl ApiError {
 
     /// Whether this error's unknown outcome leaves the process's own state
     /// unproven, so the process must be contained: an uncertain completion
-    /// the engine does not scope to its storage keys and branch.
+    /// the engine does not scope to its storage keys.
     pub(crate) fn contains_process(&self) -> bool {
         self.completion_uncertain && !self.scoped_unknown
-    }
-
-    /// A write to a branch whose publication is pending refused before any
-    /// effect; the caller may retry once storage answers.
-    fn publication_pending(message: String) -> Self {
-        Self {
-            completion_uncertain: false,
-            scoped_unknown: false,
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: Some(ErrorCode::ServiceUnavailable),
-            message: message.into_boxed_str(),
-            details: None,
-        }
     }
 
     fn from_omni(err: OmniError) -> Self {
@@ -1737,9 +1726,6 @@ impl ApiError {
             }
             err @ OmniError::BlobIntegrity { .. } => Self::internal(err.to_string()),
             OmniError::Storage(failure) => Self::internal(failure.message),
-            err @ OmniError::PublicationPending { .. } => {
-                Self::publication_pending(err.to_string())
-            }
             OmniError::RetryableCommitConflict(message) => {
                 Self::conflict(format!("retryable storage commit conflict: {message}"))
             }
@@ -3257,7 +3243,6 @@ async fn serve_config(
         startup_owner.finish();
         result
     });
-    let resolver = tokio::spawn(resolve_pending_publications_until_stopped());
     let mut shutdown_rx = shutdown_rx;
     let served = axum::serve(listener, build_app(state))
         .with_graceful_shutdown(async move {
@@ -3284,16 +3269,6 @@ async fn serve_config(
     }
     served?;
     startup_result.wrap_err("graph startup owner failed")??;
-    // A publication still pending can land after this process stops, so it
-    // gets one last attempt before the storage scope closes; one that stays
-    // pending keeps the cluster admission.
-    resolver.abort();
-    let pending = omnigraph::resolve_pending_publications().await;
-    if pending > 0 {
-        return Err(eyre!(
-            "{pending} publication(s) still pending on storage; retaining cluster admission"
-        ));
-    }
     if let Some(owner) = retained_admission {
         if owner.canonical_root().starts_with("az://") {
             // Azure keeps its existing stopped-process boundary until its
@@ -3321,34 +3296,6 @@ async fn serve_config(
             .map_err(|error| eyre!("clean cluster release refused: {error:?}"))?;
     }
     Ok(())
-}
-
-/// The shortest and longest pause between attempts to settle pending
-/// publications. Each attempt re-issues a pending commit's manifest request
-/// once, and a branch with a pending publication refuses writes until it
-/// settles, so the pause starts short and backs off while storage stays
-/// unanswering.
-const PENDING_RESOLVE_PAUSE: (std::time::Duration, std::time::Duration) = (
-    std::time::Duration::from_secs(5),
-    std::time::Duration::from_secs(60),
-);
-
-async fn resolve_pending_publications_until_stopped() {
-    let (shortest, longest) = PENDING_RESOLVE_PAUSE;
-    let mut pause = shortest;
-    loop {
-        tokio::time::sleep(pause).await;
-        if omnigraph::pending_publications() == 0 {
-            pause = shortest;
-            continue;
-        }
-        let remaining = omnigraph::resolve_pending_publications().await;
-        pause = if remaining == 0 {
-            shortest
-        } else {
-            (pause * 2).min(longest)
-        };
-    }
 }
 
 /// Load a graph-scoped policy bundle from either source kind.
