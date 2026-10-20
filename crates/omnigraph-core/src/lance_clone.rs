@@ -1,6 +1,7 @@
 //! Scoped clone-source location reuse and local manifest identity normalization.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -76,6 +77,51 @@ struct ManifestLocationCommitHandler {
     reuse_main_source_location: bool,
     normalize_local_discovery_etag: bool,
     probe: Option<ManifestRequestProbe>,
+    unresolved: UnresolvedTasks,
+}
+
+/// How many tasks one handler remembers as having a manifest request no
+/// re-issue settled.
+const MAX_UNRESOLVED_TASKS: usize = 1024;
+
+/// The tasks whose manifest request through this handler no re-issue
+/// settled. Lance reads the version back on the task that called
+/// [`CommitHandler::commit`], right after it returns, and deletes the
+/// attempt's transaction file when the handler calls a missing version
+/// definitive. A request that may still land must keep that file, because
+/// its manifest names it, so for these tasks a missing version is not
+/// definitive. A dataset's handler is shared by concurrent commits, so the
+/// mark is per task, never per handler. A mark is never cleared by another
+/// attempt, which could run between this attempt's commit and its read-back;
+/// a mark that outlives its attempt only makes a later failed commit on the
+/// same task keep its transaction file. The oldest mark goes first past the
+/// bound, which a read-back that directly follows its commit never reaches.
+#[derive(Debug, Default)]
+struct UnresolvedTasks(Mutex<VecDeque<Option<tokio::task::Id>>>);
+
+impl UnresolvedTasks {
+    fn mark_current(&self) {
+        let task = tokio::task::try_id();
+        let mut tasks = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if tasks.contains(&task) {
+            return;
+        }
+        if tasks.len() == MAX_UNRESOLVED_TASKS {
+            tasks.pop_front();
+        }
+        tasks.push_back(task);
+    }
+
+    fn holds_current(&self) -> bool {
+        let task = tokio::task::try_id();
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&task)
+    }
 }
 
 // Lance 13's direct local discovery still uses its unquoted inode-mtime-size
@@ -110,6 +156,7 @@ fn wrapped(
         reuse_main_source_location: false,
         normalize_local_discovery_etag: false,
         probe,
+        unresolved: UnresolvedTasks::default(),
     }
 }
 
@@ -170,6 +217,7 @@ async fn configured_handler(
         reuse_main_source_location,
         normalize_local_discovery_etag,
         probe,
+        unresolved: UnresolvedTasks::default(),
     })
 }
 
@@ -266,6 +314,7 @@ impl ManifestLocationCommitHandler {
                     "manifest request outcome unknown after every re-issue; the version may still \
                      hold this commit"
                 );
+                self.unresolved.mark_current();
                 finish(attempt, ManifestRequest::Unresolved);
                 return Err(CommitError::OtherError(error));
             }
@@ -283,8 +332,18 @@ impl ManifestLocationCommitHandler {
 
 #[async_trait]
 impl CommitHandler for ManifestLocationCommitHandler {
+    /// A missing version is not proof of absence while this task's manifest
+    /// request may still land (see [`UnresolvedTasks`]): Lance then reports
+    /// the commit status unknown and keeps the transaction file. A refused
+    /// request, and a commit that never sent one, keep the inner answer, so
+    /// Lance still removes a transaction file no manifest can name.
     fn is_version_not_found_definitive(&self) -> bool {
-        self.inner.is_version_not_found_definitive()
+        let unresolved = self
+            .probe
+            .as_ref()
+            .is_some_and(|probe| probe.outcome() == ManifestRequest::Unresolved)
+            || self.unresolved.holds_current();
+        !unresolved && self.inner.is_version_not_found_definitive()
     }
 
     fn propagate_commit_error_after_success(&self) -> bool {
@@ -626,6 +685,11 @@ mod tests {
 
     #[async_trait]
     impl CommitHandler for ScriptedBackend {
+        // As the conditional-put handler does: a missing version is absent.
+        fn is_version_not_found_definitive(&self) -> bool {
+            true
+        }
+
         async fn resolve_version_location(
             &self,
             _base_path: &Path,
@@ -676,11 +740,30 @@ mod tests {
     /// returns whether it succeeded, how many requests were sent and what the
     /// probe recorded.
     async fn resolve(answers: &[Answer]) -> (bool, usize, ManifestRequest) {
-        let directory = tempfile::tempdir().unwrap();
-        let dataset = fresh_dataset(directory.path().to_str().unwrap()).await;
         let backend = Arc::new(ScriptedBackend::new(answers));
         let probe = ManifestRequestProbe::new();
         let handler = wrapped(backend.clone(), Some(probe.clone()));
+        let succeeded = commit_once(&handler).await;
+        let outcome = probe.outcome();
+        // Lance reads the version back through this flag after a failure: a
+        // missing version is proof of absence unless the request may still
+        // land, which keeps the transaction file its manifest would name.
+        assert_eq!(
+            handler.is_version_not_found_definitive(),
+            outcome != ManifestRequest::Unresolved,
+            "{answers:?}"
+        );
+        (
+            succeeded,
+            backend.sent.load(std::sync::atomic::Ordering::SeqCst),
+            outcome,
+        )
+    }
+
+    /// Send one manifest commit through `handler`; returns whether it succeeded.
+    async fn commit_once(handler: &ManifestLocationCommitHandler) -> bool {
+        let directory = tempfile::tempdir().unwrap();
+        let dataset = fresh_dataset(directory.path().to_str().unwrap()).await;
         let mut manifest = dataset.manifest().clone();
         manifest.version += 1;
         let store = dataset.object_store(None).await.unwrap();
@@ -695,11 +778,7 @@ mod tests {
                 None,
             )
             .await;
-        (
-            result.is_ok(),
-            backend.sent.load(std::sync::atomic::Ordering::SeqCst),
-            probe.outcome(),
-        )
+        result.is_ok()
     }
 
     /// The handler re-issues an ambiguous manifest request until the store
@@ -734,6 +813,35 @@ mod tests {
             resolve(&unanswered).await,
             (false, unanswered.len(), ManifestRequest::Unresolved)
         );
+    }
+
+    /// A dataset's own handler has no probe and is shared by concurrent
+    /// commits. A manifest request it could not settle makes a missing
+    /// version undecided for the task that sent it, where Lance reads the
+    /// version back, and for no other task; a later definite answer on
+    /// another task keeps the inner answer.
+    #[tokio::test]
+    async fn an_unresolved_request_keeps_its_transaction_file_on_a_shared_handler_issue_1067() {
+        let unanswered = [Answer::Ambiguous; 1 + MANIFEST_REQUEST_REISSUES as usize];
+        let handler = Arc::new(wrapped(Arc::new(ScriptedBackend::new(&unanswered)), None));
+        assert!(handler.is_version_not_found_definitive());
+        let task = tokio::spawn({
+            let handler = Arc::clone(&handler);
+            async move {
+                let succeeded = commit_once(&handler).await;
+                (succeeded, handler.is_version_not_found_definitive())
+            }
+        });
+        assert_eq!(
+            task.await.unwrap(),
+            (false, false),
+            "the unresolved task's read-back keeps the transaction file"
+        );
+        let other = tokio::spawn({
+            let handler = Arc::clone(&handler);
+            async move { handler.is_version_not_found_definitive() }
+        });
+        assert!(other.await.unwrap(), "another task keeps the inner answer");
     }
 
     #[tokio::test]

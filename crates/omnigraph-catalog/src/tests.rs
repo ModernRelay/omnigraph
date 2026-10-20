@@ -14798,7 +14798,19 @@ enum ManifestFault {
     /// The first numbered manifest create fails at once, and its request is
     /// applied 50 ms later, after the client gave up on it.
     LandsLate,
+    /// Every numbered manifest create fails with an ambiguous error; the
+    /// first one's request is held and applied when the test lands it, after
+    /// every re-issue gave up.
+    LandsAfterGiveUp,
 }
+
+/// A manifest create held back to land after its client gave up.
+type DeferredCreate = (
+    Arc<dyn object_store::ObjectStore>,
+    object_store::path::Path,
+    object_store::PutPayload,
+    object_store::PutOptions,
+);
 
 #[derive(Debug, Clone)]
 struct ManifestRequestFault {
@@ -14807,6 +14819,7 @@ struct ManifestRequestFault {
     manifest_puts: Arc<std::sync::atomic::AtomicUsize>,
     /// Cleared when the store starts answering again.
     failing: Arc<std::sync::atomic::AtomicBool>,
+    deferred: Arc<std::sync::Mutex<Option<DeferredCreate>>>,
 }
 
 impl ManifestRequestFault {
@@ -14816,12 +14829,23 @@ impl ManifestRequestFault {
             fired: Arc::default(),
             manifest_puts: Arc::default(),
             failing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            deferred: Arc::default(),
         }
     }
 
     fn heal(&self) {
         self.failing
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Apply the held create now; returns whether one was held.
+    async fn land(&self) -> bool {
+        let deferred = self.deferred.lock().unwrap().take();
+        let Some((store, location, payload, options)) = deferred else {
+            return false;
+        };
+        store.put_opts(&location, payload, options).await.unwrap();
+        true
     }
 }
 
@@ -14902,6 +14926,17 @@ impl object_store::ObjectStore for ManifestRequestFaultStore {
             {
                 Err(ambiguous_store_error("503 Service Unavailable"))
             }
+            ManifestFault::LandsAfterGiveUp if numbered_manifest => {
+                if first(true) {
+                    *self.fault.deferred.lock().unwrap() = Some((
+                        Arc::clone(&self.original),
+                        location.clone(),
+                        payload,
+                        options,
+                    ));
+                }
+                Err(ambiguous_store_error("request timed out"))
+            }
             ManifestFault::LandsLate if first(numbered_manifest) => {
                 let original = Arc::clone(&self.original);
                 let location = location.clone();
@@ -14973,7 +15008,17 @@ async fn publish_through(
     fault: ManifestFault,
 ) -> (Result<PublishOutcome>, u64, u64, ManifestRequestFault) {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
+    let published = publish_through_in(dir.path(), fault).await;
+    drop(dir);
+    published
+}
+
+/// [`publish_through`] on a graph root the caller owns.
+async fn publish_through_in(
+    root: &std::path::Path,
+    fault: ManifestFault,
+) -> (Result<PublishOutcome>, u64, u64, ManifestRequestFault) {
+    let uri = root.to_str().unwrap().to_string();
     ManifestCoordinator::init(&uri, &build_test_catalog())
         .await
         .unwrap();
@@ -14982,8 +15027,8 @@ async fn publish_through(
         .unwrap()
         .version()
         .version;
-    let transactions = dir.path().join("__manifest/_transactions");
-    let parked = dir.path().join("__manifest/_transactions.parked");
+    let transactions = root.join("__manifest/_transactions");
+    let parked = root.join("__manifest/_transactions.parked");
     if fault == ManifestFault::TransactionPut {
         std::fs::rename(&transactions, &parked).unwrap();
         std::fs::write(&transactions, b"not a directory").unwrap();
@@ -15010,7 +15055,6 @@ async fn publish_through(
         .unwrap()
         .version()
         .version;
-    drop(dir);
     (result, before, after, fault)
 }
 
@@ -15227,4 +15271,41 @@ async fn pending_publication_lost_to_another_commit_releases_its_branch_issue_10
         .publish(&[], &HashMap::new(), Some(&lineage_intent(None, None)))
         .await
         .expect("the branch accepts writes again");
+}
+
+/// A manifest create no re-issue settled may still land, and its manifest
+/// names the attempt's transaction file. Lance reads the version back after
+/// the last re-issue; the missing version must not count as proof of
+/// absence there, or Lance deletes that file and the late manifest names a
+/// file that is gone. Here no storage scope backs the protocol, as on an
+/// embedded or CLI open.
+#[tokio::test]
+async fn unresolved_manifest_create_keeps_its_transaction_file_issue_1067() {
+    let dir = tempfile::tempdir().unwrap();
+    let (result, before, after, fault) =
+        publish_through_in(dir.path(), ManifestFault::LandsAfterGiveUp).await;
+    let error = result.expect_err("no manifest create is answered");
+    assert!(error.is_manifest_publish_in_doubt(), "{error:?}");
+    assert_eq!(after, before, "nothing visible yet");
+
+    assert!(fault.land().await, "the first create was held");
+    let uri = dir.path().to_str().unwrap();
+    let landed = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(
+        landed.version().version,
+        before + 1,
+        "the late create landed"
+    );
+    let transaction = landed
+        .manifest()
+        .transaction_file
+        .clone()
+        .expect("the landed manifest names its transaction file");
+    assert!(
+        dir.path()
+            .join("__manifest/_transactions")
+            .join(&transaction)
+            .exists(),
+        "the transaction file {transaction} named by the late manifest is kept"
+    );
 }
