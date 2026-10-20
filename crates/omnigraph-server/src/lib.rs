@@ -50,9 +50,9 @@ use api::{
     BranchCreateRequest, BranchDeleteOutput, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery, ErrorCode,
     ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphBatchLoadQuery, GraphDiscoveryEntry,
-    GraphDiscoveryResponse, GraphInfo, GraphListResponse, HealthOutput, IngestOutput,
-    IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse, QueriesCatalogOutput,
-    QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
+    GraphDiscoveryResponse, GraphInfo, GraphListResponse, HealthOutput, IF_ACTOR_HEADER,
+    IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
+    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
     graph_batch_load_receipt_output, ingest_receipt_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
@@ -2921,7 +2921,9 @@ pub fn build_app(state: AppState) -> Router {
     //      `AuthenticatedActor` (or rejects 401).
     //   2. `require_contract` — refuses unsupported HTTP contracts before
     //      graph resolution or request-body work.
-    //   3. `resolve_graph_handle` — captures `serving::GraphRequest` based on
+    //   3. `require_expected_actor` — refuses a request whose
+    //      `omnigraph-if-actor` names another actor than its credential.
+    //   4. `resolve_graph_handle` — captures `serving::GraphRequest` based on
     //      the active mode (single: the only handle; multi: lookup by
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
@@ -2981,6 +2983,7 @@ pub fn build_app(state: AppState) -> Router {
             state.clone(),
             resolve_graph_handle,
         ))
+        .route_layer(middleware::from_fn(require_expected_actor))
         .route_layer(middleware::from_fn(http_contract::require_contract))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -2996,6 +2999,7 @@ pub fn build_app(state: AppState) -> Router {
     let management = Router::new()
         .route("/graphs", get(server_graphs_list))
         .route("/graphs/discovery", get(server_graphs_discovery))
+        .route_layer(middleware::from_fn(require_expected_actor))
         .route_layer(middleware::from_fn(http_contract::require_contract))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -3016,6 +3020,7 @@ pub fn build_app(state: AppState) -> Router {
                 ingress::admit(&state, request, next).await
             },
         ))
+        .route_layer(middleware::from_fn(require_expected_actor))
         .route_layer(middleware::from_fn(http_contract::require_contract))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -3033,6 +3038,7 @@ pub fn build_app(state: AppState) -> Router {
                 ingress::admit(&state, request, next).await
             },
         ))
+        .route_layer(middleware::from_fn(require_expected_actor))
         .route_layer(middleware::from_fn(http_contract::require_contract))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

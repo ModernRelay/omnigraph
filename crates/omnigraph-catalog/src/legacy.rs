@@ -15,7 +15,7 @@ mod record;
 pub use census::{
     CensusCounts, CensusError, CensusHead, CensusInput, CensusRef, FindingCode, LegacyCensus,
     LegacyFinding, LegacyPlan, MAX_CENSUS_CELLS, MAX_CENSUS_SNAPSHOT_BYTES, census, census_within,
-    conversion_batch, materialize, plan,
+    census_within_with_session, conversion_batch, materialize, plan,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

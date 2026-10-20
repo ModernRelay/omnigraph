@@ -164,6 +164,13 @@ backup and read the candidate-written root with the predecessor before claiming
 a qualified rollback. This is independent of graph-stamp conversion; unchanged
 V2_2 files and format 16 do not establish reader compatibility on their own.
 
+The core `captured_provider` test runs isolated subprocesses because native
+provider environment snapshots are process-wide. It exercises S3 and Azure
+control-object and native Lance reads/conditional creates against fake HTTP
+endpoints, destination aliases and ambient-option drift, including cached Azure
+options and rotating credential providers. Storage's `binding` unit tests own
+option classification and fixed defaults; these are not live-cloud qualification.
+
 ## Server and CLI ownership
 
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
@@ -180,7 +187,9 @@ existing parity matrix. Query semantics remain in GQT, not duplicated in these
 CLI boundary tests.
 Schema-family application tests verify that failed result delivery preserves an
 applied schema and its actor with one publication, and that an undeliverable
-target line precedes writable open. Init output failure leaves a readable graph;
+target line precedes writable open. The same application owner injects write and
+flush failures into mutation-scope diagnostics; `cli_data` checks ordinary and GQ
+branch scopes while keeping JSON stdout parseable. Init output failure leaves a readable graph;
 lint report failures and subsequent invocations remain reusable. Extend the
 existing `cli_schema_config`, `cli_cluster` and `cli_data` owners for addressing,
 cluster ownership and offline source-read ordering.
@@ -201,10 +210,10 @@ filtering and wrong-plane refusal before configuration or HTTP access. The exist
 these CLI changes require no additional query-semantic GQT cases.
 
 Local command tests in `commands/local` own supplied login input, credential
-changes after report failure, captured profile configuration, and completed skill
+changes after report failure, captured target configuration, and completed skill
 or embedding files after output loss. `skill.rs` owns exact file delivery and its
 existing broken-pipe exception. Extend `cli_schema_config` for version and skill
-process behavior and `cli_data` for profile/embedding output. Its existing
+process behavior and `cli_data` for target/embedding output. Its existing
 discovery-swap fixture also replaces the credential file, requiring registry
 probing and the subsequent command to retain the original token. Application and
 managed-output tests own completion, partial-write and flush failures; managed
@@ -249,8 +258,10 @@ turnover, exercising bounded re-observation for aggregate and exact status.
 CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
 retries, malformed-receipt refusal, terminal outcomes and caller timeout without
 replay. Its managed fixtures cover status/history scope and filters, explicit
-`--managed` selection, and wrong-mode refusals before context or external access.
-Direct apply must ignore both valid and malformed managed folder context.
+managed target selection, and unsupported target-kind refusals before credentials
+or external access. Default target selection refuses applicable retired folder
+routing; explicit direct targets never route through it. Legacy lifecycle custody
+remains guarded even with explicit selection.
 Managed deployment fixtures also exercise immutable preview/delivery bodies,
 original-ID recovery, current authorization refusals, bounded waiting through
 uncertain delivery/archival, and queued-only cancellation. They do not replace
@@ -570,6 +581,15 @@ Query behavior has two test tiers. A `.gqt` case owns what is visible in rows, c
 `crates/omnigraph/tests/integration/engine_v2_plan_replay.rs` owns the replay, including refusal of altered result schemas and missing, duplicate, unused or altered node-object declarations. Each test gathers one query through `Session::query_inspected`, serializes the run's replay envelope (`Executed::replay_envelope`: the query's source and name, the accepted scope, the schema digest, the `BoundPlan` through the planner's mirrors and an exact-fragment member's derivation), reads it back (the plan must read back equal), and executes it twice through `Session::replay_bound_plan`, a door that recompiles the named query against the target's catalog, binds it to the plan's own values, accepts the plan again and takes no session setting. Each replay must return the run's rows, record the run's search decisions (gate verdicts and probe attempts) and repeat its trace: `id`, `operator` and `status` per row, `rung` and `ran` per attempt, and `actual_rows` wherever both attempts are `drained`. `drained` says the consumer pulled the operator's stream to its end; below an operator that stopped early (a `Limit`, a `Sort` with a fetch), a producer's count is a lower bound that depends on how far ahead its channel ran, and is not compared. One query per node kind that has a switch or a ladder: a `HashJoin` over an `Expand` (both switches on the report), a `nearest` ladder with an edge (two rungs), an `rrf` fusion, a `Limit` of zero (everything below skipped), a bulk `AntiJoin`, an `Aggregate`. Three more tests own the pins: after an edge write the replay of a traversal is refused, after an insert the replay of an unfiltered count is refused, and a write to a table the plan never read leaves the replay accepted, because `engine::plan_pins_snapshot` compares the plan's `Assumptions.datasets` (path, Lance branch and version per table key the planner read, or its absence) against the snapshot; a pin mismatch and a changed schema are conflicts. The envelope's own outcomes are tested there too: another envelope version asks for the query again, an exact-fragment member replays only with its unedited derivation, an edited plan that drops a predicate is invalid evidence, and an envelope claiming full full-text coverage of a partially indexed property is refused against the pinned snapshot.
 
 The scrubbed side is `crates/omnigraph/tests/engine_v2_scrubbed_replay.rs` (process environment, which no case can express): a grep that fails on any `std::env` read under `crates/omnigraph/src/engine/` outside `plan_source.rs`, the one permitted reader of configuration, before planning; two replays that set an ambient value the plan did not capture (the task-local memory limit, `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`) and require the captured one to win; and the replay of a plan gathered under one `ann_nprobes` in a session set to another. `Session::replay_bound_plan` takes no settings argument and sizes the pool from the plan's memory limit. The inventory sweep is one case per input class that a case can set two ways, `cases/v2/planner/input_*.gqt` (`engine`, `ann_nprobes`, index build state), each requiring equal rows or a plan line that differs, and the clock class is one of the replay plans of `integration/engine_v2_plan_replay.rs`; the `ran` line and the `nprobes` claim of `--- expect plan` are what a differing plan line is spelled with.
+
+GQT also owns the public ANN diagnostics contract: every inspected query checks
+metric types and names, attempt identities, scan/probe attribution and same-run
+profile preservation. Existing ranked-scan cases use `diagnostics present` to
+refuse silent metric loss, including one missing RRF arm; see the
+[GQT plan assertions](../../crates/omnigraph-gqt/README.md#plan-expectations).
+Rust retains controlled partition layouts and independent native-counter oracles
+in `search.rs`, plus synthetic missing/zero/unknown/maximum metric inputs and
+replay separation in `engine/search.rs` and `engine/report/tests.rs`.
 
 The `--- expect plan` of an inspected step reads the explain document of that same `Executed`, never a second planning run; its `ran` lines read the report of that run (`crates/omnigraph-gqt-core/src/report.rs` reads the rows). A parameter refusal, a settings error and a query that failed produce no `Executed` and keep their ordinary checks.
 

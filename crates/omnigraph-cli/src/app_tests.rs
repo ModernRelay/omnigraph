@@ -5,7 +5,7 @@ use reqwest::Method;
 use serde_json::{Value, json};
 
 use super::{Completion, UndeliveredFailure, finish, run_from};
-use crate::{command_outcome, invocation::MachineErrors};
+use crate::{client::GraphClient, command_outcome, invocation::MachineErrors};
 
 #[tokio::test]
 async fn argument_refusal_help_and_success_return_without_terminating_the_caller() {
@@ -17,6 +17,28 @@ async fn argument_refusal_help_and_success_return_without_terminating_the_caller
     ] {
         let completion = run_from(args).await.unwrap();
         assert_eq!(completion.code(), expected);
+    }
+    for verb in ["query", "mutate"] {
+        let parsed =
+            crate::invocation::parse_from(["omnigraph", verb, "stored", "--json"]).unwrap();
+        let mut out = Vec::new();
+        let completion = super::execute(
+            parsed,
+            crate::operator::InvocationConfig::at(None, None),
+            &mut io::empty(),
+            false,
+            &mut out,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let error: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(completion.code(), 2, "{verb}: {error}");
+        assert_eq!(error["code"], "target_required");
+        if verb == "mutate" {
+            assert_eq!(error["command_outcome"]["execution"], "not_started");
+            assert_eq!(error["command_outcome"]["effects"], "none");
+        }
     }
 }
 
@@ -63,7 +85,15 @@ async fn handled_lint_failure_allows_a_following_successful_invocation() {
                 &mut delivered
             };
             let mut stderr = Vec::new();
-            let result = super::execute(parsed, &mut io::empty(), false, stdout, &mut stderr).await;
+            let result = super::execute(
+                parsed,
+                crate::operator::InvocationConfig::at(None, None),
+                &mut io::empty(),
+                false,
+                stdout,
+                &mut stderr,
+            )
+            .await;
             if fault.is_some() {
                 assert_eq!(
                     result
@@ -145,6 +175,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         let error = finish(
             result,
             Some(evidence),
+            None,
             Some(MachineErrors::Json),
             &mut stdout,
             &mut stderr,
@@ -176,6 +207,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         let completion = finish(
             result,
             Some(evidence),
+            None,
             Some(MachineErrors::Json),
             &mut stdout,
             &mut stderr,
@@ -205,7 +237,15 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
             fault: OutputFault::Flush,
             bytes: b"warning after committed write\n".to_vec(),
         };
-        let error = finish(result, Some(evidence), machine, &mut stdout, &mut stderr).unwrap_err();
+        let error = finish(
+            result,
+            Some(evidence),
+            None,
+            machine,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap_err();
         let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
         let failure = serde_json::to_value(&undelivered.failure).unwrap();
         assert_eq!(
@@ -225,7 +265,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         fault: OutputFault::Flush,
         bytes: Vec::new(),
     };
-    let error = finish(result, Some(evidence), None, &mut stdout, &mut stderr).unwrap_err();
+    let error = finish(result, Some(evidence), None, None, &mut stdout, &mut stderr).unwrap_err();
     let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
     let failure = serde_json::to_value(&undelivered.failure).unwrap();
     assert_eq!(failure["error"], "response lost after dispatch");
@@ -287,7 +327,8 @@ async fn delivered_refusals_keep_their_exit_status_when_unused_stdout_cannot_flu
             bytes: Vec::new(),
         };
         let mut stderr = Vec::new();
-        let completion = finish(result, Some(evidence), None, &mut stdout, &mut stderr).unwrap();
+        let completion =
+            finish(result, Some(evidence), None, None, &mut stdout, &mut stderr).unwrap();
         assert_eq!(completion.code(), expected);
         assert!(stdout.bytes.is_empty());
         let diagnostic = String::from_utf8(stderr).unwrap();
@@ -314,7 +355,7 @@ fn handled_nonzero_completions_do_not_flush_an_unrelated_or_failed_stream() {
                 (&mut unused, &mut delivered)
             };
             let completion =
-                finish(Ok(Completion::exit(code)), None, None, stdout, stderr).unwrap();
+                finish(Ok(Completion::exit(code)), None, None, None, stdout, stderr).unwrap();
             assert_eq!(completion.code(), code);
             assert_eq!(delivered, b"already delivered and flushed\n");
             assert!(unused.bytes.is_empty());
@@ -544,7 +585,6 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                                 json,
                             },
                             false,
-                            true,
                             &mut crate::input::Input {
                                 reader: &mut io::empty(),
                                 is_terminal: false,
@@ -582,6 +622,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                 let completed = finish(
                     result,
                     Some(evidence),
+                    None,
                     json.then_some(MachineErrors::Json),
                     &mut stdout,
                     &mut stderr,
@@ -649,6 +690,13 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
         bytes: Vec::new(),
     };
     let (result, evidence) = command_outcome::observe(async {
+        crate::scope::report(
+            &crate::operator::InvocationConfig::at(None, None),
+            &server_test_target(&server.origin),
+            Some("knowledge"),
+            Some(crate::scope::WriteScope::Branch("main")),
+            &mut stderr,
+        )?;
         execute_load(
             &client,
             LoadOperation {
@@ -659,7 +707,6 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                 settings: Vec::new(),
                 json: true,
             },
-            false,
             false,
             &mut crate::input::Input {
                 reader: &mut io::empty(),
@@ -675,6 +722,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
     let completion = finish(
         result,
         Some(evidence),
+        None,
         Some(MachineErrors::Json),
         &mut stdout,
         &mut stderr,
@@ -688,6 +736,82 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
     );
     assert!(server.requests().is_empty());
     server.assert_complete();
+}
+
+#[tokio::test]
+async fn mutation_scope_delivery_failure_precedes_writable_open() {
+    use crate::cli::Command;
+    use crate::commands::query::{GraphScope, run_mutate};
+
+    for source in [
+        "query add() { insert Person { slug: \"new\" } }",
+        "branch create review",
+    ] {
+        for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
+            let temp = tempfile::tempdir().unwrap();
+            let uri = temp.path().join("graph.omni").to_str().unwrap().to_owned();
+            omnigraph::db::Omnigraph::init(&uri, "node Person { slug: String @key }")
+                .await
+                .unwrap();
+            let client = GraphClient::embedded_test(uri.clone(), None);
+            let before = client
+                .snapshot("main")
+                .await
+                .unwrap()
+                .graph_manifest_version;
+            let parsed = crate::invocation::parse_from([
+                "omnigraph",
+                "mutate",
+                "--target",
+                &uri,
+                "-e",
+                source,
+                "--json",
+            ])
+            .unwrap();
+            let Command::Mutate(args) = parsed.cli.command else {
+                unreachable!()
+            };
+            let mut stdout = Vec::new();
+            let mut stderr = FailingOutput {
+                fault,
+                bytes: Vec::new(),
+            };
+            let error = run_mutate(
+                args,
+                GraphScope {
+                    operator: &crate::operator::InvocationConfig::at(None, None),
+                    target: &direct_test_target(&uri, false),
+                    graph: None,
+                    actor: None,
+                    yes: false,
+                },
+                None,
+                &mut crate::input::Input {
+                    reader: &mut io::empty(),
+                    is_terminal: false,
+                },
+                &mut stdout,
+                &mut stderr,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert!(stdout.is_empty());
+            assert_eq!(
+                client
+                    .snapshot("main")
+                    .await
+                    .unwrap()
+                    .graph_manifest_version,
+                before
+            );
+            assert_eq!(client.branch_list().await.unwrap().branches, ["main"]);
+        }
+    }
 }
 
 #[tokio::test]
@@ -752,6 +876,7 @@ async fn transfer_reads_use_the_supplied_sink_and_propagate_delivery_errors() {
                 result.map(|()| Completion::success()),
                 None,
                 None,
+                None,
                 &mut stdout,
                 &mut stderr,
             )
@@ -791,7 +916,7 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
     let server = IntentApiFixture::graph(Vec::new());
     let parsed = parse_from([
         "omnigraph",
-        "--server",
+        "--target",
         &server.origin,
         "--graph",
         "knowledge",
@@ -806,9 +931,16 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
     .unwrap();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let completion = super::execute(parsed, &mut FailedInput, false, &mut stdout, &mut stderr)
-        .await
-        .unwrap();
+    let completion = super::execute(
+        parsed,
+        crate::operator::InvocationConfig::at(None, None),
+        &mut FailedInput,
+        false,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .unwrap();
     assert_eq!(completion.code(), 1);
     let failure: Value = serde_json::from_slice(&stdout).unwrap();
     assert_eq!(failure["error"], "cannot read stdin: input disappeared");
@@ -816,7 +948,11 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
         failure["command_outcome"],
         json!({"execution":"not_started", "effects":"none", "action":"refresh"})
     );
-    assert!(stderr.is_empty());
+    let diagnostic = String::from_utf8(stderr).unwrap();
+    assert!(
+        diagnostic.starts_with("target ") && diagnostic.contains(&server.origin),
+        "{diagnostic}"
+    );
     assert!(server.requests().is_empty());
     server.assert_complete();
 }
@@ -839,10 +975,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
             omnigraph::db::Omnigraph::init(&uri, BEFORE).await.unwrap();
             let source = temp.path().join("next.pg");
             std::fs::write(&source, AFTER).unwrap();
-            let client = GraphClient::Embedded {
-                uri,
-                actor: Some("schema-operator".into()),
-            };
+            let client = GraphClient::embedded_test(uri, Some("schema-operator".into()));
             let before = client
                 .snapshot("main")
                 .await
@@ -855,7 +988,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
             };
             let mut stderr = Vec::new();
             let (result, evidence) = command_outcome::observe(async {
-                apply_schema(&client, &source, json, true, &mut stdout, &mut stderr).await?;
+                apply_schema(&client, &source, json, &mut stdout, &mut stderr).await?;
                 Ok::<_, color_eyre::Report>(Completion::success())
             })
             .await;
@@ -863,6 +996,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
             let completed = finish(
                 result,
                 Some(evidence),
+                None,
                 json.then_some(MachineErrors::Json),
                 &mut stdout,
                 &mut stderr,
@@ -927,7 +1061,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
     omnigraph::db::Omnigraph::init(&uri, BEFORE).await.unwrap();
     let source = temp.path().join("next.pg");
     std::fs::write(&source, AFTER).unwrap();
-    let client = GraphClient::Embedded { uri, actor: None };
+    let client = GraphClient::embedded_test(uri, None);
     let before = client
         .snapshot("main")
         .await
@@ -938,23 +1072,28 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
         fault: OutputFault::AfterPrefix,
         bytes: Vec::new(),
     };
-    let (result, evidence) = command_outcome::observe(async {
-        apply_schema(&client, &source, true, false, &mut stdout, &mut stderr).await?;
-        Ok::<_, color_eyre::Report>(Completion::success())
-    })
-    .await;
-    assert_eq!(
-        finish(
-            result,
-            Some(evidence),
-            Some(MachineErrors::Json),
-            &mut stdout,
-            &mut stderr
-        )
-        .unwrap()
-        .code(),
-        1
-    );
+    let parsed = crate::invocation::parse_from([
+        "omnigraph",
+        "schema",
+        "apply",
+        "--target",
+        client.uri(),
+        "--schema",
+        source.to_str().unwrap(),
+        "--json",
+    ])
+    .unwrap();
+    let completion = super::execute(
+        parsed,
+        crate::operator::InvocationConfig::at(None, None),
+        &mut io::empty(),
+        false,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .unwrap();
+    assert_eq!(completion.code(), 1);
     let failure: Value = serde_json::from_slice(&stdout).unwrap();
     assert_eq!(
         failure["command_outcome"],
@@ -992,15 +1131,17 @@ async fn init_output_failure_preserves_the_initialized_graph() {
         let mut stderr = Vec::new();
         let result = run_init(
             InitArgs {
-                uri: uri.clone(),
+                uri: Some(uri.clone()),
                 schema: schema.clone(),
                 force: false,
             },
+            &direct_test_target(&uri, false),
             &mut stdout,
         )
         .await;
         let error = finish(
             result.map(|()| Completion::success()),
+            None,
             None,
             None,
             &mut stdout,
@@ -1015,10 +1156,7 @@ async fn init_output_failure_preserves_the_initialized_graph() {
             stderr.is_empty(),
             "init must not invent data-write evidence"
         );
-        let client = GraphClient::Embedded {
-            uri: uri.clone(),
-            actor: None,
-        };
+        let client = GraphClient::embedded_test(uri.clone(), None);
         assert_eq!(client.schema_source().await.unwrap().schema_source, SOURCE);
         let version = client
             .snapshot("main")
@@ -1029,10 +1167,11 @@ async fn init_output_failure_preserves_the_initialized_graph() {
         assert!(
             run_init(
                 InitArgs {
-                    uri,
+                    uri: Some(uri.clone()),
                     schema,
                     force: true
                 },
+                &direct_test_target(&uri, false),
                 &mut Vec::new()
             )
             .await
@@ -1065,10 +1204,7 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
             omnigraph::db::Omnigraph::init(&uri, "node Person { slug: String @key }\n")
                 .await
                 .unwrap();
-            let client = GraphClient::Embedded {
-                uri: uri.clone(),
-                actor: None,
-            };
+            let client = GraphClient::embedded_test(uri.clone(), None);
             client
                 .mutate(
                     None,
@@ -1108,6 +1244,7 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
             let parsed = crate::invocation::parse_from([
                 "omnigraph",
                 "rebuild-full-text-indexes",
+                "--target",
                 &uri,
                 "--branch",
                 "search",
@@ -1121,11 +1258,10 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
             };
             let mut stderr = Vec::new();
             let result = crate::admission::scope(rebuild_full_text_indexes(
-                &uri,
+                &crate::scope::capture_storage_binding(&direct_test_target(&uri, false)).unwrap(),
                 "search",
                 Some("maintenance-operator"),
                 json,
-                true,
                 &mut stdout,
                 &mut stderr,
             ))
@@ -1133,6 +1269,7 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
             assert_eq!(result.is_ok(), matches!(fault, OutputFault::Flush));
             let error = finish(
                 result.map(|()| Completion::success()),
+                None,
                 None,
                 json.then_some(MachineErrors::Json),
                 &mut stdout,
@@ -1177,15 +1314,24 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
                 fault: OutputFault::AfterPrefix,
                 bytes: Vec::new(),
             };
-            let error = crate::admission::scope(rebuild_full_text_indexes(
-                &uri,
-                "search",
-                Some("maintenance-operator"),
-                json,
-                false,
-                &mut stdout,
-                &mut stderr,
-            ))
+            let error = crate::admission::scope(async {
+                crate::scope::report(
+                    &crate::operator::InvocationConfig::at(None, None),
+                    &direct_test_target(&uri, false),
+                    None,
+                    Some(crate::scope::WriteScope::Branch("search")),
+                    &mut stderr,
+                )?;
+                rebuild_full_text_indexes(
+                    &crate::scope::capture_storage_binding(&direct_test_target(&uri, false))?,
+                    "search",
+                    Some("maintenance-operator"),
+                    json,
+                    &mut stdout,
+                    &mut stderr,
+                )
+                .await
+            })
             .await
             .unwrap_err();
             assert_eq!(
@@ -1250,9 +1396,17 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             } else {
                 &mut failed_err
             };
-            let error = apply_source(temp.path(), None, &caller, true, stdout, stderr)
-                .await
-                .unwrap_err();
+            let error = apply_source(
+                temp.path(),
+                &local_test_binding(temp.path()),
+                None,
+                &caller,
+                true,
+                stdout,
+                stderr,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(
                 error.downcast_ref::<io::Error>().unwrap().kind(),
                 io::ErrorKind::BrokenPipe
@@ -1293,10 +1447,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
                 .to_str()
                 .unwrap()
                 .to_owned();
-            let graph = crate::client::GraphClient::Embedded {
-                uri: graph_uri,
-                actor: None,
-            };
+            let graph = GraphClient::embedded_test(graph_uri, None);
             let snapshot = graph.snapshot("main").await.unwrap();
             let commits = graph.list_commits(Some("main")).await.unwrap().commits;
             let lock_path = temp.path().join("__cluster/lock.json");
@@ -1308,6 +1459,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let mut custody = Vec::new();
             apply_source(
                 temp.path(),
+                &local_test_binding(temp.path()),
                 Some(id),
                 &caller,
                 true,
@@ -1344,7 +1496,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let mut output = Vec::new();
             let error = crate::commands::cluster::run(
                 ClusterCommand::Apply {
-                    config: temp.path().join("missing-source"),
+                    config: None,
                     deployment_id: Some(id.to_owned()),
                     writers_stopped: true,
                     json: true,
@@ -1353,7 +1505,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
                 },
                 ClusterScope {
                     operator: &crate::operator::InvocationConfig::at(None, None),
-                    root: Some(root),
+                    target: Some(&direct_test_target(root, true)),
                     actor: Some("deployment-operator"),
                 },
                 &mut output,
@@ -1378,12 +1530,11 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let error = crate::commands::cluster::run(
                 ClusterCommand::ForceUnlock {
                     lock_id: lock.to_owned(),
-                    config: temp.path().to_owned(),
                     json: true,
                 },
                 ClusterScope {
                     operator: &crate::operator::InvocationConfig::at(None, None),
-                    root: (failed_stream != "stdout").then_some(root),
+                    target: Some(&direct_test_target(root, true)),
                     actor: None,
                 },
                 &mut failing,
@@ -1442,4 +1593,42 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             );
         }
     }
+}
+
+fn direct_test_target(uri: &str, root: bool) -> crate::targets::ResolvedTarget {
+    use crate::targets::*;
+    ResolvedTarget::new(
+        if root {
+            TargetBinding::DirectRoot {
+                uri: uri.into(),
+                provider: StorageProvider::Local,
+                default_graph: None,
+            }
+        } else {
+            TargetBinding::DirectGraph {
+                uri: uri.into(),
+                provider: StorageProvider::Local,
+            }
+        },
+        TargetProvenance::Inline {
+            address: uri.into(),
+        },
+    )
+}
+fn local_test_binding(path: &std::path::Path) -> omnigraph::storage::CapturedStorageBinding {
+    crate::scope::capture_storage_binding(&direct_test_target(path.to_str().unwrap(), true))
+        .unwrap()
+}
+fn server_test_target(endpoint: &str) -> crate::targets::ResolvedTarget {
+    use crate::targets::*;
+    ResolvedTarget::new(
+        TargetBinding::Server {
+            endpoint: endpoint.into(),
+            auth: ServerAuth::Anonymous,
+            default_graph: None,
+        },
+        TargetProvenance::Inline {
+            address: endpoint.into(),
+        },
+    )
 }

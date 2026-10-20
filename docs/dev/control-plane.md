@@ -14,19 +14,21 @@ The desired bundle is input, not runtime authority. A server reads the applied r
 its achieved result in the same process; direct apply requires a subsequent
 server start.
 
-Direct storage resolution defaults to the configuration directory and may instead
-use a local path, `file://`, `s3://`, or `az://` root. Remote capture reads the selected
-server's authenticated canonical root: omitted storage binds to it, while an
-explicit absolute root must match lexically without client storage access. The
-server independently validates canonical identity under its admission. Graph
-roots are derived as `graphs/<graph_id>.omni` beneath that root.
+The CLI selects the storage root from its captured target. `--config` supplies
+source only; an optional source `storage:` is an equality assertion against that
+root. Relative assertions resolve against the source directory. Server capture
+checks its authenticated canonical root, and the server independently validates
+canonical identity under its admission. Graph roots are derived as
+`graphs/<graph_id>.omni` beneath that root. Embedded/server callers retain their
+existing configuration-owned root selection.
 
 ## Managed CLI sessions
 
-Cluster control selects the service only with explicit `--managed`; folder
-context supplies identity after selection and never redirects direct/server
-deployment. The CLI rejects conflicting targets and wrong-mode flags before
-context, credentials, HTTP, or storage access. Data-command context is separate.
+A managed target supplies API, organization, authentication mechanism and optional
+cluster identity. Folder context cannot select a destination. The CLI validates
+operation applicability before credentials, HTTP or storage access. Legacy
+lifecycle evidence has a separate preservation guard: an explicit target cannot
+bypass pending/accepted custody migration.
 
 The CLI's managed HTTP adapter obtains current access before each new request,
 including status polls. A rotating credential pair lives only in the OS
@@ -96,7 +98,7 @@ revision. Retained roots, trust and storage format stay fixed. Removing a graph
 from desired configuration deletes its exact managed root, including all branches,
 retained history and managed Blob bytes. It does not follow external Blob
 references or delete peer roots. Adoption, missing-root recreation and catalog
-repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.13.
+repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.14.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
@@ -389,7 +391,7 @@ revision alone. Old-ID submission validates immutable input and returns the
 original record before graph closure; it cannot reinstall an old view. Boot
 digests remain boot facts. Explicit OIDC public-admission refresh is separate below.
 
-Protected graph and registry HTTP calls require the v0.13 contract header after
+Protected graph and registry HTTP calls require the v0.14 contract header after
 authentication and before graph resolution. CLI discovery and response validation
 are specified by [wire compatibility](versioning.md#wire-compatibility); the
 managed control-plane API and standard MCP/OAuth protocols are separate surfaces.
@@ -427,8 +429,8 @@ authorization still applies to ready graphs.
 
 The CLI's versioned keychain cache verifies endpoint and identity bindings before
 replacement. Unsupported caches refuse without automatic replacement. The provider-native client acquires missing/expired identity
-credentials before an operation and selects discovery in a managed folder.
-Explicit server addressing keeps the
+credentials before an operation using the selected managed target.
+A server target keeps the
 existing catalog unless `graphs list --discovery` is requested; the CLI never
 infers routing from an arbitrary bearer token's unverified shape.
 

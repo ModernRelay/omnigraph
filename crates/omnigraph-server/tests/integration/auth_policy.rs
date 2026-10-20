@@ -648,7 +648,7 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         Vec::new(),
         vec![HeaderValue::from_static("0.11")],
         vec![HeaderValue::from_static("0.12")],
-        vec![HeaderValue::from_static("0.14")],
+        vec![HeaderValue::from_static("0.13")],
         vec![HeaderValue::from_str(&format!("{HTTP_API_CONTRACT}, {HTTP_API_CONTRACT}")).unwrap()],
         vec![
             HeaderValue::from_static(HTTP_API_CONTRACT),
@@ -756,7 +756,7 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         .clone()
         .oneshot(
             Request::post(g("/mutate"))
-                .header("Omnigraph-Http-Api", "0.13")
+                .header("Omnigraph-Http-Api", HTTP_API_CONTRACT)
                 .header("authorization", "Bearer demo-token")
                 .header("content-type", "application/json")
                 .body(Body::from(payload))
@@ -3641,6 +3641,187 @@ fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -
     let checksum = sha2::Sha256::digest(&encoded);
     encoded.extend_from_slice(&checksum);
     engine.encode(encoded)
+}
+
+fn expecting(
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+    expected: &[&str],
+    body: Option<Value>,
+) -> Request<Body> {
+    let mut request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .uri(uri)
+        .method(method);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    for actor in expected {
+        request = request.header(omnigraph_server::api::IF_ACTOR_HEADER, *actor);
+    }
+    match body {
+        Some(body) => request
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+        None => request.body(Body::empty()).unwrap(),
+    }
+}
+
+fn assert_code(body: Value, code: omnigraph_server::api::ErrorCode, what: &str) {
+    let error: ErrorOutput = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(error.code, Some(code), "{what}: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expected_actor_header_narrows_a_request_and_never_supplies_an_actor() {
+    use omnigraph_server::api::ErrorCode;
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    drop(db);
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_YAML).unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![
+                ("act-bruno".to_string(), "bruno-token".to_string()),
+                ("act-ragnor".to_string(), "ragnor-token".to_string()),
+            ],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+    let change = json!({
+        "query": MUTATION_QUERIES,
+        "name": "insert_person",
+        "params": {"name": "Mina", "age": 28},
+        "branch": "feature",
+    });
+
+    // A matching assertion changes nothing.
+    let (status, body) = json_response(
+        &app,
+        expecting(
+            Method::GET,
+            &g("/snapshot"),
+            Some("bruno-token"),
+            &["act-bruno"],
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A mismatch refuses the write before it runs, and never makes the
+    // request act as the asserted actor.
+    let before = manifest_dataset_version(&graph).await;
+    let (status, body) = json_response(
+        &app,
+        expecting(
+            Method::POST,
+            &g("/mutate"),
+            Some("bruno-token"),
+            &["act-ragnor"],
+            Some(change.clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_code(body.clone(), ErrorCode::ActorMismatch, "mutate");
+    assert!(
+        body["error"].as_str().unwrap().contains("act-bruno"),
+        "{body}"
+    );
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+
+    for (what, request) in [
+        (
+            "registry",
+            expecting(
+                Method::GET,
+                "/graphs",
+                Some("bruno-token"),
+                &["act-ragnor"],
+                None,
+            ),
+        ),
+        (
+            "change feed",
+            expecting(
+                Method::GET,
+                &g("/changes?start=beginning"),
+                Some("bruno-token"),
+                &["act-ragnor"],
+                None,
+            ),
+        ),
+    ] {
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{what}: {body}");
+        assert_code(body, ErrorCode::ActorMismatch, what);
+    }
+
+    // Refusals before it keep their order: authentication, then the contract.
+    let (status, _) = json_response(
+        &app,
+        expecting(Method::GET, &g("/snapshot"), None, &["act-bruno"], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let mut no_contract = expecting(
+        Method::GET,
+        &g("/snapshot"),
+        Some("bruno-token"),
+        &["act-ragnor"],
+        None,
+    );
+    no_contract.headers_mut().remove(HTTP_API_CONTRACT_HEADER);
+    let (status, body) = json_response(&app, no_contract).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_code(body, ErrorCode::ApiContractMismatch, "contract first");
+
+    // A repeated, padded or empty assertion is malformed.
+    for expected in [
+        &["act-bruno", "act-bruno"][..],
+        &[" act-bruno"][..],
+        &[""][..],
+    ] {
+        let (status, body) = json_response(
+            &app,
+            expecting(
+                Method::GET,
+                &g("/snapshot"),
+                Some("bruno-token"),
+                expected,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{expected:?}: {body}");
+        assert_code(body, ErrorCode::BadRequest, "malformed");
+    }
+
+    // Without authentication there is no actor to match.
+    drop(app);
+    let app = build_app(
+        AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap(),
+    );
+    let (status, body) = json_response(
+        &app,
+        expecting(Method::GET, &g("/snapshot"), None, &["act-bruno"], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_code(body, ErrorCode::ActorMismatch, "unauthenticated");
 }
 
 async fn access(app: &axum::Router, query: &str, token: Option<&str>) -> (StatusCode, Value) {

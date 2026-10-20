@@ -149,8 +149,8 @@ idempotent; re-running is always safe.
 
 ```bash
 omnigraph cluster validate   # parse + typecheck everything
-omnigraph cluster plan       # preview what apply would do
-omnigraph cluster apply      # converge
+omnigraph cluster plan --target ./company-brain    # preview
+omnigraph cluster apply --target ./company-brain   # converge
 
 # Boot the server from the cluster dir; storage resolves through cluster.yaml
 omnigraph-server --cluster company-brain --bind 0.0.0.0:8080
@@ -164,7 +164,8 @@ containers, AWS/Railway/Azure, auth, and the object-store environment contracts.
 
 ## Query and mutate
 
-Set a default server and graph once in `~/.omnigraph/config.yaml`, and the
+Define a server target with `default_graph` and set `defaults.target` once in
+`~/.omnigraph/config.yaml` ([configuration](docs/user/cli/index.md)), and the
 everyday commands stay short. Stored queries and mutations run **by name**:
 
 ```bash
@@ -176,10 +177,10 @@ omnigraph branch create --from main agent/ingest-42
 omnigraph branch merge  agent/ingest-42 --into main
 ```
 
-An **alias** is shorter still: bind a server, graph, and stored query to one
+An **alias** is shorter still: bind a target, graph, and stored query to one
 name, then `omnigraph alias triage` runs it. For an ad-hoc target, any command
-still takes `--server <name|url> --graph <id>` (or `--store <uri>` for a local
-graph). See the [CLI reference](docs/user/cli/reference.md).
+takes `--target NAME|ADDRESS`, plus `--graph ID` for a graph within a server
+or direct root. Use `--target ./graph.omni` for a standalone graph. See the [CLI reference](docs/user/cli/reference.md).
 
 ## Security & governance
 

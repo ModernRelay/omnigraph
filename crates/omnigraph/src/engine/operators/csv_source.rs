@@ -13,9 +13,8 @@ use datafusion::physical_plan::{
 };
 use omnigraph_compiler::catalog::Catalog;
 
-use super::memory::WorkMemory;
-use super::producer::producer_stream;
-use super::{external, polled, streaming_properties};
+use super::external;
+use super::shape::{Source, work};
 use crate::loader::csv::{CsvLoadRequest, prepare_csv_batches};
 use crate::table_store::CapturedSource;
 
@@ -25,7 +24,7 @@ pub(crate) const CSV_SOURCE_ROWS: &str = "csv_source_rows";
 
 pub(crate) struct CsvSourceExec {
     parse: Arc<Parse>,
-    properties: Arc<PlanProperties>,
+    shape: Source,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -51,7 +50,7 @@ impl CsvSourceExec {
                 capture,
                 catalog,
             }),
-            properties: streaming_properties(schema),
+            shape: Source::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -87,7 +86,7 @@ impl ExecutionPlan for CsvSourceExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -108,16 +107,12 @@ impl ExecutionPlan for CsvSourceExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "CsvSourceExec has one partition");
-        let schema = self.schema();
-        let mut work = WorkMemory::new(ctx, "CsvSourceExec")?;
-        work.set_metrics(self.metrics.clone());
-        work.metric(CSV_SOURCE_ROWS, 0);
+        let memory = work(ctx, "CsvSourceExec", &self.metrics)?;
+        memory.metric(CSV_SOURCE_ROWS, 0);
         let parse = Arc::clone(&self.parse);
-        let stream = producer_stream(
-            schema,
-            Arc::new(work),
-            Some(&self.metrics),
-            move |memory, sender| async move {
+        Ok(self
+            .shape
+            .stream(memory, &self.metrics, move |memory, sender| async move {
                 let decoding = memory.child("CSV decoding")?;
                 decoding.checkpoint()?;
                 let prepared = prepare_csv_batches(
@@ -140,9 +135,7 @@ impl ExecutionPlan for CsvSourceExec {
                     sender.send(batch, Arc::clone(&memory)).await?;
                 }
                 Ok(())
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+            }))
     }
 }
 

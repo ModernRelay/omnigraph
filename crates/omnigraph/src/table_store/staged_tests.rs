@@ -1266,6 +1266,10 @@ async fn proven_insert_rejects_prepared_blob_descriptors_before_staging() {
 
 #[tokio::test]
 async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
+    let settings = omnigraph_compiler::settings::SessionSettings::default()
+        .with("write_max_bytes", "4093")
+        .unwrap();
+    let budget = WriteBudget::from_settings(&settings);
     for proven_commits_first in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
@@ -1284,7 +1288,7 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                 )
                 .unwrap(),
                 SYSTEM_COLUMNS_LEGACY,
-                WriteBudget::default(),
+                budget,
             )
             .await
             .unwrap();
@@ -1295,7 +1299,7 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                 person_pk_batch(&[("bob", Some(26))]),
                 KeyedWriteSemantics::StrictInsert,
                 SYSTEM_COLUMNS_LEGACY,
-                WriteBudget::default(),
+                budget,
             )
             .await
             .unwrap();
@@ -2464,59 +2468,130 @@ async fn stage_overwrite_empty_batch_replaces_all_rows() {
 /// allocation, and a zero-row batch between them contributes nothing.
 #[tokio::test]
 async fn stage_overwrite_batches_keeps_every_batch_in_one_overwrite() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    use arrow_select::concat::concat_batches;
+    use lance_file::reader::FileReader;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
-    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
-    let committed_fragment_ids: std::collections::HashSet<u64> =
-        ds.manifest.fragments.iter().map(|f| f.id).collect();
-    let pre_version = ds.version().version;
-
-    let staged = store
-        .stage_overwrite_batches(
-            &ds,
-            vec![
-                person_batch(&[("zoe", Some(99)), ("yan", Some(1))]),
-                person_batch(&[]),
-                person_batch(&[("xia", None)]),
-            ],
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        staged.transaction.operation,
-        Operation::Overwrite { .. }
-    ));
-    assert_eq!(
-        staged
-            .new_fragments()
-            .iter()
-            .map(|fragment| fragment.physical_rows.unwrap_or(0))
-            .sum::<usize>(),
-        3,
-        "the staged fragments hold every row of every batch"
+    // One hot column among many small ones makes the native per-column
+    // allowance observable while the entire input still fits write_max_bytes.
+    let mut fields = person_schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("payload", DataType::Utf8, false)));
+    fields.extend(
+        (0..29).map(|i| Arc::new(Field::new(format!("small_{i}"), DataType::Int32, false))),
     );
-    let removed: std::collections::HashSet<u64> =
-        staged.removed_fragment_ids().iter().copied().collect();
-    assert_eq!(removed, committed_fragment_ids);
-    assert_eq!(ds.version().version, pre_version);
-
-    let batches = store
-        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
-        .await
+    let schema = Arc::new(Schema::new(fields));
+    let batch = |rows: &[(&str, Option<i32>)]| {
+        let mut columns = person_batch(rows).columns().to_vec();
+        columns.push(Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|(id, _)| id.repeat(4096)),
+        )));
+        columns.extend((0..29).map(|i| Arc::new(Int32Array::from(vec![i; rows.len()])) as _));
+        RecordBatch::try_new(schema.clone(), columns).unwrap()
+    };
+    let inputs = vec![
+        batch(&[("zoe", Some(99)), ("yan", Some(1))]),
+        batch(&[]),
+        batch(&[("xia", None)]),
+    ];
+    let expected = concat_batches(&schema, &inputs).unwrap();
+    let small_settings = omnigraph_compiler::settings::SessionSettings::default()
+        .with("write_max_bytes", "131072")
         .unwrap();
-    assert_eq!(collect_ids(&batches), vec!["xia", "yan", "zoe"]);
+    for (budget, expected_hot_pages) in [
+        (WriteBudget::from_settings(&small_settings), 2),
+        (WriteBudget::default(), 1),
+    ] {
+        assert!(
+            inputs
+                .iter()
+                .map(|batch| batch.get_array_memory_size() as u64)
+                .sum::<u64>()
+                < budget.bytes()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
-    let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged)
-        .await
-        .unwrap();
-    assert_eq!(new_ds.version().version, pre_version + 1);
-    let after = store.scan_batches(&new_ds).await.unwrap();
-    assert_eq!(collect_ids(&after), vec!["xia", "yan", "zoe"]);
+        let ds = TableStore::write_dataset(&uri, batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        let committed_fragment_ids: std::collections::HashSet<u64> =
+            ds.manifest.fragments.iter().map(|f| f.id).collect();
+        let pre_version = ds.version().version;
+
+        let staged = store
+            .stage_overwrite_batches(&ds, inputs.clone(), budget)
+            .await
+            .unwrap();
+        assert!(matches!(
+            staged.transaction.operation,
+            Operation::Overwrite { .. }
+        ));
+        assert_eq!(
+            staged
+                .new_fragments()
+                .iter()
+                .map(|fragment| fragment.physical_rows.unwrap_or(0))
+                .sum::<usize>(),
+            3,
+            "the staged fragments hold every row of every batch"
+        );
+        let removed: std::collections::HashSet<u64> =
+            staged.removed_fragment_ids().iter().copied().collect();
+        assert_eq!(removed, committed_fragment_ids);
+        assert_eq!(ds.version().version, pre_version);
+        assert_eq!(
+            Dataset::open(&uri).await.unwrap().version().version,
+            pre_version
+        );
+
+        // Read the actual emitted V2_2 footer, not a copy of the options we
+        // passed. The smaller allowance flushes the hot column between input
+        // batches; cold columns retain one page. This measures page layout,
+        // not peak RSS or an encoded-page byte limit.
+        assert_eq!(staged.new_fragments().len(), 1);
+        let files = &staged.new_fragments()[0].files;
+        assert_eq!(files.len(), 1);
+        let scheduler = ScanScheduler::new(
+            ds.object_store(None).await.unwrap(),
+            SchedulerConfig::new(1024 * 1024),
+        );
+        let file = scheduler
+            .open_file(
+                &ds.data_dir().join(files[0].path.as_str()),
+                &files[0].file_size_bytes,
+            )
+            .await
+            .unwrap();
+        let metadata = FileReader::read_all_metadata(&file).await.unwrap();
+        assert_eq!(metadata.num_rows, 3);
+        assert_eq!(metadata.column_metadatas[2].pages.len(), expected_hot_pages);
+        assert_eq!(metadata.column_metadatas[3].pages.len(), 1);
+        assert_eq!(
+            metadata.column_metadatas[2]
+                .pages
+                .iter()
+                .map(|page| page.length)
+                .sum::<u64>(),
+            3
+        );
+
+        let batches = store
+            .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(&batches), vec!["xia", "yan", "zoe"]);
+        assert_eq!(concat_batches(&schema, &batches).unwrap(), expected);
+
+        let new_ds = store
+            .commit_staged(Arc::new(ds.clone()), staged)
+            .await
+            .unwrap();
+        assert_eq!(new_ds.version().version, pre_version + 1);
+        let after = store.scan_batches(&new_ds).await.unwrap();
+        assert_eq!(collect_ids(&after), vec!["xia", "yan", "zoe"]);
+        assert_eq!(concat_batches(&schema, &after).unwrap(), expected);
+    }
 }
 
 /// With no batch at all the overwrite carries no fragment and keeps the
@@ -2536,7 +2611,7 @@ async fn stage_overwrite_batches_with_no_batch_empties_the_table_keeping_its_sch
     let pre_version = ds.version().version;
 
     let staged = store
-        .stage_overwrite_batches(&ds, Vec::new())
+        .stage_overwrite_batches(&ds, Vec::new(), WriteBudget::default())
         .await
         .unwrap();
     assert!(staged.new_fragments().is_empty());

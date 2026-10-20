@@ -53,7 +53,7 @@ use lance_datafusion::exec::{
     ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
     collect_execution_metrics,
 };
-use lance_file::version::LanceFileVersion;
+use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
@@ -107,6 +107,19 @@ pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
 const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
 const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
 const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
+
+// Lance divides this per-writer accumulation allowance among top-level fields.
+// A complete input array can overshoot a column's threshold; nested leaves and
+// concurrent writers have independent queues. This is not an operation-wide
+// memory reservation. Keep copying slices so a small column cannot retain its
+// whole source batch. V2_2 does not enforce max_page_bytes in its encoder.
+fn budgeted_file_writer_options(write_budget: WriteBudget) -> FileWriterOptions {
+    FileWriterOptions {
+        data_cache_bytes: Some(write_budget.bytes()),
+        keep_original_array: Some(false),
+        max_page_bytes: None,
+    }
+}
 
 // Lance's ordinary Scanner stream executes SortExec with an unbounded memory
 // pool and spilling disabled. Every OmniGraph-ordered scan instead uses an
@@ -1502,6 +1515,10 @@ decide_seam! {
 }
 
 impl TableStore {
+    pub(crate) fn session(&self) -> Arc<lance::session::Session> {
+        self.session.clone()
+    }
+
     pub fn new(root_uri: &str, session: Arc<lance::session::Session>) -> Self {
         Self {
             root_uri: root_uri.trim_end_matches('/').to_string(),
@@ -1522,9 +1539,9 @@ impl TableStore {
     /// Authorize, normalize, deduplicate, and probe every URI before any
     /// external payload read, target ref creation, table commit, or
     /// graph-visible effect. Scalar-only preparation may already have produced
-    /// temporary in-memory or staged inputs. The graph session supplies the
-    /// process-wide shared registry, so one operation does not create cold
-    /// clients per row.
+    /// temporary in-memory or staged inputs. External sources retain their
+    /// independent provider registry; a selected graph destination never
+    /// overrides the source address or creates a cold client per row.
     pub(crate) async fn preflight_external_blob_uris(
         &self,
         uris: &[String],
@@ -1584,7 +1601,7 @@ impl TableStore {
         }
 
         crate::instrumentation::record_external_blob_preflight_inputs(uri_count);
-        let registry = self.session.store_registry();
+        let registry = crate::lance_access::external_source_registry(&self.session);
         let entries = futures::stream::iter(pending.into_values().map(|(normalized, aliases)| {
             let registry = Arc::clone(&registry);
             async move {
@@ -1735,7 +1752,8 @@ impl TableStore {
         if entry.native_dataset_branch.is_none() {
             return self.open_at_entry(entry).await;
         }
-        let dataset = match open_dataset_entry(entry, &self.root_uri, None).await {
+        let fresh = crate::lance_access::statement_session(self.session.store_registry(), 0, 0);
+        let dataset = match open_dataset_entry(entry, &self.root_uri, Some(&fresh)).await {
             Ok(dataset) => dataset,
             Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
                 // Cleanup can reclaim a pinned version of a live fork (a
@@ -3360,6 +3378,7 @@ impl TableStore {
         let ds = Arc::new(ds);
         let params = WriteParams {
             mode: WriteMode::Append,
+            file_writer_options: Some(budgeted_file_writer_options(write_budget)),
             allow_external_blob_outside_bases: false,
             auto_cleanup: None,
             skip_auto_cleanup: true,
@@ -4052,7 +4071,8 @@ impl TableStore {
             ));
         }
 
-        let store_params = crate::storage::lance_store_params_for_uri(dataset_uri)?;
+        let store_params =
+            crate::storage::lance_store_params_for_session(dataset_uri, &self.session)?;
         let handler = crate::storage_layer::lance_clone::configured_commit_handler(
             dataset_uri,
             &Some(store_params.clone()),
@@ -4335,7 +4355,10 @@ impl TableStore {
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
         let params = WriteParams {
             mode: WriteMode::Create,
-            store_params: Some(crate::storage::lance_store_params_for_uri(dataset_uri)?),
+            store_params: Some(crate::storage::lance_store_params_for_session(
+                dataset_uri,
+                &self.session,
+            )?),
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,
@@ -4636,7 +4659,8 @@ impl TableStore {
 
     /// Stage an overwrite from one batch; see [`Self::stage_overwrite_batches`].
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
-        self.stage_overwrite_batches(ds, vec![batch]).await
+        self.stage_overwrite_batches(ds, vec![batch], WriteBudget::default())
+            .await
     }
 
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments })
@@ -4655,6 +4679,7 @@ impl TableStore {
         &self,
         ds: &Dataset,
         batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
     ) -> Result<StagedWrite> {
         // Existing graph datasets retain stable row IDs through Overwrite;
         // keep the flag explicit at this write site too. This is not the
@@ -4686,6 +4711,7 @@ impl TableStore {
         } else {
             let params = WriteParams {
                 mode: WriteMode::Overwrite,
+                file_writer_options: Some(budgeted_file_writer_options(write_budget)),
                 enable_stable_row_ids: true,
                 allow_external_blob_outside_bases: true,
                 auto_cleanup: None,

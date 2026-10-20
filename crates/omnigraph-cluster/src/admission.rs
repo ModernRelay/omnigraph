@@ -97,6 +97,11 @@ impl ClusterAdmission {
         self.owner().store.io_scope()
     }
 
+    /// Provider authority captured before admission; descendant graph opens reuse it.
+    pub fn storage_binding(&self) -> Option<&omnigraph_storage::CapturedStorageBinding> {
+        self.owner().store.storage_binding()
+    }
+
     pub(crate) fn store(&self) -> ClusterStore {
         self.owner().store.clone()
     }
@@ -361,6 +366,31 @@ pub async fn acquire_graph_admission(
     let admission = acquire_cluster_admission(&root, purpose).await?;
     if let Some(owner) = admission {
         if let Err(refusal) = owner.validate_graph_uri(graph_uri).await {
+            return Err(owner.release_refused_preflight(refusal).await);
+        }
+        return Ok(Some(owner));
+    }
+    Ok(None)
+}
+
+/// Admit a graph using the same fixed provider authority for its cluster probe and lock.
+pub async fn acquire_graph_admission_with_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+    purpose: ClusterAdmissionPurpose,
+) -> Result<Option<ClusterAdmission>, Diagnostic> {
+    let Some(root) = crate::serve::cluster_root_for_graph_binding(binding).await? else {
+        return Ok(None);
+    };
+    let root_binding = binding
+        .for_uri(&root)
+        .map_err(|error| Diagnostic::error("storage_root_invalid", "storage", error.to_string()))?;
+    let mut store = ClusterStore::for_storage_binding(&root_binding)?;
+    if purpose == ClusterAdmissionPurpose::Serve {
+        store = store.with_io_scope(omnigraph_storage::StorageIoScope::new())?;
+    }
+    let admission = acquire_with_store(&store, purpose).await?;
+    if let Some(owner) = admission {
+        if let Err(refusal) = owner.validate_graph_uri(binding.uri()).await {
             return Err(owner.release_refused_preflight(refusal).await);
         }
         return Ok(Some(owner));
@@ -760,6 +790,24 @@ mod tests {
                 .code,
             "state_lock_held"
         );
+        // Execution uses the destination frozen at capture. Retargeting the
+        // original alias must not make that managed destination look standalone.
+        let binding = omnigraph_storage::CapturedStorageBinding::capture(
+            alias.to_str().unwrap(),
+            &omnigraph_storage::StorageDestination::Local,
+        )
+        .unwrap();
+        let standalone = alias_dir.path().join("standalone.omni");
+        std::fs::create_dir(&standalone).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&standalone, &alias).unwrap();
+        assert_eq!(
+            acquire_graph_admission_with_binding(&binding, ClusterAdmissionPurpose::GraphOperation)
+                .await
+                .unwrap_err()
+                .code,
+            "state_lock_held"
+        );
         owner.release_after_settlement().await.unwrap();
         let unknown = dir.path().join("graphs/unknown.omni");
         assert_eq!(
@@ -785,6 +833,18 @@ mod tests {
             .await
             .unwrap_err()
             .code,
+            "cluster_graph_root_mismatch"
+        );
+        let escaped = omnigraph_storage::CapturedStorageBinding::capture(
+            dir.path().join("graphs/knowledge.omni").to_str().unwrap(),
+            &omnigraph_storage::StorageDestination::Local,
+        )
+        .unwrap();
+        assert_eq!(
+            acquire_graph_admission_with_binding(&escaped, ClusterAdmissionPurpose::GraphOperation)
+                .await
+                .unwrap_err()
+                .code,
             "cluster_graph_root_mismatch"
         );
         assert!(!dir.path().join("__cluster/lock.json").exists());

@@ -893,7 +893,7 @@ async fn store(
 ) -> Result<(Arc<ObjectStore>, Path)> {
     let uri = history_uri(root_uri);
     let wrapper = crate::instrumentation::history_wrapper();
-    let mut params = crate::storage::lance_store_params_for_uri(&uri)?;
+    let mut params = crate::storage::lance_store_params_for_session(&uri, session)?;
     params.object_store_wrapper = wrapper.clone();
     let (store, path) = ObjectStore::from_uri_and_params(session.store_registry(), &uri, &params)
         .await

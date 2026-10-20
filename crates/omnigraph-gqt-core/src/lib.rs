@@ -3365,11 +3365,11 @@ fn check_planned_results(bound: &BoundPlan, result: &QueryResult) -> Result<(), 
     Ok(())
 }
 
-/// The executed plan, its explain document and the same run's report rows.
+/// The executed plan, its explain document and the same run's validated report.
 struct Inspection {
     plan: BoundPlan,
     explain: Value,
-    rows: Result<Vec<report::Row>, String>,
+    report: Result<report::Report, String>,
 }
 
 async fn run_query_step(
@@ -3420,10 +3420,18 @@ async fn run_query_step(
         let outcome = outcome.map_err(&fail)?;
         match outcome {
             Ok(run) => {
+                let explain = run.explain.to_value();
+                let report = report::read_report(&run.report).and_then(|report| {
+                    let profile = run
+                        .profile()
+                        .map_err(|error| format!("profile failed: {error}"))?;
+                    report.validate_ann(&explain, &profile)?;
+                    Ok(report)
+                });
                 let inspection = Inspection {
                     plan: run.plan,
-                    explain: run.explain.to_value(),
-                    rows: report::report_rows(&run.report),
+                    explain,
+                    report,
                 };
                 (Ok(run.result), counts, Some(inspection))
             }
@@ -3445,7 +3453,7 @@ async fn run_query_step(
         return Err(fail(violation));
     }
     if let Some(run) = &inspection {
-        run.rows.as_ref().map_err(|error| fail(error.clone()))?;
+        run.report.as_ref().map_err(|error| fail(error.clone()))?;
     }
     match &step.expect {
         QueryExpect::Rows {
@@ -3458,10 +3466,15 @@ async fn run_query_step(
             if let Some(run) = &inspection {
                 check_bound_plan_round_trip(&run.plan).map_err(&fail)?;
             }
-            if let (Some(plan), Some(Inspection { explain, rows, .. })) = (&step.plan, &inspection)
+            if let (
+                Some(plan),
+                Some(Inspection {
+                    explain, report, ..
+                }),
+            ) = (&step.plan, &inspection)
             {
                 validate_plan_columns(&plan.lines, &session.catalog()).map_err(&fail)?;
-                let report = rows.as_ref().ok().map(Vec::as_slice);
+                let report = report.as_ref().ok();
                 if let Some(mismatch) = plan_mismatch(&plan.lines, explain, report) {
                     return Err(fail(format!(
                         "{mismatch}\nexplain document:\n{}",
@@ -4001,7 +4014,7 @@ async fn run_control_step(
             let executed = outcome.as_ref().ok().map(|receipt| {
                 (
                     receipt.plan.as_ref().map(|explain| explain.to_value()),
-                    receipt.executed,
+                    receipt.executed.clone(),
                 )
             });
             check_write_expect(host, name, expect, outcome).map_err(&fail)?;
