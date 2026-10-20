@@ -134,21 +134,23 @@ What remains needs a decision.
 | A fresh-key or read request fails transiently | One attempt; the operation fails | Retried within Lance's client and throttle budgets |
 | A failure before the manifest request, or a request the store refused | 500 and keep serving (since #1092) | Unchanged |
 | A manifest request is ambiguous, then answered by a re-issue | Committed, or not committed (since #1092) | Unchanged |
-| A manifest request is still ambiguous after every re-issue | 500, then every graph closes, exit 2, lock retained | 500 (`outcome_unknown` on MCP); the server keeps serving; the branch's next publication either builds on the late commit or takes its version first |
+| A manifest request is still ambiguous after every re-issue | 500, then every graph closes, exit 2, lock retained | 500 `outcome_unknown`; the server keeps serving; the branch's next publication either builds on the late commit or takes its version first |
 | A mutable-key request has an unknown outcome | Every later mutation refused; release refused | Later requests to that key are refused; nothing else changes |
 | A panic, or lost ownership of a write | Contain, exit 2, lock retained | Contain, exit 2; a successor takes over after one lease of silence |
 | Clean SIGTERM | Release if settled, else retain the lock | Release unless a mutable key is unsettled; then exit nonzero and let the lease expire |
 | The process dies | The lock is held until an exact-ID `force-unlock` | A successor waits for a lease and a half of heartbeat silence, then takes over |
 
-An unknown publication is reported, not hidden. The operation returns the
-error it returns today: 500 `internal` on HTTP, `outcome_unknown: true` on
-MCP, and `execution: unknown` from the CLI. `/readyz` stays `serving`, and
-later writes to the branch proceed. The outcome becomes definite when the
-branch moves past the write's base: if the branch's next publication finds
-the late commit, the write committed; if it takes the version first, the
-write can never land. A read made before then is not final. How a client
-learns that answer belongs to
-[#1017](https://github.com/ModernRelay/omnigraph/pull/1017)'s outcome model.
+An unknown publication is reported, not hidden. It answers 500
+`outcome_unknown` on HTTP and MCP, with the disposition `effects: unknown`
+and `action: reconcile`; the CLI exits 2. `/readyz` stays `serving`, and
+later writes to the branch proceed. The publication is logged with its
+publication id: the graph commit id, or a control fact's attempt id. Its
+outcome becomes definite when the branch moves past the write's base: if the
+branch's next publication finds the late commit, the write committed; if it
+takes the version first, the write can never land. A read made before then
+is not final. Its identity on the wire belongs to the later
+`disposition.check` of [graph access and cross-process
+writes](https://github.com/ModernRelay/omnigraph/pull/1017).
 
 Orchestrators should restart a failed server, for example Railway
 `ON_FAILURE`. A restart that finds a held, renewed lock still refuses with
@@ -159,12 +161,13 @@ between 2 and 600 seconds, and the lock record carries it, so every successor
 uses the owner's value.
 
 This RFC adds no HTTP error code, CLI exit code or MCP field.
-[#1017](https://github.com/ModernRelay/omnigraph/pull/1017) carries the
-three-way outcome on the wire: `outcome_unknown`, `storage_unavailable`, the
-`outcome.check` identity and exit 2. Its first slice,
-[#1076](https://github.com/ModernRelay/omnigraph/pull/1076), answers an
-uncertain write `outcome_unknown`. This decision produces exactly the engine
-outcomes that model needs, so the two do not grow parallel shapes.
+[Graph access and cross-process
+writes](https://github.com/ModernRelay/omnigraph/pull/1017) carries the
+three-way outcome on the wire: `outcome_unknown`, the `disposition` object,
+its later `check` identity and exit 2.
+[#1076](https://github.com/ModernRelay/omnigraph/pull/1076) implements the
+code and the disposition. This decision produces exactly the engine outcomes
+that model needs, so the two do not grow parallel shapes.
 
 ## Design
 
@@ -568,9 +571,15 @@ phase 3.
   [engine settlement](2026-10-01-engine-settlement-and-resource-bounds.md)
   decisions fix today. Those RFCs get disposition notes when this one is
   accepted.
+- 2026-10-20: Aligned the user section with the accepted error body: the
+  unsettled write answers `outcome_unknown` with its `disposition`, the
+  pending branch's refusal is a one-branch `service_unavailable` with `retry`,
+  and a pending record keys a control fact by its attempt id.
 - 2026-10-20: §5 replaced its pending-publication registry with fencing by
   the version key, recorded under Alternatives, after the DST crash-state
   enumeration showed the registry landing a crashed operation's commit under
-  its rerun. §2 states who may call a version absent: only the commit's own
+  its rerun; the pending branch's refusal in the entry above goes with it,
+  and the unknown write keeps its accepted error body. §2 states who may call
+  a version absent: only the commit's own
   request record, after review of #1092 found the shared handler letting
   Lance delete a transaction file a late manifest would name.
