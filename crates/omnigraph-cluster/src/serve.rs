@@ -312,20 +312,44 @@ async fn read_root_bound_snapshot_with_store(
 /// Local aliases are resolved before testing the layout. Non-cluster-shaped
 /// remote URIs never probe storage. Works for `file://`, `s3://`, and `az://`.
 pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Result<Option<String>, Diagnostic> {
-    cluster_root_for_graph_impl(graph_uri, None).await
+    Ok(cluster_graph_impl(graph_uri, None)
+        .await?
+        .map(|location| location.root))
 }
 
 /// Probe cluster ownership without re-resolving provider endpoints from the environment.
 pub async fn cluster_root_for_graph_binding(
     binding: &omnigraph_storage::CapturedStorageBinding,
 ) -> Result<Option<String>, Diagnostic> {
-    cluster_root_for_graph_impl(binding.requested_uri(), Some(binding)).await
+    Ok(cluster_graph_for_graph_binding(binding)
+        .await?
+        .map(|location| location.root))
 }
 
-async fn cluster_root_for_graph_impl(
+/// A graph storage URI that lies in an actual cluster: the cluster's root and
+/// the graph id its layout names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterGraphLocation {
+    /// The cluster root, as [`cluster_root_for_graph_binding`] reports it.
+    pub root: String,
+    /// The `<id>` of `<root>/graphs/<id>.omni`. The layout names it; whether
+    /// the cluster applies or serves that graph is the ledger's to say.
+    pub graph_id: String,
+}
+
+/// [`cluster_root_for_graph_binding`] with the graph id the layout names,
+/// taken from the same spelling, canonical before lexical, whose root holds
+/// the state ledger.
+pub async fn cluster_graph_for_graph_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+) -> Result<Option<ClusterGraphLocation>, Diagnostic> {
+    cluster_graph_impl(binding.requested_uri(), Some(binding)).await
+}
+
+async fn cluster_graph_impl(
     graph_uri: &str,
     binding: Option<&omnigraph_storage::CapturedStorageBinding>,
-) -> Result<Option<String>, Diagnostic> {
+) -> Result<Option<ClusterGraphLocation>, Diagnostic> {
     // A captured destination is already canonical: resolving its original
     // alias again could probe a different graph than execution will open.
     // Unbound callers resolve aliases here. Also inspect the lexical layout so
@@ -339,7 +363,7 @@ async fn cluster_root_for_graph_impl(
     })?;
     let mut roots = BTreeSet::new();
     for uri in [&canonical, &lexical] {
-        let Some(root) = cluster_root_of_graph_layout(uri) else {
+        let Some((root, graph_id)) = cluster_graph_of_layout(uri) else {
             continue;
         };
         if !roots.insert(root.clone()) {
@@ -362,7 +386,10 @@ async fn cluster_root_for_graph_impl(
             )
         })?;
         if has_state {
-            return Ok(Some(store.display_root().to_string()));
+            return Ok(Some(ClusterGraphLocation {
+                root: store.display_root().to_string(),
+                graph_id,
+            }));
         }
     }
     Ok(None)
@@ -493,17 +520,17 @@ fn applied_graph_ids(state: &crate::types::ClusterState) -> Vec<String> {
     ids
 }
 
-/// Split `<root>/graphs/<id>.omni` → `<root>`, gating on the exact cluster
-/// graph-layout shape (a single `<id>` segment, no nested path). `None` for
-/// anything else — no I/O is done for non-cluster-shaped URIs.
-fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
+/// Split `<root>/graphs/<id>.omni` → `(<root>, <id>)`, gating on the exact
+/// cluster graph-layout shape (a single `<id>` segment, no nested path). `None`
+/// for anything else — no I/O is done for non-cluster-shaped URIs.
+fn cluster_graph_of_layout(graph_uri: &str) -> Option<(String, String)> {
     let trimmed = graph_uri.trim_end_matches('/');
     let rest = trimmed.strip_suffix(".omni")?;
     let (root, id) = rest.rsplit_once("/graphs/")?;
     if root.is_empty() || id.is_empty() || id.contains('/') {
         return None;
     }
-    Some(root.to_string())
+    Some((root.to_string(), id.to_string()))
 }
 
 pub(crate) async fn read_snapshot_with_store(
@@ -938,25 +965,26 @@ mod tests {
     #[test]
     fn graph_layout_gating_does_no_io_for_non_cluster_shapes() {
         // Only `<root>/graphs/<id>.omni` matches; everything else is None.
+        let pair = |root: &str, id: &str| Some((root.to_string(), id.to_string()));
         assert_eq!(
-            cluster_root_of_graph_layout("/data/cluster/graphs/kb.omni").as_deref(),
-            Some("/data/cluster")
+            cluster_graph_of_layout("/data/cluster/graphs/kb.omni"),
+            pair("/data/cluster", "kb")
         );
         assert_eq!(
-            cluster_root_of_graph_layout("s3://bucket/prefix/graphs/kb.omni").as_deref(),
-            Some("s3://bucket/prefix")
+            cluster_graph_of_layout("s3://bucket/prefix/graphs/kb.omni"),
+            pair("s3://bucket/prefix", "kb")
         );
         assert_eq!(
-            cluster_root_of_graph_layout("az://container/prefix/graphs/kb.omni").as_deref(),
-            Some("az://container/prefix")
+            cluster_graph_of_layout("az://container/prefix/graphs/kb.omni"),
+            pair("az://container/prefix", "kb")
         );
-        assert_eq!(cluster_root_of_graph_layout("./kb.omni"), None);
-        assert_eq!(cluster_root_of_graph_layout("s3://bucket/kb.omni"), None);
-        assert_eq!(cluster_root_of_graph_layout("az://container/kb.omni"), None);
+        assert_eq!(cluster_graph_of_layout("./kb.omni"), None);
+        assert_eq!(cluster_graph_of_layout("s3://bucket/kb.omni"), None);
+        assert_eq!(cluster_graph_of_layout("az://container/kb.omni"), None);
         // nested id under graphs/ is not the cluster layout
-        assert_eq!(cluster_root_of_graph_layout("/c/graphs/a/b.omni"), None);
+        assert_eq!(cluster_graph_of_layout("/c/graphs/a/b.omni"), None);
         // not a .omni graph
-        assert_eq!(cluster_root_of_graph_layout("/c/graphs/kb"), None);
+        assert_eq!(cluster_graph_of_layout("/c/graphs/kb"), None);
     }
 
     #[tokio::test]
