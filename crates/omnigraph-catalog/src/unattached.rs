@@ -258,11 +258,18 @@ impl UnattachedCommit {
     }
 
     /// The snapshot's view, labelled with its physical coordinate.
-    pub fn snapshot(&self, root_uri: &str) -> Result<crate::Snapshot> {
+    /// Its reads go through the store registry of `session`, the reading
+    /// handle's control session.
+    pub fn snapshot(
+        &self,
+        root_uri: &str,
+        session: &Arc<lance::session::Session>,
+    ) -> Result<crate::Snapshot> {
         let mut snapshot = self.record.snapshot_as(
             root_uri,
             self.detached_version,
             self.property.native_branch.as_deref(),
+            session,
         )?;
         snapshot.graph_branch = self.property.graph_branch.clone();
         Ok(snapshot)

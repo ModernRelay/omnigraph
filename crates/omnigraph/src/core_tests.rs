@@ -160,6 +160,7 @@ mod fts_compat_tests {
             &mut dataset,
             "certificate-clone",
             version,
+            None,
         )
         .await
         .unwrap();
@@ -482,10 +483,11 @@ mod branch_control_tests {
             dataset.branches().get(native).await,
             Err(lance::Error::RefNotFound { .. })
         ));
-        let error = create_branch_recoverably(&mut dataset, "team/data/feature/child", version)
-            .await
-            .err()
-            .expect("retired path must refuse a descendant");
+        let error =
+            create_branch_recoverably(&mut dataset, "team/data/feature/child", version, None)
+                .await
+                .err()
+                .expect("retired path must refuse a descendant");
         assert!(error.to_string().contains("retired branch"), "{error}");
     }
 }
