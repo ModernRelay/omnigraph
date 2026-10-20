@@ -887,8 +887,12 @@ async fn retained_merge_bases(
             if resolver.search().needs_import() {
                 if retired.is_none() {
                     retired = Some(
-                        ManifestCoordinator::retired_commit_graphs(db.root_uri(), &db.history)
-                            .await?,
+                        ManifestCoordinator::retired_commit_graphs_with_session(
+                            db.root_uri(),
+                            &db.history,
+                            &db.control_session(),
+                        )
+                        .await?,
                     );
                 }
                 for (native, graph) in retired.as_ref().expect("retired histories were loaded") {
@@ -1180,7 +1184,12 @@ pub(crate) async fn plan_collection(
     let (bases, imported_owners) = retained_merge_bases(db, &captured_lineages, live_count).await?;
     report.protected_manifest_branches.extend(imported_owners);
     for base in bases {
-        let pinned = ManifestCoordinator::pinned_graph_commit(db.root_uri(), &base).await?;
+        let pinned = ManifestCoordinator::pinned_graph_commit_with_session(
+            db.root_uri(),
+            &base,
+            &db.control_session(),
+        )
+        .await?;
         report
             .protected_manifest_branches
             .extend(pinned.dataset.manifest().branch.iter().cloned());
@@ -2678,6 +2687,71 @@ mod overlay_retention_tests {
             .iter()
             .find(|plan| plan.location == table_uri)
             .unwrap();
+        if !cfg!(debug_assertions) {
+            // Native overlays are experimental in release builds. Qualify refusal
+            // and retention without enabling the process-wide upstream opt-in.
+            assert!(!lance_table::feature_flags::can_read_dataset(
+                lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES
+            ));
+            assert_ne!(
+                overlay.manifest().reader_feature_flags
+                    & lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+                0
+            );
+            // forbidden-api-allow: test-only cold read verifies native release refusal
+            let error = lance::dataset::builder::DatasetBuilder::from_uri(&table_uri)
+                .with_session(Arc::new(lance::session::Session::default()))
+                .with_version(version)
+                .load()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, lance::Error::NotSupported { .. }),
+                "{error:?}"
+            );
+            assert!(
+                plan.errors
+                    .iter()
+                    .any(|error| error.contains("Not supported")),
+                "{:?}",
+                plan.errors
+            );
+            assert!(report.tables.iter().all(|plan| {
+                plan.sweep_paths.is_empty()
+                    && plan.dead_paths.is_empty()
+                    && plan.orphan_paths.is_empty()
+            }));
+            let mut expected = CollectorPathSnapshot::default();
+            capture_dataset_paths(&mut expected, &source, &table_uri)
+                .await
+                .unwrap();
+            capture_dataset_paths(&mut expected, &overlay, &table_uri)
+                .await
+                .unwrap();
+            assert!(
+                expected
+                    .objects
+                    .iter()
+                    .any(|object| object.path == overlay_path)
+            );
+            assert!(expected.missing_paths().await.unwrap().is_empty());
+            let rows = db.cleanup(options).await.unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row.type_key == entry.type_key)
+                .unwrap();
+            assert!(
+                row.error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("trace did not finish")),
+                "{row:?}"
+            );
+            assert_eq!(row.bytes_removed, 0);
+            assert_eq!(row.old_versions_removed, 0);
+            assert_eq!(row.manifests_removed, 0);
+            assert!(expected.missing_paths().await.unwrap().is_empty());
+            return;
+        }
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(if foreign {
             plan.foreign_versions.contains(&version)

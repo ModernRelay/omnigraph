@@ -27,7 +27,7 @@ Run an ad-hoc query with:
 
 ```bash
 omnigraph query engineers --query queries.gq \
-  --params '{"title":"Engineer"}' --store graph.omni
+  --params '{"title":"Engineer"}' --target ./graph.omni
 ```
 
 ## Declarations and parameters
@@ -264,7 +264,7 @@ Reads default to `main`. Select another branch or an immutable commit with
 
 ```bash
 omnigraph query engineers --query queries.gq --branch review \
-  --params '{"title":"Engineer"}' --store graph.omni
+  --params '{"title":"Engineer"}' --target ./graph.omni
 ```
 
 When the snapshot has an effective graph head, `omnigraph query --json`

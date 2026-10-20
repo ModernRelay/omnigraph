@@ -1,484 +1,220 @@
-//! The operator config surface (RFC-007): `~/.omnigraph/config.yaml` — who
-//! the operator IS (identity, ergonomics), never what the system is (that's
-//! cluster config) and never a project file (nothing here arrives with a
-//! repo checkout).
-//!
-//! PR-1 scope: `operator.actor` + `defaults.output`. Unknown keys WARN and
-//! are preserved-by-ignoring — a file written for a newer CLI (servers,
-//! aliases, credentials keys from later slices) must load cleanly on this
-//! one. Contrast with `cluster.yaml`, where unknown keys are fatal because
-//! they change what a plan means.
-//!
-//! This module is CLI-only by design: the server never reads operator
-//! config (server-side identity comes from bearer auth — invariant 11
-//! holds by construction).
+//! Versioned operator configuration and endpoint-bound local credentials.
+//! Routing is captured lazily once per invocation. Legacy routing is accepted
+//! only by the explicit, offline `target import` migration.
 
 use std::collections::BTreeMap;
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::graph_http::RequestTarget;
 use crate::read_format::{ReadOutputFormat, TableCellLayout};
 
 pub(crate) const OPERATOR_HOME_ENV: &str = "OMNIGRAPH_HOME";
 pub(crate) const OPERATOR_DIR: &str = ".omnigraph";
 pub(crate) const OPERATOR_CONFIG_FILE: &str = "config.yaml";
+pub(crate) const OPERATOR_FILE_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const RETIRED_PROFILE_ENV: &str = "OMNIGRAPH_PROFILE";
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OperatorConfig {
+    pub(crate) target_config_version: Option<u32>,
+    #[serde(default)]
+    pub(crate) targets: BTreeMap<String, crate::targets::TargetEntry>,
     #[serde(default)]
     pub(crate) operator: OperatorIdentity,
     #[serde(default)]
     pub(crate) defaults: OperatorDefaults,
-    /// Operator-owned endpoint definitions (RFC-007 §D2/§D4): name → url.
-    /// The name keys the credential chain; nothing a repo checkout supplies
-    /// can redefine an entry here. No tokens in this file, ever.
-    #[serde(default)]
-    pub(crate) servers: BTreeMap<String, OperatorServer>,
-    /// Personal alias bindings (RFC-007 PR 3); see OperatorAlias.
     #[serde(default)]
     pub(crate) aliases: BTreeMap<String, OperatorAlias>,
-    /// Named scope bundles (RFC-011): each binds exactly one of
-    /// {server, cluster, store} plus an optional default graph. Config data,
-    /// not state — selecting one (`--profile`/`OMNIGRAPH_PROFILE`) fills in a
-    /// command's omitted addressing; it never puts you "in" a mode.
-    #[serde(default)]
-    pub(crate) profiles: BTreeMap<String, OperatorProfile>,
-    /// Managed-cluster storage roots (RFC-011): name → root URI. The ONLY
-    /// place a storage root appears in operator config — admin-only and
-    /// opt-in; a normal operator's file has none.
-    #[serde(default)]
-    pub(crate) clusters: BTreeMap<String, OperatorCluster>,
-    /// Everything this CLI version doesn't know. Warned once at load,
-    /// otherwise ignored (forward compatibility within the operator layer).
-    #[serde(flatten)]
-    unknown: yaml_serde::Mapping,
+    #[serde(skip)]
+    pub(crate) base_dir: PathBuf,
 }
 
-/// A personal alias: a pure BINDING to a stored query on a named server —
-/// never content, never a file (RFC-007 §D2 "Aliases are bindings, not
-/// content"). The stored query is the team's contract; the alias, its
-/// defaults, and its name are the operator's.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OperatorAlias {
-    /// Names an entry under `servers:`.
-    pub(crate) server: String,
-    /// Graph id for multi-graph servers (appends `/graphs/<id>`).
+    pub(crate) target: String,
     pub(crate) graph: Option<String>,
-    /// The STORED query's name on that server.
     pub(crate) query: String,
-    /// Positional CLI args bind to these param names, in order.
     #[serde(default)]
     pub(crate) args: Vec<String>,
-    /// Fixed default params; positionals and `--params` override per key.
     #[serde(default)]
     pub(crate) params: yaml_serde::Mapping,
     pub(crate) format: Option<ReadOutputFormat>,
-    #[serde(flatten)]
-    unknown: yaml_serde::Mapping,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct OperatorServer {
-    pub(crate) url: String,
-    #[serde(flatten)]
-    unknown: yaml_serde::Mapping,
-}
-
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OperatorIdentity {
-    /// Default actor for every `--as` cascade (CLI direct-engine writes and
-    /// cluster commands alike): `--as` > this > none.
     pub(crate) actor: Option<String>,
-    #[serde(flatten)]
-    unknown: yaml_serde::Mapping,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OperatorDefaults {
-    /// Default read output format, below every more-specific source.
     pub(crate) output: Option<ReadOutputFormat>,
-    /// Table rendering preferences for `--format table`.
     pub(crate) table_max_column_width: Option<usize>,
     pub(crate) table_cell_layout: Option<TableCellLayout>,
-    /// Default server scope (RFC-011): the everyday addressing when no
-    /// `--profile` / primitive / legacy address is given. Names an entry
-    /// under `servers:`. Mutually exclusive with `store` — a scope binds one
-    /// entity.
-    pub(crate) server: Option<String>,
-    /// Default **store** scope (RFC-011): a `file://` / `s3://` / `az://` graph storage
-    /// URI used as the zero-flag local default for graph commands when no
-    /// `--profile` / primitive address is given. The local-dev counterpart of
-    /// `server`; mutually exclusive with it.
-    pub(crate) store: Option<String>,
-    /// Default graph selected within a server/cluster scope when no
-    /// `--graph` is passed (RFC-011).
-    pub(crate) default_graph: Option<String>,
-    #[serde(flatten)]
-    unknown: yaml_serde::Mapping,
-}
-
-/// A named scope bundle (RFC-011): exactly one of {server, cluster, store}
-/// plus an optional default graph. Validated on use (`binding()`), not at
-/// parse time, so an unknown CLI's profile still loads.
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct OperatorProfile {
-    /// Names an entry under `servers:` — a served scope.
-    pub(crate) server: Option<String>,
-    /// Names an entry under `clusters:` — a privileged direct cluster scope.
-    pub(crate) cluster: Option<String>,
-    /// A single graph's storage URI — a direct store scope.
-    pub(crate) store: Option<String>,
-    /// Default graph within a server/cluster scope (ignored for a store,
-    /// which is already one graph).
-    pub(crate) default_graph: Option<String>,
-    #[serde(flatten)]
-    unknown: yaml_serde::Mapping,
-}
-
-/// A managed-cluster storage root (RFC-011).
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct OperatorCluster {
-    /// The cluster's storage-root URI (`file://` / `s3://` / `az://`).
-    pub(crate) root: String,
-    #[serde(flatten)]
-    unknown: yaml_serde::Mapping,
-}
-
-/// The one entity a profile (or flat default) binds. Exactly one variant —
-/// the scope resolver consumes this; "exactly one of server/cluster/store"
-/// is enforced when producing it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScopeBinding {
-    /// Served scope: a server name (resolved against `servers:`) or a literal URL.
-    Server(String),
-    /// Direct cluster scope: a cluster name (resolved against `clusters:`) or a
-    /// literal root URI.
-    Cluster(String),
-    /// Direct store scope: a single graph's storage URI.
-    Store(String),
+    pub(crate) target: Option<String>,
 }
 
 impl OperatorConfig {
+    pub(crate) fn alias(&self, name: &str) -> Result<&OperatorAlias> {
+        self.aliases.get(name).ok_or_else(|| {
+            let defined = self.aliases.keys().map(String::as_str).collect::<Vec<_>>().join(", ");
+            crate::targets::refusal("alias_unknown", format!(
+                "unknown alias '{name}'; defined aliases: [{defined}] (add it under `aliases:` in the operator config)"
+            ))
+        })
+    }
     pub(crate) fn actor(&self) -> Option<&str> {
         self.operator.actor.as_deref()
     }
-
     pub(crate) fn output(&self) -> Option<ReadOutputFormat> {
         self.defaults.output
     }
-
-    /// The gh-host model: which operator server (if any) does a request
-    /// sent to `target` belong to? The server whose own target has the same
-    /// endpoint and whose path segments lead the request's, deepest first, so
-    /// `url: http://h:8080` covers `http://h:8080/graphs/spike` but never
-    /// `http://h:8080-evil`, a `..` that climbs out of a path-prefixed `url`,
-    /// or another socket. An entry the transport cannot address matches
-    /// nothing.
-    pub(crate) fn find_server_for_target(&self, target: &RequestTarget) -> Option<&str> {
-        let mut best: Option<(&str, usize)> = None;
-        for (name, server) in &self.servers {
-            let Ok(base) = RequestTarget::of(&server.url, &server.url) else {
-                continue;
-            };
-            if target.is_under(&base) && best.is_none_or(|(_, depth)| base.depth() > depth) {
-                best = Some((name, base.depth()));
-            }
-        }
-        best.map(|(name, _)| name)
-    }
-
-    /// A named profile, if defined (RFC-011).
-    pub(crate) fn profile(&self, name: &str) -> Option<&OperatorProfile> {
-        self.profiles.get(name)
-    }
-
-    /// The storage root of a named cluster, if defined (RFC-011).
-    pub(crate) fn cluster_root(&self, name: &str) -> Option<&str> {
-        self.clusters.get(name).map(|c| c.root.as_str())
-    }
-
-    /// The flat-default server scope name, if set (RFC-011).
-    pub(crate) fn default_server(&self) -> Option<&str> {
-        self.defaults.server.as_deref()
-    }
-
-    /// The flat-default store scope URI, if set (RFC-011) — the zero-flag
-    /// local-dev default.
-    pub(crate) fn default_store(&self) -> Option<&str> {
-        self.defaults.store.as_deref()
-    }
-
-    /// The flat-default graph within a server/cluster scope, if set (RFC-011).
-    pub(crate) fn default_graph(&self) -> Option<&str> {
-        self.defaults.default_graph.as_deref()
-    }
-
-    /// A scope binds one entity (Decision 6): `defaults.server` and
-    /// `defaults.store` are mutually exclusive, and a `store` (already a single
-    /// graph) cannot carry a `default_graph`. Both are refused loudly rather
-    /// than silently dropped.
-    fn validate_defaults(&self) -> Result<()> {
-        if self.defaults.server.is_some() && self.defaults.store.is_some() {
-            bail!(
-                "operator config `defaults` sets both `server` and `store` — a default scope \
-                 binds one entity; keep one (use a `profile` if you need both)"
-            );
-        }
-        if self.defaults.store.is_some() && self.defaults.default_graph.is_some() {
-            bail!(
-                "operator config `defaults` sets both `store` and `default_graph` — a store is \
-                 already a single graph; drop `default_graph` (it applies only to a server/cluster scope)"
-            );
-        }
-        Ok(())
-    }
-
-    /// Each server's token variable is its own: `a-b` and `a_b`, or `prod`
-    /// and `PROD`, spell one `OMNIGRAPH_TOKEN_<NAME>`, which would bind one
-    /// token to both servers. Such names are refused loudly, naming both.
-    fn validate_server_token_names(&self) -> Result<()> {
-        let mut owners: BTreeMap<String, &str> = BTreeMap::new();
-        for name in self.servers.keys() {
-            if let Some(other) = owners.insert(token_env_name(name), name) {
-                bail!(
-                    "operator config `servers` entries `{other}` and `{name}` share the token \
-                     variable {}; rename one so each server has its own credential",
-                    token_env_name(name)
-                );
-            }
-        }
-        Ok(())
-    }
 }
 
-impl OperatorProfile {
-    /// The single entity this profile binds, or a loud error if it binds zero
-    /// or more than one of {server, cluster, store} (Decision 6: a scope binds
-    /// exactly one entity). Validated here, on use, rather than at parse time.
-    pub(crate) fn binding(&self, profile_name: &str) -> Result<ScopeBinding> {
-        let set: Vec<&str> = [
-            self.server.as_ref().map(|_| "server"),
-            self.cluster.as_ref().map(|_| "cluster"),
-            self.store.as_ref().map(|_| "store"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        match set.as_slice() {
-            ["server"] => Ok(ScopeBinding::Server(self.server.clone().unwrap())),
-            ["cluster"] => Ok(ScopeBinding::Cluster(self.cluster.clone().unwrap())),
-            ["store"] => Ok(ScopeBinding::Store(self.store.clone().unwrap())),
-            [] => Err(eyre!(
-                "profile '{profile_name}' binds no scope; set exactly one of \
-                 `server`, `cluster`, or `store`"
-            )),
-            many => Err(eyre!(
-                "profile '{profile_name}' binds {} scopes ({}); a profile must \
-                 bind exactly one of `server`, `cluster`, or `store`",
-                many.len(),
-                many.join(", ")
-            )),
-        }
-    }
-}
-
-/// The operator dir: `$OMNIGRAPH_HOME` if set (tilde-expanded), else
-/// `~/.omnigraph`. Returns None when no home directory is resolvable
-/// (degenerate environments — the layer is simply absent).
 pub(crate) fn operator_dir() -> Option<PathBuf> {
     if let Some(home_override) = env::var_os(OPERATOR_HOME_ENV) {
-        let raw = home_override.to_string_lossy().into_owned();
-        return Some(expand_tilde(&raw));
+        return Some(expand_tilde(&home_override.to_string_lossy()));
     }
     env::home_dir().map(|home| home.join(OPERATOR_DIR))
 }
 
-/// Configuration inputs selected once for this invocation. Reading the file is
-/// lazy so wrong-mode and argument refusals still precede configuration access.
-/// Only routing/configuration is retained; managed token renewal stays with its
-/// existing credential owner.
 #[derive(Debug)]
 pub(crate) struct InvocationConfig {
     directory: Option<PathBuf>,
-    profile: Option<String>,
-    profile_present: bool,
-    captured: OnceLock<CapturedOperator>,
-    warnings: OnceLock<std::result::Result<(), (io::ErrorKind, String)>>,
-}
-
-#[derive(Debug)]
-struct CapturedOperator {
-    config: std::result::Result<OperatorConfig, String>,
-    warnings: Vec<u8>,
+    retired_profile_present: bool,
+    captured: OnceLock<std::result::Result<OperatorConfig, String>>,
 }
 
 impl InvocationConfig {
     pub(crate) fn capture() -> Self {
-        let profile = env::var_os(crate::scope::PROFILE_ENV);
-        let mut input = Self::at(
-            operator_dir(),
-            profile
-                .as_ref()
-                .and_then(|value| value.to_str())
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
-        );
-        // Managed ambiguity detection also rejects a non-Unicode ambient
-        // profile, while the ordinary profile resolver cannot select that name.
-        input.profile_present = profile.is_some_and(|value| !value.is_empty());
+        let mut input = Self::at(operator_dir(), None);
+        input.retired_profile_present =
+            env::var_os(RETIRED_PROFILE_ENV).is_some_and(|v| !v.is_empty());
         input
     }
-
-    pub(crate) fn at(directory: Option<PathBuf>, profile: Option<String>) -> Self {
+    pub(crate) fn at(directory: Option<PathBuf>, retired_profile: Option<String>) -> Self {
         Self {
             directory,
-            profile_present: profile.as_ref().is_some_and(|value| !value.is_empty()),
-            profile,
+            retired_profile_present: retired_profile.is_some_and(|v| !v.is_empty()),
             captured: OnceLock::new(),
-            warnings: OnceLock::new(),
         }
     }
-
     pub(crate) fn has_profile(&self) -> bool {
-        self.profile_present
+        self.retired_profile_present
     }
-
-    pub(crate) fn profile(&self) -> Option<&str> {
-        self.profile.as_deref()
+    pub(crate) fn directory(&self) -> Option<&Path> {
+        self.directory.as_deref()
     }
-
     pub(crate) fn config_path(&self) -> Option<PathBuf> {
         self.directory
             .as_ref()
             .map(|dir| dir.join(OPERATOR_CONFIG_FILE))
     }
-
     pub(crate) fn credentials_path(&self) -> Option<PathBuf> {
         self.directory
             .as_ref()
             .map(|dir| dir.join(CREDENTIALS_FILE))
     }
-
-    fn captured(&self, stderr: &mut dyn Write) -> Result<&CapturedOperator> {
-        let captured = self.captured.get_or_init(|| {
-            let mut warnings = Vec::new();
-            let config = match &self.directory {
-                Some(dir) => load_operator_config_at_with_writer(
-                    &dir.join(OPERATOR_CONFIG_FILE),
-                    &mut warnings,
-                ),
-                None => Ok(OperatorConfig::default()),
-            }
-            .map_err(|error| error.to_string());
-            CapturedOperator { config, warnings }
-        });
-        let warnings = self.warnings.get_or_init(|| {
-            if captured.warnings.is_empty() {
-                return Ok(());
-            }
-            stderr
-                .write_all(&captured.warnings)
-                .and_then(|()| stderr.flush())
-                .map_err(|error| (error.kind(), error.to_string()))
-        });
-        if let Err((kind, message)) = warnings {
-            return Err(io::Error::new(*kind, message.clone()).into());
-        }
-        Ok(captured)
-    }
-
-    pub(crate) fn get(&self, stderr: &mut dyn Write) -> Result<&OperatorConfig> {
-        self.captured(stderr)?
-            .config
+    pub(crate) fn get(&self, _stderr: &mut dyn Write) -> Result<&OperatorConfig> {
+        self.captured
+            .get_or_init(|| {
+                match self.config_path() {
+                    Some(path) => load_operator_config_at(&path),
+                    None => Ok(OperatorConfig::default()),
+                }
+                .map_err(|error| error.to_string())
+            })
             .as_ref()
-            .map_err(|message| eyre!(message.clone()))
-    }
-
-    /// Existing managed query presentation tolerates an invalid optional config.
-    /// Diagnostic delivery failures still propagate; they are not config absence.
-    pub(crate) fn optional_get(&self, stderr: &mut dyn Write) -> Result<Option<&OperatorConfig>> {
-        Ok(self.captured(stderr)?.config.as_ref().ok())
+            .map_err(|message| crate::targets::refusal("target_config_invalid", message.clone()))
     }
 }
 
-#[cfg(test)]
-pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
-    load_operator_config_at_with_writer(path, &mut io::sink())
-}
-
-/// Load the operator layer. Absent file (or unresolvable home) is an empty
-/// layer, never an error; a present-but-malformed file is a loud error (the
-/// operator owns it and can fix it); unknown keys warn to stderr once.
-fn load_operator_config_at_with_writer(
-    path: &Path,
-    stderr: &mut dyn Write,
-) -> Result<OperatorConfig> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(OperatorConfig::default());
-        }
-        Err(err) => {
-            return Err(eyre!(
-                "could not read operator config '{}': {err}",
-                path.display()
-            ));
-        }
+/// Bounded operator-owned text input, including config, credentials and backups.
+pub(crate) fn read_operator_file(path: &Path, description: &str) -> Result<Option<String>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => bail!("could not read {description} '{}': {error}", path.display()),
     };
-    let config: OperatorConfig = yaml_serde::from_str(&text).map_err(|err| {
-        eyre!(
-            "could not parse operator config '{}': {err}",
-            path.display()
-        )
-    })?;
-    for warning in config.unknown_key_warnings() {
-        writeln!(
-            stderr,
-            "warning: {warning} in operator config '{}'",
-            path.display()
-        )?;
+    let mut text = String::new();
+    file.take(OPERATOR_FILE_MAX_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| eyre!("could not read {description} '{}': {error}", path.display()))?;
+    if text.len() > OPERATOR_FILE_MAX_BYTES {
+        bail!("{description} exceeds 1 MiB");
     }
-    config.validate_defaults()?;
-    config.validate_server_token_names()?;
+    Ok(Some(text))
+}
+
+pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
+    let Some(text) = read_operator_file(path, "operator config")? else {
+        return Ok(OperatorConfig::default());
+    };
+    if text.trim().is_empty() {
+        bail!(
+            "operator config '{}' has no target_config_version; run `omnigraph target import`",
+            path.display()
+        );
+    }
+    let mut config = parse_operator_config(&text)
+        .map_err(|err| eyre!("operator config '{}': {err}", path.display()))?;
+    config.base_dir = path.parent().unwrap_or(Path::new(".")).to_owned();
     Ok(config)
 }
 
-impl OperatorConfig {
-    fn unknown_key_warnings(&self) -> Vec<String> {
-        let mut warnings = Vec::new();
-        let mut collect = |mapping: &yaml_serde::Mapping, prefix: &str| {
-            for key in mapping.keys() {
-                if let Some(name) = key.as_str() {
-                    warnings.push(format!(
-                        "unknown key `{prefix}{name}` (newer CLI feature or typo); ignored"
-                    ));
-                }
-            }
-        };
-        collect(&self.unknown, "");
-        collect(&self.operator.unknown, "operator.");
-        collect(&self.defaults.unknown, "defaults.");
-        for (name, server) in &self.servers {
-            collect(&server.unknown, &format!("servers.{name}."));
-        }
-        for (name, alias) in &self.aliases {
-            collect(&alias.unknown, &format!("aliases.{name}."));
-        }
-        for (name, profile) in &self.profiles {
-            collect(&profile.unknown, &format!("profiles.{name}."));
-        }
-        for (name, cluster) in &self.clusters {
-            collect(&cluster.unknown, &format!("clusters.{name}."));
-        }
-        warnings
+pub(crate) fn parse_operator_config(text: &str) -> Result<OperatorConfig> {
+    if text.trim().is_empty() {
+        return Ok(OperatorConfig::default());
     }
+    // Value's mapping deserializer refuses duplicate keys before typed decoding.
+    let value: yaml_serde::Value = yaml_serde::from_str(text)?;
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| eyre!("operator configuration must be a mapping"))?;
+    if ["servers", "profiles", "clusters"]
+        .iter()
+        .any(|key| mapping.contains_key(*key))
+        || mapping
+            .get("defaults")
+            .and_then(yaml_serde::Value::as_mapping)
+            .is_some_and(|defaults| {
+                ["server", "store", "default_graph"]
+                    .iter()
+                    .any(|key| defaults.contains_key(*key))
+            })
+        || mapping
+            .get("aliases")
+            .and_then(yaml_serde::Value::as_mapping)
+            .is_some_and(|aliases| {
+                aliases.values().any(|alias| {
+                    alias
+                        .as_mapping()
+                        .is_some_and(|entry| entry.contains_key("server"))
+                })
+            })
+    {
+        bail!(
+            "legacy operator routing is removed; run `omnigraph target import` to convert this file before using it"
+        );
+    }
+    if !mapping.contains_key("target_config_version") {
+        bail!(
+            "legacy operator format is removed; run `omnigraph target import` (target files require `target_config_version: 1`)"
+        );
+    }
+    let config: OperatorConfig = yaml_serde::from_value(value)?;
+    crate::targets::validate_config(&config)?;
+    Ok(config)
 }
 
 // ---- keyed credentials (RFC-007 §D4) ----
@@ -498,74 +234,103 @@ pub(crate) fn token_env_name(server: &str) -> String {
     name
 }
 
-/// The keyed token chain for a named server (§D4 steps 1–2):
-/// `OMNIGRAPH_TOKEN_<NAME>` env → `[<name>]` in the credentials file.
-/// `Ok(None)` means "no keyed token": the request carries no credential. A
-/// present-but-unreadable/over-permissive credentials file is a loud error,
-/// never a silent skip.
-pub(crate) fn resolve_keyed_token_at(server: &str, path: Option<&Path>) -> Result<Option<String>> {
-    if let Ok(token) = env::var(token_env_name(server)) {
-        let token = token.trim();
-        if !token.is_empty() {
-            return Ok(Some(token.to_string()));
-        }
-    }
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    read_credential_at(path, server)
+/// A stored token and the endpoint authority it was issued for.
+pub(crate) struct StoredCredential {
+    pub(crate) token: String,
+    pub(crate) endpoint: Option<String>,
 }
 
-pub(crate) fn read_credential_at(path: &Path, server: &str) -> Result<Option<String>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(eyre!(
-                "could not read credentials file '{}': {err}",
-                path.display()
-            ));
-        }
+impl std::fmt::Debug for StoredCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCredential")
+            .field("token", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn read_credential_at(path: &Path, owner: &str) -> Result<Option<String>> {
+    Ok(read_bound_credential_at(path, owner)?.map(|entry| entry.token))
+}
+
+pub(crate) fn read_bound_credential_at(
+    path: &Path,
+    owner: &str,
+) -> Result<Option<StoredCredential>> {
+    let Some(text) = read_operator_file(path, "credentials file")? else {
+        return Ok(None);
     };
     refuse_over_permissive(path)?;
-    let mut in_section = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_section = section.trim() == server;
-            continue;
-        }
-        if in_section {
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim() == "token" {
-                    let value = unquote(value.trim());
-                    if value.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(value.to_string()));
-                }
+    let mut sections: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut selected = None;
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            if !crate::targets::valid_name(name) || sections.contains_key(name) {
+                bail!("credentials file contains an invalid or duplicate owner");
+            }
+            sections.insert(name.into(), BTreeMap::new());
+            selected = Some(name.to_owned());
+        } else {
+            let name = selected
+                .as_deref()
+                .ok_or_else(|| eyre!("credential value outside an owner section"))?;
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| eyre!("malformed credential entry"))?;
+            let key = key.trim();
+            if !matches!(key, "token" | "endpoint")
+                || sections
+                    .get_mut(name)
+                    .unwrap()
+                    .insert(key.into(), unquote(value.trim()).into())
+                    .is_some()
+            {
+                bail!("credentials file contains an unknown or duplicate field");
             }
         }
     }
-    Ok(None)
+    let Some(mut entry) = sections.remove(owner) else {
+        return Ok(None);
+    };
+    let token = entry.remove("token").unwrap_or_default();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(StoredCredential {
+        token,
+        endpoint: entry.remove("endpoint"),
+    }))
 }
 
-pub(crate) fn rewrite_credentials_at(path: &Path, server: &str, token: Option<&str>) -> Result<()> {
-    let existing = match std::fs::read_to_string(path) {
-        Ok(text) => {
+#[cfg(test)]
+pub(crate) fn rewrite_credentials_at(path: &Path, owner: &str, token: Option<&str>) -> Result<()> {
+    rewrite_bound_credentials_at(path, owner, None, token)
+}
+
+pub(crate) fn rewrite_bound_credentials_at(
+    path: &Path,
+    server: &str,
+    endpoint: Option<&str>,
+    token: Option<&str>,
+) -> Result<()> {
+    if !crate::targets::valid_name(server) {
+        bail!("invalid credential owner");
+    }
+    if token.is_some_and(|token| token.contains(['\n', '\r'])) {
+        bail!("a bearer token must occupy one line");
+    }
+    let _lock = crate::targets::ConfigEditLock::acquire(path)?;
+    let existing = match read_operator_file(path, "credentials file")? {
+        Some(text) => {
             refuse_over_permissive(path)?;
             text
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => {
-            return Err(eyre!(
-                "could not read credentials file '{}': {err}",
-                path.display()
-            ));
-        }
+        None => String::new(),
     };
 
     // Drop the target section (if present), keep everything else verbatim.
@@ -589,40 +354,37 @@ pub(crate) fn rewrite_credentials_at(path: &Path, server: &str, token: Option<&s
             out.push('\n');
         }
         out.push_str(&format!("[{server}]\ntoken = {token}\n"));
+        if let Some(endpoint) = endpoint {
+            out.push_str(&format!("endpoint = {endpoint}\n"));
+        }
     }
 
+    if out.len() > OPERATOR_FILE_MAX_BYTES {
+        bail!("credentials file exceeds 1 MiB");
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    write_owner_only(&tmp, &out)?;
-    std::fs::rename(&tmp, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre!("credential path has no parent directory"))?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(out.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|error| {
         eyre!(
-            "could not move credentials file into place '{}': {err}",
-            path.display()
+            "could not replace credentials file '{}': {}",
+            path.display(),
+            error.error
         )
     })?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_owner_only(path: &Path, content: &str) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(content.as_bytes())?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_owner_only(path: &Path, content: &str) -> Result<()> {
-    std::fs::write(path, content)?;
+    crate::sync_dir(parent)?;
     Ok(())
 }
 
@@ -677,361 +439,6 @@ pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
-
-    #[test]
-    fn absent_file_is_an_empty_layer() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = load_operator_config_at(&dir.path().join("config.yaml")).unwrap();
-        assert!(config.actor().is_none());
-        assert!(config.output().is_none());
-    }
-
-    #[test]
-    fn parses_identity_and_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        fs::write(
-            &path,
-            "operator:\n  actor: act-andrew\ndefaults:\n  output: json\n",
-        )
-        .unwrap();
-        let config = load_operator_config_at(&path).unwrap();
-        assert_eq!(config.actor(), Some("act-andrew"));
-        assert_eq!(config.output(), Some(ReadOutputFormat::Json));
-    }
-
-    #[test]
-    fn defaults_store_parses_and_is_accessible() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        fs::write(&path, "defaults:\n  store: file:///tmp/dev.omni\n").unwrap();
-        let config = load_operator_config_at(&path).unwrap();
-        assert_eq!(config.default_store(), Some("file:///tmp/dev.omni"));
-        assert_eq!(config.default_server(), None);
-    }
-
-    #[test]
-    fn defaults_server_and_store_together_is_a_loud_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        fs::write(
-            &path,
-            "defaults:\n  server: prod\n  store: file:///tmp/dev.omni\n",
-        )
-        .unwrap();
-        let err = load_operator_config_at(&path).unwrap_err().to_string();
-        assert!(err.contains("binds one entity"), "{err}");
-    }
-
-    #[test]
-    fn defaults_store_with_default_graph_is_a_loud_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        fs::write(
-            &path,
-            "defaults:\n  store: file:///tmp/dev.omni\n  default_graph: knowledge\n",
-        )
-        .unwrap();
-        let err = load_operator_config_at(&path).unwrap_err().to_string();
-        assert!(err.contains("already a single graph"), "{err}");
-    }
-
-    #[test]
-    fn invocation_config_is_lazy_and_retains_a_failed_snapshot() {
-        let home = tempfile::tempdir().unwrap();
-        let path = home.path().join(OPERATOR_CONFIG_FILE);
-        fs::write(&path, "servers: [\n").unwrap();
-        let input = InvocationConfig::at(Some(home.path().to_owned()), Some("selected".into()));
-        assert!(input.captured.get().is_none());
-        assert_eq!(
-            input.credentials_path(),
-            Some(home.path().join(CREDENTIALS_FILE))
-        );
-        assert_eq!(input.profile(), Some("selected"));
-        assert!(input.has_profile());
-        let error = input.get(&mut Vec::new()).unwrap_err().to_string();
-        fs::write(&path, "defaults: { store: graph.omni }\n").unwrap();
-        assert_eq!(input.get(&mut Vec::new()).unwrap_err().to_string(), error);
-        assert!(input.optional_get(&mut Vec::new()).unwrap().is_none());
-        let fresh = InvocationConfig::at(Some(home.path().to_owned()), None);
-        assert_eq!(
-            fresh.get(&mut Vec::new()).unwrap().default_store(),
-            Some("graph.omni")
-        );
-    }
-
-    #[test]
-    fn invocation_warning_failure_is_not_config_absence_or_retried_delivery() {
-        struct FailedWarning {
-            flush: bool,
-            writes: usize,
-        }
-        impl Write for FailedWarning {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.writes += 1;
-                if self.flush {
-                    Ok(bytes.len())
-                } else {
-                    Err(io::ErrorKind::BrokenPipe.into())
-                }
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Err(io::ErrorKind::BrokenPipe.into())
-            }
-        }
-        let home = tempfile::tempdir().unwrap();
-        let path = home.path().join(OPERATOR_CONFIG_FILE);
-        for flush in [false, true] {
-            fs::write(&path, "future: true\ndefaults: { store: original.omni }\n").unwrap();
-            let input = InvocationConfig::at(Some(home.path().to_owned()), None);
-            let mut stderr = FailedWarning { flush, writes: 0 };
-            let error = input.get(&mut stderr).unwrap_err();
-            assert_eq!(
-                error.downcast_ref::<io::Error>().unwrap().kind(),
-                io::ErrorKind::BrokenPipe
-            );
-            assert_eq!(stderr.writes, 1);
-            fs::write(&path, "defaults: { store: replacement.omni }\n").unwrap();
-            let mut retry = Vec::new();
-            let error = input.optional_get(&mut retry).unwrap_err();
-            assert_eq!(
-                error.downcast_ref::<io::Error>().unwrap().kind(),
-                io::ErrorKind::BrokenPipe
-            );
-            assert!(retry.is_empty());
-            assert_eq!(
-                input
-                    .captured
-                    .get()
-                    .unwrap()
-                    .config
-                    .as_ref()
-                    .unwrap()
-                    .default_store(),
-                Some("original.omni")
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_keys_warn_but_load() {
-        // A file written for a later slice (servers/aliases) must load
-        // cleanly today — warn-only forward compatibility.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        fs::write(
-            &path,
-            "operator:\n  actor: act-a\n  color: green\nservers:\n  prod:\n    url: https://example.com\naliases: {}\n",
-        )
-        .unwrap();
-        let config = load_operator_config_at(&path).unwrap();
-        assert_eq!(config.actor(), Some("act-a"));
-        let warnings = config.unknown_key_warnings();
-        // `servers` (PR 2) and `aliases` (PR 3) are known keys now.
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("`operator.color`")));
-        assert_eq!(config.servers["prod"].url, "https://example.com");
-    }
-
-    #[test]
-    fn parses_profiles_clusters_and_scope_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        let yaml = "\
-defaults:
-  server: prod
-  default_graph: knowledge
-servers:
-  prod:
-    url: https://example.com
-clusters:
-  brain:
-    root: s3://acme/clusters/brain
-profiles:
-  staging:
-    server: staging
-    default_graph: knowledge
-  brain-admin:
-    cluster: brain
-    default_graph: knowledge
-";
-        fs::write(&path, yaml).unwrap();
-        let config = load_operator_config_at(&path).unwrap();
-        assert_eq!(config.default_server(), Some("prod"));
-        assert_eq!(config.default_graph(), Some("knowledge"));
-        assert_eq!(
-            config.cluster_root("brain"),
-            Some("s3://acme/clusters/brain")
-        );
-        assert_eq!(
-            config
-                .profile("staging")
-                .unwrap()
-                .binding("staging")
-                .unwrap(),
-            ScopeBinding::Server("staging".into())
-        );
-        assert_eq!(
-            config
-                .profile("brain-admin")
-                .unwrap()
-                .binding("brain-admin")
-                .unwrap(),
-            ScopeBinding::Cluster("brain".into())
-        );
-        // No unknown-key warnings for the new blocks.
-        assert!(
-            config.unknown_key_warnings().is_empty(),
-            "{:?}",
-            config.unknown_key_warnings()
-        );
-    }
-
-    #[test]
-    fn profile_binding_rejects_zero_or_multiple_entities() {
-        let none = OperatorProfile::default();
-        let err = none.binding("p").unwrap_err().to_string();
-        assert!(err.contains("binds no scope"), "{err}");
-
-        let two = OperatorProfile {
-            server: Some("prod".into()),
-            store: Some("graph.omni".into()),
-            ..Default::default()
-        };
-        let err = two.binding("p").unwrap_err().to_string();
-        assert!(err.contains("binds 2 scopes"), "{err}");
-        assert!(err.contains("server") && err.contains("store"), "{err}");
-    }
-
-    #[test]
-    fn unknown_keys_in_a_profile_warn() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        fs::write(
-            &path,
-            "profiles:\n  p:\n    server: prod\n    flavour: spicy\n",
-        )
-        .unwrap();
-        let config = load_operator_config_at(&path).unwrap();
-        let warnings = config.unknown_key_warnings();
-        assert!(
-            warnings.iter().any(|w| w.contains("`profiles.p.flavour`")),
-            "{warnings:?}"
-        );
-    }
-
-    #[test]
-    fn malformed_yaml_is_a_loud_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        fs::write(&path, "operator: [not, a, mapping\n").unwrap();
-        let err = load_operator_config_at(&path).unwrap_err();
-        assert!(err.to_string().contains("could not parse operator config"));
-    }
-
-    #[test]
-    fn servers_sharing_a_token_variable_are_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        for (first, second) in [("a-b", "a_b"), ("prod", "PROD")] {
-            fs::write(
-                &path,
-                format!(
-                    "servers:\n  {first}:\n    url: http://h:1\n  {second}:\n    url: http://h:2\n"
-                ),
-            )
-            .unwrap();
-            let err = load_operator_config_at(&path).unwrap_err().to_string();
-            assert!(
-                err.contains(&format!(
-                    "share the token variable {}",
-                    token_env_name(first)
-                )),
-                "{err}"
-            );
-            assert!(err.contains(first) && err.contains(second), "{err}");
-        }
-        fs::write(
-            &path,
-            "servers:\n  a-b:\n    url: http://h:1\n  ab:\n    url: http://h:2\n",
-        )
-        .unwrap();
-        load_operator_config_at(&path).unwrap();
-    }
-
-    #[test]
-    fn find_server_for_target_matches_where_the_request_is_sent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        fs::write(
-            &path,
-            "servers:\n  dev:\n    url: http://h:8080\n  dev-spike:\n    url: http://h:8080/graphs/spike\n  \
-               tenant:\n    url: https://t.example/tenant-a/\n  og:\n    url: unix:///tmp/og/og.sock\n",
-        )
-        .unwrap();
-        let config = load_operator_config_at(&path).unwrap();
-        let server = |url: &str| {
-            let target = RequestTarget::of(url, url).unwrap();
-            config.find_server_for_target(&target)
-        };
-        assert_eq!(server("http://h:8080"), Some("dev"));
-        assert_eq!(server("http://H:8080/graphs/other"), Some("dev"));
-        // The deepest base wins.
-        assert_eq!(
-            server("http://h:8080/graphs/spike/queries/q"),
-            Some("dev-spike")
-        );
-        assert_eq!(server("http://h:8080/graphs/spike/../other"), Some("dev"));
-        assert_eq!(
-            server("http://h:8080/graphs/x/../spike/queries/q"),
-            Some("dev-spike")
-        );
-        // A different host, port or scheme is a different server; a port
-        // that does not parse addresses nothing.
-        assert!(RequestTarget::of("http://h:8080-evil/x", "http://h:8080-evil/x").is_err());
-        assert_eq!(server("http://h-evil:8080/x"), None);
-        assert_eq!(server("http://other:9999"), None);
-        assert_eq!(server("https://h:8080"), None);
-        // The default port is the same endpoint; a sibling prefix is not.
-        assert_eq!(
-            server("https://t.example:443/tenant-a/graphs/g"),
-            Some("tenant")
-        );
-        assert_eq!(server("https://t.example/tenant-ab/graphs/g"), None);
-        assert_eq!(server("https://t.example/tenant-a/../tenant-b"), None);
-        assert_eq!(server("https://t.example/tenant-a/%2e%2e/tenant-b"), None);
-        // A socket is matched by the path the transport connects to.
-        #[cfg(unix)]
-        {
-            let socket = |root: &str| {
-                let target = RequestTarget::of(root, &format!("{root}/graphs/g")).unwrap();
-                config.find_server_for_target(&target)
-            };
-            assert_eq!(socket("unix:///tmp/og/og.sock"), Some("og"));
-            assert_eq!(socket("unix:///tmp/og/./og.sock"), Some("og"));
-            assert_eq!(socket("unix:///tmp/og/og.sock/../evil.sock"), None);
-        }
-    }
-
-    #[test]
-    fn server_lookup_supports_targeting() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        fs::write(
-            &path,
-            "servers:\n  intel-dev:\n    url: http://127.0.0.1:8080/\n",
-        )
-        .unwrap();
-        let config = load_operator_config_at(&path).unwrap();
-        // the --server resolution shape: bare url and graph-scoped url
-        let base = config.servers["intel-dev"].url.trim_end_matches('/');
-        assert_eq!(base, "http://127.0.0.1:8080");
-        assert_eq!(
-            format!("{base}/graphs/spike"),
-            "http://127.0.0.1:8080/graphs/spike"
-        );
-    }
-
     #[test]
     fn token_env_name_uppercases_and_underscores() {
         assert_eq!(token_env_name("intel-dev"), "OMNIGRAPH_TOKEN_INTEL_DEV");
@@ -1069,6 +476,17 @@ profiles:
             read_credential_at(&path, "dev").unwrap().as_deref(),
             Some("tok-dev")
         );
+        let original = fs::read_to_string(&path).unwrap();
+        for length in [OPERATOR_FILE_MAX_BYTES, OPERATOR_FILE_MAX_BYTES + 1] {
+            let padded = format!("{original}#{}", "x".repeat(length - original.len() - 1));
+            fs::write(&path, padded).unwrap();
+            let result = read_credential_at(&path, "dev");
+            if length == OPERATOR_FILE_MAX_BYTES {
+                assert_eq!(result.unwrap().as_deref(), Some("tok-dev"));
+            } else {
+                assert!(result.unwrap_err().to_string().contains("exceeds 1 MiB"));
+            }
+        }
     }
 
     #[cfg(unix)]

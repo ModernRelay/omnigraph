@@ -115,7 +115,7 @@ reports the undelivered diagnostic and its disposition, and the exit still
 follows it.
 
 For the data commands the CLI classifies (queries, reads, `load`, `mutate`,
-branch, commit, schema and Blob commands, aliases and target commands), the
+branch, commit, schema and Blob commands, and aliases), the
 exit follows from the disposition:
 
 | CLI exit | What to do |
@@ -128,9 +128,9 @@ exit follows from the disposition:
 | 64 | The argument parser refused the command line before anything ran (`EX_USAGE`); an addressing refusal inside a command, such as two scope flags, exits 1. |
 
 Maintenance commands (`init`, `upgrade`, `optimize`, `rebuild-full-text-indexes`,
-`repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy` and the
-managed commands keep their own exits for now: their exit 1 does not by itself
-say that nothing changed, so read their report.
+`repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy`,
+`target`, `credential` and the managed commands keep their own exits for now:
+their exit 1 does not by itself say that nothing changed, so read their report.
 
 A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
 `api_contract_mismatch` exits 1 with `effects: none`, and `action: refresh` for
@@ -217,7 +217,7 @@ between graph roots.
   [ownership transfer](../deployment.md#writer-topology).
 - Directory boot reads `cluster.yaml` to resolve storage, but served graph,
   query, and policy resources come from applied state. Submit configuration
-  changes with `cluster apply --server` for live activation.
+  changes with `cluster apply --target` for live activation.
 - By default one graph that cannot open is quarantined while healthy graphs
   serve. Use `--require-all-graphs` when partial startup is unacceptable.
 - `external_blob_base_overlaps_storage_root`: an `external_blobs` base lies
@@ -283,10 +283,10 @@ See [Maintenance](maintenance.md) and [Deployment](../deployment.md).
 
 ```bash
 omnigraph version
-omnigraph snapshot --store ./graph.omni --json
-omnigraph commit list --store ./graph.omni --json
-omnigraph cluster status --config ./company-brain --json
-omnigraph repair ./graph.omni --json
+omnigraph snapshot --target ./graph.omni --json
+omnigraph commit list --target ./graph.omni --json
+omnigraph cluster status --target ./company-brain --json
+omnigraph repair --target ./graph.omni --json
 ```
 
 For server requests, retain the HTTP status, response body, request path,

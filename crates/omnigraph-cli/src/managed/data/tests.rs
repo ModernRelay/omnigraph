@@ -26,21 +26,19 @@ async fn ordinary_graph_command_acquires_missing_or_expired_identity_once_before
             expire_identity(&mut saved);
             save(&store, &context, &saved);
         }
-        let dir = tempfile::tempdir().unwrap();
-        super::super::save_context(dir.path(), &context).unwrap();
+
         let cli =
             Cli::try_parse_from(["omnigraph", "mutate", "m", "--graph", "knowledge"]).unwrap();
         let client = resolve_with_acquisition(
             &cli,
-            dir.path(),
+            &context,
             &store,
-            || Ok(false),
             async |_| Ok(Some("alice".into())),
             async |context| Api::new(context.api.clone(), Some("provider-access".into())),
         )
         .await
         .unwrap();
-        assert!(client.is_some());
+        let _ = client;
         assert_eq!(cp.requests().len(), 1);
         assert_eq!(cp.requests()[0].path, "/v1/clusters/cluster-a/tokens");
         assert_eq!(
@@ -50,49 +48,23 @@ async fn ordinary_graph_command_acquires_missing_or_expired_identity_once_before
         assert!(
             resolve_with_acquisition(
                 &cli,
-                dir.path(),
+                &context,
                 &store,
-                || Ok(false),
                 async |_| Ok(Some("alice".into())),
                 async |_| { panic!("valid graph credential must not call the API") }
             )
             .await
-            .unwrap()
-            .is_some()
+            .is_ok()
         );
         cp.assert_complete();
     }
 }
 
 #[tokio::test]
-async fn acquisition_preserves_explicit_target_priority_and_refuses_retired_credentials() {
+async fn acquisition_refuses_retired_credentials_without_replacement() {
     let context = context();
-    let dir = tempfile::tempdir().unwrap();
-    super::super::save_context(dir.path(), &context).unwrap();
+
     let store = MemoryStore::default();
-    let explicit = Cli::try_parse_from([
-        "omnigraph",
-        "query",
-        "q",
-        "--server",
-        "https://explicit.example",
-        "--graph",
-        "knowledge",
-    ])
-    .unwrap();
-    assert!(
-        resolve_with_acquisition(
-            &explicit,
-            dir.path(),
-            &store,
-            || panic!("explicit target reads ambient state"),
-            async |_| panic!("explicit target reads managed identity"),
-            async |_| panic!("explicit target calls issuer")
-        )
-        .await
-        .unwrap()
-        .is_none()
-    );
     let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
     for corruption in [
         "retired-cache",
@@ -144,9 +116,8 @@ async fn acquisition_preserves_explicit_target_priority_and_refuses_retired_cred
         let before = store.get(&key(&context)).unwrap();
         let failure = resolve_with_acquisition(
             &cli,
-            dir.path(),
+            &context,
             &store,
-            || Ok(false),
             async |_| panic!("invalid cache consulted identity"),
             async |_| panic!("invalid cache called issuer"),
         )
@@ -167,9 +138,8 @@ async fn acquisition_preserves_explicit_target_priority_and_refuses_retired_cred
         save(&store, &context, &initially_expired);
         let failure = resolve_with_acquisition(
             &cli,
-            dir.path(),
+            &context,
             &store,
-            || Ok(false),
             async |_| {
                 save(&store, &context, &cached);
                 Ok(Some("alice".into()))
@@ -208,15 +178,13 @@ async fn acquisition_never_reuses_another_principal_or_accepts_a_wrong_issued_id
     let old = identity_credential(&context, "https://data.example");
     save(&store, &context, &old);
     let before = store.get(&key(&context)).unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    super::super::save_context(dir.path(), &context).unwrap();
+
     let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
     assert!(
         resolve_with_acquisition(
             &cli,
-            dir.path(),
+            &context,
             &store,
-            || Ok(false),
             async |_| Ok(Some("bob".into())),
             async |context| Api::new(context.api.clone(), Some("bob-provider-token".into()))
         )
@@ -229,7 +197,10 @@ async fn acquisition_never_reuses_another_principal_or_accepts_a_wrong_issued_id
 
 fn context() -> Context {
     Context {
-        version: 2,
+        incarnation: "incarnation-a".into(),
+        endpoint: Some("https://data.example".into()),
+        default_graph: None,
+        control_auth: super::super::ControlAuth::HumanDevice,
         organization_id: "org_test".into(),
         cluster: "cluster-a".into(),
         api: "https://control.example".into(),
@@ -334,36 +305,9 @@ fn token_arguments_bound_lifetime_and_refuse_removed_actions() {
     ] {
         assert!(graph_id(bad).is_err());
     }
-    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--managed", "--clear"]).is_ok());
-    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--managed"]).is_ok());
-    assert!(
-        Cli::try_parse_from([
-            "omnigraph",
-            "cluster",
-            "token",
-            "--managed",
-            "--actions",
-            "read"
-        ])
-        .is_err()
-    );
-    assert!(
-        Cli::try_parse_from(["omnigraph", "cluster", "status", "--direct"])
-            .unwrap()
-            .direct
-    );
-    assert!(
-        Cli::try_parse_from([
-            "omnigraph",
-            "query",
-            "q",
-            "--direct",
-            "--server",
-            "https://data.example"
-        ])
-        .unwrap()
-        .direct
-    );
+    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--clear"]).is_ok());
+    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token"]).is_ok());
+    assert!(Cli::try_parse_from(["omnigraph", "query", "q", "--direct"]).is_err());
 }
 
 #[tokio::test]
@@ -376,6 +320,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
     let mut context = context();
     let cp = IntentApiFixture::with_origin(|origin| {
         context.api = origin.to_owned();
+        context.endpoint = Some(data.origin.clone());
         let response_credential = credential(&context, &data.origin);
         let mut response = response_credential.metadata();
         response["token"] = json!(response_credential.token);
@@ -492,6 +437,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
     let mut context = context();
     let cp = IntentApiFixture::with_origin(|origin| {
         context.api = origin.to_owned();
+        context.endpoint = Some(data.origin.clone());
         let credential = identity_credential(&context, &data.origin);
         let mut response = credential.metadata();
         response["token"] = json!(credential.token);
@@ -519,11 +465,9 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
         "Cedar, not the local cache, decides permission"
     );
     let dir = tempfile::tempdir().unwrap();
-    super::super::save_context(dir.path(), &context).unwrap();
+
     let cli = Cli::try_parse_from(["omnigraph", "graphs", "list", "--json"]).unwrap();
-    let client = resolve(&cli, dir.path(), &store, || Ok(false))
-        .unwrap()
-        .unwrap();
+    let client = resolve_context(&cli, &context, &store).unwrap();
     let result = client.discover_graphs().await.unwrap();
     assert_eq!(serde_json::to_value(result).unwrap(), discovery);
     assert_eq!(data.workflow_requests()[0].path, "/graphs/discovery");
@@ -562,9 +506,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
                 .chain(command.clone()),
         )
         .unwrap();
-        let client = resolve(&selected, dir.path(), &store, || Ok(false))
-            .unwrap()
-            .unwrap();
+        let client = resolve_context(&selected, &context, &store).unwrap();
         match command.as_slice() {
             ["load", ..] => {
                 let error = client
@@ -618,9 +560,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
     let mut retired = credential(&context, &data.origin);
     retired.version = 1;
     save(&store, &context, &retired);
-    let failure = resolve(&cli, dir.path(), &store, || Ok(false))
-        .err()
-        .unwrap();
+    let failure = resolve_context(&cli, &context, &store).err().unwrap();
     assert_eq!(failure.body["type"], "data_credential_invalid");
 }
 
@@ -633,6 +573,7 @@ async fn identity_issuance_rejects_wrong_profile_and_authority_without_cache_rep
         "actor",
         "incarnation",
         "endpoint",
+        "different-endpoint",
         "token",
         "organization",
     ] {
@@ -658,6 +599,9 @@ async fn identity_issuance_rejects_wrong_profile_and_authority_without_cache_rep
                 "actor" => envelope["data"]["actor"] = json!("principal:other"),
                 "endpoint" => {
                     envelope["data"]["endpoint"] = json!("https://user:password@data.example/path")
+                }
+                "different-endpoint" => {
+                    envelope["data"]["endpoint"] = json!("https://rotated.example")
                 }
                 "token" => envelope["data"]["token"] = json!("x".repeat(MAX_TOKEN + 1)),
                 "organization" => {}
@@ -735,64 +679,6 @@ fn cached_authority_refuses_wrong_bindings_expiry_and_extra_fields() {
     assert!(load(&store, &context, "knowledge").is_err());
 }
 
-#[test]
-fn managed_routing_preserves_selected_managed_authority_without_fallback() {
-    let dir = tempfile::tempdir().unwrap();
-    let context = context();
-    super::super::save_context(dir.path(), &context).unwrap();
-    let store = MemoryStore::default();
-    for args in [
-        vec!["query", "q"],
-        vec!["mutate", "m", "--graph", "knowledge", "--as", "fake"],
-    ] {
-        let cli = Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
-        let failure = resolve(&cli, dir.path(), &store, || Ok(false))
-            .err()
-            .unwrap();
-        assert_ne!(failure.body["type"], "data_credential_required");
-    }
-    let direct = Cli::try_parse_from([
-        "omnigraph",
-        "query",
-        "q",
-        "--direct",
-        "--server",
-        "https://legacy.example",
-    ])
-    .unwrap();
-    assert!(
-        resolve(&direct, dir.path(), &store, || panic!(
-            "explicit selection read operator defaults"
-        ))
-        .unwrap()
-        .is_none()
-    );
-    let child = dir.path().join("child");
-    std::fs::create_dir(&child).unwrap();
-    let query = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
-    assert!(
-        resolve(&query, &child, &store, || panic!(
-            "absent context read operator defaults"
-        ))
-        .unwrap()
-        .is_none()
-    );
-    assert_eq!(
-        resolve(&query, dir.path(), &store, || Ok(false))
-            .err()
-            .unwrap()
-            .body["type"],
-        "data_credential_required"
-    );
-    let cached = credential(&context, "https://data.example");
-    save(&store, &context, &cached);
-    assert!(
-        resolve(&query, dir.path(), &store, || Ok(false))
-            .unwrap()
-            .is_some()
-    );
-}
-
 struct NoCredentialAccess;
 
 impl Store for NoCredentialAccess {
@@ -808,148 +694,9 @@ impl Store for NoCredentialAccess {
 }
 
 #[tokio::test]
-async fn managed_operator_warning_delivery_failure_stops_before_credentials() {
-    use crate::managed::tests::{FailedOutput, OutputFault};
-    use crate::operator::InvocationConfig;
-
-    let dir = tempfile::tempdir().unwrap();
-    super::super::save_context(dir.path(), &context()).unwrap();
-    let operator = tempfile::tempdir().unwrap();
-    let config = operator.path().join("config.yaml");
-    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
-    for source in ["future_option: true\n", "operator: [malformed\n"] {
-        std::fs::write(&config, source).unwrap();
-        for profile in [None, Some("competing-profile".to_owned())] {
-            for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
-                let input = InvocationConfig::at(Some(operator.path().to_owned()), profile.clone());
-                let mut stderr = FailedOutput::new(fault, 0);
-                let error = resolve_with_acquisition(
-                    &cli,
-                    dir.path(),
-                    &NoCredentialAccess,
-                    || has_ambient_target(&input, &mut stderr),
-                    async |_| panic!("routing failure consulted managed identity"),
-                    async |_| panic!("routing failure contacted the issuer"),
-                )
-                .await
-                .err()
-                .expect("routing preflight must refuse");
-                let expected = if profile.is_some() {
-                    ("managed_target_ambiguous", 2)
-                } else if source.starts_with("future_option") {
-                    ("output_delivery_failed", 1)
-                } else {
-                    ("operator_config_invalid", 2)
-                };
-                assert_eq!(error.body["type"], expected.0);
-                assert_eq!(error.exit, expected.1);
-                if profile.is_some() {
-                    assert!(stderr.bytes.is_empty(), "profile must precede config reads");
-                }
-                assert!(!error.body.to_string().contains("malformed"));
-            }
-        }
-    }
-}
-
-#[test]
-fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
-    for malformed in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        super::super::save_context(dir.path(), &context()).unwrap();
-        // An unreadable-as-context object makes an accidental context read fail;
-        // the ambient callback and store also fail if either is consulted.
-        if malformed {
-            std::fs::remove_file(dir.path().join(".omnigraph/context")).unwrap();
-            std::fs::create_dir(dir.path().join(".omnigraph/context")).unwrap();
-        }
-        for args in [
-            vec!["query", "q", "--server", "legacy"],
-            vec!["query", "q", "--profile", "legacy"],
-            vec!["mutate", "--store", "file:///scratch", "-e", "source"],
-            vec!["mutate", "m", "--cluster", "local"],
-            vec!["query", "q", "--direct"],
-            vec!["init", "--schema", "schema.pg", "file:///scratch"],
-            vec![
-                "load",
-                "--data",
-                "data.jsonl",
-                "--mode",
-                "append",
-                "--direct",
-            ],
-            vec![
-                "load",
-                "--data",
-                "data.jsonl",
-                "--mode",
-                "append",
-                "file:///scratch",
-            ],
-            vec![
-                "load",
-                "--data",
-                "data.jsonl",
-                "--mode",
-                "append",
-                "--store",
-                "file:///scratch",
-            ],
-            vec![
-                "load",
-                "--data",
-                "data.jsonl",
-                "--mode",
-                "append",
-                "--profile",
-                "legacy",
-            ],
-            vec![
-                "load",
-                "--data",
-                "data.jsonl",
-                "--mode",
-                "append",
-                "--server",
-                "legacy",
-            ],
-            vec!["schema", "plan", "--schema", "schema.pg"],
-            vec!["commit", "list", "file:///scratch"],
-            vec!["commit", "list", "--direct"],
-            vec!["commit", "list", "--server", "legacy"],
-            vec!["commit", "list", "--profile", "legacy"],
-            vec!["commit", "show", "commit-a", "--uri", "file:///scratch"],
-            vec!["commit", "show", "commit-a", "--store", "file:///scratch"],
-            vec!["commit", "changes", "commit-a"],
-            vec!["graphs", "list", "--server", "legacy"],
-            vec!["graphs", "list", "--server", "legacy", "--discovery"],
-            vec!["graphs", "list", "--profile", "legacy"],
-            vec!["graphs", "list", "--direct"],
-            vec!["alias", "people"],
-            vec!["queries", "list"],
-            vec!["queries", "validate"],
-            vec!["lint", "--schema", "schema.pg", "--query", "q.gq"],
-            vec!["snapshot"],
-            vec!["branch", "list"],
-            vec!["cluster", "status"],
-        ] {
-            let cli = Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
-            assert!(
-                resolve(&cli, dir.path(), &NoCredentialAccess, || {
-                    panic!("bypassed command read operator routing")
-                })
-                .unwrap()
-                .is_none()
-            );
-        }
-    }
-}
-
-#[tokio::test]
 async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fallback() {
-    let dir = tempfile::tempdir().unwrap();
-    let context = context();
-    super::super::save_context(dir.path(), &context).unwrap();
+    let mut context = context();
+
     let store = MemoryStore::default();
     let commit = json!({
         "graph_commit_id":"commit-a", "graph_branch":null,
@@ -962,6 +709,7 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         IntentReply::json(200, json!({"commits":[commit.clone()]})),
         IntentReply::json(200, commit.clone()),
     ]);
+    context.endpoint = Some(server.origin.clone());
     let cached = credential(&context, &server.origin);
     for command in [vec!["commit", "list"], vec!["commit", "show", "commit-a"]] {
         let cli = Cli::try_parse_from(
@@ -971,23 +719,11 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         )
         .unwrap();
         assert_eq!(
-            resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
-                .err()
-                .unwrap()
-                .body["type"],
-            "managed_target_ambiguous"
-        );
-        assert_eq!(
-            resolve(&cli, dir.path(), &store, || Ok(false))
-                .err()
-                .unwrap()
-                .body["type"],
+            resolve_context(&cli, &context, &store).err().unwrap().body["type"],
             "data_credential_required"
         );
         save(&store, &context, &cached);
-        let client = resolve(&cli, dir.path(), &store, || Ok(false))
-            .unwrap()
-            .unwrap();
+        let client = resolve_context(&cli, &context, &store).unwrap();
         if command[1] == "list" {
             let output = client.list_commits(Some("main")).await.unwrap();
             assert_eq!(serde_json::to_value(&output.commits[0]).unwrap(), commit);
@@ -998,7 +734,7 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         clear(&store, &context).unwrap();
         let no_graph = Cli::try_parse_from(std::iter::once("omnigraph").chain(command)).unwrap();
         assert_eq!(
-            resolve(&no_graph, dir.path(), &NoCredentialAccess, || Ok(false))
+            resolve_context(&no_graph, &context, &NoCredentialAccess)
                 .err()
                 .unwrap()
                 .body["type"],
@@ -1023,9 +759,8 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
 
 #[test]
 fn managed_load_uses_identity_and_keeps_target_preflight() {
-    let dir = tempfile::tempdir().unwrap();
     let context = context();
-    super::super::save_context(dir.path(), &context).unwrap();
+
     let store = MemoryStore::default();
     let args = [
         "omnigraph",
@@ -1039,18 +774,8 @@ fn managed_load_uses_identity_and_keeps_target_preflight() {
     ];
     let cli = Cli::try_parse_from(args).unwrap();
     assert_eq!(
-        resolve(&cli, dir.path(), &store, || Ok(false))
-            .err()
-            .unwrap()
-            .body["type"],
+        resolve_context(&cli, &context, &store).err().unwrap().body["type"],
         "data_credential_required"
-    );
-    assert_eq!(
-        resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
-            .err()
-            .unwrap()
-            .body["type"],
-        "managed_target_ambiguous"
     );
     save(
         &store,
@@ -1059,74 +784,15 @@ fn managed_load_uses_identity_and_keeps_target_preflight() {
     );
     for extra in [vec![], vec!["--branch", "review", "--from", "main"]] {
         let cli = Cli::try_parse_from(args.into_iter().chain(extra)).unwrap();
-        assert!(
-            resolve(&cli, dir.path(), &store, || Ok(false))
-                .unwrap()
-                .is_some()
-        );
+        assert!(resolve_context(&cli, &context, &store).is_ok());
     }
     let cli = Cli::try_parse_from(args.into_iter().chain(["--as", "fake"])).unwrap();
     assert_eq!(
-        resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(false))
+        resolve_context(&cli, &context, &NoCredentialAccess)
             .err()
             .unwrap()
             .body["type"],
         "managed_scope_conflict"
-    );
-    let child = dir.path().join("child");
-    std::fs::create_dir(&child).unwrap();
-    assert!(
-        resolve(&cli, &child, &NoCredentialAccess, || panic!(
-            "parent context was read"
-        ))
-        .unwrap()
-        .is_none()
-    );
-    std::fs::write(dir.path().join(".omnigraph/context"), "invalid").unwrap();
-    assert_eq!(
-        resolve(&cli, dir.path(), &NoCredentialAccess, || panic!(
-            "invalid context consulted defaults"
-        ))
-        .err()
-        .unwrap()
-        .body["type"],
-        "context_invalid"
-    );
-}
-
-#[test]
-fn managed_data_issue_633_ambiguity_and_invalid_context_precede_credentials() {
-    let dir = tempfile::tempdir().unwrap();
-    super::super::save_context(dir.path(), &context()).unwrap();
-    for verb in ["query", "mutate"] {
-        let cli = Cli::try_parse_from(["omnigraph", verb, "q", "--graph", "knowledge"]).unwrap();
-        assert_eq!(
-            resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
-                .err()
-                .unwrap()
-                .body["type"],
-            "managed_target_ambiguous"
-        );
-        assert_eq!(
-            resolve(&cli, dir.path(), &NoCredentialAccess, || {
-                Err(Failure::refused("operator_config_invalid", "fixture"))
-            })
-            .err()
-            .unwrap()
-            .body["type"],
-            "operator_config_invalid"
-        );
-    }
-    std::fs::write(dir.path().join(".omnigraph/context"), "malformed").unwrap();
-    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
-    assert_eq!(
-        resolve(&cli, dir.path(), &NoCredentialAccess, || {
-            panic!("invalid context consulted another target")
-        })
-        .err()
-        .unwrap()
-        .body["type"],
-        "context_invalid"
     );
 }
 
@@ -1322,8 +988,8 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
 #[ignore = "nightly: a real 30.75 s reply proves the 300 s load timeout outlives the 30 s managed deadline"]
 async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     let dir = tempfile::tempdir().unwrap();
-    let context = context();
-    super::super::save_context(dir.path(), &context).unwrap();
+    let mut context = context();
+
     let batch = dir.path().join("batch.jsonl");
     let ndjson = "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n{\"type\":\"Person\",\"data\":{\"name\":\"Grace\"}}\n";
     std::fs::write(&batch, ndjson).unwrap();
@@ -1337,6 +1003,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
         std::time::Duration::from_millis(30_750),
     );
     let store = MemoryStore::default();
+    context.endpoint = Some(server.origin.clone());
     let cached = credential(&context, &server.origin);
     save(&store, &context, &cached);
     let cli = Cli::try_parse_from([
@@ -1354,9 +1021,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
         "main",
     ])
     .unwrap();
-    let client = resolve(&cli, dir.path(), &store, || Ok(false))
-        .unwrap()
-        .unwrap();
+    let client = resolve_context(&cli, &context, &store).unwrap();
     let result = client
         .load(
             "review",
@@ -1460,4 +1125,80 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
         );
         server.assert_complete();
     }
+}
+
+#[tokio::test]
+async fn target_preflight_precedes_credentials_and_missing_data_endpoint_never_comes_from_cache() {
+    let mut context = context();
+    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
+    context.endpoint = None;
+    let error = resolve_with_acquisition(
+        &cli,
+        &context,
+        &NoCredentialAccess,
+        async |_| panic!("incomplete target consulted identity"),
+        async |_| panic!("incomplete target contacted issuer"),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.body["type"], "data_endpoint_required");
+    context.endpoint = Some("https://data.example".into());
+    let unsupported = Cli::try_parse_from(["omnigraph", "branch", "list"]).unwrap();
+    assert_eq!(
+        resolve_context(&unsupported, &context, &NoCredentialAccess)
+            .err()
+            .unwrap()
+            .body["type"],
+        "managed_operation_unsupported"
+    );
+    let graphless = Cli::try_parse_from(["omnigraph", "query", "q"]).unwrap();
+    assert_eq!(
+        resolve_context(&graphless, &context, &NoCredentialAccess)
+            .err()
+            .unwrap()
+            .body["type"],
+        "graph_required"
+    );
+    let store = MemoryStore::default();
+    save(
+        &store,
+        &context,
+        &credential(&context, "https://data.example"),
+    );
+    context.default_graph = Some("knowledge".into());
+    assert!(resolve_context(&graphless, &context, &store).is_ok());
+    context.endpoint = Some("https://other.example".into());
+    assert_eq!(
+        resolve_context(&cli, &context, &store).err().unwrap().body["type"],
+        "data_endpoint_mismatch"
+    );
+}
+
+#[tokio::test]
+async fn token_bootstrap_reports_endpoint_without_configuring_a_data_destination() {
+    let mut context = context();
+    context.endpoint = None;
+    let issuer = IntentApiFixture::with_origin(|origin| {
+        context.api = origin.into();
+        let credential = credential(&context, "https://issued.example");
+        let mut response = credential.metadata();
+        response["token"] = json!(credential.token);
+        vec![IntentReply::json(
+            200,
+            json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
+        )]
+    });
+    let store = MemoryStore::default();
+    let api = Api::new(issuer.origin.clone(), Some("control-token".into())).unwrap();
+    let result = mint(&store, &context, &api, 3600).await.unwrap();
+    assert_eq!(result["data"]["endpoint"], "https://issued.example");
+    assert!(context.endpoint.is_none());
+    assert_eq!(
+        load(&store, &context, "knowledge").err().unwrap().body["type"],
+        "data_endpoint_required"
+    );
+    context.endpoint = Some("https://issued.example".into());
+    assert!(load(&store, &context, "knowledge").is_ok());
+    issuer.assert_complete();
 }

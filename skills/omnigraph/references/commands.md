@@ -47,14 +47,14 @@ prints the exact flags of the installed binary.
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check or list a cluster's stored queries |
-| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; `--managed` selects the managed service |
-| `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires `--managed`; `org` is an alias |
+| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
+| `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a managed account target; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
 | `login` | — | Store a server's bearer token, or open a managed session |
 | `logout` | — | Remove a stored token or a managed session |
-| `use` | — | Select a managed cluster for a config folder |
-| `profile` | `list` `show` | Inspect operator profiles |
+| `target` | `list` `show` `add` `remove` `import` | Manage complete target bindings |
+| `credential` | `get` | Export a server target token to a pipe |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -82,7 +82,7 @@ configuration and needs no graph, server or network.
 ### `snapshot` — node/edge types and entity counts
 
 ```bash
-omnigraph snapshot $REPO --branch main --json
+omnigraph snapshot --target $REPO --branch main --json
 ```
 
 Returns every node/edge type with entity counts and published dataset versions.
@@ -91,7 +91,7 @@ Use it to verify a load or inspect the graph shape.
 ### `export` — full JSONL dump
 
 ```bash
-omnigraph export $REPO --branch main > graph.jsonl
+omnigraph export --target $REPO --branch main > graph.jsonl
 ```
 
 Streams all nodes and edges as JSONL. The right tool for large-snapshot inspection. Don't try to page through the whole graph with read queries.
@@ -99,7 +99,7 @@ Streams all nodes and edges as JSONL. The right tool for large-snapshot inspecti
 Filter by type:
 
 ```bash
-omnigraph export $REPO --branch main --type Signal > signals.jsonl
+omnigraph export --target $REPO --branch main --type Signal > signals.jsonl
 ```
 
 Use repeatable `--type` to filter node or edge types.
@@ -110,9 +110,9 @@ JSON omits null cells and renders dates as strings. See [data envelopes](data.md
 ## Blob Reads
 
 ```bash
-omnigraph blob stat node Document manual content --store "$REPO" --json
-omnigraph blob get node Document manual content --store "$REPO" --out manual.bin
-omnigraph blob get node Document manual content --store "$REPO" --offset 0 --length 4096
+omnigraph blob stat node Document manual content --target "$REPO" --json
+omnigraph blob get node Document manual content --target "$REPO" --out manual.bin
+omnigraph blob get node Document manual content --target "$REPO" --offset 0 --length 4096
 ```
 
 The selector is `<node|edge> <TYPE> <ID> <PROPERTY>`. Choose a branch or
@@ -122,10 +122,10 @@ snapshot; `get` streams managed bytes and `stat` inspects metadata. See
 ## Branches
 
 ```bash
-omnigraph branch create --from main <branch-name> --store $REPO
-omnigraph branch list --store $REPO
-omnigraph branch merge <branch-name> --into main --delete-branch --store $REPO
-omnigraph branch delete <branch-name> --store $REPO
+omnigraph branch create --from main <branch-name> --target $REPO
+omnigraph branch list --target $REPO
+omnigraph branch merge <branch-name> --into main --delete-branch --target $REPO
+omnigraph branch delete <branch-name> --target $REPO
 ```
 
 All support `--json`. `--from` and `--into` default to `main`. `branch create
@@ -137,10 +137,10 @@ The same operations are GQ branch statements, useful when a client already
 sends `.gq` source:
 
 ```bash
-omnigraph mutate -e 'branch create "review/x" from main' --server <name> --graph <id>
-omnigraph mutate -e 'branch merge "review/x" into main' --server <name> --graph <id>
-omnigraph mutate -e 'branch delete "review/x"' --server <name> --graph <id>
-omnigraph query  -e 'branch list' --server <name> --graph <id>
+omnigraph mutate -e 'branch create "review/x" from main' --target <name> --graph <id>
+omnigraph mutate -e 'branch merge "review/x" into main' --target <name> --graph <id>
+omnigraph mutate -e 'branch delete "review/x"' --target <name> --graph <id>
+omnigraph query  -e 'branch list' --target <name> --graph <id>
 ```
 
 Quote names containing `/`, `-`, `.`, or a leading uppercase letter or digit.
@@ -151,9 +151,9 @@ from data-mutation receipts; see [branch statements](changes.md#branch-statement
 ## Commits (History)
 
 ```bash
-omnigraph commit list --store "$REPO" --branch main
-omnigraph commit show <commit-id> --store "$REPO"
-omnigraph commit changes <commit-id> --store "$REPO" --json
+omnigraph commit list --target "$REPO" --branch main
+omnigraph commit show <commit-id> --target "$REPO"
+omnigraph commit changes <commit-id> --target "$REPO" --json
 ```
 
 `commit list --limit N --json` returns the newest N commits, the
@@ -168,32 +168,32 @@ baseline recovery, see [`changes.md`](changes.md).
 ## Graphs (multi-graph servers)
 
 ```bash
-omnigraph graphs list --server <name-or-url> --json
+omnigraph graphs list --target <name-or-url> --json
 ```
 
 Lists the graphs a multi-graph server serves, with each graph's `state`. Remote
 servers only (rejects local URIs); a cluster-scoped policy bundle must grant
-`graph_list`. `--discovery` (implied in a managed folder) returns only graph
+`graph_list`. `--discovery` (implied for managed targets) returns only graph
 ids and names to an identity credential and needs no `graph_list`. See
 [`server-policy.md`](server-policy.md).
 
 ## Schema
 
 ```bash
-omnigraph schema plan --schema next.pg $REPO --json
-omnigraph schema apply --schema next.pg $REPO
+omnigraph schema plan --schema next.pg --target $REPO --json
+omnigraph schema apply --schema next.pg --target $REPO
 ```
 
-Both commands require direct storage and refuse `--server`. Cluster-managed
+Both commands require a direct target; server and managed targets refuse. Cluster-managed
 graphs evolve through `cluster apply`. See `references/schema.md` for the full
 workflow.
 
 ### Offline storage upgrade
 
 ```bash
-omnigraph upgrade "$REPO" --check --json
-omnigraph upgrade "$REPO" --json
-omnigraph schema upgrade-system-columns "$REPO" --check --json
+omnigraph upgrade --target "$REPO" --check --json
+omnigraph upgrade --target "$REPO" --json
+omnigraph schema upgrade-system-columns --target "$REPO" --check --json
 ```
 
 `omnigraph upgrade` converts a standalone v8 or v9 graph (written by 0.11) or
@@ -218,7 +218,7 @@ legacy system spellings and could preserve live branches.
 ```bash
 omnigraph lint --schema schema.pg --query queries/foo.gq --json
 # or against a live repo:
-omnigraph lint --query queries/foo.gq $REPO --json
+omnigraph lint --query queries/foo.gq --target $REPO --json
 ```
 
 `lint` is the single query-validation command. See `references/queries.md`.
@@ -252,10 +252,10 @@ never overwrites an initialized graph or purges Lance datasets.
 
 ```bash
 # bare load: operates on an existing branch (default main); --mode is required
-omnigraph load --data seed.jsonl --mode merge $REPO
+omnigraph load --data seed.jsonl --mode merge --target $REPO
 
 # --from forks a missing branch from <base>, then loads onto it (one-shot review branch)
-omnigraph load --data delta.jsonl --branch feature-x --from main --mode merge $REPO
+omnigraph load --data delta.jsonl --branch feature-x --from main --mode merge --target $REPO
 ```
 
 `--mode` is **required** (no default): `merge`, `append`, or `overwrite`.
@@ -265,7 +265,7 @@ Address either direct storage or a served graph. See `references/data.md`.
 
 ```bash
 omnigraph query  get_signal --query queries/signals.gq --params '{"slug":"sig-foo"}'    # ad-hoc file; <name> is positional
-omnigraph query  get_signal --server intel-dev --params '{"slug":"sig-foo"}'            # served stored query by name
+omnigraph query  get_signal --target intel-dev --params '{"slug":"sig-foo"}'            # served stored query by name
 omnigraph mutate add_signal --query queries/mutations.gq --params '{"slug":"sig-foo","name":"Foo","brief":"Example","createdAt":"2026-04-14T00:00:00Z"}'
 ```
 
@@ -276,7 +276,7 @@ omnigraph alias signal sig-foo
 ```
 
 Aliases are read-only. Invoke a served stored mutation with `omnigraph mutate
-<name> --server ...`.
+<name> --target ...`.
 
 > `query` and `mutate` also accept inline source via `-e/--query-string '<gq>'` instead of `--query <file>`.
 
@@ -285,11 +285,11 @@ Aliases are read-only. Invoke a served stored mutation with `omnigraph mutate
 ### `optimize` — compaction and index reconciliation
 
 ```bash
-omnigraph optimize $REPO --json
+omnigraph optimize --target $REPO --json
 ```
 
 Compacts fragments and reconciles declared scalar/vector index coverage without
-deleting retained versions. Lance 11 supports compaction of Blob-bearing data;
+deleting retained versions. Lance 13 supports compaction of Blob-bearing data;
 null,
 valid-empty, and non-empty Blob values remain distinct. Existing full-text
 indexes are preserved and any uncovered tail is scanned; use the explicit
@@ -300,13 +300,15 @@ traversal startup; it does not collect unused forks (that is `cleanup`).
 ### `rebuild-full-text-indexes` — explicit analyzer upgrade
 
 ```bash
-omnigraph rebuild-full-text-indexes "$REPO" --branch main --json
+omnigraph rebuild-full-text-indexes --target "$REPO" --branch main --json
 ```
 
-Direct storage only; `--cluster <root> --graph <id>` also works. Stop overlapping
+Direct storage only; `--target <root> --graph <id>` also works. Stop overlapping
 writers, preserve a verified whole-store backup, and rebuild every live branch
-that needs search after a Lance 11 upgrade. Do not mix old and new serving
-binaries. Rebuilds use default English analysis, replacing custom tokenizer
+that needs search when moving from uncertified pre-Lance-11 indexes. Certified
+Lance 11 indexes remain compatible under Lance 13 and need no rebuild solely
+for that dependency change. Do not mix fleets across an incompatible analyzer
+transition. Rebuilds use default English analysis, replacing custom tokenizer
 settings; JSON `warnings` reports this for actual work. Check the selected
 `branch`, `graph_commit_id`, and `rebuilt_indexes`; an empty list/null commit is
 a no-op, not a migration of other branches or historical snapshots. `--as` is
@@ -315,7 +317,7 @@ actor attribution and does not install server policy on direct access.
 ### `cleanup` — destructive version GC
 
 ```bash
-omnigraph cleanup $REPO --keep 5 --older-than 7d --confirm
+omnigraph cleanup --target $REPO --keep 5 --older-than 7d --confirm
 ```
 
 Deletes table versions that no retained graph commit pins, dropping
@@ -334,8 +336,8 @@ deletion and `optimize` leave this reclamation to `cleanup`.
 ## Stored Queries
 
 ```bash
-omnigraph queries validate --cluster .              # type-check every applied registry
-omnigraph queries list --cluster . --graph knowledge # list names and typed params
+omnigraph queries validate --target .              # type-check every applied registry
+omnigraph queries list --target . --graph knowledge # list names and typed params
 ```
 
 `queries` operates on applied cluster state, not a graph URI. `validate`
@@ -346,39 +348,42 @@ Distinct from `lint`, which validates authoring source. See
 ## Operator Config & Credentials
 
 ```bash
-echo "$TOKEN" | omnigraph login <server>   # store a bearer token in ~/.omnigraph/credentials (0600)
-omnigraph logout <server>                  # remove it (idempotent)
-omnigraph login --api <origin>             # managed Intent API session (OS keychain)
-omnigraph logout --api <origin>            # revoke that session and remove its keychain entry
+echo "$TOKEN" | omnigraph login --target production
+omnigraph logout --target production
+omnigraph target list --json
+omnigraph target show production --json
 ```
 
-The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. `--config` selects source/context folders for `cluster`, `organization` and `use`.
+`~/.omnigraph/config.yaml` requires `target_config_version: 1` and complete
+`targets` entries. `OMNIGRAPH_HOME` changes the operator directory. Server
+credentials use a target's explicit owner, bound to its endpoint; managed human
+sessions and data credentials use separate OS-keychain entries. Managed
+`control_auth: automation-env` instead requires the exact origin-bound
+`OMNIGRAPH_CONTROL_API` / `OMNIGRAPH_CONTROL_TOKEN` pair, without human fallback.
+A composed route that crosses a more specific endpoint's authentication boundary
+refuses before discovery; credentials never switch within an invocation.
+Never print credential values while inspecting configuration.
 
 ## Addressing a Graph
 
-How the CLI resolves which graph a data command (`query`, `mutate`, `load`, `branch`, …) runs against. A remote is addressed with `--server` (a bare `http(s)://` URL is not a graph address).
+Every backend command resolves one complete `--target NAME|ADDRESS`, otherwise
+`defaults.target`. Failure never selects another target. `--config DIR` only
+supplies declared source for cluster validation, plan/apply, observation or
+managed push; it cannot route a command. A local command rejects routing flags.
 
-Precedence (highest first):
+A registered target is `kind: direct` (`scope: graph`, `root`, or `catalogue`),
+`kind: server`, or `kind: managed` (`scope: account` or `cluster`). Root/server/
+managed cluster graph operations require `--graph ID` or that target's
+`default_graph`; discovery never chooses a graph. Direct graph targets reject
+`--graph`. Inline addresses use explicit path spelling (`./graph.omni`) or a URI;
+bare names refer to configured targets. `init --schema schema.pg ./graph.omni`
+is the sole positional address convenience. `--as` attributes supported direct
+operations; a served write sends it as the `Omnigraph-If-Actor` assertion.
+Every backend command prints its resolved target to stderr.
 
-1. **`--store <uri>`** or a **positional `file://`/`s3://`/`az://` URI** — direct storage access (bypasses any server; no catalog, so stored-query *names* don't resolve). `--store` is exclusive with a positional URI and with `--server`. Azure is a qualification preview and writes require `omnigraph-azure-admission`.
-2. **`--server <name|url>`** (+ `--graph <id>` for a multi-graph server) — served/remote. A name resolves from `servers:` in `~/.omnigraph/config.yaml`; a literal `http(s)://` URL also works.
-3. **`--profile <name>`** (or `$OMNIGRAPH_PROFILE`) — a named scope bundle from `profiles:` in the operator config (binds one of server/cluster/store + a default graph).
-4. **Operator defaults** — `defaults.server` + `defaults.default_graph`, or `defaults.store` for a zero-flag local scope (mutually exclusive with `defaults.server`).
-
-**Managed folders.** In a directory with `.omnigraph/context` (written by
-`omnigraph use`) and no explicit `--server`/`--profile`/`--store`/`--cluster`,
-`query`, `mutate`, `load`, `commit list`/`show` and `graphs list` go to the
-managed data endpoint with an identity credential the CLI acquires and caches
-itself; all but `graphs list` require `--graph`. If `OMNIGRAPH_PROFILE` or an
-operator default server/store competes, they refuse with
-`managed_target_ambiguous`. Global `--direct` restores the ordinary resolution
-above. Other data commands are unaffected.
-
-`cluster` uses `--config <dir>` for source/context folders; policy
-and stored-query control-plane commands use `--cluster <dir|uri>`. Maintenance against a
-cluster-managed graph uses `--cluster <dir|file://|s3://|az://> --graph <id>`.
-Each command declares a **capability** — `any` / `served` / `direct` /
-`control` / `local` — shown in `omnigraph --help`; mis-addressing fails loudly.
+Legacy routing flags, `use`, `profile`, ambient profile selection and folder
+routing are removed. Use `target import` to convert legacy configuration and
+validate existing lifecycle custody; no execution adapter runs the old grammar.
 
 For query source (`query`/`mutate`):
 
@@ -424,120 +429,57 @@ its `status`, the booted applied digest, ledger revision/CAS, the registered,
 ready, loading and blocked graph counts and shutdown grace. It returns `503`
 while a graph is still loading, when a nonempty inventory has no ready graph,
 and once draining starts. Readiness is not proof that every configured graph
-is healthy; authorized `graphs list --server <name|url> --json` returns one
+is healthy; authorized `graphs list --target <name|url> --json` returns one
 `graphs` list with each graph's `state` and `action`, blocked graphs included.
 
 ## Organization Administration
 
-`organization` (alias `org`) requires explicit `--managed` and the selected
-organization's control grant `{cluster: null, verb: members_manage}`. Sign in
-with `login --api <origin> --organization <id>`. Supply those same selectors to
-organization commands, or use a bound folder (`--config <dir>` selects another
-folder). Explicit selectors must agree with that binding; outside a bound
-folder, omitting `--organization` requires exactly one cached organization for
-the API. These commands do not change the binding. They reject `--server`,
-`--profile`, `--store`, `--cluster`, `--graph`, `--as` and `--direct`.
-`--json` prints the validated API envelope.
-
-In a bound folder:
+Use a managed account target for `organization` (`org`):
 
 ```bash
-omnigraph organization members list --managed --json
-omnigraph organization members apply member.yaml --managed --idempotency-key <key> --json
-omnigraph organization members offboard <USER_ID> --managed --expected-version <N> --idempotency-key <key> --json
-omnigraph organization invitations list --managed [--after <cursor>] --json
-omnigraph organization invitations send <email> --managed --idempotency-key <key>
-omnigraph organization invitations resend <INVITATION_ID> --managed --idempotency-key <key>
-omnigraph organization invitations revoke <INVITATION_ID> --managed --idempotency-key <key>
+omnigraph organization members list --target account --json
+omnigraph organization invitations send person@example.com --target account --idempotency-key invite-person
+omnigraph organization members apply member.yaml --target account --idempotency-key enroll-person --json
+omnigraph organization members offboard USER_ID --target account --expected-version 4 --idempotency-key offboard-person --json
 ```
 
-`members list` returns the complete directory, including provider membership
-status and current local grant versions; more than 1,000 members refuses.
-`members apply` takes a versioned YAML add/update/remove patch. Use exact IDs and
-the current grant version. Add/update patches preserve unrelated grants and
-admissions; a remove patch clears local access while retaining provider membership.
-Invitation lists are pages of up to 100; pass the returned `data.after` as
-`--after` until it is null. Wait for acceptance before enrollment. Invitation
-acceptance and cluster admission do not grant graph or configuration permissions:
-applied Cedar policy owns those permissions.
-
-Before `members offboard`, remove the person's principal from applicable Cedar
-policies, deploy them and verify denial with a previously issued graph credential.
-Offboarding clears local access, removes that organization's membership and
-revokes its explicitly scoped sessions; it preserves the shared user and other
-organizations' sessions. Existing graph credentials may last 86,400 seconds, so
-membership removal alone does not immediately revoke graph access. Use grant
-version zero only for someone not enrolled locally. A partial cleanup exits 3;
-inspect its separate local, provider and session outcomes.
-
-Every write requires `--idempotency-key`. Keep the exact arguments, YAML and key
-after a timeout; it does not cancel provider work. Replay the identical request
-with the same key to retrieve its retained outcome. A new key starts a new action,
-and a partial offboard result remains partial on replay. See the
-[team administration guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/managed-team.md)
-for the patch schema and the full onboarding workflow.
+The caller needs `members_manage`. Patch organization IDs must match the target.
+Invitation/admission changes do not grant graph permissions. Deploy Cedar
+revocation before offboarding and verify denial with an existing data credential.
+Writes require exact idempotency keys and uncertain outcomes must be reconciled;
+a partial offboard stays partial on replay. See [team administration](../../../docs/user/cli/managed-team.md).
 
 ## Cluster Control Plane
 
 ```bash
-omnigraph cluster validate     --config <dir>          # parse + typecheck the declaration
-omnigraph cluster plan         --config <dir> [--json] # preview (schema changes show migration steps)
-omnigraph cluster apply        --config <dir> --as <actor>   # direct (serving stopped): bootstrap or update
-omnigraph cluster plan --server <name|url> --config <dir> --json  # read-only served preview
-omnigraph cluster apply --server <name|url> --config <dir> [--no-wait] [--timeout 1800] --json
-omnigraph cluster status --server <name|url> --deployment-id <ID> --wait [--timeout 1800] --json
-omnigraph cluster status       --config <dir> [--json] # read the ledger (read-only)
-omnigraph cluster observe      --config <dir> [--json] # current observations: no lock, no write
-omnigraph cluster force-unlock <LOCK_ID> --config <dir>  # remove an exact lock once its owner is quiescent
-omnigraph --cluster <root> cluster upgrade-ledger --writers-stopped  # convert a supported stopped legacy ledger
+omnigraph cluster validate --config ./source
+omnigraph cluster plan --target ./cluster --config ./source
+omnigraph cluster apply --target production-server --config ./source --json
+omnigraph cluster status --target production-server --deployment-id ID --wait --json
+omnigraph cluster apply --target ./cluster --deployment-id ID --writers-stopped --json
 ```
 
-`plan` and `observe` are read-only and report `authority: "observed"` with the
-ledger `state_cas` they read. A plan is an observation; apply revalidates it.
-Served apply normally polls its original ID until convergence and activation.
-`--no-wait` returns after durable acceptance; `--timeout` bounds caller waiting
-(default 300 seconds, range 1–3600), including acceptance, and never cancels work.
-A wait timeout exits 5. Exact served status returns `deployment`, `active`, and
-`in_progress`; use `--wait` with `--deployment-id` to resume observation. These
-wait flags require `--server`. Lost responses trigger original-ID reads, never
-automatic resubmission. See [deployment receipts](cluster.md#the-loop-memorize-this).
+Source directories and destinations are independent. A fresh source apply with a
+caller ID requires explicit `--config`; reusing an existing ID observes the
+existing attempt. The final command is source-free recovery with an explicit
+writer-stop attestation. Only direct-root targets support it. Status and
+force-unlock take a target, never source configuration.
 
-The 0.11 verbs `import`, `refresh` and `approve` are removed. A fresh direct
-`apply` creates the ledger, and a ledger written by 0.11 is converted once with
-`upgrade-ledger` while serving and writers are stopped. Direct `apply` keeps
-its admission lock after it completes: once the owner and its I/O have settled,
-release that exact lock id with `force-unlock` before starting the server.
-
-`cluster` commands select the managed service only with `--managed`; otherwise
-they ignore managed context (see [`cluster.md`](cluster.md#managed-clusters)):
+Managed lifecycle uses account targets for create/list and complete cluster
+targets for the remaining operations:
 
 ```bash
-omnigraph use <CLUSTER_ID> --api <origin> [--config <dir>]
-omnigraph cluster create --managed <name> --api <origin>
-omnigraph cluster push --managed --expected-revision <rev> --message <msg>
-omnigraph cluster plan --managed [--rev <revision>]
-omnigraph cluster apply --managed --plan <PLAN_RUN_ID>
-omnigraph cluster status --managed [RUN_ID]
-omnigraph cluster operation --managed <id> [--api <origin>] [--wait] [--timeout 1800]
-omnigraph cluster history --managed [--limit N] [--since <RFC3339>]
-omnigraph cluster cancel --managed <RUN_ID>
-omnigraph cluster token --managed ([--ttl 1h] | --clear)   # identity only; applied Cedar policy decides access
-omnigraph cluster delete --managed --incarnation <id> [--retention-seconds 86400]
-omnigraph cluster undo-delete --managed --incarnation <id> --deletion-id <id>
+omnigraph cluster create demo --target account --no-wait --json
+omnigraph cluster list --target account --json
+omnigraph cluster pull --target managed-production --out fresh-source --json
+omnigraph cluster push --target managed-production --config ./source --expected-revision COMMIT --message "Update schema" --json
+omnigraph cluster plan --target managed-production --rev COMMIT --json
+omnigraph cluster apply --target managed-production --plan PREVIEW_ID --json
 ```
 
-Managed plan, apply, create, delete, and undo-delete take `--no-wait`,
-`--timeout <1..3600>`, and `--idempotency-key` (reuse the same key after an uncertain response). Managed
-plan/apply/lifecycle exit codes: 0 converged, 1 failed or transport error, 2
-refused or blocked, 3 partially converged, 4 recovery required, 5 stalled or
-wait deadline, 6 cancelled.
-
-Topology rule: `omnigraph schema apply` and `omnigraph init` **refuse a
-cluster-managed graph** — in a cluster their jobs belong to `cluster apply`.
-Data commands (`load`, `mutate`, branches) normally go through the running
-server (`--server <name> --graph <id>`). A direct write or maintenance run at
-the derived root (`<dir>/graphs/<id>.omni`, or `<storage>/graphs/<id>.omni` for
-an S3-backed cluster) takes the cluster's exclusive writer admission and keeps
-the lock after it succeeds: stop the server first, then release that exact
-lock id with `cluster force-unlock` before another owner starts. See
-`references/cluster.md`.
+Creation and pull never switch targets or bind folders. Managed plan/apply use
+pushed revisions and reject `--config`. Cluster identity and incarnation are
+pinned; data requests additionally require the target endpoint. Human-device and
+automation-env control authentication never fall back to each other. Retain
+operator-home lifecycle custody after an uncertain request, and import old
+folder evidence before submitting new lifecycle work. See [managed clusters](cluster.md#managed-clusters).

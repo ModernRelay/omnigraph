@@ -57,12 +57,12 @@ See [traversal](../../docs/user/queries/traversal.md) and
 
 1. **Lint before commit** — `omnigraph lint --schema schema.pg --query queries/foo.gq` validates both sides against each other. No running repo required.
 2. **Plan before apply** — never run `schema apply` without a successful `schema plan` first. Apply is destructive; plan is free. (Cluster mode has the same rule with different verbs: `cluster plan` before `cluster apply` — the plan embeds the engine's real migration steps.)
-3. **Branches are for data; apply is for schema** — review bulk data loads on a feature branch then merge. Schema changes go straight to `main`: in cluster mode edit the `.pg` and run `cluster apply` (`--server <name|url>` deploys to the running server without a restart; without it serving must be stopped first; a direct `schema apply` **refuses** a cluster-managed graph); for the managed service commit, `cluster push --managed`, `cluster plan --managed --rev <rev>`, then `cluster apply --managed --plan <run>`; `schema plan`/`apply` is for a non-cluster store.
+3. **Branches are for data; apply is for schema** — review bulk data loads on a feature branch then merge. Schema changes go straight to `main`: in cluster mode edit the `.pg` and run `cluster apply` (a server target deploys without restart; a direct root target requires stopped serving; a direct `schema apply` **refuses** a cluster-managed graph); for the managed service commit, `cluster push --target managed`, `cluster plan --target managed --rev <rev>`, then `cluster apply --target managed --plan <run>`; `schema plan`/`apply` is for a non-cluster store.
 4. **Pick the right write command** — `mutate` for edits (typechecked, parameterized); `load` for bulk JSONL, local **or** remote, with a **required** `--mode` (`merge` upsert · `append` strict-insert · `overwrite` replaces only the node/edge types represented in the batch). `load --from <base>` forks a review branch in one shot; bare `load` needs an existing target branch.
 5. **Parameterize everything** — never string-interpolate values into `.gq` bodies or `--params`. Declare `$var: Type` and pass via `--params`.
 6. **Expose agent reads as aliases** — aliases decouple a read operation name
    from its stored-query implementation. Aliases are read-only; invoke a served
-   stored mutation with `omnigraph mutate <name> --server ...`.
+   stored mutation with `omnigraph mutate <name> --target ...`.
 7. **Treat a lost remote response as unknown** — an effectful data mutation or load returns its exact commit, but a proxy can return 504 after publication. Branch statements have different outcome/receipt semantics. On timeout, reconcile the intended effect and relevant history before replay. See `references/remote-ops.md`.
 
 ## Essentials: Queries, Mutations, Loads
@@ -123,8 +123,8 @@ query remove($slug: String)              { delete Signal where slug = $slug }
 ```
 
 ```bash
-omnigraph load --data seed.jsonl --mode merge $GRAPH                                  # --mode is REQUIRED (no default)
-omnigraph load --data delta.jsonl --from main --branch review --mode merge $GRAPH     # fork a review branch in one shot
+omnigraph load --data seed.jsonl --mode merge --target $GRAPH                                  # --mode is REQUIRED (no default)
+omnigraph load --data delta.jsonl --from main --branch review --mode merge --target $GRAPH     # fork a review branch in one shot
 ```
 
 - `--mode`: `merge` (upsert by logical entity ID; keyed node and keyed edge IDs derive from their `@key` tuple — re-running a merge file duplicates unkeyed edges) · `append` (fails on ID collision) · `overwrite` (destructive, staged). `--from <base>` forks a missing `--branch`; bare `load` needs an existing branch. Works local **and** remote.
@@ -164,69 +164,61 @@ single source of truth.
 
 ## CLI Reference (condensed)
 
-Notation: `<x>` required · `[x]` optional · `<a|b>` choice · `…` repeatable.
+Select one complete destination with `--target NAME|ADDRESS` or the operator
+file's `defaults.target`. Every backend invocation prints the resolved target to
+stderr; machine results remain on stdout. An unknown or unsupported target
+refuses without fallback. Source files and current directories never select a
+backend. `--config DIR` is source input only.
 
-**Global addressing flags**: `--as <actor>` (direct-engine writes, `rebuild-full-text-indexes`, and a direct `cluster apply`/`upgrade-ledger`; a served write, `cluster plan --server` or `cluster apply --server` takes its actor from the bearer token and treats `--as` as an assertion the server checks, refusing a mismatch with `actor_mismatch` and exit 4; read verbs reject it), `--server <name|url>`, `--cluster <dir|uri>` (cluster-managed storage, primarily for maintenance), `--graph <id>` (selects within a `--server` or `--cluster` scope; required for managed queries, mutations, loads and commit reads), `--profile <name>` (`$OMNIGRAPH_PROFILE`), `--store <uri>`, `--direct` (ignore managed context for data commands). Commands with an open positional slot also accept `file://`, `s3://`, or preview `az://` directly. `--config <dir>` selects source/context folders for `cluster`, `organization` and `use`. Output: `--json`, or read queries take `--format <json|jsonl|csv|kv|table>` (`arrow` is listed but always fails in 0.12.0). **Write guards:** `--yes` skips non-local confirmation for destructive writes; `--quiet` suppresses the resolved-target echo.
+- Direct graph: `--target ./graph.omni` or a registered `kind: direct, scope: graph` entry.
+- Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
+- Server: `--target production --graph knowledge` or an explicit HTTP/Unix address. A registered server target binds its endpoint and credential owner or `auth: anonymous`.
+- Managed: a registered account or cluster target pins API, organization, authentication mechanism and, for clusters, ID and incarnation. Data access additionally requires its endpoint. `--graph` or `default_graph` is required for graph commands.
+- Catalogue: `--target og_catalog` for `query` and `schema show`.
 
-**Data plane** — `any` (served via `--server`/`--profile`, or direct via `--store`/URI):
-- `query` `<name>` — a **served stored query** by name (via `--server`/`--profile`); or ad-hoc `[<name>] (--query <f.gq> | -e '<GQ>')` where `<name>` picks which query in the source. `[--params <json> | --params-file <p>] [--branch <b> | --snapshot <id>] [--format <fmt> | --json]`. No positional URI — address via `--server`/`--store`/`--profile`.
-- `mutate` — same shape (served stored mutation by `<name>`, or ad-hoc `--query`/`-e`); `[--params …] [--branch <b>] [--if-commit <graph_commit_id>] [--json]`. The verb asserts kind; a failed precondition has no effect and exits 4, served or direct (`--store`).
-- `load --data <f.jsonl> --mode <overwrite|append|merge> [--branch <b>] [--from <base>] [--json]` — `--mode` required; `--from` forks a missing `--branch`; overwrite replaces only represented types
-- `blob <get|stat> <node|edge> <TYPE> <ID> <PROPERTY>` — dedicated Blob-cell reads; `get` supports ranges/`--out`, `stat` returns metadata
-- `snapshot [--branch <b>] [--json]`
-- `export [--branch <b>] [--type <T>…]` (streams JSONL)
-- `branch <create <name> [--from <base>] | list | delete <name> | merge <source> [--into <target>] [--delete-branch]> [--json]` (`--from`/`--into` default to `main`; also available as GQ statements via `mutate -e`/`query -e`)
-- `commit <list [--branch <b>] | show <commit_id> | changes <commit_id> [filters…]> [--json]`
-- `diff --from <branch|commit_id> --to <branch|commit_id> [filters…] [--json]` — net entity changes between two read targets; `branch diff <source> [--into <target>]` reviews a branch against its merge base, and `branch merge-base <source> [--into <target>]` prints that base
-- `changes <poll [--start now|beginning|after:<id> | --cursor <c>] | baseline --out <snapshot.jsonl>> [filters…] [--json]`
-- `schema show` (alias `get`)
+Bare target names resolve from the operator file; use `./` for relative inline
+paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
+address convenience. `--as ACTOR` attributes supported direct operations;
+served targets derive their actor from credentials and send `--as` as the
+`Omnigraph-If-Actor` assertion, refusing a mismatch with `actor_mismatch` and
+exit 4; managed targets refuse it. `--yes` supplies explicit
+consent for destructive nonlocal operations. There is no quiet switch for the
+destination line. Legacy `--server`, `--store`, `--cluster`, `--profile`,
+`--managed`, `--direct`, graph `--uri`, `use` and `profile` commands are removed.
 
-Every read query runs on engine v2, the planned execution route and the only
-`engine` value. `query -e 'explain query q() { … }'`
-returns the v2 logical, physical and available DataFusion trees without
-executing the query. It uses the ordinary query target and parameter flags.
+| Family | Operations and applicability |
+|---|---|
+| Data | `query`, `mutate`, `load --mode overwrite\|append\|merge`, `branch`, `commit`, `snapshot`, `export`, `blob`, `diff`, `changes`; direct or server targets |
+| Managed data | `query`, `mutate`, `load`, `commit list/show`, `graphs list`; other wrappers do not acquire managed credentials |
+| Direct schema | `schema plan`; `schema apply` and `schema upgrade-system-columns` require standalone graph targets |
+| Direct maintenance | `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes`; `upgrade --target ADDRESS` is standalone and offline |
+| Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
+| Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets |
+| Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
+| Managed account | `cluster create/list`, `organization members/invitations`; account target |
+| Managed cluster | `cluster members/pull/push/plan/apply/status/history/cancel/token/delete/undo-delete`; complete cluster target |
+| Local configuration | `target list/show/add/remove/import`, `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
+| Authentication | `login --target NAME` / `logout --target NAME`; server static credentials or managed human-device session. `credential get --target NAME` exports a server token to a pipe |
 
-**Served only** (needs `--server`/`--profile`): `graphs list [--json]`
+`query` and `mutate` invoke stored queries by positional name, or accept
+`--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate
+values into query source. Reads support `--format table|json|jsonl|csv|kv`;
+`--json` preserves exact receipt/error structure. Inspect `commit` and
+`graph_commit_id` after uncertain writes; do not infer safe retry from a timeout.
 
-**Direct / storage** — reject `--server`. `init` requires its positional URI;
-`schema plan`/`apply` use a positional URI or `--store`; lint and maintenance also
-accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
-- `init --schema <f.pg> <uri> [--force]`
-- `schema <plan|apply> --schema <f.pg> [--json]` — `apply` refuses a cluster-managed graph; evolve those via `cluster apply`
-- `upgrade <uri> [--check] [--to-format <N>] [--json]` — offline standalone
-  conversion of a v8, v9 or v13 graph to the format `omnigraph version`
-  reports as written, the only `--to-format` target; a graph at an older
-  served format is only stamped to it.
-  `schema upgrade-system-columns <uri> [--check] [--json]` respells a served
-  graph's legacy `id`/`src`/`dst` columns without changing its format.
-  Read [migration preconditions](references/migrations.md) first;
-  cluster-managed roots refuse. The 0.11 binary's `upgrade` took
-  `--to-format <7|8|9>` and defaulted to v9.
-- `lint --query <f.gq> [--schema <f.pg>] [<uri>] [--json]` — offline with `--schema`, graph-backed with a URI
-- `optimize [--json]` · `repair [--json]` · `cleanup [--keep <N>] [--older-than <7d>] --confirm [--json]` (at least one retention option; both may be combined)
-- `rebuild-full-text-indexes [--branch <b>] [--json]` — replace full-text indexes on one branch with default English analysis; custom tokenizer settings are replaced. Stop overlapping writers and retain a whole-store backup for upgrades. `--as` records attribution; direct access does not load server policy. See [maintenance commands](references/commands.md#rebuild-full-text-indexes--explicit-analyzer-upgrade).
+Managed source changes use `cluster push --config DIR --expected-revision REV`,
+then `cluster plan --rev REV`, then `cluster apply --plan PREVIEW_ID`, all with
+the same cluster target. Managed plan/apply reject local `--config`. Creation
+returns identity; it does not select a new target or bind a folder. Human-device
+and automation-env authentication never fall back to each other. Preserve
+operator-home lifecycle recovery records; `target import` validates and migrates
+legacy folder evidence before new lifecycle submissions.
 
-**Control plane**:
-- `organization --managed <members | invitations> <command>` (alias `org`) — manage people in the selected organization; supply `--api <origin>` and `--organization <id>`, or use a bound folder. Requires the organization `members_manage` grant. Writes require `--idempotency-key`; admission and invitations do not grant graph permissions. Before offboarding, deploy Cedar revocation and verify denial with an existing graph credential. See [organization administration](references/commands.md#organization-administration) for all commands and partial-result handling.
-- `cluster <validate | plan | apply | status | observe> [--config <dir>] [--json]` — self-hosted unless `--managed` is explicit; folder context never selects the mode. `plan` and `observe` are read-only. `plan`, `apply`, and `status` accept `--server <name|url>`. Served `apply` waits for activation; `--no-wait` returns after durable acceptance, and `--timeout <1..3600>` bounds caller waiting. Resume observation with `status --deployment-id <id> --wait [--timeout <seconds>]`; timeout never cancels execution. Direct recovery uses the original `--deployment-id` with `--writers-stopped`.
-- `cluster force-unlock <lock_id> [--config <dir>] [--json]` · `--cluster <root> cluster upgrade-ledger --writers-stopped [--json]` (explicit conversion of a supported legacy ledger, with serving and writers stopped)
-- Managed service: `use <CLUSTER_ID> --api <origin>` · `cluster <command> --managed` for `create <name> --api <origin>`, `push --expected-revision <rev> --message <m>`, `plan [--rev <rev>]`, `apply --plan <run>`, `status [RUN_ID]`, `operation <id> [--wait]`, `history`, `cancel <run>`, `token ([--ttl 1h] | --clear)`, `delete --incarnation <id>`, or `undo-delete --incarnation <id> --deletion-id <id>`. The mode rejects ordinary target/actor flags and `--direct`; see [managed clusters](references/cluster.md#managed-clusters).
-- `policy <validate | test --tests <f> | explain --actor <a> --action <act> [--branch <b> | --target-branch <b>]> --cluster <dir|uri> [--graph <id>]`
-- `queries <validate | list> --cluster <dir|uri> [--graph <id>] [--json]`
-
-**Local** (no graph):
-- `alias <name> [args…]` — invoke an operator alias's bound stored read query; `[--params … | --params-file <p>] [--format <fmt> | --json]` (server/graph/query come from the binding)
-- `embed (--seed <embed.yaml> | --input <raw.jsonl> --output <out.jsonl> --spec <spec.json>) [--reembed-all | --clean] [--type <T>…] [--select "<Type>:<field>=<value>"]`
-- `login <server> [--token <t>]` (prefer piping the token on stdin) · `logout <server>` · `login --api <origin>` / `logout --api <origin>` (managed session) · `profile <list | show [<name>]>` · `skill <export <dir> [--force] [--json] | show [<path>]>` · `version [--json]`
-
-Managed folders can select an Intent API with `login --api` and `use`; implicit
-`query`, `mutate`, `load`, `commit list`/`show` and `graphs list` then acquire
-and cache a separate identity credential themselves (`cluster token --managed` remains
-for credential administration). Global `--direct`
-selects ordinary addressing. See [managed routing](references/cluster.md#managed-clusters)
-before using ambient targets or credentials.
-
-Pre-0.7.0 spellings (`read`/`change`/`ingest`, `--target`, positional `http://`) → [`references/migrations.md`](references/migrations.md).
+For direct recovery, `cluster apply --target ROOT --deployment-id ID
+--writers-stopped` has no `--config`: it reconciles an existing attempt. A fresh
+apply with a caller ID requires explicit `--config`, and reusing an existing ID
+only observes that attempt. Full command shapes and bounds live in
+[commands](references/commands.md) and [cluster operations](references/cluster.md).
 
 ## Schema Design
 
@@ -266,7 +258,7 @@ mappings: [`references/schema-design.md`](references/schema-design.md).
 
 A graph's bytes live in one of three supported URI families:
 
-- **Local filesystem** — a path or `file://` URI. In cluster mode `storage:` defaults to the config directory, so local dev needs no object store.
+- **Local filesystem** — a path or `file://` URI. The target selects the graph or cluster root explicitly; a source directory does not select storage. Local development needs no object store.
 - **S3-compatible object storage** — AWS, Railway, Tigris, etc. (`s3://bucket/prefix`). Authenticate with the standard `AWS_*` environment contract.
 - **Azure Blob storage preview** — `az://container/prefix`. Reads and Azurite qualification are available, but Azure is not production-supported; every write or maintenance process must be launched through the root-scoped `omnigraph-azure-admission` wrapper.
 
@@ -276,7 +268,7 @@ Keep development credentials in a git-ignored `.env.omni` and source it before C
 set -a && source .env.omni && set +a
 ```
 
-Direct `init`/`load` and **`cluster apply`** write storage without an HTTP server. A served `load` is different: the CLI sends it to `omnigraph-server`, which performs the graph write. A direct `cluster apply` reaches the cluster ledger and graph datasets directly, so its host needs storage credentials (`cluster apply --managed --plan` is executed by the Intent API). A serving process also needs read-write access for served data-plane writes. Validate with `curl http://127.0.0.1:8080/readyz` (HTTP 200, `ready: true`; `/healthz` only proves the process is alive), then `omnigraph snapshot --server <name> --graph <id> --json`.
+Direct `init`/`load` and **`cluster apply`** write storage without an HTTP server. A served `load` is different: the CLI sends it to `omnigraph-server`, which performs the graph write. A direct `cluster apply` reaches the cluster ledger and graph datasets directly, so its host needs storage credentials (`cluster apply --target managed --plan` is executed by the Intent API). A serving process also needs read-write access for served data-plane writes. Validate with `curl http://127.0.0.1:8080/readyz` (HTTP 200, `ready: true`; `/healthz` only proves the process is alive), then `omnigraph snapshot --target <name> --graph <id> --json`.
 
 ## Project Layout
 
@@ -289,54 +281,52 @@ Direct `init`/`load` and **`cluster apply`** write storage without an HTTP serve
   config-free) serves it. A direct apply keeps its admission lock: once its
   writes have settled, release that exact lock with
   `cluster force-unlock <LOCK_ID>` before starting the server, and send later
-  changes with `cluster apply --server <name|url>`.
+  changes with `cluster apply --target <name|url>`.
   See `references/cluster.md`.
 - **Direct / embedded access — no server.** Address a graph's storage directly
-  with `--store <file://|s3://|az:// uri>` or a positional URI for one-off CLI ops.
+  with `--target <file://|s3://|az:// uri>`; `init` also accepts its creation URI positionally.
   There is **no single-graph server mode** — the server is cluster-only.
 
 ### The two config surfaces
 
-Configuration has two single-owner homes (RFC-007/008), plus an
-everything-explicit flag/env tier:
-
-| Surface | Owner | Location | Declares |
-|---|---|---|---|
-| **Cluster config** | the team, in the repo | `cluster.yaml` + the `.pg`/`.gq`/policy files it references | what the system **is**: graphs, schemas, queries, policies, storage |
-| **Operator config** | one person | `~/.omnigraph/config.yaml` (`$OMNIGRAPH_HOME` relocates it) | who **I** am: identity, named servers, output defaults, personal aliases |
-| Flags / env | per invocation | — | everything, explicitly |
+The team owns `cluster.yaml` and referenced schemas, stored queries and policies.
+The operator owns complete destinations, identity, presentation and personal
+aliases in `~/.omnigraph/config.yaml` (`OMNIGRAPH_HOME` changes that directory).
+Source configuration declares desired state; targets select where it applies.
 
 ```yaml
-# ~/.omnigraph/config.yaml — per operator, never committed
+target_config_version: 1
 operator:
-  actor: act-andrew          # default --as identity
-servers:
-  intel-dev:
-    url: https://graph.example.com    # no tokens here, ever
+  actor: act-andrew
 defaults:
-  output: table              # read-format default
-  server: intel-dev          # default served scope (or `store: file://…/g.omni` for a local default — mutually exclusive)
-  default_graph: spike       # graph within a server/cluster scope
-profiles:                    # optional named scope bundles — pick with --profile <name>
-  staging: { server: intel-staging, default_graph: spike }
-aliases:                     # personal bindings to TEAM stored queries (see references/aliases.md)
-  triage: { server: intel-dev, graph: spike, query: weekly_triage, args: [since] }
+  output: table
+  target: intel-dev
+targets:
+  intel-dev:
+    kind: server
+    endpoint: https://graph.example.com
+    credential: intel-dev
+    default_graph: spike
+aliases:
+  triage:
+    target: intel-dev
+    graph: spike
+    query: weekly_triage
+    args: [since]
 ```
 
-The operator config and credentials are **auto-discovered — no flag points at them**: the CLI reads `$OMNIGRAPH_HOME/config.yaml` (default `~/.omnigraph/config.yaml`), and an absent file is just an empty layer (zero-config). `$OMNIGRAPH_HOME` relocates the *directory* only, not a specific file. `--config` selects source/context folders for `cluster`, `organization` and `use`.
+Secrets stay outside configuration. `echo "$TOKEN" | omnigraph login --target
+intel-dev` stores an endpoint-bound static token with mode `0600`;
+`OMNIGRAPH_TOKEN_INTEL_DEV` overrides it. Managed sessions and data credentials
+use separate OS-keychain entries. Named cloud targets pin provider destination
+settings while standard provider chains supply storage credentials. Stored
+relative paths resolve beside the operator file, whereas explicit inline paths
+resolve from the working directory. Source/query paths are independent inputs.
 
-Credentials live outside config: `echo $TOKEN | omnigraph login intel-dev`
-writes `~/.omnigraph/credentials` (`0600`); the matching token resolves via
-`OMNIGRAPH_TOKEN_INTEL_DEV` or that file. A token goes only to URLs under its
-server's `url`: a literal `--server <url>` matching no `servers:` entry gets no
-credential, and `OMNIGRAPH_BEARER_TOKEN` is not read.
-
-**Addressing a graph**: `--store <file://|s3://|az:// uri>` or a positional URI for
-direct storage; `--server <name|url>` (+ `--graph <id>`) for a served remote;
-`--profile <name>` for a named bundle; else the operator `defaults`. A remote is
-addressed with `--server` (a bare `http(s)://` URL is not a graph address). Run
-data-plane commands from a graph's project folder so relative `queries/`,
-`schema.pg`, and `.env.omni` paths resolve.
+Use `target import` for old operator files and matching lifecycle evidence.
+It preserves the original file and refuses ambiguous bindings. Neither
+`OMNIGRAPH_PROFILE` nor `.omnigraph/context` supplies a target. A target name
+never falls back to a filesystem path, credential cache or discovered graph.
 
 ### What to commit
 
@@ -374,14 +364,14 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | `$p.id`, `{ id: $v }`, `where id =` from a v0.10 query | ``T6``/``T2``/``T11``: ``type `Person` has no property `id`; the system identity is `$p.@id` `` (a failing stored-query registry quarantines its graph) | Use `$p.@id`, `$e.@src`/`@dst`, `where @id =`; lint every `.gq` before restarting on v0.11 or later |
 | Long-lived feature branches | merge conflicts, schema apply blocked | Merge promptly; delete when done |
 | `mutation { ... }` wrapper in `.gq` | `parse error: expected query_file` at line 1 | Use `query <name>(...) { insert T { ... } }`; there is no top-level `mutation` keyword |
-| `--config` on a data/schema command | `unexpected argument '--config' found` | Use it for `cluster`, `organization` and `use`; use `--server`/`--graph`, `--store`, or `--profile` elsewhere |
+| `--config` on a data/schema command | `unexpected argument '--config' found` | Use it only for source-taking cluster commands; select destinations with `--target` |
 | `--as` names another actor than the served write's token | `actor_mismatch` (exit 4) | Use the token of that actor, or drop `--as`; the bearer token selects the actor |
-| Reading a large schema via stdout-capped tool | Truncated, garbled, or duplicated output | `omnigraph schema show --server <name> --graph <id> > /tmp/schema.pg`, then read the file in chunks |
+| Reading a large schema via stdout-capped tool | Truncated, garbled, or duplicated output | `omnigraph schema show --target <name> --graph <id> > /tmp/schema.pg`, then read the file in chunks |
 | `omnigraph load` without `--mode` | `the following required arguments were not provided: --mode <MODE>` | Pass `--mode merge\|append\|overwrite` — there is no default (overwrite is destructive, so it is never implicit). Address direct storage or a served graph |
 | Blind retry after 504 | duplicate unkeyed nodes/edges or a repeated effect | compare the intended branch/entity state first; retry only after proving the attempt did not land |
 | Review branch left after a timed-out `load --from` | uncertain load result | Inspect its content and history; matching `main`'s head alone is not proof of abandonment or authorization to delete it |
-| `omnigraph schema apply` / `init` on a cluster-managed graph | refused — bypasses the cluster ledger | Evolve cluster graphs via `omnigraph cluster apply --config .`; `schema apply`/`init` are for a non-cluster store |
-| Assuming Blob-bearing data cannot compact | unnecessary skipped maintenance | Lance 11 Blob compaction is supported; `optimize` preserves null/empty/non-empty values |
+| `omnigraph schema apply` / `init` on a cluster-managed graph | refused — bypasses the cluster ledger | Evolve cluster graphs via `omnigraph cluster apply --target ROOT --config .`; `schema apply`/`init` are for a non-cluster store |
+| Assuming Blob-bearing data cannot compact | unnecessary skipped maintenance | Lance 13 Blob compaction is supported; `optimize` preserves null/empty/non-empty values |
 | `@unique`/`@index` on a Blob column | schema parse/validation rejection | Blob properties cannot be keys, unique, or indexed |
 | Full-text search on indexes built before Lance 11 (v0.9 era), including after `omnigraph upgrade` | `FullTextIndexRebuildRequired` | Stop mixed-version access and run `rebuild-full-text-indexes --branch <b>` on every live branch that needs text search; `upgrade` does not rebuild them |
 | Reopening a v0.10/v6 graph with v0.12 | `__manifest is stamped at internal schema v6, but this omnigraph reads only v14 to v14` | Stop the old fleet; take a standalone graph to v9 with the 0.11 `upgrade`, then to 14 with the 0.12 `upgrade`, or rebuild by export, `init` and `load --mode overwrite` |
@@ -392,7 +382,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Assuming every JSON result cell has a key | absent keys for null values | Query/export JSON omits null cells; change images retain explicit nulls |
 | `--format arrow` or `defaults.output: arrow` | `has no text rendering` after the query runs | 0.12.0 has no Arrow output; use `json` or `jsonl` |
 | `..` or a symlink in a `cluster.yaml` relative path | `config_path_escape` / `config_path_symlink` | Keep referenced files inside the config directory with plain relative paths |
-| Managed folder plus `OMNIGRAPH_PROFILE` or an operator default server/store | `managed_target_ambiguous` | Pass an explicit `--server`/`--store`/`--profile`, or `--direct` |
+| Legacy folder/profile routing | `legacy_routing` | Import preserved configuration/custody, then choose an explicit complete target |
 | Policy commands with both a graph and a `cluster` bundle applied | `matches 2 policy bundles` | Known 0.12.0 limitation of `policy validate/test/explain --graph`; inspect each bundle file directly |
 
 ## Deep Dives
@@ -407,11 +397,11 @@ For anything beyond the basics, load the relevant reference file. Each is self-c
 | [`references/data.md`](references/data.md) | Choosing between `mutate` and `load` (required `--mode`, `--from` to fork a review branch); branch review workflow; exact overwrite scope |
 | [`references/blobs.md`](references/blobs.md) | Writing and reading managed/external Blob values, selectors/ranges, security and lifecycle boundaries |
 | [`references/changes.md`](references/changes.md) | Exact read/write positions, conditional mutations, commit diffs, feed cursors, baselines, and retention gaps |
-| [`references/remote-ops.md`](references/remote-ops.md) | Operating through `--server`: exact receipts, unknown 504 outcomes, conflict handling, and safe retry decisions |
+| [`references/remote-ops.md`](references/remote-ops.md) | Operating through `--target`: exact receipts, unknown 504 outcomes, conflict handling, and safe retry decisions |
 | [`references/cluster.md`](references/cluster.md) | Cluster configuration, plan/apply, drift, and serving |
 | [`references/search.md`](references/search.md) | Embeddings, `@embed`, vector/text ranking, scope-then-rank pattern |
 | [`references/aliases.md`](references/aliases.md) | Defining aliases for agents, structured output, JSON args |
-| [`references/stored-queries.md`](references/stored-queries.md) | Cluster stored-query registry: declaration, `queries validate/list --cluster`, served invocation, and `invoke_query` Cedar gating |
+| [`references/stored-queries.md`](references/stored-queries.md) | Cluster stored-query registry: declaration, `queries validate/list --target`, served invocation, and `invoke_query` Cedar gating |
 | [`references/server-policy.md`](references/server-policy.md) | Starting the HTTP server, routes, bearer auth, Cedar policy gating, multi-graph mode |
 | [`references/commands.md`](references/commands.md) | Current command shapes, addressing, output, and maintenance |
 | [`references/migrations.md`](references/migrations.md) | Upgrading v0.11 graphs to storage format 14; v0.11 storage/system-column upgrades and wire changes; older v0.9→v0.10 and pre-0.7 boundaries |

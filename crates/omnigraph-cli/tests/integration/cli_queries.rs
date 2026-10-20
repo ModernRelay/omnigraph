@@ -13,7 +13,7 @@ use crate::support::*;
 
 const STATEMENT_GRAPH_ID: &str = "knowledge";
 
-/// A loaded graph for the embedded (`--store`) arm.
+/// A loaded graph for the embedded (`--target`) arm.
 fn loaded_graph() -> (TempDir, PathBuf) {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -22,7 +22,7 @@ fn loaded_graph() -> (TempDir, PathBuf) {
     (temp, graph)
 }
 
-/// A loaded graph served unauthenticated for the remote (`--server`) arm.
+/// A loaded graph served unauthenticated for the remote (`--target`) arm.
 fn served_graph() -> (ClusterFixture, TestServer) {
     let cluster = converged_loaded_cluster(STATEMENT_GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -31,7 +31,7 @@ fn served_graph() -> (ClusterFixture, TestServer) {
 
 fn embedded(verb: &str, graph: &Path) -> assert_cmd::Command {
     let mut command = cli();
-    command.arg(verb).arg("--store").arg(graph);
+    command.arg(verb).arg("--target").arg(graph);
     command
 }
 
@@ -39,7 +39,7 @@ fn served(verb: &str, server: &TestServer) -> assert_cmd::Command {
     let mut command = cli();
     command
         .arg(verb)
-        .arg("--server")
+        .arg("--target")
         .arg(&server.base_url)
         .arg("--graph")
         .arg(STATEMENT_GRAPH_ID);
@@ -316,7 +316,7 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
         })
     );
     assert!(refusal.get("http_status").is_none());
-    assert!(refused_json.stderr.is_empty());
+    assert!(only_target_report(&refused_json));
     let listed = output_success(
         served("query", &server)
             .arg("-e")
@@ -384,7 +384,7 @@ fn branch_statement_local_refusals_happen_before_any_round_trip() {
         let mut command = cli();
         command
             .args(args)
-            .arg("--server")
+            .arg("--target")
             .arg(unreachable)
             .arg("--graph")
             .arg("g");
@@ -582,7 +582,7 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
                 .arg(verb)
                 .arg("-e")
                 .arg(SOURCE)
-                .arg("--server")
+                .arg("--target")
                 .arg(&server.origin)
                 .arg("--graph")
                 .arg("g")
@@ -609,7 +609,7 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
             actual, refusal,
             "{verb} must preserve every original server field"
         );
-        assert!(output.stderr.is_empty(), "{verb}: {output:?}");
+        assert!(only_target_report(&output), "{verb}: {output:?}");
         let requests = server.requests();
         assert_eq!(requests.len(), 2, "one discovery and one data request");
         assert_eq!(requests[0].method, "HEAD");
@@ -791,7 +791,7 @@ fn set_flag_refusals_happen_before_any_open_or_round_trip() {
         let mut command = cli();
         command
             .args(args)
-            .arg("--server")
+            .arg("--target")
             .arg(unreachable)
             .arg("--graph")
             .arg("g");
@@ -889,7 +889,7 @@ fn alias_unknown_name_errors_listing_defined() {
     let home = tempdir().unwrap();
     std::fs::write(
         home.path().join("config.yaml"),
-        "servers:\n  dev:\n    url: https://x\ndefaults:\n  output: json\naliases:\n  who:\n    server: dev\n    query: find_person\n",
+        "target_config_version: 1\ntargets:\n  dev:\n    kind: server\n    endpoint: https://x\n    credential: dev\ndefaults:\n  output: json\naliases:\n  who:\n    target: dev\n    query: find_person\n",
     )
     .unwrap();
     let output = output_failure(
@@ -949,12 +949,12 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
         };
         let server = IntentApiFixture::graph(vec![response]);
         let captured_config = format!(
-            "servers:\n  prod:\n    url: '{}'\n  graph-owner:\n    url: '{}/graphs/knowledge'\ndefaults:\n  output: {default_format}\naliases:\n  who:\n    server: prod\n    graph: knowledge\n    query: find_person\n    args: [name, limit]\n    params: {{name: fixed, limit: 1, source: original-alias}}\n    format: {alias_format}\ncaptured_only: true\n",
+            "target_config_version: 1\ntargets:\n  prod:\n    kind: server\n    endpoint: '{}'\n    credential: prod\n  graph-owner:\n    kind: server\n    endpoint: '{}/unrelated'\n    credential: graph-owner\ndefaults:\n  output: {default_format}\naliases:\n  who:\n    target: prod\n    graph: knowledge\n    query: find_person\n    args: [name, limit]\n    params: {{name: fixed, limit: 1, source: original-alias}}\n    format: {alias_format}\n",
             server.origin, server.origin
         );
         fs::write(&config, captured_config).unwrap();
         let replacement_config = format!(
-            "servers:\n  prod:\n    url: '{}'\n  replacement:\n    url: '{}/graphs/knowledge'\naliases:\n  who:\n    server: prod\n    graph: replacement\n    query: replacement_query\n    params: {{source: replacement-alias}}\nreplacement_only: true\n",
+            "target_config_version: 1\ntargets:\n  prod:\n    kind: server\n    endpoint: '{}'\n    credential: prod\n  replacement:\n    kind: server\n    endpoint: '{}/graphs/knowledge'\n    credential: replacement\naliases:\n  who:\n    target: prod\n    graph: replacement\n    query: replacement_query\n    params: {{source: replacement-alias}}\n",
             trap.origin, server.origin
         );
         fs::write(&replacement, &replacement_config).unwrap();
@@ -1071,12 +1071,14 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
         assert_eq!(requests[0].path, "/graphs/knowledge/queries/find_person");
         assert_eq!(
             requests[0].headers["authorization"],
-            "Bearer captured-graph-token"
+            "Bearer captured-root-token"
         );
         assert_eq!(
             requests[0].body,
             json!({
                 "expect_mutation": false,
+                "branch": null,
+                "snapshot": null,
                 "params": {
                     "name": "explicit-name", "limit": 2,
                     "source": "original-alias", "extra": "file"
@@ -1086,7 +1088,7 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
         let stderr = stderr_string(&output);
         assert_eq!(
             stderr.matches("unknown key `captured_only`").count(),
-            1,
+            0,
             "{stderr}"
         );
         // Success and failure presentation use the same config as alias dispatch.
@@ -1101,70 +1103,39 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
 #[test]
 fn alias_rejects_global_scope_flags_that_the_binding_owns() {
     for (flag, value) in [
-        ("--server", "dev"),
+        ("--target", "dev"),
         ("--graph", "local"),
-        ("--store", "file:///tmp/graph.omni"),
-        ("--cluster", "."),
-        ("--profile", "prod"),
         ("--as", "act-op"),
     ] {
-        let output = output_failure(cli().arg(flag).arg(value).arg("alias").arg("who"));
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let output = output_failure(cli().args(["alias", "who", flag, value]));
+        let stderr = stderr_string(&output);
         assert!(
-            stderr.contains("`alias` uses the server, graph, and stored query")
-                && stderr.contains(flag),
-            "expected {flag} to be rejected by the alias binding guard; got: {stderr}"
+            stderr.contains("does not accept") && stderr.contains(flag),
+            "{stderr}"
         );
     }
 }
 
 #[test]
-fn queries_list_with_store_flag_errors() {
-    // `queries list` reads a cluster's applied state; a single-graph `--store`
-    // address can never apply. Rejected loudly at the addressing guard (was:
-    // silently ignored, then failed later asking for a cluster).
+fn queries_list_rejects_direct_graph_target() {
+    let home = tempdir().unwrap();
+    fs::write(home.path().join("config.yaml"), "target_config_version: 1\ntargets:\n  graph:\n    kind: direct\n    scope: graph\n    uri: ./graph.omni\n").unwrap();
     let output = output_failure(
         cli()
-            .arg("--store")
-            .arg("file:///tmp/graph.omni")
-            .arg("queries")
-            .arg("list"),
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["queries", "list", "--target", "graph"]),
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("`queries list` is a cluster control command")
-            && stderr
-                .contains("--store addresses a single graph's storage directly and does not apply"),
-        "expected the addressing-guard store rejection; got: {stderr}"
-    );
+    assert!(stderr_string(&output).contains("not available for this target kind and scope"));
 }
 
 #[test]
 fn queries_list_with_as_flag_errors() {
-    // Read-only control verbs (`queries`, `policy`, `cluster status`, …) never
-    // read the actor; only actor-bound `cluster apply` does. `--as` on a
-    // non-attributing control verb must be a loud guard error, not a silently
-    // dropped identity (PR #377 review follow-up).
-    let output = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-alice")
-            .arg("queries")
-            .arg("list"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("`queries list` is a cluster control command")
-            && stderr.contains("--as")
-            && stderr.contains("does not apply"),
-        "expected the addressing-guard --as rejection; got: {stderr}"
-    );
+    let output = output_failure(cli().args(["queries", "list", "--as", "act-alice"]));
+    assert!(stderr_string(&output).contains("queries list does not accept --as"));
 }
 
 #[test]
-fn queries_and_policy_wrong_server_scope_points_at_cluster_scope() {
-    let home = tempdir().unwrap();
-    fs::write(home.path().join("config.yaml"), "servers: [\n").unwrap();
+fn queries_and_policy_refuse_server_targets_before_network() {
     let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
     for args in [
         vec!["queries", "list"],
@@ -1173,35 +1144,20 @@ fn queries_and_policy_wrong_server_scope_points_at_cluster_scope() {
         vec!["policy", "test", "--tests", "missing-tests.yaml"],
         vec!["policy", "explain", "--actor", "actor", "--action", "read"],
     ] {
-        let output = output_failure(
-            cli()
-                .current_dir(home.path())
-                .env("OMNIGRAPH_HOME", home.path())
-                .args(["--server", &server.origin])
-                .args(&args),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let output = output_failure(cli().args(["--target", &server.origin]).args(&args));
+        let stderr = stderr_string(&output);
         assert!(
-            stderr.contains("pass --cluster <dir|uri>") && !stderr.contains("pass --config <dir>"),
-            "{args:?} should point at --cluster, not --config; got: {stderr}"
+            stderr.contains("not available for this target kind and scope"),
+            "{args:?}: {stderr}"
         );
-        assert!(
-            !stderr.contains("could not parse operator config"),
-            "{stderr}"
-        );
-        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
-        assert!(
-            server.requests().is_empty(),
-            "{args:?} must refuse before HTTP"
-        );
-        assert!(!home.path().join("__cluster").exists());
-        assert!(!home.path().join("graphs").exists());
+        assert!(output.stdout.is_empty());
+        assert!(server.requests().is_empty());
     }
     server.assert_complete();
 }
 
 // RFC-011: `queries validate`/`list` source the registry + schemas from a
-// converged cluster's applied state (`--cluster <dir>`), not omnigraph.yaml.
+// converged cluster's applied state (`--target <dir>`), not omnigraph.yaml.
 
 /// Build a converged single-graph cluster (id `knowledge`) with one stored
 /// query. `query_block` is the YAML under the graph's `queries:` key.
@@ -1237,7 +1193,7 @@ fn queries_validate_exits_zero_on_clean_registry() {
         cli()
             .arg("queries")
             .arg("validate")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
@@ -1279,7 +1235,15 @@ fn cluster_apply_rejects_a_broken_query_naming_it_and_where() {
             ),
         )
         .unwrap();
-        let output = output_failure(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
+        let output = output_failure(
+            cli()
+                .arg("cluster")
+                .arg("apply")
+                .arg("--target")
+                .arg(dir)
+                .arg("--config")
+                .arg(dir),
+        );
         let combined = format!(
             "{}{}",
             stdout_string(&output),
@@ -1305,7 +1269,7 @@ fn queries_list_prints_registered_query() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
@@ -1336,7 +1300,7 @@ fn queries_list_surfaces_description_and_instruction() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
@@ -1354,7 +1318,7 @@ fn queries_list_surfaces_description_and_instruction() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path())
             .arg("--json"),
     );
@@ -1388,7 +1352,7 @@ fn queries_list_indents_multiline_annotation_continuation() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
@@ -1415,7 +1379,7 @@ fn queries_list_omits_annotations_when_absent() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
@@ -1430,7 +1394,7 @@ fn queries_list_omits_annotations_when_absent() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path())
             .arg("--json"),
     );
@@ -1449,12 +1413,11 @@ fn queries_list_omits_annotations_when_absent() {
 
 #[test]
 fn queries_validate_requires_a_cluster() {
-    // RFC-011: with no --cluster (and no cluster profile), the command errors
-    // loudly rather than reading any omnigraph.yaml.
+    // With no --target or defaults.target, no source file can route the command.
     let output = output_failure(cli().arg("queries").arg("validate"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("needs a cluster") || stderr.contains("--cluster"),
+        stderr.contains("target_required") && stderr.contains("--target"),
         "queries validate must require a cluster; stderr:\n{stderr}"
     );
 }
@@ -1473,7 +1436,7 @@ fn queries_validate_graph_filter_selects_one_graph() {
         cli()
             .arg("queries")
             .arg("validate")
-            .arg("--cluster")
+            .arg("--target")
             .arg(dir)
             .arg("--graph")
             .arg("knowledge"),
@@ -1481,7 +1444,7 @@ fn queries_validate_graph_filter_selects_one_graph() {
     assert!(stdout_string(&output).contains("OK"));
 
     let listed = parse_stdout_json(&output_success(
-        cli().args(["queries", "list", "--cluster"]).arg(dir).args([
+        cli().args(["queries", "list", "--target"]).arg(dir).args([
             "--graph",
             "knowledge",
             "--json",
@@ -1492,7 +1455,7 @@ fn queries_validate_graph_filter_selects_one_graph() {
 
     let missing = output_failure(
         cli()
-            .args(["queries", "validate", "--cluster"])
+            .args(["queries", "validate", "--target"])
             .arg(dir)
             .args(["--graph", "missing", "--json"]),
     );
@@ -1582,7 +1545,7 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     for &(default_format, flags, expected_format) in cases {
         std::fs::write(
             operator_home.path().join("config.yaml"),
-            format!("defaults:\n  output: {default_format}\n"),
+            format!("target_config_version: 1\ndefaults:\n  output: {default_format}\n"),
         )
         .unwrap();
         let output = output_failure(
@@ -1603,7 +1566,7 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
                 json,
                 "{default_format} {flags:?}"
             );
-            assert!(output.stderr.is_empty(), "{output:?}");
+            assert!(only_target_report(&output), "{output:?}");
             if expected_format == "jsonl" {
                 assert_eq!(stdout_string(&output).lines().count(), 1, "{output:?}");
             }

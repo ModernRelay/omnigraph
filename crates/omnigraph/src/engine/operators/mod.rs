@@ -19,6 +19,7 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, MetricsSet,
+    Timestamp,
 };
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{PlanProperties, RecordBatchStream, SendableRecordBatchStream};
@@ -174,7 +175,8 @@ pub(in crate::engine) fn was_drained(metrics: &MetricsSet) -> Option<bool> {
     counts_polls.then_some(drained)
 }
 
-/// `stream` with every poll counted on `metrics`, and its end when reached.
+/// `stream` with every poll counted on `metrics`, its end when reached, and
+/// the timestamps of its first poll and its end, the operator's wall span.
 pub(super) fn polled(
     metrics: &ExecutionPlanMetricsSet,
     stream: SendableRecordBatchStream,
@@ -183,6 +185,8 @@ pub(super) fn polled(
         stream,
         polls: MetricBuilder::new(metrics).counter(POLLS, 0),
         drained: MetricBuilder::new(metrics).counter(DRAINED, 0),
+        start: MetricBuilder::new(metrics).start_timestamp(0),
+        end: MetricBuilder::new(metrics).end_timestamp(0),
     })
 }
 
@@ -190,16 +194,26 @@ struct Polled {
     stream: SendableRecordBatchStream,
     polls: Count,
     drained: Count,
+    start: Timestamp,
+    end: Timestamp,
 }
 
 impl Stream for Polled {
     type Item = DfResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.polls.value() == 0 {
+            self.start.record();
+        }
         self.polls.add(1);
         let polled = self.stream.as_mut().poll_next(cx);
-        if matches!(polled, Poll::Ready(None)) {
-            self.drained.add(1);
+        match &polled {
+            Poll::Ready(None) => {
+                self.drained.add(1);
+                self.end.record();
+            }
+            Poll::Ready(Some(Err(_))) => self.end.record(),
+            _ => {}
         }
         polled
     }

@@ -6,10 +6,7 @@ use omnigraph_api_types::{
     CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput,
     SchemaApplyOutput, SnapshotDatasetOutput,
 };
-use omnigraph_cluster::{
-    DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
-    ValidateOutput,
-};
+use omnigraph_cluster::{DiagnosticSeverity, PlanOutput, StateSyncOutput, ValidateOutput};
 use omnigraph_compiler::{
     JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSeverity,
     QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, json_params_to_param_map,
@@ -48,6 +45,7 @@ mod presentation;
 mod schema_upgrade;
 mod scope;
 mod skill;
+mod targets;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/unix_gateway.rs"]
 mod unix_gateway_fixture;

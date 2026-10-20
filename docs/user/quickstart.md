@@ -55,7 +55,7 @@ several node and edge types and publishes them as one graph commit. `--mode` is
 required (`overwrite | append | merge`):
 
 ```bash
-omnigraph load --data evidence.jsonl --mode overwrite graph.omni
+omnigraph load --data evidence.jsonl --mode overwrite --target ./graph.omni
 ```
 
 For finer-grained writes and the node/edge JSONL shapes, see
@@ -81,13 +81,13 @@ Run it:
 
 ```bash
 omnigraph query sources_for_claim --query queries.gq \
-  --params '{"claim":"lower-latency"}' --format table --store graph.omni
+  --params '{"claim":"lower-latency"}' --format table --target ./graph.omni
 ```
 
 This returns `Load test report` and `Production metrics`.
 
 The query name is positional; `--query` points at the `.gq` source and
-`--store` addresses the graph's storage directly.
+`--target` addresses the graph's storage directly.
 
 The [query language](queries/index.md) covers `match`/`return`/`order`, and
 [search](search/index.md) covers vector and full-text search.
@@ -103,16 +103,16 @@ graph. Save an additional source and evidence link as `benchmark.jsonl`:
 ```
 
 `branch` commands reserve their positional argument for the branch name, so
-they address the graph with `--store` (the same flag `query` uses above):
+they address the graph with `--target` (the same flag `query` uses above):
 
 ```bash
-omnigraph branch create review/add-benchmark --store graph.omni
+omnigraph branch create review/add-benchmark --target ./graph.omni
 omnigraph load --data benchmark.jsonl --mode append \
-  --branch review/add-benchmark graph.omni
+  --branch review/add-benchmark --target ./graph.omni
 omnigraph query sources_for_claim --query queries.gq \
   --params '{"claim":"lower-latency"}' \
-  --branch review/add-benchmark --store graph.omni
-omnigraph branch merge review/add-benchmark --into main --store graph.omni
+  --branch review/add-benchmark --target ./graph.omni
+omnigraph branch merge review/add-benchmark --into main --target ./graph.omni
 ```
 
 See [branches & commits](branching/index.md) and [merging](branching/merge.md).

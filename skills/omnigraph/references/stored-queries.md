@@ -20,7 +20,7 @@ graphs:
 `queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq` or a duplicate query name across files fails `cluster validate`. A relative `queries` path must stay inside the config
 directory: a `..` segment fails with `config_path_escape`, and a symbolic link
 on the path (or a symlinked discovered `.gq` file) fails with
-`config_path_symlink`. `cluster apply` publishes them to the content-addressed catalog, and the `--cluster` server type-checks and serves every applied query. Every applied query is listed.
+`config_path_symlink`. `cluster apply` publishes them to the content-addressed catalog, and the `--target` server type-checks and serves every applied query. Every applied query is listed.
 
 A standalone `branch create`, `branch delete`, `branch merge`, or `branch list`
 statement cannot be registered as a stored query. Registry files must contain
@@ -30,9 +30,9 @@ loading reject branch-statement files.
 ## CLI
 
 ```bash
-omnigraph queries validate --cluster .             # all applied graphs
-omnigraph queries validate --cluster . --graph dev # one graph
-omnigraph queries list --cluster . --graph dev     # names and typed params
+omnigraph queries validate --target .             # all applied graphs
+omnigraph queries validate --target . --graph dev # one graph
+omnigraph queries list --target . --graph dev     # names and typed params
 ```
 
 - `cluster validate --config .` checks desired `.gq` sources before apply.
@@ -41,7 +41,7 @@ omnigraph queries list --cluster . --graph dev     # names and typed params
   edits. Registry drift or duplicate names quarantine the affected graph by
   default while healthy graphs serve; startup is fatal when no healthy graph
   remains or `--require-all-graphs` is set.
-- Both commands take `--cluster <dir|uri>`; `--graph` narrows the operation to
+- Both commands take `--target <dir|uri>`; `--graph` narrows the operation to
   one declared graph.
 - `queries` is distinct from `lint` — `lint` validates a single `.gq` file you point it at; `queries validate` validates the registry the server will actually serve.
 

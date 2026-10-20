@@ -40,13 +40,20 @@ pub(crate) struct Evidence {
     retry_after: Option<String>,
 }
 
+impl Evidence {
+    pub(crate) fn has_no_effects(&self) -> bool {
+        self.dispatched == 0 && !self.writable_open
+    }
+}
+
 tokio::task_local! {
     static COMMAND: Arc<Mutex<Evidence>>;
 }
 
 /// The kind of a command whose failure reports an outcome. Commands with
-/// their own failure reports (`lint`, `queries validate`, cluster and managed
-/// commands) and maintenance report none yet. The match is exhaustive, so a
+/// their own failure reports (`lint`, `queries validate`, the target and
+/// credential commands, cluster and managed commands) and maintenance report
+/// none yet. The match is exhaustive, so a
 /// new command declares how its failure reads.
 pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
     use CommandKind::{Read, Write};
@@ -103,8 +110,8 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
         | Command::Embed(_)
         | Command::Login { .. }
         | Command::Logout { .. }
-        | Command::Use { .. }
-        | Command::Profile { .. }
+        | Command::Target { .. }
+        | Command::Credential { .. }
         | Command::Skill { .. }
         | Command::Version { .. } => None,
     }

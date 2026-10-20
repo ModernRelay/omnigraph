@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-10-12
+updated: 2026-10-20
 discussion: https://github.com/ModernRelay/omnigraph/pull/629
 supersedes: []
 superseded_by: []
@@ -16,10 +16,19 @@ blocked_on: []
 
 # RFC 0052: Managed control-plane CLI
 
+> **RFC 0059 disposition:** [RFC 0059](0059-config-cli-coherency.md) replaces
+> managed mode flags and folder routing with managed account/cluster targets.
+> Historical: Summary and User behavior's routing forms, Design's folder context,
+> organization-selection inputs and `use`, and Compatibility's selector promises.
+> Current: exact saved-plan execution, service-owned authorization and leases,
+> captured principal identity, operation keys/outcomes, bounded observation and
+> refusal without fallback. The accepted replacement design remains subject to
+> RFC 0059's implementation cutover and qualification.
+
 > The [identity and applied-policy extension](2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
 > replaces this RFC's original authentication contract with provider-native
-> login and automatic identity acquisition. The routing and exact-plan
-> execution contracts below remain applicable.
+> login and automatic identity acquisition. The exact-plan execution contract
+> remains applicable; the RFC 0059 disposition above governs the later routing change.
 
 ## Summary
 

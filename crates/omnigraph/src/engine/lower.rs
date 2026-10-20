@@ -21,6 +21,7 @@ use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use datafusion::physical_plan::execution_plan::EmissionType;
 use omnigraph_compiler::ir::SubqueryPredicate;
 use omnigraph_compiler::query::ast::LoadStmtMode;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
@@ -478,6 +479,28 @@ impl<'l, 'a> Walk<'l, 'a> {
     fn built(&mut self, id: NodeId, operator: impl ExecutionPlan) -> Lowers<Plan> {
         let plan: Plan = Arc::new(operator);
         let node = self.lowering.node(id)?;
+        let holds_input = plan.properties().emission_type == EmissionType::Final;
+        if !node.inputs().is_empty()
+            && !matches!(node, PhysicalNode::FragmentWrite { .. })
+            && holds_input != node.breaks_pipeline()
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "node {id} `{}` is a pipeline {} in the plan but its operator `{}` emits {}",
+                node.name(),
+                if node.breaks_pipeline() {
+                    "breaker"
+                } else {
+                    "operator"
+                },
+                plan.name(),
+                if holds_input {
+                    "after its whole input"
+                } else {
+                    "incrementally"
+                },
+            ))
+            .into());
+        }
         if matches!(
             node,
             PhysicalNode::Projection { .. }

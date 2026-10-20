@@ -4,7 +4,7 @@ use serde_json::json;
 
 use crate::support::*;
 
-/// Graph id every served test addresses (`--server <url> --graph GRAPH_ID`).
+/// Graph id every served test addresses (`--target <url> --graph GRAPH_ID`).
 /// RFC-011: the server is cluster-only, so a graph selector is always required
 /// — even for a single-graph cluster.
 const GRAPH_ID: &str = "knowledge";
@@ -87,12 +87,16 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(health["status"], "ok");
 
     let local_snapshot = parse_stdout_json(&output_success(
-        cli().arg("snapshot").arg(&served_root).arg("--json"),
+        cli()
+            .arg("snapshot")
+            .arg("--target")
+            .arg(&served_root)
+            .arg("--json"),
     ));
     let snapshot = parse_stdout_json(&output_success(
         cli()
             .arg("snapshot")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -104,7 +108,7 @@ query insert_person($name: String, $age: I32) {
     let local_read = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--store")
+            .arg("--target")
             .arg(&served_root)
             .arg("--query")
             .arg(fixture("test.gq"))
@@ -116,7 +120,7 @@ query insert_person($name: String, $age: I32) {
     let read_payload = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -140,7 +144,7 @@ query insert_person($name: String, $age: I32) {
     let change_payload = parse_stdout_json(&output_success(
         cli()
             .arg("mutate")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -179,7 +183,7 @@ query insert_person($name: String, $age: I32) {
     let local_verify = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--store")
+            .arg("--target")
             .arg(&served_root)
             .arg("--query")
             .arg(fixture("test.gq"))
@@ -191,13 +195,13 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(local_verify["row_count"], 1);
     assert_eq!(local_verify["rows"][0]["p.name"], "Mina");
 
-    // CLI inline source over the HTTP transport (--server). Confirms inline
+    // CLI inline source over the HTTP transport (--target). Confirms inline
     // source survives the remote-execution path identically to file-based
     // queries.
     let inline_remote_read = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -213,7 +217,7 @@ query insert_person($name: String, $age: I32) {
     let inline_remote_change = parse_stdout_json(&output_success(
         cli()
             .arg("mutate")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -264,7 +268,7 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
     let read = |arguments: &[&str]| {
         parse_stdout_json(&output_success(
             cli()
-                .args(["--server", &server.base_url, "--graph", GRAPH_ID])
+                .args(["--target", &server.base_url, "--graph", GRAPH_ID])
                 .args(arguments)
                 .arg("--json"),
         ))
@@ -288,7 +292,7 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
     let before = state();
     let output = output_failure(
         cli()
-            .args(["--server", &server.base_url, "--graph", GRAPH_ID])
+            .args(["--target", &server.base_url])
             .args(["schema", "apply", "--schema"])
             .arg(schema)
             .arg("--json"),
@@ -301,7 +305,7 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
         refusal["error"]
             .as_str()
             .unwrap()
-            .contains("`schema apply` is a direct (storage-native) command"),
+            .contains("schema apply is not available for this target kind and scope"),
         "{refusal}"
     );
     assert_eq!(
@@ -356,7 +360,7 @@ fn remote_schema_apply_refuses_branched_cluster_backed_graph() {
         cli()
             .arg("branch")
             .arg("create")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -401,7 +405,7 @@ query ordered_person($name: String) {
     let json_payload = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -423,7 +427,7 @@ query ordered_person($name: String) {
     let csv = stdout_string(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -460,7 +464,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("branch")
             .arg("list")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -472,7 +476,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("branch")
             .arg("create")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -488,7 +492,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("branch")
             .arg("list")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -499,7 +503,7 @@ query insert_person($name: String, $age: I32) {
     let changed = parse_stdout_json(&output_success(
         cli()
             .arg("mutate")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -518,7 +522,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("branch")
             .arg("merge")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -534,7 +538,7 @@ query insert_person($name: String, $age: I32) {
     let verify = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -627,7 +631,7 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
         };
         args.extend(
             [
-                "--server",
+                "--target",
                 proxy.origin.as_str(),
                 "--graph",
                 GRAPH_ID,
@@ -829,7 +833,7 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
                 "commit",
                 operation,
                 commit_id,
-                "--server",
+                "--target",
                 &proxy.origin,
                 "--graph",
                 GRAPH_ID,
@@ -1043,7 +1047,7 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
             }
             args.extend(
                 [
-                    "--server",
+                    "--target",
                     proxy.origin.as_str(),
                     "--graph",
                     PARITY_GRAPH_ID,
@@ -1243,7 +1247,7 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
             .args(["cluster", "apply", "--config"])
             .arg(cluster.path())
             .args([
-                "--server",
+                "--target",
                 &proxy.origin,
                 "--deployment-id",
                 &id,
@@ -1341,7 +1345,7 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
                     .args([
                         "cluster",
                         "status",
-                        "--server",
+                        "--target",
                         &proxy.origin,
                         "--deployment-id",
                         &id,
@@ -1427,7 +1431,7 @@ fn remote_branch_delete_removes_branch() {
         cli()
             .arg("branch")
             .arg("create")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1441,7 +1445,7 @@ fn remote_branch_delete_removes_branch() {
         cli()
             .arg("branch")
             .arg("delete")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1456,7 +1460,7 @@ fn remote_branch_delete_removes_branch() {
         cli()
             .arg("branch")
             .arg("list")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1489,7 +1493,7 @@ query add_friend($from: String, $to: String) {
         cli()
             .arg("branch")
             .arg("create")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1501,7 +1505,7 @@ query add_friend($from: String, $to: String) {
     output_success(
         cli()
             .arg("mutate")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1517,7 +1521,7 @@ query add_friend($from: String, $to: String) {
     output_success(
         cli()
             .arg("mutate")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1534,7 +1538,7 @@ query add_friend($from: String, $to: String) {
     let exported = stdout_string(&output_success(
         cli()
             .arg("export")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1559,11 +1563,16 @@ query add_friend($from: String, $to: String) {
             .arg("overwrite")
             .arg("--data")
             .arg(&export_path)
+            .arg("--target")
             .arg(&imported_graph),
     );
 
     let snapshot = parse_stdout_json(&output_success(
-        cli().arg("snapshot").arg(&imported_graph).arg("--json"),
+        cli()
+            .arg("snapshot")
+            .arg("--target")
+            .arg(&imported_graph)
+            .arg("--json"),
     ));
     assert_eq!(
         snapshot["datasets"]
@@ -1589,7 +1598,7 @@ query add_friend($from: String, $to: String) {
     let eve = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--store")
+            .arg("--target")
             .arg(&imported_graph)
             .arg("--query")
             .arg(fixture("test.gq"))
@@ -1620,7 +1629,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
             .arg("load")
             .arg("--mode")
             .arg("merge")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1645,7 +1654,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     let feature_snapshot = parse_stdout_json(&output_success(
         cli()
             .arg("snapshot")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1658,7 +1667,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     let zoe = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1694,7 +1703,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
     let failure = output_failure(
         cli()
             .arg("load")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1714,7 +1723,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
     let payload = parse_stdout_json(&output_success(
         cli()
             .arg("load")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1740,7 +1749,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
     let snapshot = parse_stdout_json(&output_success(
         cli()
             .arg("snapshot")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1760,7 +1769,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
         cli()
             .arg("branch")
             .arg("create")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1783,7 +1792,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
             .arg("load")
             .arg("--mode")
             .arg("merge")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1806,7 +1815,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
     let bob = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1825,7 +1834,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
     let zoe = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1873,7 +1882,7 @@ query insert_person($name: String, $age: I32) {
             cli()
                 .envs(server.credential("team-token"))
                 .arg("snapshot")
-                .arg("--server")
+                .arg("--target")
                 .arg(&server.base_url)
                 .arg("--graph")
                 .arg(GRAPH_ID)
@@ -1904,7 +1913,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .envs(server.credential("team-token"))
             .arg("mutate")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1935,7 +1944,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .envs(server.credential("team-token"))
             .arg("load")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1955,7 +1964,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .envs(server.credential("unknown-token"))
             .arg("mutate")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1977,7 +1986,7 @@ query insert_person($name: String, $age: I32) {
             .envs(server.credential("team-token"))
             .arg("branch")
             .arg("create")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -1993,7 +2002,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .envs(server.credential("team-token"))
             .arg("mutate")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -2015,7 +2024,7 @@ query insert_person($name: String, $age: I32) {
             .envs(server.credential("team-token"))
             .arg("branch")
             .arg("delete")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -2035,7 +2044,7 @@ query insert_person($name: String, $age: I32) {
             .envs(server.credential("team-token"))
             .arg("branch")
             .arg("merge")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -2060,7 +2069,7 @@ query insert_person($name: String, $age: I32) {
             .envs(server.credential("admin-token"))
             .arg("branch")
             .arg("merge")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -2108,7 +2117,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .envs(server.credential("team-token"))
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -2131,9 +2140,9 @@ query insert_person($name: String, $age: I32) {
 /// Steps:
 ///   1. Build a converged cluster serving one graph `alpha` with a
 ///      server-scoped policy granting `act-admin` the `graph_list` action.
-///   2. Spawn the server with `--cluster` + a bearer-token map.
-///   3. `omnigraph graphs list --server <url>` (admin token) — expect `alpha`.
-///   4. Addressing the server via `--server <url>` with NO `--graph` errors and
+///   2. Spawn the server with `--target` + a bearer-token map.
+///   3. `omnigraph graphs list --target <url>` (admin token) — expect `alpha`.
+///   4. Addressing the server via `--target <url>` with NO `--graph` errors and
 ///      lists the candidate graphs (RFC-011 D7).
 ///
 /// Runs real server processes over loopback in the ordinary workspace gate.
@@ -2168,7 +2177,7 @@ fn graphs_list_against_multi_graph_server() {
             .envs(server.credential("admin-token"))
             .arg("graphs")
             .arg("list")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--json"),
     ));
@@ -2180,13 +2189,12 @@ fn graphs_list_against_multi_graph_server() {
         .collect();
     assert_eq!(ids, vec!["alpha"]);
 
-    // RFC-011 D7: addressing the multi-graph server via `--server <url>` with no
-    // `--graph` errors and lists the candidate graphs (the resolver probes
-    // GET /graphs; the server's keyed token authorizes it).
+    // Target resolution requires explicit graph selection without discovering
+    // a candidate or changing the destination from the server inventory.
     let no_graph = cli()
         .envs(server.credential("admin-token"))
         .arg("query")
-        .arg("--server")
+        .arg("--target")
         .arg(&server.base_url)
         .arg("-e")
         .arg("query q { match { $p: Person { name: \"x\" } } return { $p.name } }")
@@ -2198,8 +2206,8 @@ fn graphs_list_against_multi_graph_server() {
     );
     let stderr = String::from_utf8_lossy(&no_graph.stderr);
     assert!(
-        stderr.contains("alpha") && stderr.contains("--graph <id>"),
-        "expected a candidate-listing error naming alpha; got: {stderr}"
+        stderr.contains("graph_required") && stderr.contains("--graph ID"),
+        "expected an explicit graph selection error; got: {stderr}"
     );
 
     drop(server);
@@ -2218,7 +2226,7 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     fn mutate_cmd(base_url: &str, name: &str, if_commit: Option<&str>) -> std::process::Output {
         let mut cmd = cli();
         cmd.arg("mutate")
-            .arg("--server")
+            .arg("--target")
             .arg(base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -2241,7 +2249,7 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     let read = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -2285,7 +2293,7 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     let read = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
+            .arg("--target")
             .arg(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
@@ -2338,7 +2346,7 @@ fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
         };
         let mut command = cli();
         command.envs(credential).args(args).args([
-            "--server",
+            "--target",
             server_url,
             "--graph",
             PARITY_GRAPH_ID,
