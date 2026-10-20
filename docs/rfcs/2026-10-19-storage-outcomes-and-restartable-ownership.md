@@ -31,10 +31,16 @@ the process.
 A graph write therefore ends in exactly one of three results. It
 ***committed***. It is ***not committed***: refused before any effect, lost
 its conflict, or failed before its manifest request could land. Or its
-***publication is pending***: its manifest request got no definite answer
-after every re-issue. A pending publication blocks writes to its branch
-only, until a resolver re-issues it and the store answers. Reads, other
-branches and other graphs keep serving.
+***outcome is unknown***: its manifest request got no definite answer after
+every re-issue. An unknown publication needs no record and blocks nothing:
+its manifest version is created only if absent, so it lands before the
+branch's next publication or never. The branch keeps publishing; reads,
+other branches and other graphs keep serving.
+
+Each fact about a request has exactly one owner, and every consumer reads it
+from there: the commit's request record says whether its manifest request
+was sent and how it ended; the version key decides a publication that record
+leaves open; the storage scope owns the outcome of each mutable key.
 
 The cluster lock gains a lease. Its owner writes heartbeats and stops
 writing when it can no longer renew. A successor takes over a lock whose
@@ -128,27 +134,21 @@ What remains needs a decision.
 | A fresh-key or read request fails transiently | One attempt; the operation fails | Retried within Lance's client and throttle budgets |
 | A failure before the manifest request, or a request the store refused | 500 and keep serving (since #1092) | Unchanged |
 | A manifest request is ambiguous, then answered by a re-issue | Committed, or not committed (since #1092) | Unchanged |
-| A manifest request is still ambiguous after every re-issue | 500, then every graph closes, exit 2, lock retained | 500 (`outcome_unknown` on MCP); the branch's writes answer 503 `service_unavailable` until resolution; the resolver completes or refuses the write |
+| A manifest request is still ambiguous after every re-issue | 500, then every graph closes, exit 2, lock retained | 500 (`outcome_unknown` on MCP); the server keeps serving; the branch's next publication either builds on the late commit or takes its version first |
 | A mutable-key request has an unknown outcome | Every later mutation refused; release refused | Later requests to that key are refused; nothing else changes |
 | A panic, or lost ownership of a write | Contain, exit 2, lock retained | Contain, exit 2; a successor takes over after one lease of silence |
-| Clean SIGTERM | Release if settled, else retain the lock | Resolve pending publications, then release; if any remain, exit nonzero and let the lease expire |
+| Clean SIGTERM | Release if settled, else retain the lock | Release unless a mutable key is unsettled; then exit nonzero and let the lease expire |
 | The process dies | The lock is held until an exact-ID `force-unlock` | A successor waits for a lease and a half of heartbeat silence, then takes over |
 
-A pending publication is reported, not hidden. The operation that left it
-pending returns the error it returns today: 500 `internal` on HTTP,
-`outcome_unknown: true` on MCP, and `execution: unknown` from the CLI. Later
-writes to the same branch get a typed refusal, `PublicationPending`, that
-names the pending graph commit. Its status is 503 `service_unavailable`. The
-refusal is definite, because those writes did nothing. `/readyz` stays
-`serving`. The pending publication and its resolution are logged with the
-graph commit id. A status field for them belongs to
+An unknown publication is reported, not hidden. The operation returns the
+error it returns today: 500 `internal` on HTTP, `outcome_unknown: true` on
+MCP, and `execution: unknown` from the CLI. `/readyz` stays `serving`, and
+later writes to the branch proceed. The outcome becomes definite when the
+branch moves past the write's base: if the branch's next publication finds
+the late commit, the write committed; if it takes the version first, the
+write can never land. A read made before then is not final. How a client
+learns that answer belongs to
 [#1017](https://github.com/ModernRelay/omnigraph/pull/1017)'s outcome model.
-
-Resolution re-issues the identical manifest commit. If it lands, or a copy of
-it already landed, the pending write is committed. If another commit holds
-the version, the pending write is not committed. Either answer is logged with
-the graph commit id. A read made while the branch is pending is not final;
-the refusal says so.
 
 Orchestrators should restart a failed server, for example Railway
 `ON_FAILURE`. A restart that finds a held, renewed lock still refuses with
@@ -158,8 +158,7 @@ default, so the wait is 45 seconds; `OMNIGRAPH_CLUSTER_LEASE_SECONDS` sets it
 between 2 and 600 seconds, and the lock record carries it, so every successor
 uses the owner's value.
 
-This RFC adds no HTTP error code, CLI exit code or MCP field; the pending
-refusal uses the existing `service_unavailable` code.
+This RFC adds no HTTP error code, CLI exit code or MCP field.
 [#1017](https://github.com/ModernRelay/omnigraph/pull/1017) carries the
 three-way outcome on the wire: `outcome_unknown`, `storage_unavailable`, the
 `outcome.check` identity and exit 2. Its first slice,
@@ -244,6 +243,13 @@ it can land.
   stays ambiguous is `Unresolved`. A failure the store answered definitely is
   `Refused`: the local filesystem, a missing key or container, an invalid
   path, an unsupported operation, or a refusal from the owning scope.
+  Lance deletes an attempt's transaction file when its handler calls a
+  missing version definitive, and asks without naming the attempt. Only the
+  commit's own request record may answer yes: the catalog's per-commit
+  handler answers from it, keeping the store's answer unless the request may
+  still land, and a dataset's shared handler, which holds no record of the
+  attempt being read back, never does. A late manifest therefore always
+  finds its transaction file.
 - **Refs and tags.** Lance's `put_ref_if_absent` reports `RefConflict`
   without reading the object. Its OmniGraph callers read the ref back:
   candidate tags compare branch and version, and native branch creation
@@ -297,43 +303,32 @@ Each set is capped, at 4096 keys. Past the cap the scope refuses new
 mutations: writes fail fast, and reads continue. Clean release requires an
 empty unsettled set; otherwise the lease hands admission over.
 
-### 5. Pending publications
+### 5. Unknown publications are fenced by their version key
 
-A publication whose manifest request is `Unresolved` is ***pending*** on its
-branch. The publisher records it in a bounded registry, one per graph root
-and process, keyed by the branch's `__manifest` base. The record holds:
+A publication whose manifest request is `Unresolved` answers
+`manifest_publish_in_doubt`, and nothing records it. Its version key decides
+it. The manifest version is created only if absent, so the abandoned request
+can land only while that version is free:
 
-- the attempted version;
-- the graph commit id;
-- what the commit needs to re-issue its manifest: the staged `__manifest`
-  transaction, its fragments, and the probed handler.
+- If it lands before the branch's next publication, that publication loads it
+  as the head and builds on it, and the unknown write committed.
+- If the next publication creates the version first, the abandoned request
+  fails its precondition whenever it arrives, and the unknown write is not
+  committed.
+- If it lands between the next publication's load and its create, that
+  publication loses the version CAS and retries from a fresh load, as for any
+  concurrent writer.
 
-The operation returns `manifest_publish_in_doubt` as it does today.
-
-- **Writes to the branch.** A publish to a branch with a pending record
-  first re-issues the pending commit once. If the store answers, the record
-  is resolved and the publish continues from a fresh load. If not, the
-  publish refuses with the typed pending refusal. Its own staging is
-  unpublished.
-- **The resolver.** A server task re-issues every pending record, with
-  backoff from 5 s to 60 s.
-- **Clean shutdown** gives pending records one bounded attempt each.
-- **Memory.** The registry holds at most 64 records per process. A full
-  registry refuses new publications, a breaker bounded in memory.
-
-The record is process memory, not a durable queue. If the process dies, the
-pending request is either applied by the store or not. A later publication
-of the same version wins or loses the put-if-absent against it, and graph
-state stays consistent. The collector keeps the pending write's staging while
-its authority, the base head, is current. That staging becomes reclaimable
-only once another commit holds the version, and then the pending write can
-no longer land.
+Graph state stays consistent in every order, in this process or after it
+dies. The collector keeps the unknown write's staging while its authority,
+the base head, is current; that staging becomes reclaimable only once another
+commit holds the version, when the write can no longer land.
 
 ### 6. The server
 
 An unknown storage outcome no longer closes operation admission or exits
-the process. That covers a publication in doubt, which is now pending on its
-branch, and an opaque storage or I/O failure, whose mutable keys the scope
+the process. That covers a publication in doubt, which its version key
+fences, and an opaque storage or I/O failure, whose mutable keys the scope
 holds unsettled. The owned write records its result, releases its
 reservations, and logs the failure's redacted class.
 
@@ -351,7 +346,7 @@ handed over by the lease.
 The engine-settlement decision's "unsupported ambiguous cases retain
 fail-stop" is replaced as follows. An ambiguous conditional request is
 resolved by an effective fence, its own re-issue. A request that cannot be
-resolved is scoped to its key and its branch.
+resolved is scoped to its key: for a publication, the version key fences it.
 
 ### 7. Restartable ownership: the lock lease
 
@@ -427,25 +422,27 @@ as it does for any two writers today.
 ## Invariants
 
 - **Invariants 2 to 5.** Publication stays one conditional `__manifest`
-  commit. A pending publication is a request that may still land, never a
+  commit. An unknown publication is a request that may still land, never a
   partial graph state. Staging stays unreachable until the manifest names
-  it. The transaction-file hold keeps a late manifest's transaction file.
-- **Invariant 8.** Integrity failures stay loud. A pending outcome is
+  it. Only the commit's request record lets Lance delete a transaction file,
+  so a late manifest keeps its own; the scope's transaction-file hold is a
+  second line in the server.
+- **Invariant 8.** Integrity failures stay loud. An unknown outcome is
   reported, never converted into success or failure without the store's
   answer.
 - **Invariant 11.** Retries are by class, bounded, counted and logged. The
-  pending registry, the per-key sets and the beats are bounded. A full
-  structure refuses new work instead of growing.
-- **Invariant 12.** The pending registry is process memory over in-flight
-  requests, derived from nothing durable and authoritative for nothing. The
-  manifest stays the only authority.
+  per-key sets and the beats are bounded. A full structure refuses new work
+  instead of growing.
+- **Invariant 12.** One owner per fact: the request record, the version key
+  and the storage scope. No component keeps a second copy, and the manifest
+  stays the only authority.
 
 On the deny-list:
 
 - **No silent retries.** Every re-issue is logged, and a retry never changes
   a reported outcome.
-- **No job queue.** The resolver has no durable queue: it re-sends the
-  requests the process itself left unanswered.
+- **No job queue.** Nothing re-sends a request after the operation that sent
+  it returns; the version key settles what the operation left open.
 - **No process-local lock presented as fencing.** The lease is a liveness
   protocol and is documented as one. Fencing remains the conditional
   publication.
@@ -469,7 +466,15 @@ On the deny-list:
 - **Keep fail-stop and add only the lease.** An orchestrator would restart
   the process, but every unanswered request would still stop every graph for
   at least one lease. The incident request did not need the restart.
-- **Fence a pending version with a no-op publication instead of re-issuing
+- **A process registry of pending publications** (an earlier draft of §5).
+  It kept each unresolved publication, refused its branch with a 503, and
+  re-issued it from a server resolver until the store answered. It repeated
+  what the version key already guarantees, held process-wide state with its
+  own bound, error and shutdown rule, and landed a crashed operation's commit
+  under a rerun that had captured its authority before the registry
+  resolved, so the rerun failed instead of converging (the DST crash-state
+  enumeration found it).
+- **Fence an unknown version with a no-op publication instead of re-issuing
   it.** This gives a definite "not committed" at once, but adds a commit the
   caller never asked for. It also discards a write the store may have been
   about to apply. Settling a prepared schema uses a fence because its intent
@@ -495,14 +500,15 @@ The owners to extend:
   with #1092.
 - **Catalog publisher tests.** A transaction-file failure; a lost
   acknowledgement; a request that lands late; a request that is never
-  answered; and, for §5, the pending refusal and its resolution.
+  answered; and, for §5, that an unknown publication lands before the
+  branch's next publication or never, in both orders.
 - **Engine.** `writes::*_issue_1067`; `detached_commit_matrix.rs` with a
-  storage-fault actor; and `failpoints.rs` seams around the resolver.
+  storage-fault actor.
 - **Server.** `operations::tests::*_issue_1067` and
   `boot_settings::owned_shutdown::*` with real backend faults: a planted
-  file, and a manifest put that never answers. They show no containment, a
-  503 on the pending branch only, another graph still writable, and a lock
-  that is released or handed over.
+  file, and a manifest put that never answers. They show no containment,
+  the branch and other graphs still writable, and a lock that is released or
+  handed over.
 - **DST** (`crates/omnigraph-dst`). Injected 5xx, throttles and lost
   responses on a write, in the Lance realm. An abandoned conditional
   `__manifest` put that lands late. A successor taking over a dead owner's
@@ -514,7 +520,8 @@ The owners to extend:
 
 Upstream surfaces reviewed at the pinned versions:
 
-- Lance 11.0.0: `commit_transaction`, `do_commit_detached_transaction`,
+- Lance 11.0.0, and 13.0.0 after #1072 (where `ConditionalPutCommitHandler`
+  calls a missing version definitive): `commit_transaction`, `do_commit_detached_transaction`,
   `verify_commit_outcome`, `cleanup_transaction_file`,
   `ConditionalPutCommitHandler`, `commit_handler_from_url`, refs, and
   `CommitStatusUnknownError`;
@@ -529,8 +536,8 @@ Upstream surfaces reviewed at the pinned versions:
 1. **#1092.** Commit-handler resolution and evidence by phase. This is a fix
    within today's contract.
 2. **Per-operation outcomes, §§1 to 6** (#1096). Request classes, retries,
-   the per-key scope, pending publications and the server change, in one
-   change with its tests and docs.
+   the per-key scope and the server change, in one change with its tests and
+   docs.
 3. **The lease, §7** (#1097). With the restart policy on the storage
    failures operations page.
 4. **#1017's outcome model** on the wire, which reads these engine outcomes.
@@ -545,6 +552,10 @@ phase 3.
   configurable value stays compatible.
 - **Shared local volumes.** Should a local root on a shared network
   filesystem be refused for takeover?
+- **One owner of request outcomes on every open path.** The storage scope
+  owns mutable-key outcomes only where the server installs it. Installing it
+  on embedded and CLI opens too would give those writers the same per-key
+  rule and let the scope's transaction-file hold retire.
 
 ## Decision log
 
@@ -557,3 +568,9 @@ phase 3.
   [engine settlement](2026-10-01-engine-settlement-and-resource-bounds.md)
   decisions fix today. Those RFCs get disposition notes when this one is
   accepted.
+- 2026-10-20: §5 replaced its pending-publication registry with fencing by
+  the version key, recorded under Alternatives, after the DST crash-state
+  enumeration showed the registry landing a crashed operation's commit under
+  its rerun. §2 states who may call a version absent: only the commit's own
+  request record, after review of #1092 found the shared handler letting
+  Lance delete a transaction file a late manifest would name.
