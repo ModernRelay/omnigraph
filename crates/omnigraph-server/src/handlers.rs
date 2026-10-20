@@ -1854,6 +1854,7 @@ pub(crate) async fn run_mutate(
             actor_id,
             commit: receipt.commit.as_ref().map(api::commit_output),
             outcome: None,
+            executed: None,
         })
     })
     .await

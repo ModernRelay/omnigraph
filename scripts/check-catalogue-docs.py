@@ -42,7 +42,7 @@ INVENTORIES = {
 
 def rows_of(binary: pathlib.Path, query: str) -> list[dict]:
     result = subprocess.run(
-        [str(binary), "query", "--store", "og_catalog", "-e", query, "--json"],
+        [str(binary), "query", "--target", "og_catalog", "-e", query, "--json"],
         capture_output=True,
         text=True,
         check=False,

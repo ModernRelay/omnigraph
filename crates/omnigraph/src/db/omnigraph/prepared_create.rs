@@ -108,8 +108,15 @@ impl Omnigraph {
     /// Capture an exact graph birth before effects. This performs schema
     /// compilation and read-only target checks, not a writable open or probe.
     pub async fn prepare_graph_create(uri: &str, source: &str) -> Result<PreparedGraphCreate> {
+        Self::prepare_graph_create_with_storage(uri, source, storage_for_uri(uri)?).await
+    }
+
+    pub async fn prepare_graph_create_with_storage(
+        uri: &str,
+        source: &str,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<PreparedGraphCreate> {
         let root = write_queue_root_identity(&normalize_root_uri(uri)?)?;
-        let storage = storage_for_uri(&root)?;
         preflight_init_target(&root, storage.as_ref(), InitOptions::default()).await?;
         require_empty_create_target(&root, storage.as_ref()).await?;
         if storage.exists(&init_claim_uri(&root)).await? {
@@ -147,6 +154,14 @@ impl Omnigraph {
             Some(scope) => crate::storage::storage_for_uri_scoped(prepared.root(), scope)?,
             None => storage_for_uri(prepared.root())?,
         };
+        Self::apply_prepared_graph_create_with_storage(prepared, storage).await
+    }
+
+    pub async fn apply_prepared_graph_create_with_storage(
+        prepared: &PreparedGraphCreate,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<Self> {
+        prepared.validate()?;
         Self::init_with_storage_for_vintage(
             prepared.root(),
             prepared.source(),
@@ -169,12 +184,25 @@ impl Omnigraph {
     pub async fn settle_prepared_graph_create_after_quiescence(
         prepared: &PreparedGraphCreate,
     ) -> Result<GraphCreateReconciliation> {
-        let observed = Self::reconcile_prepared_graph_create(prepared).await?;
+        Self::settle_prepared_graph_create_after_quiescence_with_storage(
+            prepared,
+            storage_for_uri(prepared.root())?,
+        )
+        .await
+    }
+
+    pub async fn settle_prepared_graph_create_after_quiescence_with_storage(
+        prepared: &PreparedGraphCreate,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<GraphCreateReconciliation> {
+        let observed =
+            Self::reconcile_prepared_graph_create_with_storage(prepared, storage.clone()).await?;
         if !matches!(observed, GraphCreateReconciliation::Unknown) {
             return Ok(observed);
         }
         let schema = prepared.validated_schema_ir()?;
-        let storage = crate::storage::decorate(storage_for_uri(prepared.root())?);
+        let access = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
+        let storage = crate::storage::decorate(storage);
         let claim_uri = init_claim_uri(prepared.root());
         let expected_claim = prepared.claim_payload()?;
         if storage
@@ -221,7 +249,6 @@ impl Omnigraph {
         if tables.len() > 4096 {
             return Ok(GraphCreateReconciliation::Unknown);
         }
-        let access = crate::lance_access::LanceAccessContext::new();
         let table_store = TableStore::new(prepared.root(), access.control_session());
         // Validate the complete deletion set before removing any object.
         for table in &tables {
@@ -277,8 +304,20 @@ impl Omnigraph {
     pub async fn reconcile_prepared_graph_create(
         prepared: &PreparedGraphCreate,
     ) -> Result<GraphCreateReconciliation> {
+        Self::reconcile_prepared_graph_create_with_storage(
+            prepared,
+            storage_for_uri(prepared.root())?,
+        )
+        .await
+    }
+
+    pub async fn reconcile_prepared_graph_create_with_storage(
+        prepared: &PreparedGraphCreate,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<GraphCreateReconciliation> {
         let schema_ir = prepared.validated_schema_ir()?;
-        let storage = crate::storage::decorate(storage_for_uri(prepared.root())?);
+        let access = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
+        let storage = crate::storage::decorate(storage);
         if !storage
             .exists(&crate::db::manifest::manifest_uri(prepared.root()))
             .await?
@@ -289,7 +328,6 @@ impl Omnigraph {
                 GraphCreateReconciliation::Absent
             });
         }
-        let access = crate::lance_access::LanceAccessContext::new();
         // This is a read-only evidence probe, not an invocation. Malformed
         // native metadata can panic in Lance's footer decoder; it supplies no
         // exact publication proof and must never reach the cleanup path.

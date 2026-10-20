@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 use crate::engine::operators::LookupSpec;
 use crate::engine::operators::memory::WorkMemory;
-use crate::engine::operators::producer::{BatchSender, producer_stream};
+use crate::engine::operators::shape::{BatchSender, Flow, Streamed};
 use crate::engine::scan::{
     ScanColumns, SearchColumns, add_null_blob_columns, conjoin_fts_queries, hconcat_batches,
     id_in_list_expr, ir_expr_to_df_expr,
@@ -17,8 +17,8 @@ use crate::error::OmniError;
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::{PlanProperties, SendableRecordBatchStream};
-use futures::StreamExt;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use futures::future::BoxFuture;
 
 impl ScanExec {
     /// The schema a dependent scan declares: the input's fields without the
@@ -56,77 +56,85 @@ impl ScanExec {
         Ok(Arc::new(Schema::new(fields)))
     }
 
-    pub(super) fn input_properties(schema: SchemaRef) -> Arc<PlanProperties> {
-        super::super::streaming_properties(schema)
-    }
-
     pub(super) fn execute_input(
         &self,
-        input: SendableRecordBatchStream,
+        input: &Arc<dyn ExecutionPlan>,
         ctx: Arc<TaskContext>,
+        shape: &Streaming,
     ) -> DfResult<SendableRecordBatchStream> {
-        let mut work = WorkMemory::new(ctx, "ScanExec")?;
-        work.set_metrics(self.metrics.clone());
-        let memory = Arc::new(work);
-        let schema = self.schema();
-        let declared = Arc::clone(&schema);
-        let lookup = LookupSpec {
-            type_name: self.type_name.clone(),
-            binding: self.binding.clone(),
-            filters: self.filters.clone(),
-            projection: self.projection.clone(),
-            params: Arc::clone(&self.params),
-            snapshot: self.snapshot.clone(),
-            catalog: Arc::clone(&self.catalog),
+        let memory = work(Arc::clone(&ctx), "ScanExec", &self.metrics)?;
+        let lookup = Lookup {
+            spec: Arc::new(LookupSpec {
+                type_name: self.type_name.clone(),
+                binding: self.binding.clone(),
+                filters: self.filters.clone(),
+                projection: self.projection.clone(),
+                params: Arc::clone(&self.params),
+                snapshot: self.snapshot.clone(),
+                catalog: Arc::clone(&self.catalog),
+            }),
+            declared: self.schema(),
         };
-        Ok(producer_stream(
-            schema,
-            memory,
-            Some(&self.metrics),
-            move |memory, sender| async move {
-                lookup_candidates(input, &lookup, &declared, &memory, &sender).await
-            },
-        ))
+        let input = Arc::clone(input);
+        Ok(shape.produce(memory, &self.metrics, move || input.execute(0, ctx), lookup))
     }
 }
 
-/// Every batch of `input` resolved to destination rows one slice of at most
-/// 256 rows at a time, each slice one Lance read `id IN (slice ids)` with the
-/// pushed filters, sent in `declared`'s shape.
-pub(in crate::engine) async fn lookup_candidates(
-    mut input: SendableRecordBatchStream,
-    lookup: &LookupSpec,
-    declared: &SchemaRef,
-    memory: &Arc<WorkMemory>,
-    sender: &BatchSender,
-) -> DfResult<()> {
-    while let Some(batch) = input.next().await {
-        let batch = batch?;
+/// The per-batch body of a dependent scan, and of a hash join after its
+/// build fell back: each input batch resolved to destination rows one slice
+/// of at most 256 rows at a time, each slice one Lance read
+/// `id IN (slice ids)` with the pushed filters, sent in `declared`'s shape.
+pub(in crate::engine::operators) struct Lookup {
+    pub(in crate::engine::operators) spec: Arc<LookupSpec>,
+    pub(in crate::engine::operators) declared: SchemaRef,
+}
+
+impl Lookup {
+    pub(in crate::engine::operators) async fn resolve(
+        &self,
+        batch: RecordBatch,
+        memory: &Arc<WorkMemory>,
+        sender: &BatchSender,
+    ) -> DfResult<()> {
         let held = memory.child("scan candidate input")?;
         held.hold(&batch)?;
-        memory.metric("input_rows", batch.num_rows());
         let rows = memory.ctx.session_config().batch_size().clamp(1, 256);
         for offset in (0..batch.num_rows()).step_by(rows) {
             let work = Arc::new(memory.child("destination scan batch")?);
             let candidates = batch.slice(offset, rows.min(batch.num_rows() - offset));
             let output = read_candidates(
                 &candidates,
-                &lookup.type_name,
-                &lookup.binding,
-                &lookup.filters,
-                lookup.projection.as_ref(),
-                &lookup.params,
-                &lookup.snapshot,
-                &lookup.catalog,
+                &self.spec.type_name,
+                &self.spec.binding,
+                &self.spec.filters,
+                self.spec.projection.as_ref(),
+                &self.spec.params,
+                &self.spec.snapshot,
+                &self.spec.catalog,
                 &work,
             )
             .await
             .map_err(external)?;
-            let output = conform(output, declared).map_err(external)?;
+            let output = conform(output, &self.declared).map_err(external)?;
             sender.send_bounded(output, work).await?;
         }
+        Ok(())
     }
-    Ok(())
+}
+
+impl Streamed for Lookup {
+    fn batch<'a>(
+        &'a mut self,
+        batch: RecordBatch,
+        memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, DfResult<Flow>> {
+        Box::pin(async move {
+            memory.metric("input_rows", batch.num_rows());
+            self.resolve(batch, memory, sender).await?;
+            Ok(Flow::Continue)
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1430,7 +1430,12 @@ impl Omnigraph {
             // same named branch and numeric table version. Blob reads need a
             // coherent physical-incarnation witness; bypass the held handle for
             // named-native-branch tables and prove the graph ref again below.
-            match open_dataset_entry(entry, self.uri(), None).await {
+            let fresh = crate::lance_access::statement_session(
+                self.read_caches().session.store_registry(),
+                0,
+                0,
+            );
+            match open_dataset_entry(entry, self.uri(), Some(&fresh)).await {
                 Ok(dataset) => dataset,
                 Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
                     // Incarnation-suffixed refs put a recreated branch on a new

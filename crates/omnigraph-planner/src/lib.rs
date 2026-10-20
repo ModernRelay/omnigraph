@@ -77,9 +77,9 @@ pub use passes::{PassId, PassRow, PassStage, pass_rows};
 pub use physical::{
     Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, GatePolicy, Hop,
     HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OperatorRow, OrderKey, OverfetchRung,
-    PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineSink, PipelineSource, PipelineSpec,
-    Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind, RankScope,
-    RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
+    PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineShape, PipelineSink, PipelineSource,
+    PipelineSpec, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind,
+    RankScope, RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
 };
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;

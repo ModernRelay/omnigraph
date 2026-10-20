@@ -548,11 +548,12 @@ impl GraphCoordinator {
         &self,
         graph_manifest_version: u64,
     ) -> Result<Snapshot> {
-        ManifestCoordinator::snapshot_at_in(
+        ManifestCoordinator::snapshot_at_in_with_session(
             self.root_uri(),
             self.current_branch(),
             graph_manifest_version,
             self.history(),
+            &self.manifest.control_session(),
         )
         .await
         .map(Snapshot::wrap)

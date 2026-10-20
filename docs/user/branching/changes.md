@@ -12,7 +12,7 @@ JSON or streamed body.
 ## Inspect one commit
 
 ```bash
-omnigraph commit changes <commit-id> --store graph.omni --json
+omnigraph commit changes <commit-id> --target ./graph.omni --json
 ```
 
 The equivalent HTTP route is
@@ -48,7 +48,7 @@ as an empty change.
 ## Compare two points
 
 ```bash
-omnigraph diff --from <commit-id> --to main --store graph.omni --json
+omnigraph diff --from <commit-id> --to main --target ./graph.omni --json
 ```
 
 Each side is a branch name, meaning its head when the diff starts, or a commit
@@ -89,8 +89,8 @@ Types unchanged between the two points are skipped.
 ## Review a branch
 
 ```bash
-omnigraph branch diff feature --into main --store graph.omni --json
-omnigraph branch merge-base feature --into main --store graph.omni --json
+omnigraph branch diff feature --into main --target ./graph.omni --json
+omnigraph branch merge-base feature --into main --target ./graph.omni --json
 ```
 
 `branch diff` reports what `feature` changed since its merge base with `main`
@@ -124,14 +124,14 @@ the merge would succeed, run it as a [dry run](merge.md#preview-a-merge).
 
 ```bash
 # Start at the current head. Existing history is not replayed.
-omnigraph changes poll --start now --store graph.omni --json
+omnigraph changes poll --start now --target ./graph.omni --json
 
 # Replay the branch's first-parent history.
-omnigraph changes poll --start beginning --store graph.omni --json
+omnigraph changes poll --start beginning --target ./graph.omni --json
 
 # Continue after a known commit, or resume from a saved cursor.
-omnigraph changes poll --start after:<commit-id> --store graph.omni --json
-omnigraph changes poll --cursor <cursor> --store graph.omni --json
+omnigraph changes poll --start after:<commit-id> --target ./graph.omni --json
+omnigraph changes poll --cursor <cursor> --target ./graph.omni --json
 ```
 
 `now` is the default when neither `--start` nor `--cursor` is supplied.
@@ -169,7 +169,7 @@ available, the rejected `cursor`. Retrying the same cursor cannot close the
 gap; install a new baseline:
 
 ```bash
-omnigraph changes baseline --out snapshot.jsonl --store graph.omni --json
+omnigraph changes baseline --out snapshot.jsonl --target ./graph.omni --json
 ```
 
 If a poll has already accumulated complete readable blocks before it reaches a

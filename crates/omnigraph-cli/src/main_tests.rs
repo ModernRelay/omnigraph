@@ -1,9 +1,8 @@
 //! Shared CLI contract tests, compiled once in the application library.
 
 use super::{
-    MissingCredential, RemoteCredential, apply_bearer_token, branch_statement_change_request,
-    branch_statement_query_request, normalize_bearer_token, resolve_remote_credential_with_input,
-    sync_dir,
+    apply_bearer_token, branch_statement_change_request, branch_statement_query_request,
+    normalize_bearer_token, sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -183,59 +182,50 @@ impl Drop for ScopedEnv {
 
 #[test]
 fn resolve_remote_credential_sends_no_unkeyed_token_issue_1022() {
-    // A token reaches only the operator server it is keyed to. The unkeyed
-    // `OMNIGRAPH_BEARER_TOKEN` is never a credential: a URL that matches no
-    // `servers:` entry, and a declared server with no keyed token, both get
-    // none.
+    use crate::targets::{ServerAuth, resolve_server_token};
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(
-        home.path().join("config.yaml"),
-        "servers:\n  \
-           unkeyed:\n    url: https://unkeyed.example.com\n  \
-           keyed:\n    url: https://keyed.example.com\n",
-    )
-    .unwrap();
+    std::fs::write(home.path().join("config.yaml"), "target_config_version: 1\ntargets:\n  keyed:\n    kind: server\n    endpoint: https://keyed.example.com\n    credential: keyed\n  unkeyed:\n    kind: server\n    endpoint: https://unkeyed.example.com\n    credential: unkeyed\n").unwrap();
     let _env = ScopedEnv::set(&[
         ("OMNIGRAPH_BEARER_TOKEN", Some("global-token")),
         ("OMNIGRAPH_TOKEN_KEYED", Some("keyed-token")),
         ("OMNIGRAPH_TOKEN_UNKEYED", None),
     ]);
-
-    // The whole URL is the address here; served clients pass the server root
-    // and a graph URL under it.
     let input = crate::operator::InvocationConfig::at(Some(home.path().to_path_buf()), None);
-    let config = input.get(&mut Vec::new()).unwrap();
-    let credential =
-        |url: &str| match resolve_remote_credential_with_input(&input, config, url, url).unwrap() {
-            RemoteCredential::Keyed(token) => Ok(token),
-            RemoteCredential::Missing(missing) => Err(missing),
-        };
-    let unbound = |server_root: &str| {
-        Err(MissingCredential::Unbound {
-            server_root: server_root.to_string(),
-            config: Some(home.path().join("config.yaml")),
-        })
+    assert_eq!(
+        resolve_server_token(
+            &input,
+            &ServerAuth::Anonymous,
+            "https://override.example.com"
+        )
+        .unwrap(),
+        None
+    );
+    let keyed = ServerAuth::Token {
+        owner: "keyed".into(),
     };
-    assert_eq!(
-        credential("https://override.example.com"),
-        unbound("https://override.example.com")
+    assert!(
+        resolve_server_token(
+            &input,
+            &keyed,
+            "https://keyed.example.com-evil/graphs/knowledge"
+        )
+        .is_err()
     );
     assert_eq!(
-        credential("https://unkeyed.example.com/graphs/knowledge"),
-        Err(MissingCredential::Server("unkeyed".to_string()))
+        resolve_server_token(&input, &keyed, "https://keyed.example.com/graphs/knowledge").unwrap(),
+        Some("keyed-token".into())
     );
-    assert_eq!(
-        credential("https://keyed.example.com-evil/graphs/knowledge"),
-        unbound("https://keyed.example.com-evil/graphs/knowledge")
-    );
-    assert_eq!(
-        credential("https://keyed.example.com/graphs/knowledge"),
-        Ok("keyed-token".to_string())
-    );
-    // A refusal names the address without credentials written into its URL.
-    assert_eq!(
-        credential("https://user:secret@override.example.com"),
-        unbound("https://override.example.com/")
+    assert!(
+        resolve_server_token(
+            &input,
+            &ServerAuth::Token {
+                owner: "unkeyed".into()
+            },
+            "https://unkeyed.example.com"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("credential_missing")
     );
 }
 
