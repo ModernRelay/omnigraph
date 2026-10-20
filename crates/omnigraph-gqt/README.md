@@ -120,8 +120,9 @@ expected to succeed, binds the receipt's commit id to `$name`
 `--- query snapshot: $name` header reads at that commit instead of a branch,
 and a commit statement whose whole quoted operand is the name,
 `commit publish "${name}"` or `commit drop "${name}"`, is dispatched with the
-bound id; this is the one place `${` may appear in a statement body, and the
-engine receives an ordinary literal. A mutation declaration
+bound id, as is a `branch create <branch> from commit "${name}"` whose
+commit is the whole quoted operand; these are the places `${` may appear in a statement
+body, and the engine receives an ordinary literal. A mutation declaration
 `as unattached branch on "${name}"` (RFC "Unattached graph branches") is
 substituted the same way, and a `--- params` body may spell a bound name,
 `{"base": "${name}"}`, beside the loop variable; a `--- mutate` header without
@@ -189,7 +190,7 @@ load csv "person.csv" into node:Person mode append delimiter "|" header
 
 A `--- expect plan` section directly after a `load csv` step's `--- expect ok`
 pins the load's planner document and executed report, read from the load's
-receipt ([explaining a load statement](../../docs/user/queries/explain.md#explaining-a-load-statement)).
+receipt ([explaining a load statement](../../docs/user/queries/explain-load.md)).
 Each line is one fact; a fact the section does not mention is unchecked, as
 for a query plan. The forms: `load route: <plan|pipeline>` (the document's
 `engine` or `executor` route); `load scan: partitions <n> fallback
@@ -515,6 +516,8 @@ not pass aggregate_pushdown
 aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
 block aggregate sum($c.amount): sum(I64?) exact_integer round_to_nearest -> F64?
 validation scope exact_subset
+pipeline 0: Scan -> Projection => Sort
+pipeline 1: Sort => consumer after 0
 ```
 
 A `scan <Type>[ as $var]:` line selects the scans of that type (or the one
@@ -561,6 +564,16 @@ both block comparison operands.
 Cast text is transparent, so a `type` line selects the underlying expression.
 The internal `exact_integer` and `[exact_integer]` comparison types, optionally
 nullable, are accepted here but cannot be returned as public result columns.
+
+`pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]` claims
+one entry of the document's `pipelines` by position: the physical plan cut at
+every node whose operator emits nothing before it has seen its whole input
+(`Sort`, `Aggregate`, `AntiJoin`, `RankFuse`, a costed multi-hop `Expand`)
+and at a join's build side. The source is the entry's first node, the
+operators follow in run order, the sink is the node the pipeline drains into
+(a breaker by its name, a build side as `HashJoin(build)`, or the `consumer`)
+and `after` lists the pipelines drained before this one starts. A mismatch
+prints every pipeline the document holds in the same spelling.
 
 Every successful rows step compares the plan root's declared schema with the
 compiler's independent inference and with the executed result. The inference
@@ -630,7 +643,7 @@ completed finalization; `pass key_to_id` records a safe key narrowing.
 A `load csv` step may carry an `--- expect plan` section directly after its
 `--- expect ok`.
 Its lines are checked against the planner document in the executed load's
-receipt ([Explaining a load statement](../../docs/user/queries/explain.md#explaining-a-load-statement)).
+receipt ([Explaining a load statement](../../docs/user/queries/explain-load.md)).
 Each line is one fact claim, and a fact no line mentions is unchecked:
 
 ```text
@@ -643,7 +656,9 @@ load validate retained_edges <node-table> <edge-table> from|to: access delta|pro
 load write: overwrite fragments
 load write: append strict_insert
 load write: merge upsert
+load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]
 load executed: partitions <n> rows <m>
+load executed <Node>: rows <m>
 ```
 
 `load route` claims the document's route, `plan` for `engine` and `pipeline`
@@ -653,7 +668,17 @@ fallback.
 A `load validate` line claims one check of the `Validate` node with that
 identity, and its `access` suffix claims the check's access path.
 `load write` claims the `FragmentWrite` node's mode and adapter.
-`load executed` claims the partitions and rows the load executed.
+`load pipeline` claims one entry of the document's `pipelines` by position:
+its source node, its streaming operators in run order, the sink it drains
+into (a node that holds its whole input, a join's build side, or the
+`consumer`) and, after `after`, the pipelines drained before it starts; an
+overwrite load prints `0: CsvSource => Validate` and
+`1: Validate -> FragmentWrite => consumer after 0`.
+`load executed:` claims the partitions and rows the load executed;
+`load executed <Node>: rows <m>` claims the rows one node's operator emitted
+(`CsvSource`, `Validate`, or the rows `FragmentWrite` staged), read from the
+receipt's `executed.operators`; the operator timings there are measurements
+and have no line.
 
 ```text
 --- csv knows.csv

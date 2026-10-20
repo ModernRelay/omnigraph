@@ -210,7 +210,7 @@ document a query's explain prints: the source, the one validation with each
 check and its access path, and the write.
 An overwrite runs that plan; append and merge run the keyed adapters.
 It reads the source's metadata and no payload byte.
-See [Explaining a load statement](../queries/explain.md#explaining-a-load-statement).
+See [Explaining a load statement](../queries/explain-load.md).
 
 #### CLI and HTTP requests
 
@@ -222,8 +222,11 @@ omnigraph mutate --target dev -e 'load csv "s3://imports/knows.csv" into edge:Kn
 The CLI uses `--branch`; HTTP uses the request `branch`, with `main` as the
 omitted default. The statement accepts no `name`, `params` or commit
 precondition (`--if-commit` or `Omnigraph-If-Graph-Commit`). It requires
-`change` on the branch. The response is a mutation's `ChangeOutput`: the
-branch, `load csv` as `query_name`, loaded node and edge counts, and the commit.
+`change` on the branch. A source that holds no records is refused. The
+response is a mutation's `ChangeOutput`: the
+branch, `load csv` as `query_name`, loaded node and edge counts, the commit,
+and for `mode overwrite` an `executed` object, what the load's plan measured
+as it ran ([explaining a load statement](../queries/explain-load.md)).
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/mutate \

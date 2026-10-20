@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - andrew
 created: 2026-09-06
-updated: 2026-10-19
+updated: 2026-10-20
 discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
@@ -44,8 +44,13 @@ no compatibility adapters; an operator file is either the new format or refused.
 
 Keep declarative plan/apply and existing deployment, identity and publication
 authority. This is a targeting change, not a new resource model or deployment
-protocol. The [CLI reference](../user/cli/reference.md)
-owns currently supported behavior.
+protocol. Implementation is tracked in
+[PR #1090](https://github.com/ModernRelay/omnigraph/pull/1090); accepting this
+RFC does not merge or release that implementation. The
+[CLI reference](../user/cli/reference.md) owns currently supported behavior.
+Access reporting, local serving and the CLI MCP bridge are separate work under
+[the graph-access RFC proposal](https://github.com/ModernRelay/omnigraph/pull/1017).
+They consume this target contract and are not prerequisites for its migration.
 
 ## Motivation
 
@@ -66,8 +71,8 @@ and local skill commands from [#995](https://github.com/ModernRelay/omnigraph/pu
 Owners include [scope](../../crates/omnigraph-cli/src/scope.rs),
 [applicability](../../crates/omnigraph-cli/src/planes.rs),
 [managed data](../../crates/omnigraph-cli/src/managed/data.rs) and
-[dispatch](../../crates/omnigraph-cli/src/main.rs). This is source inspection,
-not runtime qualification of the proposed resolver.
+[application dispatch](../../crates/omnigraph-cli/src/app.rs). This is source inspection,
+not runtime qualification of the target resolver.
 
 The common workflow is authoring locally and applying to a chosen cluster.
 Bootstrap, authentication and recovery must also work without a source directory
@@ -127,8 +132,8 @@ No `workspace`, `service` or `deployment` command group is introduced.
 
 ### Before and after
 
-The following comparisons show current commands and proposed post-migration
-syntax. Assume `defaults.target: staging`, with `staging` and `production` as
+The following comparisons show the legacy commands and accepted post-migration
+syntax. The latter requires the implementation release. Assume `defaults.target: staging`, with `staging` and `production` as
 server targets and `cloud` as a managed cluster target. For the direct-access
 example, the working directory is `/data/project` and `local` has
 `uri: file:///data/project/graph.omni`, so it names the same graph as `./graph.omni`.
@@ -367,6 +372,20 @@ omitted destination option must have a fixed provider default or refuse; it cann
 inherit an environment or AWS-profile endpoint. Cover S3 endpoint/region/addressing
 style and Azure account/endpoint/emulator selection, including aliases, on both
 paths. Credential refresh cannot change those captured destination settings.
+Do not copy every recognized provider environment key into a binding. Signing,
+TLS validation, proxy routing and conditional-write settings also require explicit
+classification and supported values; an unclassified ambient setting cannot weaken
+request authentication or the write protocol. Use fixed safe defaults where this
+format exposes no override. This boundary must also hold when the native provider
+fills absent options from environment or profile configuration: filtering the
+initial map alone is insufficient. Test both conflicting configuration at capture
+and changes after capture, through control-object and Lance clients.
+
+Preserve native authentication semantics independently of destination capture.
+Refreshable credential providers must remain refreshable; explicitly supplied
+static keys, including an environment session-token triple, retain their native
+static lifetime. Do not promise refresh for static credentials or replace the
+native provider chain with a CLI credential cache.
 
 An inline target, below, is the only exception to registered destination
 settings.
@@ -439,14 +458,38 @@ propose a default and records one only when the legacy file selected exactly
 one; it never infers one from a folder, token or environment profile.
 `credential get --target NAME` hands a server target's stored token to a pipe,
 never a terminal, for a same-account client that attaches to that server.
-Each command's `--json` output carries a protocol version that `version --json`
-reports.
+Target administration and credential JSON reports carry `protocol: 1`.
+`version --json` advertises them independently as
+`"protocols": {"target": 1, "credential": 1}`, alongside its existing version,
+HTTP-contract and storage-format fields. Do not publish a separate scalar
+`target_protocol`. Later command families add their own protocol entries only
+when implemented.
+
+The nonsecret `binding` digest uses one canonical endpoint identity shared with
+credential scope checks, including managed data endpoints. HTTP identity includes
+scheme, the URL parser's host, effective port and base-path segments; an empty
+trailing segment does not distinguish an endpoint. Thus `https://h.example`,
+`https://H.example:443` and `https://h.example/` have the same identity, while
+another port or base path differs. Unix identity uses the decoded socket path's
+bytes, never lossy display text or its synthetic HTTP origin. Equivalent encoded
+spellings compare equally; distinct non-UTF-8 socket paths remain distinct.
+The digest includes the binding's kind/scope, destination and declared
+authentication binding, but excludes target nicknames, default graph, token values
+and token expiry. It identifies a binding, not permission or a database snapshot.
+Changing these identity rules after protocol 1 is consumed requires compatibility
+review.
+
+Preserve stable refusal codes in the existing error envelope: `target_unknown`,
+`target_invalid`, `target_exists`, `target_is_default`, `config_not_editable`,
+`target_kind_unsupported`, `credential_terminal`, `credential_anonymous` and
+`credential_missing`. Integration into the shared typed error registry follows
+its owner; this RFC introduces no second error envelope or exit-status table.
 
 ### Command applicability
 
 The following groups map the 75-leaf baseline and the new target/credential
-commands into the current surface. The embedded command-index test pins every
-current Clap leaf. Applicability is per mode,
+commands into the accepted post-migration surface. The embedded command-index
+test pins every current Clap leaf. Applicability is per mode,
 not merely the top-level verb. Existing ownership, authorization and transport
 checks remain additional requirements; this table grants no permissions.
 
@@ -509,7 +552,7 @@ target or graph overrides refuse. They do not introduce another resolver or inhe
 credentials from ambient config. Help remains local and uses existing Clap and
 applicability declarations; no second exhaustive command registry or backend probe
 is needed. No completion command or generator exists in the inspected CLI; adding
-one, including local target completion, is outside this proposal.
+one, including local target completion, is outside this decision.
 
 ### Configuration input and deployment
 
@@ -573,8 +616,12 @@ immutable input only observes the original invocation; changed input refuses.
 Neither deliberate resubmission nor receipt eviction permits that ID to execute
 again. Source mode may capture files to verify equality; recovery mode never does.
 Caller preallocation remains supported; computing an ID does not reserve its
-sequence. Do not replace these existing rules with arbitrary idempotency strings
-or require that the server previously issued the ID.
+sequence. For a direct root, `cluster status --target ROOT --json` exposes
+`ledger_id` and `next_sequence`; a caller can form
+`<ledger_id>:<next_sequence>:<fresh ULID>` and submit it with explicit `--config`.
+A concurrent submission can make that sequence stale, which refuses.
+Do not replace these existing rules with arbitrary idempotency strings or require
+that the server previously issued the ID.
 
 Managed apply rejects `--deployment-id` and `--writers-stopped`; server apply
 rejects the writer attestation; direct recovery rejects managed `--plan` and run
@@ -640,9 +687,12 @@ writes or token issuance. Move existing pending lifecycle recovery custody from 
 source folder to operator-owned storage. Persist API, organization, principal,
 request identity/digest and key before sending. Repeating the same existing command
 resumes its matching pending request; conflicting reuse refuses under the existing
-pending-request rules. Mutable target names, changed folders or config edits cannot
+pending-request rules. An unresolved pending request with a different key or
+request body refuses with `pending_lifecycle_conflict`; no new key is sent.
+Mutable target names, changed folders or config edits cannot
 erase that record or redirect its replay. This is recovery evidence, not another
-remote state authority; exact storage/lookup details are part of schema acceptance.
+remote state authority; its implementation must preserve the accepted identity and
+bounded-retention rules below.
 
 Migration must inspect the invocation/source folder for legacy pending, last-operation
 and bound-context evidence before any lifecycle submission, even with an explicit
@@ -654,8 +704,9 @@ evidence or a refusal guard, never fabricate a replayable request. Do not retire
 custody until the new record is durable and conflicting legacy writers are excluded.
 An interrupted migration must recover or refuse, never appear as empty history.
 
-Serialize custody read/check/persist under one lock per operator home. This is
-local coordination, not cross-home deduplication: moving recovery to another home
+Serialize custody read/check/persist under one lock for each API/organization
+custody domain within an operator home. This is local coordination, not cross-home
+deduplication: moving recovery to another home
 requires transferring verified custody or using the original operation ID/key
 within its owner's replay contract. Independent homes do not acquire a distributed
 lock or infer common intent from equal target names.
@@ -669,11 +720,15 @@ A different explicit `--idempotency-key` denotes a deliberate new create only af
 prior submission uncertainty is resolved by exact-key recovery or authoritative
 operation observation; absence of a local record is not proof of non-acceptance.
 
-Bound record count and encoded bytes in the accepted schema. At capacity, refuse
-new lifecycle submissions requiring a new record; existing-record lookup and replay
-remain available. Do not evict uncertain records by age or LRU. Accepted
+Version 1 permits one pending request, at most 128 accepted request records and
+at most 128 imported accepted-evidence records per API/organization custody
+domain in an operator home. Each serialized custody file is limited to 1 MiB.
+At capacity, refuse new lifecycle submissions requiring a new record; existing
+record lookup and replay remain available. A full accepted-record list reports
+`lifecycle_custody_full`; unreadable, oversized or invalid custody fails closed. Do not evict uncertain records by age or LRU. Accepted
 payloads may retire only after verified terminal observation and durable installation
-of a home-wide guard against automatic key generation on a subsequent lookup miss.
+of a guard for that custody domain against automatic key generation on a subsequent
+lookup miss.
 After retirement, an unrecognized no-key create refuses: use a known operation ID
 for recovery or an explicit key for a deliberate new create. The guard precedes
 deletion and survives config edits. This permits bounded custody without promising
@@ -760,21 +815,25 @@ binding does not replace an accepted engine snapshot. Each attempt captures and
 revalidates coherent authority; graph changes retain their publication boundary,
 unpublished-result contracts and durable receipts. No shadow configuration ledger,
 cloud-only correctness path, custom storage primitive or generic retry queue is
-introduced. Lance remains pinned to 11.0.0. Complete upstream
+introduced. The current substrate is unmodified Lance 13.0.0; this CLI decision
+changes no dependency or storage format. Its complete upstream
 [object-store](https://lance.org/guide/object_store/) and
-[observability](https://lance.org/guide/observability/) pages were reviewed; any
-implementation changing a substrate boundary must repeat the relevant
-[Lance qualification](../dev/lance.md).
+[observability](https://lance.org/guide/observability/) pages and native provider
+option loading were reviewed. Any implementation changing that boundary must
+repeat the relevant [Lance qualification](../dev/lance.md) against the dependency
+version it will merge with.
 
 ## Compatibility and reversibility
 
-The following section-level dispositions are required at acceptance. These owners
-remain authoritative until then; this draft neither supersedes them nor claims
-the new syntax is implemented.
+This accepted decision replaces only the routing and custody-selection sections
+listed below. Each earlier RFC carries a matching disposition; its other contracts
+remain authoritative. These are design dispositions, not claims that a released
+binary already uses the new syntax. Runtime cutover is the one breaking release
+below.
 
-| Accepted owner | Proposed disposition |
+| Accepted owner | Accepted disposition |
 | --- | --- |
-| [RFC 0007, D2/D3 and D5](0007-operator-config.md#design) | Replace routing schema/precedence; preserve keyed server credential ownership and prohibit cross-endpoint reference reuse. |
+| [RFC 0007, D2–D6](0007-operator-config.md#design) | Replace routing schema/precedence, server-named login, legacy credential fallback and additive migration; preserve keyed credential custody, endpoint scope, actor/output preferences and atomic credential writes. |
 | [RFC 0011, access path and resolution](0011-cli-addressing-and-config.md#access-path-is-derived-not-chosen) | Replace primitive/profile selectors with fixed declared kinds; preserve no scheme inference, distinct access authorities and refusal without fallback. |
 | [RFC 0052, operational behavior](0052-managed-control-plane-cli.md#user-and-operational-behavior) | Replace folder/mode routing; preserve authorization, operation identities and outcomes. |
 | [RFC 0053, managed CLI data access](0053-offline-data-token-verification.md#managed-cli-data-access) | Replace implicit folder routing and issuer-selected data endpoint with a configured endpoint assertion; preserve credential verification and bounded acquisition. |
@@ -783,7 +842,7 @@ the new syntax is implemented.
 | [Server-runtime RFC, CLI and conversion](2026-09-29-server-runtime-and-online-deployment.md#cli-and-conversion) | Replace literal `--cluster` routing and configuration-discovery independence with explicit root targets and the isolated-home procedure below; preserve deployment/reconciliation authority and full-ID non-replay. |
 
 RFC 0011 rejected the former `--target` because one graph nickname could switch
-access path according to its URI scheme. This proposal intentionally revisits that
+access path according to its URI scheme. This decision intentionally revisits that
 decision: kind/scope are mandatory, cannot be overridden per command, and are
 validated and announced with the complete binding. A path, nickname or credential
 never infers another kind. The spelling is shared; storage and server authority
@@ -892,10 +951,14 @@ registry or tests that merely repeat the implementation.
 | Inline targets | Name versus address, reserved `og_catalog`, relative-path guidance; direct scope by `--graph` and by root-only command, refusing a graph operation on a root without one; inline server credentials only under a configured owner's endpoint scope; invocation-local cloud capture reaching both storage paths; managed refuses inline; `init URI` equals the inline form. | `scope.rs`, `targets.rs`, `cli_data`, `cli_cluster` |
 | Administration | Each edit keeps the rest of the file's text, refuses an incomplete, conflicting or uneditable entry and the default's removal, never stores a secret or sets the default, and serializes under the lock; `credential get` refuses a terminal. | `targets.rs`, `cli_data` |
 
-This RFC update runs documentation, link and spelling checks only; it does not
-claim these proposed runtime gates pass. Implementation must update user docs,
-help and release notes together. The rollout below remains conditional on
-acceptance; documentation checks do not qualify a new runtime contract.
+This documentation change validates the decision record, links and spelling.
+Runtime evidence belongs to the implementation PR and its exact tested commit;
+documentation checks do not qualify the new contract. Before release, qualify the
+current command tree and both storage paths, canonical binding digests, protocol
+discovery, graph/branch diagnostics, recovery custody and the old/new binary
+combinations above. Update user docs, help and release notes with the implementation.
+Rebase and rerun affected owners when the dependency or command baseline changes;
+checks on a pre-Lance-13 base do not qualify the merged implementation.
 
 The served query-catalog gap [#653](https://github.com/ModernRelay/omnigraph/issues/653)
 remains separate: reuse target resolution and current catalog authority, but do not
@@ -952,7 +1015,7 @@ Kubernetes documentation and implementation were reviewed on 2026-10-14:
 - [Shared client configuration](https://github.com/kubernetes/cli-runtime/blob/master/pkg/genericclioptions/config_flags.go)
   and [command construction](https://github.com/kubernetes/kubectl/blob/7795eab7acb6f8653133eb3f8b7743623ecc0b12/pkg/cmd/cmd.go)
   inform one resolver across commands. Freezing its complete result for an invocation
-  is this proposal's stronger requirement.
+  is this decision's stronger requirement.
 - [Usage conventions](https://kubernetes.io/docs/reference/kubectl/conventions)
   inform explicit selection in automation and parseable output; existing OmniGraph
   formats remain intact rather than copying every kubectl flag.
@@ -968,12 +1031,14 @@ Kubernetes documentation and implementation were reviewed on 2026-10-14:
 
 ## Rollout
 
-1. Accept the schema and the breaking release; amend affected accepted RFC
-   sections and capture baseline routing/authentication/outcome fixtures.
-2. Extract the affected command/preparation boundaries without changing behavior,
-   then implement typed operations, the shared resolver and immutable client inputs
-   in those owners. Qualify all current commands, login/init bootstrap and same-ID
-   behavior before enabling the new contract; unsupported combinations remain
+1. Land this accepted schema and the 0.14.0 breaking-release decision, with
+   section-level dispositions on the earlier RFCs. This documentation-only stop
+   leaves shipped behavior unchanged.
+2. Build on the command/preparation boundaries already extracted in
+   [PR #1047](https://github.com/ModernRelay/omnigraph/pull/1047). Complete the
+   shared resolver, typed bindings and migration in
+   [PR #1090](https://github.com/ModernRelay/omnigraph/pull/1090). Qualify all current
+   commands, login/init bootstrap and same-ID behavior before enabling the new contract; unsupported combinations remain
    errors. Keep broad file moves separate from targeting changes, and move output
    handling incrementally while preserving streams and outcome contracts.
 3. Ship one breaking release with the target contract, inline targets, the
@@ -989,10 +1054,11 @@ None for destination selection or the version 1 operator format. Implementation
 qualification remains required before release, including the cloud destination,
 legacy recovery-custody and old/new binary combinations listed above.
 
-The breaking target contract ships with 0.14.0. Operators using older binaries
-must keep a separate operator home and must not share a migrated home with them.
-The exact serialized fields are owned by
-[`TargetEntry`](../../crates/omnigraph-cli/src/targets.rs); the only format marker
+The designated breaking release is 0.14.0, conditional on implementation
+qualification. Operators using older binaries must keep a separate operator home and must not share a migrated home with them.
+The implementation's exact serialized fields are represented by
+[`TargetEntry` in PR #1090](https://github.com/ModernRelay/omnigraph/blob/84283920f89cc089ae36a3efec72610318bf9634/crates/omnigraph-cli/src/targets.rs);
+that unmerged implementation must conform to this decision. The only format marker
 is `target_config_version: 1`. Managed account entries may omit `organization_id`
 only for human-device login discovery. Saved server credentials carry their
 endpoint scope. Managed pending/accepted records are kept in operator-owned
@@ -1057,3 +1123,16 @@ new submissions while preserving observation and exact retries.
   preserve existing command, publication, admission and recovery owners.
   Reuse the schema and administration work from
   [PR #1080](https://github.com/ModernRelay/omnigraph/pull/1080).
+
+- **2026-10-20:** Consolidated the accepted design into this canonical RFC before
+  merging it independently of the runtime change. Replaces the remaining draft
+  and conditional-acceptance wording with implementation qualification, records
+  section-level dispositions on earlier RFCs, and updates the substrate baseline
+  to Lance 13. Protocol discovery uses the `protocols` object; binding hashes use
+  the same canonical endpoint identity as credential checks. Provider-option
+  classification covers native environment refill and preserves native static
+  versus refreshable authentication semantics. Specify per-API/organization custody
+  limits and serialization within each operator home. [PR #1080](https://github.com/ModernRelay/omnigraph/pull/1080)
+  is closed in favor of [PR #1090](https://github.com/ModernRelay/omnigraph/pull/1090),
+  which owns the breaking implementation and its remaining qualification. Access,
+  local serving and the CLI MCP bridge remain independent follow-up work.

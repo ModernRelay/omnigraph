@@ -2,7 +2,7 @@
 
 `explain` before a read declaration returns the query's v2 plan instead of
 its rows, regardless of the selected execution engine; before a `load csv`
-statement it returns the load's plan ([below](#explaining-a-load-statement)).
+statement it returns the load's plan ([explaining a load statement](explain-load.md)).
 It is a statement:
 one per file, never beside a declaration. The query is compiled and planned
 against the target's schema and snapshot without executing it. Planning
@@ -158,9 +158,19 @@ fragment, `partial` when coverage is incomplete or unknown, `absent` without a
 full-text index); and
 `memory_limit`, the query pool in bytes. Selector statements also capture
 `traversal_work_limit`, shared across the execution, and `has_wildcard_traversal`,
-retained through rewrites so historical replay can enforce the target rule. Query
-plans omit `pipelines` and node `properties.schema`: complete pipeline schemas
-are derived when lowering. Result nodes declare their output through `columns`. Every query scan records its pinned `version`, or
+retained through rewrites so historical replay can enforce the target rule. Every
+planned document carries `pipelines`, the physical plan cut at each node whose
+operator emits nothing before it has seen its whole input (`Sort`, `Aggregate`,
+`AntiJoin`, `RankFuse`, a load's `Validate`, a costed multi-hop `Expand`) and
+at a join's build side (a hash join's build, the collected left side of a
+cross join or a contains join): each entry names its `source`, its streaming
+`operators` in run order, the `sink` it drains into (the breaker node, a
+join's build side, or the `consumer`) and `depends_on`, the pipelines drained
+before it starts. The pipelines describe the plan: a correlated block the
+engine answers from the bulk CSR degree (a single-hop, filter-free existence
+or row-count test) prints its inner pipeline without running it. Query plans
+omit node `properties.schema`: complete pipeline
+schemas are derived when lowering. Result nodes declare their output through `columns`. Every query scan records its pinned `version`, or
 `null` when that type has no dataset in the requested snapshot.
 The explain document's `statistics` includes one `index_facts(<table>)`
 entry per read table, with index names, columns, kinds and fragment coverage.
@@ -224,10 +234,12 @@ declared policy: `node` `gate` (a pre-pass gate's `plan`, `prefilter`,
 overfetch `rung`. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
-`Executed::profile`). The row schema is `explain_version` 6: `pipelines`
-entries (present on planner-routed diff and merge documents, never on a
-query's) carry a pipeline `id` and `depends_on`, with `source`, `operators`
-and `sink` as objects whose `id` joins the `physical_plan` node ids. Saved physical
+`Executed::profile`). The row schema is `explain_version` 7: `pipelines`
+entries (on every planner document since version 7, on diff and merge
+documents only before it) carry a pipeline `id` and `depends_on`, with
+`source`, `operators` and `sink` as objects whose `id` joins the
+`physical_plan` node ids; the engine refuses to lower a plan whose operator
+declares an emission other than the cut the document prints. Saved physical
 plans use a `bound_plan_version: 9` envelope whose `body` contains `plan` and
 `values`; version 7 records each aggregate's `distinct` flag, version 8
 types each node's ordering and declares ranked scans' eligibility and policy,
@@ -282,69 +294,3 @@ require the load's `change` permission on that branch before source access.
 Every read executes on engine v2, the one value of the session setting
 `engine`, so explain describes the route the query runs. See
 [session settings](index.md#session-settings).
-
-## Explaining a load statement
-
-`explain` before a `load csv` statement returns the load's accepted plan
-instead of running the load:
-
-```gq
-explain load csv "s3://imports/knows.csv" into edge:Knows mode overwrite delimiter "|" header
-```
-
-The statement accepts every load option. It reads metadata, but no payload,
-and publishes nothing. HTTP and MCP require `change` on the target branch
-before the external Blob policy check or metadata probe. A source over
-`load_source_max_bytes` refuses as `csv_source_bytes`, as a load would.
-
-The answer is the planner's document, in the same rows a query's explain
-uses: trees `logical_initial`, `logical` and `physical` in pre-order, then the `plan` rows.
-A load plan has three nodes, from the root down:
-
-| `node` | `detail` fields |
-|---|---|
-| `FragmentWrite` | `table`, `version`, `mode`, `adapter`; the physical row adds `max_input_bytes`, `max_workers` |
-| `Validate` | `table` and `checks`, every check of the load in the order it runs, which is the refusal precedence |
-| `CsvSource` | `format`, `source`, `source_bytes`, `estimated_rows`, `delimiter`, `header`, `columns`, `table`, `version`; the physical row adds `max_partitions`, `max_workers`, `fallback` |
-
-Each entry of `checks` carries `check` (`value`, `unique`, `edge_ri`,
-`cardinality` or `retained_edges`), its identity fields, `consults` (the
-committed table it reads, or `null`) and, on the physical node, `access`:
-
-- `unique` carries `columns` and `role` (`key` or `unique`).
-- `edge_ri` and `cardinality` carry `endpoint` (`from` or `to`) and
-  `node_type`.
-- `retained_edges`, on a node overwrite, carries `edge_table` and `endpoint`.
-
-`access` is the path the check reads committed state by:
-
-| `access` | Meaning |
-|---|---|
-| `delta` | the check reads no committed state: a `@key` group, or a non-key `@unique` group under overwrite, whose committed view is empty |
-| `probe` | a filtered key lookup; uniqueness uses chunks of 8,192 keys |
-| `scan` | one projected scan of the key columns, matched in memory |
-
-Overwrite endpoint checks cost probes and scans using estimated input rows,
-the consulted table's row count, and usable BTREE coverage at the accepted
-version. A probe first pays its key list, one entry per input row, so an
-unindexed endpoint check scans, and a partially or fully indexed table keeps
-`probe` only while the key list is small against it. Unknown counts and equal
-costs keep `probe`; statistics record `index_coverage` and both costs.
-`cardinality` and `retained_edges` always use `probe`. Node overwrite scans
-old node IDs to find removals; retained-edge access describes the filtered
-lookup in the incident edge table. Append and merge always use `probe`.
-
-The `FragmentWrite` row's `mode` pairs with its `adapter`: an overwrite writes
-`fragments`, an append uses `strict_insert`, and a merge uses `upsert`.
-
-The `plan` rows are the query explain's, with these values for a load:
-
-| `node` | `detail` |
-|---|---|
-| `datafusion` | `unavailable`: a load's operators are lowered at execution, under the statement's transaction |
-| `route` | `engine` for overwrite, which runs the plan; `executor` for append and merge, which the plan describes while the keyed adapters run them (`reason` then says `mode_on_executor`) |
-| `explain_version` | the shared counter, `6` since load nodes exist |
-| `operation` | `kind` (`load`), `mode`, and `tables`: the target and each consulted committed table with its `type_key` and `version` |
-
-An executed load's receipt carries the same document and an `executed`
-object with `partitions`, `rows` and `source_bytes`.

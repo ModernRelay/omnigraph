@@ -3716,6 +3716,15 @@ pub(crate) mod test_support {
     }
 
     impl lance::io::WrappingObjectStore for ReadFault {
+        fn wrap_paginated(
+            &self,
+            _: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            // Keep listings on the wrapped path so faults and request accounting apply.
+            None
+        }
+
         fn wrap(
             &self,
             _: &str,

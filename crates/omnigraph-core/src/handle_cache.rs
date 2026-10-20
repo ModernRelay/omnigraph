@@ -5,6 +5,7 @@ use std::sync::Arc;
 use lance::Dataset;
 use lance::io::WrappingObjectStore;
 use lance::session::Session;
+use lance_io::object_store::ChainedWrappingObjectStore;
 use tokio::sync::Mutex;
 
 use crate::error::Result;
@@ -151,8 +152,11 @@ impl TableHandleCache {
         let memo = statement_wrapper.clone();
         let wrapper = match (statement_wrapper, crate::instrumentation::table_wrapper()) {
             (Some(statement), Some(probe)) => {
-                Some(crate::read_memo::StackedWrapper::new(statement, probe)
-                    as Arc<dyn WrappingObjectStore>)
+                // Native chains apply inner wrappers first; memo hits stay outside the probe.
+                Some(
+                    Arc::new(ChainedWrappingObjectStore::new(vec![probe, statement]))
+                        as Arc<dyn WrappingObjectStore>,
+                )
             }
             (Some(statement), None) => Some(statement as Arc<dyn WrappingObjectStore>),
             (None, probe) => probe,

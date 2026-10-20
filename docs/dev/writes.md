@@ -76,6 +76,36 @@ native branch lifetime; a stale or missing view takes the existing refresh/open
 path. Captures share immutable lineage and the Lance session, copy current
 table state, and leave the handle's active branch unchanged.
 
+A start at a graph commit (`from_commit`, `branch create … from commit "<id>"`) captures the
+branch whose incarnation wrote the commit and clones that branch's
+`__manifest` at the version that published it: Lance `create_branch` takes any
+retained version, so the new branch's first manifest holds the commit's table
+pins, head, buffer and schema contract, exactly as a create while the commit
+was the head. No second publication follows. Under the gates the engine
+captures the branch by name and reads the commit's record from the capture.
+The incarnation that wrote the commit must be the one the name resolves to:
+a name that resolves to nothing and a name created again since are one fact,
+refused as `BranchDeleted` in that one place, on every door. It then refuses,
+before any effect, a version above the captured head, a schema contract
+other than the accepted one, a version only the legacy history serves, a
+version whose head row is another commit, and any pinned table version that
+no longer opens (cleanup reclaimed it) or misses an object its manifest
+references. The collector's sweep deletes a version's files before its
+manifest, so a manifest that opens proves nothing after an interrupted run:
+every object of every pin the captured head does not also hold (the head's
+pins are roots, whose files the collector never deletes) is probed, as the
+collector oracle probes retained roots. The probe runs under the exclusive
+schema permit every write waits on, so it opens the pins and probes their
+objects with bounded concurrency and stops at the first missing object; it
+still sends one request per object of those pins. The probe stands in for a
+property the collector does not yet give every reader: a manifest that is
+present names only objects that are present. A sweep that deleted a version's
+manifest before its files would give it, and the probe would then reduce to
+opening each pin. Collection keeps the new branch's base version, and with
+it the commit's pins, while the branch lives.
+An unpublished commit and an unattached snapshot are detached `__manifest`
+versions that no branch history holds, and are refused.
+
 Create admission lists native ref names and reads bodies only for the source,
 the target's incarnations and logical ancestors or descendants. Physical path
 checks include retired ref names. The
@@ -227,7 +257,7 @@ deterministically, whatever Lance's size and deletion heuristics select. It
 stages the rewrite detached with fragment ids above the base's high-water
 mark, so it needs no `ReserveFragments`; a lagging scalar or vector index is
 rebuilt whole as a detached commit chained on the rewrite under its name
-(Lance 11 folds only through a linear commit), keeping a vector index's
+(Lance 13 folds only through a linear commit), keeping a vector index's
 partition count; the batch publishes once with an exact CAS on every planned
 pin, and a pin a concurrent writer moved fails the run with a read-set
 conflict so the next run re-plans. A failure before publication leaves

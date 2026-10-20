@@ -67,7 +67,16 @@ fn branch_statements_embedded_print_the_verb_lines() {
     let (_temp, graph) = loaded_graph();
 
     let created = output_success(embedded("mutate", &graph).arg("-e").arg("branch create b0"));
-    assert_eq!(stdout_string(&created), "created branch b0 from main\n");
+    let start = parse_stdout_json(&output_success(
+        embedded("commit", &graph).args(["list", "--branch", "b0", "--json"]),
+    ))["commits"][0]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        stdout_string(&created),
+        format!("created branch b0 from main at {start}\n")
+    );
 
     let listed = output_success(
         embedded("query", &graph)
@@ -236,7 +245,16 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
     let (_cluster, server) = served_graph();
 
     let created = output_success(served("mutate", &server).arg("-e").arg("branch create b0"));
-    assert_eq!(stdout_string(&created), "created branch b0 from main\n");
+    let start = parse_stdout_json(&output_success(
+        served("commit", &server).args(["list", "--branch", "b0", "--json"]),
+    ))["commits"][0]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        stdout_string(&created),
+        format!("created branch b0 from main at {start}\n")
+    );
 
     let table = stdout_string(&output_success(
         served("query", &server)

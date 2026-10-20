@@ -226,7 +226,7 @@ Clean native shutdown closes logical admission, drains its existing operation
 owners, then closes and drains an explicit `StorageIoScope` shared by control
 adapters and graph Lance sessions. The wrappers count actual mutating requests
 and multipart lifetimes. Physical settlement depends on the operation and the
-key it names. The wrapper recognizes Lance 11's fresh `data/*.lance` files,
+key it names. The wrapper recognizes Lance 13's fresh `data/*.lance` files,
 their `data/<file-key>/*.blob` sidecars, `_transactions/*.txn`,
 `_deletions/*.arrow|*.bin`, flat files in `_indices/<uuid>/`, detached
 `_versions/d*.manifest`, and numbered manifests created only if absent.

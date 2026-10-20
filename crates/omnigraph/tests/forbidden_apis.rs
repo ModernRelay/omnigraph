@@ -478,6 +478,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "published_record",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "capture_change_cut",
     ),
     (
@@ -670,6 +675,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "branch_create_at",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "branch_delete_captured",
         WriteProtocol::NativeRefControl,
     ),
@@ -701,6 +712,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "create_branch",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "create_branch_at",
         WriteProtocol::NativeRefControl,
     ),
     (
@@ -2892,6 +2909,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
     let coordinator_methods = [
         "init_commit_with_session",
         "branch_create",
+        "branch_create_at",
         "branch_delete_captured",
         "commit_updates_with_actor",
         "commit_updates_with_actor_with_expected",
@@ -2935,6 +2953,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         "init_commit",
         "commit_changes_with_lineage_and_precondition",
         "create_branch",
+        "create_branch_at",
         "delete_branch",
         "delete_branch_with_expected",
     ] {
@@ -2970,6 +2989,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         "commit_changes_with_lineage",
         "commit_changes_with_lineage_and_precondition",
         "create_branch",
+        "create_branch_at",
         "delete_branch",
         "delete_branch_with_expected",
     ];
@@ -3053,6 +3073,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "db/manifest.rs: omnigraph_catalog::INTERNAL_MANIFEST_SCHEMA_VERSION",
     "db/manifest.rs: omnigraph_catalog::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION",
     "db/manifest.rs: omnigraph_catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE",
+    "error.rs: omnigraph_core::error::BranchStartRefusal",
     "error.rs: omnigraph_core::error::CompletionEvidence",
     "error.rs: omnigraph_core::error::ManifestConflictDetails",
     "error.rs: omnigraph_core::error::ManifestError",

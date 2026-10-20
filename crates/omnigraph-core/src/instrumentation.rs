@@ -1609,7 +1609,7 @@ pub fn record_stage_append(rows: u64) {
     });
 }
 
-/// Record one `stage_merge_insert` of `rows` rows against the active probes.
+/// Record one merge-insert keyed stage of `rows` rows against the active probes.
 /// No-op in production (no probes installed).
 pub fn record_stage_merge_insert(rows: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {

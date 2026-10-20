@@ -109,18 +109,18 @@ Server and cluster selectors, cluster profiles and cluster-layout roots are
 refused: a cluster-managed graph is exported with the build that wrote it and
 [rebuilt](#rebuild). Paths, file URIs and symlinks resolve before that check.
 
-## v0.9 to v0.10
+## Lance substrate upgrades (v0.10, v0.14)
 
-Released v0.9.0 uses Lance 9; v0.10.0 uses Lance 11. Both use graph storage
-format v6, so existing entities, branches, and retained history do not need an
-export/import migration. Development builds using Lance 10 follow the same
-full-text upgrade procedure below.
+v0.10.0 moved from Lance 9 to Lance 11 on graph storage format v6: no export/import
+migration, but the full-text upgrade below. v0.14 moves to Lance 13 with graph
+format 16 and V2_2 data files unchanged: no `omnigraph upgrade` for a format-16
+graph, and full-text indexes stay searchable, the analyzer being unchanged.
 
-The CLI/API vocabulary changes are not rolling-compatible. Update the CLI,
-server, and client integrations together, with application traffic stopped.
-Even without full-text indexes, do not run an old and new fleet against the
-same graph. Keep the old executables and a verified whole-root backup until the
-upgrade is proven. See the [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility).
+Neither transition is rolling-compatible. Update the CLI, server, and client
+integrations together with application traffic stopped, never run an old and new
+fleet against the same graph, and keep the old executables and a verified whole-root
+backup until the upgrade is proven: a graph the new fleet has written is not qualified
+for the old reader ([Lance contract](../../dev/versioning.md#lance-contract), [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility)).
 
 ## Full-text index upgrade
 

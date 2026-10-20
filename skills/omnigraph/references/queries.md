@@ -450,7 +450,8 @@ branch delete "review/abandoned"
 branch list
 ```
 
-`from` and `into` default to `main`. Quote a name that is not a bare
+`from` and `into` default to `main`; `branch create "fix" from commit "<commit-id>"`
+starts the branch at a published commit. Quote a name that is not a bare
 identifier (a lowercase letter or `_`, then letters, digits, or `_`), such as
 one containing `/`, `-`, or `.`. Run the control writes with
 `omnigraph mutate -e '…'` (HTTP `POST /mutate`) and `branch list` with

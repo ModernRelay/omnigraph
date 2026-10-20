@@ -16,6 +16,7 @@ fn retained_bytes(dataset: &Dataset) -> usize {
         .saturating_add(dataset.uri().len().saturating_mul(4))
         .saturating_add(location.path.as_ref().len().saturating_mul(4))
         .saturating_add(location.e_tag.as_ref().map_or(0, String::capacity))
+        .saturating_add(location.identity.as_ref().map_or(0, String::capacity))
         .saturating_add(manifest.fragments.len().saturating_mul(128))
         .saturating_add(1024)
 }
@@ -65,7 +66,8 @@ pub async fn retain_control_dataset(dataset: &Dataset, budget: usize) -> Option<
 }
 
 /// Qualify a retained main control image against fresh storage metadata.
-/// Missing or changed ETags return a cache miss without consulting session metadata caches.
+/// Missing or changed ETags, or changed commit-store identities, return a cache miss
+/// without consulting session metadata caches.
 pub async fn current_control_dataset(
     dataset: &Dataset,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
@@ -105,6 +107,7 @@ fn same_location(held: &ManifestLocation, latest: &ManifestLocation) -> bool {
     held.path == latest.path
         && held.version == latest.version
         && held.naming_scheme == latest.naming_scheme
+        && held.identity == latest.identity
         && latest
             .e_tag
             .as_ref()
@@ -126,6 +129,7 @@ mod tests {
             size: Some(1024),
             naming_scheme: ManifestNamingScheme::V1,
             e_tag: Some("original".to_string()),
+            identity: None,
         };
         assert!(same_location(&held, &held));
         for (old, new) in [
@@ -140,6 +144,27 @@ mod tests {
             let mut after = held.clone();
             after.e_tag = new.map(str::to_string);
             assert!(!same_location(&before, &after), "old={old:?}, new={new:?}");
+        }
+        for (old, new, matches) in [
+            (None, None, true),
+            (Some("record"), Some("record"), true),
+            (Some("record"), Some("replacement"), false),
+            (Some("record"), None, false),
+            (None, Some("record"), false),
+        ] {
+            let mut before = held.clone();
+            before.identity = old.map(str::to_string);
+            let mut after = held.clone();
+            after.identity = new.map(str::to_string);
+            assert_eq!(
+                same_location(&before, &after),
+                matches,
+                "old={old:?}, new={new:?}"
+            );
+            // A matching commit-store identity never substitutes for a fresh
+            // object-generation token.
+            after.e_tag = None;
+            assert!(!same_location(&before, &after));
         }
         let mut changed = held.clone();
         changed.size = Some(2048);

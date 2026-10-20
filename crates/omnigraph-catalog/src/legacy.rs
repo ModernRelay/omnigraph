@@ -479,7 +479,7 @@ pub(crate) enum RetiredHead {
 /// `Some` when `dataset`'s version is read from the legacy history of a root
 /// that has one: it predates native commit records, or is a supported pending
 /// conversion. The value says whether it carries the pending key.
-fn legacy_version(dataset: &Dataset) -> Option<bool> {
+pub(crate) fn legacy_version(dataset: &Dataset) -> Option<bool> {
     let metadata = &dataset.schema().metadata;
     let fenced = metadata.contains_key(UPGRADE_PENDING_KEY);
     let legacy = match metadata

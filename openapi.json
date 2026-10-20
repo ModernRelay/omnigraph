@@ -3073,7 +3073,7 @@
           "branches"
         ],
         "summary": "Create a new branch.",
-        "description": "Forks `name` off of `from` (defaults to `main`). The new branch shares\nbacking dataset data with its parent until it is mutated. Returns 409 if `name`\nalready exists. The GQ statement `branch create` on `POST /mutate` runs\nthe same body.",
+        "description": "Forks `name` off of `from` (defaults to `main`) at its head, or starts it\nat the published graph commit `from_commit` with that commit's data and\nhistory. The receipt names the branch forked and the commit the new\nbranch starts at. The new branch shares backing dataset data with its\nparent until it is mutated. Returns 409 if `name` already exists. The GQ\nstatement `branch create` on `POST /mutate` runs the same body.",
         "operationId": "cluster_createBranch",
         "parameters": [
           {
@@ -3131,7 +3131,7 @@
             }
           },
           "400": {
-            "description": "Bad request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "description": "Bad request, or both `from` and `from_commit`; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3193,6 +3193,27 @@
               }
             }
           },
+          "404": {
+            "description": "`from` names no branch, or `from_commit` names no commit the actor may branch from",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "408": {
             "description": "Request body deadline exceeded before operation admission",
             "headers": {
@@ -3215,7 +3236,28 @@
             }
           },
           "409": {
-            "description": "Branch already exists",
+            "description": "Branch already exists, or the commit `from_commit` names cannot start a branch; see branch_start_refusal",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The commit `from_commit` names is no longer retained; see branch_start_refusal",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -9832,7 +9874,8 @@
         "required": [
           "uri",
           "from",
-          "name"
+          "name",
+          "from_commit_id"
         ],
         "properties": {
           "actor_id": {
@@ -9843,6 +9886,10 @@
           },
           "from": {
             "type": "string"
+          },
+          "from_commit_id": {
+            "type": "string",
+            "description": "The graph commit the new branch starts at: `from`'s head when the\nbranch was created, or the commit `from_commit` named. For a commit\nstart, `from` is the branch that wrote the commit."
           },
           "name": {
             "type": "string"
@@ -9863,7 +9910,14 @@
               "string",
               "null"
             ],
-            "description": "Parent branch to fork from. Defaults to `main`."
+            "description": "Parent branch to fork from; the new branch starts at its head.\nMutually exclusive with `from_commit`. Defaults to `main`."
+          },
+          "from_commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A published graph commit id to start the new branch at, with that\ncommit's data and history. Mutually exclusive with `from`."
           },
           "name": {
             "type": "string",
@@ -10019,14 +10073,18 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "`name` was forked off `from`.",
+            "description": "`name` was forked off `from` at the commit `from_commit_id`: the\nhead of `from`, or the commit a `from commit \"<id>\"` start named,\nwhich `from` wrote.",
             "required": [
               "from",
               "name",
+              "from_commit_id",
               "kind"
             ],
             "properties": {
               "from": {
+                "type": "string"
+              },
+              "from_commit_id": {
                 "type": "string"
               },
               "kind": {
@@ -10122,6 +10180,49 @@
           }
         ],
         "description": "The effect of a branch statement sent to `POST /mutate`, tagged by `kind`.\nA merge conflict has no kind: it is the 409 `POST /branches/merge` answers.\nThe statement grammar is `BranchStmt` in `omnigraph-compiler`."
+      },
+      "BranchStartRefusalOutput": {
+        "type": "object",
+        "description": "A branch create refused at the graph commit `from_commit` named; nothing\nwas created.",
+        "required": [
+          "reason",
+          "graph_commit_id"
+        ],
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `branch_deleted`, the branch that wrote the commit."
+          },
+          "graph_commit_id": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/BranchStartRefusalReason"
+          },
+          "type_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `not_retained`, the graph type whose stored version cleanup reclaimed."
+          }
+        }
+      },
+      "BranchStartRefusalReason": {
+        "type": "string",
+        "description": "Why a branch could not start at the graph commit `from_commit` named.",
+        "enum": [
+          "not_retained",
+          "schema_changed",
+          "earlier_storage_format",
+          "branch_deleted",
+          "unpublished_commit",
+          "unattached_snapshot",
+          "unknown"
+        ]
       },
       "ChangeBaselineOutput": {
         "type": "object",
@@ -10482,6 +10583,17 @@
               {
                 "$ref": "#/components/schemas/CommitOutput",
                 "description": "This write's own publication, including for a fast-forward merge.\nAlways present on the wire; `null` for branch creation, deletion, or\nan already-up-to-date merge, which publish no graph content commit."
+              }
+            ]
+          },
+          "executed": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadExecutedOutput",
+                "description": "Present only when the request was a `load csv` statement whose plan\nthe engine ran (`mode overwrite`): what the plan measured."
               }
             ]
           },
@@ -10928,6 +11040,17 @@
               {
                 "$ref": "#/components/schemas/BlobRangeOutput",
                 "description": "Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.\n`start..end` is half-open and `length` is the selected Blob length."
+              }
+            ]
+          },
+          "branch_start_refusal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BranchStartRefusalOutput",
+                "description": "Set with HTTP 409, or 410 for `not_retained`, when `branch create`\ncannot start a branch at the commit `from_commit` named."
               }
             ]
           },
@@ -11583,6 +11706,43 @@
           "unsupported"
         ]
       },
+      "LoadExecutedOutput": {
+        "type": "object",
+        "description": "What a `load csv` statement's plan measured as it ran, beside the\nstatement's [`ChangeOutput`]: the source partitions and bytes it read, the\ncount its sink staged, and what each operator did. Absent for an append\nor merge load, which the keyed adapters run, and for every other change.",
+        "required": [
+          "partitions",
+          "rows",
+          "source_bytes",
+          "operators"
+        ],
+        "properties": {
+          "operators": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoadOperatorExecutedOutput"
+            },
+            "description": "One entry per node of the executed plan in post-order, the source\nfirst."
+          },
+          "partitions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Source partitions the plan read.",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Entities the sink staged.",
+            "minimum": 0
+          },
+          "source_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes of the captured source.",
+            "minimum": 0
+          }
+        }
+      },
       "LoadMode": {
         "type": "string",
         "description": "Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.",
@@ -11591,6 +11751,52 @@
           "append",
           "merge"
         ]
+      },
+      "LoadOperatorExecutedOutput": {
+        "type": "object",
+        "description": "What one operator of an executed load plan did.",
+        "required": [
+          "id",
+          "node",
+          "operator",
+          "rows",
+          "elapsed_compute_ns",
+          "wall_ns"
+        ],
+        "properties": {
+          "elapsed_compute_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds the operator was computing: the polls of its stream and of\nits workers, never the time it waited for its input or for storage.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The plan node's `id`, as the explain document numbers it.",
+            "minimum": 0
+          },
+          "node": {
+            "type": "string",
+            "description": "The plan node's kind: `CsvSource`, `Validate`, `FragmentWrite`."
+          },
+          "operator": {
+            "type": "string",
+            "description": "The operator the node built."
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What the operator emitted; the sink counts what it staged.",
+            "minimum": 0
+          },
+          "wall_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds from the operator's first poll to its end, waits included;\n`0` where no end was recorded.",
+            "minimum": 0
+          }
+        }
       },
       "MergeBaseOutput": {
         "type": "object",

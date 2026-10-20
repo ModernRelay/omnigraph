@@ -5,5 +5,5 @@
   A GQT load step takes an `--- expect plan` section, checked against the
   executed load's document ([plan expectations][load-plan-gqt-guide]).
 
-[load-plan-explain-guide]: ../docs/user/queries/explain.md#explaining-a-load-statement
+[load-plan-explain-guide]: ../docs/user/queries/explain-load.md
 [load-plan-gqt-guide]: ../crates/omnigraph-gqt/README.md#plan-expectations

@@ -7,7 +7,7 @@ use omnigraph::db::{
     GraphCommit, GraphCommitKind, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot,
 };
 use omnigraph::error::{MergeConflict, MergeConflictKind};
-use omnigraph::loader::{LoadMode, LoadReceipt, LoadResult};
+use omnigraph::loader::{LoadExecuted, LoadMode, LoadOperatorExecuted, LoadReceipt, LoadResult};
 use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
@@ -390,8 +390,13 @@ pub struct SnapshotOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchCreateRequest {
-    /// Parent branch to fork from. Defaults to `main`.
+    /// Parent branch to fork from; the new branch starts at its head.
+    /// Mutually exclusive with `from_commit`. Defaults to `main`.
     pub from: Option<String>,
+    /// A published graph commit id to start the new branch at, with that
+    /// commit's data and history. Mutually exclusive with `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit: Option<String>,
     /// Name of the new branch. Must not already exist.
     pub name: String,
 }
@@ -402,6 +407,10 @@ pub struct BranchCreateOutput {
     pub from: String,
     pub name: String,
     pub actor_id: Option<String>,
+    /// The graph commit the new branch starts at: `from`'s head when the
+    /// branch was created, or the commit `from_commit` named. For a commit
+    /// start, `from` is the branch that wrote the commit.
+    pub from_commit_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -612,8 +621,14 @@ pub struct ReadPageOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BranchOutcomeOutput {
-    /// `name` was forked off `from`.
-    Created { from: String, name: String },
+    /// `name` was forked off `from` at the commit `from_commit_id`: the
+    /// head of `from`, or the commit a `from commit "<id>"` start named,
+    /// which `from` wrote.
+    Created {
+        from: String,
+        name: String,
+        from_commit_id: String,
+    },
     /// `name` was removed.
     Deleted { name: String },
     /// `source` was merged into `target`; `merge` is the three-way result,
@@ -654,6 +669,10 @@ pub struct ChangeOutput {
     /// Present only when the request was a branch statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<BranchOutcomeOutput>,
+    /// Present only when the request was a `load csv` statement whose plan
+    /// the engine ran (`mode overwrite`): what the plan measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed: Option<LoadExecutedOutput>,
 }
 
 /// Load capability for a batch touching a node type with declared `@embed`.
@@ -710,6 +729,42 @@ pub struct IngestOutput {
     pub embedding_generation: Option<LoadEmbeddingGeneration>,
     pub actor_id: Option<String>,
     pub commit: Option<CommitOutput>,
+}
+
+/// What a `load csv` statement's plan measured as it ran, beside the
+/// statement's [`ChangeOutput`]: the source partitions and bytes it read, the
+/// count its sink staged, and what each operator did. Absent for an append
+/// or merge load, which the keyed adapters run, and for every other change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LoadExecutedOutput {
+    /// Source partitions the plan read.
+    pub partitions: u32,
+    /// Entities the sink staged.
+    pub rows: u64,
+    /// Bytes of the captured source.
+    pub source_bytes: u64,
+    /// One entry per node of the executed plan in post-order, the source
+    /// first.
+    pub operators: Vec<LoadOperatorExecutedOutput>,
+}
+
+/// What one operator of an executed load plan did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LoadOperatorExecutedOutput {
+    /// The plan node's `id`, as the explain document numbers it.
+    pub id: u64,
+    /// The plan node's kind: `CsvSource`, `Validate`, `FragmentWrite`.
+    pub node: String,
+    /// The operator the node built.
+    pub operator: String,
+    /// What the operator emitted; the sink counts what it staged.
+    pub rows: u64,
+    /// Nanoseconds the operator was computing: the polls of its stream and of
+    /// its workers, never the time it waited for its input or for storage.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds from the operator's first poll to its end, waits included;
+    /// `0` where no end was recorded.
+    pub wall_ns: u64,
 }
 
 /// One logical declaration touched by a graph-batch load.
@@ -2106,6 +2161,42 @@ pub struct ChangeDiffRefusalOutput {
     pub type_name: Option<String>,
 }
 
+/// Why a branch could not start at the graph commit `from_commit` named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchStartRefusalReason {
+    /// HTTP 410: cleanup reclaimed data the commit's snapshot names.
+    NotRetained,
+    /// HTTP 409: the commit was written under an earlier schema.
+    SchemaChanged,
+    /// HTTP 409: the commit was written before the storage upgrade.
+    EarlierStorageFormat,
+    /// HTTP 409: the branch that wrote the commit was deleted, and may have
+    /// been created again under the same name since.
+    BranchDeleted,
+    /// HTTP 409: the commit is unpublished; publish it first.
+    UnpublishedCommit,
+    /// HTTP 409: the commit is an unattached snapshot, never branch history.
+    UnattachedSnapshot,
+    /// A reason added by a newer server; the branch was not created.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A branch create refused at the graph commit `from_commit` named; nothing
+/// was created.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BranchStartRefusalOutput {
+    pub reason: BranchStartRefusalReason,
+    pub graph_commit_id: String,
+    /// For `not_retained`, the graph type whose stored version cleanup reclaimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    /// For `branch_deleted`, the branch that wrote the commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
 /// A selected full-text index cannot safely serve the current analyzer (HTTP 409).
 /// This is not a retryable write conflict: an operator must rebuild the live
 /// branch's indexes. Historical snapshots stay unchanged; branch old content
@@ -2282,6 +2373,10 @@ pub struct ErrorOutput {
     /// commit or an unprovable schema boundary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
+    /// Set with HTTP 409, or 410 for `not_retained`, when `branch create`
+    /// cannot start a branch at the commit `from_commit` named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_start_refusal: Option<BranchStartRefusalOutput>,
     /// Set with HTTP 409 when a selected full-text index requires an explicit
     /// rebuild before search can succeed. Unlike a write-authority conflict,
     /// this condition is not cleared by retrying. This additive discriminator
@@ -2318,6 +2413,7 @@ impl ErrorOutput {
             blob_precondition_failure: None,
             change_feed_gap: None,
             change_diff_refusal: None,
+            branch_start_refusal: None,
             full_text_index_rebuild_required: None,
             full_text_index_required: None,
             diagnostic: None,
@@ -2377,6 +2473,29 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
         published: commit.published,
         kind: commit.kind.into(),
         root_commit_id: commit.root_commit_id.clone(),
+    }
+}
+
+/// The receipt's measurement on the wire, for a load whose plan ran.
+pub fn load_executed_output(executed: &LoadExecuted) -> LoadExecutedOutput {
+    LoadExecutedOutput {
+        partitions: executed.partitions,
+        rows: executed.rows,
+        source_bytes: executed.source_bytes,
+        operators: executed
+            .operators
+            .iter()
+            .map(
+                |operator: &LoadOperatorExecuted| LoadOperatorExecutedOutput {
+                    id: operator.id,
+                    node: operator.node.clone(),
+                    operator: operator.operator.clone(),
+                    rows: operator.rows,
+                    elapsed_compute_ns: operator.elapsed_compute_ns,
+                    wall_ns: operator.wall_ns,
+                },
+            )
+            .collect(),
     }
 }
 
@@ -3235,6 +3354,44 @@ mod tests {
                 .to_string()
                 .contains("missing field `commit`")
         );
+    }
+
+    /// A `load csv` change carries the plan's measurement as `executed`,
+    /// absent from the wire for every other change.
+    #[test]
+    fn change_receipts_carry_the_executed_load_plan_only_when_it_ran() {
+        let executed = load_executed_output(&LoadExecuted {
+            partitions: 1,
+            rows: 2,
+            source_bytes: 19,
+            operators: vec![LoadOperatorExecuted {
+                id: 0,
+                node: "CsvSource".to_string(),
+                operator: "CsvSourceExec".to_string(),
+                rows: 2,
+                elapsed_compute_ns: 12,
+                wall_ns: 34,
+            }],
+        });
+        let change = json!({
+            "branch": "main", "query_name": "load csv",
+            "affected_nodes": 2, "affected_edges": 0, "actor_id": null, "commit": null,
+            "executed": {
+                "partitions": 1, "rows": 2, "source_bytes": 19,
+                "operators": [{"id": 0, "node": "CsvSource", "operator": "CsvSourceExec",
+                               "rows": 2, "elapsed_compute_ns": 12, "wall_ns": 34}]
+            }
+        });
+        let decoded: ChangeOutput = serde_json::from_value(change.clone()).unwrap();
+        assert_eq!(decoded.executed.as_ref(), Some(&executed));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), change);
+        let plain = json!({
+            "branch": "main", "query_name": "insert_person",
+            "affected_nodes": 1, "affected_edges": 0, "actor_id": null, "commit": null
+        });
+        let decoded: ChangeOutput = serde_json::from_value(plain.clone()).unwrap();
+        assert!(decoded.executed.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), plain);
     }
 
     #[test]
