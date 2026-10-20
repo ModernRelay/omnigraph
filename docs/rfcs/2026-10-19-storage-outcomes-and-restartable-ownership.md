@@ -265,8 +265,8 @@ it can land.
   publication occupies, so nothing fences a late put against that sweep. The
   storage scope's transaction-file hold (§4) keeps such files for the
   server's lifetime. A table manifest that lands later still is a detached
-  version no `__manifest` pin names, because its staging failed, and it stays
-  unreachable.
+  version no `__manifest` pin names, because its writer published no pin for
+  it, and it stays unreachable even when it is the commit that succeeded.
 - **Refs and tags.** Lance's `put_ref_if_absent` reports `RefConflict`
   without reading the object. Its OmniGraph callers read the ref back:
   candidate tags compare branch and version, and native branch creation
@@ -382,8 +382,10 @@ without racing a release the old owner already sent, and only a conditional
 update does that. Local roots have none: `LocalFileSystem` offers no update
 precondition, and `write_text_if_match` there is a read, a compare and a
 put, so a successor's overwrite could be undone by an exact-owner delete the
-old process had already sent. Local and Azure locks therefore carry no
-lease and keep the exact-ID unlock. A local root on a shared network
+old process had already sent. Local locks therefore carry no lease and keep
+the exact-ID unlock. Azure has an update precondition, but its release is an
+exact-ID delete and its lock behavior is qualified separately through its
+admission wrapper, so Azure locks stay unleased too. A local root on a shared network
 filesystem is the same case and is never taken over. A CLI writer's or
 deployment's lock is unleased too: nothing in those processes would stop
 their writes when a lease fenced, so a successor could not safely act.
@@ -435,7 +437,8 @@ postpone it. The first beat races the same deadline, counted from the send
 of the request that wrote the lock record, because a successor may count
 silence from the moment that record is visible. If beat 0 is not
 acknowledged by then, acquisition fails and the process does not serve; the
-lock stays for a successor. When the timer fires, or a claim exists, the
+lock stays for a successor. After beat 0 is acknowledged, the owner reads
+the claim once more before it admits work. When the timer fires, or a claim exists, the
 owner ***fences***: the lease closes the owner's storage scope before it
 reports the fence, so no mutation is sent after a successor may claim,
 whatever the server's shutdown grace. The server then closes operation
@@ -480,8 +483,11 @@ newest beat it saw became visible, so the takeover happens at least
 `3/2 × lease_seconds` after `s`. The owner fenced by `s + 2/3 ×
 lease_seconds`. The gap, five sixths of a lease, covers clock-rate drift and
 a stalled runtime. A beat that lands after its owner fenced only makes a
-successor refuse once more. Requests already in flight when the scope
-closes were sent before the fence, within the lease. S3 lists a created
+successor refuse once more. Closing the scope refuses every new mutation;
+it does not recall a request the store already accepted. Such a request was
+sent before the fence, within the lease, and lands like a dead owner's: by
+the classes below it cannot corrupt state. A fresh-key put still in its
+client's retry loop re-sends the same bytes to its own fresh name. S3 lists a created
 object as soon as the create
 is acknowledged, so a counted beat is visible to every successor's listing.
 A store whose listing lags its creates could hide a beat from a successor,
@@ -626,8 +632,10 @@ Upstream surfaces reviewed at the pinned versions:
   `ConditionalPutCommitHandler`, `commit_handler_from_url`, refs, and
   `CommitStatusUnknownError`;
 - lance-io 11.0.0: storage options, retry and AIMD;
-- object_store 0.13.2: the retry loop, error mapping, `LocalFileSystem` and
-  `InMemory` conditionals;
+- object_store 0.14.2: the retry loop (a `PutMode::Create` is retried on a
+  server error and a retry that finds the object answers 412, mapped to
+  `AlreadyExists`), error mapping, `LocalFileSystem` and `InMemory`
+  conditionals;
 - the Lance guides on transactions, table versioning, branch and tag format,
   object stores and observability.
 
