@@ -377,14 +377,16 @@ resolved is scoped to its key: for a publication, the version key fences it.
 
 ### 7. Restartable ownership: the lock lease
 
-Only S3 locks are leased. A takeover must replace `lock.json` without
-racing a release the old owner already sent, and only a conditional update
-does that. Local roots have none: `LocalFileSystem` offers no update
+Only a server's lock on S3 is leased. A takeover must replace `lock.json`
+without racing a release the old owner already sent, and only a conditional
+update does that. Local roots have none: `LocalFileSystem` offers no update
 precondition, and `write_text_if_match` there is a read, a compare and a
 put, so a successor's overwrite could be undone by an exact-owner delete the
 old process had already sent. Local and Azure locks therefore carry no
 lease and keep the exact-ID unlock. A local root on a shared network
-filesystem is the same case and is never taken over.
+filesystem is the same case and is never taken over. A CLI writer's or
+deployment's lock is unleased too: nothing in those processes would stop
+their writes when a lease fenced, so a successor could not safely act.
 
 The protocol uses these S3 operations:
 
@@ -429,9 +431,16 @@ no earlier than its first send, so it counts as acknowledged with `s` its
 first send. A beat that gets no answer is sent again, under the same key,
 after a quarter of a beat interval. A timer of its own fires at
 `s + 2/3 × lease_seconds`, two beat intervals, so a hung beat request cannot
-postpone it. When the timer fires, or a claim exists, the owner
-***fences***: it closes its storage scope and operation admission, and exits
-nonzero. It never resumes, because a successor may already act. A clean
+postpone it. The first beat races the same deadline, counted from the send
+of the request that wrote the lock record, because a successor may count
+silence from the moment that record is visible. If beat 0 is not
+acknowledged by then, acquisition fails and the process does not serve; the
+lock stays for a successor. When the timer fires, or a claim exists, the
+owner ***fences***: the lease closes the owner's storage scope before it
+reports the fence, so no mutation is sent after a successor may claim,
+whatever the server's shutdown grace. The server then closes operation
+admission and exits nonzero. It never resumes, because a successor may
+already act. A clean
 release stops beating, deletes its lease directory, and releases `lock.json`
 as today, by if-match; if that release fails, the lock is a silent leased
 lock, and a successor takes it over.
@@ -444,7 +453,11 @@ orchestrator retries it later. The silence is measured from the
 successor's first observation of the newest beat. An empty listing starts
 it, and the first beat that appears restarts it: the owner writes
 `lock.json` before beat 0 lands, so an empty listing is the normal gap before
-the first beat, and also the gap while beat 0 is slow. After
+the first beat, and also the gap while beat 0 is slow; the owner's first
+deadline, counted from the lock write, fences it before this silence ends.
+An empty listing after a beat was seen means the beats were removed, by a
+clean release or a takeover, and the successor refuses as it does for a new
+beat. After
 `3/2 × lease_seconds` of silence the successor creates the claim:
 
 - If it wins, or finds a claim that names its own lock id (its own earlier
@@ -462,12 +475,14 @@ no one acts on; that lock needs the exact-ID unlock. The successor never
 takes over a version-1 lock.
 
 **Timing.** Every beat the owner counts became visible no earlier than its
-first send `s`. A successor's silence starts no earlier than the moment the
+first send `s`, and the lock record no earlier than its own send. A successor's silence starts no earlier than the moment the
 newest beat it saw became visible, so the takeover happens at least
 `3/2 × lease_seconds` after `s`. The owner fenced by `s + 2/3 ×
 lease_seconds`. The gap, five sixths of a lease, covers clock-rate drift and
 a stalled runtime. A beat that lands after its owner fenced only makes a
-successor refuse once more. S3 lists a created object as soon as the create
+successor refuse once more. Requests already in flight when the scope
+closes were sent before the fence, within the lease. S3 lists a created
+object as soon as the create
 is acknowledged, so a counted beat is visible to every successor's listing.
 A store whose listing lags its creates could hide a beat from a successor,
 and is outside this protocol.
@@ -593,13 +608,15 @@ The owners to extend:
   lease through the adapter realm, with the old owner's in-flight requests
   landing after the takeover.
 - **Cluster** `lease` tests under paused time: beats, the owner's fence on a
-  lapse and on a claim, a beat whose answer was lost still renewing, a
-  successor recognizing its own claim, a takeover after silence, refusal
-  while beats continue, and one winner between two successors.
-  `state_lock` tests on an in-memory store with S3's conditional semantics:
-  takeover after silence, refusal of a non-serving acquisition, and a release
-  and a takeover never both applying; and on a local root, refusal with no
-  lease.
+  lapse and on a claim, a failed beat and a beat whose answer was lost still
+  renewing, a hung first beat fencing before a successor can claim with the
+  owner's scope closed, a successor recognizing its own claim, a takeover
+  after silence, refusal while beats continue, and one winner between two
+  successors. `state_lock` tests on an in-memory store with S3's conditional
+  semantics: takeover after silence, refusal of a non-serving acquisition,
+  and a release and a takeover never both applying; that only a server's S3
+  lock is leased; and that a local lock, even one with a leased record, is
+  refused at once.
 
 Upstream surfaces reviewed at the pinned versions:
 
@@ -663,7 +680,11 @@ phase 3.
 - 2026-10-20: After review, the lease is S3-only: a local takeover's
   overwrite could be undone by a delete the old owner had already sent, so
   local and Azure locks keep the exact-ID unlock, and a shared network
-  filesystem needs no separate rule. Heartbeats moved off the scope's
+  filesystem needs no separate rule. Only a server's lock is leased, because
+  a CLI writer has nothing that stops its writes on a fence. The first beat
+  races the owner's deadline counted from the lock write, and a fence closes
+  the owner's storage scope before it is reported, so a shutdown grace
+  longer than the fence-to-claim gap sends nothing late. Heartbeats moved off the scope's
   single-attempt client to the root's retrying client, an existing beat
   counts from its first send, and §7 defines the empty listing. §2 no longer
   claims every late manifest finds its transaction file: a table's file is
