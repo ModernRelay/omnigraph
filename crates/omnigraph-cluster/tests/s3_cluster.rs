@@ -389,8 +389,11 @@ async fn object_storage_offline_deployment(root: &str) {
     assert!(
         matches!(status.lookup, Some(DeploymentLookup::Complete { result: observed }) if observed.input_digest == result.input_digest && observed.id == id)
     );
+    // The finished deployment keeps its admission. Any acquisition but a
+    // server's refuses it at once; a server would take it over once its lease
+    // lapsed (the `state_lock` lease tests cover that).
     assert_eq!(
-        acquire_cluster_admission(root, ClusterAdmissionPurpose::Serve)
+        acquire_cluster_admission(root, ClusterAdmissionPurpose::GraphOperation)
             .await
             .unwrap_err()
             .code,
