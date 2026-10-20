@@ -3876,13 +3876,13 @@ fn branch_list_outputs_sorted_branches() {
 
     assert_eq!(lines, vec!["alpha", "main", "zeta"]);
 
-    // `--detail` keeps one line per branch, in the same order, and adds the
-    // head, the fork and the times.
+    // `--detailed` keeps one line per branch, in the same order, and adds the
+    // head, where the branch started and the times.
     let detailed = output_success(
         cli()
             .arg("branch")
             .arg("list")
-            .arg("--detail")
+            .arg("--detailed")
             .arg("--uri")
             .arg(&graph),
     );
@@ -3899,13 +3899,12 @@ fn branch_list_outputs_sorted_branches() {
         .unwrap_or_else(|| panic!("{stdout}"));
     for (line, name) in [(lines[0], "alpha"), (lines[2], "zeta")] {
         assert!(
-            line.starts_with(&format!("{name} head={head} from=main fork={head} ")),
+            line.starts_with(&format!(
+                "{name} head={head} from=main from_commit_id={head} created_at="
+            )),
             "{stdout}"
         );
-        assert!(
-            line.contains(" created_at=") && line.contains(" updated_at="),
-            "{stdout}"
-        );
+        assert!(line.contains(" updated_at="), "{stdout}");
     }
 }
 
@@ -5396,11 +5395,11 @@ fn catalogue_scope_reads_the_binary_registries_without_a_store() {
         stderr.contains("not available under `og_catalog`"),
         "{stderr}"
     );
-    for detail in [None, Some("--detail")] {
+    for detailed in [None, Some("--detailed")] {
         let listed = output_failure(
             cli()
                 .args(["branch", "list", "--store", "og_catalog"])
-                .args(detail),
+                .args(detailed),
         );
         let stderr = String::from_utf8_lossy(&listed.stderr);
         assert!(

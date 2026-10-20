@@ -58,6 +58,12 @@ decide_seam! {
     pub static CLEANUP_SWEEP_PRE_FILE_DELETE = ("cleanup.sweep_pre_file_delete", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// After the files only a table's dead stagings reference are deleted and
+    /// before the first of their manifests is.
+    pub static CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE = ("cleanup.sweep_pre_dead_manifest_delete", Unreachable, [Fail]);
+}
+
 /// Requests the run made, for the two ceilings in `maintenance.rs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CollectorCost {
@@ -319,6 +325,7 @@ pub(crate) async fn sweep_table(
     let dead = plan.dead_stagings();
     if !dead.is_empty() {
         stats.bytes_removed += delete_paths(&store, &base, &plan.dead_paths).await?;
+        fail(&CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE)?;
     }
     for version in dead {
         let manifest = naming.manifest_path(&base, version);
@@ -426,6 +433,42 @@ impl CollectorPathSnapshot {
         Ok(missing.into_iter().collect())
     }
 
+    /// The location of a captured object that no longer exists, or `None`
+    /// when every one does. Probes at most `concurrency` objects at once and
+    /// stops at the first missing one, so a complete inventory costs one
+    /// request per object and an incomplete one usually far fewer.
+    pub(crate) async fn first_missing_location(
+        &self,
+        concurrency: usize,
+    ) -> Result<Option<String>> {
+        use futures::StreamExt;
+        if let Some((location, _)) = self.missing_at_capture.first() {
+            return Ok(Some(location.clone()));
+        }
+        let mut probes = futures::stream::iter(self.objects.iter().cloned())
+            .map(|object| async move {
+                let present = object
+                    .store
+                    .exists(&object.path)
+                    .await
+                    .map_err(OmniError::storage)?;
+                Ok::<_, OmniError>((!present).then_some(object.location))
+            })
+            .buffer_unordered(concurrency.max(1));
+        while let Some(probed) = probes.next().await {
+            if let Some(location) = probed? {
+                return Ok(Some(location));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Move `other`'s captured objects into this inventory.
+    pub(crate) fn absorb(&mut self, other: CollectorPathSnapshot) {
+        self.objects.extend(other.objects);
+        self.missing_at_capture.extend(other.missing_at_capture);
+    }
+
     fn insert(
         &mut self,
         location: &str,
@@ -516,7 +559,7 @@ async fn capture_index_paths(
     Ok(())
 }
 
-async fn capture_dataset_paths(
+pub(crate) async fn capture_dataset_paths(
     snapshot: &mut CollectorPathSnapshot,
     dataset: &lance::Dataset,
     location: &str,

@@ -76,6 +76,36 @@ native branch lifetime; a stale or missing view takes the existing refresh/open
 path. Captures share immutable lineage and the Lance session, copy current
 table state, and leave the handle's active branch unchanged.
 
+A start at a graph commit (`from_commit`, `branch create … from commit "<id>"`) captures the
+branch whose incarnation wrote the commit and clones that branch's
+`__manifest` at the version that published it: Lance `create_branch` takes any
+retained version, so the new branch's first manifest holds the commit's table
+pins, head, buffer and schema contract, exactly as a create while the commit
+was the head. No second publication follows. Under the gates the engine
+captures the branch by name and reads the commit's record from the capture.
+The incarnation that wrote the commit must be the one the name resolves to:
+a name that resolves to nothing and a name created again since are one fact,
+refused as `BranchDeleted` in that one place, on every door. It then refuses,
+before any effect, a version above the captured head, a schema contract
+other than the accepted one, a version only the legacy history serves, a
+version whose head row is another commit, and any pinned table version that
+no longer opens (cleanup reclaimed it) or misses an object its manifest
+references. The collector's sweep deletes a version's files before its
+manifest, so a manifest that opens proves nothing after an interrupted run:
+every object of every pin the captured head does not also hold (the head's
+pins are roots, whose files the collector never deletes) is probed, as the
+collector oracle probes retained roots. The probe runs under the exclusive
+schema permit every write waits on, so it opens the pins and probes their
+objects with bounded concurrency and stops at the first missing object; it
+still sends one request per object of those pins. The probe stands in for a
+property the collector does not yet give every reader: a manifest that is
+present names only objects that are present. A sweep that deleted a version's
+manifest before its files would give it, and the probe would then reduce to
+opening each pin. Collection keeps the new branch's base version, and with
+it the commit's pins, while the branch lives.
+An unpublished commit and an unattached snapshot are detached `__manifest`
+versions that no branch history holds, and are refused.
+
 Create admission lists native ref names and reads bodies only for the source,
 the target's incarnations and logical ancestors or descendants. Physical path
 checks include retired ref names. The
@@ -472,18 +502,15 @@ through the existing lookup, with no additional storage request. Cold branch
 enumeration reads active refs; creation does not scan retired histories.
 
 A detailed listing (`list_graph_branches_detailed` in `omnigraph-catalog`)
-derives every field from the same authority: each live ref's `BranchContents`
-(`parent_branch`, `parent_version`, `create_at`, and the creating actor under
-the metadata key `omnigraph.created_by_actor_id`), the head row of the
-branch's latest `__manifest` version and, once the branch has written a
-commit, the head row of its clone at `parent_version`. Creation records the
-actor with a second write of the new ref after the native create
-(`record_branch_creator`); retirement preserves the key. When that write
-fails, read back, the branch exists without an actor and the create reports
-uncertain completion. It reads no lineage, so its cost per
-branch is flat in history (`branch_control_cost.rs`). No path prunes a live
-branch's `__manifest` versions; a reclamation that did would have to keep each
-live branch's `parent_version`.
+derives every field from the same authority and writes nothing: each live
+ref's `BranchContents` (`parent_branch`, `parent_version`, `create_at`), the
+head row of the branch's latest `__manifest` version and, once the branch has
+written a commit, the head row of its clone at `parent_version`, the commit it
+started at (a start at a past commit clones that commit's version, so the
+same read answers it). It reads no lineage, so its cost per branch is flat in
+history (`branch_control_cost.rs`). The collector keeps each live branch's
+oldest own `__manifest` version (`retained_versions` with `keep_base`), which
+is that clone; a reclamation that dropped it would lose the start.
 
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, or pointer belongs to the same lifetime.
@@ -512,13 +539,19 @@ carried stored external reference the policy refuses fails as
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |
-| Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone |
+| Mutation, load, Blob write or merge fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob and merge writers mark the steps between, so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape; the publisher alone reports an outcome it could not read back as in doubt |
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
 | A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
 | A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
 | `commit publish` of an unpublished commit whose target head moved past its captured parent, or whose target incarnation is retired | `PreconditionFailed` naming the captured parent and the current head, or not found; the proposal stays retained until `cleanup` releases its expired tag |
 | `commit publish` or `commit drop` of a published commit id | Publish answers the established published commit; drop is a conflict |
 | A proposal tag's creation or deletion reports an ambiguous result | The tag is read back: a matching tag is success, a differing tag an integrity error, an unavailable readback `manifest_publish_in_doubt` |
+
+The `Unpublished` annotations cover the named writer envelopes and the table
+store's staged-write and detached-commit sites. Other opaque schema and maintenance
+preparation errors without completion evidence remain uncertain. A
+post-publication `RecoveryRequired` or an uncertain publication is never
+changed into definite non-publication by these annotations.
 
 An acknowledgement is returned only after the manifest commit is durable and
 visible; for a write `as commit`, after the proposal tag is durable and the

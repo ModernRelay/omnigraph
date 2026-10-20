@@ -1104,8 +1104,15 @@ pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Wr
 /// prints; a mutation's prints the affected counts.
 pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) -> Result<()> {
     match &output.outcome {
-        Some(BranchOutcomeOutput::Created { from, name }) => {
-            writeln!(writer, "created branch {name} from {from}")?;
+        Some(BranchOutcomeOutput::Created {
+            from,
+            name,
+            from_commit_id,
+        }) => {
+            writeln!(
+                writer,
+                "created branch {name} from {from} at {from_commit_id}"
+            )?;
         }
         Some(BranchOutcomeOutput::Deleted { name }) => writeln!(writer, "deleted branch {name}")?,
         Some(BranchOutcomeOutput::Merged {
@@ -1139,10 +1146,10 @@ pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) 
     Ok(())
 }
 
-/// One line per branch: its name, then with details its head, the branch and
-/// commit it was created from, the actor that created it, and its creation and
-/// last-move times. A branch without details (one the caller may not read)
-/// writes its name alone.
+/// One line per branch: its name, then with details its head, where it
+/// started, and its creation and last-move times, under the keys the JSON
+/// output uses. A branch without details (one the caller may not read) writes
+/// its name alone.
 pub(crate) fn write_branch_list_human(
     list: &BranchListOutput,
     writer: &mut dyn Write,
@@ -1153,24 +1160,14 @@ pub(crate) fn write_branch_list_human(
             writeln!(writer, "{branch}")?;
             continue;
         };
-        let fork = match (&detail.from, &detail.fork) {
-            (Some(from), Some(fork)) => format!(" from={from} fork={}", fork.graph_commit_id),
-            _ => String::new(),
-        };
-        let actor = detail
-            .actor_id
-            .as_deref()
-            .map(|actor| format!(" actor={actor}"))
-            .unwrap_or_default();
-        let created_at = detail
-            .created_at
-            .map(|created_at| format!(" created_at={created_at}"))
-            .unwrap_or_default();
-        writeln!(
-            writer,
-            "{branch} head={}{fork}{actor}{created_at} updated_at={}",
-            detail.head.graph_commit_id, detail.updated_at
-        )?;
+        let mut line = format!("{branch} head={}", detail.head.graph_commit_id);
+        if let (Some(from), Some(from_commit_id)) = (&detail.from, &detail.from_commit_id) {
+            line.push_str(&format!(" from={from} from_commit_id={from_commit_id}"));
+        }
+        if let Some(created_at) = detail.created_at {
+            line.push_str(&format!(" created_at={created_at}"));
+        }
+        writeln!(writer, "{line} updated_at={}", detail.updated_at)?;
     }
     Ok(())
 }

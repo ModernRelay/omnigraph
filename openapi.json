@@ -1047,6 +1047,196 @@
         ]
       }
     },
+    "/graphs/{graph_id}/access": {
+      "get": {
+        "tags": [
+          "access"
+        ],
+        "summary": "What the caller's own credential may do on this graph.",
+        "description": "Evaluates the graph's installed policy for the resolved actor once per\naction, with each action's branch and target branch shaped as the route\nthat performs it shapes them. It needs no graph action itself, reads no\ngraph data, and never checks whether a named branch exists.",
+        "operationId": "cluster_getAccess",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "A branch whose actions to report, by name; it need not exist.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target_branch",
+            "in": "query",
+            "description": "With `branch`, the branch `branch_create` would create and\n`branch_merge` would merge into, by name.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.13"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The actions the caller's credential may take",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An unknown or repeated parameter, a target branch without a branch, or a branch name that is not canonical; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The installed policy could not be evaluated",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/blob": {
       "get": {
         "tags": [
@@ -2713,7 +2903,7 @@
           "branches"
         ],
         "summary": "List all branches.",
-        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.\n\n`detail=true` adds `details`: for each branch the caller may `read`, its\nhead commit, the branch and commit it was created from, who created it and\nwhen, and when it last moved. Each listed branch costs a read of its latest\nversion, and of the version it was created from once it has written a\ncommit; no commit history is read.",
+        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.\n\n`detailed=true` adds `details`: for each branch the caller may `read`, its\nhead commit, the branch and commit it started from, when it was created,\nand when it last moved. Each listed branch costs a read of its latest\nversion, and of the version it was created from once it has written a\ncommit; no commit history is read.",
         "operationId": "cluster_listBranches",
         "parameters": [
           {
@@ -2726,9 +2916,9 @@
             }
           },
           {
-            "name": "detail",
+            "name": "detailed",
             "in": "query",
-            "description": "`true` adds `details`: each branch's head, the branch and commit it\nwas created from, who created it and when, and when it last moved.\nReads each listed branch's latest version, and the version it was\ncreated from once it has written a commit, never its commit history;\nthe names alone read neither.",
+            "description": "`true` adds `details`: each branch's head, the branch and commit it\nstarted from, when it was created, and when it last moved. Reads each\nlisted branch's latest version, and the version it was created from\nonce it has written a commit, never its commit history; the names\nalone read neither.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -2892,7 +3082,7 @@
           "branches"
         ],
         "summary": "Create a new branch.",
-        "description": "Forks `name` off of `from` (defaults to `main`). The new branch shares\nbacking dataset data with its parent until it is mutated. Returns 409 if `name`\nalready exists. The GQ statement `branch create` on `POST /mutate` runs\nthe same body.",
+        "description": "Forks `name` off of `from` (defaults to `main`) at its head, or starts it\nat the published graph commit `from_commit` with that commit's data and\nhistory. The receipt names the branch forked and the commit the new\nbranch starts at. The new branch shares backing dataset data with its\nparent until it is mutated. Returns 409 if `name` already exists. The GQ\nstatement `branch create` on `POST /mutate` runs the same body.",
         "operationId": "cluster_createBranch",
         "parameters": [
           {
@@ -2950,7 +3140,7 @@
             }
           },
           "400": {
-            "description": "Bad request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "description": "Bad request, or both `from` and `from_commit`; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3012,6 +3202,27 @@
               }
             }
           },
+          "404": {
+            "description": "`from` names no branch, or `from_commit` names no commit the actor may branch from",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "408": {
             "description": "Request body deadline exceeded before operation admission",
             "headers": {
@@ -3034,7 +3245,28 @@
             }
           },
           "409": {
-            "description": "Branch already exists",
+            "description": "Branch already exists, or the commit `from_commit` names cannot start a branch; see branch_start_refusal",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The commit `from_commit` names is no longer retained; see branch_start_refusal",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -8199,7 +8431,7 @@
             }
           },
           "409": {
-            "description": "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
+            "description": "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required); neither is cleared by retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -8839,7 +9071,7 @@
             }
           },
           "409": {
-            "description": "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
+            "description": "A full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required); neither is cleared by retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -9442,6 +9674,71 @@
   },
   "components": {
     "schemas": {
+      "AccessAction": {
+        "type": "string",
+        "description": "A graph action a policy decides, as the access route reports it.",
+        "enum": [
+          "read",
+          "export",
+          "change",
+          "schema_apply",
+          "branch_create",
+          "branch_delete",
+          "branch_merge",
+          "commit_publish",
+          "commit_drop",
+          "invoke_query"
+        ]
+      },
+      "AccessOutput": {
+        "type": "object",
+        "description": "What the caller's own credential may do on one graph, by the graph's\ninstalled policy. It names actions, never the rules that allow them, and\nsays nothing about any other actor.",
+        "required": [
+          "graph_id",
+          "graph_wide",
+          "actions"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessAction"
+            },
+            "description": "With `branch`, the actions allowed on it, including `branch_delete`,\n`commit_publish`, `commit_drop` and `schema_apply` with it as their\ntarget. With `target_branch` as well, also `branch_create` and\n`branch_merge` from `branch` into it. Empty without `branch`."
+          },
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The actor the credential resolves to. Absent only on a server that runs\nwithout authentication."
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch asked about, when one was."
+          },
+          "graph_id": {
+            "type": "string"
+          },
+          "graph_wide": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessAction"
+            },
+            "description": "Actions allowed with no branch named: the graph-scoped ones, and the\nbranch-scoped ones a single rule allows on every branch (a rule with no\nbranch scope, `branch_scope: any` or `target_branch_scope: any`).\nRules that cover every branch only together, one for protected\nbranches and one for the rest, allow each named branch but leave the\naction out of this list; read `actions` for a branch."
+          },
+          "target_branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The target branch asked about, when one was."
+          }
+        }
+      },
       "ApplicabilityOutput": {
         "type": "string",
         "description": "Whether a suggested source edit can be applied mechanically.",
@@ -9586,7 +9883,8 @@
         "required": [
           "uri",
           "from",
-          "name"
+          "name",
+          "from_commit_id"
         ],
         "properties": {
           "actor_id": {
@@ -9597,6 +9895,10 @@
           },
           "from": {
             "type": "string"
+          },
+          "from_commit_id": {
+            "type": "string",
+            "description": "The graph commit the new branch starts at: `from`'s head when the\nbranch was created, or the commit `from_commit` named. For a commit\nstart, `from` is the branch that wrote the commit."
           },
           "name": {
             "type": "string"
@@ -9617,7 +9919,14 @@
               "string",
               "null"
             ],
-            "description": "Parent branch to fork from. Defaults to `main`."
+            "description": "Parent branch to fork from; the new branch starts at its head.\nMutually exclusive with `from_commit`. Defaults to `main`."
+          },
+          "from_commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A published graph commit id to start the new branch at, with that\ncommit's data and history. Mutually exclusive with `from`."
           },
           "name": {
             "type": "string",
@@ -9648,50 +9957,39 @@
       },
       "BranchDetailOutput": {
         "type": "object",
-        "description": "One live branch as `GET /branches?detail=true` reports it. `from`,\n`actor_id` and `created_at` describe the branch's creation as its\n`POST /branches` receipt did. A branch deleted and created again under the\nsame name is a new lifetime: its creation and fork are the later creation's.",
+        "description": "One live branch as `GET /branches?detailed=true` reports it. `from` and\n`from_commit_id` say where the branch started, as its `POST /branches`\nreceipt did. A branch deleted and created again under the same name is a\nnew lifetime: its start and creation time are the later creation's. The\noptional fields are absent on `main`.",
         "required": [
           "name",
           "head",
           "updated_at"
         ],
         "properties": {
-          "actor_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The actor that created the branch; `null` on `main` and when the\ncreation recorded no actor."
-          },
           "created_at": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "When the branch was created, as Unix epoch microseconds recorded to\nthe second; `null` on `main`.",
+            "description": "When the branch was created, as Unix epoch microseconds recorded to\nthe second.",
             "example": 1714000000000000
-          },
-          "fork": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/CommitOutput",
-                "description": "The head of `from` when this branch was created. A later merge does\nnot move it; `GET /branches/merge-base` answers where two branches\nlast met. `null` on `main`."
-              }
-            ]
           },
           "from": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The branch this one was created from, as that branch was named then;\nit may since have been deleted or recreated. `null` on `main`."
+            "description": "The branch this one started from, as that branch was named then; it\nmay since have been deleted or recreated."
+          },
+          "from_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit the branch started at. A later merge does not move it;\n`GET /branches/merge-base` answers where two branches last met."
           },
           "head": {
             "$ref": "#/components/schemas/CommitOutput",
-            "description": "The commit a read of the branch sees: its newest commit, or `fork`\nwhile it has written none."
+            "description": "The commit a read of the branch sees: its newest commit, or the commit\nit started at while it has written none."
           },
           "name": {
             "type": "string"
@@ -9725,7 +10023,7 @@
             "items": {
               "$ref": "#/components/schemas/BranchDetailOutput"
             },
-            "description": "Present only with `detail=true`: one entry per branch the caller may\n`read`, in the order of `branches`. A branch the caller may not read is\nlisted in `branches` alone."
+            "description": "Present only with `detailed=true`: one entry per branch the caller\nmay `read`, in the order of `branches`. A branch the caller may not\nread is listed in `branches` alone."
           }
         }
       },
@@ -9842,14 +10140,18 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "`name` was forked off `from`.",
+            "description": "`name` was forked off `from` at the commit `from_commit_id`: the\nhead of `from`, or the commit a `from commit \"<id>\"` start named,\nwhich `from` wrote.",
             "required": [
               "from",
               "name",
+              "from_commit_id",
               "kind"
             ],
             "properties": {
               "from": {
+                "type": "string"
+              },
+              "from_commit_id": {
                 "type": "string"
               },
               "kind": {
@@ -9945,6 +10247,49 @@
           }
         ],
         "description": "The effect of a branch statement sent to `POST /mutate`, tagged by `kind`.\nA merge conflict has no kind: it is the 409 `POST /branches/merge` answers.\nThe statement grammar is `BranchStmt` in `omnigraph-compiler`."
+      },
+      "BranchStartRefusalOutput": {
+        "type": "object",
+        "description": "A branch create refused at the graph commit `from_commit` named; nothing\nwas created.",
+        "required": [
+          "reason",
+          "graph_commit_id"
+        ],
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `branch_deleted`, the branch that wrote the commit."
+          },
+          "graph_commit_id": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/BranchStartRefusalReason"
+          },
+          "type_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `not_retained`, the graph type whose stored version cleanup reclaimed."
+          }
+        }
+      },
+      "BranchStartRefusalReason": {
+        "type": "string",
+        "description": "Why a branch could not start at the graph commit `from_commit` named.",
+        "enum": [
+          "not_retained",
+          "schema_changed",
+          "earlier_storage_format",
+          "branch_deleted",
+          "unpublished_commit",
+          "unattached_snapshot",
+          "unknown"
+        ]
       },
       "ChangeBaselineOutput": {
         "type": "object",
@@ -10754,6 +11099,17 @@
               }
             ]
           },
+          "branch_start_refusal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BranchStartRefusalOutput",
+                "description": "Set with HTTP 409, or 410 for `not_retained`, when `branch create`\ncannot start a branch at the commit `from_commit` named."
+              }
+            ]
+          },
           "change_diff_refusal": {
             "oneOf": [
               {
@@ -10819,6 +11175,17 @@
               {
                 "$ref": "#/components/schemas/FullTextIndexRebuildRequiredOutput",
                 "description": "Set with HTTP 409 when a selected full-text index requires an explicit\nrebuild before search can succeed. Unlike a write-authority conflict,\nthis condition is not cleared by retrying. This additive discriminator\npreserves the closed [`ErrorCode`] contract."
+              }
+            ]
+          },
+          "full_text_index_required": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FullTextIndexRequiredOutput",
+                "description": "Set with HTTP 409 when a full-text call reads a declared index that\nhas no segment at the query's snapshot. Building the index clears it;\nretrying does not."
               }
             ]
           },
@@ -10948,6 +11315,19 @@
           "reason": {
             "type": "string",
             "description": "Human-readable diagnosis; branch on the enclosing detail's presence,\nnot this text, to distinguish the operator-action-required condition."
+          }
+        }
+      },
+      "FullTextIndexRequiredOutput": {
+        "type": "object",
+        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes\n--branch` elsewhere). Historical snapshots stay unchanged.",
+        "required": [
+          "index"
+        ],
+        "properties": {
+          "index": {
+            "type": "string",
+            "description": "The index's property as `Type.property`."
           }
         }
       },

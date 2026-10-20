@@ -87,6 +87,7 @@ for a deployment whose policy was written with an LLM caller in mind.
 | `query` | `graph`, `name`, optional `params`, `branch` | `POST /graphs/{graph}/queries/{name}` as a read | `invoke_query`, then `read` |
 | `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph}/query` | `read`; `change` for `explain load csv` |
 | `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph}/snapshot` | `read` |
+| `access` | `graph`, optional `branch`, `target_branch` | `GET /graphs/{graph}/access` | none |
 | `branches_list` | `graph` | `GET /graphs/{graph}/branches` | `read` |
 | `commits_list` | `graph`, optional `branch`, `limit`, `page_token` | `GET /graphs/{graph}/commits` | `read` |
 | `commits_get` | `graph`, `commit_id` | `GET /graphs/{graph}/commits/{commit_id}` | `read` |
@@ -165,8 +166,8 @@ unknown resource or graph is error `-32002`.
 ## Results and errors
 
 A successful call returns the route's JSON response body as structured content,
-plus a text copy for older clients. `health`, `graphs`, `schema`, `queries` and
-`branches_list` declare an output schema.
+plus a text copy for older clients. `health`, `graphs`, `schema`, `queries`,
+`access` and `branches_list` declare an output schema.
 
 A refused call returns `isError: true` with one of two shapes:
 

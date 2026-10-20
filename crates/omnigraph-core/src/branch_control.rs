@@ -789,52 +789,6 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// After the native create, before the creating actor is recorded on the
-    /// new ref. The branch exists and lists with no actor; the create reports
-    /// uncertain completion.
-    pub static BRANCH_CREATE_PRE_CREATOR = ("branch_create.pre_creator", BranchCreate, [Fail]);
-}
-
-/// The ref metadata key holding the actor that created a native manifest
-/// branch. Absent on a ref created without a known actor or before the key
-/// existed; retirement preserves it.
-const BRANCH_CREATOR_KEY: &str = "omnigraph.created_by_actor_id";
-
-/// The actor recorded as the creator of a native manifest branch.
-pub fn branch_creator(contents: &BranchContents) -> Option<&str> {
-    contents
-        .metadata
-        .get(BRANCH_CREATOR_KEY)
-        .map(String::as_str)
-}
-
-/// Record `actor` as the creator of `branch`, a ref this caller has just
-/// created under its branch gate and so carries no other metadata yet. Lance
-/// writes the whole ref again; a concurrent reader's torn read of it is
-/// reread at the bounded ref-read boundary. A failed write is read back, so a
-/// lost acknowledgement counts as recorded.
-pub async fn record_branch_creator(dataset: &Dataset, branch: &str, actor: &str) -> Result<()> {
-    let written = match fail(&BRANCH_CREATE_PRE_CREATOR) {
-        Ok(()) => dataset
-            .branches()
-            .replace_metadata(
-                branch,
-                HashMap::from([(BRANCH_CREATOR_KEY.to_string(), actor.to_string())]),
-            )
-            .await
-            .map_err(OmniError::storage),
-        Err(error) => Err(error),
-    };
-    let Err(error) = written else {
-        return Ok(());
-    };
-    match get_branch_contents(dataset, branch).await {
-        Ok(contents) if branch_creator(&contents) == Some(actor) => Ok(()),
-        _ => Err(error),
-    }
-}
-
-decide_seam! {
     /// After the namespace inventory (refs listed, path collision checked,
     /// a ref-less tree reclaimed), before the native create. No CAS covers
     /// this window: the caller's exclusive schema permit is what keeps a

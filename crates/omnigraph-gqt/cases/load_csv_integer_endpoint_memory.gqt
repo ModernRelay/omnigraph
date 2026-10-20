@@ -1,0 +1,83 @@
+# issue: none
+# notes: An integer-keyed edge load is admitted against `query_memory_bytes` for its source, batches,
+# notes: both key sets with their build buffers and the staged rows: 26,316 bytes at the 8-key shape's last
+# notes: step, 25,220 before it. 25 KiB refuses and keeps the edge, 32 KiB replaces it, header-only still refuses.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person { id: I64 @key }
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 1
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+
+--- csv original.csv
+from,to
+0,1
+
+--- mutate
+load csv "original.csv" into edge:Knows mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:Knows from Person: access scan
+load validate edge_ri edge:Knows to Person: access scan
+load executed: partitions 1 rows 1
+
+--- csv replacement.csv
+from,to
+0,7
+
+--- mutate
+set query_memory_bytes = 25600;
+load csv "replacement.csv" into edge:Knows mode overwrite header
+--- expect error: query_memory_bytes
+
+--- query
+query unchanged() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": 0, "b.id": 1}
+--- expect shape
+a.id: I64
+b.id: I64
+
+--- mutate
+set query_memory_bytes = 32768;
+load csv "replacement.csv" into edge:Knows mode overwrite header
+--- expect ok
+
+--- query
+query replaced() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": 0, "b.id": 7}
+--- expect shape
+a.id: I64
+b.id: I64
+
+--- csv empty.csv
+from,to
+
+--- mutate
+set query_memory_bytes = 25600;
+load csv "empty.csv" into edge:Knows mode overwrite header
+--- expect error: the source holds no records
+
+--- query
+query empty_refusal_preserves_edges() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n": 1}
+--- expect shape
+n: I64

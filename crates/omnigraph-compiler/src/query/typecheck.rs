@@ -436,6 +436,31 @@ impl TypedExpr {
         }
     }
 
+    /// The bindings a leading ranking key ranks: the variable of `nearest`
+    /// or `bm25`, and both arms' variables (once each) for `rrf()`. Empty for
+    /// any other key.
+    pub(crate) fn ranked_variables(&self) -> Vec<&str> {
+        match self {
+            Self::Nearest { variable, .. } => vec![variable.as_str()],
+            Self::Bm25 { field, .. } => match field.as_ref() {
+                Self::PropAccess { variable, .. } => vec![variable.as_str()],
+                _ => Vec::new(),
+            },
+            Self::Rrf {
+                primary, secondary, ..
+            } => {
+                let mut variables = primary.ranked_variables();
+                for variable in secondary.ranked_variables() {
+                    if !variables.contains(&variable) {
+                        variables.push(variable);
+                    }
+                }
+                variables
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// The variable a `search`, `fuzzy` or `match_text` call reads, anywhere
     /// in the expression.
     pub(crate) fn text_search_subject(&self) -> Option<&str> {
@@ -912,6 +937,10 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
         });
     }
 
+    if let (Some(leading), Some(source)) = (orders.first(), query.order_clause.first()) {
+        refuse_rrf_over_one_component(&leading.expr, &source.expr, &clauses)?;
+    }
+
     let has_standalone_nearest = query
         .order_clause
         .iter()
@@ -976,6 +1005,53 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
         orders,
         limit: query.limit,
     })
+}
+
+/// T59: a leading `rrf()` whose arms rank two bindings one traversal
+/// connects. The ranked binding roots its component's scan, and one scan
+/// cannot start at both.
+fn refuse_rrf_over_one_component(
+    leading: &TypedExpr,
+    source: &Expr,
+    clauses: &[CheckedClause],
+) -> Result<()> {
+    let TypedExpr::Rrf { .. } = leading else {
+        return Ok(());
+    };
+    let [first, second] = leading.ranked_variables()[..] else {
+        return Ok(());
+    };
+    let mut adjacent: HashMap<&str, Vec<&str>> = HashMap::new();
+    for clause in clauses {
+        if let CheckedClause::Traversal(traversal) = clause {
+            let (src, dst) = (traversal.src.as_str(), traversal.dst.as_str());
+            if src != "_" && dst != "_" {
+                adjacent.entry(src).or_default().push(dst);
+                adjacent.entry(dst).or_default().push(src);
+            }
+        }
+    }
+    let mut reached = HashSet::from([first]);
+    let mut frontier = vec![first];
+    while let Some(var) = frontier.pop() {
+        for &next in adjacent.get(var).into_iter().flatten() {
+            if reached.insert(next) {
+                frontier.push(next);
+            }
+        }
+    }
+    if !reached.contains(second) {
+        return Ok(());
+    }
+    Err(CompilerError::query(
+        QueryDiagnostic::typecheck(
+            T59,
+            format!(
+                "`rrf()` ranks `${first}` and `${second}`, which one traversal connects; a ranking starts the traversal at the binding it ranks, and one traversal cannot start at both"
+            ),
+        )
+        .with_expression(source.to_string()),
+    ))
 }
 
 /// T42 (RFC 2026-09-24-shared-expression-model, "Order keys bind against the
@@ -2794,6 +2870,55 @@ fn reject_edge_binding_search_field(ctx: &TypeContext, field: &Expr, func: &str)
     Ok(())
 }
 
+/// T27: a full-text call reads the full-text index of the node property it
+/// names, which the schema declares with a one-column `@index` (or `@key`)
+/// on a free-text String property
+/// ([`crate::catalog::NodeType::has_full_text_index`]). The check reads the
+/// schema only, never physical index state; without the declaration the
+/// substrate would scan with a bare, case-sensitive tokenizer. A field that
+/// is not a String property keeps its operand type error (T19, T20).
+fn require_full_text_index(
+    catalog: &Catalog,
+    ctx: &TypeContext,
+    field: &Expr,
+    func: &str,
+) -> Result<()> {
+    let Expr::PropAccess { variable, property } = field else {
+        return Ok(());
+    };
+    let Some(BoundVariable::Node { type_name }) = ctx.bindings.get(variable) else {
+        return Ok(());
+    };
+    let Some(node_type) = catalog.node_types.get(type_name) else {
+        return Ok(());
+    };
+    let Some(prop) = node_type.properties.get(property) else {
+        return Ok(());
+    };
+    if prop.scalar != ScalarType::String || prop.list || node_type.has_full_text_index(property) {
+        return Ok(());
+    }
+    let fix = if prop.is_enum() {
+        format!(
+            "`{type_name}.{property}` is an enum, which takes no full-text index; match its values with `${variable}.{property} = \"<value>\"`"
+        )
+    } else {
+        format!(
+            "declare `{property}: String @index` on `{type_name}`; every write then carries the index's analyzer"
+        )
+    };
+    Err(CompilerError::query(
+        QueryDiagnostic::typecheck(
+            T27,
+            format!(
+                "`{func}` over `${variable}.{property}` needs a full-text index, and `{type_name}.{property}` declares none"
+            ),
+        )
+        .with_expression(format!("${variable}.{property}"))
+        .with_fix(fix),
+    ))
+}
+
 /// A catalogue type has no index: text and rank search over its rows is
 /// refused at the check, before any storage planning. Scalar predicates,
 /// projection, aggregation, ordering and joins stay available.
@@ -3082,6 +3207,7 @@ fn resolve_expr(
         }
         Expr::Search { field, query } => {
             reject_edge_binding_search_field(ctx, field, "search")?;
+            require_full_text_index(catalog, ctx, field, "search")?;
             let field = resolve_expr(catalog, field, ctx, params, scope)?;
             match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
@@ -3128,6 +3254,7 @@ fn resolve_expr(
             max_edits,
         } => {
             reject_edge_binding_search_field(ctx, field, "fuzzy")?;
+            require_full_text_index(catalog, ctx, field, "fuzzy")?;
             let field = resolve_expr(catalog, field, ctx, params, scope)?;
             match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
@@ -3203,6 +3330,7 @@ fn resolve_expr(
         }
         Expr::MatchText { field, query } => {
             reject_edge_binding_search_field(ctx, field, "match_text")?;
+            require_full_text_index(catalog, ctx, field, "match_text")?;
             let field = resolve_expr(catalog, field, ctx, params, scope)?;
             match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
@@ -3245,6 +3373,7 @@ fn resolve_expr(
         }
         Expr::Bm25 { field, query } => {
             reject_edge_binding_search_field(ctx, field, "bm25")?;
+            require_full_text_index(catalog, ctx, field, "bm25")?;
             let field = resolve_expr(catalog, field, ctx, params, scope)?;
             match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}

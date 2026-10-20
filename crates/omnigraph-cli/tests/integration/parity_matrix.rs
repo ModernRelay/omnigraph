@@ -304,8 +304,8 @@ fn parity_branch_list() {
     let p = parity();
     let (l, r) = p.run(&["branch", "list", "--json"]);
     assert_parity("branch list", &l, &r);
-    let (l, r) = p.run(&["branch", "list", "--detail", "--json"]);
-    assert_parity("branch list --detail", &l, &r);
+    let (l, r) = p.run(&["branch", "list", "--detailed", "--json"]);
+    assert_parity("branch list --detailed", &l, &r);
     assert!(
         parse_stdout_json(&l)["details"][0]["head"]["graph_commit_id"].is_string(),
         "{}",
@@ -327,6 +327,43 @@ fn parity_commit_list_branch() {
     let p = parity();
     let (l, r) = p.run(&["commit", "list", "--branch", "main", "--json"]);
     assert_parity("commit list --branch", &l, &r);
+}
+
+#[test]
+fn parity_branch_create_at_a_commit() {
+    // The twins share their history, so one commit id names the same commit
+    // on both arms: the embedded arm starts the branch in the engine, the
+    // remote arm through `from_commit` on `POST /branches`.
+    let p = parity();
+    let (listed, _) = p.run(&["commit", "list", "--branch", "main", "--json"]);
+    let head = parse_stdout_json(&listed)["commits"][0]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (l, r) = p.run(&[
+        "branch",
+        "create",
+        "--from-commit",
+        &head,
+        "at-head",
+        "--json",
+    ]);
+    assert_parity("branch create at a commit", &l, &r);
+    for (arm, output) in [("local", &l), ("remote", &r)] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["from"], "main", "{arm}");
+        assert_eq!(payload["from_commit_id"], head, "{arm}");
+    }
+    let (l, r) = p.run(&[
+        "branch",
+        "create",
+        "--from-commit",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "nowhere",
+        "--json",
+    ]);
+    assert_parity("branch create at an unknown commit", &l, &r);
+    assert!(!l.status.success(), "{l:?}");
 }
 
 #[test]

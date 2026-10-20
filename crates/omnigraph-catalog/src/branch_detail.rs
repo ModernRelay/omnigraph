@@ -1,7 +1,7 @@
 //! What a detailed branch listing reports about each live graph branch: its
-//! head, the branch and commit its current lifetime was created from, and when
-//! and by whom that lifetime was created. Every fact is read from the branch
-//! refs and each branch's own `__manifest`; nothing is stored for the listing.
+//! head, the branch and commit its current lifetime started from, and when
+//! that lifetime was created. Every fact is read from the branch refs and each
+//! branch's own `__manifest`; nothing is stored for the listing.
 
 use std::sync::Arc;
 
@@ -73,12 +73,9 @@ pub struct GraphBranchDetail {
     /// as that branch was named then; it may since have been deleted or
     /// recreated. `None` on main.
     pub from: Option<String>,
-    /// The head of `from` at the `__manifest` version the lifetime was
-    /// created from; `None` on main.
-    pub fork: Option<GraphLineageRow>,
-    /// The actor recorded on the lifetime's native ref as its creator; `None`
-    /// on main and when no actor was recorded.
-    pub actor_id: Option<String>,
+    /// The head commit of the `__manifest` version the lifetime was created
+    /// from: the commit it started at. `None` on main.
+    pub from_commit_id: Option<String>,
     /// `BranchContents::create_at` of the lifetime's native ref, in Unix
     /// seconds; `None` on main.
     pub created_at_seconds: Option<u64>,
@@ -109,8 +106,7 @@ pub async fn list_graph_branches_detailed(
             head_is_own: exact_head(&head, None).is_some(),
             head,
             from: None,
-            fork: None,
-            actor_id: None,
+            from_commit_id: None,
             created_at_seconds: None,
         });
     }
@@ -143,8 +139,7 @@ async fn branch_detail(
         contents,
     } = branch;
     match read_branch(root, main, legacy, &native, &contents).await {
-        Ok((head, fork_commit)) => {
-            let head_is_own = exact_head(&head, Some(&native)).is_some();
+        Ok((head, head_is_own, from_commit_id)) => {
             let from = contents
                 .parent_branch
                 .as_deref()
@@ -154,10 +149,9 @@ async fn branch_detail(
             Ok(Some(GraphBranchDetail {
                 name: logical,
                 from: Some(from),
-                fork: Some(fork_commit.unwrap_or_else(|| head.clone())),
+                from_commit_id: Some(from_commit_id),
                 head,
                 head_is_own,
-                actor_id: crate::branch_control::branch_creator(&contents).map(str::to_string),
                 created_at_seconds: Some(contents.create_at),
             }))
         }
@@ -171,30 +165,33 @@ async fn branch_detail(
     }
 }
 
-/// The latest head of the lifetime `native` and, when the lifetime wrote it,
-/// the head at the version the lifetime was created from.
+/// The latest head of the lifetime `native`, whether the lifetime wrote it,
+/// and the commit the lifetime started at: the head of the version it was
+/// created from, which is still its head while it has written none.
 async fn read_branch(
     root: &str,
     main: &Dataset,
     legacy: &ExtentCache,
     native: &str,
     contents: &BranchContents,
-) -> Result<(GraphLineageRow, Option<GraphLineageRow>)> {
+) -> Result<(GraphLineageRow, bool, String)> {
     let branch = main
         .checkout_branch(native)
         .await
         .map_err(OmniError::storage)?;
     let head = read_manifest_rows_projected(&branch).await?.head;
     if exact_head(&head, Some(native)).is_none() {
-        return Ok((head, None));
+        let started_at = head.graph_commit_id.clone();
+        return Ok((head, false, started_at));
     }
     let created = branch
         .checkout_version(contents.parent_version)
         .await
         .map_err(OmniError::storage)?;
-    let fork = match crate::legacy::at_version(root, &created.session(), legacy, &created).await? {
-        None => read_manifest_rows_projected(&created).await?.head,
-        Some(at) => at.served(Some(native), contents.parent_version)?.commit,
-    };
-    Ok((head, Some(fork)))
+    let started_at =
+        match crate::legacy::at_version(root, &created.session(), legacy, &created).await? {
+            None => read_manifest_rows_projected(&created).await?.head,
+            Some(at) => at.served(Some(native), contents.parent_version)?.commit,
+        };
+    Ok((head, true, started_at.graph_commit_id))
 }

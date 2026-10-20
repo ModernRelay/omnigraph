@@ -48,6 +48,7 @@ codes! {
     T23 = "a node or edge binding is used in an incompatible role";
     T24 = "a Blob property is not a read value";
     T25 = "two projections produce the same result column";
+    T27 = "a full-text call needs a full-text index on its property";
     T32 = "a retrieval cannot sit under an aggregate";
     T33 = "a projected rank must repeat the executed retrieval";
     T35 = "a search predicate cannot be projected";
@@ -73,13 +74,13 @@ codes! {
     T56 = "distinct does not apply to an aggregated return";
     T57 = "distinct applies only to count";
     T58 = "a Boolean return item compares aggregates with constants only";
+    T59 = "an rrf() ranks two bindings one traversal connects";
 
-    // Planner.
-    P001 = "a ranking orders a binding a traversal reaches";
+    // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
+    // the binding it ranks, and `rrf()` arms one traversal connects are T59.
     P002 = "an edge alternation or wildcard traversal needs a finite traversal work limit";
     P003 = "the traversal work limit is out of range or recorded twice";
     P004 = "an edge alternation or wildcard traversal cannot run in CSR traversal mode";
-    P005 = "an rrf() ranks two bindings one traversal connects";
 }
 
 #[cfg(test)]

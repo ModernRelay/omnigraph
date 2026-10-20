@@ -521,8 +521,8 @@ async fn assert_converted(source: &Source) {
         let dataset = open(root, Some(branch)).await.unwrap();
         assert_eq!(dataset.version().version, version, "{branch}");
     }
-    // A detailed listing serves each converted branch's fork from the legacy
-    // history: `feature` wrote its own head, so its fork is read at the
+    // A detailed listing serves each converted branch's start from the legacy
+    // history: `feature` wrote its own head, so its start is read at the
     // pre-upgrade version it was created from; `child` was forked from the
     // retired `gone`.
     let listing = crate::db::manifest::list_graph_branches_detailed(
@@ -539,10 +539,7 @@ async fn assert_converted(source: &Source) {
             (
                 detail.name.as_str(),
                 detail.from.as_deref(),
-                detail
-                    .fork
-                    .as_ref()
-                    .map(|fork| fork.graph_commit_id.clone()),
+                detail.from_commit_id.clone(),
                 detail.head.graph_commit_id.clone(),
             )
         })
@@ -1531,6 +1528,148 @@ async fn a_staged_schema_object_at_the_root_refuses_before_the_contract_is_read(
         assert_eq!(stored_files(source.dir.path()), before);
         assert_eq!(manifest_version(&source.root).await, 4);
         std::fs::remove_file(source.dir.path().join(&staging)).unwrap();
+    }
+}
+
+/// Accepted bounds keep their recorded representation and endpoint meaning.
+/// Ordinary open and the old-root upgrade validate through the same matcher.
+#[tokio::test]
+async fn accepted_range_contracts_keep_their_complete_historical_shape() {
+    use crate::db::schema_state::{render_schema_contract, validate_schema_contract_row};
+    use ConstraintBound::{Float, Integer};
+    use omnigraph_compiler::schema::ast::{Constraint, ConstraintBound, SchemaDecl};
+    use omnigraph_compiler::schema::parser::parse_schema;
+    use omnigraph_compiler::{SchemaIdentityDomain, compile_schema_shape, initialize_schema_ir};
+
+    let source = |value: &str, other: &str| {
+        format!(
+            "node Counter {{ value: U64? other: I64? \
+             @range(value, {value}) @range(other, {other}) }}"
+        )
+    };
+    // Build the accepted bounds as typed values, independently of either
+    // parser interpretation. The stored Float is exactly what overflow kept.
+    let lower = |value| (Some(value), None);
+    let upper = |value| (None, Some(value));
+    for (label, text, bounds, valid) in [
+        (
+            "historical upper-only and overflowing integer",
+            source("..9223372036854775808", "..10"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            true,
+        ),
+        (
+            "historical negative overflow",
+            source("-9223372036854775809..", "..10"),
+            [
+                lower(Float(-9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            true,
+        ),
+        (
+            "current upper-only",
+            source("..9223372036854775807", "..10"),
+            [upper(Integer(i64::MAX)), upper(Integer(10))],
+            true,
+        ),
+        (
+            "hybrid endpoint interpretation",
+            source("..9223372036854775808", "..10"),
+            [
+                upper(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            false,
+        ),
+        (
+            "unrelated bound drift",
+            source("..9223372036854775808", "..10"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(11)),
+            ],
+            false,
+        ),
+        (
+            "unrelated property drift",
+            source("..9223372036854775808", "..10").replace("value: U64", "value: U32"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            false,
+        ),
+        (
+            "malformed range",
+            source("..", "..10"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            false,
+        ),
+    ] {
+        let mut schema = parse_schema("node Counter { value: U64? other: I64? }").unwrap();
+        let SchemaDecl::Node(node) = &mut schema.declarations[0] else {
+            unreachable!();
+        };
+        node.constraints = ["value", "other"]
+            .into_iter()
+            .zip(bounds)
+            .map(|(property, (min, max))| Constraint::Range {
+                property: property.into(),
+                min,
+                max,
+            })
+            .collect();
+        node.source_constraints = node.constraints.clone();
+        let shape = compile_schema_shape(&schema).unwrap();
+        let domain = SchemaIdentityDomain::from_ulid(ulid::Ulid::from(77u128));
+        let ir = initialize_schema_ir(domain, &shape).unwrap().schema_ir;
+        let contract = render_schema_contract(&ir, &text).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ObjectStorageAdapter::local();
+        let root = dir.path().to_str().unwrap();
+        for damage in ["none", "hash", "domain"] {
+            let mut row = contract.clone();
+            match damage {
+                "hash" => row.head.schema_ir_hash = format!("sha256:{}", "a".repeat(64)),
+                "domain" => {
+                    row.head.schema_identity_domain =
+                        SchemaIdentityDomain::from_ulid(ulid::Ulid::from(78u128))
+                            .as_str()
+                            .to_string();
+                }
+                _ => {}
+            }
+            write_root_schema(dir.path(), &row);
+            let before = root_objects(dir.path());
+            let opened = validate_schema_contract_row(&row);
+            let upgraded = root_schema::load_validated_schema_contract(
+                root,
+                &storage,
+                Bounds::SERVED.root_object_bytes,
+            )
+            .await;
+            let accepted = valid && damage == "none";
+            assert_eq!(opened.is_ok(), accepted, "{label}, {damage}: {opened:?}");
+            assert_eq!(
+                upgraded.is_ok(),
+                accepted,
+                "{label}, {damage}: {upgraded:?}"
+            );
+            if accepted {
+                assert_eq!(opened.unwrap().0, ir, "{label}");
+                let loaded = upgraded.unwrap();
+                assert_eq!(loaded.ir, ir, "{label}");
+                assert_eq!(loaded.row, contract, "{label}");
+            }
+            assert_eq!(root_objects(dir.path()), before, "{label}, {damage}");
+        }
     }
 }
 
@@ -2965,6 +3104,64 @@ async fn commit_list_and_change_feed_cross_the_upgrade() {
             .collect();
         assert_eq!(blocks, expected, "{branch:?}");
     }
+}
+
+/// A commit written before the storage upgrade starts no branch: its
+/// `__manifest` version is in the earlier format, which only the legacy
+/// history reads, so the start is refused before any effect. A commit
+/// written after the upgrade starts one.
+#[tokio::test]
+async fn branch_start_refuses_a_commit_written_before_the_upgrade() {
+    use crate::db::{ReadTarget, SnapshotId};
+    use crate::error::{BranchStartRefusal, CompletionEvidence};
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let source = engine_source().await;
+    assert_eq!(
+        execute(&source.root).await.outcome,
+        UpgradeOutcome::Completed
+    );
+    let graph = Arc::new(Omnigraph::open(&source.root).await.unwrap());
+    insert(&graph, "main", "d").await;
+    let branches = graph.branch_list().await.unwrap();
+    let main_version = version_of(&source.root, None).await;
+    for commit in [id(1), id(2), id(3), id(4)] {
+        let refused = graph
+            .branch_create_from(ReadTarget::snapshot(SnapshotId::new(commit.clone())), "old")
+            .await
+            .expect_err("a pre-upgrade commit starts no branch");
+        assert_eq!(
+            refused.completion_evidence(),
+            Some(CompletionEvidence::BeforeEffect),
+            "{refused}"
+        );
+        let refused = refused.into_completion_evidence().0;
+        assert!(
+            matches!(
+                &refused,
+                OmniError::BranchStartRefused {
+                    reason: BranchStartRefusal::EarlierStorageFormat,
+                    graph_commit_id,
+                } if *graph_commit_id == commit
+            ),
+            "{commit}: {refused:?}"
+        );
+    }
+    assert_eq!(graph.branch_list().await.unwrap(), branches);
+    assert_eq!(version_of(&source.root, None).await, main_version);
+
+    let newest = graph.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let created = graph
+        .branch_create_from(ReadTarget::snapshot(SnapshotId::new(newest.clone())), "new")
+        .await
+        .unwrap();
+    assert_eq!(
+        (created.from.as_str(), created.from_commit_id.as_str()),
+        ("main", newest.as_str())
+    );
+    assert_eq!(names(&graph, "new").await, ["a", "c", "d"]);
 }
 
 /// Publish a lineage-only commit on `branch` of `root` under the release

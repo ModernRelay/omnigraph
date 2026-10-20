@@ -9,7 +9,6 @@ omnigraph_seams::catalog! {
     crate::blob::BLOB_READ_POST_CAPTURE,
     crate::branch_control::BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE,
     crate::branch_control::BRANCH_CREATE_POST_NATIVE,
-    crate::branch_control::BRANCH_CREATE_PRE_CREATOR,
     crate::branch_control::BRANCH_DELETE_POST_NATIVE,
     crate::branch_control::BRANCH_DELETE_POST_ARCHIVE,
     crate::changes::enumerate::CHANGE_FEED_POST_HEAD_WITNESS,
@@ -88,6 +87,7 @@ omnigraph_seams::catalog! {
     crate::db::omnigraph::collector::CLEANUP_SWEEP_PRE_MANIFEST_DELETE,
     crate::db::omnigraph::collector::CLEANUP_SWEEP_BETWEEN_MANIFESTS,
     crate::db::omnigraph::collector::CLEANUP_SWEEP_PRE_FILE_DELETE,
+    crate::db::omnigraph::collector::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE,
 }
 
 /// The one string-keyed lookup: a case file or the harness names a seam, the catalog answers.

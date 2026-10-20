@@ -390,14 +390,14 @@ impl BranchRead {
     }
 }
 
-/// A control write: `branch create <name> [from <parent>]`,
+/// A control write: `branch create <name> [from <parent> | from commit "<id>"]`,
 /// `branch delete <name>`, or `branch merge <source> [into <target>] [as commit]`.
 /// `from` and `into` are `None` when unspelled; no default is filled here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchWrite {
     Create {
         name: String,
-        from: Option<String>,
+        from: Option<BranchCreateFrom>,
     },
     Delete {
         name: String,
@@ -408,6 +408,16 @@ pub enum BranchWrite {
         /// `as commit`: the merge result is an unpublished commit.
         as_commit: bool,
     },
+}
+
+/// Where `branch create` starts the new branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchCreateFrom {
+    /// `from <parent>`: the new branch starts at the parent's head.
+    Branch(String),
+    /// `from commit "<id>"`: the new branch starts at that published graph
+    /// commit.
+    Commit(String),
 }
 
 impl BranchWrite {

@@ -390,8 +390,13 @@ pub struct SnapshotOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchCreateRequest {
-    /// Parent branch to fork from. Defaults to `main`.
+    /// Parent branch to fork from; the new branch starts at its head.
+    /// Mutually exclusive with `from_commit`. Defaults to `main`.
     pub from: Option<String>,
+    /// A published graph commit id to start the new branch at, with that
+    /// commit's data and history. Mutually exclusive with `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit: Option<String>,
     /// Name of the new branch. Must not already exist.
     pub name: String,
 }
@@ -402,6 +407,10 @@ pub struct BranchCreateOutput {
     pub from: String,
     pub name: String,
     pub actor_id: Option<String>,
+    /// The graph commit the new branch starts at: `from`'s head when the
+    /// branch was created, or the commit `from_commit` named. For a commit
+    /// start, `from` is the branch that wrote the commit.
+    pub from_commit_id: String,
 }
 
 /// Query parameters for listing branches.
@@ -409,47 +418,47 @@ pub struct BranchCreateOutput {
 #[into_params(parameter_in = Query)]
 pub struct BranchListQuery {
     /// `true` adds `details`: each branch's head, the branch and commit it
-    /// was created from, who created it and when, and when it last moved.
-    /// Reads each listed branch's latest version, and the version it was
-    /// created from once it has written a commit, never its commit history;
-    /// the names alone read neither.
+    /// started from, when it was created, and when it last moved. Reads each
+    /// listed branch's latest version, and the version it was created from
+    /// once it has written a commit, never its commit history; the names
+    /// alone read neither.
     #[serde(default)]
-    pub detail: bool,
+    pub detailed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchListOutput {
     /// Every live branch, sorted by name in byte order.
     pub branches: Vec<String>,
-    /// Present only with `detail=true`: one entry per branch the caller may
-    /// `read`, in the order of `branches`. A branch the caller may not read is
-    /// listed in `branches` alone.
+    /// Present only with `detailed=true`: one entry per branch the caller
+    /// may `read`, in the order of `branches`. A branch the caller may not
+    /// read is listed in `branches` alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Vec<BranchDetailOutput>>,
 }
 
-/// One live branch as `GET /branches?detail=true` reports it. `from`,
-/// `actor_id` and `created_at` describe the branch's creation as its
-/// `POST /branches` receipt did. A branch deleted and created again under the
-/// same name is a new lifetime: its creation and fork are the later creation's.
+/// One live branch as `GET /branches?detailed=true` reports it. `from` and
+/// `from_commit_id` say where the branch started, as its `POST /branches`
+/// receipt did. A branch deleted and created again under the same name is a
+/// new lifetime: its start and creation time are the later creation's. The
+/// optional fields are absent on `main`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchDetailOutput {
     pub name: String,
-    /// The commit a read of the branch sees: its newest commit, or `fork`
-    /// while it has written none.
+    /// The commit a read of the branch sees: its newest commit, or the commit
+    /// it started at while it has written none.
     pub head: CommitOutput,
-    /// The branch this one was created from, as that branch was named then;
-    /// it may since have been deleted or recreated. `null` on `main`.
+    /// The branch this one started from, as that branch was named then; it
+    /// may since have been deleted or recreated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    /// The head of `from` when this branch was created. A later merge does
-    /// not move it; `GET /branches/merge-base` answers where two branches
-    /// last met. `null` on `main`.
-    pub fork: Option<CommitOutput>,
-    /// The actor that created the branch; `null` on `main` and when the
-    /// creation recorded no actor.
-    pub actor_id: Option<String>,
+    /// The commit the branch started at. A later merge does not move it;
+    /// `GET /branches/merge-base` answers where two branches last met.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit_id: Option<String>,
     /// When the branch was created, as Unix epoch microseconds recorded to
-    /// the second; `null` on `main`.
+    /// the second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = 1714000000000000i64)]
     pub created_at: Option<i64>,
     /// When the head last moved, as Unix epoch microseconds: the time of the
@@ -661,8 +670,14 @@ pub struct ReadPageOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BranchOutcomeOutput {
-    /// `name` was forked off `from`.
-    Created { from: String, name: String },
+    /// `name` was forked off `from` at the commit `from_commit_id`: the
+    /// head of `from`, or the commit a `from commit "<id>"` start named,
+    /// which `from` wrote.
+    Created {
+        from: String,
+        name: String,
+        from_commit_id: String,
+    },
     /// `name` was removed.
     Deleted { name: String },
     /// `source` was merged into `target`; `merge` is the three-way result,
@@ -1874,6 +1889,61 @@ pub struct SnapshotQuery {
     pub branch: Option<String>,
 }
 
+/// Query parameters for `GET /graphs/{graph_id}/access`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct AccessQuery {
+    /// A branch whose actions to report, by name; it need not exist.
+    pub branch: Option<String>,
+    /// With `branch`, the branch `branch_create` would create and
+    /// `branch_merge` would merge into, by name.
+    pub target_branch: Option<String>,
+}
+
+/// A graph action a policy decides, as the access route reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessAction {
+    Read,
+    Export,
+    Change,
+    SchemaApply,
+    BranchCreate,
+    BranchDelete,
+    BranchMerge,
+    CommitPublish,
+    CommitDrop,
+    InvokeQuery,
+}
+
+/// What the caller's own credential may do on one graph, by the graph's
+/// installed policy. It names actions, never the rules that allow them, and
+/// says nothing about any other actor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AccessOutput {
+    /// The actor the credential resolves to. Absent only on a server that runs
+    /// without authentication.
+    pub actor: Option<String>,
+    pub graph_id: String,
+    /// Actions allowed with no branch named: the graph-scoped ones, and the
+    /// branch-scoped ones a single rule allows on every branch (a rule with no
+    /// branch scope, `branch_scope: any` or `target_branch_scope: any`).
+    /// Rules that cover every branch only together, one for protected
+    /// branches and one for the rest, allow each named branch but leave the
+    /// action out of this list; read `actions` for a branch.
+    pub graph_wide: Vec<AccessAction>,
+    /// The branch asked about, when one was.
+    pub branch: Option<String>,
+    /// The target branch asked about, when one was.
+    pub target_branch: Option<String>,
+    /// With `branch`, the actions allowed on it, including `branch_delete`,
+    /// `commit_publish`, `commit_drop` and `schema_apply` with it as their
+    /// target. With `target_branch` as well, also `branch_create` and
+    /// `branch_merge` from `branch` into it. Empty without `branch`.
+    pub actions: Vec<AccessAction>,
+}
+
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct CommitListQuery {
     pub branch: Option<String>,
@@ -2100,6 +2170,42 @@ pub struct ChangeDiffRefusalOutput {
     pub type_name: Option<String>,
 }
 
+/// Why a branch could not start at the graph commit `from_commit` named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchStartRefusalReason {
+    /// HTTP 410: cleanup reclaimed data the commit's snapshot names.
+    NotRetained,
+    /// HTTP 409: the commit was written under an earlier schema.
+    SchemaChanged,
+    /// HTTP 409: the commit was written before the storage upgrade.
+    EarlierStorageFormat,
+    /// HTTP 409: the branch that wrote the commit was deleted, and may have
+    /// been created again under the same name since.
+    BranchDeleted,
+    /// HTTP 409: the commit is unpublished; publish it first.
+    UnpublishedCommit,
+    /// HTTP 409: the commit is an unattached snapshot, never branch history.
+    UnattachedSnapshot,
+    /// A reason added by a newer server; the branch was not created.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A branch create refused at the graph commit `from_commit` named; nothing
+/// was created.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BranchStartRefusalOutput {
+    pub reason: BranchStartRefusalReason,
+    pub graph_commit_id: String,
+    /// For `not_retained`, the graph type whose stored version cleanup reclaimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    /// For `branch_deleted`, the branch that wrote the commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
 /// A selected full-text index cannot safely serve the current analyzer (HTTP 409).
 /// This is not a retryable write conflict: an operator must rebuild the live
 /// branch's indexes. Historical snapshots stay unchanged; branch old content
@@ -2110,6 +2216,17 @@ pub struct FullTextIndexRebuildRequiredOutput {
     /// Human-readable diagnosis; branch on the enclosing detail's presence,
     /// not this text, to distinguish the operator-action-required condition.
     pub reason: String,
+}
+
+/// A full-text call read a declared full-text index that has no segment at
+/// the query's snapshot (HTTP 409), so no segment carries its analyzer. This
+/// is not a retryable conflict: an operator builds the branch's index
+/// (`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes
+/// --branch` elsewhere). Historical snapshots stay unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FullTextIndexRequiredOutput {
+    /// The index's property as `Type.property`.
+    pub index: String,
 }
 
 /// A source position: 1-based line and column (in characters) and the byte
@@ -2265,12 +2382,21 @@ pub struct ErrorOutput {
     /// commit or an unprovable schema boundary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
+    /// Set with HTTP 409, or 410 for `not_retained`, when `branch create`
+    /// cannot start a branch at the commit `from_commit` named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_start_refusal: Option<BranchStartRefusalOutput>,
     /// Set with HTTP 409 when a selected full-text index requires an explicit
     /// rebuild before search can succeed. Unlike a write-authority conflict,
     /// this condition is not cleared by retrying. This additive discriminator
     /// preserves the closed [`ErrorCode`] contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_index_rebuild_required: Option<FullTextIndexRebuildRequiredOutput>,
+    /// Set with HTTP 409 when a full-text call reads a declared index that
+    /// has no segment at the query's snapshot. Building the index clears it;
+    /// retrying does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text_index_required: Option<FullTextIndexRequiredOutput>,
     /// Set for a refused query: the diagnostics contract's code, position or
     /// stage, expectation and fix. `error` keeps the one-line rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2296,7 +2422,9 @@ impl ErrorOutput {
             blob_precondition_failure: None,
             change_feed_gap: None,
             change_diff_refusal: None,
+            branch_start_refusal: None,
             full_text_index_rebuild_required: None,
+            full_text_index_required: None,
             diagnostic: None,
         }
     }
@@ -2480,7 +2608,7 @@ pub fn diff_output(page: &omnigraph::changes::GraphDiffPage) -> DiffOutput {
     }
 }
 
-/// A detailed branch listing (`detail=true`): names and details, each in
+/// A detailed branch listing (`detailed=true`): names and details, each in
 /// byte order.
 pub fn branch_list_output(listing: &omnigraph::db::BranchListing) -> BranchListOutput {
     let mut branches = listing.branches.clone();
@@ -2498,8 +2626,7 @@ pub fn branch_detail_output(detail: &omnigraph::db::BranchDetail) -> BranchDetai
         name: detail.name.clone(),
         head: commit_output(&detail.head),
         from: detail.from.clone(),
-        fork: detail.fork.as_ref().map(commit_output),
-        actor_id: detail.actor_id.clone(),
+        from_commit_id: detail.from_commit_id.clone(),
         created_at: detail.created_at,
         updated_at: detail.updated_at,
     }

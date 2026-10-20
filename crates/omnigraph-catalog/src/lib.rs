@@ -2386,45 +2386,71 @@ impl ManifestCoordinator {
     /// legacy ref named exactly `name` also counts as existing.
     #[doc(hidden)]
     pub async fn create_branch(&mut self, name: &str) -> Result<()> {
-        self.create_branch_as(name, None).await
+        crate::branch_names::ensure_logical_branch_name(name)?;
+        let version = self.version();
+        Self::create_branch_from(self.dataset.clone(), name, version).await
     }
 
-    /// [`Self::create_branch`], recording `actor` on the new ref as the actor
-    /// that created it. The branch exists once the native create succeeds; a
-    /// failure to record the actor afterwards reports uncertain completion,
-    /// and the branch lists with no actor.
+    /// Create the logical branch `name` as a fresh native incarnation whose
+    /// first `__manifest` version is a clone of this branch's version
+    /// `version`, the version whose publish made `graph_commit_id` the head:
+    /// the new branch starts with that commit's table pins, lineage and
+    /// schema contract, exactly as a branch created while the commit was the
+    /// head. The version must hold `graph_commit_id` as its head in the
+    /// format this build writes; a version only the legacy history serves is
+    /// refused. Every refusal here precedes any effect.
     #[doc(hidden)]
-    pub async fn create_branch_as(&mut self, name: &str, actor: Option<&str>) -> Result<()> {
+    pub async fn create_branch_at(
+        &mut self,
+        name: &str,
+        version: u64,
+        graph_commit_id: &str,
+    ) -> Result<()> {
         crate::branch_names::ensure_logical_branch_name(name)?;
-        let mut ds = self.dataset.clone();
+        let dataset = if version == self.version() {
+            self.dataset.clone()
+        } else {
+            self.dataset
+                .checkout_version(version)
+                .await
+                .map_err(|error| OmniError::storage(error).before_effect())?
+        };
+        if crate::legacy::legacy_version(&dataset).is_some() {
+            return Err(OmniError::branch_start_refused(
+                graph_commit_id,
+                crate::error::BranchStartRefusal::EarlierStorageFormat,
+            )
+            .before_effect());
+        }
+        let head = state::read_manifest_rows_projected(&dataset)
+            .await
+            .map_err(OmniError::before_effect)?
+            .head;
+        if head.graph_commit_id != graph_commit_id {
+            return Err(OmniError::manifest_internal(format!(
+                "`__manifest` version {version} of {} holds head commit '{}', not '{graph_commit_id}' \
+                 its record names; no branch was created",
+                self.native_branch.as_deref().unwrap_or("main"),
+                head.graph_commit_id
+            ))
+            .before_effect());
+        }
+        Self::create_branch_from(dataset, name, version).await
+    }
+
+    /// Create `name` as a clone of `ds`, checked out at `version`.
+    async fn create_branch_from(mut ds: Dataset, name: &str, version: u64) -> Result<()> {
         crate::branch_control::ensure_manifest_branch_create_namespace(&ds, name)
             .await
             .map_err(OmniError::before_effect)?;
         let native =
             crate::branch_names::native_branch_name(name, &crate::branch_names::mint_incarnation());
-        match crate::branch_control::create_branch_recoverably(&mut ds, &native, self.version())
-            .await?
-        {
-            crate::branch_control::BranchCreateOutcome::Created => {}
-            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => {
-                return Err(OmniError::manifest_conflict(format!(
-                    "branch '{}' already exists",
-                    name
-                )));
-            }
+        match crate::branch_control::create_branch_recoverably(&mut ds, &native, version).await? {
+            crate::branch_control::BranchCreateOutcome::Created => Ok(()),
+            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => Err(
+                OmniError::manifest_conflict(format!("branch '{}' already exists", name)),
+            ),
         }
-        let Some(actor) = actor else {
-            return Ok(());
-        };
-        crate::branch_control::record_branch_creator(&ds, &native, actor)
-            .await
-            .map_err(|error| {
-                OmniError::manifest_internal(format!(
-                    "branch '{name}' was created, but recording the actor that created it \
-                     failed ({error}); it lists with no actor"
-                ))
-                .with_completion_evidence(crate::error::CompletionEvidence::Uncertain)
-            })
     }
 
     async fn open_branch_control_dataset(&self) -> Result<Dataset> {

@@ -50,8 +50,14 @@ pub(crate) enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
+        /// Branch to fork; the new branch starts at its head. Defaults to
+        /// `main`.
         #[arg(long)]
         from: Option<String>,
+        /// A published graph commit id to start the branch at, with that
+        /// commit's data and history, instead of a branch head.
+        #[arg(long, conflicts_with = "from")]
+        from_commit: Option<String>,
         name: String,
         #[arg(long)]
         json: bool,
@@ -61,10 +67,10 @@ pub(crate) enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        /// Also report each branch's head, the branch and commit it was
-        /// created from, who created it and when, and when it last moved
+        /// Also report each branch's head, the branch and commit it started
+        /// from, when it was created, and when it last moved
         #[arg(long)]
-        detail: bool,
+        detailed: bool,
         #[arg(long)]
         json: bool,
     },

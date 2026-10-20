@@ -128,12 +128,12 @@ omnigraph branch merge <branch-name> --into main --delete-branch --store $REPO
 omnigraph branch delete <branch-name> --store $REPO
 ```
 
-All support `--json`. `--from` and `--into` default to `main`.
+All support `--json`. `--from` and `--into` default to `main`. `branch create
+--from-commit <commit-id>` starts the branch at a published commit instead.
 `--delete-branch` removes the source only after a successful merge publication.
-A served `branch delete --json` needs `--yes`. `branch list --detail` adds each
-branch's head, the branch (`from`) and commit (`fork`) it was created from,
-its creator (`actor_id`), and `created_at`/`updated_at`, without reading
-commit history.
+A served `branch delete --json` needs `--yes`. `branch list --detailed` adds
+each branch's head, the branch (`from`) and commit (`from_commit_id`) it
+started from, and `created_at`/`updated_at`, without reading commit history.
 
 The same operations are GQ branch statements, useful when a client already
 sends `.gq` source:

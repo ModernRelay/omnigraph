@@ -28,45 +28,23 @@ omnigraph branch list --store graph.omni
 omnigraph branch delete review/abandoned --store graph.omni
 ```
 
-`branch list --detail` (served: `GET /branches?detail=true`, which adds a
-`details` array beside `branches`) also reports, for each branch:
+`branch list --detailed` (served: `GET /branches?detailed=true`) adds a
+`details` array. Per branch it reports `head`, the commit a read sees; `from`
+and `from_commit_id`, the branch and commit it started from, as its create
+receipt named them (a later merge moves the merge base, not these);
+`created_at`, recorded to the second; and `updated_at`, the newest commit's
+time, or `created_at` while the branch has written none. Times are Unix
+microseconds. `main` omits `from`, `from_commit_id` and `created_at`. A branch
+deleted and created again reports its new creation. Each branch costs a read
+of its own manifest, two once it has written a commit, whatever its history,
+and the branches are not read as one cut. The served listing needs the `read`
+that `GET /branches` needs, and has details only for branches the caller may
+`read`.
 
-| Field | Meaning |
-|---|---|
-| `head` | The commit a read of the branch sees: its newest commit, or the commit it was created at while it has written none. |
-| `from` | The branch this one was created from, as the create receipt named it; that branch may since have been deleted or recreated. |
-| `fork` | The head of `from` when this branch was created. It is fixed for the branch's lifetime, so a later merge moves the merge base (`branch merge-base`) but not the fork. |
-| `actor_id` | The actor that created this branch, as the create receipt named it; `null` when the create named no actor, and for branches created before OmniGraph recorded creators. |
-| `created_at` | When this branch was created, as Unix microseconds recorded to the second. |
-| `updated_at` | When the head last moved: the newest commit's time, or `created_at` while the branch has written none. |
-
-`main` has no `from`, `fork`, `actor_id` or `created_at`. A branch deleted and created
-again under the same name is a new lifetime, so the listing reports the second
-creation, its actor and its fork. A create that cannot record its actor
-after creating the branch fails with an uncertain outcome; the branch exists
-and lists with `actor_id: null`. The details are read from each branch's own manifest,
-never from its commit history: a listing reads the latest version of each
-branch and, once the branch has written a commit, the version it was created
-from, whatever the history depth. The text output prints one line per branch:
-
-```text
-feature head=<commit> from=main fork=<commit> actor=<actor> created_at=<micros> updated_at=<micros>
-main head=<commit> updated_at=<micros>
-```
-
-The served listing needs the same `read` as `GET /branches`, and reports
-details only for the branches the caller may `read`; another branch appears in
-`branches` alone.
-
-Each branch is read on its own, so the details are not one cut across
-branches: a branch written or created during the listing may show its state
-from just before or just after that write. A branch whose create is still
-recording its actor lists with `actor_id: null` for that moment. After a create
-that reports an uncertain outcome, a retry answers `409` (`already exists`);
-list the branches to confirm the branch exists.
-
-Creating a branch defaults to `main` when `--from` is omitted. A load can create
-a missing target branch by combining `--branch <name>` with `--from <base>`.
+Creating a branch defaults to `main` when `--from` is omitted. To start a
+branch at a past commit instead of a branch head, use `--from-commit`; see
+[start a branch at a commit](#start-a-branch-at-a-commit). A load can create a
+missing target branch by combining `--branch <name>` with `--from <base>`.
 
 Each branch operation is also a GQ statement, so a client that already sends
 `.gq` source needs no second transport. The three control writes go to
@@ -75,6 +53,7 @@ with no request target, name, or parameters:
 
 ```text
 branch create "review/add-benchmark" from main
+branch create "fix/import" from commit "<commit-id>"
 branch merge "review/add-benchmark" into main
 branch delete "review/abandoned"
 branch list
@@ -185,6 +164,40 @@ costs. Served, the same listing is
 `GET /commits?branch=<name>&limit=<n>` continued with `page_token=<token>`.
 Paging applies to a branch's history, not to `--unpublished` or
 `--unattached`.
+
+### Start a branch at a commit
+
+A branch can start at a published graph commit instead of a branch's head. It
+holds that commit's rows and history, as if it had been created while the
+commit was the head. Use it to try a fix or a revert where a change was made,
+then merge the branch as usual; the commit is its merge base.
+
+```bash
+omnigraph commit list graph.omni --branch main --json
+omnigraph branch create fix/import --from-commit <commit-id> --store graph.omni
+```
+
+The statement is `branch create "fix/import" from commit "<commit-id>"`, and
+`POST /branches` takes the id in `from_commit`, which excludes `from` (a
+request with both answers `400`). An id no commit has answers `404`. The
+receipt names the branch the new
+branch was forked off in `from`, for a commit start the branch that wrote the
+commit, and the commit it starts at in `from_commit_id`. Every receipt carries
+`from_commit_id`: for a start from a branch it is that branch's head when the
+branch was created. A branch starts only at a commit whose whole snapshot is
+still there under the graph's current schema; otherwise nothing is created:
+
+| `from_commit` names | Answer | `branch_start_refusal.reason` |
+|---|---|---|
+| A commit whose table versions `cleanup` reclaimed, wholly or in a run that stopped part way | `410` | `not_retained`, with the type in `type_name` |
+| A commit written under an earlier schema than the graph's | `409` | `schema_changed` |
+| A commit written before the storage upgrade | `409` | `earlier_storage_format` |
+| A commit of a branch that was deleted, even if a branch has since been created under its name | `409` | `branch_deleted`, with the branch in `branch` |
+| An [unpublished commit](#unpublished-commits) | `409` | `unpublished_commit`; publish it, then start at the published commit |
+| An [unattached snapshot](#unattached-branches) | `409` | `unattached_snapshot`; it never becomes branch history |
+
+While the new branch lives, `cleanup` keeps the commit's table versions, so a
+later start at the same commit succeeds too.
 
 ### Unpublished commits
 

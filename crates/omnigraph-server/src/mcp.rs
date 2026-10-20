@@ -447,6 +447,15 @@ struct BranchArguments {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AccessArguments {
+    graph: String,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    target_branch: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommitsListArguments {
     graph: String,
     #[serde(default)]
@@ -555,6 +564,8 @@ struct BranchCreateArguments {
     name: String,
     #[serde(default)]
     from: Option<String>,
+    #[serde(default)]
+    from_commit: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -992,6 +1003,19 @@ impl GraphTools {
                 .await?;
                 bounded_result(&output.0)
             }
+            "access" => {
+                let args: AccessArguments = arguments_as(arguments)?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output = handlers::access_body(
+                    &handle,
+                    Some(&actor),
+                    crate::api::AccessQuery {
+                        branch: args.branch,
+                        target_branch: args.target_branch,
+                    },
+                )?;
+                bounded_result(&output)
+            }
             "branches_list" => {
                 let args: GraphArguments = arguments_as(arguments)?;
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
@@ -1141,6 +1165,7 @@ impl GraphTools {
                     Some(Extension(actor)),
                     Json(crate::api::BranchCreateRequest {
                         from: args.from,
+                        from_commit: args.from_commit,
                         name: args.name,
                     }),
                 )
@@ -1430,6 +1455,15 @@ const TOOLS: &[ToolSpec] = &[
         gate: Gate::Always,
     },
     ToolSpec {
+        name: "access",
+        title: "Your access",
+        description: "Return what your credential may do on a graph: your `actor`, the actions allowed whatever the branch (`graph_wide`), and, for a `branch` you name, the actions allowed on it (`actions`). Name a `target_branch` too to learn whether you may create it from `branch` or merge `branch` into it. Check this before a write instead of learning from a refusal. Branches are judged by name and need not exist.",
+        input: access_schema,
+        output: Some(access_output_schema),
+        effect: Effect::Read,
+        gate: Gate::Always,
+    },
+    ToolSpec {
         name: "branches_list",
         title: "List branches",
         description: "List a graph's branch names.",
@@ -1628,6 +1662,16 @@ fn branch_schema() -> Value {
     )
 }
 
+fn access_schema() -> Value {
+    arguments(
+        json!({
+            "branch": text_schema("A branch whose actions to report."),
+            "target_branch": text_schema("With `branch`, the branch it would be created into or merged into."),
+        }),
+        &[],
+    )
+}
+
 fn commits_list_schema() -> Value {
     arguments(
         json!({
@@ -1732,7 +1776,8 @@ fn branch_create_schema() -> Value {
     arguments(
         json!({
             "name": text_schema("The new branch's name."),
-            "from": text_schema("Branch to fork. Defaults to `main`."),
+            "from": text_schema("Branch to fork; the new branch starts at its head. Defaults to `main`."),
+            "from_commit": text_schema("A published graph commit id to start the branch at instead of a branch head; excludes `from`."),
         }),
         &["name"],
     )
@@ -1794,6 +1839,28 @@ fn graphs_output_schema() -> Value {
             "required": ["graph_id", "display_name"],
         }}},
         "required": ["graphs"],
+    })
+}
+
+fn access_output_schema() -> Value {
+    let actions = json!({
+        "type": "array",
+        "items": {"type": "string", "enum": [
+            "read", "export", "change", "schema_apply", "branch_create", "branch_delete",
+            "branch_merge", "commit_publish", "commit_drop", "invoke_query"
+        ]},
+    });
+    json!({
+        "type": "object",
+        "properties": {
+            "actor": {"type": ["string", "null"]},
+            "graph_id": {"type": "string"},
+            "graph_wide": actions,
+            "branch": {"type": ["string", "null"]},
+            "target_branch": {"type": ["string", "null"]},
+            "actions": actions,
+        },
+        "required": ["actor", "graph_id", "graph_wide", "branch", "target_branch", "actions"],
     })
 }
 
