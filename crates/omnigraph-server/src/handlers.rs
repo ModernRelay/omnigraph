@@ -494,6 +494,7 @@ pub(crate) async fn require_expected_actor(
     };
     Err(ApiError {
         completion_uncertain: false,
+        scoped_unknown: false,
         status: StatusCode::PRECONDITION_FAILED,
         code: Some(ErrorCode::ActorMismatch),
         message: message.into_boxed_str(),
