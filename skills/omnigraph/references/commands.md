@@ -128,7 +128,8 @@ omnigraph branch merge <branch-name> --into main --delete-branch --store $REPO
 omnigraph branch delete <branch-name> --store $REPO
 ```
 
-All support `--json`. `--from` and `--into` default to `main`.
+All support `--json`. `--from` and `--into` default to `main`. `branch create
+--from-commit <commit-id>` starts the branch at a published commit instead.
 `--delete-branch` removes the source only after a successful merge publication.
 A served `branch delete --json` needs `--yes`.
 

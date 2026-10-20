@@ -1082,7 +1082,11 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
                 .await
                 .unwrap();
             client
-                .branch_create_from("main", "search", &mut Vec::new())
+                .branch_create(
+                    omnigraph::db::ReadTarget::branch("main"),
+                    "search",
+                    &mut Vec::new(),
+                )
                 .await
                 .unwrap();
             let main_before = client

@@ -41,6 +41,7 @@ impl RedactedCause {
             OmniError::BranchNotFound { .. } => "BranchNotFound",
             OmniError::ReadTargetNotFound { .. } => "ReadTargetNotFound",
             OmniError::AmbiguousReadTarget { .. } => "AmbiguousReadTarget",
+            OmniError::BranchStartRefused { .. } => "BranchStartRefused",
             OmniError::ChangeFeedGap { .. } => "ChangeFeedGap",
             OmniError::CommitHasNoParent { .. } => "CommitHasNoParent",
             OmniError::ChangeSchemaBoundary { .. } => "ChangeSchemaBoundary",
