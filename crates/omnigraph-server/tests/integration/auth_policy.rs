@@ -914,6 +914,84 @@ async fn malformed_and_unrouted_requests_answer_the_error_body() {
     assert_eq!(manifest_dataset_version(&graph).await, before);
 }
 
+/// A method a protected route does not serve is answered by the same guards
+/// as one it serves: authentication, the contract and the actor assertion
+/// refuse first, and only a request they admit learns which methods the path
+/// serves. One route of each protected router; MCP serves its own methods
+/// behind its own guards.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unserved_method_on_a_protected_route_answers_after_every_guard() {
+    use omnigraph_server::api::{
+        DispositionAction, DispositionEffects, DispositionOutput, ErrorCode,
+    };
+
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let routes = [
+        (Method::PUT, g("/snapshot"), "GET,HEAD"),
+        (Method::PUT, g("/branches/feature"), "DELETE"),
+        (Method::PUT, "/graphs".to_string(), "GET,HEAD"),
+        (Method::PUT, "/cluster/plan".to_string(), "POST"),
+        (Method::GET, "/graphs/og_catalog/query".to_string(), "POST"),
+    ];
+    for (method, path, allow) in routes {
+        let what = format!("{method} {path}");
+
+        let (status, body) =
+            json_response(&app, expecting(method.clone(), &path, None, &[], None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}: {body}");
+        assert_code(body, ErrorCode::Unauthorized, &what);
+
+        let mut request = expecting(method.clone(), &path, Some("demo-token"), &[], None);
+        request
+            .headers_mut()
+            .insert(HTTP_API_CONTRACT_HEADER, HeaderValue::from_static("0.11"));
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+        assert_code(body, ErrorCode::ApiContractMismatch, &what);
+
+        let (status, body) = json_response(
+            &app,
+            expecting(
+                method.clone(),
+                &path,
+                Some("demo-token"),
+                &["act-someone-else"],
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{what}: {body}");
+        assert_code(body, ErrorCode::ActorMismatch, &what);
+
+        let response = app
+            .clone()
+            .oneshot(expecting(method, &path, Some("demo-token"), &[], None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{what}");
+        assert_eq!(response.headers()["allow"], allow, "{what}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("{what}: {}", String::from_utf8_lossy(&body)));
+        assert_eq!(error.code, Some(ErrorCode::MethodNotAllowed), "{what}");
+        assert_eq!(
+            error.disposition,
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action: DispositionAction::Fix,
+            }),
+            "{what}"
+        );
+    }
+
+    let response = app
+        .clone()
+        .oneshot(expecting(Method::PUT, "/mcp", None, &[], None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "PUT /mcp");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn protected_routes_require_bearer_token() {
     let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
