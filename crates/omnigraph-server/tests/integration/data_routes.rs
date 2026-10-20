@@ -5868,6 +5868,18 @@ async fn remote_branch_delete_flow_works() {
             "{method} {name}"
         );
         assert_eq!(response.headers()["allow"], allow, "{method} {name}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["code"], "method_not_allowed",
+            "{method} {name}: {body}"
+        );
+        assert_eq!(
+            body["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{method} {name}"
+        );
     }
 
     let (list_status, list_body) = json_response(

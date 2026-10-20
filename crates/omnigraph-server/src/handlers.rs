@@ -3108,7 +3108,7 @@ impl BranchAction {
 /// and method select, or 405 naming what that name serves.
 pub(crate) async fn server_branch_action(
     State(state): State<AppState>,
-    Path(BranchPath { branch }): Path<BranchPath>,
+    ApiPath(BranchPath { branch }): ApiPath<BranchPath>,
     request: Request,
 ) -> Response {
     match BranchAction::of(&branch) {
@@ -3119,17 +3119,23 @@ pub(crate) async fn server_branch_action(
 
 /// 405 for a method `/branches/{branch}` does not serve for that name, with
 /// the methods it does serve: DELETE for every name, plus an action's own.
+/// The body is the error body every other refusal answers.
 fn branch_method_not_allowed(action: Option<BranchAction>) -> Response {
     let allow = match action.map(BranchAction::method) {
         None => "DELETE".to_string(),
         Some(method) if method == axum::http::Method::GET => "DELETE, GET, HEAD".to_string(),
         Some(method) => format!("DELETE, {method}"),
     };
-    (
-        StatusCode::METHOD_NOT_ALLOWED,
-        [(axum::http::header::ALLOW, allow)],
-    )
-        .into_response()
+    let mut response = ApiError::method_not_allowed(format!(
+        "this branch path serves {allow}, not the request's method"
+    ))
+    .into_response();
+    if let Ok(allow) = axum::http::HeaderValue::from_str(&allow) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::ALLOW, allow);
+    }
+    response
 }
 
 #[utoipa::path(
