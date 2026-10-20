@@ -1,7 +1,7 @@
 //! The cluster lock's lease: heartbeats, self-fencing and takeover.
 //!
-//! A held version-3 lock (`state_lock`) carries `lease_seconds`; only S3
-//! locks are leased. Its owner renews it by creating
+//! A held version-3 lock (`state_lock`) carries `lease_seconds`; only a
+//! server's lock on S3 is leased. Its owner renews it by creating
 //! `__cluster/lease/<lock_id>/beat-<seq>.json`, put-if-absent, every third
 //! of a lease. A successor that finds the lock held watches those beats: a
 //! new beat means the owner is alive, and the successor refuses. When no
@@ -17,6 +17,13 @@
 //! successor may already act. The gap between the owner's two thirds of a
 //! lease and the successor's lease and a half covers clock-rate drift and
 //! scheduling delay; the protocol needs no synchronized clocks.
+//!
+//! The first beat races the same deadline, counted from the send of the
+//! lock's own write, because a successor may count silence from the moment
+//! the record is visible: a holder whose first beat is not acknowledged in
+//! time gets no lease and must not serve. A fence closes the holder's
+//! storage scope before it is reported, so the holder sends no storage
+//! mutation after a successor may claim, whatever its shutdown grace.
 //!
 //! Heartbeats, the watch and the claim go through the root outside the
 //! owner's storage scope, on a client with the backend's own retries. A beat
@@ -43,7 +50,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use omnigraph_storage::StorageAdapter;
+use omnigraph_storage::{StorageAdapter, StorageIoScope};
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
@@ -170,15 +177,25 @@ pub struct LeaseKeeper {
 }
 
 impl LeaseKeeper {
-    /// Start beating for `lock_id`. The first beat is sent before this
-    /// returns, so a successor never observes a held version-3 lock with no
-    /// beat to watch for longer than the owner's own deadline.
+    /// Start beating for `lock_id`, whose lock record was written by a
+    /// request sent at `lock_sent`.
+    ///
+    /// A successor may start counting silence as soon as the record is
+    /// visible, which is no earlier than `lock_sent`, so the first beat races
+    /// the owner's deadline counted from there, like every later one. When
+    /// it is not acknowledged in time, or a claim already names the lock,
+    /// this returns the fence and no keeper: the caller must not serve.
+    ///
+    /// When the lease fences, `scope` closes before the fence is published,
+    /// so the holder sends no storage mutation after a successor may act.
     pub async fn start(
         adapter: Arc<dyn StorageAdapter>,
         root: &str,
         lock_id: &str,
         seconds: u32,
-    ) -> Self {
+        lock_sent: Instant,
+        scope: Option<StorageIoScope>,
+    ) -> Result<Self, LeaseFenced> {
         let dir = lease_dir(root, lock_id);
         let (sender, fenced) = watch::channel(None);
         let stop = Arc::new(Notify::new());
@@ -187,16 +204,27 @@ impl LeaseKeeper {
             dir: dir.clone(),
             seq: 0,
             first_sent: None,
-            acknowledged: Instant::now(),
+            acknowledged: lock_sent,
             answered: true,
         };
-        beat.once().await;
+        let first = tokio::select! {
+            biased;
+            fence = beat.first(seconds) => fence,
+            () = tokio::time::sleep_until(lock_sent + owner_deadline(seconds)) => {
+                Some(LeaseFenced::Lapsed)
+            }
+        };
+        if let Some(fence) = first {
+            fence_holder(scope.as_ref(), fence);
+            return Err(fence);
+        }
         let task = tokio::spawn({
             let stop = Arc::clone(&stop);
             async move {
                 let fence = loop {
                     // The deadline is a timer of its own: a beat request that
-                    // hangs must not postpone the owner's fence.
+                    // hangs must not postpone the owner's fence. A beat that
+                    // completes at the same moment is counted first.
                     let deadline = beat.acknowledged + owner_deadline(seconds);
                     let pause = if beat.answered {
                         beat_interval(seconds)
@@ -210,25 +238,22 @@ impl LeaseKeeper {
                     tokio::select! {
                         biased;
                         () = stop.notified() => return,
-                        () = tokio::time::sleep_until(deadline) => break LeaseFenced::Lapsed,
                         fence = next => if let Some(fence) = fence {
                             break fence;
                         },
+                        () = tokio::time::sleep_until(deadline) => break LeaseFenced::Lapsed,
                     }
                 };
-                tracing::error!(
-                    ?fence,
-                    "cluster admission lease fenced; this process must stop writing"
-                );
+                fence_holder(scope.as_ref(), fence);
                 let _ = sender.send(Some(fence));
             }
         });
-        Self {
+        Ok(Self {
             fenced,
             stop,
             task: Some(task),
             dir,
-        }
+        })
     }
 
     /// Resolves once the lease fenced; never resolves while it holds.
@@ -271,7 +296,34 @@ struct Beat {
     answered: bool,
 }
 
+/// Stop the holder's storage mutations, then report the fence. A successor
+/// may claim the lock five sixths of a lease after the owner's deadline;
+/// closing the scope here, not when the process exits, keeps every
+/// mutation this holder sends before that.
+fn fence_holder(scope: Option<&StorageIoScope>, fence: LeaseFenced) {
+    if let Some(scope) = scope {
+        scope.close();
+    }
+    tracing::error!(
+        ?fence,
+        "cluster admission lease fenced; storage mutation closed, this process must stop"
+    );
+}
+
 impl Beat {
+    /// Send beat 0 until it is acknowledged, or a claim names the lock.
+    async fn first(&mut self, seconds: u32) -> Option<LeaseFenced> {
+        loop {
+            if let Some(fence) = self.once().await {
+                return Some(fence);
+            }
+            if self.answered {
+                return None;
+            }
+            tokio::time::sleep(reissue_pause(seconds)).await;
+        }
+    }
+
     /// Check for a claim, send beat `seq` (again, if an earlier request for
     /// it got no answer), and report a fence.
     async fn once(&mut self) -> Option<LeaseFenced> {
@@ -382,14 +434,18 @@ mod tests {
     const SECONDS: u32 = 30;
 
     /// An in-memory store that can stop acknowledging beats, the way a
-    /// partitioned owner's requests stop coming back; lose the answer to
-    /// beats it applied; and answer a claim it applied as already present,
-    /// the way a retried create whose first attempt landed is answered.
+    /// partitioned owner's requests stop coming back; fail some beats
+    /// without applying them; lose the answer to beats it applied; leave
+    /// beats unanswered for good; and answer a claim it applied as already
+    /// present, the way a retried create whose first attempt landed is
+    /// answered.
     #[derive(Debug)]
     struct Beats {
         inner: Arc<dyn StorageAdapter>,
         refuse: AtomicBool,
+        failures: AtomicUsize,
         lost_answers: AtomicUsize,
+        hang: AtomicBool,
         claim_retried: AtomicBool,
     }
 
@@ -398,10 +454,24 @@ mod tests {
             Arc::new(Self {
                 inner: Arc::new(ObjectStorageAdapter::in_memory()),
                 refuse: AtomicBool::new(false),
+                failures: AtomicUsize::new(0),
                 lost_answers: AtomicUsize::new(0),
+                hang: AtomicBool::new(false),
                 claim_retried: AtomicBool::new(false),
             })
         }
+    }
+
+    fn take_one(counter: &AtomicUsize) -> bool {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
+    async fn start(store: &Arc<Beats>, lock_id: &str) -> LeaseKeeper {
+        LeaseKeeper::start(store.clone(), ROOT, lock_id, SECONDS, Instant::now(), None)
+            .await
+            .unwrap()
     }
 
     #[async_trait]
@@ -448,17 +518,15 @@ mod tests {
                     "beat request unanswered",
                 ))
             };
-            if uri.contains("/beat-") && self.refuse.load(Ordering::SeqCst) {
+            let beat = uri.contains("/beat-");
+            if beat && self.hang.load(Ordering::SeqCst) {
+                return std::future::pending().await;
+            }
+            if beat && (self.refuse.load(Ordering::SeqCst) || take_one(&self.failures)) {
                 return Err(unanswered());
             }
             let created = self.inner.write_text_if_absent(uri, contents).await?;
-            if created
-                && uri.contains("/beat-")
-                && self
-                    .lost_answers
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-            {
+            if created && beat && take_one(&self.lost_answers) {
                 return Err(unanswered());
             }
             if uri.ends_with("/superseded.json") && self.claim_retried.load(Ordering::SeqCst) {
@@ -529,7 +597,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_successor_refuses_while_the_owner_beats_issue_1067() {
         let store = Beats::new();
-        let keeper = LeaseKeeper::start(store.clone(), ROOT, "owner", SECONDS).await;
+        let keeper = start(&store, "owner").await;
         let watched = watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "successor")
             .await
             .unwrap();
@@ -551,7 +619,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_successor_claims_a_silent_owner_after_a_lease_and_a_half_issue_1067() {
         let store = Beats::new();
-        let keeper = LeaseKeeper::start(store.clone(), ROOT, "owner", SECONDS).await;
+        let keeper = start(&store, "owner").await;
         drop(keeper);
         let started = Instant::now();
         let (first, second) = tokio::join!(
@@ -570,7 +638,7 @@ mod tests {
     async fn an_owner_fences_itself_when_its_beats_lapse_issue_1067() {
         let store = Beats::new();
         let started = Instant::now();
-        let keeper = LeaseKeeper::start(store.clone(), ROOT, "owner", SECONDS).await;
+        let keeper = start(&store, "owner").await;
         store.refuse.store(true, Ordering::SeqCst);
         assert_eq!(
             fenced_within(&keeper, lease(SECONDS)).await,
@@ -580,14 +648,30 @@ mod tests {
         assert!(started.elapsed() < successor_silence(SECONDS));
     }
 
+    /// A beat the store refused is sent again soon, under the same key, until
+    /// the deadline. A failed heartbeat, or several in a row within the
+    /// deadline, never fences a live owner.
+    #[tokio::test(start_paused = true)]
+    async fn one_failed_heartbeat_does_not_fence_a_live_owner_issue_1067() {
+        let store = Beats::new();
+        let keeper = start(&store, "owner").await;
+        store.failures.store(1, Ordering::SeqCst);
+        assert_eq!(fenced_within(&keeper, lease(SECONDS) * 2).await, None);
+        assert_eq!(store.failures.load(Ordering::SeqCst), 0);
+        // Three failures in a row still leave a re-issue inside the deadline.
+        store.failures.store(3, Ordering::SeqCst);
+        assert_eq!(fenced_within(&keeper, lease(SECONDS) * 2).await, None);
+        assert_eq!(store.failures.load(Ordering::SeqCst), 0);
+    }
+
     /// A beat the store applied but whose answer was lost is the owner's own:
     /// the owner sends it again soon, finds it present, and counts it from
     /// its first send. Lost answers never fence a live owner, and a
     /// successor keeps seeing its beats.
     #[tokio::test(start_paused = true)]
-    async fn a_beat_whose_answer_was_lost_still_renews_the_lease_issue_1067() {
+    async fn a_landed_beat_whose_ack_was_lost_refreshes_the_owner_issue_1067() {
         let store = Beats::new();
-        let keeper = LeaseKeeper::start(store.clone(), ROOT, "owner", SECONDS).await;
+        let keeper = start(&store, "owner").await;
         store.lost_answers.store(6, Ordering::SeqCst);
         assert_eq!(
             fenced_within(&keeper, lease(SECONDS) * 4).await,
@@ -609,7 +693,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_successor_recognizes_its_own_claim_issue_1067() {
         let store = Beats::new();
-        drop(LeaseKeeper::start(store.clone(), ROOT, "owner", SECONDS).await);
+        drop(start(&store, "owner").await);
         store.claim_retried.store(true, Ordering::SeqCst);
         assert_eq!(
             watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "first")
@@ -625,11 +709,56 @@ mod tests {
         );
     }
 
+    /// The lock is visible before the first beat lands, and a successor may
+    /// count silence from then. A first beat that never answers fences the
+    /// owner at its deadline, counted from the lock's write: `start` returns
+    /// the fence and no keeper, before a successor can claim, and the
+    /// holder's storage scope is closed.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_first_beat_fences_before_a_successor_can_claim_issue_1067() {
+        let store = Beats::new();
+        store.hang.store(true, Ordering::SeqCst);
+        let scope = StorageIoScope::new();
+        let lock_sent = Instant::now();
+        let (owner, successor) = tokio::join!(
+            async {
+                let result = LeaseKeeper::start(
+                    store.clone(),
+                    ROOT,
+                    "owner",
+                    SECONDS,
+                    lock_sent,
+                    Some(scope.clone()),
+                )
+                .await;
+                (result.map(|_| ()), lock_sent.elapsed())
+            },
+            async {
+                let watched =
+                    watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "successor").await;
+                (watched.unwrap(), lock_sent.elapsed())
+            },
+        );
+        assert_eq!(owner.0, Err(LeaseFenced::Lapsed));
+        assert!(owner.1 <= owner_deadline(SECONDS), "{:?}", owner.1);
+        assert_eq!(successor.0, Watch::Claimed);
+        assert!(successor.1 >= successor_silence(SECONDS));
+        let dir = tempfile::tempdir().unwrap();
+        let fenced = ObjectStorageAdapter::local_scoped(scope);
+        assert!(
+            fenced
+                .write_text(&format!("{}/after-fence", dir.path().display()), "x")
+                .await
+                .is_err(),
+            "a fenced holder's storage scope refuses mutations"
+        );
+    }
+
     /// A claim on its lock fences the owner at its next beat.
     #[tokio::test(start_paused = true)]
     async fn a_claim_fences_the_owner_issue_1067() {
         let store = Beats::new();
-        let keeper = LeaseKeeper::start(store.clone(), ROOT, "owner", SECONDS).await;
+        let keeper = start(&store, "owner").await;
         assert!(
             store
                 .write_text_if_absent(&claim_uri(&lease_dir(ROOT, "owner")), "{}")

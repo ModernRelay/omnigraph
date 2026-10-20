@@ -292,10 +292,11 @@ unqualified and its prior retained-lock shutdown behavior is unchanged. Older
 tools refuse the new released record. This supplies neither
 distributed fencing nor generic runtime reuse.
 
-On S3 roots a held lock is version 3 and carries `lease_seconds`
-(`lease.rs`, `state_lock.rs`). Its owner creates
-`__cluster/lease/<lock_id>/beat-<seq>.json` put-if-absent every third of a
-lease, first before it admits work, and checks for
+On S3 roots a server's held lock is version 3 and carries `lease_seconds`
+(`lease.rs`, `state_lock.rs`); a CLI writer or deployment holds an unleased
+lock, because nothing would stop its writes when a lease fenced. Its owner
+creates `__cluster/lease/<lock_id>/beat-<seq>.json` put-if-absent every third
+of a lease, first before it admits work, and checks for
 `__cluster/lease/<lock_id>/superseded.json` before each beat. The lease's
 requests go through the root outside the owner's storage scope, on a client
 with the backend's retries (`ClusterStore::lease_adapter`): a failed beat
@@ -304,11 +305,17 @@ A beat already present is the owner's own earlier request and counts from
 the first send of that beat; an unanswered beat is sent again after a
 quarter of a beat interval. A timer of its own fences the owner two thirds
 of a lease after the first send of its last acknowledged beat, or at once on
-a claim: the server closes admission and exits 2 without releasing. A
+a claim. The first beat races the same deadline counted from the send of the
+lock's own write, because a successor may count silence from the moment the
+record is visible; when it lapses, acquisition fails and the server does not
+serve. A fence closes the owner's storage scope before it is reported, so no
+mutation is sent after a successor may claim, whatever the shutdown grace;
+the server then closes admission and exits 2 without releasing. A
 serving acquisition that finds a version-3 lock watches the beat listing on
 its own monotonic clock. A new beat refuses it. An empty listing starts the
 silence and the first beat that appears restarts it, because the owner
-writes its lock before its first beat lands. A lease and a half of silence
+writes its lock before its first beat lands; an empty listing after a beat
+was seen refuses, like a new beat. A lease and a half of silence
 lets it create the claim, once (a claim already present is its own only when
 it names this successor's lock id), then replace `lock.json` by if-match on
 the version it first read. The owner's clean release is if-match on the

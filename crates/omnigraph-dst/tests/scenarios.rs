@@ -6545,7 +6545,10 @@ fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
             let store: Arc<dyn omnigraph_storage::StorageAdapter> =
                 Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
             let root = "cluster";
-            let owner = LeaseKeeper::start(store.clone(), root, "owner", SECONDS).await;
+            let owner =
+                LeaseKeeper::start(store.clone(), root, "owner", SECONDS, Instant::now(), None)
+                    .await
+                    .expect("the owner's first beat lands");
             tokio::time::sleep(Duration::from_millis(rng.below(90_000))).await;
             drop(owner);
             let died = Instant::now();
@@ -6598,7 +6601,16 @@ fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
                 "seed {seed}"
             );
 
-            let successor = LeaseKeeper::start(store.clone(), root, "successor", SECONDS).await;
+            let successor = LeaseKeeper::start(
+                store.clone(),
+                root,
+                "successor",
+                SECONDS,
+                Instant::now(),
+                None,
+            )
+            .await
+            .expect("the successor's first beat lands");
             tokio::time::sleep(lease * 6).await;
             assert!(
                 successor.fenced().borrow().is_none(),

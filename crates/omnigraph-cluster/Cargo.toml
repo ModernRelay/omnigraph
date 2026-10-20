@@ -40,7 +40,8 @@ ulid = { workspace = true }
 async-trait = { workspace = true }
 serial_test = "3"
 tempfile = { workspace = true }
-tokio = { workspace = true }
+# Paused time for the lease tests, so the crate's own test build runs them.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
