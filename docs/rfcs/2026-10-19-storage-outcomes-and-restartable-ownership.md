@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-19
-updated: 2026-10-19
+updated: 2026-10-20
 discussion: https://github.com/ModernRelay/omnigraph/issues/1067
 supersedes: []
 superseded_by: []
@@ -42,11 +42,11 @@ from there: the commit's request record says whether its manifest request
 was sent and how it ended; the version key decides a publication that record
 leaves open; the storage scope owns the outcome of each mutable key.
 
-The cluster lock gains a lease. Its owner writes heartbeats and stops
+On S3 the cluster lock gains a lease. Its owner writes heartbeats and stops
 writing when it can no longer renew. A successor takes over a lock whose
 heartbeats stopped for a lease and a half, so an orchestrator can restart a
-failed server with no operator step. `cluster force-unlock` remains for exceptional
-recovery.
+failed server with no operator step. Local and Azure locks keep the exact-ID
+unlock, and `cluster force-unlock` remains for exceptional recovery.
 
 The graph format, the publication protocol and the HTTP error codes do not
 change. Process containment remains for a panic and for lost write ownership.
@@ -136,9 +136,9 @@ What remains needs a decision.
 | A manifest request is ambiguous, then answered by a re-issue | Committed, or not committed (since #1092) | Unchanged |
 | A manifest request is still ambiguous after every re-issue | 500, then every graph closes, exit 2, lock retained | 500 `outcome_unknown`; the server keeps serving; the branch's next publication either builds on the late commit or takes its version first |
 | A mutable-key request has an unknown outcome | Every later mutation refused; release refused | Later requests to that key are refused; nothing else changes |
-| A panic, or lost ownership of a write | Contain, exit 2, lock retained | Contain, exit 2; a successor takes over after one lease of silence |
-| Clean SIGTERM | Release if settled, else retain the lock | Release unless a mutable key is unsettled; then exit nonzero and let the lease expire |
-| The process dies | The lock is held until an exact-ID `force-unlock` | A successor waits for a lease and a half of heartbeat silence, then takes over |
+| A panic, or lost ownership of a write | Contain, exit 2, lock retained | Contain, exit 2; on S3 a successor takes over after a lease and a half of silence |
+| Clean SIGTERM | Release if settled, else retain the lock | Release unless a mutable key is unsettled; then exit nonzero, and on S3 let the lease expire |
+| The process dies | The lock is held until an exact-ID `force-unlock` | On S3, a successor waits for a lease and a half of heartbeat silence, then takes over; local and Azure locks keep the exact-ID unlock |
 
 An unknown publication is reported, not hidden. It answers 500
 `outcome_unknown` on HTTP and MCP, with the disposition `effects: unknown`
@@ -153,7 +153,7 @@ is not final. Its identity on the wire belongs to the later
 writes](https://github.com/ModernRelay/omnigraph/pull/1017).
 
 Orchestrators should restart a failed server, for example Railway
-`ON_FAILURE`. A restart that finds a held, renewed lock still refuses with
+`ON_FAILURE`. On an S3 root, a restart that finds a held, renewed lock still refuses with
 `state_lock_held`. When the renewals have stopped, the restart waits out a
 lease and a half of silence and then starts. The lease is 30 seconds by
 default, so the wait is 45 seconds; `OMNIGRAPH_CLUSTER_LEASE_SECONDS` sets it
@@ -197,7 +197,8 @@ name that is reused. The audited set is small:
 - branch-ref rewrites and deletes, through `Branches::replace_metadata` and
   `Branches::delete`;
 - tag deletes;
-- the local and Azure lock delete;
+- the local and Azure lock delete, and the S3 release and takeover, which
+  replace `lock.json` by if-match;
 - the local `write_text_if_match` emulation;
 - `__graph_index/csr-current.bin`;
 - the reused `__init_claim.json`;
@@ -210,13 +211,16 @@ Each item is either safe when it lands late or is changed by this RFC:
   leaves a retired ref.
 - A tag's name carries a commit id.
 - The CSR artifact is verified by identity stamps on load.
-- Lock deletes are replaced by the lease (§7).
+- A local or Azure lock is deleted only by its exact owner after every
+  accepted effect settled, with other unlocks excluded by the operator, as
+  today; such a lock is never taken over (§7).
 - Branch creation mints a fresh native name per attempt.
 - Initialization is not served.
 
 The class is decided once per request. It is a `KeyClass` value carried by
 the request the storage boundary accounts for. Lance's writes are classified
-by Lance 11's table layout, which is a format contract. OmniGraph's own
+by the table layout Lance 11 defines and Lance 13 still writes, which is a
+format contract. OmniGraph's own
 writes are classified by the `StorageAdapter` method that issues them:
 `write_text_if_absent` and `write_text_if_match` are conditional,
 `write_text`, `write_bytes` and `delete` are mutable, and fresh objects go
@@ -251,8 +255,18 @@ it can land.
   commit's own request record may answer yes: the catalog's per-commit
   handler answers from it, keeping the store's answer unless the request may
   still land, and a dataset's shared handler, which holds no record of the
-  attempt being read back, never does. A late manifest therefore always
-  finds its transaction file.
+  attempt being read back, never does. Lance itself therefore never deletes
+  the transaction file of an attempt whose request may still land. The
+  collector is the other deleter, and it differs by table. It does not sweep
+  `__manifest` transaction files, so a late catalog manifest finds its file.
+  A table's `_transactions/*.txn` is swept as an orphan once nothing has
+  referenced it for seven days (`plan_orphans`, `UNVERIFIED_THRESHOLD_DAYS`).
+  A detached table manifest takes a fresh version id that no later
+  publication occupies, so nothing fences a late put against that sweep. The
+  storage scope's transaction-file hold (§4) keeps such files for the
+  server's lifetime. A table manifest that lands later still is a detached
+  version no `__manifest` pin names, because its staging failed, and it stays
+  unreachable.
 - **Refs and tags.** Lance's `put_ref_if_absent` reports `RefConflict`
   without reading the object. Its OmniGraph callers read the ref back:
   candidate tags compare branch and version, and native branch creation
@@ -304,7 +318,8 @@ place:
 
 Each set is capped, at 4096 keys. Past the cap the scope refuses new
 mutations: writes fail fast, and reads continue. Clean release requires an
-empty unsettled set; otherwise the lease hands admission over.
+empty unsettled set; otherwise the lock is retained, and on S3 the lease
+hands admission over.
 
 ### 5. Unknown publications are fenced by their version key
 
@@ -326,6 +341,15 @@ Graph state stays consistent in every order, in this process or after it
 dies. The collector keeps the unknown write's staging while its authority,
 the base head, is current; that staging becomes reclaimable only once another
 commit holds the version, when the write can no longer land.
+
+These three orders hold for a linear overwrite, a branch's next version. A
+proposal and an unattached snapshot publish with `overwrite_detached`
+instead. The next linear publication neither loads that `__manifest` version
+nor takes its id, so the version key does not fence it. Their tag is written
+only after `overwrite_detached` returns, so a late detached version stays off
+every branch, and the tag's own creation is the conditional ref of §2, which
+stays in doubt until its read-back settles it. Do not fence a detached
+version with the next linear one.
 
 ### 6. The server
 
@@ -353,15 +377,25 @@ resolved is scoped to its key: for a publication, the version key fences it.
 
 ### 7. Restartable ownership: the lock lease
 
-The protocol uses only operations every supported backend provides:
+Only S3 locks are leased. A takeover must replace `lock.json` without
+racing a release the old owner already sent, and only a conditional update
+does that. Local roots have none: `LocalFileSystem` offers no update
+precondition, and `write_text_if_match` there is a read, a compare and a
+put, so a successor's overwrite could be undone by an exact-owner delete the
+old process had already sent. Local and Azure locks therefore carry no
+lease and keep the exact-ID unlock. A local root on a shared network
+filesystem is the same case and is never taken over.
+
+The protocol uses these S3 operations:
 
 - create-if-absent;
 - list;
 - get;
-- delete of the caller's own fresh keys.
+- delete of lease keys: an owner's own stale beats, and a lease directory
+  whose lock id no longer holds the lock;
+- the if-match replacement of `lock.json`, at takeover and at release.
 
-It needs no conditional update on local roots, because `LocalFileSystem` has
-none. It relies on bounded relative clock rates, not synchronized clocks.
+It relies on bounded relative clock rates, not synchronized clocks.
 
 **Records.** `__cluster/lock.json` gains held version 3,
 `{version, lock_id, operation, created_at, pid, lease_seconds}`. Two key
@@ -370,54 +404,83 @@ patterns are added:
 - `__cluster/lease/<lock_id>/beat-<seq>.json`: the owner's heartbeats,
   created put-if-absent;
 - `__cluster/lease/<lock_id>/superseded.json`: one successor's takeover
-  claim, created put-if-absent.
+  claim, created put-if-absent and naming that successor's lock id.
 
 Version 1, version 2 released markers and the bootstrap handoff are
 unchanged.
 
+**Where the lease's requests go.** Heartbeats, a successor's watch and
+claim, and the removal of a lease directory go through the root outside the
+owner's storage scope, on a client with the backend's own retries. A beat is
+a key only its owner creates, under a lock id no other process uses, so a
+copy that lands late only keeps a successor waiting. It needs neither the
+scope's accounting nor the single-attempt client of §3. A failed beat
+therefore leaves no key unsettled, and beats continue after the scope
+closes for a release. A retried create that finds its object present is
+resolved as §2 resolves a conditional request, by what the object proves:
+only this owner, or for a claim only this successor, could have written it.
+
 **Owner.** After acquiring the lock, the owner writes beat 0 before it
 admits work, then a new beat every `lease_seconds / 3`. Before each beat it
-checks for a `superseded.json` claim. Let `s` be the monotonic send time of
-the last acknowledged beat. A timer of its own fires at `s + 2/3 ×
-lease_seconds`, two missed beats, so a hung beat request cannot postpone it.
-A beat that already exists is the owner's own earlier request and does not
-refresh `s`. When the timer fires, or a claim exists, the owner
+checks for a `superseded.json` claim. Let `s` be the monotonic time the
+owner first sent its last acknowledged beat. A beat that already exists when
+its owner sends it is the owner's own earlier request for it, which landed
+no earlier than its first send, so it counts as acknowledged with `s` its
+first send. A beat that gets no answer is sent again, under the same key,
+after a quarter of a beat interval. A timer of its own fires at
+`s + 2/3 × lease_seconds`, two beat intervals, so a hung beat request cannot
+postpone it. When the timer fires, or a claim exists, the owner
 ***fences***: it closes its storage scope and operation admission, and exits
 nonzero. It never resumes, because a successor may already act. A clean
 release stops beating, deletes its lease directory, and releases `lock.json`
-as today; if that release fails, the lock is a silent leased lock, and a
-successor takes it over.
+as today, by if-match; if that release fails, the lock is a silent leased
+lock, and a successor takes it over.
 
-**Successor.** A successor that finds a version-3 lock first observes its
-beat listing. A new beat means the owner is alive: the successor refuses with
-`state_lock_held` and the orchestrator retries it later. If the beat listing
-is silent for `3/2 × lease_seconds` of the successor's own monotonic time,
-measured from its first observation of the newest beat, the successor creates
-the claim:
+**Successor.** Only a serving acquisition takes a lock over; every other
+operation refuses a held lock at once. A successor that finds a version-3
+lock observes its beat listing on its own monotonic clock. A new beat means
+the owner is alive: the successor refuses with `state_lock_held` and the
+orchestrator retries it later. The silence is measured from the
+successor's first observation of the newest beat. An empty listing starts
+it, and the first beat that appears restarts it: the owner writes
+`lock.json` before beat 0 lands, so an empty listing is the normal gap before
+the first beat, and also the gap while beat 0 is slow. After
+`3/2 × lease_seconds` of silence the successor creates the claim:
 
-- If it wins, it replaces `lock.json` with its own version-3 record. On S3
-  it uses if-match on the ETag it first read; a changed ETag means a clean
-  release happened, so it acquires normally. On a local root it overwrites;
-  the claim has serialised successors, and local writes end with the process.
-- If it loses, another successor won, and it refuses.
+- If it wins, or finds a claim that names its own lock id (its own earlier
+  request, which landed unacknowledged), it replaces `lock.json` with its
+  own version-3 record by if-match on the ETag it first read. The old
+  owner's release is if-match on the ETag it read, so of a release and a
+  takeover in flight together exactly one applies. A changed ETag means the
+  lock changed, usually by a clean release: the successor refuses, and the
+  next start acquires the released lock normally.
+- If another successor's claim is there, that successor won, and this one
+  refuses.
 
-The successor never takes over a version-1 lock. Azure roots keep their
-admission-wrapper lease and current behavior.
+A successor that dies between its claim and its replacement leaves a claim
+no one acts on; that lock needs the exact-ID unlock. The successor never
+takes over a version-1 lock.
 
-**Timing.** The newest beat a successor observes was sent at some `s` no
-later than the observation, so the takeover happens at least `3/2 ×
-lease_seconds` after `s`. The owner fenced by `s + 2/3 × lease_seconds`. The
-gap, five sixths of a lease, covers clock-rate drift and a stalled runtime.
-A beat that lands after its owner fenced only makes a successor refuse once
-more.
+**Timing.** Every beat the owner counts became visible no earlier than its
+first send `s`. A successor's silence starts no earlier than the moment the
+newest beat it saw became visible, so the takeover happens at least
+`3/2 × lease_seconds` after `s`. The owner fenced by `s + 2/3 ×
+lease_seconds`. The gap, five sixths of a lease, covers clock-rate drift and
+a stalled runtime. A beat that lands after its owner fenced only makes a
+successor refuse once more. S3 lists a created object as soon as the create
+is acknowledged, so a counted beat is visible to every successor's listing.
+A store whose listing lags its creates could hide a beat from a successor,
+and is outside this protocol.
 
 **Why late requests are harmless.** A dead owner's requests were sent before
 its own lease ran out. A request the store applies after the takeover is:
 
 - a fresh key, unreachable;
 - a conditional request, which applies at most once against the CAS the
-  successor also uses;
-- a mutable key from the audited set, harmless by §1.
+  successor also uses; the old owner's release is one;
+- a mutable key from the audited set, harmless by §1;
+- a heartbeat or a lease-directory delete under the old lock id, which no
+  successor watches any longer.
 
 The lock coordinates liveness. Correctness rests on conditional publication,
 as it does for any two writers today.
@@ -428,8 +491,10 @@ as it does for any two writers today.
   commit. An unknown publication is a request that may still land, never a
   partial graph state. Staging stays unreachable until the manifest names
   it. Only the commit's request record lets Lance delete a transaction file,
-  so a late manifest keeps its own; the scope's transaction-file hold is a
-  second line in the server.
+  so Lance never deletes one a request in flight may name. The collector's
+  orphan sweep still deletes an unreferenced table transaction file after
+  seven days, so the scope's transaction-file hold stays in the server
+  (§2).
 - **Invariant 8.** Integrity failures stay loud. An unknown outcome is
   reported, never converted into success or failure without the store's
   answer.
@@ -482,9 +547,19 @@ On the deny-list:
   caller never asked for. It also discards a write the store may have been
   about to apply. Settling a prepared schema uses a fence because its intent
   is durable. A pending row write's intent is not.
-- **Lease by if-match renewal of `lock.json` alone.** This is simpler on S3
-  and Azure. It does not exist on local roots, where `write_text_if_match`
-  is a compare-then-replace, so two backends would need two protocols.
+- **Lease by if-match renewal of `lock.json` alone.** One conditional key
+  would carry both renewal and ownership. Every renewal would then contend
+  with the release and the takeover on that key, and a renewal whose answer
+  was lost would leave the owner unsure which ETag it holds. Create-once
+  beats keep renewal off the lock key.
+- **Take a local lock over by overwrite after the claim.** The claim
+  serializes successors but not the old owner: an exact-owner delete it had
+  already sent can remove the successor's record. Refused until local roots
+  have a conditional update.
+- **Heartbeats on the scope's single-attempt client.** One unanswered beat,
+  a 503 like the incident's, left the owner one more chance before its
+  deadline. It also left the beat key unsettled, so the scope refused the
+  owner's own re-issue and then refused a clean release.
 - **Wait for [#1018](https://github.com/ModernRelay/omnigraph/issues/1018).**
   Cross-process schema and branch control is a larger change. The lease here
   coordinates one writer's liveness and does not depend on it.
@@ -510,16 +585,21 @@ The owners to extend:
 - **Server.** `operations::tests::*_issue_1067` and
   `boot_settings::owned_shutdown::*` with real backend faults: a planted
   file, and a manifest put that never answers. They show no containment,
-  the branch and other graphs still writable, and a lock that is released or
-  handed over.
+  the branch and other graphs still writable, and a lock that is released,
+  or retained on a local root for the exact-ID unlock.
 - **DST** (`crates/omnigraph-dst`). Injected 5xx, throttles and lost
   responses on a write, in the Lance realm. An abandoned conditional
   `__manifest` put that lands late. A successor taking over a dead owner's
   lease through the adapter realm, with the old owner's in-flight requests
   landing after the takeover.
-- **Cluster** `state_lock` tests under paused time: beats, the owner's fence
-  on a lapse and on a claim, a takeover after silence, refusal while beats
-  continue, and one winner between two successors.
+- **Cluster** `lease` tests under paused time: beats, the owner's fence on a
+  lapse and on a claim, a beat whose answer was lost still renewing, a
+  successor recognizing its own claim, a takeover after silence, refusal
+  while beats continue, and one winner between two successors.
+  `state_lock` tests on an in-memory store with S3's conditional semantics:
+  takeover after silence, refusal of a non-serving acquisition, and a release
+  and a takeover never both applying; and on a local root, refusal with no
+  lease.
 
 Upstream surfaces reviewed at the pinned versions:
 
@@ -550,15 +630,13 @@ phase 3.
 
 ## Unresolved questions
 
-- **Lease length.** Is 30 s right for every deployment, or should it be
-  configurable from the start? The record carries `lease_seconds`, so a
-  configurable value stays compatible.
-- **Shared local volumes.** Should a local root on a shared network
-  filesystem be refused for takeover?
 - **One owner of request outcomes on every open path.** The storage scope
   owns mutable-key outcomes only where the server installs it. Installing it
   on embedded and CLI opens too would give those writers the same per-key
-  rule and let the scope's transaction-file hold retire.
+  rule and the transaction-file hold. The hold stays: the collector's orphan
+  sweep does not know which detached version is still free.
+- **A conditional update for local roots.** With one, local locks could be
+  leased under the same protocol.
 
 ## Decision log
 
@@ -571,15 +649,24 @@ phase 3.
   [engine settlement](2026-10-01-engine-settlement-and-resource-bounds.md)
   decisions fix today. Those RFCs get disposition notes when this one is
   accepted.
-- 2026-10-20: Aligned the user section with the accepted error body: the
-  unsettled write answers `outcome_unknown` with its `disposition`, the
-  pending branch's refusal is a one-branch `service_unavailable` with `retry`,
-  and a pending record keys a control fact by its attempt id.
+- 2026-10-20: Aligned the user section with the accepted error body: an
+  unknown write answers `outcome_unknown` with its `disposition`, and its log
+  names a control fact by its attempt id.
 - 2026-10-20: §5 replaced its pending-publication registry with fencing by
   the version key, recorded under Alternatives, after the DST crash-state
   enumeration showed the registry landing a crashed operation's commit under
-  its rerun; the pending branch's refusal in the entry above goes with it,
-  and the unknown write keeps its accepted error body. §2 states who may call
+  its rerun; the unknown write keeps its accepted error body. §2 states who
+  may call
   a version absent: only the commit's own
   request record, after review of #1092 found the shared handler letting
   Lance delete a transaction file a late manifest would name.
+- 2026-10-20: After review, the lease is S3-only: a local takeover's
+  overwrite could be undone by a delete the old owner had already sent, so
+  local and Azure locks keep the exact-ID unlock, and a shared network
+  filesystem needs no separate rule. Heartbeats moved off the scope's
+  single-attempt client to the root's retrying client, an existing beat
+  counts from its first send, and §7 defines the empty listing. §2 no longer
+  claims every late manifest finds its transaction file: a table's file is
+  swept as an orphan after seven days, so the scope's hold stays. §5 is
+  limited to linear overwrites. The lease length is settled as
+  `OMNIGRAPH_CLUSTER_LEASE_SECONDS`, 2 to 600 seconds, default 30.
