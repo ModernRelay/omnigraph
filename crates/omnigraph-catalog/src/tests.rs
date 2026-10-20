@@ -14835,7 +14835,10 @@ impl ManifestRequestFault {
 
     /// Apply the held create now; returns whether one was held.
     async fn land(&self) -> bool {
-        self.try_land().await.map(Result::unwrap).is_some()
+        self.try_land()
+            .await
+            .map(|answer| answer.unwrap())
+            .is_some()
     }
 
     /// Send the held create now, and return the store's answer to it.
