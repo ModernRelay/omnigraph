@@ -1855,6 +1855,7 @@ pub(crate) async fn run_mutate(
             actor_id,
             commit: receipt.commit.as_ref().map(api::commit_output),
             outcome: None,
+            executed: None,
         })
     })
     .await
@@ -3054,6 +3055,83 @@ pub(crate) struct BranchPath {
     pub(crate) branch: String,
 }
 
+/// The branch actions whose names share `/branches/{branch}`: the router
+/// matches one route for the whole shape, so a branch named like an action
+/// is still a branch for DELETE, and the actions keep their URLs. Each
+/// action's name, method and handler live in this one place.
+#[derive(Clone, Copy)]
+enum BranchAction {
+    Merge,
+    Diff,
+    MergeBase,
+}
+
+impl BranchAction {
+    const ALL: [Self; 3] = [Self::Merge, Self::Diff, Self::MergeBase];
+
+    fn of(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == name)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Diff => "diff",
+            Self::MergeBase => "merge-base",
+        }
+    }
+
+    fn method(self) -> axum::http::Method {
+        match self {
+            Self::Merge => axum::http::Method::POST,
+            Self::Diff | Self::MergeBase => axum::http::Method::GET,
+        }
+    }
+
+    /// Whether `method` runs this action; HEAD runs a GET action.
+    fn serves(self, method: &axum::http::Method) -> bool {
+        *method == self.method()
+            || (*method == axum::http::Method::HEAD && self.method() == axum::http::Method::GET)
+    }
+
+    async fn run(self, request: Request, state: AppState) -> Response {
+        use axum::handler::Handler;
+        match self {
+            Self::Merge => server_branch_merge.call(request, state).await,
+            Self::Diff => server_branch_diff.call(request, state).await,
+            Self::MergeBase => server_merge_base.call(request, state).await,
+        }
+    }
+}
+
+/// Every method of `/branches/{branch}` except DELETE: the action the name
+/// and method select, or 405 naming what that name serves.
+pub(crate) async fn server_branch_action(
+    State(state): State<AppState>,
+    Path(BranchPath { branch }): Path<BranchPath>,
+    request: Request,
+) -> Response {
+    match BranchAction::of(&branch) {
+        Some(action) if action.serves(request.method()) => action.run(request, state).await,
+        action => branch_method_not_allowed(action),
+    }
+}
+
+/// 405 for a method `/branches/{branch}` does not serve for that name, with
+/// the methods it does serve: DELETE for every name, plus an action's own.
+fn branch_method_not_allowed(action: Option<BranchAction>) -> Response {
+    let allow = match action.map(BranchAction::method) {
+        None => "DELETE".to_string(),
+        Some(method) if method == axum::http::Method::GET => "DELETE, GET, HEAD".to_string(),
+        Some(method) => format!("DELETE, {method}"),
+    };
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(axum::http::header::ALLOW, allow)],
+    )
+        .into_response()
+}
+
 #[utoipa::path(
     delete,
     path = "/branches/{branch}",
@@ -3863,6 +3941,15 @@ mod blob_error_tests {
     struct CatalogReadFault;
 
     impl lance::io::WrappingObjectStore for CatalogReadFault {
+        fn wrap_paginated(
+            &self,
+            _: &str,
+            original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            // This wrapper does not observe or change listings.
+            Some(original)
+        }
+
         fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
             Arc::new(CatalogReadFaultStore { target })
         }

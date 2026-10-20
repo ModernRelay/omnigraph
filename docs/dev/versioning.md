@@ -340,11 +340,16 @@ still carries a sidecar until the build that wrote it has resolved it. See
 ## Lance contract
 
 The workspace resolves the unmodified crates.io Lance package family to
-**11.0.0** and explicitly writes stable data storage version **V2_2**.
+**13.0.0** and explicitly writes stable data storage version **V2_2**.
 Engine adapters and compatibility boundaries are documented in
 [lance.md](lance.md). A dependency bump alone
 does not change the OmniGraph manifest format. Adopting a new Lance file format
-or a behavior that changes persisted graph meaning does.
+or a behavior that changes persisted graph meaning does. The Lance 13 bump keeps
+graph format 16 and does not require `omnigraph upgrade` for a format-16 graph.
+Experimental V2_3, spilled row lineage and stable-row-ID fragment-reuse indexes
+remain outside the graph contract. Retaining V2_2 alone is not a general rollback
+guarantee: qualify old readers against actual new writes using the predecessor
+journey in [testing](testing.md#lance-compatibility).
 
 Current compatibility fences and the required upstream reading set are in
 [lance.md](lance.md).
@@ -362,8 +367,8 @@ Data, vectors and blobs are preserved; commit history and branches are not. See
 ## Storage upgrade support matrix
 
 The `storage_upgrade_compatibility` CI job (Storage Upgrade Compatibility)
-builds the genuine stamp-13 CLI from main commit `c0a4519f`, installs the
-released 0.10.0 and 0.11.0 CLIs, and requires the
+builds the genuine stamp-13 CLI from main commit `c0a4519f` and the Lance 11
+CLI from `0a62bb7b`, installs the released 0.10.0 and 0.11.0 CLIs, and requires the
 `storage_upgrade` cases of `crossversion_upgrade.rs`, the engine
 `db::upgrade::tests`, Lance version qualification and protocol guards on
 every change. Missing test cases, empty runs, a missing predecessor binary

@@ -160,8 +160,8 @@ have no built-in behavior.
 Always preview a direct schema change before applying it:
 
 ```bash
-omnigraph schema plan --schema next.pg graph.omni
-omnigraph schema apply --schema next.pg graph.omni
+omnigraph schema plan --schema next.pg --target ./graph.omni
+omnigraph schema apply --schema next.pg --target ./graph.omni
 ```
 
 Supported changes include adding types, adding nullable properties, renaming

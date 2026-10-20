@@ -159,6 +159,129 @@ async fn bootstrap_and_add_graph_use_one_v2_protocol_without_reset() {
 }
 
 #[tokio::test]
+async fn direct_source_operations_use_selected_root_and_same_id_never_reexecutes() {
+    let source = crate::tests::identity_fixture();
+    let selected = tempfile::tempdir().unwrap();
+    let root = selected.path().to_str().unwrap();
+    let source_base = format!("file://{}/", source.path().display());
+    edit_config(source.path(), |config| {
+        config["graphs"]["knowledge"]["external_blobs"] = yaml_serde::from_str(&format!(
+            "allow:\n  - base: {source_base}\n    scope: embedded_only\n"
+        ))
+        .unwrap();
+    });
+    let validated = validate_config_dir(source.path());
+    assert!(validated.ok, "{:?}", validated.diagnostics);
+    let binding = omnigraph_storage::CapturedStorageBinding::capture(
+        root,
+        &omnigraph_storage::StorageDestination::Local,
+    )
+    .unwrap();
+    let preview =
+        plan_config_dir_with_binding_as(source.path(), &binding, Some("principal:owner".into()))
+            .await;
+    assert!(preview.ok, "{:?}", preview.diagnostics);
+    assert!(!source.path().join(CLUSTER_STATE_FILE).exists());
+    assert!(!selected.path().join(CLUSTER_STATE_FILE).exists());
+    let result =
+        apply_deployment_with_binding(source.path(), &binding, None, &owner(), |_, _, _| {})
+            .await
+            .unwrap();
+    let DeploymentLookup::Complete { result } = result else {
+        panic!("{result:?}");
+    };
+    assert!(result.converged);
+    assert!(selected.path().join("graphs/knowledge.omni").is_dir());
+    assert!(!source.path().join("graphs").exists());
+    assert!(!source.path().join(CLUSTER_STATE_FILE).exists());
+    let ledger = fs::read(selected.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let repeated = apply_deployment_with_binding(
+        source.path(),
+        &binding,
+        Some(&result.id),
+        &owner(),
+        |_, _, _| panic!("known identity must not execute"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(repeated, DeploymentLookup::Complete { result: prior } if prior.id == result.id)
+    );
+    assert_eq!(
+        fs::read(selected.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    let observed = observe_config_dir_with_binding(source.path(), &binding).await;
+    assert!(observed.ok, "{:?}", observed.diagnostics);
+    assert_eq!(
+        fs::read(selected.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    let config_path = source.path().join(CLUSTER_CONFIG_FILE);
+    let config = fs::read_to_string(&config_path).unwrap();
+    edit_config(source.path(), |config| {
+        config["graphs"]["knowledge"]["external_blobs"]["allow"][0]["base"] =
+            yaml_serde::Value::String(format!("file://{root}/"));
+    });
+    // Offline source validation has no destination. Plan and apply must still
+    // refuse a policy that overlaps the selected root before ledger effects.
+    assert!(validate_config_dir(source.path()).ok);
+    let overlap =
+        plan_config_dir_with_binding_as(source.path(), &binding, Some("principal:owner".into()))
+            .await;
+    assert!(!overlap.ok);
+    assert!(
+        overlap
+            .diagnostics
+            .iter()
+            .any(|error| error.code == "external_blob_base_overlaps_storage_root")
+    );
+    assert_eq!(
+        apply_deployment_with_binding(source.path(), &binding, None, &owner(), |_, _, _| panic!(
+            "overlapping destination must not execute"
+        ))
+        .await
+        .unwrap_err()
+        .code,
+        "external_blob_base_overlaps_storage_root"
+    );
+    assert_eq!(
+        fs::read(selected.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    fs::write(&config_path, format!("storage: .\n{config}")).unwrap();
+    let refused =
+        plan_config_dir_with_binding_as(source.path(), &binding, Some("principal:owner".into()))
+            .await;
+    assert!(!refused.ok);
+    assert!(
+        refused
+            .diagnostics
+            .iter()
+            .any(|error| error.code == "deployment_input_invalid")
+    );
+    assert!(
+        !observe_config_dir_with_binding(source.path(), &binding)
+            .await
+            .ok
+    );
+    assert_eq!(
+        apply_deployment_with_binding(source.path(), &binding, None, &owner(), |_, _, _| panic!(
+            "mismatched target must not execute"
+        ))
+        .await
+        .unwrap_err()
+        .code,
+        "deployment_input_invalid"
+    );
+    assert_eq!(
+        fs::read(selected.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    assert!(!source.path().join(CLUSTER_STATE_FILE).exists());
+}
+
+#[tokio::test]
 async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
     let dir = crate::tests::identity_fixture();
     let root = dir.path().to_str().unwrap();
@@ -989,6 +1112,78 @@ fn remote_capture_does_not_open_server_storage() {
         fs::write(&config_path, format!("storage: {root}/\n{config}")).unwrap();
         let captured = capture_deployment_for_server(dir.path(), root).unwrap();
         assert_eq!(captured.canonical_root(), root);
+    }
+
+    // Portable source may allow files beside itself. Only the advertised
+    // destination matters, and its path still need not exist on this client.
+    let remote_parent = tempfile::tempdir().unwrap();
+    let remote_path = remote_parent.path().join("server-only-storage");
+    let remote_root = format!("file://{}", remote_path.display());
+    fs::write(&config_path, &config).unwrap();
+    edit_config(dir.path(), |config| {
+        config["graphs"]["knowledge"]["external_blobs"] = yaml_serde::from_str(&format!(
+            "allow:\n  - base: file://{}/\n    scope: embedded_only\n",
+            dir.path().display()
+        ))
+        .unwrap();
+    });
+    let captured = capture_deployment_for_server(dir.path(), &remote_root).unwrap();
+    assert_eq!(captured.canonical_root(), remote_root);
+    assert!(!remote_path.exists());
+    let colocated_root = format!("file://{}", fs::canonicalize(dir.path()).unwrap().display());
+    assert_eq!(
+        capture_deployment_for_server(dir.path(), &colocated_root)
+            .unwrap_err()
+            .code,
+        "deployment_input_invalid"
+    );
+
+    // Direct targets choose storage independently from source. Absence is not
+    // a source-directory fallback, and local assertions are source-relative.
+    fs::write(&config_path, &config).unwrap();
+    let selected = tempfile::tempdir().unwrap();
+    let selected_root = selected.path().to_str().unwrap();
+    let selected_identity = format!(
+        "file://{}",
+        fs::canonicalize(selected.path()).unwrap().display()
+    );
+    let direct = capture_deployment_at_root(dir.path(), selected_root).unwrap();
+    assert_eq!(direct.canonical_root(), selected_identity);
+    for assertion in [selected_root, selected_identity.as_str()] {
+        fs::write(&config_path, format!("storage: {assertion}\n{config}")).unwrap();
+        let asserted = capture_deployment_at_root(dir.path(), selected_root).unwrap();
+        assert_eq!(asserted.canonical_root(), selected_identity);
+        validate_bundle(&asserted, &selected_identity).unwrap();
+    }
+    fs::write(&config_path, &config).unwrap();
+    assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+    assert!(!selected.path().join(CLUSTER_STATE_FILE).exists());
+    assert_eq!(
+        capture_deployment_at_root(dir.path(), missing.to_str().unwrap())
+            .unwrap_err()
+            .code,
+        "storage_root_invalid"
+    );
+    fs::write(&config_path, format!("storage: .\n{config}")).unwrap();
+    assert_eq!(
+        capture_deployment_at_root(dir.path(), selected_root)
+            .unwrap_err()
+            .code,
+        "deployment_input_invalid"
+    );
+    let colocated = capture_deployment_at_root(dir.path(), dir.path().to_str().unwrap()).unwrap();
+    assert_eq!(
+        colocated.canonical_root(),
+        format!("file://{}", fs::canonicalize(dir.path()).unwrap().display())
+    );
+    #[cfg(unix)]
+    {
+        let alias = dir.path().join("selected-alias");
+        std::os::unix::fs::symlink(selected.path(), &alias).unwrap();
+        fs::write(&config_path, format!("storage: ./selected-alias\n{config}")).unwrap();
+        let asserted = capture_deployment_at_root(dir.path(), selected_root).unwrap();
+        assert_eq!(asserted.canonical_root(), selected_identity);
+        validate_bundle(&asserted, &selected_identity).unwrap();
     }
 
     // Existing local roots produce identical frozen input across executors.

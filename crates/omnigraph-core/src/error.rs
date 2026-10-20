@@ -1246,7 +1246,9 @@ fn classify_engine_storage_source<'a>(
             return Break(StorageFailureKind::Unknown);
         }
         return match error {
-            lance::Error::Timeout { .. } => Break(StorageFailureKind::Transient),
+            lance::Error::Timeout { .. } | lance::Error::Backpressure { .. } => {
+                Break(StorageFailureKind::Transient)
+            }
             lance::Error::DiskCapExceeded { .. }
             | lance::Error::InvalidInput { .. }
             | lance::Error::InvalidTableLocation { .. }
@@ -1817,6 +1819,13 @@ mod tests {
         use lance::Error;
 
         assert_lance_kind(Error::timeout("timeout"), StorageFailureKind::Transient);
+        assert_lance_kind(Error::backpressure("busy"), StorageFailureKind::Transient);
+        // A refused substrate write does not prove that the whole graph
+        // operation had no earlier effects, and does not authorize replay.
+        assert_eq!(
+            OmniError::storage(Error::backpressure("busy")).completion_evidence(),
+            None
+        );
 
         for error in [
             Error::disk_cap_exceeded(1, 2),
@@ -1925,6 +1934,7 @@ mod tests {
             for source in [
                 lance::Error::not_found("manifest probe"),
                 lance::Error::timeout("manifest probe"),
+                lance::Error::backpressure("manifest probe"),
                 lance::Error::version_conflict("manifest probe", 43, 42),
             ] {
                 let error = lance::Error::commit_status_unknown_source(42, Box::new(source));
@@ -2392,29 +2402,27 @@ mod tests {
     }
 
     #[test]
-    fn lance_top_level_multiply_owned_shared_has_a_pinned_upstream_type_loss() {
+    fn lance_top_level_multiply_owned_shared_preserves_typed_failures() {
         use datafusion::error::DataFusionError;
         use std::sync::Arc;
 
-        let shared = Arc::new(
-            OmniError::BlobIntegrity {
-                reason: "top-level multiply-owned shared".to_string(),
-            }
-            .into_datafusion_external(),
-        );
-        let retained = Arc::clone(&shared);
-        let lance = lance::Error::from(DataFusionError::Shared(shared));
-        assert!(matches!(lance, lance::Error::Execution { .. }));
-        let lance_message = lance.to_string();
+        for (carried, expected) in supported_stream_failures()
+            .into_iter()
+            .zip(supported_stream_failures())
+        {
+            let shared = Arc::new(carried.into_datafusion_external());
+            let retained = Arc::clone(&shared);
+            assert_eq!(Arc::strong_count(&retained), 2);
 
-        let recovered = OmniError::lance_stream(lance);
-        assert_eq!(
-            recovered.storage_failure().map(|failure| failure.kind),
-            Some(StorageFailureKind::Unknown)
-        );
-        assert_eq!(recovered.to_string(), format!("storage: {lance_message}"));
-        assert!(!matches!(recovered, OmniError::BlobIntegrity { .. }));
-        drop(retained);
+            // Lance 13 keeps a typed Shared source when Arc::try_unwrap cannot
+            // take ownership. The retained consumer must remain live through
+            // recovery, including preservation of explicit completion evidence.
+            let lance = lance::Error::from(DataFusionError::Shared(shared));
+            assert!(matches!(lance, lance::Error::External { .. }));
+            assert_eq!(Arc::strong_count(&retained), 2);
+            assert_same_stream_failure(OmniError::lance_stream(lance), expected);
+            assert_eq!(Arc::strong_count(&retained), 1);
+        }
     }
 
     #[test]

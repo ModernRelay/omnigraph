@@ -1609,7 +1609,7 @@ pub fn record_stage_append(rows: u64) {
     });
 }
 
-/// Record one `stage_merge_insert` of `rows` rows against the active probes.
+/// Record one merge-insert keyed stage of `rows` rows against the active probes.
 /// No-op in production (no probes installed).
 pub fn record_stage_merge_insert(rows: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
@@ -2058,8 +2058,8 @@ async fn dataset_builder(
     let session = session
         .cloned()
         .unwrap_or_else(crate::lance_access::control_session);
+    let mut store_params = crate::storage::lance_store_params_for_session(uri, &session)?;
     builder = builder.with_session(session);
-    let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
     if let Some(wrapper) = wrapper {
         store_params.object_store_wrapper = Some(wrapper.clone());
     }
@@ -2149,6 +2149,12 @@ impl CountingStorageAdapter {
 
 #[async_trait]
 impl StorageAdapter for CountingStorageAdapter {
+    fn binding(&self) -> Option<crate::storage::CapturedStorageBinding> {
+        self.inner.binding()
+    }
+    fn io_scope(&self) -> Option<crate::storage::StorageIoScope> {
+        self.inner.io_scope()
+    }
     async fn read_text(&self, uri: &str) -> Result<String> {
         self.counts.read_text.fetch_add(1, Ordering::Relaxed);
         self.inner.read_text(uri).await

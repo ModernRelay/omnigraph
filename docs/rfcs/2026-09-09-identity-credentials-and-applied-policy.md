@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-10-12
+updated: 2026-10-20
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -15,6 +15,15 @@ blocked_on: []
 ---
 
 # RFC: Identity credentials and applied policy authorization
+
+> **RFC 0059 disposition:** [RFC 0059](0059-config-cli-coherency.md) replaces
+> the connected-folder routing in User behavior and the folder/independent
+> `--organization` selection inputs in Provider-native access and standard clients
+> with managed target identity and an explicit authentication mechanism.
+> Historical: those selection forms and their command examples. Current:
+> provider-native login/refresh, principal and session custody, verified fresh-login
+> organization selection, independent data credentials and current-policy authority.
+> The accepted design's implementation cutover remains tracked by RFC 0059.
 
 ## Summary
 

@@ -15,7 +15,7 @@ use omnigraph_compiler::catalog::Catalog;
 
 use super::memory::WorkMemory;
 use super::producer::producer_stream;
-use super::{external, polled, streaming_properties};
+use super::{breaker_properties, external, polled};
 use crate::loader::csv::{CsvLoadRequest, prepare_csv_batches};
 use crate::table_store::CapturedSource;
 
@@ -51,7 +51,7 @@ impl CsvSourceExec {
                 capture,
                 catalog,
             }),
-            properties: streaming_properties(schema),
+            properties: breaker_properties(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }

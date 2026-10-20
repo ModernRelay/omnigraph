@@ -2,7 +2,7 @@
 use super::*;
 
 mod capture;
-mod pending;
+pub(super) mod pending;
 mod source;
 
 pub(super) fn outcome_exit(state: &str) -> Result<Option<i32>> {
@@ -40,38 +40,22 @@ pub(super) fn handles(command: &ClusterCommand) -> bool {
     )
 }
 
-async fn client(origin: &str, organization: Option<&str>) -> Result<Api> {
-    Api::authenticated(origin.into(), organization).await
-}
-
-fn context_required(config: &Path) -> Result<Context> {
-    read_context(config)?.ok_or_else(|| {
-        Failure::refused(
-            "managed_context_required",
-            "this command requires the selected folder's .omnigraph/context",
-        )
-    })
-}
-
 pub(super) async fn dispatch(
+    binding: &Binding,
+    input: &crate::operator::InvocationConfig,
     command: &ClusterCommand,
     stderr: &mut dyn Write,
 ) -> Result<(Value, i32)> {
-    let (config, _) = config_and_json(command);
+    binding.organization()?;
     match command {
-        ClusterCommand::List {
-            api, organization, ..
-        } => source::list(config, api, organization.as_deref()).await,
-        ClusterCommand::Pull { out, revision, .. } => {
-            source::pull(config, out, revision.as_deref()).await
+        ClusterCommand::List { .. } => {
+            binding.account()?;
+            source::list(binding).await
         }
-        ClusterCommand::Create {
-            name,
-            api,
-            organization,
-            run,
-            ..
-        } => {
+        ClusterCommand::Pull { out, revision, .. } => {
+            source::pull(&binding.context()?, out, revision.as_deref()).await
+        }
+        ClusterCommand::Create { name, run, .. } => {
             if name.is_empty()
                 || name.len() > 64
                 || name.trim() != name
@@ -82,19 +66,17 @@ pub(super) async fn dispatch(
                     "name must contain 1–64 bytes without surrounding whitespace or control characters",
                 ));
             }
-            let origin = canonical_origin(api)?;
+            binding.account()?;
+            let recovery = pending::directory(input, binding)?;
             let body = json!({"name":name});
-            let context = read_context(config)?;
-            let selected =
-                selected_organization(context.as_ref(), &origin, organization.as_deref())?;
             submit(
-                &client(&origin, selected).await?,
+                &binding.client().await?,
                 Submission {
-                    config,
+                    config: &recovery,
                     path: "/v1/clusters".into(),
                     body,
                     kind: "create",
-                    context,
+                    context: None,
                     incarnation: None,
                     run,
                     tombstone: false,
@@ -110,7 +92,14 @@ pub(super) async fn dispatch(
             incarnation, run, ..
         } => {
             identifier(incarnation)?;
-            let context = context_required(config)?;
+            let context = binding.context()?;
+            if incarnation != &context.incarnation {
+                return Err(Failure::refused(
+                    "target_mismatch",
+                    "--incarnation must equal the selected target's cluster_incarnation",
+                ));
+            }
+            let recovery = pending::directory(input, binding)?;
             let (kind, body, tombstone) = match command {
                 ClusterCommand::Delete {
                     retention_seconds, ..
@@ -131,9 +120,9 @@ pub(super) async fn dispatch(
             };
             let path = format!("/v1/clusters/{}:{kind}", context.cluster);
             submit(
-                &client(&context.api, Some(&context.organization_id)).await?,
+                &context.client().await?,
                 Submission {
-                    config,
+                    config: &recovery,
                     path,
                     body,
                     kind,
@@ -148,36 +137,21 @@ pub(super) async fn dispatch(
         }
         ClusterCommand::Operation {
             operation_id: id,
-            api,
-            organization,
             wait,
             timeout,
             ..
         } => {
             identifier(id)?;
-            let context = read_context(config)?;
-            let origin = match (api, &context) {
-                (Some(api), context) => {
-                    let origin = canonical_origin(api)?;
-                    if context.as_ref().is_some_and(|c| c.api != origin) {
-                        return Err(Failure::refused(
-                            "context_mismatch",
-                            "--api differs from the selected folder context",
-                        ));
-                    }
-                    origin
-                }
-                (None, Some(context)) => context.api.clone(),
-                _ => {
-                    return Err(Failure::refused(
-                        "managed_context_required",
-                        "operation status requires --api or a managed folder context",
-                    ));
-                }
+            let context = binding
+                .cluster
+                .as_ref()
+                .map(|_| binding.context())
+                .transpose()?;
+            let api = if let Some(context) = &context {
+                context.client().await?
+            } else {
+                binding.client().await?
             };
-            let selected =
-                selected_organization(context.as_ref(), &origin, organization.as_deref())?;
-            let api = client(&origin, selected).await?;
             let options = ClusterRunArgs {
                 no_wait: !wait,
                 timeout: *timeout,
@@ -208,6 +182,7 @@ pub(super) async fn dispatch(
         ClusterCommand::Push {
             expected_revision,
             message,
+            config,
             ..
         } => {
             if expected_revision.len() != 40
@@ -223,9 +198,10 @@ pub(super) async fn dispatch(
                     "supply a full lowercase Git revision and a message of 1–1024 bytes without control characters",
                 ));
             }
-            let context = context_required(config)?;
+            let context = binding.context()?;
             let body = capture::request(config, expected_revision, message)?;
-            let body = client(&context.api, Some(&context.organization_id))
+            let body = context
+                .client()
                 .await?
                 .request(
                     Method::POST,
@@ -234,7 +210,7 @@ pub(super) async fn dispatch(
                     None,
                 )
                 .await?;
-            cluster_matches(&body, &context.cluster)?;
+            context.verify(&body)?;
             if body["data"]["cluster_id"].as_str() != Some(context.cluster.as_str())
                 || !body["data"]["revision"].as_str().is_some_and(|r| {
                     r.len() == 40
@@ -250,7 +226,8 @@ pub(super) async fn dispatch(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Identity {
     cluster_id: String,
     incarnation: String,
@@ -303,7 +280,8 @@ impl Identity {
         incarnation: Option<&str>,
         operation: Option<&str>,
     ) -> Result<()> {
-        if context.is_some_and(|c| c.cluster != self.cluster_id)
+        if context
+            .is_some_and(|c| c.cluster != self.cluster_id || c.incarnation != self.incarnation)
             || incarnation.is_some_and(|i| i != self.incarnation)
             || operation.is_some_and(|o| o != self.operation_id)
         {
@@ -384,28 +362,8 @@ fn definitive_refusal(response: &Response) -> bool {
     )
 }
 
-async fn submit(
-    api: &Api,
-    mut intent: Submission<'_>,
-    stderr: &mut dyn Write,
-) -> Result<(Value, i32)> {
+async fn submit(api: &Api, intent: Submission<'_>, stderr: &mut dyn Write) -> Result<(Value, i32)> {
     let lock = pending::lock(intent.config)?;
-    let current = read_context(intent.config)?;
-    if intent.kind == "create" {
-        intent.context = current;
-    } else if current
-        .as_ref()
-        .map(|c| (&c.api, &c.cluster, &c.organization_id))
-        != intent
-            .context
-            .as_ref()
-            .map(|c| (&c.api, &c.cluster, &c.organization_id))
-    {
-        return Err(Failure::refused(
-            "context_mismatch",
-            "folder context changed before submission",
-        ));
-    }
     if intent.context.as_ref().is_some_and(|c| {
         c.api != api.origin || !api.account_id().is_ok_and(|org| org == c.organization_id)
     }) {
@@ -425,7 +383,6 @@ async fn submit(
         &intent.body,
         &principal,
         intent.run.idempotency_key.as_deref(),
-        intent.kind == "create" && intent.context.is_some(),
         stderr,
     )?;
     let response = tokio::time::timeout_at(
@@ -453,6 +410,7 @@ async fn submit(
         }
         return Err(Failure {
             body: response.body,
+            response_status: Some(response.status),
             exit: if response.status.is_client_error() {
                 2
             } else {
@@ -463,21 +421,10 @@ async fn submit(
     let response = response.body;
     let identity = Identity::read(&response, Some(intent.kind))?;
     identity.matches(intent.context.as_ref(), intent.incarnation, None)?;
-    // Save the operation before changing context or clearing recovery state. If
+    // Save the operation before clearing recovery state. If
     // local persistence fails, the error still carries the accepted identity.
     let accepted = || -> Result<()> {
-        pending::record(intent.config, &api.origin, &identity)?;
-        if intent.kind == "create" {
-            pending::bind(
-                intent.config,
-                &Context {
-                    version: 2,
-                    organization_id: principal.account_id.clone(),
-                    cluster: identity.cluster_id.clone(),
-                    api: api.origin.clone(),
-                },
-            )?;
-        }
+        pending::record(intent.config, &pending, &identity)?;
         pending::clear(intent.config)?;
         Ok(())
     }();
@@ -543,7 +490,7 @@ async fn wait_operation(
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
             identity.diagnostic(stderr, format_args!(
-                "wait deadline reached; operation {} continues; use cluster operation --managed {}\n",
+                "wait deadline reached; operation {} continues; use cluster operation {} --target NAME\n",
                 identity.operation_id, identity.operation_id
             ))?;
             return Ok((body, 5));
@@ -642,12 +589,11 @@ mod tests {
                 &request,
                 &principal,
                 Some("original-key"),
-                false,
                 &mut delivered,
             )
             .unwrap();
             assert_eq!(delivered, b"Idempotency-Key: original-key\n");
-            let path = temp.path().join(".omnigraph/pending-lifecycle.json");
+            let path = temp.path().join("pending-lifecycle.json");
             let before = std::fs::read(&path).unwrap();
             let error = pending::prepare(
                 temp.path(),
@@ -656,7 +602,6 @@ mod tests {
                 &request,
                 &principal,
                 None,
-                false,
                 &mut FailedOutput::new(fault, 0),
             )
             .err()

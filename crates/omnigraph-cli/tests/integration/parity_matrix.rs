@@ -3,8 +3,8 @@
 //! For every CLI verb with an `is_remote` fork, run the identical
 //! invocation against (a) the local graph directly and (b) a spawned
 //! server on a twin copy of the same graph. Actor-bearing operations use the
-//! SAME actor on both arms (local `--as act-parity`; remote bearer token
-//! resolving to `act-parity`); read-only Blob commands reject `--as`.
+//! SAME actor on both arms (local `operator.actor: act-parity`, which writes
+//! resolve and reads ignore; remote bearer token resolving to `act-parity`).
 //! Scrub the declared-volatile allowlist
 //! (`support::scrub_volatile` — ids, wall-clock, transport locations);
 //! everything else must match exactly.
@@ -26,11 +26,12 @@ const KNOWN_DIVERGENCES: &[&str] = &[
 ];
 
 /// One matched setup per row: twin graphs + the parity Cedar bundle on the
-/// served arm. The local (`--store`) arm carries no policy (RFC-011); the
+/// served arm. The local (`--target`) arm carries no policy (RFC-011); the
 /// bundle is permissive for `act-parity`, so the arms still agree.
 struct Parity {
     _temp: TempDir,
     local: std::path::PathBuf,
+    local_operator_home: std::path::PathBuf,
     server: TestServer,
     blob_external_uri: Option<String>,
 }
@@ -49,9 +50,11 @@ fn parity() -> Parity {
             r#"{"act-parity":"parity-tok"}"#,
         )],
     );
+    let local_operator_home = parity_operator_home(temp.path());
     Parity {
         _temp: temp,
         local,
+        local_operator_home,
         server,
         blob_external_uri: None,
     }
@@ -68,9 +71,11 @@ fn blob_parity() -> Parity {
             r#"{"act-parity":"parity-tok"}"#,
         )],
     );
+    let local_operator_home = parity_operator_home(temp.path());
     Parity {
         _temp: temp,
         local,
+        local_operator_home,
         server,
         blob_external_uri: Some(blob_external_uri),
     }
@@ -93,7 +98,7 @@ fn blob_write_parity() -> Parity {
 
 impl Parity {
     fn run(&self, args: &[&str]) -> (std::process::Output, std::process::Output) {
-        run_both(&self.local, &self.server, args)
+        run_both(&self.local, &self.local_operator_home, &self.server, args)
     }
 }
 
@@ -267,15 +272,15 @@ fn parity_schema_show() {
     std::fs::write(
         home.join("config.yaml"),
         format!(
-            "servers:\n  local:\n    url: '{}'\nprofiles:\n  catalogue:\n    server: local\n    default_graph: og_catalog\n",
+            "target_config_version: 1\ntargets:\n  local:\n    kind: server\n    endpoint: '{}'\n    credential: local\n    default_graph: og_catalog\n",
             p.server.base_url
         ),
     )
     .unwrap();
     for addressing in [
-        vec!["--store", "og_catalog"],
-        vec!["--server", &p.server.base_url, "--graph", "og_catalog"],
-        vec!["--profile", "catalogue"],
+        vec!["--target", "og_catalog"],
+        vec!["--target", &p.server.base_url, "--graph", "og_catalog"],
+        vec!["--target", "local"],
     ] {
         let output = output_success(
             cli()
@@ -446,14 +451,13 @@ fn parity_mutate() {
             command.args(args);
             if arm == "local" {
                 command
-                    .arg("--store")
-                    .arg(&p.local)
-                    .arg("--as")
-                    .arg(PARITY_ACTOR);
+                    .env("OMNIGRAPH_HOME", &p.local_operator_home)
+                    .arg("--target")
+                    .arg(&p.local);
             } else {
                 command
                     .envs(p.server.credential(PARITY_TOKEN))
-                    .arg("--server")
+                    .arg("--target")
                     .arg(&p.server.base_url)
                     .arg("--graph")
                     .arg(PARITY_GRAPH_ID);
@@ -708,6 +712,7 @@ fn parity_verb_and_statement_agree() {
         assert_eq!(verb["name"], "via-verb", "{arm}: verb name");
         assert_eq!(stmt["outcome"]["name"], "via_stmt", "{arm}: statement name");
         assert_eq!(verb["actor_id"], stmt["actor_id"], "{arm}: create actor");
+        assert_eq!(verb["actor_id"], PARITY_ACTOR, "{arm}: create actor");
     }
 
     let (verb_l, verb_r) = p.run(&["branch", "list", "--json"]);
@@ -745,6 +750,7 @@ fn parity_verb_and_statement_agree() {
             "{arm}: nothing to merge"
         );
         assert_eq!(verb["actor_id"], stmt["actor_id"], "{arm}: merge actor");
+        assert_eq!(verb["actor_id"], PARITY_ACTOR, "{arm}: merge actor");
     }
 
     let (verb_l, verb_r) = p.run(&["branch", "delete", "via-verb", "--yes", "--json"]);
@@ -758,6 +764,7 @@ fn parity_verb_and_statement_agree() {
             "{arm}: statement delete"
         );
         assert_eq!(verb["actor_id"], stmt["actor_id"], "{arm}: delete actor");
+        assert_eq!(verb["actor_id"], PARITY_ACTOR, "{arm}: delete actor");
     }
     let (verb_l, _) = p.run(&["branch", "list", "--json"]);
     assert_eq!(
@@ -876,9 +883,11 @@ fn parity_load_embedding_diagnostics() {
             r#"{"act-parity":"parity-tok"}"#,
         )],
     );
+    let local_operator_home = parity_operator_home(temp.path());
     let p = Parity {
         _temp: temp,
         local,
+        local_operator_home,
         server,
         blob_external_uri: None,
     };
@@ -1039,7 +1048,7 @@ fn assert_slow_export_and_baseline_complete(p: &Parity) {
         "--json",
     ]);
     assert_write_parity("slow export fixture", &local, &remote);
-    let expected = output_success(cli().args(["export", "--store", p.local.to_str().unwrap()]));
+    let expected = output_success(cli().args(["export", "--target", p.local.to_str().unwrap()]));
     assert!(
         expected.stdout.len() > 8 * 1024 * 1024,
         "fixture must exceed socket buffers"
@@ -1381,8 +1390,12 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
             normalized_blob_receipt(verb, "remote", &remote),
             "{verb}: normalized receipts diverge (left=local, right=remote)"
         );
-        if verb == "blob put" {
-            assert_eq!(parse_stdout_json(&local)["actor_id"], PARITY_ACTOR);
+        for (arm, output) in [("local", &local), ("remote", &remote)] {
+            assert_eq!(
+                parse_stdout_json(output)["actor_id"],
+                PARITY_ACTOR,
+                "{verb}: {arm}"
+            );
         }
         if verb.ends_with("null cell") {
             assert!(parse_stdout_json(&local)["commit"].is_null());

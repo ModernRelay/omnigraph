@@ -194,8 +194,8 @@ state. Then rebuild every full-text index on every live branch that needs
 full-text search:
 
 ```bash
-omnigraph branch list --store graph.omni --json
-omnigraph rebuild-full-text-indexes --store graph.omni \
+omnigraph-v0.10 branch list --store graph.omni --json
+omnigraph-v0.10 rebuild-full-text-indexes --store graph.omni \
   --branch main --as operator --json
 ```
 
@@ -226,20 +226,20 @@ entity, property, graph-manifest, and published-dataset terms plus
 |---|---|
 | `omnigraph.yaml` | `cluster.yaml` for team deployment plus `~/.omnigraph/config.yaml` for operator settings |
 | `cli.actor` | `operator.actor` |
-| `cli.graph` / `server.graph` | `defaults.default_graph` plus optional `defaults.server` |
+| `cli.graph` / `server.graph` | a target’s `default_graph` plus `defaults.target` |
 | `targets:` / `target:` | `graphs:` / `graph:` |
 
 `omnigraph.yaml` is removed and there is no automatic config migration. Move
 schema/query/policy declarations into `cluster.yaml`; move identity, named
-servers, output defaults, profiles, and aliases into the operator file.
+targets, output defaults and aliases into the versioned operator file.
 
 ## Retired addressing and verbs
 
 | Before | Current |
 |---|---|
-| `--target <name>` | `--server`, `--store`, `--cluster`, or `--profile`, as the command permits |
-| positional HTTP URL | `--server <name|url>` |
-| `--cluster-graph <id>` | `--cluster <dir|uri> --graph <id>` |
+| `--server`, `--store`, `--cluster`, `--profile` | One complete `--target NAME\|ADDRESS`; use `target import` for legacy operator configuration |
+| positional backend URL or URI | `--target NAME\|ADDRESS` (only `init` retains its positional creation address) |
+| `--cluster-graph <id>` | `--target ROOT --graph ID` |
 | query `--name <q>` | positional query name plus `--query`/`-e` for ad-hoc source |
 | `ingest` | `load --mode <append|merge|overwrite>` |
 | `read` / `change` | `query` / `mutate` |
@@ -249,11 +249,11 @@ servers, output defaults, profiles, and aliases into the operator file.
 The server is cluster-only: start it with `omnigraph-server --cluster
 <dir|file://|s3://|az://>`. Data-plane commands do not take the cluster
 control-plane `--config` flag. `policy` and the stored-query registry use
-`--cluster` plus optional `--graph`.
+`--target ROOT` plus optional `--graph`.
 
 Direct `schema apply` remains available for a non-cluster store. A cluster-only
 server rejects the legacy schema-apply route with `409`; edit the declared `.pg`
-and submit it with `cluster apply --server <name|url> --config <dir>`.
+and submit it with `cluster apply --target NAME --config DIR`.
 
 ## HTTP compatibility aliases
 

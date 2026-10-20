@@ -60,13 +60,13 @@ OmniGraph never deletes the external source object.
 ## CLI reads
 
 Select one cell as `<node|edge> <TYPE> <ID> <PROPERTY>` and address the graph
-with `--store`, `--server`, or a profile. A keyed edge's `<ID>` is its derived
+with `--target NAME|ADDRESS`. A keyed edge's `<ID>` is its derived
 JSON-array id (for example `'["alice","bob"]'`):
 
 ```bash
-omnigraph blob stat node Document manual content --store graph.omni --json
+omnigraph blob stat node Document manual content --target ./graph.omni --json
 omnigraph blob get node Document manual content \
-  --store graph.omni --out manual.bin
+  --target ./graph.omni --out manual.bin
 ```
 
 Use `--branch` or the mutually exclusive `--snapshot`. `get` supports

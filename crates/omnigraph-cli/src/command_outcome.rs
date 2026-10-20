@@ -24,6 +24,12 @@ pub(crate) struct Evidence {
     retry_after: Option<String>,
 }
 
+impl Evidence {
+    pub(crate) fn has_no_effects(&self) -> bool {
+        self.dispatched == 0 && !self.writable_open
+    }
+}
+
 tokio::task_local! {
     static COMMAND: Arc<Mutex<Evidence>>;
 }

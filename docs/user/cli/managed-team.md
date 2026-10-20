@@ -8,30 +8,26 @@ administration, and the organization must already be activated by its operator.
 Sign in to the selected organization:
 
 ```sh
-omnigraph login --api https://control.example --organization org_customer
+omnigraph login --target account
 ```
 
-Every command below requires `organization --managed` (`org` is an alias) and
-uses the cached organization session. The caller needs the exact organization
-control grant `{cluster: null, verb: members_manage}`. A WorkOS role or legacy
-administrator flag does not imply that grant. The initial administrator receives
-it through the service operator's enrollment procedure.
+Every command below uses `--target account`, a managed account target with an
+explicit API, organization ID and authentication mechanism. `org` aliases
+`organization`. The caller needs the exact organization control grant
+`{cluster: null, verb: members_manage}`; a provider role alone does not imply it.
+The service operator's enrollment procedure grants the initial administrator.
 
-Supply `--api` and `--organization`, or run in a bound configuration directory.
-`--config DIR` selects another directory. An explicit API or organization must
-agree with that folder's context. In an unbound directory, omitting
-`--organization` works only when one cached organization exists for that API.
-These commands never modify the folder binding. `--json` emits the validated API
-envelope instead of readable text.
+These commands never use folder context or change the target. A cluster target
+cannot administer its organization implicitly. The organization in a member
+patch must equal the account target before any credential or request is used.
+`--json` emits the validated API envelope.
 
 ## Invite and find people
 
 ```sh
-omnigraph organization --managed --api https://control.example \
-  --organization org_customer invitations send avery@example.com \
+omnigraph organization --target account invitations send avery@example.com \
   --idempotency-key invite-avery-20261015
-omnigraph organization --managed --api https://control.example \
-  --organization org_customer invitations list --json
+omnigraph organization --target account invitations list --json
 ```
 
 The invitation email lets the recipient join the organization. Wait for
@@ -40,8 +36,7 @@ or graph permissions. List the organization directory to find the exact user ID,
 provider membership status and current local grant version:
 
 ```sh
-omnigraph organization members list --managed --api https://control.example \
-  --organization org_customer --json
+omnigraph organization members list --target account --json
 ```
 
 This complete directory includes active, pending and inactive provider members,
@@ -55,13 +50,13 @@ as `--after CURSOR` to fetch the next page. A null cursor means the last page.
 To resend or cancel an invitation, use its exact ID:
 
 ```sh
-omnigraph org invitations resend invitation_example --managed \
+omnigraph org invitations resend invitation_example --target account \
   --idempotency-key resend-avery-20261015
-omnigraph org invitations revoke invitation_example --managed \
+omnigraph org invitations revoke invitation_example --target account \
   --idempotency-key revoke-avery-20261015
 ```
 
-These examples use a bound folder. Invitation output never includes acceptance
+These examples select the account explicitly. Invitation output never includes acceptance
 URLs or invitation tokens.
 
 ## Enroll and grant cluster access
@@ -84,7 +79,7 @@ add:
 ```
 
 ```sh
-omnigraph organization members apply member.yaml --managed \
+omnigraph organization members apply member.yaml --target account \
   --idempotency-key enroll-avery-20261015 --json > member-receipt.json
 ```
 
@@ -109,14 +104,14 @@ appropriate Cedar policy through the normal [source and deployment
 workflow](managed-lifecycle.md#prepare-and-apply-configuration). Grant only the
 intended graph and configuration permissions, retaining another manager.
 
-The teammate then signs in, discovers the cluster and binds a directory:
+The teammate configures their own account target, signs in and discovers the
+cluster, then adds a complete cluster target from its returned identity:
 
 ```sh
-omnigraph login --api https://control.example --organization org_customer
-omnigraph cluster list --managed --api https://control.example \
-  --organization org_customer
-omnigraph use CLUSTER_ID --api https://control.example \
-  --organization org_customer --config my-cluster
+omnigraph login --target account
+omnigraph cluster list --target account
+# Add the cluster entry under targets, then verify the selected destination.
+omnigraph target show production
 ```
 
 Verify a permitted graph read, a reversible write if granted, and a forbidden
@@ -132,8 +127,8 @@ configuration manager.
 Then read the current grant version and offboard the exact user:
 
 ```sh
-omnigraph organization members list --managed --json
-omnigraph organization members offboard user_avery --managed \
+omnigraph organization members list --target account --json
+omnigraph organization members offboard user_avery --target account \
   --expected-version 4 --idempotency-key offboard-avery-20261015 --json
 ```
 

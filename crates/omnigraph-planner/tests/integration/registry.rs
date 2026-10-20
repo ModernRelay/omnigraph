@@ -396,11 +396,11 @@ fn physical_ids(node: &serde_json::Value, out: &mut Vec<u64>) {
 }
 
 /// Pins a wire constant and a wire key that no query result shows: the
-/// document stamps `explain_version` 6, and every physical node carries the
+/// document stamps `explain_version` 7, and every physical node carries the
 /// `id` of its node in the plan.
 #[test]
-fn explain_version_is_six_and_every_physical_node_carries_its_id() {
-    assert_eq!(omnigraph_planner::explain::EXPLAIN_VERSION, 6);
+fn explain_version_is_seven_and_every_physical_node_carries_its_id() {
+    assert_eq!(omnigraph_planner::explain::EXPLAIN_VERSION, 7);
     let Decision::Engine { plan, explain, .. } = futures::executor::block_on(
         route(
             &documents_query(),
@@ -413,7 +413,7 @@ fn explain_version_is_six_and_every_physical_node_carries_its_id() {
         panic!("read query did not build an engine plan");
     };
     let document = explain.to_value();
-    assert_eq!(document["explain_version"], 6);
+    assert_eq!(document["explain_version"], 7);
     assert!(
         document.get("logical_plan_initial").is_some(),
         "the document carries the pre-rewrite logical plan"

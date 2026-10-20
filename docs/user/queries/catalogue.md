@@ -16,7 +16,7 @@ query operators() {
 ```
 
 The declarations, one per type, are in [`catalogue.gq`](catalogue.gq);
-`omnigraph schema show og_catalog` prints them. Ordinary `schema show`
+`omnigraph schema show --target og_catalog` prints them. Ordinary `schema show`
 prints only the graph's reusable schema source; `--json` includes the
 built-in declarations in the separate `catalogue_source` field.
 
@@ -24,9 +24,9 @@ built-in declarations in the separate `catalogue_source` field.
 
 | Scope | Command |
 |---|---|
-| no store at all | `omnigraph query --store og_catalog -e '<gq>'` |
-| beside a graph's own types | `omnigraph query --store <uri> -e '<gq>'` |
-| served | `omnigraph query --server <name> --graph og_catalog -e '<gq>'` |
+| no store at all | `omnigraph query --target og_catalog -e '<gq>'` |
+| beside a graph's own types | `omnigraph query --target <uri> -e '<gq>'` |
+| served | `omnigraph query --target <name> --graph og_catalog -e '<gq>'` |
 
 `og_catalog` is a reserved scope the binary serves without opening a store:
 no branch, no snapshot, no graph commit in the answer, and `--branch` or

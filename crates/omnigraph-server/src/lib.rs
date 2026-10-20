@@ -65,7 +65,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
@@ -3459,10 +3459,13 @@ pub fn build_app(state: AppState) -> Router {
             "/branches",
             get(server_branch_list).post(server_branch_create),
         )
-        .route("/branches/{branch}", delete(server_branch_delete))
-        .route("/branches/merge", post(server_branch_merge))
-        .route("/branches/diff", get(server_branch_diff))
-        .route("/branches/merge-base", get(server_merge_base))
+        // One route owns `/branches/{name}`: the branch actions `merge`,
+        // `diff` and `merge-base` share its shape, so it dispatches them by
+        // name and method, and DELETE of any name deletes that branch.
+        .route(
+            "/branches/{branch}",
+            axum::routing::delete(server_branch_delete).fallback(server_branch_action),
+        )
         .route("/commits", get(server_commit_list))
         .route(
             "/commits/{commit_id}",

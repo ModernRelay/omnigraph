@@ -908,6 +908,46 @@ physical_nodes! {
     } => "FragmentWrite" [input: NodeId];
 }
 
+impl PhysicalNode {
+    /// Whether the node's operator emits nothing until it has seen all of its
+    /// input, the cut between two pipelines ([`PhysicalPlan::pipelines`]).
+    /// The engine's lowering refuses a plan whose operator declares otherwise
+    /// (`EmissionType::Final` against `Incremental`), so the two cannot drift.
+    /// A source has no input to hold and a `FragmentWrite` is the pipeline's
+    /// end, whose emission is its input's; neither is a cut. An `Expand`
+    /// holds its paths only as a costed multi-hop traversal: one hop streams
+    /// its pairs and a budgeted traversal streams its frontier.
+    pub fn breaks_pipeline(&self) -> bool {
+        match self {
+            Self::Sort { .. }
+            | Self::Aggregate { .. }
+            | Self::AntiJoin { .. }
+            | Self::RankFuse { .. }
+            | Self::Validate { .. } => true,
+            Self::Expand {
+                max_hops, policy, ..
+            } => !(*max_hops == Some(1) || matches!(policy, ExpandPolicy::Budgeted)),
+            Self::MetadataCount { .. }
+            | Self::Scan { .. }
+            | Self::OuterReference { .. }
+            | Self::CsvSource { .. }
+            | Self::HashJoin { .. }
+            | Self::SortMergeJoin { .. }
+            | Self::CrossJoin { .. }
+            | Self::ContainsJoin { .. }
+            | Self::RowCompare { .. }
+            | Self::ClassifyThreeWay { .. }
+            | Self::HydrateByAddress { .. }
+            | Self::HydrateColumns { .. }
+            | Self::Page { .. }
+            | Self::Limit { .. }
+            | Self::Filter { .. }
+            | Self::Projection { .. }
+            | Self::FragmentWrite { .. } => false,
+        }
+    }
+}
+
 /// One `@Operator` row: a distinct explain name and the sorted, distinct
 /// child counts every kind reporting that name admits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1467,12 +1507,18 @@ impl PhysicalPlan {
         value
     }
 
-    /// The pipelines the push operators build for a diff or merge plan:
-    /// walking from the root, a streaming node joins the current pipeline; a
-    /// join with a build side ends it and starts a child pipeline for the
-    /// build input; a scan is the source. Child pipelines come first, so a
-    /// pipeline's `depends_on` names only earlier pipelines, and the last
-    /// pipeline is the root one feeding the consumer.
+    /// The plan cut into pipelines: walking from the root, a streaming node
+    /// joins the current pipeline; a join with a build side ends it and starts
+    /// a child pipeline for the build input; a node that emits nothing before
+    /// it has seen all of its input ([`PhysicalNode::breaks_pipeline`]) ends
+    /// it too, the input chain becoming a child pipeline drained into the
+    /// breaker and the breaker the source of the pipeline above; a scan is a
+    /// source. Child pipelines come first, so a pipeline's `depends_on` names
+    /// only earlier pipelines, and the last pipeline is the root one feeding
+    /// the consumer. The push executor builds diff and merge plans from this
+    /// decomposition; for a query or a load it describes the pull chain the
+    /// engine lowers, cut where its operators declare that they hold their
+    /// input.
     pub fn pipelines(&self) -> Vec<PipelineSpec> {
         let mut pipelines = Vec::new();
         let mut operators = Vec::new();
@@ -1507,6 +1553,7 @@ impl PhysicalPlan {
         let sink = match pipeline.sink {
             PipelineSink::Consumer => json!({ "name": "consumer" }),
             PipelineSink::Node(id) => json!({ "id": id, "name": self.sink_name(id) }),
+            PipelineSink::Breaker(id) => json!({ "id": id, "name": self.breaker_name(id) }),
         };
         json!({
             "id": pipeline.id,
@@ -1587,10 +1634,12 @@ impl PhysicalPlan {
         match self.node(id) {
             Some(PhysicalNode::HashJoin { .. }) => "HashJoin(probe)".to_string(),
             Some(PhysicalNode::SortMergeJoin { .. }) => "SortMergeJoin(probe)".to_string(),
+            Some(PhysicalNode::CrossJoin { .. }) => "CrossJoin(probe)".to_string(),
+            Some(PhysicalNode::ContainsJoin { .. }) => "ContainsJoin(probe)".to_string(),
             Some(PhysicalNode::Scan {
                 source: ScanInput::Dependent { .. },
                 ..
-            }) => "Scan(input ids)".to_string(),
+            }) => "Scan(input_ids)".to_string(),
             Some(PhysicalNode::HydrateByAddress { side, .. }) => {
                 format!("HydrateByAddress({})", side.name())
             }
@@ -1605,8 +1654,19 @@ impl PhysicalPlan {
         match self.node(id) {
             Some(PhysicalNode::HashJoin { .. }) => "HashJoin(build)".to_string(),
             Some(PhysicalNode::SortMergeJoin { .. }) => "SortMergeJoin(build)".to_string(),
+            Some(PhysicalNode::CrossJoin { .. }) => "CrossJoin(build)".to_string(),
+            Some(PhysicalNode::ContainsJoin { .. }) => "ContainsJoin(build)".to_string(),
             Some(PhysicalNode::AntiJoin { .. }) => "AntiJoin(inner)".to_string(),
             Some(PhysicalNode::RankFuse { .. }) => "RankFuse(secondary)".to_string(),
+            Some(node) => node.name().to_string(),
+            None => "tombstone".to_string(),
+        }
+    }
+
+    /// The name a breaker occurrence of `id` prints: the node itself, the
+    /// whole of whose input the pipeline is.
+    fn breaker_name(&self, id: NodeId) -> String {
+        match self.node(id) {
             Some(node) => node.name().to_string(),
             None => "tombstone".to_string(),
         }
@@ -1656,23 +1716,27 @@ impl PhysicalPlan {
                 right,
                 build: false,
                 ..
-            }
-            | PhysicalNode::CrossJoin { left, right, .. }
-            | PhysicalNode::ContainsJoin { left, right, .. } => PipelineSource::Streaming {
+            } => PipelineSource::Streaming {
                 node: id,
                 left: self.side_chain(*left, pipelines, depends_on),
                 right: self.side_chain(*right, pipelines, depends_on),
             },
+            PhysicalNode::CrossJoin { left, right, .. }
+            | PhysicalNode::ContainsJoin { left, right, .. } => {
+                depends_on.push(self.build_pipeline(*left, id, pipelines));
+                operators.push(id);
+                self.pipeline_of(*right, operators, pipelines, depends_on)
+            }
             PhysicalNode::AntiJoin { input, inner, .. } => {
                 depends_on.push(self.build_pipeline(*inner, id, pipelines));
-                operators.push(id);
-                self.pipeline_of(*input, operators, pipelines, depends_on)
+                depends_on.push(self.breaker_pipeline(*input, id, pipelines));
+                PipelineSource::Node(id)
             }
             PhysicalNode::RankFuse { arms, .. } => {
                 let [primary, secondary] = arms;
                 depends_on.push(self.build_pipeline(secondary.input, id, pipelines));
-                operators.push(id);
-                self.pipeline_of(primary.input, operators, pipelines, depends_on)
+                depends_on.push(self.breaker_pipeline(primary.input, id, pipelines));
+                PipelineSource::Node(id)
             }
             PhysicalNode::RowCompare { input }
             | PhysicalNode::ClassifyThreeWay { input }
@@ -1687,11 +1751,39 @@ impl PhysicalPlan {
             | PhysicalNode::Sort { input, .. }
             | PhysicalNode::Validate { input, .. }
             | PhysicalNode::FragmentWrite { input, .. } => {
+                if node.breaks_pipeline() {
+                    depends_on.push(self.breaker_pipeline(*input, id, pipelines));
+                    return PipelineSource::Node(id);
+                }
                 operators.push(id);
                 self.pipeline_of(*input, operators, pipelines, depends_on)
             }
             PhysicalNode::CsvSource { .. } => PipelineSource::Node(id),
         }
+    }
+
+    /// The whole input of breaker `sink`: its own pipeline, drained into the
+    /// breaker before the pipeline the breaker feeds starts. Returns the
+    /// child pipeline's id.
+    fn breaker_pipeline(
+        &self,
+        input: NodeId,
+        sink: NodeId,
+        pipelines: &mut Vec<PipelineSpec>,
+    ) -> usize {
+        let mut operators = Vec::new();
+        let mut depends_on = Vec::new();
+        let source = self.pipeline_of(input, &mut operators, pipelines, &mut depends_on);
+        operators.reverse();
+        let id = pipelines.len();
+        pipelines.push(PipelineSpec {
+            id,
+            source,
+            operators,
+            sink: PipelineSink::Breaker(sink),
+            depends_on,
+        });
+        id
     }
 
     /// The build side of `sink`: its own pipeline, drained into `sink`
@@ -1737,10 +1829,11 @@ impl PhysicalPlan {
     }
 }
 
-/// One pipeline of a diff or merge plan: `source` feeds `operators` in run
-/// order and the last operator's output reaches `sink`. The push executor
-/// consumes the same decomposition explain serializes, so the printed
-/// pipelines are the executed ones.
+/// One pipeline of a plan: `source` feeds `operators` in run order and the
+/// last operator's output reaches `sink`. The push executor consumes the same
+/// decomposition explain serializes, and the engine's lowering checks every
+/// operator's declared emission against [`PhysicalNode::breaks_pipeline`], so
+/// the printed pipelines are the executed ones on every route.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineSpec {
     /// Position in [`PhysicalPlan::pipelines`], child pipelines first.
@@ -1760,9 +1853,9 @@ pub enum PipelineSource {
     /// A single source node: a table scan, a metadata count, or an outer
     /// reference.
     Node(NodeId),
-    /// A streaming two-sided node (a sort-merge join without a build side, a
-    /// cross join, a contains join): each side is its own chain the node
-    /// pulls, not a separately drained pipeline.
+    /// A sort-merge join without a build side: each side is its own chain the
+    /// node pulls, not a drained pipeline. A cross join and a contains join
+    /// collect their left side, so that side is a build pipeline instead.
     Streaming {
         node: NodeId,
         left: SideChain,
@@ -1788,4 +1881,8 @@ pub enum PipelineSink {
     /// The pipeline drains into this node's build side before the pipeline
     /// holding the node as an operator starts.
     Node(NodeId),
+    /// The pipeline drains into this node, which emits nothing until it has
+    /// seen all of its input ([`PhysicalNode::breaks_pipeline`]); the node's
+    /// output is the source of the pipeline that depends on this one.
+    Breaker(NodeId),
 }
