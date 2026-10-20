@@ -6,8 +6,10 @@
   not settle answers `500` `outcome_unknown` whatever failed underneath, and
   every `503` that asks for a retry, a graph that is not served or closed
   admission, carries `Retry-After` as a `429` does. `ErrorCode` in
-  `openapi.json` names each code's status and meaning, every protected
-  operation documents the `404` and `405` its router answers, and header
+  `openapi.json` names each code's statuses and meaning, two for
+  `branch_start_refusal` (`409`, and `410` for a commit that is no longer
+  retained), every protected operation documents the `404` and `405` its
+  router answers, and header
   parameters are published as `Omnigraph-Http-Api` and
   `Omnigraph-If-Actor`. Update clients that matched those refusals by
   `conflict` or `bad_request`, and regenerate clients that key on header
