@@ -19,8 +19,10 @@
 //! head, a branch delete, historical and commit-addressed reads, the change
 //! feed, export and maintenance.
 //!
-//! Runs only against a configured plain-HTTP endpoint (RustFS in CI); it
-//! needs its own process because the child re-executes this binary.
+//! Runs only against a configured plain-HTTP endpoint the forwarders can
+//! front (RustFS in CI) and skips, naming why, for AWS itself or an HTTPS
+//! endpoint. It needs its own process because the child re-executes this
+//! binary.
 
 mod helpers;
 
@@ -104,20 +106,13 @@ fn bound_handle_never_reaches_the_ambient_endpoint() {
         eprintln!("skipping s3 bound-storage decoy test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };
-    let configured = ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL", "AWS_ENDPOINT"]
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .expect("a configured S3 test bucket names its endpoint in AWS_ENDPOINT_URL_S3");
-    let upstream = configured
-        .strip_prefix("http://")
-        .unwrap_or_else(|| {
-            panic!("the bound-storage decoy test forwards plain HTTP; {configured} is not")
-        })
-        .trim_end_matches('/')
-        .to_socket_addrs()
-        .expect("the configured endpoint resolves")
-        .next()
-        .expect("the configured endpoint resolves to an address");
+    let upstream = match plain_http_upstream() {
+        Ok(upstream) => upstream,
+        Err(reason) => {
+            eprintln!("skipping s3 bound-storage decoy test: {reason}");
+            return;
+        }
+    };
     let region = std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|_| "us-east-1".into());
@@ -325,6 +320,34 @@ async fn bound_handle_workload_child() {
     .await
     .unwrap();
     assert_eq!(rows.num_rows(), 1);
+}
+
+/// The address of the configured S3-compatible endpoint, when it is one the
+/// forwarders can relay: they parse plain HTTP, so AWS itself (no endpoint
+/// override) and an HTTPS endpoint are reasons to skip, not failures.
+fn plain_http_upstream() -> Result<SocketAddr, String> {
+    let Some((name, configured)) = ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL", "AWS_ENDPOINT"]
+        .iter()
+        .find_map(|name| Some((*name, std::env::var(name).ok()?)))
+    else {
+        return Err(
+            "no S3 endpoint override is set (AWS itself); it needs a plain-HTTP \
+                    endpoint in AWS_ENDPOINT_URL_S3"
+                .into(),
+        );
+    };
+    let Some(authority) = configured.strip_prefix("http://") else {
+        return Err(format!(
+            "{name} is not a plain-HTTP endpoint; the decoy forwarders relay only http://"
+        ));
+    };
+    let upstream = authority
+        .trim_end_matches('/')
+        .to_socket_addrs()
+        .unwrap_or_else(|error| panic!("{name} does not resolve: {error}"))
+        .next()
+        .unwrap_or_else(|| panic!("{name} resolves to no address"));
+    Ok(upstream)
 }
 
 fn graph_version(snapshot: &Snapshot) -> u64 {
