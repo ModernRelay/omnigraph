@@ -455,12 +455,15 @@ These are representation limits, not a combined allocator/RSS budget; native
 scan buffers, conversion copies and validation's derived state are outside them.
 The captured `WriteBudget` also supplies `FileWriterOptions.data_cache_bytes`
 for absence-proven strict inserts and staged overwrite batches. Lance divides
-this accumulation target by top-level field count; a field flushes after an
-incoming array crosses its threshold. Nested encoders can each hold a share,
-and concurrent table writers each receive the target. Buffered slices keep
-copying enabled. The write still selects V2_2, and no encoded-page-size bound
-is added. Native merge-insert does not expose writer options, so upserts and
-known-present updates retain native buffering defaults.
+this accumulation target by top-level field count. At the default 32 MiB,
+fewer than four fields receive a higher threshold than Lance's native 8 MiB
+per field, and more than four receive a lower threshold. A field flushes after
+an incoming array crosses its threshold. Nested encoders can each hold a
+share, and concurrent table writers each receive the target. Buffered slices
+keep copying enabled. These writes retain the existing dataset's V2_2 format,
+and no encoded-page-size bound is added. Native merge-insert does not expose
+writer options, so upserts and known-present updates retain native buffering
+defaults.
 Refusal precedes the current
 operation's fragment staging and publication, though writable open may have
 completed earlier schema work and a load may already have created its branch.

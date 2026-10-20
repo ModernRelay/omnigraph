@@ -247,8 +247,13 @@ A nearest scan also reports `node` `ann_metrics` for each measured attempt:
 | `detail` key | Meaning |
 |---|---|
 | `id`, `rung`, `attempt` | the scan node, overfetch pass and zero-based position in that pass's `probes.attempts` list |
-| `counts` | available partition counts and prefilter loads, input rows, input batches and row IDs |
+| `counts` | available `partitions_searched`, `partitions_ranked`, and prefilter loads, input rows, input batches and row IDs |
 | `cumulative_times_ns` | available index-open, partition-load/preparation, prefilter-wait, CPU-queue-wait, search, query-preparation, distance/top-k and result-materialization timings, plus prefilter load/input/build timings, in nanoseconds |
+
+`partitions_ranked` sums the total IVF partitions in each opened index delta;
+`partitions_searched` counts the partitions actually searched. Their ratio is
+not a recall measurement. This is a curated subset of native diagnostics;
+index cache hits, misses and comparison counts are not exposed here.
 
 Missing metrics are absent, not zero; an attempt without metrics has no row.
 Timings include waits, overlap and accumulate across concurrent partitions;

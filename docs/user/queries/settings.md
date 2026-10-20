@@ -115,6 +115,8 @@ rounding, so allowances below a few KiB refuse every write.
 Strict inserts and overwrite writes also pass `write_max_bytes` to Lance as
 the buffer accumulation target for each data-file writer. Lance divides it
 across top-level columns instead of using its default 8 MiB per column.
+The default 32 MiB target therefore raises or lowers each column's threshold
+depending on the number of columns.
 This is a flush threshold, not a total memory cap: the incoming array can
 cross it, nested fields and encoding have additional working memory, and
 concurrent table writers each receive the target. Upserts and updates use
