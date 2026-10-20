@@ -3485,7 +3485,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3527,7 +3527,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
