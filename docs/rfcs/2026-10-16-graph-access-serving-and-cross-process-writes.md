@@ -42,8 +42,9 @@ follow from that name.** Seven rules follow from the idea:
 5. **Identity is fixed at the boundary.** `--as` declares the actor on direct
    access and is checked against the credential on served access. It is never
    ignored.
-6. **One outcome model.** Servers and the CLI share one registry of error codes
-   and one outcome object, and the exit code follows from the outcome.
+6. **One failure model.** Servers and the CLI share one registry of error codes
+   and one `disposition` object, and the exit code follows from the
+   disposition.
 7. **Introspection is a command.** `omnigraph target list` says what you can
    reach and what is running; `omnigraph access` says who you are there and
    what you may do.
@@ -54,8 +55,8 @@ follow from that name.** Seven rules follow from the idea:
 | 2 | [Cross-process writes](#cross-process-writes) in the engine |
 | 3 | [One set of operations](#one-set-of-operations) and its inventory test |
 | 4 | `omnigraph serve`, its ***local server*** for you and its deployment for others; `omnigraph studio`; `omnigraph mcp` |
-| 5 | [Identity](#identity) and the `omnigraph-expect-actor` request header |
-| 6 | [Outcomes and refusals](#outcomes-and-refusals) |
+| 5 | [Identity](#identity) and the `Omnigraph-If-Actor` request header |
+| 6 | [Dispositions and refusals](#dispositions-and-refusals) |
 | 7 | `omnigraph target list`, `omnigraph access` and `GET /graphs/{graph_id}/access` |
 
 `omnigraph serve` is for programs that speak only HTTP or MCP, such as
@@ -66,7 +67,7 @@ calling process, so self-hosted servers with static tokens work in every client.
 
 The engine phase adds `__manifest` rows under the next storage stamp; nothing
 else changes the storage format. The HTTP API gains an access route, an actor
-precondition header and an `outcome` object on error responses. Changes
+precondition header and a `disposition` object on error responses. Changes
 with a wider blast radius are in
 [Appendix A](#appendix-a-changes-for-separate-decisions), each with a
 recommended RFC or issue.
@@ -547,33 +548,34 @@ An operation's actor is fixed where trust is established:
   ([CLI addressing](0011-cli-addressing-and-config.md)). The engine enforces the
   graph's policy for that actor.
 - **Served access.** The server resolves the actor from the bearer credential,
-  and `--as` becomes an assertion. The CLI sends `omnigraph-expect-actor:
-  <actor>`, and the server compares it with the resolved actor after
-  authentication and the contract-header check (on `/mcp`, which has no
-  contract check, after authentication and before admission), before graph
-  lookup, body decoding or effects. A mismatch is `412 actor_mismatch`: a
-  condition the caller set did not hold, and nothing ran. A duplicate, padded,
-  empty or malformed header is `400 bad_request`. The header arrives with the
-  contract bump in [HTTP API](#http-api), so a server that would ignore it
-  refuses the request's contract first; no separate capability header
-  advertises it. Without `--as` the CLI sends no header: `operator.actor`
-  names the direct actor and is not asserted against servers, whose tokens may
-  resolve to other names. The refusal of `--as` on served writes, and its stale
-  help text, go.
+  and `--as` becomes an assertion. The CLI sends `Omnigraph-If-Actor: <actor>`,
+  and the server compares it with the resolved actor after authentication and
+  the contract-header check (on `/mcp`, which has no contract check, after
+  authentication and before admission), before graph lookup, body decoding or
+  effects. A mismatch is `412 actor_mismatch`: as with HTTP's `If-*` headers,
+  whose naming it follows, a condition the caller set did not hold, and nothing
+  ran. A duplicate, padded, empty or malformed header is `400 bad_request`. The
+  header arrives with the contract bump in [HTTP API](#http-api), so a server
+  that would ignore it refuses the request's contract first; no separate
+  capability header advertises it. Without `--as` the CLI sends no header:
+  `operator.actor` names the direct actor and is not asserted against servers,
+  whose tokens may resolve to other names. The refusal of `--as` on served
+  writes, and its stale help text, go.
 - **Local servers.** `serve --as` declares the local server's actor, as direct
   access does; requests to it may assert it like any served request.
 
 An assertion can only narrow: a matching header changes nothing, and no client
 supplies an actor the server trusts. `--as` is never ignored.
 
-### Outcomes and refusals
+### Dispositions and refusals
 
 Every failure, from a server or from the CLI, has one shape: today's
-`ErrorOutput` (`error`, `code` and its typed details) plus an `outcome` object.
+`ErrorOutput` (`error`, `code` and its typed details) plus a `disposition`
+object.
 
 ```json
 {"error":"a local server already serves file:///Users/me/company.omni","code":"local_server_exists",
- "outcome":{"execution":"not_started","effects":"none","action":"refresh"}}
+ "disposition":{"effects":"none","action":"fix"}}
 ```
 
 - **One registry of codes.** `ErrorCode` in `omnigraph-api-types` holds every
@@ -585,32 +587,36 @@ Every failure, from a server or from the CLI, has one shape: today's
   problems managed commands print are the managed control plane's own. The CLI
   relays one verbatim under `problem`, with `code: managed_problem`, so
   OmniGraph's registry never lists another service's problem types. Its
-  `outcome` is the one the control plane states; where it states none, the CLI
-  reports `not_started` only if no request was sent and `unknown` otherwise,
-  because it never infers whether a remote refusal had effects.
-- **One outcome object.** `execution` says whether the operation ran
-  (`not_started`, `unknown`), `effects` whether it changed anything (`none`,
-  `unknown`), and `action` what to do next (`retry`, `refresh`, `recover`,
-  `reconcile`). A server includes it on every error response, computed where
-  the knowledge is. The CLI combines it with transport evidence, as
-  `command_outcome` does today for data writes, so a lost response becomes
-  `unknown` and `reconcile` and is never replayed. Every command reports it, not
-  only data writes.
+  `disposition` is the one the control plane states; where it states none, the
+  CLI reports `effects: none` only if no request was sent and `unknown`
+  otherwise, because it never infers whether a remote refusal had effects.
+- **One disposition object.** `effects` says what the operation changed:
+  `none`; `partial`, when an earlier step of the same operation published and
+  the failing step wrote nothing; or `unknown`. `action` says what to do next:
+  `fix` the request, `refresh` from the current state, `retry` the same
+  request, `recover` what the error names, or `reconcile` an unknown effect
+  before writing again. Each code names the action its refusal asks for, so a
+  client never reads it from the status. A server includes the disposition on
+  every error response, computed where the knowledge is. The CLI combines it
+  with transport evidence, as `command_outcome` does today for data writes, so
+  a lost response becomes `unknown` and `reconcile` and is never replayed.
+  Every command reports it, not only data writes. A separate field for whether
+  the operation ran would only repeat `effects`.
 - **A write has three results.** It is committed, not committed, or of unknown
   outcome, the same on every surface, as
   [#1067](https://github.com/ModernRelay/omnigraph/issues/1067) proposes. A server that could not settle the attempt itself
   answers `outcome_unknown`, never a plain `internal`. Every other error keeps
-  its code, and its outcome follows from what the server knows:
+  its code, and its disposition follows from what the server knows:
 
-  | Error | `execution` / `effects` | `action` |
+  | Error | `effects` | `action` |
   |---|---|---|
-  | Before the request submitted a write | `not_started` / `none` | `retry` when busy or unavailable, `recover` when something must be rebuilt, else `refresh` |
-  | A refusal the write met before it started (authentication, contract, actor assertion, policy, admission, a precondition), or a typed refusal of its one publication | `not_started` / `none` | `refresh`, `retry` when busy |
-  | Any of those after an earlier publication of the same operation, such as the fork a load makes before its rows, which the engine marks on its error | `unknown` / `unknown` | `refresh` |
-  | Any other error after a write | `unknown` / `unknown` | `reconcile` |
-  | An attempt the server could not settle (`outcome_unknown`) | `unknown` / `unknown` | `reconcile`, `recover` when recovery is required |
+  | Before the request submitted a write | `none` | the code's: `retry` when busy or unavailable, `fix` when the request itself is wrong, `recover` when something must be rebuilt, else `refresh` |
+  | A refusal the write met before it started (authentication, contract, actor assertion, policy, admission, a precondition), or a typed refusal of its one publication | `none` | the code's |
+  | Any of those after an earlier publication of the same operation, such as the fork a load makes before its rows, which the engine marks on its error | `partial` | the code's |
+  | Any other error after a write | `unknown` | `reconcile` |
+  | An attempt the server could not settle (`outcome_unknown`) | `unknown` | `reconcile`, `recover` when recovery is required |
 
-  `outcome.check` carries what a later read needs to settle an unknown write:
+  `disposition.check` carries what a later read needs to settle an unknown write:
   the branch, its head before the write and the attempt's transaction id. It
   arrives with the attempt identity of
   [cross-process writes](#cross-process-writes); until then a caller settles
@@ -618,17 +624,17 @@ Every failure, from a server or from the CLI, has one shape: today's
 
   ```json
   {"error":"the write may have published","code":"outcome_unknown",
-   "outcome":{"execution":"unknown","effects":"unknown","action":"reconcile",
-              "check":{"branch":"main","head_before":"01JAC…","attempt":"0c410ce6-…"}}}
+   "disposition":{"effects":"unknown","action":"reconcile",
+                  "check":{"branch":"main","head_before":"01JAC…","attempt":"0c410ce6-…"}}}
   ```
 
-- **Exit codes follow from the outcome**, the same for every command:
+- **Exit codes follow from the disposition**, the same for every command:
 
 | Exit | Meaning | Today |
 |---|---|---|
 | 0 | Success | The same |
-| 1 | Not started: a refusal, a cancelled queued deployment, or an error before any effect | Also managed `failed`; managed refusals are 2 and cancellation 6 |
-| 2 | Effects unknown or incomplete: reconcile or recover before retrying. Also a deployment or local server that stopped with an uncertain write | Also usage errors and managed refusals; managed `recovery_required` is 4 |
+| 1 | No effects: a refusal, a cancelled queued deployment, or an error before any effect | Also managed `failed`; managed refusals are 2 and cancellation 6 |
+| 2 | Effects unknown, or partial because an earlier step published: read the target, and reconcile or recover before retrying. Also a deployment or local server that stopped with an uncertain write | Also usage errors and managed refusals; managed `recovery_required` is 4 |
 | 3 | Completed in part, and the result says which part | Managed partial convergence and partial organization results |
 | 4 | A condition the caller set did not hold: a Blob precondition, a conditional publish, an `--as` assertion | Also managed `recovery_required` |
 | 5 | A bounded wait ended; the work continues | Also managed `stalled` |
@@ -799,12 +805,13 @@ versions stay independent, and their only contract remains the link format.
 
 ### Platform coverage
 
-The CLI's commands work alike on macOS, Linux and Windows. Studio's side does
-not yet:
+The CLI's commands work alike on macOS, Linux and Windows, except that records
+on Windows wait for their own pull request. Studio's side does not yet:
 
 | | macOS | Linux | Windows |
 |---|---|---|---|
-| `serve`, `mcp`, `target`, `credential get`, `access` | Supported | Supported | Supported |
+| `target`, `credential get`, `access`, `mcp` on a server target | Supported | Supported | Supported |
+| `serve`, `mcp` on a direct target | Supported | Supported | Once records check their directory's access list and read `MachineGuid`; until then they refuse with `local_server_records_unsafe` |
 | Studio opens a link from `omnigraph studio` | Supported | Once Studio registers its scheme and GPUI's Linux platform dispatches opened links | Once Studio registers its scheme and forwards a second launch's link to the running instance |
 | Studio's agent panel | Supported | Supported | Not yet available, as Studio's README says |
 | Installing Studio | A verified, signed disk image | Prints how to install | Opens Studio's installer once one ships |
@@ -1222,8 +1229,8 @@ The existing convenience constructors stay until
 | Change | Contract |
 |---|---|
 | `GET /graphs/{graph_id}/access` | [Access](#access); requires authentication like every graph route, and no graph action |
-| `omnigraph-expect-actor` request header | [Identity](#identity); `412 actor_mismatch` before graph lookup |
-| `outcome` on every error body | [Outcomes and refusals](#outcomes-and-refusals); the existing fields keep their meaning |
+| `Omnigraph-If-Actor` request header | [Identity](#identity); `412 actor_mismatch` before graph lookup |
+| `disposition` on every error body | [Dispositions and refusals](#dispositions-and-refusals); the existing fields keep their meaning |
 | `ErrorCode` | Grows to the one registry; OpenAPI lists every code with the statuses servers send it under |
 
 The HTTP contract version moves once for all four, from `0.13` to `0.14`,
@@ -1233,8 +1240,8 @@ that matters, and the other three ride it in the same release. Servers keep acce
 one version. A client that talks to deployments of several versions, as a
 manager of long-lived deployments does, reads each one's version from
 `/healthz`, which needs no header and names it, and speaks that version to it.
-A client that refuses unknown fields in error bodies must accept `outcome`
-before the new version reaches it.
+A client that refuses unknown fields in error bodies must accept
+`disposition` before the new version reaches it.
 
 ### CLI
 
@@ -1247,9 +1254,9 @@ before the new version reaches it.
   `commit` and `internal_schema`. A client requires the protocol versions it
   speaks before running a command.
 - **One failure path.** `app.rs`'s `finish` prints one `ErrorOutput` with
-  `outcome` for every command family, replacing the data-write `Failure`, the
+  `disposition` for every command family, replacing the data-write `Failure`, the
   `RemoteRefusalOutput` and the managed `Output` failure bodies.
-- **`--as`** sends `omnigraph-expect-actor` on every served request of the
+- **`--as`** sends `Omnigraph-If-Actor` on every served request of the
   command.
 - **Loopback guard**, a layer the CLI adds in `extend`, outside every server
   layer, so a deployment never gains it:
@@ -1263,9 +1270,15 @@ before the new version reaches it.
     `Cross-Origin-Resource-Policy: same-origin`. Nothing relies on
     `Sec-Fetch-*`, which browsers do not send to plain-HTTP origins.
   - Malformed `Host` or `Origin` bytes are refused, never a panic.
-- **The MCP bridge** relays JSON-RPC unchanged except for filtering
-  `tools/list` and refusing `tools/call` for tools without `readOnlyHint` when
-  it was started without `--write`.
+- **The MCP bridge** relays JSON-RPC unchanged except where
+  [MCP for agents](#mcp-for-agents) binds it. For its one graph it fills
+  `graph` in each tool call that omits it, refuses a call or resource URI
+  naming another graph, and narrows the `graphs` tool and `resources/list` to
+  that graph; it appends that binding to `initialize`'s instructions. Without
+  `--write` it lists only tools annotated `readOnlyHint: true` and refuses
+  `tools/call` for any other. It applies `notifications/cancelled` itself
+  rather than forwarding it: the cancelled request gets no answer unless the
+  answer was written before the cancel arrived.
 - **The opener** passes only the link, which carries no secret, so its
   appearance in the opener's arguments discloses nothing.
 
@@ -1308,7 +1321,7 @@ reparse points are refused as `coordination.rs` refuses them.
 {
   "format": 1,
   "id": "01JA9…",
-  "machine": "5F0C…",
+  "machine": "5f0c…",
   "root": "file:///Users/me/company.omni",
   "destination": "sha256:4b7e…",
   "scope": "graph",
@@ -1329,19 +1342,23 @@ whether a record's owner is alive. The owner takes it with
 `std::fs::File::try_lock`, opens the target, binds, writes the record
 (temporary file and rename) and then announces readiness.
 
-A reader checks `machine` first. It is the platform's host identifier
-(`gethostuuid` on macOS, `/etc/machine-id` on Linux, the `MachineGuid` registry
-value on Windows), and a reader ignores a record from another machine without
-touching its lock or deleting it, so a home directory shared over a network
-cannot send a client to another machine's port or remove a live record. For a
-record from this machine, a reader that can take the lock has found a dead
+A reader checks `machine` first. It is the platform's host identifier as 32
+lowercase hexadecimal digits: the 16 bytes `gethostuuid` writes on macOS;
+`/etc/machine-id` on Linux, or `/var/lib/dbus/machine-id` when that file is
+missing or empty, trimmed and lowercased; the `MachineGuid` registry value on
+Windows without its dashes. Any other value, all zeros or systemd's first-boot
+`uninitialized` marker among them, is no machine's identifier: two machines
+could share it, so records refuse with `local_server_records_unsafe` rather than
+fall back to another source. A reader ignores a record from another machine
+without touching its lock or deleting it, so a home directory shared over a
+network cannot send a client to another machine's port or remove a live record.
+For a record from this machine, a reader that can take the lock has found a dead
 local server: it ignores the record and may delete both files. The operating
 system releases the lock however its process exits, so liveness never consults
-the process ID, which proves neither liveness nor quiescence
-([server runtime RFC](2026-09-29-server-runtime-and-online-deployment.md)). A
-record with an unknown `format` is ignored. Matching uses `destination`, never
-`root`, which is for display. `cli` is informational; a client chooses its CLI
-itself.
+the process ID, which proves neither liveness nor quiescence ([server runtime
+RFC](2026-09-29-server-runtime-and-online-deployment.md)). A record with an
+unknown `format` is ignored. Matching uses `destination`, never `root`, which is
+for display. `cli` is informational; a client chooses its CLI itself.
 
 The election lock is `<directory>/<destination digest>.start`, opened like the
 record files. It is held only while a local server starts, so a reader never
@@ -1352,7 +1369,7 @@ waits on it.
 - **Trust at the boundary (10).** No client supplies an actor. Direct access
   declares one, because the process holds storage access and is entitled to
   it, as a direct `omnigraph mutate` is; served access resolves one from the
-  credential, and `omnigraph-expect-actor` only narrows. A local server keeps
+  credential, and `Omnigraph-If-Actor` only narrows. A local server keeps
   only its token's hash; the record is a user-only delivery file like the CLI's
   `credentials`. `credential get` hands a person's own static token to a
   process running as that person. The engine enforces the policy for every
@@ -1369,8 +1386,8 @@ waits on it.
   publication.
 - **Bounded and observable (11).** One local server per destination, elected;
   fixed shapes for the record and the JSON lines; server limits and the
-  owned-operation lifecycle unchanged; one registry of codes and one outcome
-  object, with exit codes derived from it; no silent retry.
+  owned-operation lifecycle unchanged; one registry of codes and one
+  `disposition` object, with exit codes derived from it; no silent retry.
 - **One source of truth (12).** The CLI is the only resolver of targets, the
   only program writer of their configuration and the only store of their static
   tokens. A record is a hint whose liveness the operating system establishes;
@@ -1405,10 +1422,10 @@ existing use, deliberately and without adapters:
   `recovery_required` from 4 to 2, managed cancellation from 6 to 1, and usage
   errors from 2 to 64.
 - **The HTTP contract.** One version bump carries the access route, the actor
-  header, `outcome` and the code registry; clients and servers upgrade
+  header, `disposition` and the code registry; clients and servers upgrade
   together, as the contract header already requires.
 - **Failure bodies.** The managed `{type, title, detail}` body and the CLI's
-  `command_outcome` field become `ErrorOutput` with `outcome`.
+  `command_outcome` field become `ErrorOutput` with `disposition`.
 
 New contracts: `serve`, `studio`, `mcp`, `target`, `credential get` and
 `access`, their outputs (`protocol: 1`), the `protocols` field of
@@ -1489,9 +1506,9 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   before any open; no local state runs open or default-deny; the access route's
   graph-wide, per-branch and source-to-target answers, its refusal to probe a
   hidden branch, and its answers for a static token and a signed credential
-  without a policy; `omnigraph-expect-actor` checked after authentication and
+  without a policy; `Omnigraph-If-Actor` checked after authentication and
   the contract header and before graph lookup, a mismatch answering 412 with no
-  effect, a duplicate 400; `outcome` on every error body.
+  effect, a duplicate 400; `disposition` on every error body.
 - **Server, `integration/mcp.rs`:** a read-only local server lists no write
   tools and refuses one as unknown; the new tools equal their routes.
 - **Server, `boot_settings.rs`:** `serve_local` refuses a non-loopback
@@ -1499,7 +1516,7 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   returns an uncertain outcome on uncertain completion; serving for others
   keeps every behavior the binary's tests pin, now through `omnigraph serve`.
 - **Server, `integration/openapi.rs`:** `openapi.json` regenerated for the
-  route, the header, `outcome` and the code registry.
+  route, the header, `disposition` and the code registry.
 - **Cluster:** a read-only local server of a cluster leaves
   `__cluster/lock.json` untouched; a read-write one holds and releases it as a
   deployment does.
@@ -1511,8 +1528,8 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   - the guard's `Host`, `Origin`, CORS and malformed-header cases; read-only
     refusals; a cluster's local server applying the cluster's policy and stored
     queries;
-  - every code in [Outcomes and refusals](#outcomes-and-refusals) that these
-    commands make, with `code`, `outcome` and its exit;
+  - every code in [Dispositions and refusals](#dispositions-and-refusals) that
+    these commands make, with `code`, `disposition` and its exit;
   - records: a dead owner's record ignored with no process-ID check; a record
     from another machine ignored and kept; the directory resolved from the
     account database with `HOME`, `TMPDIR` and `XDG_*` pointing elsewhere;
@@ -1548,8 +1565,8 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   support helper, and its three refusals; `access` against a server, a local
   server and a direct target; `version --json` reporting `protocols`.
 - **CLI, one failure path:** every command family's failure prints `code` and
-  `outcome`, and the exit table holds on every plane, including usage errors at
-  64 and managed refusals at 1; `--as` sends `omnigraph-expect-actor` on every
+  `disposition`, and the exit table holds on every plane, including usage errors at
+  64 and managed refusals at 1; `--as` sends `Omnigraph-If-Actor` on every
   served request.
 - **CLI, `integration/parity_matrix.rs`:** each row's `--json` output equals the
   HTTP body of the same request.
@@ -1586,8 +1603,8 @@ repositories' changes are listed as dependencies, made and reviewed there.
 | Area | Change |
 |---|---|
 | Engine | Retirement as a tombstone publication on the branch's chain; branch registration and deregistration on main's `__manifest`; drop as a publication on the target branch's chain; cleanup's unregistered-tree rule and a ref-absent-only tree delete in place of Lance's forced delete; the new stamp and its upgrade census; the gates' comments rewritten as contention optimizations; `branch_deleted`, `branch_exists`, `commit_dropped` and `commit_published`. |
-| `omnigraph-api-types` | The code registry, `outcome`, the access output and the operation table. |
-| `omnigraph-server` | A library only: the deployment entry point made public; `AppState::local` for graphs and clusters, `LocalScope`, `LocalBinding`, `LocalOptions`, `LocalCredential`, `LocalOpenError`; `serve_local` with the lifecycle shared with deployments, returning `ServeOutcome` and printing nothing to stdout; `install_log_subscriber`; the access route; `omnigraph-expect-actor`; `outcome` on error bodies; read-only refusal in `ingress::admit` with `forbidden`; the exhaustive local-server class of every `PolicyAction`; the new MCP tools. |
+| `omnigraph-api-types` | The code registry, `disposition`, the access output and the operation table. |
+| `omnigraph-server` | A library only: the deployment entry point made public; `AppState::local` for graphs and clusters, `LocalScope`, `LocalBinding`, `LocalOptions`, `LocalCredential`, `LocalOpenError`; `serve_local` with the lifecycle shared with deployments, returning `ServeOutcome` and printing nothing to stdout; `install_log_subscriber`; the access route; `Omnigraph-If-Actor`; `disposition` on error bodies; read-only refusal in `ingress::admit` with `forbidden`; the exhaustive local-server class of every `PolicyAction`; the new MCP tools. |
 | `omnigraph-cli` | `serve` (with `--write`, `--reuse`, `--port`, `--json`, and `--listen` for deployments), `studio`, `mcp`, `target`, `credential get` and `access`, each with its `commands/` module and `app.rs` arm; `protocols` in `version --json`; one failure path and the exit table; `--as` as an assertion; the loopback guard; server records in the per-platform directories, reusing the `coordination.rs` home resolution and checks; the MCP bridge with its `readOnlyHint` filter; the platform opener with its scheme-handler check; `queries list` for server targets and `load --json` printing the route's body; later, the Studio installer with code-signature verification. |
 | Packaging | The Dockerfile, `docker/entrypoint.sh`, the release, edge, image and package workflows, `scripts/install.sh` and the Homebrew formula ship and smoke-test `omnigraph serve`, and no longer build or install `omnigraph-server`. |
 | Docs | The support boundaries in [invariants](../dev/invariants.md); a user page for `serve`, with local servers, serving for others and the interim one-writer-process note; the server operations guide and deployment guide rewritten for `omnigraph serve`; the CLI reference; the server authentication page's self-hosting settings; the MCP guide's `omnigraph mcp`; the README's quick start and clients table, which still lists the retired stdio package; the public embedding APIs in [control plane](../dev/control-plane.md) and the observability guide's note for embedders; [writes](../dev/writes.md) and [recovery](../dev/recovery.md) for the engine phase; new owners in [testing](../dev/testing.md); a disposition note on RFC 0003 for the stdio bridge it deferred; the bundled skill's command index and condensed reference, its rule for which path an agent uses, and its lines saying the cluster server is "the only way to serve" and that there is "no single-graph server mode" (`SKILL.md`, `references/cluster.md`, `references/server-policy.md`); one `changelog.d` note per phase. |
@@ -1602,7 +1619,7 @@ repositories' changes are listed as dependencies, made and reviewed there.
 | Connections | Remove the operator-config and credentials parsers (`graph_store/src/cli_config.rs`), the name-based token lookup and Studio's own server list: list targets and aliases with `omnigraph target list --json`, add a server with `omnigraph target add` and `omnigraph login --target NAME` on standard input, and move existing keychain servers the same way once. |
 | Static tokens | Obtain them with `omnigraph credential get --json`, keep them in memory, send them only to URLs under `endpoint`, and run it again after a 401. |
 | Access | Show only the actions `omnigraph access` or the access route allows, for the target, graph and branch on screen; hide write affordances on a read-only local server. |
-| Failures | Read `code` and `outcome` from every error body; never resubmit on `unknown`, and settle it from `outcome.check`. Show writes as degraded, not the graph as gone, on `storage_unavailable` or a degraded readiness report. |
+| Failures | Read `code` and `disposition` from every error body; never resubmit on `unknown`, and settle it from `disposition.check`. Show writes as degraded, not the graph as gone, on `storage_unavailable` or a degraded readiness report. |
 | Agents | Keep the agent gateway for panel agents and point it at the local server's URL and token; say when a read-only local server refuses their branch writes. Create each conversation's CLI home with `omnigraph target add` under that home's `OMNIGRAPH_HOME`, so the CLI writes its format, and refuse `--target` in the agent wrapper as it refuses `--server` and `--as`. Never pass the captured environment to agents. Bring the agent panel to Windows. |
 | Releases | Configure the Apple secrets so every release is Developer ID signed and notarized; the workflow already does both when they are set, but releases so far are pre-releases signed ad hoc. A fixed, documented team identifier the CLI can pin; full releases with version-free asset names, so a latest URL resolves for each architecture; an updater inside the app; a package identity when Windows ships as an installer rather than a zip. Installing Studio waits for these ([omnigraph-studio#3](https://github.com/ModernRelay/omnigraph-studio/issues/3)). |
 | Specs | Rewrite spec 012's E1–E5 and E15 as this RFC, drop spec 013's note that the launcher passes its CLI path, and update specs 002 (links), 003 (connections), 011 and 013 (agents). |
@@ -1614,7 +1631,7 @@ plane moves its pinned OmniGraph version past that phase:
 
 | Phase | What the control plane changes |
 |---|---|
-| 1, the HTTP contract | Its OmniGraph clients choose the contract per deployment while deployments of several versions coexist, and accept `outcome` in error bodies. Its problem bodies state their `outcome`, so the CLI need not report `unknown` for every managed refusal. Its data hosts route the access route and pass `omnigraph-expect-actor` through. |
+| 1, the HTTP contract | Its OmniGraph clients choose the contract per deployment while deployments of several versions coexist, and accept `disposition` in error bodies. Its problem bodies state their `disposition`, so the CLI need not report `unknown` for every managed refusal. Its data hosts route the access route and pass `Omnigraph-If-Actor` through. |
 | 2, addressing | Its documentation, procedures and tests move from the retired flags, `use` and folder context to targets and the literal-root administration commands, and its managed CLI behavior takes the exit table. |
 | 4, the binary fold | Deployments it creates run `omnigraph serve <root> --listen ADDR`, its checks of a serving process accept both forms while older deployments remain, and its images ship the one binary. |
 | 5, the engine | Nothing beyond the version move: the new rows live inside each graph's own `__manifest`, so nothing outside a graph's root is written. |
@@ -1634,10 +1651,11 @@ local server counts as one writer process.
 Each phase is one or more pull requests titled in Conventional Commits, each
 with its single-bullet `changelog.d` note, the public Rust APIs included.
 
-1. **Outcomes, identity and access over HTTP.** The code registry, `outcome` on
-   every failure with the three write results and `outcome_unknown`, the exit
-   codes, `omnigraph-expect-actor` and the `--as` assertion, and
-   `GET /graphs/{graph_id}/access`, under one HTTP contract bump. This is the
+1. **Dispositions, identity and access over HTTP.** The code registry,
+   `disposition` on every failure with the three write results and
+   `outcome_unknown`, the exit codes, `Omnigraph-If-Actor` and the `--as`
+   assertion, and `GET /graphs/{graph_id}/access`, under one HTTP contract
+   bump. This is the
    result surface [#1067](https://github.com/ModernRelay/omnigraph/issues/1067) asks for in its sixth step. `implementation: in-progress`.
 2. **Targets.** `target list|show|add|remove` with RFC 0059, `credential get`,
    `access`, and `protocols` in `version --json`.
@@ -1891,3 +1909,13 @@ changes and pointing at this RFC.
   local embedding API names `LocalBinding::local`, `ReadWriteUnavailable`,
   `start_local` and `LocalServing::release`, refuses a graph inside a cluster
   instead of promoting it, and binds local roots only.
+- 2026-10-19: Named the actor header `Omnigraph-If-Actor`, after HTTP's
+  conditional `If-*` headers, since a mismatch is a failed condition (412). The
+  error object became `disposition`: `execution` went, because it only repeated
+  `effects`; `effects` gained `partial` for a refused step after an earlier
+  publication of the same operation, which `unknown` overstated; and `action`
+  gained `fix`, because a malformed request or a wrong credential fails the
+  same way on resend, which `refresh` did not say. Each code names its own
+  action. Records accept only a 32-hexadecimal machine id, Windows records wait
+  for their own pull request, and the MCP bridge's relay rules match the
+  implementation.
