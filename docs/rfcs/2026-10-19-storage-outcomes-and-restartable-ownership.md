@@ -528,10 +528,11 @@ Upstream surfaces reviewed at the pinned versions:
 
 1. **#1092.** Commit-handler resolution and evidence by phase. This is a fix
    within today's contract.
-2. **Per-operation outcomes, §§1 to 6.** Request classes, retries, the
-   per-key scope, pending publications and the server change, in one change
-   with its tests and docs.
-3. **The lease, §7.** With the deployment guide's restart policy.
+2. **Per-operation outcomes, §§1 to 6** (#1096). Request classes, retries,
+   the per-key scope, pending publications and the server change, in one
+   change with its tests and docs.
+3. **The lease, §7** (#1097). With the restart policy on the storage
+   failures operations page.
 4. **#1017's outcome model** on the wire, which reads these engine outcomes.
 
 `implementation` moves to `partial` when phase 2 lands and to `complete` with
