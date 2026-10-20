@@ -158,9 +158,10 @@ The disposition covers the entire command. A later refused subrequest cannot
 undo an earlier branch creation, load or publication. An embedded write's own
 refusal says what the engine did, projected as a server would project it: a
 policy refusal precedes every publication, a `load --from` fork included, so it
-has `effects: none` on both planes. The engine marks a refusal that follows a
-fork which did publish, and that refusal has `effects: partial` on both planes.
-A `load --from` onto a branch that already exists forks nothing. Any later
+has `effects: none` on both planes. The engine marks an error that follows a
+fork which did publish: a typed refusal then has `effects: partial` on both
+planes, and an error the engine cannot prove wrote nothing has `unknown`. A
+`load --from` onto a branch that already exists forks nothing. Any later
 failure, such as rendering a committed receipt, stays `unknown`.
 Disconnecting an admitted HTTP write does not cancel it: the server keeps
 running the original operation, and a lost response can leave the caller's
