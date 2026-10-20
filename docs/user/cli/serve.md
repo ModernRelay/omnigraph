@@ -80,12 +80,13 @@ refuses there with `local_server_records_unsafe`.
 
 `OMNIGRAPH_LOCAL_SERVERS_DIR` names another directory. A directory another
 account owns, or one with group or other access, refuses with
-`local_server_records_unsafe`. So does a machine whose host identifier cannot be
-read (`gethostuuid` on macOS, `/etc/machine-id` or `/var/lib/dbus/machine-id` on
-Linux): a record names its machine, so that a home directory shared with
-another machine never sends a client to that machine's port or removes its
-record. `omnigraph version --json` reports the record format as
-`protocols.local_server_record`.
+`local_server_records_unsafe`. So does a machine whose host identifier
+(`gethostuuid` on macOS, `/etc/machine-id` or `/var/lib/dbus/machine-id` on
+Linux) cannot be read or is not a machine id, which is 32 hexadecimal digits,
+not all zeros; the `uninitialized` marker of a first boot is not one. A record
+names its machine, so that a home directory shared with another machine never
+sends a client to that machine's port or removes its record. `omnigraph version
+--json` reports the record format as `protocols.local_server_record`.
 
 Each record is held by its process for as long as it runs. A record whose
 process is gone, killed included, is not live: readers ignore it and remove it.
