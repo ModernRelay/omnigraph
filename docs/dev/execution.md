@@ -493,6 +493,25 @@ producer-held chunks, queued buffers and consumer handoffs are all charged.
 failures; blocked CPU work also checks cooperative cancellation. This is a
 producer/stream bridge, not a parallel graph-partition scheduler.
 
+Whether an operator holds its input is one planner fact,
+`PhysicalNode::shape()` (`PipelineShape::Streaming` or `Breaker`), and the
+inputs a node drains whole before its streamed input runs are
+`PhysicalNode::collected_sides()`; explain's `pipelines`, the push executor
+and the engine read both. The engine makes the shape a consequence of
+construction (`engine/operators/shape.rs`): every operator holds one shape
+value and builds its output stream only through it. `Breaker` owns the
+materialization (`stream`: one batch sliced out after the body returns;
+`held`: a producer whose collect stage has no sender and whose emit stage has
+no input), `Streaming` drives the operator one input batch at a time
+(`map`: an inline adapter; `produce`: a producer calling the `Streamed`
+body's `open`, then `batch` per input batch, then `finish`, and executing the
+streamed input only after `open`, so a collected side or a filled runtime
+filter is in place first), and `Source` is a leaf's free producer. A join
+drains a side only through `CollectedSide`. The producer channel, the
+breaker's slicer and the poll counter are private to that module, so no
+operator declares an emission beside the stream it builds, and the lowering
+compares nothing but DataFusion's own `AggregateExec`.
+
 `QueryResources` tracks retained Arrow buffers by allocation identity. Child
 arrays and null buffers participate, and shared views or slices reuse one
 charge while any operator lease retains that allocation. This avoids charging

@@ -377,8 +377,9 @@ managed cluster graph operations require `--graph ID` or that target's
 `default_graph`; discovery never chooses a graph. Direct graph targets reject
 `--graph`. Inline addresses use explicit path spelling (`./graph.omni`) or a URI;
 bare names refer to configured targets. `init --schema schema.pg ./graph.omni`
-is the sole positional address convenience. `--as` applies only to supported
-direct operations. Every backend command prints its resolved target to stderr.
+is the sole positional address convenience. `--as` attributes supported direct
+operations; a served write sends it as the `Omnigraph-If-Actor` assertion.
+Every backend command prints its resolved target to stderr.
 
 Legacy routing flags, `use`, `profile`, ambient profile selection and folder
 routing are removed. Use `target import` to convert legacy configuration and

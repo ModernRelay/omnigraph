@@ -308,16 +308,20 @@ impl GraphClient {
                 })
             }
             TargetBinding::Server { endpoint, auth, .. } => {
-                if actor.is_some() {
-                    bail!("--as does not apply to a served target");
-                }
+                // A served write's actor is the one its credential resolves
+                // to. `--as` cannot set it: it is sent as an assertion, and
+                // the server refuses the request when the credential resolves
+                // to another actor. `operator.actor` names the direct actor
+                // and is not asserted against servers.
                 let graph =
                     crate::scope::graph_selection(target, graph)?.expect("server graph selection");
                 let base_url = remote_url(endpoint, &["graphs", graph], &[])?;
                 let token =
                     crate::targets::resolve_server_token_for(input, auth, endpoint, &base_url)?;
                 Ok(Self::Remote {
-                    http: Box::new(GraphHttpClient::server_target(input, target)?),
+                    http: Box::new(
+                        GraphHttpClient::server_target(input, target)?.with_expected_actor(actor),
+                    ),
                     base_url,
                     token,
                     response_limit: None,
@@ -2780,7 +2784,7 @@ mod tests {
             (200, vec![]),
             (200, vec![(HEADER.into(), "0.11".into())]),
             (200, vec![(HEADER.into(), "0.12".into())]),
-            (200, vec![(HEADER.into(), "0.14".into())]),
+            (200, vec![(HEADER.into(), "0.13".into())]),
             (
                 200,
                 vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],

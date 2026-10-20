@@ -7,16 +7,14 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
-use datafusion::execution::TaskContext;
-use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge};
-use futures::StreamExt;
+use futures::future::BoxFuture;
 use omnigraph_planner::should_switch_to_csr;
 
 use super::expand::{ExpandStep, GraphEnv, NamedExpand};
 use super::expand_stream::{align_sources, output_rows};
 use super::memory::WorkMemory;
-use super::producer::{BatchSender, producer_stream};
+use super::shape::{BatchSender, Flow, Streamed};
 use super::{Switch, external};
 use crate::engine::graph::{
     CsrSource, EndpointColumns, ExpandStart, GraphIndexHandle, HopPolicy, decide_expand_start,
@@ -25,136 +23,220 @@ use crate::engine::graph::{
 use crate::error::OmniError;
 use crate::graph_index::{CsrIndex, TypeIndex};
 
-pub(super) fn execute(
-    input: SendableRecordBatchStream,
+/// The per-batch body of a named one hop: the first non-empty input batch
+/// decides the start mode, then every batch is walked in bounded slices,
+/// switching to the CSR between batches once the frontier outgrows the
+/// indexed path.
+pub(super) struct SingleHop {
     schema: SchemaRef,
     step: ExpandStep,
     named: NamedExpand,
     env: Arc<GraphEnv>,
-    ctx: Arc<TaskContext>,
-    metrics: &ExecutionPlanMetricsSet,
-) -> Result<SendableRecordBatchStream> {
-    let switch = Switch::gauge(metrics);
-    let mut work = WorkMemory::new(ctx, "ExpandExec")?;
-    work.set_metrics(metrics.clone());
-    work.metric("input_rows", 0);
-    let memory = Arc::new(work);
-    let declared = Arc::clone(&schema);
-    Ok(producer_stream(
-        schema,
-        memory,
-        Some(metrics),
-        move |memory, sender| async move {
-            run(
-                input, &declared, &step, &named, &env, &switch, &memory, &sender,
-            )
-            .await
-        },
-    ))
+    switch: Gauge,
+    started: Option<Started>,
 }
 
-async fn run(
-    mut input: SendableRecordBatchStream,
-    schema: &SchemaRef,
-    step: &ExpandStep,
-    named: &NamedExpand,
-    env: &GraphEnv,
-    switch: &Gauge,
-    memory: &Arc<WorkMemory>,
-    sender: &BatchSender,
-) -> Result<()> {
-    let catalog = &env.catalog;
-    let member = &named.member;
-    let edge_def = catalog.edge_types.get(&member.edge_type).ok_or_else(|| {
-        external(OmniError::manifest(format!(
-            "unknown edge type '{}'",
-            member.edge_type
-        )))
-    })?;
-    let src_column = format!("{}.{}", step.src, catalog.system_columns.id);
-    let probes = endpoint_probes(member.direction, catalog.system_columns);
-    let walk_memory = memory.child("expand walk")?;
-    let first = loop {
-        match input.next().await.transpose()? {
-            Some(batch) if batch.num_rows() > 0 => break batch,
-            Some(_) => continue,
-            None => return Ok(()),
+/// What the first batch decided and what every batch after it reuses.
+struct Started {
+    mode: Mode,
+    src_column: String,
+    probes: Vec<EndpointColumns>,
+    walk: Walk,
+    walk_memory: WorkMemory,
+    observed: usize,
+}
+
+/// Where the neighbours come from, owned across batches: the shared CSR
+/// dictionary, resolved again per batch from the index handle, or the edge
+/// dataset the batch's own scan reads.
+enum Mode {
+    Csr,
+    Indexed {
+        edge_ds: Box<lance::Dataset>,
+        hop_policy: HopPolicy,
+    },
+}
+
+impl Mode {
+    fn switches(&self, observed: usize, graph_index: &GraphIndexHandle) -> bool {
+        let Self::Indexed { hop_policy, .. } = self else {
+            return false;
+        };
+        match hop_policy {
+            HopPolicy::Off => false,
+            HopPolicy::Full(inputs) => should_switch_to_csr(
+                observed as u64,
+                observed as u64,
+                1,
+                graph_index.is_built(),
+                inputs,
+            ),
         }
-    };
-    let start = decide_expand_start(
-        Some(first.num_rows()),
-        &env.graph_index,
-        &env.snapshot,
-        catalog,
-        step,
-        named,
-        memory,
-    )
-    .await
-    .map_err(external)?;
-    let mut source = match start {
-        ExpandStart::Csr => {
-            Switch::Csr.record(switch);
-            Source::csr(env, edge_def, named).await?
+    }
+}
+
+impl SingleHop {
+    pub(super) fn new(
+        schema: SchemaRef,
+        step: ExpandStep,
+        named: NamedExpand,
+        env: Arc<GraphEnv>,
+        metrics: &ExecutionPlanMetricsSet,
+    ) -> Self {
+        Self {
+            schema,
+            step,
+            named,
+            env,
+            switch: Switch::gauge(metrics),
+            started: None,
         }
-        ExpandStart::Indexed {
-            edge_ds,
-            hop_policy,
-        } => {
-            Switch::IndexedScan.record(switch);
-            Source::Indexed {
+    }
+
+    async fn start(&self, first: &RecordBatch, memory: &Arc<WorkMemory>) -> Result<Started> {
+        let catalog = &self.env.catalog;
+        let member = &self.named.member;
+        let src_column = format!("{}.{}", self.step.src, catalog.system_columns.id);
+        let probes = endpoint_probes(member.direction, catalog.system_columns);
+        let walk_memory = memory.child("expand walk")?;
+        let start = decide_expand_start(
+            Some(first.num_rows()),
+            &self.env.graph_index,
+            &self.env.snapshot,
+            catalog,
+            &self.step,
+            &self.named,
+            memory,
+        )
+        .await
+        .map_err(external)?;
+        let mode = match start {
+            ExpandStart::Csr => {
+                Switch::Csr.record(&self.switch);
+                Mode::Csr
+            }
+            ExpandStart::Indexed {
                 edge_ds,
                 hop_policy,
+            } => {
+                Switch::IndexedScan.record(&self.switch);
+                Mode::Indexed {
+                    edge_ds,
+                    hop_policy,
+                }
             }
-        }
-    };
-    let batch_size = output_rows(memory);
-    walk_memory.entries::<u32>(batch_size * 2)?;
-    let mut walk = Walk::new(batch_size);
-    let mut observed = 0usize;
-    let mut input = futures::stream::iter([Ok(first)]).chain(input);
-    while let Some(batch) = input.next().await {
-        let batch = batch?;
+        };
+        let batch_size = output_rows(memory);
+        walk_memory.entries::<u32>(batch_size * 2)?;
+        Ok(Started {
+            mode,
+            src_column,
+            probes,
+            walk: Walk::new(batch_size),
+            walk_memory,
+            observed: 0,
+        })
+    }
+
+    async fn hop(
+        &mut self,
+        batch: RecordBatch,
+        memory: &Arc<WorkMemory>,
+        sender: &BatchSender,
+    ) -> Result<()> {
         memory.metric("input_rows", batch.num_rows());
         if batch.num_rows() == 0 {
-            continue;
+            return Ok(());
         }
-        observed = observed.saturating_add(batch.num_rows());
-        if source.switches(observed, &env.graph_index) {
+        if self.started.is_none() {
+            self.started = Some(self.start(&batch, memory).await?);
+        }
+        let Self {
+            schema,
+            env,
+            named,
+            switch,
+            started,
+            ..
+        } = self;
+        let started = started.as_mut().ok_or_else(|| {
+            DataFusionError::Internal("single hop walked before its start was decided".into())
+        })?;
+        let member = &named.member;
+        let edge_def = env
+            .catalog
+            .edge_types
+            .get(&member.edge_type)
+            .ok_or_else(|| {
+                external(OmniError::manifest(format!(
+                    "unknown edge type '{}'",
+                    member.edge_type
+                )))
+            })?;
+        started.observed = started.observed.saturating_add(batch.num_rows());
+        if started.mode.switches(started.observed, &env.graph_index) {
             crate::instrumentation::record_traversal_mid_switch();
             crate::instrumentation::record_expand_path(false);
             memory.metric("expand_csr", 1);
             tracing::debug!(
                 target: "omnigraph::traverse",
                 edge = %member.edge_type,
-                frontier = observed,
+                frontier = started.observed,
                 mode = "csr",
                 reason = "frontier outgrew the indexed path",
                 "expand mode switched between input batches",
             );
             Switch::Csr.record(switch);
-            source = Source::csr(env, edge_def, named).await?;
+            started.mode = Mode::Csr;
         }
         let input_memory = memory.child("expand input batch")?;
         input_memory.hold(&batch)?;
         let src_ids = batch
-            .column_by_name(&src_column)
+            .column_by_name(&started.src_column)
             .and_then(|column| column.as_any().downcast_ref::<StringArray>())
             .ok_or_else(|| {
-                DataFusionError::Internal(format!("expand input has no Utf8 '{src_column}'"))
+                DataFusionError::Internal(format!(
+                    "expand input has no Utf8 '{}'",
+                    started.src_column
+                ))
             })?;
         let hop_memory = memory.child("expand hop")?;
         hop_memory.entries::<usize>(batch.num_rows())?;
         let row_bytes = (0..batch.num_rows())
             .map(|row| memory.slice_bytes(&batch, row, 1))
             .collect::<Result<Vec<_>>>()?;
+        let source = match &started.mode {
+            Mode::Csr => {
+                let gi = env
+                    .graph_index
+                    .get()
+                    .await
+                    .map_err(external)?
+                    .ok_or_else(|| {
+                        external(OmniError::manifest(
+                            "graph index required for CSR traversal".to_string(),
+                        ))
+                    })?;
+                Source::Csr {
+                    csr: resolve_csr(gi, edge_def, &member.edge_type, member.direction)
+                        .map_err(external)?,
+                }
+            }
+            Mode::Indexed { edge_ds, .. } => Source::Indexed { edge_ds },
+        };
         let (src_dense, ids, neighbours) = source
-            .prepare(src_ids, &probes, &hop_memory, &walk_memory, &mut walk)
+            .prepare(
+                src_ids,
+                &started.probes,
+                &hop_memory,
+                &started.walk_memory,
+                &mut started.walk,
+            )
             .await?;
         memory.checkpoint()?;
         let mut cursor = Cursor::default();
         loop {
-            let stop = walk.fill(
+            let stop = started.walk.fill(
                 &src_dense,
                 &neighbours,
                 &mut cursor,
@@ -162,26 +244,38 @@ async fn run(
                 ids.as_slice(),
                 memory.batch_bytes(),
             );
-            walk.flush(&batch, ids.as_slice(), memory, sender, schema)
+            started
+                .walk
+                .flush(&batch, ids.as_slice(), memory, sender, schema)
                 .await?;
             match stop {
                 Stop::Full => {}
                 Stop::Exhausted => break,
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
-/// Neighbours come from the shared CSR dictionary or batch-local edge scans.
+impl Streamed for SingleHop {
+    fn batch<'a>(
+        &'a mut self,
+        batch: RecordBatch,
+        memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, Result<Flow>> {
+        Box::pin(async move {
+            self.hop(batch, memory, sender).await?;
+            Ok(Flow::Continue)
+        })
+    }
+}
+
+/// One batch's neighbour source: CSR slices borrowed from the index, or the
+/// edge dataset a batch-local scan reads.
 enum Source<'g> {
-    Csr {
-        csr: CsrSource<'g>,
-    },
-    Indexed {
-        edge_ds: Box<lance::Dataset>,
-        hop_policy: HopPolicy,
-    },
+    Csr { csr: CsrSource<'g> },
+    Indexed { edge_ds: &'g lance::Dataset },
 }
 
 /// One input batch's neighbour lists: CSR slices, or the batch's own scan.
@@ -206,43 +300,6 @@ impl Neighbours<'_> {
 }
 
 impl<'g> Source<'g> {
-    async fn csr(
-        env: &'g GraphEnv,
-        edge_def: &omnigraph_compiler::catalog::EdgeType,
-        named: &NamedExpand,
-    ) -> Result<Self> {
-        let member = &named.member;
-        let gi = env
-            .graph_index
-            .get()
-            .await
-            .map_err(external)?
-            .ok_or_else(|| {
-                external(OmniError::manifest(
-                    "graph index required for CSR traversal".to_string(),
-                ))
-            })?;
-        let csr =
-            resolve_csr(gi, edge_def, &member.edge_type, member.direction).map_err(external)?;
-        Ok(Self::Csr { csr })
-    }
-
-    fn switches(&self, observed: usize, graph_index: &GraphIndexHandle) -> bool {
-        let Self::Indexed { hop_policy, .. } = self else {
-            return false;
-        };
-        match hop_policy {
-            HopPolicy::Off => false,
-            HopPolicy::Full(inputs) => should_switch_to_csr(
-                observed as u64,
-                observed as u64,
-                1,
-                graph_index.is_built(),
-                inputs,
-            ),
-        }
-    }
-
     /// The batch's sources as dense ids (`None`: unknown to the index, no
     /// edges), the id table its destinations are taken from, and its
     /// neighbour lists.
@@ -270,7 +327,7 @@ impl<'g> Source<'g> {
                     },
                 ))
             }
-            Self::Indexed { edge_ds, .. } => {
+            Self::Indexed { edge_ds } => {
                 let mut interner = TypeIndex::new();
                 let src_dense = (0..src_ids.len())
                     .map(|row| intern(&mut interner, src_ids.value(row), hop_memory).map(Some))

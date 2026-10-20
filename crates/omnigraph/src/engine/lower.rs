@@ -475,29 +475,19 @@ impl<'l, 'a> Walk<'l, 'a> {
             .into()
     }
 
-    /// The one operator of node `id`.
+    /// The one operator of node `id`; DataFusion's `AggregateExec`, the one
+    /// operator not built through a shape, has its emission compared against
+    /// the plan's cut (`Final` while its input order mode is linear).
     fn built(&mut self, id: NodeId, operator: impl ExecutionPlan) -> Lowers<Plan> {
         let plan: Plan = Arc::new(operator);
         let node = self.lowering.node(id)?;
-        let holds_input = plan.properties().emission_type == EmissionType::Final;
-        if !node.inputs().is_empty()
-            && !matches!(node, PhysicalNode::FragmentWrite { .. })
-            && holds_input != node.breaks_pipeline()
+        if matches!(node, PhysicalNode::Aggregate { .. })
+            && plan.properties().emission_type != EmissionType::Final
         {
             return Err(OmniError::manifest_internal(format!(
-                "node {id} `{}` is a pipeline {} in the plan but its operator `{}` emits {}",
-                node.name(),
-                if node.breaks_pipeline() {
-                    "breaker"
-                } else {
-                    "operator"
-                },
+                "node {id} `Aggregate` is a pipeline breaker in the plan but `{}` emits {:?}",
                 plan.name(),
-                if holds_input {
-                    "after its whole input"
-                } else {
-                    "incrementally"
-                },
+                plan.properties().emission_type,
             ))
             .into());
         }

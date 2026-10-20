@@ -15,6 +15,11 @@ use lance_table::io::commit::{
 use object_store::ObjectStore as RawObjectStore;
 use object_store::path::Path;
 
+use crate::manifest_request::{
+    FailedRequest, MANIFEST_REQUEST_REISSUES, ManifestRequest, ManifestRequestAttempt,
+    ManifestRequestProbe, classify_failed_request, reissue_pause, request_error_class,
+};
+
 #[cfg(test)]
 pub(crate) use tests::fresh_dataset;
 
@@ -62,11 +67,15 @@ impl CloneContext {
     }
 }
 
+/// The handler every OmniGraph dataset commits through. It reuses a clone
+/// source's location, normalizes local discovery tags, and resolves the
+/// manifest request of every commit (`manifest_request`).
 #[derive(Debug)]
 struct ManifestLocationCommitHandler {
     inner: Arc<dyn CommitHandler>,
     reuse_main_source_location: bool,
     normalize_local_discovery_etag: bool,
+    probe: Option<ManifestRequestProbe>,
 }
 
 // Lance 13's direct local discovery still uses its unquoted inode-mtime-size
@@ -89,11 +98,19 @@ fn normalize_local_discovery_etag(location: &mut ManifestLocation) {
 }
 
 pub fn wrap_commit_handler(inner: Arc<dyn CommitHandler>) -> Arc<dyn CommitHandler> {
-    Arc::new(ManifestLocationCommitHandler {
+    Arc::new(wrapped(inner, None))
+}
+
+fn wrapped(
+    inner: Arc<dyn CommitHandler>,
+    probe: Option<ManifestRequestProbe>,
+) -> ManifestLocationCommitHandler {
+    ManifestLocationCommitHandler {
         inner,
         reuse_main_source_location: false,
         normalize_local_discovery_etag: false,
-    })
+        probe,
+    }
 }
 
 pub async fn configured_commit_handler(
@@ -101,8 +118,32 @@ pub async fn configured_commit_handler(
     params: &Option<lance::io::ObjectStoreParams>,
     existing: Option<Arc<dyn CommitHandler>>,
 ) -> Result<Arc<dyn CommitHandler>> {
+    Ok(Arc::new(
+        configured_handler(uri, params, existing, None).await?,
+    ))
+}
+
+/// The configured handler for one commit of `dataset`, recording what its
+/// manifest requests establish in `probe`. Pass it to that commit's
+/// `CommitBuilder::with_commit_handler`; the dataset keeps its own handler.
+pub async fn probed_commit_handler(
+    dataset: &Dataset,
+    probe: ManifestRequestProbe,
+) -> Result<Arc<dyn CommitHandler>> {
+    let params = dataset.store_params().cloned();
+    Ok(Arc::new(
+        configured_handler(dataset.uri(), &params, None, Some(probe)).await?,
+    ))
+}
+
+async fn configured_handler(
+    uri: &str,
+    params: &Option<lance::io::ObjectStoreParams>,
+    existing: Option<Arc<dyn CommitHandler>>,
+    probe: Option<ManifestRequestProbe>,
+) -> Result<ManifestLocationCommitHandler> {
     if let Some(handler) = existing {
-        return Ok(wrap_commit_handler(handler));
+        return Ok(wrapped(handler, probe));
     }
     let reuse_main_source_location = url::Url::parse(uri).map_or(true, |url| {
         matches!(
@@ -124,11 +165,12 @@ pub async fn configured_commit_handler(
         matches!(url.scheme(), "file" | "file-object-store")
             || (cfg!(windows) && url.scheme().len() == 1)
     });
-    Ok(Arc::new(ManifestLocationCommitHandler {
+    Ok(ManifestLocationCommitHandler {
         inner: lance_table::io::commit::commit_handler_from_url(uri, params).await?,
         reuse_main_source_location,
         normalize_local_discovery_etag,
-    }))
+        probe,
+    })
 }
 
 pub async fn write_params(
@@ -152,10 +194,111 @@ pub async fn create_branch(
         .await
 }
 
+impl ManifestLocationCommitHandler {
+    /// Send the commit's manifest put-if-absent until the store answers it.
+    ///
+    /// A version the store holds goes back to Lance as a conflict, which Lance
+    /// reads back by its complete transaction: this commit's own earlier
+    /// request is then a success, another commit's a conflict. An ambiguous
+    /// failure is re-issued with the same manifest and the same precondition,
+    /// so at most one copy applies, and the key's next definite answer
+    /// settles every earlier request for it. A request still ambiguous after
+    /// the last re-issue goes back to Lance as it failed, recorded as
+    /// unresolved for the committer.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_manifest_request(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &Path,
+        object_store: &ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        let attempt = self.probe.as_ref().map(ManifestRequestProbe::attempt);
+        let finish = |attempt: Option<ManifestRequestAttempt>, outcome| {
+            if let Some(attempt) = attempt {
+                attempt.finish(outcome);
+            }
+        };
+        let mut reissues = 0;
+        loop {
+            let result = self
+                .inner
+                .commit(
+                    manifest,
+                    indices.clone(),
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction.clone(),
+                )
+                .await;
+            let error = match result {
+                Ok(location) => {
+                    if reissues > 0 {
+                        tracing::info!(
+                            version = manifest.version,
+                            reissues,
+                            "manifest request resolved by re-issue: the store holds this commit"
+                        );
+                    }
+                    finish(attempt, ManifestRequest::Landed);
+                    return Ok(location);
+                }
+                Err(CommitError::CommitConflict) => {
+                    finish(attempt, ManifestRequest::Held);
+                    return Err(CommitError::CommitConflict);
+                }
+                Err(CommitError::OtherError(error)) => error,
+            };
+            if reissues == 0 && classify_failed_request(&error) == FailedRequest::Refused {
+                finish(attempt, ManifestRequest::Refused);
+                return Err(CommitError::OtherError(error));
+            }
+            if reissues == MANIFEST_REQUEST_REISSUES {
+                tracing::error!(
+                    version = manifest.version,
+                    reissues,
+                    error_class = request_error_class(&error),
+                    "manifest request outcome unknown after every re-issue; the version may still \
+                     hold this commit"
+                );
+                finish(attempt, ManifestRequest::Unresolved);
+                return Err(CommitError::OtherError(error));
+            }
+            reissues += 1;
+            tracing::warn!(
+                version = manifest.version,
+                reissue = reissues,
+                error_class = request_error_class(&error),
+                "manifest request outcome unknown; re-issuing the identical conditional request"
+            );
+            tokio::time::sleep(reissue_pause(reissues)).await;
+        }
+    }
+}
+
 #[async_trait]
 impl CommitHandler for ManifestLocationCommitHandler {
+    /// Whether a version read back as missing after a failed commit proves
+    /// the commit absent, which lets Lance delete the attempt's transaction
+    /// file. Only the commit's own request record can say so: a handler built
+    /// for one commit answers from its probe, and a request that may still
+    /// land keeps the file its manifest would name. A dataset's shared handler
+    /// holds no record of which attempt Lance is reading back, so it never
+    /// calls a missing version definitive; Lance then reports the commit
+    /// status unknown and leaves the file to the collector's orphan sweep.
     fn is_version_not_found_definitive(&self) -> bool {
-        self.inner.is_version_not_found_definitive()
+        match &self.probe {
+            Some(probe) => {
+                probe.outcome() != ManifestRequest::Unresolved
+                    && self.inner.is_version_not_found_definitive()
+            }
+            None => false,
+        }
     }
 
     fn propagate_commit_error_after_success(&self) -> bool {
@@ -245,17 +388,16 @@ impl CommitHandler for ManifestLocationCommitHandler {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
-        self.inner
-            .commit(
-                manifest,
-                indices,
-                base_path,
-                object_store,
-                manifest_writer,
-                naming_scheme,
-                transaction,
-            )
-            .await
+        self.resolve_manifest_request(
+            manifest,
+            indices,
+            base_path,
+            object_store,
+            manifest_writer,
+            naming_scheme,
+            transaction,
+        )
+        .await
     }
 
     fn supports_predecessor_condition(&self) -> bool {
@@ -471,6 +613,207 @@ mod tests {
         }
     }
 
+    /// A backend that answers each manifest commit with the next scripted
+    /// result and counts the requests it was sent.
+    #[derive(Debug)]
+    struct ScriptedBackend {
+        answers: std::sync::Mutex<std::collections::VecDeque<Answer>>,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Answer {
+        Landed,
+        Held,
+        Ambiguous,
+        Refused,
+        LandedWithLocalError,
+        NativeConditionalPut,
+    }
+
+    impl ScriptedBackend {
+        fn new(answers: &[Answer]) -> Self {
+            Self {
+                answers: std::sync::Mutex::new(answers.iter().copied().collect()),
+                sent: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CommitHandler for ScriptedBackend {
+        // As the conditional-put handler does: a missing version is absent.
+        fn is_version_not_found_definitive(&self) -> bool {
+            true
+        }
+
+        async fn resolve_version_location(
+            &self,
+            _base_path: &Path,
+            _version: u64,
+            _object_store: &dyn RawObjectStore,
+        ) -> Result<ManifestLocation> {
+            Err(Error::io("scripted resolver"))
+        }
+
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let answer = self.answers.lock().unwrap().pop_front().expect("scripted");
+            let store_error = |store: &'static str| {
+                CommitError::OtherError(
+                    object_store::Error::Generic {
+                        store,
+                        source: std::io::Error::other("scripted").into(),
+                    }
+                    .into(),
+                )
+            };
+            match answer {
+                Answer::Landed => Ok(ManifestLocation {
+                    version: manifest.version,
+                    path: naming_scheme.manifest_path(base_path, manifest.version),
+                    size: None,
+                    naming_scheme,
+                    e_tag: None,
+                    identity: None,
+                }),
+                Answer::Held => Err(CommitError::CommitConflict),
+                Answer::Ambiguous => Err(store_error("S3")),
+                Answer::Refused => Err(store_error(omnigraph_storage::OWNED_STORE_NAME)),
+                Answer::LandedWithLocalError | Answer::NativeConditionalPut => {
+                    let result = lance_table::io::commit::ConditionalPutCommitHandler
+                        .commit(
+                            manifest,
+                            indices,
+                            base_path,
+                            object_store,
+                            writer,
+                            naming_scheme,
+                            transaction,
+                        )
+                        .await;
+                    if matches!(answer, Answer::LandedWithLocalError) {
+                        // Windows' rename handler can create the destination
+                        // before source cleanup fails. Persist a real manifest
+                        // here so the re-issue meets its native precondition.
+                        result.expect("the manifest must exist before the local error");
+                        Err(store_error("LocalFileSystem"))
+                    } else {
+                        result
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run one manifest commit through the configured handler over `answers`;
+    /// returns whether it succeeded, how many requests were sent and what the
+    /// probe recorded.
+    async fn resolve(answers: &[Answer]) -> (bool, usize, ManifestRequest) {
+        let backend = Arc::new(ScriptedBackend::new(answers));
+        let probe = ManifestRequestProbe::new();
+        let handler = wrapped(backend.clone(), Some(probe.clone()));
+        let succeeded = commit_once(&handler).await;
+        let outcome = probe.outcome();
+        // Lance reads the version back through this flag after a failure: a
+        // missing version is proof of absence unless the request may still
+        // land, which keeps the transaction file its manifest would name.
+        assert_eq!(
+            handler.is_version_not_found_definitive(),
+            outcome != ManifestRequest::Unresolved,
+            "{answers:?}"
+        );
+        (
+            succeeded,
+            backend.sent.load(std::sync::atomic::Ordering::SeqCst),
+            outcome,
+        )
+    }
+
+    /// Send one manifest commit through `handler`; returns whether it succeeded.
+    async fn commit_once(handler: &ManifestLocationCommitHandler) -> bool {
+        let directory = tempfile::tempdir().unwrap();
+        let dataset = fresh_dataset(directory.path().to_str().unwrap()).await;
+        let mut manifest = dataset.manifest().clone();
+        manifest.version += 1;
+        let store = dataset.object_store(None).await.unwrap();
+        let result = handler
+            .commit(
+                &mut manifest,
+                None,
+                &dataset.branch_location().path,
+                &store,
+                lance_table::io::commit::write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await;
+        result.is_ok()
+    }
+
+    /// The handler re-issues an ambiguous manifest request until the store
+    /// answers it; a definite refusal, a held version and a landed manifest
+    /// end it at once; and a request no answer settles stays unresolved.
+    #[tokio::test]
+    async fn manifest_request_is_re_issued_until_the_store_answers_issue_1067() {
+        use Answer::*;
+        assert_eq!(resolve(&[Landed]).await, (true, 1, ManifestRequest::Landed));
+        assert_eq!(
+            resolve(&[LandedWithLocalError, NativeConditionalPut]).await,
+            (false, 2, ManifestRequest::Held),
+            "a local error after manifest creation must not be called a refusal"
+        );
+        assert_eq!(
+            resolve(&[Ambiguous, Ambiguous, Landed]).await,
+            (true, 3, ManifestRequest::Landed),
+            "a re-issue the store applies is this commit"
+        );
+        assert_eq!(
+            resolve(&[Ambiguous, Held]).await,
+            (false, 2, ManifestRequest::Held),
+            "a held version goes to Lance's read-back, which tells this commit from another"
+        );
+        assert_eq!(
+            resolve(&[Refused]).await,
+            (false, 1, ManifestRequest::Refused),
+            "a definite refusal is not re-issued"
+        );
+        assert_eq!(
+            resolve(&[Ambiguous, Refused, Landed]).await,
+            (true, 3, ManifestRequest::Landed),
+            "after an ambiguous request, a refusal does not settle the key"
+        );
+        let unanswered = [Ambiguous; 1 + MANIFEST_REQUEST_REISSUES as usize];
+        assert_eq!(
+            resolve(&unanswered).await,
+            (false, unanswered.len(), ManifestRequest::Unresolved)
+        );
+    }
+
+    /// A dataset's own handler is shared by concurrent commits and holds no
+    /// record of the attempt Lance reads back, so it never calls a missing
+    /// version definitive, whatever its last commit did: a request that may
+    /// still land keeps the transaction file its manifest would name.
+    #[tokio::test]
+    async fn a_shared_handler_never_calls_a_missing_version_definitive_issue_1067() {
+        let unanswered = [Answer::Ambiguous; 1 + MANIFEST_REQUEST_REISSUES as usize];
+        for answers in [&[Answer::Landed][..], &[Answer::Refused], &unanswered] {
+            let handler = wrapped(Arc::new(ScriptedBackend::new(answers)), None);
+            assert!(!handler.is_version_not_found_definitive(), "{answers:?}");
+            commit_once(&handler).await;
+            assert!(!handler.is_version_not_found_definitive(), "{answers:?}");
+        }
+    }
+
     #[tokio::test]
     async fn creation_preserves_configured_handler_session_and_failure_semantics() {
         let session = Arc::new(Session::default());
@@ -486,7 +829,10 @@ mod tests {
         .unwrap();
         assert!(Arc::ptr_eq(params.session.as_ref().unwrap(), &session));
         let handler = params.commit_handler.unwrap();
-        assert!(handler.is_version_not_found_definitive());
+        // A shared handler holds no record of the attempt Lance reads back,
+        // so it never calls a missing version definitive, whatever the
+        // configured backend says.
+        assert!(!handler.is_version_not_found_definitive());
         assert!(!handler.propagate_commit_error_after_success());
         assert!(handler.supports_predecessor_condition());
         let path = Path::from("dataset");

@@ -450,6 +450,57 @@ pub(crate) async fn require_bearer_auth(
     Ok(next.run(request).await)
 }
 
+/// Refuse a request whose `omnigraph-if-actor` header names another actor
+/// than its credential resolved to. It runs after authentication and the
+/// contract check, before graph resolution or any body work, and can only
+/// narrow a request: a matching value changes nothing, and the header never
+/// supplies an actor.
+pub(crate) async fn require_expected_actor(
+    request: Request,
+    next: Next,
+) -> std::result::Result<Response, ApiError> {
+    let mut values = request.headers().get_all(IF_ACTOR_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(next.run(request).await);
+    };
+    if values.next().is_some() {
+        return Err(ApiError::bad_request(format!(
+            "at most one {IF_ACTOR_HEADER} header is allowed"
+        )));
+    }
+    let expected = value
+        .to_str()
+        .ok()
+        .filter(|actor| !actor.is_empty() && actor.trim() == *actor)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "{IF_ACTOR_HEADER} must name one actor, without surrounding whitespace"
+            ))
+        })?;
+    let resolved = request
+        .extensions()
+        .get::<AuthenticatedActor>()
+        .map(|actor| actor.actor_id.as_ref());
+    if resolved == Some(expected) {
+        return Ok(next.run(request).await);
+    }
+    let message = match resolved {
+        Some(actor) => {
+            format!("the credential resolves to actor '{actor}', not the expected '{expected}'")
+        }
+        None => format!(
+            "the server runs without authentication and resolves no actor, not the expected '{expected}'"
+        ),
+    };
+    Err(ApiError {
+        completion_uncertain: false,
+        status: StatusCode::PRECONDITION_FAILED,
+        code: Some(ErrorCode::ActorMismatch),
+        message: message.into_boxed_str(),
+        details: None,
+    })
+}
+
 /// Routing middleware (RFC-011 cluster-only). Resolves the active graph
 /// for the request and injects `GraphRequest` as an extension so
 /// handlers can extract it via `Extension<GraphRequest>`.

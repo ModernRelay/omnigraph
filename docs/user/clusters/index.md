@@ -52,7 +52,7 @@ require `read` and `schema_apply` on the affected graphs. Direct deletion also
 enforces an installed graph policy and requires an authorized `--as` actor.
 Deployment status requires `config_manage`, not unrelated data access. New graphs
 need suitable declared policies too.
-The server derives the actor from its bearer token; `--as` is for direct access.
+The server derives the actor from its bearer token; there `--as` only asserts it.
 
 ## Bootstrap a cluster
 

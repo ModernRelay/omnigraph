@@ -15,7 +15,7 @@ use datafusion::physical_plan::{
 };
 use omnigraph_compiler::catalog::Catalog;
 
-use super::{breaker_properties, breaker_stream, polled};
+use super::shape::{Breaker, work};
 use crate::engine::catalogue;
 use crate::engine::scan::{ScanColumns, SearchColumns, prefix_batch};
 use crate::engine::search::NeededColumns;
@@ -27,7 +27,7 @@ pub(crate) struct CatalogueExec {
     /// The projected, prefixed rows, built at lowering so the operator's
     /// schema is the batch's.
     batch: RecordBatch,
-    properties: Arc<PlanProperties>,
+    shape: Breaker,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -66,7 +66,7 @@ impl CatalogueExec {
         Ok(Self {
             type_name: type_name.to_string(),
             binding: binding.to_string(),
-            properties: breaker_properties(batch.schema()),
+            shape: Breaker::new(batch.schema()),
             batch,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -105,7 +105,7 @@ impl ExecutionPlan for CatalogueExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -127,17 +127,13 @@ impl ExecutionPlan for CatalogueExec {
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "CatalogueExec has one partition");
         let batch = self.batch.clone();
-        let stream = breaker_stream(
-            "CatalogueExec",
-            batch.schema(),
-            &ctx,
-            &self.metrics,
-            move |memory| async move {
+        let memory = work(ctx, "CatalogueExec", &self.metrics)?;
+        Ok(self
+            .shape
+            .stream(memory, &self.metrics, move |memory| async move {
                 memory.metric("catalogue_rows", batch.num_rows());
                 memory.hold(&batch)?;
                 Ok(batch)
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+            }))
     }
 }

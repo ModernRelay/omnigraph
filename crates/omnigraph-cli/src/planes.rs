@@ -162,7 +162,8 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 
 /// An explicit actor applies only to an actor-consuming operation. Match mixed
 /// families exhaustively so new leaves need a decision; read-only families
-/// refuse as a whole. Served targets still derive identity from credentials.
+/// refuse as a whole. A served target still derives identity from its
+/// credential and carries `--as` as the `Omnigraph-If-Actor` assertion.
 fn accepts_actor(command: &Command) -> bool {
     match command {
         Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => true,
@@ -192,7 +193,8 @@ fn accepts_actor(command: &Command) -> bool {
         },
         Command::Cluster { command } => match command {
             // Plan checks the intended actor; apply and upgrade attribute it.
-            // validate_target separately refuses --as on served/managed targets.
+            // A served plan or apply asserts it; validate_target refuses
+            // --as on managed targets.
             ClusterCommand::Plan { .. }
             | ClusterCommand::Apply { .. }
             | ClusterCommand::UpgradeLedger { .. } => true,
@@ -305,9 +307,11 @@ pub(crate) fn validate_target(
     if cli.graph.is_some() && matches!(target.binding, DirectGraph { .. } | DirectCatalogue) {
         bail!("a direct graph or catalogue target already identifies its graph; remove --graph");
     }
-    if cli.as_actor.is_some() && matches!(target.binding, Server { .. } | Managed(_)) {
+    // A served target derives identity from its credential and sends `--as`
+    // as an assertion the server checks; a managed target asserts nothing.
+    if cli.as_actor.is_some() && matches!(target.binding, Managed(_)) {
         bail!(
-            "--as is only available for direct operations; a served target derives identity from its credential"
+            "--as is not available for a managed target; it derives identity from its credential"
         );
     }
     if matches!(
