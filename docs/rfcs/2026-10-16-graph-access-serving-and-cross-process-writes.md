@@ -389,14 +389,17 @@ object.
   unknown write: the identity storage outcomes per operation gives a pending
   publication, its branch and its publication id (a graph commit id, or a
   control fact's attempt id), with the branch's head before the write. It arrives with the attempt identity of
-  [cross-process writes](#cross-process-writes); until then a caller settles
-  from the branch it sent and that branch's head. The body below is that later
+  [cross-process writes](#cross-process-writes). Until then a caller settles a
+  row publication from the branch it sent and that branch's head, and a
+  control fact from the registration, tombstone or drop record it names, since
+  a control fact does not move the head. Retrying one is safe: a create refuses
+  with `branch_exists`, and a delete or a drop converges. The body below is that later
   phase's:
 
   ```json
   {"error":"the write may have published","code":"outcome_unknown",
    "disposition":{"effects":"unknown","action":"reconcile",
-                  "check":{"branch":"main","head_before":"01JAC…","attempt":"0c410ce6-…"}}}
+                  "check":{"branch":"main","head_before":"01JAC…","attempt":"01JAD…"}}}
   ```
 
 - **Exit codes follow from the disposition**, the same for every command:
@@ -745,8 +748,10 @@ writes records it. The attempt id is a control fact's identity, as the graph
 commit id is a row publication's:
 
 - **Read-back.** After a lost acknowledgement, the publisher reads the version it
-  attempted. The attempt landed when that version holds a fact with its attempt
-  id, and lost when it holds anything else. The row read-back compares heads,
+  attempted, with three results. The attempt landed when that version holds a
+  fact with its attempt id. It lost when the version is readable and holds
+  anything else, or is absent and the request never reached the store. It stays
+  pending when the version cannot be read. The row read-back compares heads,
   which cannot tell two control facts apart, since neither moves the head.
 - **The owner's retry.** A fact with the operation's own attempt id is its own
   landed attempt, never a refusal: the operation goes on to its follow-ups,
@@ -785,7 +790,8 @@ its candidate's drop record.
    point, which cleanup retains while the registration names it. Listings read
    registrations too: `branch list`, with the details
    [#1012](https://github.com/ModernRelay/omnigraph/pull/1012) adds, lists such
-   a branch as not ready, from its registration.
+   a branch as not ready. Its registration fills the name, the parent and the
+   fork commit; `head` and `created_at` stay absent until its ref exists.
 
    Until [schema apply with live branches](https://github.com/ModernRelay/omnigraph/pull/963)
    lands, a registration also refuses, on any attempt, when main's schema
@@ -807,11 +813,15 @@ its candidate's drop record.
    main's registrations, so any listed ref or tree whose create is in flight is
    already registered in what it reads. Such a ref or tree, whether a tombstone
    retired it, a late marker rewrite recreated its ref, or a create crashed
-   before it, is reclaimable with no age threshold. The collector's existing
-   dependency and tag closure still keeps any tree a live branch reads, and it
-   deletes the rest through a ref delete and a delete of that tree alone,
-   never Lance's forced branch delete. The deciding authority is the
-   registration set, never an age, as invariant 5 requires. Lance 13's stock
+   before it, is a candidate with no age threshold. The registration set decides
+   which refs and trees are candidates; it does not replace the collector's
+   keep set. `protected_manifest_branches` still keeps any tree a live branch
+   reads and any retired tree that supplies a live tag, a retention root or
+   imported merge-base lineage (`retained_merge_bases`), and a not-ready
+   registration's fork point stays while the registration names it. The
+   collector deletes the remaining candidates through a ref delete and a delete
+   of that tree alone, never Lance's forced branch delete. The deciding
+   authority is the registration set, never an age, as invariant 5 requires. Lance 13's stock
    `cleanup_old_versions` now also reaches unreferenced data newer than the
    retained manifests
    ([lance#8944](https://github.com/lance-format/lance/pull/8944)), so the engine
@@ -868,8 +878,11 @@ main's registrations, refuse instead, which is the point until PR 963. Row write
 crash after a tombstone and before the unlink leaves a branch that refuses
 writes, which delete, cleanup and `repair` complete. A crash after a
 registration and before its ref leaves a branch that refuses as not ready until
-its delete removes it or `repair` completes it. An operation retried after a
-crash recognizes its own facts by its attempt id. A crash after a drop
+its delete removes it or `repair` completes it. A crash loses the attempt id
+with its process. Delete and drop need no id, because a later one completes
+the follow-ups. A create does not converge: a new create of the name refuses
+with `branch_exists`, and `repair` completes the branch or its delete removes
+it. A crash after a drop
 record and before the tag release leaves tags that expire with their captured
 authority, as a proposal's tags already do.
 
@@ -1078,7 +1091,10 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   - Each precondition kind refuses on an attempt a fact names and passes one it
     does not.
   - With two control facts on one chain, a lost acknowledgement reads back as
-    landed only for the fact carrying the attempt's own id.
+    landed only for the fact carrying the attempt's own id, and an unreadable
+    attempted version stays pending.
+  - A delete and a drop that find another attempt's fact complete the
+    follow-ups and succeed.
   - An operation retried with its attempt id goes on to its follow-ups.
   - A system-column upgrade attempt refuses when main's registrations name
     another branch.
@@ -1468,3 +1484,10 @@ proposal.
   never completes a crashed create's registration. The pending-branch
   `service_unavailable` covers one branch, `branch list` lists a registered
   branch with no ref as not ready, and the `--as` help quote is current.
+- 2026-10-20: Took the optional corrections of the review of `ef441758`:
+  read-back has three results (landed, lost, pending); a caller settles a
+  control fact from the fact itself, since the head does not move; cleanup's
+  candidates still pass the collector's keep set (`protected_manifest_branches`,
+  `retained_merge_bases`, a not-ready fork point); a crash loses the attempt id,
+  so only delete and drop converge after one; `branch list` fills a not-ready
+  branch from its registration.
