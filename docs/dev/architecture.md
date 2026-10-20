@@ -139,7 +139,9 @@ through contract discovery and the command. Managed credential renewal remains
 with the managed authentication owner, using the target's declared mechanism.
 Direct targets capture provider destination settings and pass the same authority
 through cluster admission, control storage and Lance sessions. Bound handles
-never reconstruct an endpoint or account from ambient settings. Existing
+never reconstruct an endpoint or account from ambient settings: a catalog
+snapshot keeps the control session it was read with, so its table, contract
+and branch-control reads reuse that session's registry. Existing
 non-CLI engine/server constructors retain their own explicit environment contract.
 The [target RFC](../rfcs/0059-config-cli-coherency.md) records the migration and
 credential/recovery custody requirements.

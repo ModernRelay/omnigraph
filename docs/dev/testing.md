@@ -170,6 +170,14 @@ control-object and native Lance reads/conditional creates against fake HTTP
 endpoints, destination aliases and ambient-option drift, including cached Azure
 options and rotating credential providers. Storage's `binding` unit tests own
 option classification and fixed defaults; these are not live-cloud qualification.
+The engine's `bound_storage.rs` (S3-configured, run by the RustFS job; its own
+binary because it re-executes itself) carries a bound handle's whole workload
+past that capture: a child whose ambient endpoint variables name a recording
+decoy, with unsigned requests and disabled conditional puts, runs writes, the
+`@card` live re-read, a racing publish, a branch create, merge and delete,
+historical CSR and commit-addressed reads, the change feed, export and
+maintenance, and the decoy must see no request. The in-source
+`changes::enumerate` test owns the change feed's fresh re-prove session.
 
 ## Server and CLI ownership
 
