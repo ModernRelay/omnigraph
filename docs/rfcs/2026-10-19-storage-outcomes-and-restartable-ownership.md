@@ -128,21 +128,24 @@ What remains needs a decision.
 | A fresh-key or read request fails transiently | One attempt; the operation fails | Retried within Lance's client and throttle budgets |
 | A failure before the manifest request, or a request the store refused | 500 and keep serving (since #1092) | Unchanged |
 | A manifest request is ambiguous, then answered by a re-issue | Committed, or not committed (since #1092) | Unchanged |
-| A manifest request is still ambiguous after every re-issue | 500, then every graph closes, exit 2, lock retained | 500 (`outcome_unknown` on MCP); the branch's writes answer 503 `service_unavailable` until resolution; the resolver completes or refuses the write |
+| A manifest request is still ambiguous after every re-issue | 500, then every graph closes, exit 2, lock retained | 500 `outcome_unknown`; the branch's writes answer 503 `service_unavailable` until resolution; the resolver completes or refuses the write |
 | A mutable-key request has an unknown outcome | Every later mutation refused; release refused | Later requests to that key are refused; nothing else changes |
 | A panic, or lost ownership of a write | Contain, exit 2, lock retained | Contain, exit 2; a successor takes over after one lease of silence |
 | Clean SIGTERM | Release if settled, else retain the lock | Resolve pending publications, then release; if any remain, exit nonzero and let the lease expire |
 | The process dies | The lock is held until an exact-ID `force-unlock` | A successor waits for a lease and a half of heartbeat silence, then takes over |
 
 A pending publication is reported, not hidden. The operation that left it
-pending returns the error it returns today: 500 `internal` on HTTP,
-`outcome_unknown: true` on MCP, and `execution: unknown` from the CLI. Later
-writes to the same branch get a typed refusal, `PublicationPending`, that
-names the pending graph commit. Its status is 503 `service_unavailable`. The
-refusal is definite, because those writes did nothing. `/readyz` stays
-`serving`. The pending publication and its resolution are logged with the
-graph commit id. A status field for them belongs to
-[#1017](https://github.com/ModernRelay/omnigraph/pull/1017)'s outcome model.
+pending answers 500 `outcome_unknown` on HTTP and MCP, with the disposition
+`effects: unknown` and `action: reconcile`; the CLI exits 2. Later writes to
+the same branch get a typed refusal, `PublicationPending`, that names the
+pending publication. Its status is 503 `service_unavailable`, with
+`effects: none` and `action: retry`. The refusal is definite, because those
+writes did nothing, and it covers that branch only. `/readyz` stays
+`serving`. The pending publication and its resolution are logged with its
+publication id: the graph commit id, or a control fact's attempt id. Its
+identity on the wire belongs to the later `disposition.check` of
+[graph access and cross-process
+writes](https://github.com/ModernRelay/omnigraph/pull/1017).
 
 Resolution re-issues the identical manifest commit. If it lands, or a copy of
 it already landed, the pending write is committed. If another commit holds
@@ -160,12 +163,13 @@ uses the owner's value.
 
 This RFC adds no HTTP error code, CLI exit code or MCP field; the pending
 refusal uses the existing `service_unavailable` code.
-[#1017](https://github.com/ModernRelay/omnigraph/pull/1017) carries the
-three-way outcome on the wire: `outcome_unknown`, `storage_unavailable`, the
-`outcome.check` identity and exit 2. Its first slice,
-[#1076](https://github.com/ModernRelay/omnigraph/pull/1076), answers an
-uncertain write `outcome_unknown`. This decision produces exactly the engine
-outcomes that model needs, so the two do not grow parallel shapes.
+[Graph access and cross-process
+writes](https://github.com/ModernRelay/omnigraph/pull/1017) carries the
+three-way outcome on the wire: `outcome_unknown`, the `disposition` object,
+its later `check` identity and exit 2.
+[#1076](https://github.com/ModernRelay/omnigraph/pull/1076) implements the
+code and the disposition. This decision produces exactly the engine outcomes
+that model needs, so the two do not grow parallel shapes.
 
 ## Design
 
@@ -304,7 +308,7 @@ branch. The publisher records it in a bounded registry, one per graph root
 and process, keyed by the branch's `__manifest` base. The record holds:
 
 - the attempted version;
-- the graph commit id;
+- the publication id: the graph commit id, or a control fact's attempt id;
 - what the commit needs to re-issue its manifest: the staged `__manifest`
   transaction, its fragments, and the probed handler.
 
@@ -557,3 +561,7 @@ phase 3.
   [engine settlement](2026-10-01-engine-settlement-and-resource-bounds.md)
   decisions fix today. Those RFCs get disposition notes when this one is
   accepted.
+- 2026-10-20: Aligned the user section with the accepted error body: the
+  unsettled write answers `outcome_unknown` with its `disposition`, the
+  pending branch's refusal is a one-branch `service_unavailable` with `retry`,
+  and a pending record keys a control fact by its attempt id.
