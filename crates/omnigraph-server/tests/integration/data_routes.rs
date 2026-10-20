@@ -224,7 +224,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
     );
     let output: ErrorOutput =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(output.code, Some(ErrorCode::Conflict));
+    assert_eq!(output.code, Some(ErrorCode::PreconditionFailed));
 
     for (range, expected_range, expected) in [
         ("bytes=1-4", "bytes 1-4/11", &b"ello"[..]),
@@ -486,7 +486,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         error.code,
-        Some(omnigraph_server::api::ErrorCode::BadRequest)
+        Some(omnigraph_server::api::ErrorCode::RangeNotSatisfiable)
     );
     let range = error
         .blob_range
@@ -664,12 +664,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
                 Some(omnigraph_server::api::ErrorCode::BadRequest),
                 "{case}"
             );
-            assert!(
-                output
-                    .error
-                    .starts_with("invalid Blob selector query parameters:"),
-                "{case}"
-            );
+            assert!(output.error.starts_with("invalid query string:"), "{case}");
         }
     }
 }
@@ -684,7 +679,7 @@ async fn blob_put_and_delete_return_exact_receipts_and_blob_preconditions() {
     let (_temp, app) = app_for_blob_http_data(BLOB_HTTP_DATA).await;
     let precondition_failure = |body: &[u8]| {
         let output: Value = serde_json::from_slice(body).unwrap();
-        assert_eq!(output["code"], "conflict", "{output}");
+        assert_eq!(output["code"], "precondition_failed", "{output}");
         assert!(output.get("precondition_failure").is_none(), "{output}");
         output["blob_precondition_failure"].clone()
     };
@@ -1745,8 +1740,8 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["key_conflict"].is_object(), "{body}");
     assert_eq!(
-        body["outcome"],
-        json!({"execution": "unknown", "effects": "unknown", "action": "refresh"}),
+        body["disposition"],
+        json!({"effects": "partial", "action": "refresh"}),
         "{body}"
     );
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
@@ -1779,8 +1774,8 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["key_conflict"].is_object(), "{body}");
     assert_eq!(
-        body["outcome"],
-        json!({"execution": "not_started", "effects": "none", "action": "refresh"}),
+        body["disposition"],
+        json!({"effects": "none", "action": "refresh"}),
         "{body}"
     );
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
@@ -1855,8 +1850,8 @@ async fn a_load_that_forks_a_branch_deleted_during_its_body_reports_the_fork() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["key_conflict"].is_object(), "{body}");
     assert_eq!(
-        body["outcome"],
-        json!({"execution": "unknown", "effects": "unknown", "action": "refresh"}),
+        body["disposition"],
+        json!({"effects": "partial", "action": "refresh"}),
         "the fork published before the rows: {body}"
     );
     assert!(
@@ -2717,6 +2712,7 @@ async fn branch_merge_receipts_keep_own_publication_when_a_later_writer_finishes
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_statements_dispatch_to_their_route_bodies() {
     let (_temp, app) = app_for_loaded_graph().await;
+    let loaded = main_head_commit_id(&app).await;
 
     let (status, body) = json_response(
         &app,
@@ -2736,7 +2732,12 @@ async fn branch_statements_dispatch_to_their_route_bodies() {
             "affected_edges": 0,
             "actor_id": null,
             "commit": null,
-            "outcome": {"kind": "created", "from": "main", "name": "feature"}
+            "outcome": {
+                "kind": "created",
+                "from": "main",
+                "name": "feature",
+                "from_commit_id": loaded,
+            }
         })
     );
 
@@ -2771,7 +2772,13 @@ async fn branch_statements_dispatch_to_their_route_bodies() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["outcome"],
-        json!({"kind": "created", "from": "feature", "name": "review/x"})
+        json!({
+            "kind": "created",
+            "from": "feature",
+            "name": "review/x",
+            "from_commit_id": loaded,
+        }),
+        "a branch with no commit of its own starts at the head it inherited"
     );
     let (_, body) =
         json_response(&app, json_post("/query", &json!({"query": "branch list"}))).await;
@@ -3157,6 +3164,7 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "b0".to_string(),
     };
     let post_create = || {
@@ -3540,8 +3548,32 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
             body["error"],
             format!("commit '{id}' is unattached and cannot publish")
         );
+        // An unattached snapshot never becomes branch history, so no branch
+        // starts at it.
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/branches",
+                &json!({"from_commit": id, "name": "from-snapshot"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "branch_start_refusal", "{body}");
+        assert_eq!(
+            body["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{body}"
+        );
+        assert_eq!(
+            body["branch_start_refusal"],
+            json!({"reason": "unattached_snapshot", "graph_commit_id": id}),
+            "{body}"
+        );
     }
     assert_eq!(main_head_commit_id(&app).await, head_before);
+    let (_, branches) = get_json(&app, g("/branches")).await;
+    assert_eq!(branches["branches"], json!(["main"]));
 
     let response = app
         .clone()
@@ -3811,7 +3843,7 @@ const SHOW_AT_WRITE_DOOR: &str = "statement 'show merge_lineage' is a read; use 
 const SHOW_COLUMNS: [&str; 5] = ["name", "value", "default", "source", "scope"];
 
 /// Every settings refusal is `ApiError::bad_request`: the message, the code,
-/// the outcome of a refusal, and nothing else in the body.
+/// the disposition of a refusal, and nothing else in the body.
 fn assert_settings_refusal(status: StatusCode, body: &Value, error: &str) {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(
@@ -3819,7 +3851,7 @@ fn assert_settings_refusal(status: StatusCode, body: &Value, error: &str) {
         &json!({
             "error": error,
             "code": "bad_request",
-            "outcome": {"execution": "not_started", "effects": "none", "action": "refresh"},
+            "disposition": {"effects": "none", "action": "fix"},
         })
     );
 }
@@ -3852,7 +3884,7 @@ async fn assert_unknown_settings_field(app: &axum::Router, request: Request<Body
     let error = body["error"].as_str().unwrap_or_default();
     assert!(error.contains("unknown field"), "{error}");
     assert_eq!(body.as_object().unwrap().len(), 3, "{body}");
-    assert_eq!(body["outcome"]["execution"], "not_started", "{body}");
+    assert_eq!(body["disposition"]["effects"], "none", "{body}");
 }
 
 fn show_row(name: &str, value: &str, default: &str, source: &str, scope: &str) -> Value {
@@ -5545,6 +5577,7 @@ async fn remote_branch_list_create_merge_flow_works() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, create_body) = json_response(
@@ -5561,6 +5594,11 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(create_status, StatusCode::OK);
     assert_eq!(create_body["from"], "main");
     assert_eq!(create_body["name"], "feature");
+    let loaded = main_head_commit_id(&app).await;
+    assert_eq!(
+        create_body["from_commit_id"], loaded,
+        "the receipt names the head the branch starts at"
+    );
 
     // Target namespace inventory reads the ancestor ref before it can clone
     // or reclaim anything. A failed read must leave server admission open.
@@ -5692,6 +5730,77 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(read_status, StatusCode::OK);
     assert_eq!(read_body["row_count"], 1);
     assert_eq!(read_body["rows"][0]["p.name"], "Zoe");
+
+    // A branch started at the commit main held before the merge reads that
+    // commit's rows, not main's head.
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches",
+            &json!({"from_commit": loaded, "name": "before-zoe"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["from"], "main", "the branch that wrote the commit");
+    assert_eq!(body["from_commit_id"], loaded);
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({
+                "query": fs::read_to_string(fixture("test.gq")).unwrap(),
+                "name": "get_person",
+                "params": {"name": "Zoe"},
+                "branch": "before-zoe",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["row_count"], 0);
+
+    // A commit id no commit has is not found, and a start is a branch or a
+    // commit, never both.
+    let unknown = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches",
+            &json!({"from_commit": unknown, "name": "nowhere"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], format!("commit '{unknown}' not found"));
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches",
+            &json!({"from": "main", "from_commit": loaded, "name": "both"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        "request may specify from or from_commit, not both"
+    );
+    let (_, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/branches"))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        body["branches"],
+        json!(["before-zoe", "feature", "main"]),
+        "refused starts create nothing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5700,6 +5809,7 @@ async fn remote_branch_delete_flow_works() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, _) = json_response(
@@ -5748,6 +5858,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, _) = json_response(
@@ -5785,6 +5896,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
 
     let create_child = BranchCreateRequest {
         from: Some("feature".to_string()),
+        from_commit: None,
         name: "feature-child".to_string(),
     };
     let (create_child_status, _) = json_response(
@@ -5846,6 +5958,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, _) = json_response(
@@ -7136,6 +7249,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
     let inherited_head = head_commit_id(&app).await;
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "fresh-cas".to_string(),
     };
     let (status, body) = json_response(

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::{Bytes, to_bytes};
+use axum::body::Bytes;
 use axum::extract::{RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
-use crate::api::InvokeStoredQueryRequest;
+use crate::api::{ErrorCode, InvokeStoredQueryRequest};
 use crate::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::handlers::{self, QueryNamePath};
 use crate::ingress::McpGraphRequest;
@@ -330,72 +330,82 @@ enum Refusal {
 }
 
 impl Refusal {
-    /// The `isError` tool result. A write's caller learns when its wait ended
-    /// before the owned write did, or when the server could not tell whether
-    /// the write completed: the outcome is unknown and must be reconciled, never
-    /// replayed blindly.
-    async fn tool_result(self, write: bool) -> CallToolResult {
+    /// The refusal as the error an HTTP route would answer. A write's caller
+    /// learns when its wait ended before the owned write did, or when the
+    /// server could not tell whether the write completed: the code is
+    /// `outcome_unknown`, to be reconciled, never replayed blindly.
+    fn into_error(self, write: bool) -> ApiError {
         let unknown = "The write keeps running and its outcome is unknown. Before replaying it, read the target (`read` or `snapshot`, comparing `graph_commit_id`) or list the branch with `commits_list`, and replay a `mutate` with `if_graph_commit`.";
+        let wait_ended = |code, reason: &str| {
+            let mut error = ApiError::new(code, format!("{reason} {unknown}")).after_owned_write();
+            error.completion_uncertain = true;
+            error
+        };
         match self {
-            Refusal::Unauthenticated => failure(
-                "unauthenticated",
-                "A verified bearer credential is required.",
-            ),
-            Refusal::MissingContext => {
-                failure("internal_error", "MCP admission context is missing.")
+            Refusal::Unauthenticated => {
+                ApiError::unauthorized("A verified bearer credential is required.")
             }
-            Refusal::Capacity => failure(
-                "capacity_exceeded",
+            Refusal::MissingContext => ApiError::internal("MCP admission context is missing."),
+            Refusal::Capacity => ApiError::too_many_requests(
                 "The server is handling its maximum concurrent MCP tool calls.",
             ),
-            Refusal::Cancelled if write => outcome_unknown("cancelled", unknown),
-            Refusal::Cancelled => failure("cancelled", "The read was cancelled."),
-            Refusal::Deadline if write => outcome_unknown("deadline_exceeded", unknown),
-            Refusal::Deadline => failure(
-                "deadline_exceeded",
+            Refusal::Cancelled if write => {
+                wait_ended(ErrorCode::Cancelled, "The write's call was cancelled.")
+            }
+            Refusal::Cancelled => ApiError::new(ErrorCode::Cancelled, "The read was cancelled."),
+            Refusal::Deadline if write => wait_ended(
+                ErrorCode::DeadlineExceeded,
+                "The write passed its 30 second wait.",
+            ),
+            Refusal::Deadline => ApiError::new(
+                ErrorCode::DeadlineExceeded,
                 "The read exceeded its 30 second deadline.",
             ),
-            Refusal::Api(error) => {
-                let uncertain = write && error.completion_uncertain();
-                let mut result = api_failure(error).await;
-                if uncertain {
-                    if let Some(Value::Object(body)) = result.structured_content.as_mut() {
-                        body.insert("outcome_unknown".into(), Value::Bool(true));
-                    }
-                }
-                result
+            // A write tool's failure the server cannot settle may follow the
+            // write, wherever in the call it arose, and a result it could not
+            // deliver was built after the write ran.
+            Refusal::Api(error)
+                if write
+                    && (error.completion_uncertain()
+                        || error.code == ErrorCode::ResultTooLarge) =>
+            {
+                error.after_owned_write()
             }
+            Refusal::Api(error) => error,
         }
     }
 
-    /// The JSON-RPC error a resource read answers with.
-    async fn resource_error(self) -> ErrorData {
-        match self {
-            Refusal::Api(error) => {
-                let status = error.status;
-                let body = api_failure(error).await.structured_content;
-                if status == StatusCode::NOT_FOUND {
-                    ErrorData::resource_not_found("resource not found", body)
-                } else if status.is_client_error() {
-                    ErrorData::invalid_request("resource read refused", body)
-                } else {
-                    ErrorData::internal_error("resource read failed", body)
-                }
-            }
-            Refusal::Unauthenticated => {
-                ErrorData::invalid_request("a verified bearer credential is required", None)
-            }
-            Refusal::MissingContext => {
-                ErrorData::internal_error("MCP admission context is missing", None)
-            }
-            Refusal::Capacity => ErrorData::internal_error(
-                "the server is handling its maximum concurrent MCP calls",
-                None,
-            ),
-            Refusal::Cancelled => ErrorData::internal_error("the read was cancelled", None),
-            Refusal::Deadline => {
-                ErrorData::internal_error("the read exceeded its 30 second deadline", None)
-            }
+    /// The `isError` tool result.
+    fn tool_result(self, write: bool) -> CallToolResult {
+        tool_error(self.into_error(write))
+    }
+
+    /// The JSON-RPC error a resource read answers with, carrying the same
+    /// error body as `data`.
+    fn resource_error(self) -> ErrorData {
+        let status = match &self {
+            Refusal::Api(error) => Some(error.status()),
+            _ => None,
+        };
+        let refused = status.is_some_and(|status| status.is_client_error())
+            || matches!(self, Refusal::Unauthenticated);
+        let message = match &self {
+            Refusal::Api(_) if status == Some(StatusCode::NOT_FOUND) => "resource not found",
+            Refusal::Api(_) if refused => "resource read refused",
+            Refusal::Api(_) => "resource read failed",
+            Refusal::Unauthenticated => "a verified bearer credential is required",
+            Refusal::MissingContext => "MCP admission context is missing",
+            Refusal::Capacity => "the server is handling its maximum concurrent MCP calls",
+            Refusal::Cancelled => "the read was cancelled",
+            Refusal::Deadline => "the read exceeded its 30 second deadline",
+        };
+        let data = tool_error(self.into_error(false)).structured_content;
+        if status == Some(StatusCode::NOT_FOUND) {
+            ErrorData::resource_not_found(message, data)
+        } else if refused {
+            ErrorData::invalid_request(message, data)
+        } else {
+            ErrorData::internal_error(message, data)
         }
     }
 }
@@ -566,6 +576,8 @@ struct BranchCreateArguments {
     name: String,
     #[serde(default)]
     from: Option<String>,
+    #[serde(default)]
+    from_commit: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -624,7 +636,7 @@ impl ServerHandler for GraphTools {
         let write = spec.gate == Gate::Writes;
         let admitted = match admitted(&context) {
             Ok(admitted) => admitted,
-            Err(refusal) => return Ok(refusal.tool_result(write).await.into()),
+            Err(refusal) => return Ok(refusal.tool_result(write).into()),
         };
         let service = self.clone();
         let execution_input = admitted.input.clone();
@@ -646,9 +658,9 @@ impl ServerHandler for GraphTools {
             .await;
         let result = match result {
             Ok(result) => result,
-            Err(refusal) => refusal.tool_result(write).await,
+            Err(refusal) => refusal.tool_result(write),
         };
-        Ok(fit_result(result).into())
+        Ok(fit_result(result, write).into())
     }
 
     async fn list_resources(
@@ -709,7 +721,7 @@ impl ServerHandler for GraphTools {
         }
         let admitted = match admitted(&context) {
             Ok(admitted) => admitted,
-            Err(refusal) => return Err(refusal.resource_error().await),
+            Err(refusal) => return Err(refusal.resource_error()),
         };
         let service = self.clone();
         let execution_graph = admitted.graph.clone();
@@ -738,7 +750,7 @@ impl ServerHandler for GraphTools {
                 ])
                 .into())
             }
-            Err(refusal) => Err(refusal.resource_error().await),
+            Err(refusal) => Err(refusal.resource_error()),
         }
     }
 }
@@ -876,7 +888,7 @@ impl GraphTools {
             .await
         {
             Ok(result) => result,
-            Err(refusal) => refusal.tool_result(false).await,
+            Err(refusal) => refusal.tool_result(false),
         }
     }
 
@@ -985,7 +997,7 @@ impl GraphTools {
                     state(),
                     Extension(handle),
                     Some(Extension(actor)),
-                    Ok(Json(request)),
+                    ApiJson(request),
                 )
                 .await?;
                 bounded_result(&output.0)
@@ -1091,7 +1103,7 @@ impl GraphTools {
                 let ingress = self.write_ingress(&arguments)?;
                 let args: MutateArguments = arguments_as(arguments)?;
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let request = Json(request_body(json!({
+                let request = ApiJson(request_body(json!({
                     "query": args.query,
                     "name": args.name,
                     "params": args.params,
@@ -1112,7 +1124,7 @@ impl GraphTools {
                             Extension(ingress),
                             Some(Extension(actor)),
                             headers,
-                            Ok(request),
+                            request,
                         )
                         .await?
                     }
@@ -1123,7 +1135,7 @@ impl GraphTools {
                             Extension(ingress),
                             Some(Extension(actor)),
                             HeaderMap::new(),
-                            Ok(request),
+                            request,
                         )
                         .await?
                     }
@@ -1161,6 +1173,7 @@ impl GraphTools {
                     Some(Extension(actor)),
                     ApiJson(crate::api::BranchCreateRequest {
                         from: args.from,
+                        from_commit: args.from_commit,
                         name: args.name,
                     }),
                 )
@@ -1194,7 +1207,7 @@ impl GraphTools {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    Ok(Json(request)),
+                    ApiJson(request),
                 )
                 .await?;
                 bounded_result(&output.0)
@@ -1767,7 +1780,8 @@ fn branch_create_schema() -> Value {
     arguments(
         json!({
             "name": text_schema("The new branch's name."),
-            "from": text_schema("Branch to fork. Defaults to `main`."),
+            "from": text_schema("Branch to fork; the new branch starts at its head. Defaults to `main`."),
+            "from_commit": text_schema("A published graph commit id to start the branch at instead of a branch head; excludes `from`."),
         }),
         &["name"],
     )
@@ -1790,19 +1804,25 @@ fn branch_merge_schema() -> Value {
     )
 }
 
-/// The `isError` envelope: an HTTP refusal (`status` and the route's `error`
-/// body) or an MCP-side refusal (`code` and `message`); a write whose
-/// completion is unknown adds `outcome_unknown`.
+/// The `isError` envelope: the error body an HTTP route answers under
+/// `error`, with the HTTP `status` the same failure answers with; a refusal
+/// only MCP makes carries no status.
 fn error_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
             "status": {"type": "integer"},
-            "error": {"type": "object"},
-            "code": {"type": "string"},
-            "message": {"type": "string"},
-            "outcome_unknown": {"type": "boolean"},
+            "error": {
+                "type": "object",
+                "properties": {
+                    "error": {"type": "string"},
+                    "code": {"type": "string"},
+                    "disposition": {"type": "object"},
+                },
+                "required": ["error", "code", "disposition"],
+            },
         },
+        "required": ["error"],
         "additionalProperties": false,
     })
 }
@@ -1921,49 +1941,60 @@ impl std::io::Write for LimitedBytes {
     }
 }
 
+/// A handler's result, refused as `result_too_large` when it does not fit;
+/// the refusal is the call's error, so a write tool's says the write ran.
 fn bounded_result<T: Serialize>(value: &T) -> Result<CallToolResult, ApiError> {
     let mut bytes = LimitedBytes(Vec::new());
     if serde_json::to_writer(&mut bytes, value).is_err() {
-        return Ok(failure(
-            "result_too_large",
-            "The result exceeds 1 MiB; use a narrower stored query.",
-        ));
+        return Err(result_too_large());
     }
     let value = serde_json::from_slice(&bytes.0)
         .map_err(|_| ApiError::internal("could not encode MCP result"))?;
-    Ok(fit_result(CallToolResult::structured(value)))
-}
-
-fn fit_result(result: CallToolResult) -> CallToolResult {
-    // Structured results also carry a text representation for older clients.
-    // Bound the complete tool result, including that duplicate representation.
-    if serde_json::to_writer(&mut LimitedBytes(Vec::new()), &result).is_err() {
-        return failure(
-            "result_too_large",
-            "The result exceeds 1 MiB; use a narrower stored query.",
-        );
+    let result = CallToolResult::structured(value);
+    if exceeds_result_limit(&result) {
+        return Err(result_too_large());
     }
-    result
+    Ok(result)
 }
 
-fn failure(code: &str, message: &str) -> CallToolResult {
-    CallToolResult::structured_error(json!({"code":code,"message":message}))
+/// Whether the complete tool result, including the text copy structured
+/// results carry for older clients, exceeds the result limit.
+fn exceeds_result_limit(result: &CallToolResult) -> bool {
+    serde_json::to_writer(&mut LimitedBytes(Vec::new()), result).is_err()
 }
 
-fn outcome_unknown(code: &str, message: &str) -> CallToolResult {
-    CallToolResult::structured_error(json!({"code":code,"message":message,"outcome_unknown":true}))
-}
-
-async fn api_failure(error: ApiError) -> CallToolResult {
-    let response = error.into_response();
-    let status = response.status().as_u16();
-    match to_bytes(response.into_body(), RESULT_BYTES).await {
-        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-            Ok(error) => CallToolResult::structured_error(json!({"status":status,"error":error})),
-            Err(_) => failure("request_failed", "The graph request failed."),
-        },
-        Err(_) => failure("request_failed", "The graph request failed."),
+/// Bound the complete tool result. A write's result that does not fit leaves
+/// the caller without its receipt, so the write must be reconciled.
+fn fit_result(result: CallToolResult, write: bool) -> CallToolResult {
+    if !exceeds_result_limit(&result) {
+        return result;
     }
+    let error = result_too_large();
+    tool_error(if write {
+        error.after_owned_write()
+    } else {
+        error
+    })
+}
+
+fn result_too_large() -> ApiError {
+    ApiError::new(
+        ErrorCode::ResultTooLarge,
+        "The result exceeds 1 MiB; use a narrower stored query.",
+    )
+}
+
+/// The `isError` result of a refusal: the error body an HTTP route answers,
+/// under `error`, beside the HTTP status the same failure answers with. A
+/// refusal only MCP makes has no status.
+fn tool_error(error: ApiError) -> CallToolResult {
+    let output = error.into_output();
+    let status = output.http_status();
+    let mut body = json!({ "error": output });
+    if let Some(status) = status {
+        body["status"] = json!(status);
+    }
+    CallToolResult::structured_error(body)
 }
 
 #[cfg(test)]
@@ -2031,14 +2062,17 @@ mod tests {
                         },
                     )
                     .await;
+                let refused = result.structured_content.unwrap();
                 assert_eq!(
-                    result.structured_content.unwrap()["code"],
+                    refused["error"]["code"],
                     if cancelled {
                         "cancelled"
                     } else {
                         "deadline_exceeded"
                     }
                 );
+                // Only MCP sends these, so no HTTP status rides them.
+                assert!(refused.get("status").is_none(), "{refused}");
                 select.send(()).unwrap();
                 started.await.unwrap();
                 let transition = service
@@ -2063,9 +2097,12 @@ mod tests {
                         READ_DEADLINE,
                     )
                     .await;
+                let refused = refused.structured_content.unwrap();
+                assert_eq!(refused["status"], 429);
+                assert_eq!(refused["error"]["code"], "too_many_requests");
                 assert_eq!(
-                    refused.structured_content.unwrap()["code"],
-                    "capacity_exceeded"
+                    refused["error"]["disposition"],
+                    json!({"effects": "none", "action": "retry"})
                 );
                 assert_eq!(operations.snapshot().active_reads, 1);
                 assert_eq!(workload.snapshot().read_ingress_bytes, 17);
@@ -2092,38 +2129,65 @@ mod tests {
         // The server's answer must arrive before a client on a common default
         // timeout gives up and never sees `outcome_unknown`.
         assert!(WRITE_DEADLINE < COMMON_CLIENT_TIMEOUT);
+        let unknown = json!({"effects": "unknown", "action": "reconcile"});
         for refusal in [Refusal::Cancelled, Refusal::Deadline] {
-            let result = refusal.tool_result(true).await;
+            let result = refusal.tool_result(true);
             assert_eq!(result.is_error, Some(true));
-            assert_eq!(result.structured_content.unwrap()["outcome_unknown"], true);
+            let body = result.structured_content.unwrap();
+            assert_eq!(body["status"], 500, "{body}");
+            assert_eq!(body["error"]["code"], "outcome_unknown", "{body}");
+            assert_eq!(body["error"]["disposition"], unknown, "{body}");
+            assert!(body.get("outcome_unknown").is_none(), "{body}");
         }
-        let read = Refusal::Deadline.tool_result(false).await;
-        assert!(
-            read.structured_content
-                .unwrap()
-                .get("outcome_unknown")
-                .is_none()
+        let read = Refusal::Deadline
+            .tool_result(false)
+            .structured_content
+            .unwrap();
+        assert_eq!(read["error"]["code"], "deadline_exceeded");
+        assert_eq!(
+            read["error"]["disposition"],
+            json!({"effects": "none", "action": "retry"})
         );
-        // A handler failure the server cannot settle keeps that report, for a
-        // write only; a refusal before effects is a known outcome.
+        // A handler failure the server cannot settle is an unknown outcome
+        // for a write only; a refusal before effects is a known one.
         let uncertain = Refusal::Api(ApiError::internal("lost"))
             .tool_result(true)
-            .await
             .structured_content
             .unwrap();
         assert_eq!(uncertain["status"], 500);
-        assert_eq!(uncertain["outcome_unknown"], true);
-        for (error, write) in [
-            (ApiError::bad_request("refused"), true),
-            (ApiError::internal("lost"), false),
+        assert_eq!(uncertain["error"]["code"], "outcome_unknown");
+        assert_eq!(uncertain["error"]["disposition"], unknown);
+        for (error, write, code, disposition) in [
+            (
+                ApiError::bad_request("refused"),
+                true,
+                "bad_request",
+                json!({"effects": "none", "action": "fix"}),
+            ),
+            (
+                ApiError::internal("lost"),
+                false,
+                "internal",
+                json!({"effects": "none", "action": "refresh"}),
+            ),
         ] {
             let body = Refusal::Api(error)
                 .tool_result(write)
-                .await
                 .structured_content
                 .unwrap();
-            assert!(body.get("outcome_unknown").is_none(), "{body}");
+            assert_eq!(body["error"]["code"], code, "{body}");
+            assert_eq!(body["error"]["disposition"], disposition, "{body}");
         }
+        // The MCP layer's own refusals carry the same body: a registry code,
+        // a disposition and the HTTP status the same refusal answers.
+        let unauthenticated = Refusal::Unauthenticated
+            .tool_result(false)
+            .structured_content
+            .unwrap();
+        assert_eq!(unauthenticated["status"], 401);
+        assert_eq!(unauthenticated["error"]["code"], "unauthorized");
+        let data = Refusal::Unauthenticated.resource_error().data.unwrap();
+        assert_eq!(data, unauthenticated);
     }
 
     #[test]
@@ -2168,13 +2232,29 @@ mod tests {
         // The source JSON fits, but the SDK's structured + legacy text
         // compatibility representation exceeds the complete result bound.
         let duplicate = json!({"text":"x".repeat(RESULT_BYTES * 3 / 4)});
-        let result = bounded_result(&duplicate).unwrap();
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(
-            result.structured_content.unwrap()["code"],
-            "result_too_large"
-        );
         let too_large = json!({"text":"x".repeat(RESULT_BYTES+1)});
-        assert_eq!(bounded_result(&too_large).unwrap().is_error, Some(true));
+        for value in [&duplicate, &too_large] {
+            let refused = Refusal::Api(bounded_result(value).unwrap_err())
+                .tool_result(false)
+                .structured_content
+                .unwrap();
+            assert_eq!(refused["error"]["code"], "result_too_large");
+            assert_eq!(
+                refused["error"]["disposition"],
+                json!({"effects": "none", "action": "fix"})
+            );
+        }
+        // A write's result that does not fit leaves its receipt unread.
+        let unread = json!({"effects": "unknown", "action": "reconcile"});
+        let write = Refusal::Api(bounded_result(&duplicate).unwrap_err())
+            .tool_result(true)
+            .structured_content
+            .unwrap();
+        assert_eq!(write["error"]["disposition"], unread);
+        let write = fit_result(CallToolResult::structured(duplicate), true)
+            .structured_content
+            .unwrap();
+        assert_eq!(write["error"]["code"], "result_too_large");
+        assert_eq!(write["error"]["disposition"], unread);
     }
 }

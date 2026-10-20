@@ -67,7 +67,16 @@ fn branch_statements_embedded_print_the_verb_lines() {
     let (_temp, graph) = loaded_graph();
 
     let created = output_success(embedded("mutate", &graph).arg("-e").arg("branch create b0"));
-    assert_eq!(stdout_string(&created), "created branch b0 from main\n");
+    let start = parse_stdout_json(&output_success(
+        embedded("commit", &graph).args(["list", "--branch", "b0", "--json"]),
+    ))["commits"][0]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        stdout_string(&created),
+        format!("created branch b0 from main at {start}\n")
+    );
 
     let listed = output_success(
         embedded("query", &graph)
@@ -236,7 +245,16 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
     let (_cluster, server) = served_graph();
 
     let created = output_success(served("mutate", &server).arg("-e").arg("branch create b0"));
-    assert_eq!(stdout_string(&created), "created branch b0 from main\n");
+    let start = parse_stdout_json(&output_success(
+        served("commit", &server).args(["list", "--branch", "b0", "--json"]),
+    ))["commits"][0]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        stdout_string(&created),
+        format!("created branch b0 from main at {start}\n")
+    );
 
     let table = stdout_string(&output_success(
         served("query", &server)
@@ -292,9 +310,9 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
         "--json fails closed too: {refusal}"
     );
     assert_eq!(
-        refusal["outcome"],
+        refusal["disposition"],
         serde_json::json!({
-            "execution":"not_started", "effects":"none", "action":"refresh"
+            "effects":"none", "action":"refresh"
         })
     );
     assert!(refusal.get("http_status").is_none());
@@ -575,20 +593,18 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
         // effects unknown.
         assert_eq!(actual["http_status"], 400);
         assert_eq!(
-            actual["outcome"],
+            actual["disposition"],
             if verb == "mutate" {
                 serde_json::json!({
-                    "execution":"unknown", "effects":"unknown", "action":"reconcile"
+                    "effects":"unknown", "action":"reconcile"
                 })
             } else {
-                serde_json::json!({
-                    "execution":"not_started", "effects":"none", "action":"refresh"
-                })
+                serde_json::json!({"effects":"none", "action":"fix"})
             }
         );
         let fields = actual.as_object_mut().unwrap();
         fields.remove("http_status");
-        fields.remove("outcome");
+        fields.remove("disposition");
         assert_eq!(
             actual, refusal,
             "{verb} must preserve every original server field"
@@ -1014,17 +1030,17 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
                     "{output:?}"
                 );
             } else {
-                // An alias is a read: its refusal reports the outcome a
-                // `query` does, with nothing started.
+                // An alias is a read: its refusal reports the disposition a
+                // `query` does, with no effects.
                 let mut reported = parse_stdout_json(&output);
                 assert_eq!(
-                    reported["outcome"],
-                    serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
+                    reported["disposition"],
+                    serde_json::json!({"effects":"none","action":"refresh"}),
                     "{output:?}"
                 );
                 assert_eq!(reported["http_status"], 403, "{output:?}");
                 let reported = reported.as_object_mut().unwrap();
-                reported.remove("outcome");
+                reported.remove("disposition");
                 reported.remove("http_status");
                 assert_eq!(
                     serde_json::Value::Object(reported.clone()),

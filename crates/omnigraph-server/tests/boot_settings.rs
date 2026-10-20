@@ -42,6 +42,103 @@ async fn cluster_management_policy_can_boot_beside_legacy_catalog_rules() {
     );
 }
 
+/// Deployment routes refuse with the error body: a server that resolves no
+/// actor refuses before anything else, and a body that does not decode keeps
+/// its own status and code once authorization admits the caller.
+#[tokio::test]
+async fn deployment_routes_refuse_with_the_error_body() {
+    let temp = tempfile::tempdir().unwrap();
+    let request = |method: Method,
+                   path: &str,
+                   token: Option<&str>,
+                   content_type: &str,
+                   body: &'static str| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("content-type", content_type);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        request.body(Body::from(body)).unwrap()
+    };
+    let open = build_app(
+        omnigraph_server::open_multi_graph_state(
+            Vec::new(),
+            Vec::new(),
+            None,
+            temp.path().join("open.yaml"),
+            false,
+        )
+        .await
+        .unwrap(),
+    );
+    for (method, path) in [
+        (Method::GET, "/cluster/deployments"),
+        (Method::GET, "/cluster/deployments/some-id"),
+        (Method::POST, "/cluster/plan"),
+        (Method::POST, "/cluster/deployments"),
+    ] {
+        let (status, body) = json_response(
+            &open,
+            request(method.clone(), path, None, "application/json", "{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        assert_eq!(body["code"], "forbidden", "{method} {path}: {body}");
+        assert_eq!(
+            body["disposition"],
+            serde_json::json!({"effects": "none", "action": "refresh"}),
+            "{method} {path}"
+        );
+    }
+
+    let source = omnigraph_server::PolicySource::Inline(
+        "version: 1\ngroups:\n  operators: [operator]\nrules:\n  - id: configuration\n    allow:\n      actors: {group: operators}\n      actions: [config_manage]\n".into(),
+    );
+    let managed = build_app(
+        omnigraph_server::open_multi_graph_state(
+            Vec::new(),
+            vec![("operator".into(), "static-token".into())],
+            Some(&source),
+            temp.path().join("cluster.yaml"),
+            false,
+        )
+        .await
+        .unwrap(),
+    );
+    for path in ["/cluster/plan", "/cluster/deployments"] {
+        for (content_type, body, status, code) in [
+            (
+                "text/plain",
+                "{}",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+            ),
+            (
+                "application/json",
+                "{",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+        ] {
+            let (answered, refusal) = json_response(
+                &managed,
+                request(Method::POST, path, Some("static-token"), content_type, body),
+            )
+            .await;
+            assert_eq!(answered, status, "{path} {content_type}: {refusal}");
+            assert_eq!(refusal["code"], code, "{path} {content_type}: {refusal}");
+            assert_eq!(
+                refusal["disposition"],
+                serde_json::json!({"effects": "none", "action": "fix"}),
+                "{path} {content_type}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn v2_settings_capture_holds_admission_across_drop_and_refuses_another_server() {
     let temp = converged_cluster_dir("").await;
@@ -1891,7 +1988,8 @@ mod owned_shutdown {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(!response.headers().contains_key("retry-after"));
+            // An unavailable graph asks for a retry, and says when.
+            assert_eq!(response.headers()["retry-after"], "60");
             let unknown = client
                 .get(format!("http://{address}/graphs/unknown/snapshot"))
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
