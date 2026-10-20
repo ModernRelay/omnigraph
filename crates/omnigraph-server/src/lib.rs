@@ -2521,6 +2521,11 @@ mod api_error_tests {
                 partial(DispositionAction::Refresh),
             ),
             (
+                failed_put().after_earlier_publication().unpublished(),
+                ErrorCode::Internal,
+                partial(DispositionAction::Refresh),
+            ),
+            (
                 failed_put().after_earlier_publication(),
                 ErrorCode::OutcomeUnknown,
                 unknown(DispositionAction::Reconcile),
