@@ -322,7 +322,7 @@ An operation's actor is fixed where trust is established:
   capability header advertises it. Without `--as` the CLI sends no header:
   `operator.actor` names the direct actor and is not asserted against servers,
   whose tokens may resolve to other names. The refusal of `--as` on served
-  writes, and its stale help text, go.
+  targets, which the help text now states, goes.
 
 An assertion can only narrow: a matching header changes nothing, and no client
 supplies an actor the server trusts. `--as` is never ignored.
@@ -382,10 +382,13 @@ object.
   | An attempt the server could not settle (`outcome_unknown`) | `unknown` | `reconcile`, `recover` when recovery is required |
   | A later write to a branch whose publication is pending (`service_unavailable`) | `none` | `retry` |
 
+  That `service_unavailable` covers one branch: reads and the other branches
+  keep serving.
+
   A later phase adds `disposition.check`, what a later read needs to settle an
   unknown write: the identity storage outcomes per operation gives a pending
-  publication, its branch and graph commit id, with the branch's head before
-  the write. It arrives with the attempt identity of
+  publication, its branch and its publication id (a graph commit id, or a
+  control fact's attempt id), with the branch's head before the write. It arrives with the attempt identity of
   [cross-process writes](#cross-process-writes); until then a caller settles
   from the branch it sent and that branch's head. The body below is that later
   phase's:
@@ -736,6 +739,28 @@ move, and a drop record costs the branch's other writers the same. A check made
 only before the first attempt would leave open the window the facts close, so
 the check runs where the precondition already runs, on every attempt.
 
+**Each control fact carries its attempt id.** A control-fact operation mints one
+***attempt id***, a ULID, before its first publish attempt, and every fact it
+writes records it. The attempt id is a control fact's identity, as the graph
+commit id is a row publication's:
+
+- **Read-back.** After a lost acknowledgement, the publisher reads the version it
+  attempted. The attempt landed when that version holds a fact with its attempt
+  id, and lost when it holds anything else. The row read-back compares heads,
+  which cannot tell two control facts apart, since neither moves the head.
+- **The owner's retry.** A fact with the operation's own attempt id is its own
+  landed attempt, never a refusal: the operation goes on to its follow-ups,
+  the ref, the deregistration, the archive and unlink, or the tag release.
+- **Pending publications.** A control fact whose request stays ambiguous is
+  pending under its attempt id, as a row publication is under its graph commit
+  id in [storage outcomes per
+  operation](https://github.com/ModernRelay/omnigraph/pull/1093).
+
+The refusals in the table apply to facts with another attempt id, with two
+convergent exceptions: a delete that finds its branch tombstoned by another
+attempt completes the follow-ups and succeeds, and so does a drop that finds
+its candidate's drop record.
+
 1. **Retirement is a publication.** Branch delete first publishes a tombstone on
    the branch's own chain. A concurrent publisher either loses that version,
    reloads and refuses with `branch_deleted`, or wins it, and the delete
@@ -755,29 +780,37 @@ the check runs where the precondition already runs, on every attempt.
    name race on main's version, and the loser refuses with `branch_exists`
    before it has written anything. A crash after the registration and before
    the ref leaves a registered branch with no ref, which refuses reads and
-   writes as not ready; the next create of that name, its delete or `repair`
-   completes it from the recorded fork point, which cleanup retains while the
-   registration names it, or removes it.
+   writes as not ready. A create of that name refuses with `branch_exists`;
+   its delete removes it, and `repair` completes it from the recorded fork
+   point, which cleanup retains while the registration names it. Listings read
+   registrations too: `branch list`, with the details
+   [#1012](https://github.com/ModernRelay/omnigraph/pull/1012) adds, lists such
+   a branch as not ready, from its registration.
 
    Until [schema apply with live branches](https://github.com/ModernRelay/omnigraph/pull/963)
    lands, a registration also refuses, on any attempt, when main's schema
    contract is no longer the one its fork point carries (`schema_changed`, the
    branch-start refusal [#1016](https://github.com/ModernRelay/omnigraph/pull/1016)
    defines), and schema apply's `ExactGraphVersion` refuses when a registration
-   moved main's version after its live-branch check. Whichever publishes second
-   refuses, so no branch outlives an apply with the old contract. Once PR 963
+   moved main's version after its live-branch check. System-column upgrade pins
+   main's head, not its version (`ExactGraphHead`), so its attempts read main's
+   registrations in `check_publish_precondition`, every attempt, and refuse when
+   they name any branch but main. Whichever publishes second refuses, so no
+   branch outlives an apply or an upgrade with the old contract. Once PR 963
    lands, its rule wins: a branch keeps its contract until a merge, a
    registration no longer reads main's contract, and a registration is never
-   the reason an apply refuses. PR 963 then decides what apply pins in place of
-   main's exact version.
+   the reason an apply or an upgrade refuses. PR 963 then decides what they
+   pin in place of main's exact version and branch set.
 3. **Cleanup reclaims only what no registration names.** A create registers
-   before its tree exists, so a tree that no registration names and no
-   tombstone retired is no create in progress. The collector lists trees
-   before it reads main's registrations, so any listed tree whose create is in
-   flight is already registered in what it reads. It reclaims such a tree with
-   no age threshold, through a delete of that tree alone, and never calls
-   Lance's forced branch delete, which deletes a ref it finds. Tombstoned trees
-   follow today's rules for retired trees. The deciding authority is the
+   before its ref and tree exist, so a ref or tree that no registration names
+   is no create in progress. The collector lists refs and trees before it reads
+   main's registrations, so any listed ref or tree whose create is in flight is
+   already registered in what it reads. Such a ref or tree, whether a tombstone
+   retired it, a late marker rewrite recreated its ref, or a create crashed
+   before it, is reclaimable with no age threshold. The collector's existing
+   dependency and tag closure still keeps any tree a live branch reads, and it
+   deletes the rest through a ref delete and a delete of that tree alone,
+   never Lance's forced branch delete. The deciding authority is the
    registration set, never an age, as invariant 5 requires. Lance 13's stock
    `cleanup_old_versions` now also reaches unreferenced data newer than the
    retained manifests
@@ -806,8 +839,8 @@ defines:
   archive, the unlink and a drop's tag release.
 
 The marker rewrite is unconditional in Lance 13: a late one can even recreate a
-ref the delete already unlinked. That ref is tombstoned and deregistered, so it
-names no logical branch, and cleanup reclaims it. A guard against unconditional
+ref the delete already unlinked. That ref is deregistered, so it names no
+logical branch, and cleanup's registration rule reclaims it with its tree. A guard against unconditional
 writes of mutable keys admits these only as follow-ups of a publication.
 
 **Format.** Control facts are new `__manifest` rows under the next storage
@@ -826,16 +859,17 @@ Downgrade is export and load.
 **Cost.** Branch creation gains one zero-retry publication on main, deletion one
 on the branch and one on main, and drop one on the target branch. Each is one
 more version its chain's writers may reload past within their retry budget; a
-fact that does not name them never makes them refuse. Only schema apply and
-system-column upgrade, which pin main's exact version, refuse instead, which is
-the point until PR 963. Row writes, loads and merges are otherwise unchanged.
+fact that does not name them never makes them refuse. Only schema apply,
+which pins main's exact version, and system-column upgrade, whose attempts read
+main's registrations, refuse instead, which is the point until PR 963. Row writes, loads and merges are otherwise unchanged.
 `integration/branch_control_cost.rs` measures the added requests per backend.
 
 **Recovery.** Every new durable step is a publication or a follow-up of one. A
 crash after a tombstone and before the unlink leaves a branch that refuses
 writes, which delete, cleanup and `repair` complete. A crash after a
 registration and before its ref leaves a branch that refuses as not ready until
-a create, its delete or `repair` completes or removes it. A crash after a drop
+its delete removes it or `repair` completes it. An operation retried after a
+crash recognizes its own facts by its attempt id. A crash after a drop
 record and before the tag release leaves tags that expire with their captured
 authority, as a proposal's tags already do.
 
@@ -1035,10 +1069,16 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   on a first attempt: a publisher whose first attempt loses the CAS to a
   tombstone, or a candidate publish that loses it to a drop record, must
   refuse on the attempt after.
-- **Catalog, publisher tests:** a publication of control facts alone records no
-  graph commit and leaves every `table` row and the head unchanged; each
-  precondition kind refuses on an attempt a fact names and passes one it does
-  not.
+- **Catalog, publisher tests:**
+  - A publication of control facts alone records no graph commit and leaves
+    every `table` row and the head unchanged.
+  - Each precondition kind refuses on an attempt a fact names and passes one it
+    does not.
+  - With two control facts on one chain, a lost acknowledgement reads back as
+    landed only for the fact carrying the attempt's own id.
+  - An operation retried with its attempt id goes on to its follow-ups.
+  - A system-column upgrade attempt refuses when main's registrations name
+    another branch.
 - **Engine, `tests/detached_commit_matrix.rs`:** the other-process actor runs by
   default for the control operations, not only under `OMNIGRAPH_MATRIX=full`.
 - **DST:** actors that model separate processes get separate write-queue
@@ -1263,7 +1303,7 @@ independent HTTP and engine changes do not depend on a second serving model.
 | [#1024](https://github.com/ModernRelay/omnigraph/issues/1024) | The credentials file's directory is created with default permissions, not `0700`. | Open |
 | [omnigraph-studio#2](https://github.com/ModernRelay/omnigraph-studio/issues/2) | The agent gateway checks neither `Host` nor `Origin`. | Open |
 | Not filed | The surveyed `docker/entrypoint.sh` passed unsupported positional URI, `--config` or `--target` forms to the server. | Revalidate and fix independently through the existing server boot contract; no binary fold |
-| Not filed | `--as` help says it has "No effect on remote writes", but served writes refuse it. | Open; [Identity](#identity) replaces both |
+| Not filed | `--as` help said it had "No effect on remote writes", but served writes refused it. | The help now states the refusal; [Identity](#identity) replaces the refusal |
 
 ## Decision log
 
@@ -1414,3 +1454,14 @@ proposal.
   bridge and Studio opener, and the engine control-fact design with its
   qualification gates. Appendix A's items stay separate decisions. The
   phase 1 and 2 implementations are #1074, #1076, #1078 and #1081.
+- 2026-10-20: Addressed the review of `eeb6e123`. Every control fact records
+  the attempt id its operation mints once: the read-back after a lost
+  acknowledgement compares it, a pending control fact is keyed by it, and an
+  operation's retry treats its own fact as landed, so deletes and drops converge
+  instead of refusing themselves. System-column upgrade pins main's head, not
+  its version, so its attempts read main's registrations. Cleanup's
+  registration rule covers refs as well as trees, including a ref a late
+  marker rewrite recreates, under the collector's dependency closure. A create
+  never completes a crashed create's registration. The pending-branch
+  `service_unavailable` covers one branch, `branch list` lists a registered
+  branch with no ref as not ready, and the `--as` help quote is current.
