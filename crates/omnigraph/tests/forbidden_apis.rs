@@ -1013,7 +1013,6 @@ durable_calls! {
     ("omnigraph-catalog/commit.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/commit.rs", ".execute_uncommitted(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/commit.rs", "CommitBuilder::new(", 2, WriteProtocol::Exact("lowest manifest publisher gateway: the linear version with zero retries, or a detached candidate version whose only retry is the random version id")),
-    ("omnigraph-catalog/pending.rs", "CommitBuilder::new(", 1, WriteProtocol::Exact("re-issue of a pending publication: the identical zero-retry `__manifest` transaction at the version it attempted, which lands once or finds the version held")),
     // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
     // derived, regenerable topology written ONLY from `optimize`'s tail (never
     // the query path, which only loads), outside graph visibility — a stale or
@@ -3364,8 +3363,6 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::with_stage_write_probes",
     "lib.rs: lance_access::object_store_seam",
     "lib.rs: lance_access::store_registry as dst_lance_store_registry",
-    "lib.rs: omnigraph_catalog::pending::pending_publications",
-    "lib.rs: omnigraph_catalog::pending::resolve_pending_publications",
     "lib.rs: omnigraph_core::dst_clock",
     "lib.rs: omnigraph_core::dst_gate",
     "lib.rs: omnigraph_core::dst_ids",

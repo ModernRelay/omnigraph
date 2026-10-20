@@ -256,20 +256,6 @@ fn format_merge_conflicts(conflicts: &[MergeConflict]) -> String {
         .join("; ")
 }
 
-fn publication_pending_message(branch: Option<&str>, graph_commit_id: Option<&str>) -> String {
-    match graph_commit_id {
-        Some(commit) => format!(
-            "branch '{}' has a pending publication: graph commit {commit} may still land, so the \
-             branch refuses writes until storage answers; it is not final until then, and a read \
-             that does not show it is not proof that it failed",
-            branch.unwrap_or("main")
-        ),
-        None => "too many publications in this process are pending on storage; writes are \
-                 refused until storage answers"
-            .to_string(),
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum OmniError {
     /// Operation-local completion evidence. Composing callers must discard
@@ -284,16 +270,6 @@ pub enum OmniError {
     Compiler(#[from] omnigraph_compiler::error::CompilerError),
     #[error("{0}")]
     Storage(StorageFailure),
-    /// A publication on the branch has a manifest request with no definite
-    /// answer, which may still land at the branch's next version: the branch
-    /// refuses new publications until the store answers a re-issue. Nothing
-    /// was written. With no commit id, this process holds as many pending
-    /// publications as it may and refuses every new one.
-    #[error("{}", publication_pending_message(branch.as_deref(), graph_commit_id.as_deref()))]
-    PublicationPending {
-        branch: Option<String>,
-        graph_commit_id: Option<String>,
-    },
     /// A graph-snapshot-pinned Lance dataset version was reclaimed by cleanup. Kept typed at
     /// the common opener so historical APIs never infer retention from error text.
     #[error("historical published dataset version {published_dataset_version} was reclaimed")]

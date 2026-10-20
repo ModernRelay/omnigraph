@@ -87,12 +87,6 @@ reports the undelivered diagnostic and its outcome.
 | 75 | The server's typed admission refusal proves this whole command did not start. Honor `Retry-After` and bound any caller retry. |
 | 1 | Inspect the action and details. A conflict, resource limit, unavailable server, incomplete response or lost connection does not by itself permit repeating the write. |
 
-A served write whose branch has a pending publication answers 503
-`service_unavailable` naming the pending graph commit, with nothing written.
-Retry it once the branch accepts writes again, but do not repeat the earlier
-write whose outcome was unknown: it may still complete. See
-[pending publications](storage-failures.md#pending-publications).
-
 A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
 `api_contract_mismatch` exits 1 with `execution: not_started`, `effects: none`
 and `action: refresh`. The server answers these before it admits the write:

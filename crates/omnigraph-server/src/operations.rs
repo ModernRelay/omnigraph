@@ -367,7 +367,7 @@ pub(crate) struct OwnedResult<T> {
 }
 
 impl<T> From<Result<T, ApiError>> for OwnedResult<T> {
-    /// An unknown outcome the engine scopes to its storage keys and branch
+    /// An unknown outcome the engine scopes to its storage keys
     /// is reported, not contained; every other uncertain completion contains
     /// the process.
     fn from(result: Result<T, ApiError>) -> Self {
@@ -792,7 +792,7 @@ mod tests {
         use omnigraph::error::OmniError;
         // (error, it contains the process). An unknown storage outcome, a
         // publication in doubt or an opaque storage or I/O failure, is
-        // scoped to its keys and branch and does not contain.
+        // scoped to its keys and does not contain.
         for (error, contained) in [
             (
                 OmniError::Io(std::io::Error::other("schema read failed")).before_effect(),
@@ -868,7 +868,7 @@ mod tests {
     /// can act on, not an unknown outcome: admission stays open, the
     /// reservation is released and nothing contains the process. The same
     /// error without that evidence reports an unknown outcome scoped to its
-    /// storage keys and branch, which does not contain either; an unknown
+    /// storage keys, which does not contain either; an unknown
     /// outcome the engine does not scope still contains.
     #[tokio::test]
     async fn definite_unpublished_storage_failure_keeps_admission_open_issue_1067() {
@@ -888,7 +888,7 @@ mod tests {
                 false,
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
-            // An unknown storage outcome is scoped to its keys and branch:
+            // An unknown storage outcome is scoped to its keys:
             // reported, never contained.
             (
                 OmniError::Io(std::io::Error::other("detached manifest put failed")),
@@ -902,17 +902,6 @@ mod tests {
                 true,
                 false,
                 StatusCode::INTERNAL_SERVER_ERROR,
-            ),
-            // A write refused because its branch has a pending publication
-            // did nothing.
-            (
-                OmniError::PublicationPending {
-                    branch: None,
-                    graph_commit_id: Some("01J".to_string()),
-                },
-                false,
-                false,
-                StatusCode::SERVICE_UNAVAILABLE,
             ),
             // An unknown outcome the engine does not scope still contains.
             (
