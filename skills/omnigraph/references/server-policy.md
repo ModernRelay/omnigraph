@@ -14,9 +14,10 @@ omnigraph-server --cluster s3://bucket/prefix --bind 0.0.0.0:8080
 The server loads the cluster's applied revision and serves each graph under
 `/graphs/{id}`. `cluster apply --server` activates schema and stored-query
 changes and new graphs without a restart; a direct `cluster apply` needs the
-server stopped. There is no single-graph server mode. A stopped server, even
-after a clean exit, leaves the cluster lock: once its writes have settled,
-clear it with `cluster force-unlock <LOCK_ID>` before the next start (see
+server stopped. `omnigraph serve` serves one direct target on loopback to
+this account, read-only for now; `omnigraph-server` remains the deployment. A
+stopped server, even after a clean exit, leaves the cluster lock: once its
+writes have settled, clear it with `cluster force-unlock <LOCK_ID>` before the next start (see
 [cluster mode](cluster.md)).
 
 Shutdown is bounded by `--shutdown-grace-seconds` (else

@@ -212,12 +212,20 @@ fn host_id() -> Option<String> {
 /// The machine whose records a reader or writer may touch. Without a host
 /// identifier, this machine's records cannot be told from another machine's
 /// in a shared home, which would then be reaped or reused, so records refuse.
+/// A valid identifier is 32 hex digits and not all zeros, which both
+/// sources produce: a Linux machine-id (machine-id(5)) and macOS's 16-byte
+/// host UUID. Anything else, such as systemd's `uninitialized` first-boot
+/// marker, could be shared by two machines, so it refuses too.
 fn this_machine(host: Option<String>) -> Result<String> {
-    host.map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
+    host.map(|id| id.trim().to_ascii_lowercase())
+        .filter(|id| {
+            id.len() == 32
+                && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && id.bytes().any(|byte| byte != b'0')
+        })
         .ok_or_else(|| {
             unsafe_records(
-                "this machine's host identifier cannot be read, so its records cannot be told from another machine's",
+                "this machine's host identifier is missing or is not a machine id, so its records cannot be told from another machine's",
             )
         })
 }
@@ -502,13 +510,16 @@ impl Records {
 
 #[cfg(test)]
 mod tests {
+    /// A host identifier in the shape `host_id` reads.
+    const THIS_MACHINE: &str = "0123456789abcdef0123456789abcdef";
+    const ANOTHER_MACHINE: &str = "fedcba9876543210fedcba9876543210";
     use super::*;
 
     #[test]
     fn a_record_is_live_while_its_lock_is_held_and_removed_after() {
         let dir = tempfile::tempdir().unwrap();
         let records_dir = dir.path().join("servers");
-        let records = Records::open_at(records_dir, Some("this-machine".into())).unwrap();
+        let records = Records::open_at(records_dir, Some(THIS_MACHINE.into())).unwrap();
         let graph = dir.path().join("g.omni");
         std::fs::create_dir(&graph).unwrap();
         let destination = Destination::of("graph", graph.to_str().unwrap()).unwrap();
@@ -590,7 +601,15 @@ mod tests {
     fn records_refuse_a_machine_without_a_host_identifier() {
         let dir = tempfile::tempdir().unwrap();
         let records_dir = dir.path().join("servers");
-        for host in [None, Some(String::new()), Some(" \n".to_string())] {
+        for host in [
+            None,
+            Some(String::new()),
+            Some(" \n".to_string()),
+            Some("uninitialized".to_string()),
+            Some("0".repeat(32)),
+            Some("0123456789abcdef".to_string()),
+            Some("g123456789abcdef0123456789abcdef".to_string()),
+        ] {
             let refused = Records::open_at(records_dir.clone(), host.clone())
                 .err()
                 .expect("a start without a host identifier refuses");
@@ -608,7 +627,8 @@ mod tests {
         }
         // A directory a shared home holds: here, a record whose lock this
         // machine can take, as another machine's lock is invisible to it.
-        let elsewhere = Records::open_at(records_dir.clone(), Some("unknown".into())).unwrap();
+        let elsewhere =
+            Records::open_at(records_dir.clone(), Some(ANOTHER_MACHINE.into())).unwrap();
         let graph = dir.path().join("g.omni");
         std::fs::create_dir(&graph).unwrap();
         let destination = Destination::of("graph", graph.to_str().unwrap()).unwrap();
@@ -654,7 +674,7 @@ mod tests {
     fn a_second_start_waits_for_the_first_and_finds_its_record() {
         let dir = tempfile::tempdir().unwrap();
         let records =
-            Records::open_at(dir.path().join("servers"), Some("this-machine".into())).unwrap();
+            Records::open_at(dir.path().join("servers"), Some(THIS_MACHINE.into())).unwrap();
         let graph = dir.path().join("g.omni");
         std::fs::create_dir(&graph).unwrap();
         let destination = Destination::of("graph", graph.to_str().unwrap()).unwrap();
