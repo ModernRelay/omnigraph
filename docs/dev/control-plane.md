@@ -237,6 +237,10 @@ dataset uses re-issues an ambiguous manifest request until the store answers
 it and records whether a request was sent; the publisher marks a failure with
 no request sent, or one the store refused, `Unpublished`, and only an outcome
 its read-back cannot settle reaches the logical operation owner as uncertain.
+For the task whose request no re-issue settled, the handler reports a missing
+version as not definitive, so Lance's read-back keeps the attempt's
+transaction file on every open path; the transaction-delete hold below is the
+served process's second line.
 
 Refs, version hints, cluster control objects, unknown paths, if-match
 replacements and recursive deletes remain conservative. A cancelled or
