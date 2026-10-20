@@ -208,7 +208,10 @@ At least one retention option is required:
 A graph commit survives when either option retains it. The current HEAD of
 every live branch is always retained, and a named branch also keeps its
 oldest commit, the copy of the parent's commit it was created from, while
-the branch lives. Cleanup also retains the selected merge bases between
+the branch lives; for a branch started at a past commit, that is the commit
+it names. A commit cleanup no longer retains starts no branch
+([start a branch at a commit](../branching/index.md#start-a-branch-at-a-commit)).
+Cleanup also retains the selected merge bases between
 current branch heads and accepted merge inputs. Native tags protect the exact
 snapshots they name. A tagged graph snapshot retains all its table versions; a
 tagged table snapshot retains that version, including a detached version or a

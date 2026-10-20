@@ -1489,7 +1489,14 @@ fn parse_branch(input: &str) -> BranchStmt {
 fn create(name: &str, from: Option<&str>) -> BranchStmt {
     BranchStmt::Write(BranchWrite::Create {
         name: name.to_string(),
-        from: from.map(str::to_string),
+        from: from.map(|from| BranchCreateFrom::Branch(from.to_string())),
+    })
+}
+
+fn create_at(name: &str, commit: &str) -> BranchStmt {
+    BranchStmt::Write(BranchWrite::Create {
+        name: name.to_string(),
+        from: Some(BranchCreateFrom::Commit(commit.to_string())),
     })
 }
 
@@ -1951,6 +1958,32 @@ fn branch_names_outside_the_identifier_alphabet_are_quoted() {
     );
     assert!(parse_query("branch create from main").is_err());
     assert!(parse_query("branch create b0 from").is_err());
+}
+
+#[test]
+fn branch_create_from_commit_names_a_graph_commit() {
+    let id = "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.3.01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    assert_eq!(
+        parse_branch(&format!(r#"branch create fix from commit "{id}""#)),
+        create_at("fix", id)
+    );
+    assert_eq!(
+        parse_branch(r#"branch create "fix/import" from commit "01ARZ3NDEKTSV4RRFFQ69G5FAV""#),
+        create_at("fix/import", "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    );
+    // A bare `commit` with no quoted id after it is a branch called `commit`.
+    assert_eq!(
+        parse_branch("branch create b0 from commit"),
+        create("b0", Some("commit"))
+    );
+    assert_eq!(
+        parse_branch(r#"branch create b0 from "commit""#),
+        create("b0", Some("commit"))
+    );
+    // The id is quoted; an unquoted word after `from commit` is refused.
+    assert!(parse_query("branch create b0 from commit main").is_err());
+    assert!(parse_query(r#"branch create b0 from commit """#).is_err());
+    assert!(parse_query(r#"branch create b0 from commit " x""#).is_err());
     assert!(parse_query("branch merge b0 into").is_err());
     assert!(parse_query("branch list all").is_err());
 }

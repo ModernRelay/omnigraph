@@ -257,6 +257,7 @@ impl Failure {
             || output.external_blob_source.is_some()
             || !output.merge_conflicts.is_empty()
             || output.diagnostic.is_some()
+            || output.branch_start_refusal.is_some()
         {
             Action::Refresh
         } else {
@@ -320,6 +321,7 @@ pub(crate) fn is_plain_refusal(output: &ErrorOutput) -> bool {
         && output.blob_precondition_failure.is_none()
         && output.change_feed_gap.is_none()
         && output.change_diff_refusal.is_none()
+        && output.branch_start_refusal.is_none()
         && output.full_text_index_rebuild_required.is_none()
         && output.full_text_index_required.is_none()
         && output.diagnostic.is_none()

@@ -1059,6 +1059,8 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ChangeBaselineRecord",
     "ChangeDiffRefusalOutput",
     "ChangeDiffRefusalReason",
+    "BranchStartRefusalOutput",
+    "BranchStartRefusalReason",
     "BlobRangeOutput",
     "ExternalBlobSourceOutput",
     "ExportRequest",
@@ -1259,7 +1261,7 @@ fn branch_outcome_output_schema_is_tagged_by_kind() {
             .collect();
         fields.sort_unstable();
         let expected: &[&str] = match kind {
-            "created" => &["from", "name"],
+            "created" => &["from", "from_commit_id", "name"],
             "deleted" => &["name"],
             "merged" => &["merge", "source", "target"],
             "published" => &[],
@@ -1399,6 +1401,45 @@ fn error_output_schema_has_expected_fields() {
             .iter()
             .any(|field| field == "full_text_index_rebuild_required")
     );
+    // A refused branch start is an optional detail; `POST /branches` declares
+    // its 409 and its 410 (a commit cleanup no longer retains) with it.
+    let branch_start = &props["branch_start_refusal"];
+    assert!(
+        branch_start["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|schema| { schema["$ref"] == "#/components/schemas/BranchStartRefusalOutput" })
+    );
+    assert_eq!(
+        doc["components"]["schemas"]["BranchStartRefusalReason"]["enum"],
+        serde_json::json!([
+            "not_retained",
+            "schema_changed",
+            "earlier_storage_format",
+            "branch_deleted",
+            "unpublished_commit",
+            "unattached_snapshot",
+            "unknown"
+        ])
+    );
+    let create = &doc["paths"]["/graphs/{graph_id}/branches"]["post"]["responses"];
+    for status in ["404", "409", "410"] {
+        assert_eq!(
+            create[status]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "POST /branches {status}"
+        );
+    }
+    for status in ["409", "410"] {
+        assert!(
+            create[status]["description"]
+                .as_str()
+                .unwrap()
+                .contains("branch_start_refusal"),
+            "POST /branches {status} must name the refusal detail"
+        );
+    }
     let details = &doc["components"]["schemas"]["FullTextIndexRebuildRequiredOutput"];
     let required: HashSet<&str> = details["required"]
         .as_array()

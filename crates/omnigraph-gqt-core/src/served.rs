@@ -11,7 +11,7 @@ use omnigraph_api_types::{
     BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ChangeRequest, HTTP_API_CONTRACT,
     HTTP_API_CONTRACT_HEADER, IngestRequest, QueryRequest, ReadOutput, SchemaOutput,
 };
-use omnigraph_compiler::query::ast::show_statement_name;
+use omnigraph_compiler::query::ast::{BranchCreateFrom, show_statement_name};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -714,12 +714,21 @@ fn control_statement(write: &ControlWrite, bindings: &Bindings) -> Result<String
     Ok(match write {
         ControlWrite::Create {
             name,
-            from: Some(parent),
+            from: Some(BranchCreateFrom::Branch(parent)),
             ..
         } => format!(
             "branch create {} from {}",
             branch_name(name),
             branch_name(parent)
+        ),
+        ControlWrite::Create {
+            name,
+            from: Some(BranchCreateFrom::Commit(commit)),
+            ..
+        } => format!(
+            "branch create {} from commit {}",
+            branch_name(name),
+            string_literal(&resolve_operand(commit, bindings)?)
         ),
         ControlWrite::Create { name, .. } => format!("branch create {}", branch_name(name)),
         ControlWrite::Delete { name, .. } => format!("branch delete {}", branch_name(name)),
