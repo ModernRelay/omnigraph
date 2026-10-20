@@ -512,6 +512,42 @@ enum ApiErrorDetails {
     Diagnostic(api::DiagnosticOutput),
 }
 
+/// What a detail says about the operation that failed with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailClass {
+    /// A refusal the engine gives before its one publication, so a refused
+    /// publication did not happen.
+    Refusal,
+    /// Something must be resolved or built before the operation can run.
+    Recovery,
+    /// A read's refusal, which says nothing of a write's effects.
+    Read,
+}
+
+impl ApiErrorDetails {
+    /// Exhaustive, so a new detail must decide whether it refuses before
+    /// publication.
+    fn class(&self) -> DetailClass {
+        match self {
+            Self::MergeConflicts(_)
+            | Self::PublishedDatasetVersionConflict(_)
+            | Self::ReadSetConflict(_)
+            | Self::KeyConflict(_)
+            | Self::ResourceLimit(_)
+            | Self::ExternalBlobSource(_)
+            | Self::PreconditionFailure(_)
+            | Self::BlobPreconditionFailure(_)
+            | Self::Diagnostic(_) => DetailClass::Refusal,
+            Self::RecoveryRequired(_)
+            | Self::FullTextIndexRebuildRequired(_)
+            | Self::FullTextIndexRequired(_) => DetailClass::Recovery,
+            Self::BlobRange(_) | Self::ChangeFeedGap(_) | Self::ChangeDiffRefusal(_) => {
+                DetailClass::Read
+            }
+        }
+    }
+}
+
 impl AppState {
     /// Logical server owners only; this is not an engine-reuse/drain proof.
     /// Embedding hosts must close admission on shutdown and wait for these
@@ -1318,16 +1354,9 @@ impl ApiError {
     /// effects are unknown, which must be reconciled first.
     fn disposition(&self) -> api::DispositionOutput {
         use api::{DispositionAction, DispositionEffects};
-        let details = self.details.as_deref();
+        let class = self.details.as_deref().map(ApiErrorDetails::class);
         // Something must be resolved or rebuilt before the operation can run.
-        let recovery = matches!(
-            details,
-            Some(
-                ApiErrorDetails::RecoveryRequired(_)
-                    | ApiErrorDetails::FullTextIndexRebuildRequired(_)
-                    | ApiErrorDetails::FullTextIndexRequired(_)
-            )
-        );
+        let recovery = class == Some(DetailClass::Recovery);
         let step = if recovery {
             DispositionAction::Recover
         } else {
@@ -1338,31 +1367,17 @@ impl ApiError {
         } else if self.completion_uncertain {
             DispositionEffects::Unknown
         } else {
-            let refused_before_start =
-                matches!(
-                    self.code,
-                    ErrorCode::Unauthorized
-                        | ErrorCode::ApiContractMismatch
-                        | ErrorCode::ActorMismatch
-                        | ErrorCode::Forbidden
-                        | ErrorCode::PreconditionFailed
-                        | ErrorCode::TooManyRequests
-                ) || matches!(details, Some(ApiErrorDetails::BlobPreconditionFailure(_)));
-            // An engine refuses with a typed reason before it publishes, so a
-            // single publication refused that way did not happen.
-            let typed_refusal = matches!(
-                details,
-                Some(
-                    ApiErrorDetails::MergeConflicts(_)
-                        | ApiErrorDetails::PublishedDatasetVersionConflict(_)
-                        | ApiErrorDetails::ReadSetConflict(_)
-                        | ApiErrorDetails::KeyConflict(_)
-                        | ApiErrorDetails::ResourceLimit(_)
-                        | ApiErrorDetails::ExternalBlobSource(_)
-                        | ApiErrorDetails::Diagnostic(_)
-                )
+            let refused_before_start = matches!(
+                self.code,
+                ErrorCode::Unauthorized
+                    | ErrorCode::ApiContractMismatch
+                    | ErrorCode::ActorMismatch
+                    | ErrorCode::Forbidden
+                    | ErrorCode::PreconditionFailed
+                    | ErrorCode::TooManyRequests
             );
-            match ((refused_before_start || typed_refusal) && !recovery) || self.unpublished {
+            let typed_refusal = class == Some(DetailClass::Refusal);
+            match (refused_before_start && !recovery) || typed_refusal || self.unpublished {
                 true if self.compound => DispositionEffects::Partial,
                 true => DispositionEffects::None,
                 false => DispositionEffects::Unknown,
@@ -2244,60 +2259,56 @@ mod api_error_tests {
                 actual: 2,
             })
         };
-        let cases: [(&str, fn() -> ApiError, Action); 14] = [
+        let cases = [
             (
                 "unauthorized",
-                || ApiError::unauthorized("no token"),
+                ApiError::unauthorized("no token"),
                 Action::Fix,
             ),
             (
                 "bad request",
-                || ApiError::bad_request("malformed"),
+                ApiError::bad_request("malformed"),
                 Action::Fix,
             ),
             (
                 "not found",
-                || ApiError::not_found("no such branch"),
+                ApiError::not_found("no such branch"),
                 Action::Fix,
             ),
             (
                 "method",
-                || ApiError::method_not_allowed("not served"),
+                ApiError::method_not_allowed("not served"),
                 Action::Fix,
             ),
-            ("resource limit", resource_limit, Action::Fix),
+            ("resource limit", resource_limit(), Action::Fix),
             (
                 "range",
-                || ApiError::range_not_satisfiable(4, 9, 8),
+                ApiError::range_not_satisfiable(4, 9, 8),
                 Action::Fix,
             ),
             (
                 "media type",
-                || ApiError::unsupported_media_type("not JSON"),
+                ApiError::unsupported_media_type("not JSON"),
                 Action::Fix,
             ),
             (
                 "blob precondition",
-                || ApiError::blob_write_precondition_failed(None),
+                ApiError::blob_write_precondition_failed(None),
                 Action::Refresh,
             ),
             (
                 "body deadline",
-                || ApiError::new(ErrorCode::RequestTimeout, "too slow"),
+                ApiError::new(ErrorCode::RequestTimeout, "too slow"),
                 Action::Retry,
             ),
-            ("policy", || ApiError::forbidden("denied"), Action::Refresh),
-            ("key conflict", key_conflict, Action::Refresh),
-            (
-                "busy",
-                || ApiError::too_many_requests("busy"),
-                Action::Retry,
-            ),
-            ("closed", ApiError::admission_closed, Action::Retry),
-            ("recovery", recovery, Action::Recover),
+            ("policy", ApiError::forbidden("denied"), Action::Refresh),
+            ("key conflict", key_conflict(), Action::Refresh),
+            ("busy", ApiError::too_many_requests("busy"), Action::Retry),
+            ("closed", ApiError::admission_closed(), Action::Retry),
+            ("recovery", recovery(), Action::Recover),
         ];
         for (name, error, action) in cases {
-            let before = output_of(error()).await.disposition.unwrap();
+            let before = output_of(error).await.disposition.unwrap();
             assert_eq!(
                 (before.effects, before.action),
                 (Effects::None, action),
