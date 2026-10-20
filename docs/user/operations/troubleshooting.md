@@ -21,8 +21,9 @@ means the data request was not sent. HTTP discovery refusals retain their status
 
 ## HTTP errors
 
-Each `code` is sent under one status, which `ErrorCode` in `openapi.json` names
-beside the code's meaning.
+Each `code` is sent under the statuses `ErrorCode` in `openapi.json` names
+beside its meaning: one, except `branch_start_refusal`, which is `409`, or `410`
+for `not_retained`.
 
 | Status | Meaning | Usual action |
 |---:|---|---|

@@ -474,7 +474,8 @@ struct OpenedGraph {
 #[derive(Debug)]
 pub struct ApiError {
     /// Every error the server answers names its registry code, and answers
-    /// under that code's one HTTP status.
+    /// under one of that code's HTTP statuses: its usual one unless its
+    /// details choose another.
     code: ErrorCode,
     message: Box<str>,
     details: Option<Box<ApiErrorDetails>>,
@@ -2234,7 +2235,7 @@ mod api_error_tests {
         assert_eq!(error.disposition, unknown(DispositionAction::Reconcile));
     }
 
-    /// Every error answers under its code's one status, a write the server
+    /// Every error answers under one of its code's statuses, a write the server
     /// could not settle under 500 whatever failed underneath, and every 429
     /// or 503 that asks for a retry says when.
     #[tokio::test]

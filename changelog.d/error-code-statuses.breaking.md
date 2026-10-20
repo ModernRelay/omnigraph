@@ -1,4 +1,4 @@
-- **Every error code is sent under one status.** A Blob `If-Match` that fails
+- **Every error code names the statuses it is sent under.** A Blob `If-Match` that fails
   answers `412` `precondition_failed` instead of `conflict`, and `408`, `413`,
   `415` and `416` answer `request_timeout`, `payload_too_large`,
   `unsupported_media_type` and `range_not_satisfiable` instead of
