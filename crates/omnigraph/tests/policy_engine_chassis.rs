@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use omnigraph::Session;
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
@@ -562,6 +562,24 @@ async fn branch_create_from_as_denies_when_policy_rejects_actor() {
         .branch_create_from_as(ReadTarget::branch("main"), "feature", Some("act-denied"))
         .await;
     assert_denied(result, "branch_create_from_as");
+
+    // A commit start is checked on the branch that wrote the commit, and a
+    // denial is the not-found of an unknown id: the id discloses nothing.
+    let head = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let result = db
+        .branch_create_from_as(
+            ReadTarget::snapshot(SnapshotId::new(head)),
+            "feature",
+            Some("act-denied"),
+        )
+        .await;
+    assert!(
+        matches!(&result, Err(OmniError::Manifest(error)) if error.kind == ManifestErrorKind::NotFound),
+        "{result:?}"
+    );
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
 #[tokio::test]
@@ -572,6 +590,20 @@ async fn branch_create_from_as_allows_when_policy_permits_actor() {
     db.branch_create_from_as(ReadTarget::branch("main"), "feature", Some("act-allowed"))
         .await
         .expect("act-allowed should be able to BranchCreate from main");
+
+    let head = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let created = db
+        .branch_create_from_as(
+            ReadTarget::snapshot(SnapshotId::new(head.clone())),
+            "at-head",
+            Some("act-allowed"),
+        )
+        .await
+        .expect("act-allowed should be able to BranchCreate at a commit of main");
+    assert_eq!(created.from_commit_id, head);
+    assert_eq!(created.from, "main");
 }
 
 #[tokio::test]
@@ -744,7 +776,8 @@ async fn non_canonical_branch_names_cannot_reach_a_protected_branch() {
         );
         let result = db
             .branch_create_from_as(ReadTarget::branch(main), "fresh", actor)
-            .await;
+            .await
+            .map(drop);
         check(
             format!("branch_create_from_as({main:?} -> fresh)"),
             result,

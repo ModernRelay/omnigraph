@@ -326,8 +326,10 @@ committed table it reads, or `null`) and, on the physical node, `access`:
 
 Overwrite endpoint checks cost probes and scans using estimated input rows,
 the consulted table's row count, and usable BTREE coverage at the accepted
-version. Partial or missing coverage gets no index discount. Unknown counts
-and equal costs keep `probe`; statistics record the inputs and both costs.
+version. A probe first pays its key list, one entry per input row, so an
+unindexed endpoint check scans, and a partially or fully indexed table keeps
+`probe` only while the key list is small against it. Unknown counts and equal
+costs keep `probe`; statistics record `index_coverage` and both costs.
 `cardinality` and `retained_edges` always use `probe`. Node overwrite scans
 old node IDs to find removals; retained-edge access describes the filtered
 lookup in the incident edge table. Append and merge always use `probe`.

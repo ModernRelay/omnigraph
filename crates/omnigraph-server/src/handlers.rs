@@ -11,7 +11,7 @@ use crate::serving::GraphRequest;
 use crate::workload::{AdmissionGuard, IngressLease};
 use futures::StreamExt;
 use omnigraph::Session;
-use omnigraph::db::MergeResult;
+use omnigraph::db::{BranchCreated, MergeResult, SnapshotId};
 use omnigraph::settings::{SettingId, SettingValue};
 use omnigraph_compiler::Literal;
 use omnigraph_compiler::query::ast::{
@@ -2921,10 +2921,14 @@ async fn branch_list_body(
     request_body = BranchCreateRequest,
     responses(
         (status = 200, description = "Branch created", body = BranchCreateOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 400, description = "Bad request, or both `from` and `from_commit`", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Branch already exists", body = ErrorOutput),
+        // A commit the actor may not branch from is indistinguishable from
+        // one that does not exist.
+        (status = 404, description = "`from` names no branch, or `from_commit` names no commit the actor may branch from", body = ErrorOutput),
+        (status = 409, description = "Branch already exists, or the commit `from_commit` names cannot start a branch; see branch_start_refusal", body = ErrorOutput),
+        (status = 410, description = "The commit `from_commit` names is no longer retained; see branch_start_refusal", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -2932,10 +2936,12 @@ async fn branch_list_body(
 )]
 /// Create a new branch.
 ///
-/// Forks `name` off of `from` (defaults to `main`). The new branch shares
-/// backing dataset data with its parent until it is mutated. Returns 409 if `name`
-/// already exists. The GQ statement `branch create` on `POST /mutate` runs
-/// the same body.
+/// Forks `name` off of `from` (defaults to `main`) at its head, or starts it
+/// at the published graph commit `from_commit` with that commit's data and
+/// history. The receipt names the branch forked and the commit the new
+/// branch starts at. The new branch shares backing dataset data with its
+/// parent until it is mutated. Returns 409 if `name` already exists. The GQ
+/// statement `branch create` on `POST /mutate` runs the same body.
 pub(crate) async fn server_branch_create(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
@@ -2943,46 +2949,78 @@ pub(crate) async fn server_branch_create(
     actor: Option<Extension<AuthenticatedActor>>,
     ApiJson(request): ApiJson<BranchCreateRequest>,
 ) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
-    let from = request.from.unwrap_or_else(|| "main".to_string());
-    branch_create_body(
+    let start = match (request.from, request.from_commit) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "request may specify from or from_commit, not both",
+            ));
+        }
+        (_, Some(commit)) => ReadTarget::snapshot(SnapshotId::new(commit)),
+        (from, None) => ReadTarget::branch(from.unwrap_or_else(|| "main".to_string())),
+    };
+    let created = branch_create_body(
         &state,
         &handle,
         actor.as_ref().map(|Extension(actor)| actor),
         ingress,
-        &from,
+        start,
         &request.name,
     )
     .await?;
     Ok(Json(BranchCreateOutput {
         uri: handle.uri.clone(),
-        from,
+        from: created.from,
         name: request.name,
         actor_id: actor.map(|Extension(actor)| actor.actor_id.as_ref().to_string()),
+        from_commit_id: created.from_commit_id,
     }))
 }
 
 /// Body shared by `POST /branches` and the `branch create` statement: the
-/// `branch_create` check on (`from`, `name`), admission, the engine call.
+/// `branch_create` check on (the start's branch, `name`), admission, the
+/// engine call. A start at a commit is checked on the branch a control on
+/// the commit addresses, and a denial answers the 404 of an unknown commit,
+/// as the commit controls do, so the route discloses no commit the actor
+/// may not branch from.
 async fn branch_create_body(
     state: &AppState,
     handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
     ingress: IngressLease,
-    from: &str,
+    start: ReadTarget,
     name: &str,
-) -> std::result::Result<(), ApiError> {
+) -> std::result::Result<BranchCreated, ApiError> {
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    authorize_request(
+    let source = match &start {
+        ReadTarget::Branch(branch) => branch.clone(),
+        ReadTarget::Snapshot(commit_id) => handle
+            .engine
+            .commit_target_branch(commit_id.as_str())
+            .await
+            .map_err(|error| change_route_commit_lookup_error(error, commit_id.as_str()))?,
+    };
+    let decision = authorize(
         actor,
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::BranchCreate,
-            branch: Some(from.to_string()),
+            branch: Some(source),
             target_branch: Some(name.to_string()),
         },
     )?;
+    match (decision, &start) {
+        (Authz::Allowed, _) => {}
+        (Authz::Denied(message), ReadTarget::Branch(_)) => {
+            return Err(ApiError::forbidden(message));
+        }
+        (Authz::Denied(_), ReadTarget::Snapshot(commit_id)) => {
+            return Err(ApiError::not_found(format!(
+                "commit '{commit_id}' not found"
+            )));
+        }
+    }
     // Branch metadata only — small constant bytes estimate. The Lance
     // shallow-clone work is bounded by the parent's manifest size, not
     // the request body.
@@ -2991,12 +3029,11 @@ async fn branch_create_body(
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
     let engine = Arc::clone(&handle.engine);
-    let from = from.to_owned();
     let name = name.to_owned();
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
     owned_write(state, admission, ingress, handle.clone(), async move {
         engine
-            .branch_create_from_as(ReadTarget::branch(&from), &name, actor_id.as_deref())
+            .branch_create_from_as(start, &name, actor_id.as_deref())
             .await
             .map_err(ApiError::from_omni)
     })

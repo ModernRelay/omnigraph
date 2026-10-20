@@ -494,7 +494,9 @@ impl GraphCoordinator {
         self.manifest.native_branch()
     }
 
-    pub(crate) async fn branch_create(&mut self, name: &str) -> Result<()> {
+    /// Create `name` from the `__manifest` version this coordinator holds and
+    /// return the commit the new branch starts at: that version's head.
+    pub(crate) async fn branch_create(&mut self, name: &str) -> Result<String> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
 
@@ -502,7 +504,27 @@ impl GraphCoordinator {
         // it in two physical phases (shallow clone, then BranchContents); the
         // manifest coordinator classifies/reclaims a clone-only zombie before
         // a bounded retry. No graph-lineage branch is created or rolled back.
-        self.manifest.create_branch(&branch).await
+        self.manifest.create_branch(&branch).await?;
+        Ok(self.manifest.head().graph_commit_id.clone())
+    }
+
+    /// Create `name` at the published commit `record` names, which this
+    /// coordinator's branch incarnation wrote: the new branch's first
+    /// `__manifest` version is a clone of the version that published it.
+    pub(crate) async fn branch_create_at(
+        &mut self,
+        name: &str,
+        record: &HistoryRecord,
+    ) -> Result<()> {
+        let branch = normalize_branch_name(name)?
+            .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
+        self.manifest
+            .create_branch_at(
+                &branch,
+                record.commit.graph_manifest_version,
+                &record.commit.graph_commit_id,
+            )
+            .await
     }
 
     /// Delete the branch represented by an operation-local post-gate capture.
@@ -669,6 +691,24 @@ impl GraphCoordinator {
                     None => Err(commit_not_found(snapshot_id)),
                 }
             }
+        }
+    }
+
+    /// The record of the published commit `id`: held by this coordinator,
+    /// else in `__history`, else in a live branch. `None` for an id no
+    /// published commit has.
+    pub(crate) async fn published_record(&self, id: &str) -> Result<Option<HistoryRecord>> {
+        if let Some(record) = self.manifest.held_record(id) {
+            return Ok(Some(record));
+        }
+        let session = self.manifest.control_session();
+        match self
+            .history()
+            .read_record(self.root_uri(), &session, id)
+            .await?
+        {
+            Some(record) => Ok(Some(record)),
+            None => self.record_in_live_branches(id).await,
         }
     }
 

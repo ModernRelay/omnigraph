@@ -183,6 +183,61 @@ fn format_key_conflict(type_key: &str) -> String {
     format!("{} already has this id", graph_type_subject(type_key))
 }
 
+/// Why a branch cannot start at a graph commit. Each reason is decided before
+/// any effect; none is approximated by a nearby commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchStartRefusal {
+    /// Cleanup reclaimed a table version the commit's snapshot pins.
+    NotRetained {
+        table_key: String,
+        published_dataset_version: u64,
+    },
+    /// The commit was written under another accepted schema than the graph's.
+    SchemaChanged,
+    /// The commit's `__manifest` version predates the storage upgrade; this
+    /// build reads it only through the legacy history.
+    EarlierStorageFormat,
+    /// The branch incarnation that wrote the commit was deleted: its name
+    /// names no branch now, or a later branch created under the same name.
+    BranchDeleted { branch: String },
+    /// The commit is an unpublished proposal, which belongs to no branch's
+    /// history until it is published.
+    UnpublishedCommit,
+    /// The commit is an unattached snapshot, which never becomes branch
+    /// history.
+    UnattachedSnapshot,
+}
+
+fn format_branch_start_refusal(graph_commit_id: &str, reason: &BranchStartRefusal) -> String {
+    let why = match reason {
+        BranchStartRefusal::NotRetained {
+            table_key,
+            published_dataset_version,
+        } => format!(
+            "it is no longer retained: cleanup reclaimed version {published_dataset_version} of \
+             {}; start the branch at a retained commit",
+            graph_type_subject(table_key)
+        ),
+        BranchStartRefusal::SchemaChanged => "it was written under an earlier schema; start the \
+             branch at a commit written under the current schema"
+            .to_string(),
+        BranchStartRefusal::EarlierStorageFormat => "it was written before the storage upgrade; \
+             start the branch at a commit written after it"
+            .to_string(),
+        BranchStartRefusal::BranchDeleted { branch } => format!(
+            "branch '{branch}', which wrote it, was deleted; start the branch at a commit of a \
+             live branch"
+        ),
+        BranchStartRefusal::UnpublishedCommit => "it is an unpublished commit; publish it with \
+             `commit publish` and start the branch at the published commit"
+            .to_string(),
+        BranchStartRefusal::UnattachedSnapshot => {
+            "it is an unattached snapshot, which never becomes branch history".to_string()
+        }
+    };
+    format!("cannot start a branch at commit '{graph_commit_id}': {why}")
+}
+
 fn merge_conflict_kind_label(kind: MergeConflictKind) -> &'static str {
     match kind {
         MergeConflictKind::DivergentInsert => "divergent_insert",
@@ -302,6 +357,13 @@ pub enum OmniError {
         "'{target}' names both a branch and a commit; rename the branch, or name its head by commit id"
     )]
     AmbiguousReadTarget { target: String },
+    /// `branch create` named a graph commit a branch cannot start at. Refused
+    /// before any effect; the commit itself is unchanged.
+    #[error("{}", format_branch_start_refusal(graph_commit_id, reason))]
+    BranchStartRefused {
+        graph_commit_id: String,
+        reason: BranchStartRefusal,
+    },
     /// A change page or feed can no longer be reconstructed contiguously:
     /// cleanup reclaimed a published dataset version one of its commits pins. Recovery is
     /// the exact baseline handshake, never a retried continuation.
@@ -996,6 +1058,16 @@ impl OmniError {
             ManifestError::new(ManifestErrorKind::Conflict, message)
                 .with_details(ManifestConflictDetails::UnattachedCannotPublish { graph_commit_id }),
         )
+    }
+
+    pub fn branch_start_refused(
+        graph_commit_id: impl Into<String>,
+        reason: BranchStartRefusal,
+    ) -> Self {
+        Self::BranchStartRefused {
+            graph_commit_id: graph_commit_id.into(),
+            reason,
+        }
     }
 
     pub fn manifest_row_level_cas_contention(message: impl Into<String>) -> Self {

@@ -63,8 +63,8 @@ load csv "knows.csv" into edge:Knows mode overwrite header
 --- expect plan
 load route: plan
 load scan: partitions 1 fallback single_scan
-load validate edge_ri edge:Knows from Person: access probe
-load validate edge_ri edge:Knows to Person: access probe
+load validate edge_ri edge:Knows from Person: access scan
+load validate edge_ri edge:Knows to Person: access scan
 load write: overwrite fragments
 load executed: partitions 1 rows 2
 

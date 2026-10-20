@@ -32,8 +32,8 @@ beside the code's meaning.
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
 | 405 | The path is served, but not with this method (`method_not_allowed`) | Use a method the `Allow` header lists |
 | 408 | The request body did not arrive before its deadline (`request_timeout`) | Send the request again; nothing was admitted |
-| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, or incompatible full-text index | Inspect structured details; not every conflict is retryable |
-| 410 | Required change-feed history was reclaimed | Capture and durably install a new baseline, then resume from its terminal cursor |
+| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, or a commit no branch can start at (`branch_start_refusal`) | Inspect structured details; not every conflict is retryable |
+| 410 | Required change-feed history was reclaimed, or the commit a branch start names (`branch_start_refusal`, `not_retained`) | Capture and durably install a new baseline, then resume from its terminal cursor; start the branch at a retained commit |
 | 412 | Blob entity-tag or graph-commit precondition failed (`precondition_failed`), or `actor_mismatch` | Refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit |
 | 413 | Request or operation exceeded a bounded resource limit (`payload_too_large`) | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
 | 415 | The body's content type is not one the route accepts (`unsupported_media_type`) | Send JSON with `Content-Type: application/json`, or the type the route names |
@@ -91,7 +91,8 @@ full-text index to build, `retry` for `too_many_requests`,
 `service_unavailable`, `graph_unavailable` and `request_timeout`, `fix` for
 `unauthorized`, `bad_request`, `api_contract_mismatch`, `actor_mismatch`,
 `not_found`, `method_not_allowed`, `unattached_cannot_publish`,
-`payload_too_large`, `unsupported_media_type` and `range_not_satisfiable`, and
+`branch_start_refusal`, `payload_too_large`, `unsupported_media_type` and
+`range_not_satisfiable`, and
 `refresh` for the rest: `forbidden`, `precondition_failed`, `conflict`,
 `external_blob_source`, `change_feed_gap` and `internal`. A write the server
 could not settle answers `500`.

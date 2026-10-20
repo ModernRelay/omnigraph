@@ -69,7 +69,7 @@ use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
+use omnigraph::error::{BranchStartRefusal, ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::storage::normalize_root_uri;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::json_params_to_param_map;
@@ -507,6 +507,7 @@ enum ApiErrorDetails {
     BlobPreconditionFailure(api::BlobPreconditionFailureOutput),
     ChangeFeedGap(api::ChangeFeedGapOutput),
     ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
+    BranchStartRefusal(api::BranchStartRefusalOutput),
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
     FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
@@ -537,6 +538,7 @@ impl ApiErrorDetails {
             | Self::ExternalBlobSource(_)
             | Self::PreconditionFailure(_)
             | Self::BlobPreconditionFailure(_)
+            | Self::BranchStartRefusal(_)
             | Self::Diagnostic(_) => DetailClass::Refusal,
             Self::RecoveryRequired(_)
             | Self::FullTextIndexRebuildRequired(_)
@@ -1199,7 +1201,11 @@ impl ApiError {
 
     /// The HTTP status this error answers with: its code's.
     pub(crate) fn status(&self) -> StatusCode {
-        status_of(self.code)
+        let status = match self.details.as_deref() {
+            Some(ApiErrorDetails::BranchStartRefusal(refusal)) => refusal.reason.http_status(),
+            _ => self.code.http_statuses().first().copied().unwrap_or(500),
+        };
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
     }
 
     /// The human-readable message body, used by tests to assert the wire
@@ -1308,6 +1314,14 @@ impl ApiError {
     /// cannot satisfy (parentless genesis or an unprovable schema boundary).
     fn change_diff_refusal(message: String, details: api::ChangeDiffRefusalOutput) -> Self {
         Self::conflict(message).with_details(ApiErrorDetails::ChangeDiffRefusal(details))
+    }
+
+    /// HTTP 409, or 410 Gone when the commit is no longer retained: `branch
+    /// create` cannot start a branch at the commit `from` named, and nothing
+    /// was created. The `branch_start_refusal` detail carries the reason.
+    fn branch_start_refusal(message: String, details: api::BranchStartRefusalOutput) -> Self {
+        Self::new(ErrorCode::BranchStartRefusal, message)
+            .with_details(ApiErrorDetails::BranchStartRefusal(details))
     }
 
     /// A refused query: HTTP 400 with the one-line message, plus the
@@ -1528,6 +1542,60 @@ impl ApiError {
             }
             error @ OmniError::ReadTargetNotFound { .. } => Self::not_found(error.to_string()),
             error @ OmniError::AmbiguousReadTarget { .. } => Self::bad_request(error.to_string()),
+            error @ OmniError::BranchStartRefused { .. } => {
+                let message = error.to_string();
+                let OmniError::BranchStartRefused {
+                    graph_commit_id,
+                    reason,
+                } = error
+                else {
+                    unreachable!()
+                };
+                let (reason, type_name, branch) = match reason {
+                    BranchStartRefusal::NotRetained { table_key, .. } => {
+                        let Ok((_, type_name)) = api::entity_type_parts(&table_key) else {
+                            return Self::internal(
+                                "branch start refusal named invalid graph type metadata",
+                            );
+                        };
+                        (
+                            api::BranchStartRefusalReason::NotRetained,
+                            Some(type_name.to_string()),
+                            None,
+                        )
+                    }
+                    BranchStartRefusal::SchemaChanged => {
+                        (api::BranchStartRefusalReason::SchemaChanged, None, None)
+                    }
+                    BranchStartRefusal::EarlierStorageFormat => (
+                        api::BranchStartRefusalReason::EarlierStorageFormat,
+                        None,
+                        None,
+                    ),
+                    BranchStartRefusal::BranchDeleted { branch } => (
+                        api::BranchStartRefusalReason::BranchDeleted,
+                        None,
+                        Some(branch),
+                    ),
+                    BranchStartRefusal::UnpublishedCommit => {
+                        (api::BranchStartRefusalReason::UnpublishedCommit, None, None)
+                    }
+                    BranchStartRefusal::UnattachedSnapshot => (
+                        api::BranchStartRefusalReason::UnattachedSnapshot,
+                        None,
+                        None,
+                    ),
+                };
+                Self::branch_start_refusal(
+                    message,
+                    api::BranchStartRefusalOutput {
+                        reason,
+                        graph_commit_id,
+                        type_name,
+                        branch,
+                    },
+                )
+            }
             // Retention loss under a change continuation: 410 with the
             // structured resume hint. Recovery is the baseline handshake.
             OmniError::ChangeFeedGap {
@@ -1704,11 +1772,12 @@ fn format_key_conflict(
 /// whose action is `retry`.
 const RETRY_AFTER_SECONDS: &str = "60";
 
-/// The one HTTP status a code is answered under. A code no HTTP response
-/// carries belongs to MCP results, which never become a response; reaching
-/// one here is a server failure.
-fn status_of(code: ErrorCode) -> StatusCode {
-    code.http_status()
+/// The HTTP status a body is answered under, one of its code's. A code no
+/// HTTP response carries belongs to MCP results, which never become a
+/// response; reaching one here is a server failure.
+fn status_of(output: &ErrorOutput) -> StatusCode {
+    output
+        .http_status()
         .and_then(|status| StatusCode::from_u16(status).ok())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -1727,9 +1796,7 @@ impl IntoResponse for ApiError {
         let output = self.into_output();
         // The answered code fixes the status: a write the server could not
         // settle answers 500 whatever failed underneath.
-        let status = output
-            .code
-            .map_or(StatusCode::INTERNAL_SERVER_ERROR, status_of);
+        let status = status_of(&output);
         if output
             .disposition
             .is_some_and(|disposition| disposition.action == api::DispositionAction::Retry)
@@ -1802,6 +1869,9 @@ impl ApiError {
                 ApiErrorDetails::ChangeFeedGap(value) => output.change_feed_gap = Some(value),
                 ApiErrorDetails::ChangeDiffRefusal(value) => {
                     output.change_diff_refusal = Some(value)
+                }
+                ApiErrorDetails::BranchStartRefusal(value) => {
+                    output.branch_start_refusal = Some(value)
                 }
                 ApiErrorDetails::FullTextIndexRebuildRequired(value) => {
                     output.full_text_index_rebuild_required = Some(value)
@@ -2072,6 +2142,18 @@ mod api_error_tests {
             output_of(lost()).await.disposition,
             none(DispositionAction::Refresh)
         );
+        // A branch start refused at its commit created nothing, and that
+        // commit can never start the branch.
+        let error = output_of(
+            ApiError::from_omni(OmniError::branch_start_refused(
+                "01JTESTROOT",
+                BranchStartRefusal::UnattachedSnapshot,
+            ))
+            .after_owned_write(),
+        )
+        .await;
+        assert_eq!(error.code, Some(ErrorCode::BranchStartRefusal));
+        assert_eq!(error.disposition, none(DispositionAction::Fix));
         let compound = |mut error: ApiError| {
             error.compound = true;
             error
@@ -2234,7 +2316,7 @@ mod api_error_tests {
         ] {
             let answered = answer(error).await;
             assert_eq!(answered, (status, code, retry_after));
-            assert_eq!(Some(status.as_u16()), code.http_status(), "{code:?}");
+            assert!(code.http_statuses().contains(&status.as_u16()), "{code:?}");
         }
     }
 
@@ -2470,6 +2552,83 @@ mod api_error_tests {
                 assert_eq!(output.code, code, "{after_write} {compound}");
                 assert_eq!(output.disposition, disposition, "{after_write} {compound}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_start_refusal_is_typed_409_or_410() {
+        for (reason, status, wire, type_name) in [
+            (
+                BranchStartRefusal::NotRetained {
+                    table_key: "node:Person".to_string(),
+                    published_dataset_version: 7,
+                },
+                StatusCode::GONE,
+                api::BranchStartRefusalReason::NotRetained,
+                Some("Person".to_string()),
+            ),
+            (
+                BranchStartRefusal::SchemaChanged,
+                StatusCode::CONFLICT,
+                api::BranchStartRefusalReason::SchemaChanged,
+                None,
+            ),
+            (
+                BranchStartRefusal::EarlierStorageFormat,
+                StatusCode::CONFLICT,
+                api::BranchStartRefusalReason::EarlierStorageFormat,
+                None,
+            ),
+            (
+                BranchStartRefusal::BranchDeleted {
+                    branch: "gone".to_string(),
+                },
+                StatusCode::CONFLICT,
+                api::BranchStartRefusalReason::BranchDeleted,
+                None,
+            ),
+            (
+                BranchStartRefusal::UnpublishedCommit,
+                StatusCode::CONFLICT,
+                api::BranchStartRefusalReason::UnpublishedCommit,
+                None,
+            ),
+            (
+                BranchStartRefusal::UnattachedSnapshot,
+                StatusCode::CONFLICT,
+                api::BranchStartRefusalReason::UnattachedSnapshot,
+                None,
+            ),
+        ] {
+            let error = OmniError::branch_start_refused("01JTESTROOT", reason).before_effect();
+            let message = error.to_string();
+            // Branch create is an owned write; the refusal at its commit
+            // created nothing, and that commit can never start the branch.
+            let response = ApiError::from_omni(error)
+                .after_owned_write()
+                .into_response();
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error.code, Some(ErrorCode::BranchStartRefusal));
+            assert_eq!(
+                error.disposition,
+                Some(api::DispositionOutput {
+                    effects: api::DispositionEffects::None,
+                    action: api::DispositionAction::Fix,
+                })
+            );
+            assert_eq!(error.error, message);
+            let refusal = error.branch_start_refusal.expect("structured refusal");
+            assert_eq!(refusal.reason, wire);
+            assert_eq!(refusal.graph_commit_id, "01JTESTROOT");
+            assert_eq!(refusal.type_name, type_name);
+            assert_eq!(
+                refusal.branch.as_deref(),
+                (wire == api::BranchStartRefusalReason::BranchDeleted).then_some("gone")
+            );
         }
     }
 

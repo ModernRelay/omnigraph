@@ -397,8 +397,13 @@ pub struct SnapshotOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchCreateRequest {
-    /// Parent branch to fork from. Defaults to `main`.
+    /// Parent branch to fork from; the new branch starts at its head.
+    /// Mutually exclusive with `from_commit`. Defaults to `main`.
     pub from: Option<String>,
+    /// A published graph commit id to start the new branch at, with that
+    /// commit's data and history. Mutually exclusive with `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit: Option<String>,
     /// Name of the new branch. Must not already exist.
     pub name: String,
 }
@@ -409,6 +414,10 @@ pub struct BranchCreateOutput {
     pub from: String,
     pub name: String,
     pub actor_id: Option<String>,
+    /// The graph commit the new branch starts at: `from`'s head when the
+    /// branch was created, or the commit `from_commit` named. For a commit
+    /// start, `from` is the branch that wrote the commit.
+    pub from_commit_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -619,8 +628,14 @@ pub struct ReadPageOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BranchOutcomeOutput {
-    /// `name` was forked off `from`.
-    Created { from: String, name: String },
+    /// `name` was forked off `from` at the commit `from_commit_id`: the
+    /// head of `from`, or the commit a `from commit "<id>"` start named,
+    /// which `from` wrote.
+    Created {
+        from: String,
+        name: String,
+        from_commit_id: String,
+    },
     /// `name` was removed.
     Deleted { name: String },
     /// `source` was merged into `target`; `merge` is the three-way result,
@@ -1971,9 +1986,9 @@ pub struct ReadinessOutput {
 /// description and every server's status come from this list, so a code
 /// cannot be sent under a status its documentation does not name.
 macro_rules! error_codes {
-    ($( $(#[doc = $doc:literal])+ $code:ident = $name:literal, $status:expr; )+) => {
-        /// The registry of error codes. A server sends each code under the one
-        /// HTTP status the list names; a code with none never appears in an
+    ($( $(#[doc = $doc:literal])+ $code:ident = $name:literal, [$($status:literal),*]; )+) => {
+        /// The registry of error codes. A server sends each code under the
+        /// HTTP statuses the list names; a code with none never appears in an
         /// HTTP response.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         pub enum ErrorCode {
@@ -1989,10 +2004,12 @@ macro_rules! error_codes {
                 match self { $(ErrorCode::$code => $name,)+ }
             }
 
-            /// The HTTP status a server answers this code with, or `None` for
-            /// a code no HTTP response carries.
-            pub const fn http_status(self) -> Option<u16> {
-                match self { $(ErrorCode::$code => $status,)+ }
+            /// The HTTP statuses a server answers this code with, the usual
+            /// one first; empty for a code no HTTP response carries. Only a
+            /// code's details choose among several, as
+            /// [`ErrorOutput::http_status`] says.
+            pub const fn http_statuses(self) -> &'static [u16] {
+                match self { $(ErrorCode::$code => &[$($status),*],)+ }
             }
 
             /// What the code means, as its registry entry documents it.
@@ -2008,100 +2025,102 @@ error_codes! {
     /// The request carries no credential the server accepts: a bearer token
     /// is missing, unknown or expired. Supply one the server is configured
     /// to verify.
-    Unauthorized = "unauthorized", Some(401);
+    Unauthorized = "unauthorized", [401];
     /// The credential's actor may not do this: policy denies the action, or
     /// the action needs a policy permit the server has not been given.
-    Forbidden = "forbidden", Some(403);
+    Forbidden = "forbidden", [403];
     /// The request is malformed or invalid: a body, query string, path
     /// parameter or header that does not decode, a query the compiler
     /// refuses (see `diagnostic`), or a value refused before any effect.
-    BadRequest = "bad_request", Some(400);
+    BadRequest = "bad_request", [400];
     /// The request lacks exactly one `Omnigraph-Http-Api` header naming the
     /// contract this server speaks. Authentication and this check precede
     /// graph access and effects.
-    ApiContractMismatch = "api_contract_mismatch", Some(400);
+    ApiContractMismatch = "api_contract_mismatch", [400];
     /// The request's `Omnigraph-Expect-Actor` header names another actor
     /// than its credential resolves to. Nothing ran.
-    ActorMismatch = "actor_mismatch", Some(412);
+    ActorMismatch = "actor_mismatch", [412];
     /// A write whose completion the server could not settle: it may or may
     /// not have published. Read the target before writing again; never
     /// replay the write blindly. An MCP write call that was cancelled or
     /// passed its deadline answers it too.
-    OutcomeUnknown = "outcome_unknown", Some(500);
+    OutcomeUnknown = "outcome_unknown", [500];
     /// A request precondition no longer holds: the branch head moved past
     /// `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's
     /// `If-Match` names a value the cell no longer holds (a write's
     /// `blob_precondition_failure` names the current one). Nothing was
     /// written.
-    PreconditionFailed = "precondition_failed", Some(412);
+    PreconditionFailed = "precondition_failed", [412];
     /// An overlapping durable recovery intent must be resolved first; see
     /// `recovery_required`.
-    RecoveryRequired = "recovery_required", Some(503);
+    RecoveryRequired = "recovery_required", [503];
     /// An admitted external Blob source could not be probed or read; see
     /// `external_blob_source`.
-    ExternalBlobSource = "external_blob_source", Some(424);
+    ExternalBlobSource = "external_blob_source", [424];
     /// Retained history can no longer reconstruct a change continuation; see
     /// `change_feed_gap`. Resume from a new baseline.
-    ChangeFeedGap = "change_feed_gap", Some(410);
+    ChangeFeedGap = "change_feed_gap", [410];
     /// The graph, branch, commit, query, entity or route the request names
     /// does not exist, or the caller may not learn that it does.
-    NotFound = "not_found", Some(404);
+    NotFound = "not_found", [404];
     /// The request path is served, but not with the request's method.
-    MethodNotAllowed = "method_not_allowed", Some(405);
+    MethodNotAllowed = "method_not_allowed", [405];
     /// The request body did not arrive before its deadline; nothing was
     /// admitted.
-    RequestTimeout = "request_timeout", Some(408);
+    RequestTimeout = "request_timeout", [408];
     /// The request conflicts with the graph's current state: a concurrent
     /// change, an existing id, a merge conflict, an index that must be built
     /// first, or a commit that cannot be diffed. The details say which.
-    Conflict = "conflict", Some(409);
+    Conflict = "conflict", [409];
+    /// `branch create` could not start the branch at the commit
+    /// `from_commit` named, and nothing was created; see
+    /// `branch_start_refusal`, whose `not_retained` reason answers 410.
+    BranchStartRefusal = "branch_start_refusal", [409, 410];
     /// The commit is an unattached snapshot, a kind that never publishes.
     /// Distinct from `conflict`, the authority-moved refusal of a publishable
     /// proposal.
-    UnattachedCannotPublish = "unattached_cannot_publish", Some(409);
+    UnattachedCannotPublish = "unattached_cannot_publish", [409];
     /// The request body, or the work it asks for, exceeds a bounded limit;
     /// `resource_limit` names the limit when it is the operation's. Split or
     /// reduce the request.
-    PayloadTooLarge = "payload_too_large", Some(413);
+    PayloadTooLarge = "payload_too_large", [413];
     /// The request body's content type is not one the route accepts.
-    UnsupportedMediaType = "unsupported_media_type", Some(415);
+    UnsupportedMediaType = "unsupported_media_type", [415];
     /// The requested Blob byte range lies outside the value; see
     /// `blob_range`.
-    RangeNotSatisfiable = "range_not_satisfiable", Some(416);
+    RangeNotSatisfiable = "range_not_satisfiable", [416];
     /// Admission capacity is exhausted: an actor's, the server's, or the MCP
     /// endpoint's concurrent tool calls. Nothing started; retry after
     /// `Retry-After`.
-    TooManyRequests = "too_many_requests", Some(429);
+    TooManyRequests = "too_many_requests", [429];
     /// Operation admission is closed, or a deployment observation raced an
     /// owner change. Nothing started; retry after `Retry-After`, reconciling
     /// any earlier write first.
-    ServiceUnavailable = "service_unavailable", Some(503);
+    ServiceUnavailable = "service_unavailable", [503];
     /// A known graph is not being served. The request did not start, so it
     /// may be retried once the graph is served again.
-    GraphUnavailable = "graph_unavailable", Some(503);
+    GraphUnavailable = "graph_unavailable", [503];
     /// The server failed. An error before any write took no effect; see the
     /// server log.
-    Internal = "internal", Some(500);
+    Internal = "internal", [500];
     /// MCP only: the client cancelled a read tool call. A cancelled write
     /// answers `outcome_unknown`.
-    Cancelled = "cancelled", None;
+    Cancelled = "cancelled", [];
     /// MCP only: a read tool call passed its deadline. A write that does
     /// answers `outcome_unknown`.
-    DeadlineExceeded = "deadline_exceeded", None;
+    DeadlineExceeded = "deadline_exceeded", [];
     /// MCP only: a tool result exceeds the result limit. Narrow the read.
-    ResultTooLarge = "result_too_large", None;
+    ResultTooLarge = "result_too_large", [];
 }
 
 impl utoipa::PartialSchema for ErrorCode {
     fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
         let mut description = String::from(
-            "The registry of error codes. A server sends each code under the HTTP status named \
-             with it; a code without one never appears in an HTTP response.\n",
+            "The registry of error codes. A server sends each code under the HTTP statuses \
+             named with it; a code without one never appears in an HTTP response.\n",
         );
         for code in Self::ALL {
-            let status = code
-                .http_status()
-                .map_or_else(|| "no HTTP status".to_string(), |status| status.to_string());
+            let status = statuses_label(code.http_statuses());
             description.push_str(&format!(
                 "\n- `{}` ({status}): {}",
                 code.as_str(),
@@ -2117,6 +2136,18 @@ impl utoipa::PartialSchema for ErrorCode {
 }
 
 impl ToSchema for ErrorCode {}
+
+/// The statuses a code is sent under, as the published registry lists them.
+fn statuses_label(statuses: &[u16]) -> String {
+    if statuses.is_empty() {
+        return "no HTTP status".to_string();
+    }
+    statuses
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 impl ErrorCode {
     /// What a refusal with this code asks of its caller. A server's
@@ -2140,6 +2171,7 @@ impl ErrorCode {
             | Self::NotFound
             | Self::MethodNotAllowed
             | Self::UnattachedCannotPublish
+            | Self::BranchStartRefusal
             | Self::PayloadTooLarge
             | Self::UnsupportedMediaType
             | Self::RangeNotSatisfiable
@@ -2279,6 +2311,52 @@ pub struct ChangeDiffRefusalOutput {
     /// The graph type at the schema boundary, when the reason names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_name: Option<String>,
+}
+
+/// Why a branch could not start at the graph commit `from_commit` named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchStartRefusalReason {
+    /// HTTP 410: cleanup reclaimed data the commit's snapshot names.
+    NotRetained,
+    /// HTTP 409: the commit was written under an earlier schema.
+    SchemaChanged,
+    /// HTTP 409: the commit was written before the storage upgrade.
+    EarlierStorageFormat,
+    /// HTTP 409: the branch that wrote the commit was deleted, and may have
+    /// been created again under the same name since.
+    BranchDeleted,
+    /// HTTP 409: the commit is unpublished; publish it first.
+    UnpublishedCommit,
+    /// HTTP 409: the commit is an unattached snapshot, never branch history.
+    UnattachedSnapshot,
+    /// A reason added by a newer server; the branch was not created.
+    #[serde(other)]
+    Unknown,
+}
+
+impl BranchStartRefusalReason {
+    /// The HTTP status a server answers a refusal for this reason with.
+    pub const fn http_status(self) -> u16 {
+        match self {
+            Self::NotRetained => 410,
+            _ => 409,
+        }
+    }
+}
+
+/// A branch create refused at the graph commit `from_commit` named; nothing
+/// was created.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BranchStartRefusalOutput {
+    pub reason: BranchStartRefusalReason,
+    pub graph_commit_id: String,
+    /// For `not_retained`, the graph type whose stored version cleanup reclaimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    /// For `branch_deleted`, the branch that wrote the commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// A selected full-text index cannot safely serve the current analyzer (HTTP 409).
@@ -2504,6 +2582,10 @@ pub struct ErrorOutput {
     /// commit or an unprovable schema boundary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
+    /// Set with HTTP 409, or 410 for `not_retained`, when `branch create`
+    /// cannot start a branch at the commit `from_commit` named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_start_refusal: Option<BranchStartRefusalOutput>,
     /// Set with HTTP 409 when a selected full-text index requires an explicit
     /// rebuild before search can succeed. Unlike a write-authority conflict,
     /// this condition is not cleared by retrying. This additive discriminator
@@ -2522,6 +2604,19 @@ pub struct ErrorOutput {
 }
 
 impl ErrorOutput {
+    /// The HTTP status a server answers this body with: its code's usual one,
+    /// or the one its details select for a code sent under several. `None`
+    /// for a body without a code, or one whose code no HTTP response carries.
+    pub fn http_status(&self) -> Option<u16> {
+        let code = self.code?;
+        if code == ErrorCode::BranchStartRefusal
+            && let Some(refusal) = &self.branch_start_refusal
+        {
+            return Some(refusal.reason.http_status());
+        }
+        code.http_statuses().first().copied()
+    }
+
     /// An error body carrying `error` and nothing else; every typed detail is
     /// absent.
     pub fn message(error: impl Into<String>) -> Self {
@@ -2541,6 +2636,7 @@ impl ErrorOutput {
             blob_precondition_failure: None,
             change_feed_gap: None,
             change_diff_refusal: None,
+            branch_start_refusal: None,
             full_text_index_rebuild_required: None,
             full_text_index_required: None,
             diagnostic: None,
@@ -3197,14 +3293,43 @@ mod tests {
             );
             let description = code.description();
             assert!(description.len() > 20, "{code:?}: {description}");
-            match code.http_status() {
-                Some(status) => assert!((400..600).contains(&status), "{code:?}: {status}"),
-                None => assert!(
+            let statuses = code.http_statuses();
+            assert!(
+                statuses.iter().all(|status| (400..600).contains(status)),
+                "{code:?}: {statuses:?}"
+            );
+            if statuses.is_empty() {
+                assert!(
                     description.starts_with("MCP only:") || description.starts_with("CLI only"),
                     "{code:?} has no HTTP status, so it names the surface that sends it: \
                      {description}"
-                ),
+                );
             }
+            // A body answers under one of its code's statuses.
+            let mut body = super::ErrorOutput::message("refused");
+            body.code = Some(*code);
+            assert_eq!(body.http_status(), statuses.first().copied(), "{code:?}");
+        }
+        // The one code sent under two statuses: its details choose.
+        let mut body = super::ErrorOutput::message("refused");
+        body.code = Some(ErrorCode::BranchStartRefusal);
+        for (reason, status) in [
+            (super::BranchStartRefusalReason::NotRetained, 410),
+            (super::BranchStartRefusalReason::SchemaChanged, 409),
+            (super::BranchStartRefusalReason::UnattachedSnapshot, 409),
+        ] {
+            body.branch_start_refusal = Some(super::BranchStartRefusalOutput {
+                reason,
+                graph_commit_id: "01JTEST".into(),
+                type_name: None,
+                branch: None,
+            });
+            assert_eq!(body.http_status(), Some(status), "{reason:?}");
+            assert!(
+                ErrorCode::BranchStartRefusal
+                    .http_statuses()
+                    .contains(&status)
+            );
         }
         let RefOr::T(Schema::Object(schema)) = <ErrorCode as utoipa::PartialSchema>::schema()
         else {
@@ -3213,14 +3338,13 @@ mod tests {
         assert_eq!(schema.enum_values.unwrap().len(), ErrorCode::ALL.len());
         let description = schema.description.unwrap();
         for code in ErrorCode::ALL {
-            let status = code
-                .http_status()
-                .map_or_else(|| "no HTTP status".to_string(), |status| status.to_string());
+            let status = super::statuses_label(code.http_statuses());
             assert!(
                 description.contains(&format!("- `{}` ({status}): ", code.as_str())),
                 "{description}"
             );
         }
+        assert!(description.contains("- `branch_start_refusal` (409, 410): "));
     }
 
     #[test]

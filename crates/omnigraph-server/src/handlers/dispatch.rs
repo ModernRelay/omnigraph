@@ -7,8 +7,8 @@ use super::*;
 use crate::api::branch_statement_refusals as refusals;
 use omnigraph::loader::CsvLoadRequest;
 use omnigraph_compiler::query::ast::{
-    BranchDiffSides, BranchRead, BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME,
-    LoadStmt, SettingStmt, show_statement_name,
+    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, CommitWrite,
+    EXPLAIN_STATEMENT_NAME, LoadStmt, SettingStmt, show_statement_name,
 };
 use omnigraph_compiler::settings::{SettingId, SettingRow};
 
@@ -321,12 +321,22 @@ pub(super) async fn run_branch_statement(
     let actor_id = actor.map(|actor| actor.actor_id.as_ref().to_string());
     let (branch, commit, outcome) = match write {
         BranchWrite::Create { name, from } => {
-            let from = from.unwrap_or_else(|| "main".to_string());
-            branch_create_body(state, handle, actor, ingress, &from, &name).await?;
+            let start = match from {
+                Some(BranchCreateFrom::Commit(commit)) => {
+                    ReadTarget::snapshot(SnapshotId::new(commit))
+                }
+                Some(BranchCreateFrom::Branch(branch)) => ReadTarget::branch(branch),
+                None => ReadTarget::branch("main"),
+            };
+            let created = branch_create_body(state, handle, actor, ingress, start, &name).await?;
             (
                 name.clone(),
                 None,
-                api::BranchOutcomeOutput::Created { from, name },
+                api::BranchOutcomeOutput::Created {
+                    from: created.from,
+                    name,
+                    from_commit_id: created.from_commit_id,
+                },
             )
         }
         BranchWrite::Delete { name } => {
