@@ -9,7 +9,7 @@ use crate::read_format::ReadOutputFormat;
 #[derive(Debug, Args)]
 pub(crate) struct QueryArgs {
     /// Query name. With no `--query`/`-e`, the stored query to invoke from
-    /// the catalog (served — addressed via --server/--profile). With
+    /// the catalog (served — addressed via --target). With
     /// `--query`/`-e`, selects which query in that ad-hoc source to run.
     pub(crate) name: Option<String>,
     /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one branch read statement
@@ -47,7 +47,7 @@ pub(crate) struct QueryArgs {
 #[derive(Debug, Args)]
 pub(crate) struct MutateArgs {
     /// Query name. With no `--query`/`-e`, the stored mutation to invoke
-    /// from the catalog (served — addressed via --server/--profile). With
+    /// from the catalog (served — addressed via --target). With
     /// `--query`/`-e`, selects which query in that ad-hoc source to run.
     pub(crate) name: Option<String>,
     /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass), or

@@ -14,13 +14,13 @@ How to wire Omnigraph operations for agents and scripts.
 
 ## What an alias is
 
-An **operator alias** decouples a stable **operation name** from its implementation, so an agent calling `omnigraph alias signal …` keeps working as the query evolves. Aliases live in `~/.omnigraph/config.yaml` and are personal *bindings* to a **stored query on a named server** — they carry no query content; the stored query in the cluster catalog is the team's contract.
+An **operator alias** decouples a stable **operation name** from its implementation, so an agent calling `omnigraph alias signal …` keeps working as the query evolves. Aliases live in `~/.omnigraph/config.yaml` and are personal *bindings* to a **stored query on a registered server target** — they carry no query content; the stored query in the cluster catalog is the team's contract.
 
 ```yaml
-# ~/.omnigraph/config.yaml
+# Add to a target_config_version: 1 operator file.
 aliases:
   triage:
-    server: intel-dev      # an entry under servers:
+    target: intel-dev      # an entry under targets:
     graph: spike           # optional (multi-graph servers)
     query: weekly_triage   # the STORED query's name — never a file
     args: [since]          # positional args → params, in order
@@ -39,7 +39,7 @@ omnigraph alias triage 2026-06-01
 ```yaml
 aliases:
   <alias-name>:
-    server: <server-name>     # an entry under servers: in ~/.omnigraph/config.yaml
+    target: <server-name>     # an entry under targets: in ~/.omnigraph/config.yaml
     graph: <graph-id>         # optional: for multi-graph servers
     query: <stored-query>     # the stored query's NAME (never a file path)
     args: [<name1>, <name2>]  # positional CLI args → named params, in order
@@ -50,7 +50,7 @@ aliases:
 Dispatch with `omnigraph alias <name> [args]`. Operator aliases are read-only:
 the alias asserts a read, so the server refuses a bound stored mutation with
 `400`. Invoke stored mutations with
-`omnigraph mutate <name> --server <server> --graph <id>`. Aliases live in their
+`omnigraph mutate <name> --target <server> --graph <id>`. Aliases live in their
 own namespace, so one can never shadow or be shadowed by a built-in verb.
 
 ### `args` bind to query parameters
@@ -79,6 +79,7 @@ Explicit `--params '{...}'` wins on key conflict.
 For scripts and agents, prefer `jsonl` or `json`; `table` is for humans. Set a default in `~/.omnigraph/config.yaml`:
 
 ```yaml
+target_config_version: 1
 defaults:
   output: jsonl
 ```
@@ -112,22 +113,23 @@ Short, hyphenated, matches the conceptual operation:
 
 ## Secrets Don't Belong in Aliases
 
-Credentials never live in an alias or any config file. For remote servers, `omnigraph login <server>` stores the bearer token in `~/.omnigraph/credentials` (`0600`); for S3-backed storage, AWS creds go in `.env.omni`. Aliases should only contain query names and parameter bindings — never tokens, passwords, or API keys.
+Credentials never live in an alias or any config file. For remote servers, `omnigraph login --target <target>` stores the bearer token in `~/.omnigraph/credentials` (`0600`); for S3-backed storage, AWS creds go in `.env.omni`. Aliases should only contain query names and parameter bindings — never tokens, passwords, or API keys.
 
 ## Example Alias Set
 
 ```yaml
 # ~/.omnigraph/config.yaml
-servers:
-  intel-dev: { url: https://graph.example.com }
+target_config_version: 1
+targets:
+  intel-dev: { kind: server, endpoint: https://graph.example.com, credential: intel-dev }
 aliases:
   # Lookups (kv format for single-row readability)
-  signal:   { server: intel-dev, graph: spike, query: get_signal,  args: [slug], format: kv }
-  pattern:  { server: intel-dev, graph: spike, query: get_pattern, args: [slug], format: kv }
+  signal:   { target: intel-dev, graph: spike, query: get_signal,  args: [slug], format: kv }
+  pattern:  { target: intel-dev, graph: spike, query: get_pattern, args: [slug], format: kv }
   # Lists
-  signals:  { server: intel-dev, graph: spike, query: recent_signals }
+  signals:  { target: intel-dev, graph: spike, query: recent_signals }
   # Traversals
-  pattern-signals: { server: intel-dev, graph: spike, query: pattern_signals, args: [slug] }
+  pattern-signals: { target: intel-dev, graph: spike, query: pattern_signals, args: [slug] }
 ```
 
 Each `query:` names a stored query the cluster serves — declare them in `cluster.yaml` and `cluster apply` first (see [`stored-queries.md`](stored-queries.md)).
@@ -139,7 +141,7 @@ Each `query:` names a stored query the cluster serves — declare them in `clust
 omnigraph alias signal sig-kimi-k25
 
 # Invoke a served stored mutation directly (aliases are read-only)
-omnigraph mutate add_signal --server intel-dev --graph spike \
+omnigraph mutate add_signal --target intel-dev --graph spike \
   --params '{"slug":"sig-new","name":"Name","brief":"Brief","stagingTimestamp":"2026-04-14T00:00:00Z","createdAt":"2026-04-14T00:00:00Z","updatedAt":"2026-04-14T00:00:00Z"}'
 
 # Override output format

@@ -4479,7 +4479,7 @@ async fn query_endpoint_answers_an_explain_load_statement_as_rows() {
         assert_eq!(validate["inputs"][0]["node"], "CsvSource", "{physical}");
         assert_eq!(explain_tree(&body, "logical")["node"], "FragmentWrite");
         assert_eq!(explain_plan_rows(&body, "route"), ["engine"], "{body}");
-        assert_eq!(explain_plan_rows(&body, "explain_version"), ["6"], "{body}");
+        assert_eq!(explain_plan_rows(&body, "explain_version"), ["7"], "{body}");
     }
     assert_eq!(
         main_head_commit_id(&app).await,
@@ -5653,36 +5653,68 @@ async fn remote_branch_list_create_merge_flow_works() {
 async fn remote_branch_delete_flow_works() {
     let (_temp, app) = app_for_loaded_graph().await;
 
-    let create = BranchCreateRequest {
-        from: Some("main".to_string()),
-        from_commit: None,
-        name: "feature".to_string(),
-    };
-    let (create_status, _) = json_response(
-        &app,
-        Request::builder()
-            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/branches"))
-            .method(Method::POST)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&create).unwrap()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(create_status, StatusCode::OK);
+    // A branch may carry the name of a branch action (`merge`, `diff`,
+    // `merge-base`); DELETE of that name still deletes the branch.
+    for name in ["feature", "merge", "diff", "merge-base"] {
+        let create = BranchCreateRequest {
+            from: Some("main".to_string()),
+            from_commit: None,
+            name: name.to_string(),
+        };
+        let (create_status, _) = json_response(
+            &app,
+            Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(g("/branches"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&create).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::OK, "{name}");
 
-    let (delete_status, delete_body) = json_response(
-        &app,
-        Request::builder()
-            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/branches/feature"))
-            .method(Method::DELETE)
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(delete_status, StatusCode::OK);
-    assert_eq!(delete_body["name"], "feature");
+        let (delete_status, delete_body) = json_response(
+            &app,
+            Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(g(&format!("/branches/{name}")))
+                .method(Method::DELETE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(delete_status, StatusCode::OK, "{name}: {delete_body}");
+        assert_eq!(delete_body["name"], name);
+    }
+    // Any other method and name answers 405, naming what that name serves.
+    for (method, name, allow) in [
+        (Method::POST, "feature", "DELETE"),
+        (Method::GET, "feature", "DELETE"),
+        (Method::GET, "merge", "DELETE, POST"),
+        (Method::POST, "diff", "DELETE, GET, HEAD"),
+        (Method::PUT, "feature", "DELETE"),
+        (Method::PATCH, "merge", "DELETE, POST"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .uri(g(&format!("/branches/{name}")))
+                    .method(method.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {name}"
+        );
+        assert_eq!(response.headers()["allow"], allow, "{method} {name}");
+    }
 
     let (list_status, list_body) = json_response(
         &app,

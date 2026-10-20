@@ -190,6 +190,7 @@ mod tests {
             actor_id: None,
             commit: None,
             outcome: None,
+            executed: None,
         };
         assert_writer_failure(|writer| write_change_human(&change, writer));
     }

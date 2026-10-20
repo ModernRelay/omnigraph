@@ -4,15 +4,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Args)]
 pub(crate) struct OrganizationArgs {
-    /// API origin; may be omitted in a bound configuration directory.
-    #[arg(long, global = true)]
-    pub(crate) api: Option<String>,
-    /// Organization ID; omission uses the folder binding or sole cached organization.
-    #[arg(long, global = true)]
-    pub(crate) organization: Option<String>,
-    /// Configuration folder supplying an optional managed context.
-    #[arg(long, global = true, default_value = ".")]
-    pub(crate) config: PathBuf,
     /// Emit the validated API envelope instead of readable text.
     #[arg(long, global = true)]
     pub(crate) json: bool,

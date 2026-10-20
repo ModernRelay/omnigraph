@@ -7,25 +7,25 @@ review a multi-step change without exposing intermediate results on `main`.
 
 ```bash
 # Create an isolated branch from main.
-omnigraph branch create review/add-benchmark --from main --store graph.omni
+omnigraph branch create review/add-benchmark --from main --target ./graph.omni
 
 # Write and inspect it.
 omnigraph load --data benchmark.jsonl --mode append \
-  --branch review/add-benchmark graph.omni
+  --branch review/add-benchmark --target ./graph.omni
 omnigraph query sources_for_claim --query queries.gq \
   --params '{"claim":"lower-latency"}' \
-  --branch review/add-benchmark --store graph.omni
+  --branch review/add-benchmark --target ./graph.omni
 
 # Publish its result to main, then remove the source branch.
 omnigraph branch merge review/add-benchmark --into main --delete-branch \
-  --store graph.omni
+  --target ./graph.omni
 ```
 
 List and delete branches with:
 
 ```bash
-omnigraph branch list --store graph.omni
-omnigraph branch delete review/abandoned --store graph.omni
+omnigraph branch list --target ./graph.omni
+omnigraph branch delete review/abandoned --target ./graph.omni
 ```
 
 Creating a branch defaults to `main` when `--from` is omitted. To start a
@@ -121,8 +121,8 @@ id, parent, branch, actor when known, and timestamp. Merge commits have two
 parents.
 
 ```bash
-omnigraph commit list graph.omni --branch main
-omnigraph commit show <commit-id> --uri graph.omni
+omnigraph commit list --target ./graph.omni --branch main
+omnigraph commit show <commit-id> --target ./graph.omni
 ```
 
 `commit list` is newest first. Omitting `--branch` shows history reachable from
@@ -132,8 +132,8 @@ own commits.
 A long history can be read a page at a time:
 
 ```bash
-omnigraph commit list graph.omni --branch main --limit 50 --json
-omnigraph commit list graph.omni --branch main --page-token <token> --json
+omnigraph commit list --target ./graph.omni --branch main --limit 50 --json
+omnigraph commit list --target ./graph.omni --branch main --page-token <token> --json
 ```
 
 `--limit` (1 to 1,000) returns one page with `head_commit_id`, the head the
@@ -160,8 +160,8 @@ commit was the head. Use it to try a fix or a revert where a change was made,
 then merge the branch as usual; the commit is its merge base.
 
 ```bash
-omnigraph commit list graph.omni --branch main --json
-omnigraph branch create fix/import --from-commit <commit-id> --store graph.omni
+omnigraph commit list --target ./graph.omni --branch main --json
+omnigraph branch create fix/import --from-commit <commit-id> --target ./graph.omni
 ```
 
 The statement is `branch create "fix/import" from commit "<commit-id>"`, and
@@ -214,10 +214,10 @@ its id (`--snapshot`, `commit show`, `commit changes`) answer `not found`, and
 it leaves the `--unpublished` listing.
 
 ```bash
-omnigraph branch merge feature --into main --as-commit --uri graph.omni
-omnigraph commit list graph.omni --branch main --unpublished
-omnigraph commit publish <commit-id> --uri graph.omni
-omnigraph commit drop <commit-id> --uri graph.omni
+omnigraph branch merge feature --into main --as-commit --target ./graph.omni
+omnigraph commit list --target ./graph.omni --branch main --unpublished
+omnigraph commit publish <commit-id> --target ./graph.omni
+omnigraph commit drop <commit-id> --target ./graph.omni
 ```
 
 Served, the same control writes are `POST /commits/{commit_id}/publish`
@@ -258,9 +258,9 @@ be a live unattached snapshot: a published commit or an unpublished commit is
 refused.
 
 ```bash
-omnigraph commit list graph.omni --branch main --unattached
-omnigraph query people --query queries.gq --snapshot <snapshot-id> --store graph.omni
-omnigraph commit drop <snapshot-id> --uri graph.omni
+omnigraph commit list --target ./graph.omni --branch main --unattached
+omnigraph query people --query queries.gq --snapshot <snapshot-id> --target ./graph.omni
+omnigraph commit drop <snapshot-id> --target ./graph.omni
 ```
 
 `commit list --unattached` shows the branch's live snapshots, newest first,
@@ -288,7 +288,7 @@ Every read targets either a live branch or an immutable graph commit. Take a
 ```bash
 omnigraph query sources_for_claim --query queries.gq \
   --params '{"claim":"lower-latency"}' \
-  --snapshot <graph-commit-id> --store graph.omni
+  --snapshot <graph-commit-id> --target ./graph.omni
 ```
 
 A query stays on one snapshot for its entire lifetime. Wildcard traversal is
@@ -316,9 +316,9 @@ Inspect the logical changes made by one commit, compare two points, or review
 what a branch changed since it left `main`:
 
 ```bash
-omnigraph commit changes <commit-id> --store graph.omni --json
-omnigraph diff --from <commit-id> --to main --store graph.omni --json
-omnigraph branch diff feature --store graph.omni --json
+omnigraph commit changes <commit-id> --target ./graph.omni --json
+omnigraph diff --from <commit-id> --to main --target ./graph.omni --json
+omnigraph branch diff feature --target ./graph.omni --json
 ```
 
 For continuous consumption, `omnigraph changes poll` follows complete commits

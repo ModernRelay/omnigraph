@@ -14,8 +14,8 @@ datasets directly.
 | `az://container/prefix/graph.omni` | Azure Blob Storage qualification preview |
 
 An `http://` or `https://` URL addresses an OmniGraph server; it is not a graph
-storage URI. CLI commands use `--server` for server URLs and `--store` for direct
-storage access.
+storage URI. CLI commands use `--target NAME|ADDRESS` for both server and direct-storage
+destinations; the selected kind determines command availability.
 
 Azure support is a qualification preview: local Azurite validation and a live
 managed-identity smoke deployment are complete, but the adversarial live-Azure

@@ -1,12 +1,11 @@
-//! Resolution helpers: config/actor/graph/branch/query resolution,
-//! remote HTTP, env/token handling, scaffolding (moved verbatim from
-//! main.rs in the modularization).
+//! Shared actor resolution, request construction, diagnostics and local scaffolding.
+//! Backend selection belongs to the typed target resolver.
 
 use omnigraph_api_types::{ChangeRequest, QueryRequest, query_file_refusals};
 use omnigraph_compiler::query::ast::QueryFile;
 
 use super::*;
-use crate::operator::{self, InvocationConfig, OperatorConfig};
+use crate::operator::{InvocationConfig, OperatorConfig};
 
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
@@ -15,45 +14,13 @@ pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a URI addresses a server (`http://`, `https://` or `unix://`)
-/// rather than graph storage.
-pub(crate) fn is_remote_uri(uri: &str) -> bool {
-    crate::graph_http::server_scheme(uri).is_some()
-}
-
 /// Whether a resolved write target is *local* for the purposes of the RFC-011
 /// Decision 9 destructive-confirm gate: a bare path or a `file://` URI. Anything
 /// else carrying a scheme — `http(s)://` or `unix://` (served), `s3://` /
 /// `gs://` / … (object store) — is non-local and a destructive write against it
-/// requires explicit consent. Generalizes `is_remote_uri` (which only catches
-/// server schemes).
+/// requires explicit consent.
 pub(crate) fn uri_is_local(uri: &str) -> bool {
     !uri.contains("://") || uri.starts_with("file://")
-}
-
-/// Echo the resolved write target + access path to stderr (RFC-011 Decision 9),
-/// unless `--quiet`. One line, e.g. `omnigraph load → file://g.omni (direct,
-/// local)`. stderr so `--json` consumers reading stdout are unaffected; the line
-/// legitimately differs embedded-vs-served (that visibility is the point).
-pub(crate) fn write_target(
-    quiet: bool,
-    label: &str,
-    uri: &str,
-    served: bool,
-    stderr: &mut dyn Write,
-) -> Result<()> {
-    if quiet {
-        return Ok(());
-    }
-    let access = if served {
-        "served"
-    } else if uri_is_local(uri) {
-        "direct, local"
-    } else {
-        "direct, remote"
-    };
-    writeln!(stderr, "omnigraph {label} → {uri} ({access})")?;
-    Ok(())
 }
 
 /// Gate a destructive write (`cleanup`, overwrite `load`, `branch delete`)
@@ -139,12 +106,6 @@ pub(crate) fn graph_resource_id_for_selection(
     selected_graph.unwrap_or(normalized_uri).to_string()
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ResolvedCliGraph {
-    pub(crate) uri: String,
-    pub(crate) is_remote: bool,
-}
-
 /// THE actor chain (RFC-011) — every command that needs an identity
 /// resolves through this one function (one path per concern):
 /// `--as` > `operator.actor` in ~/.omnigraph/config.yaml > none.
@@ -168,39 +129,13 @@ pub(crate) fn resolve_actor_with_config(
         .map(str::to_string)
 }
 
-pub(crate) fn resolve_cluster_actor(
-    input: &InvocationConfig,
-    cli_as: Option<&str>,
-    stderr: &mut dyn Write,
-) -> Result<Option<String>> {
-    resolve_actor(input, cli_as, stderr)
-}
-
-pub(crate) fn resolve_cli_actor(
-    input: &InvocationConfig,
-    cli_as: Option<&str>,
-    stderr: &mut dyn Write,
-) -> Result<Option<String>> {
-    resolve_actor(input, cli_as, stderr)
-}
-
-/// The credential a served request carries (RFC-007 §D4–§D5, gh-host
-/// model): the token keyed to the operator server whose `url` the request
-/// URL falls under, from `OMNIGRAPH_TOKEN_<NAME>` env, then the 0600
-/// credentials file. A token is sent only to the server it is keyed to, and
-/// no unkeyed token is read, so every other request carries none.
-pub(crate) enum RemoteCredential {
-    Keyed(String),
-    Missing(MissingCredential),
-}
-
 /// Why a served request carries no credential. A 401 to that request names
 /// it, so the refusal says how to bind one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MissingCredential {
-    /// The URL falls under this operator server, which has no keyed token.
-    Server(String),
-    /// The URL falls under no operator server. `server_root` is the address
+    /// A declared target deliberately selected anonymous authentication.
+    AnonymousTarget(String),
+    /// The URL falls under no declared server target. `server_root` is the address
     /// as written, without URL userinfo; `config` is the operator config path.
     Unbound {
         server_root: String,
@@ -208,14 +143,22 @@ pub(crate) enum MissingCredential {
     },
 }
 
-/// `{"server": NAME, "hint": …}` for a declared server without a token,
-/// `{"unbound": ADDRESS, "hint": …}` for an address under no declared server.
+/// An anonymous target or unbound address, with actionable configuration guidance.
+/// Missing tokens for credential-bound targets refuse before any HTTP request.
 impl Serialize for MissingCredential {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("MissingCredential", 2)?;
+        let fields = if matches!(self, Self::AnonymousTarget(_)) {
+            3
+        } else {
+            2
+        };
+        let mut state = serializer.serialize_struct("MissingCredential", fields)?;
         match self {
-            Self::Server(name) => state.serialize_field("server", name)?,
+            Self::AnonymousTarget(name) => {
+                state.serialize_field("target", name)?;
+                state.serialize_field("auth", "anonymous")?;
+            }
             Self::Unbound { server_root, .. } => state.serialize_field("unbound", server_root)?,
         }
         state.serialize_field("hint", &self.to_string())?;
@@ -226,19 +169,18 @@ impl Serialize for MissingCredential {
 impl std::fmt::Display for MissingCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Server(name) => write!(
+            Self::AnonymousTarget(name) => write!(
                 f,
-                "no credential is stored for server `{name}`: run `omnigraph login {name}` \
-                 or set {}",
-                operator::token_env_name(name)
+                "target `{name}` uses anonymous authentication: configure its credential owner, \
+                 then run `omnigraph login --target {name}`"
             ),
             Self::Unbound {
                 server_root,
                 config,
             } => write!(
                 f,
-                "no credential is bound to {server_root}: declare it under `servers:` in {}, \
-                 then run `omnigraph login <name>` or set OMNIGRAPH_TOKEN_<NAME>",
+                "no credential is bound to {server_root}: declare a target for it under `targets:` in {}, \
+                 then run `omnigraph login --target <target>` or set OMNIGRAPH_TOKEN_<NAME>",
                 config.as_deref().map_or_else(
                     || "~/.omnigraph/config.yaml".to_string(),
                     |path| path.display().to_string()
@@ -246,60 +188,6 @@ impl std::fmt::Display for MissingCredential {
             ),
         }
     }
-}
-
-/// Resolve the credential for `url`, a URL under `server_root`, by where the
-/// transport sends it. Routing and credential-file location come from the
-/// invocation's captured inputs; secrets are acquired only for the matched server.
-pub(crate) fn resolve_remote_credential_with_input(
-    input: &InvocationConfig,
-    operator_config: &OperatorConfig,
-    server_root: &str,
-    url: &str,
-) -> Result<RemoteCredential> {
-    let target = crate::graph_http::RequestTarget::of(server_root, url)?;
-    let Some(server) = operator_config.find_server_for_target(&target) else {
-        return Ok(RemoteCredential::Missing(MissingCredential::Unbound {
-            server_root: without_userinfo(server_root),
-            config: input.config_path(),
-        }));
-    };
-    Ok(
-        match operator::resolve_keyed_token_at(server, input.credentials_path().as_deref())? {
-            Some(token) => RemoteCredential::Keyed(token),
-            None => RemoteCredential::Missing(MissingCredential::Server(server.to_string())),
-        },
-    )
-}
-
-/// A server address for display: URL-embedded credentials never leave the
-/// request they were written for.
-fn without_userinfo(server_root: &str) -> String {
-    match reqwest::Url::parse(server_root) {
-        Ok(mut url) if !url.username().is_empty() || url.password().is_some() => {
-            let _ = url.set_username("");
-            let _ = url.set_password(None);
-            url.to_string()
-        }
-        _ => server_root.to_string(),
-    }
-}
-
-/// The HTTP client for `server_root` and the token its requests to `url`
-/// carry. A client without one keeps the reason, which a 401 reports.
-pub(crate) fn served_client_with_config(
-    input: &InvocationConfig,
-    operator_config: &OperatorConfig,
-    server_root: &str,
-    url: &str,
-) -> Result<(crate::graph_http::GraphHttpClient, Option<String>)> {
-    let http = crate::graph_http::GraphHttpClient::new(server_root)?;
-    Ok(
-        match resolve_remote_credential_with_input(input, operator_config, server_root, url)? {
-            RemoteCredential::Keyed(token) => (http, Some(token)),
-            RemoteCredential::Missing(missing) => (http.with_missing_credential(missing), None),
-        },
-    )
 }
 
 /// The reason a 401 response's request carried no credential.
@@ -319,59 +207,8 @@ pub(crate) fn with_missing_credential(
     }
 }
 
-/// `--server <name>` (RFC-007 PR 3): resolve an operator-defined server
-/// name (+ optional `--graph` for multi-graph servers) to the effective
-/// remote URI. The result feeds the ordinary `uri` slot, so graph
-/// resolution and the keyed-token URL match work unchanged — the flag is
-/// sugar for a URI the operator already owns. Unknown names fail loudly,
-/// listing what IS defined.
-pub(crate) fn resolve_server_flag_with_config(
-    operator_config: &OperatorConfig,
-    server: Option<&str>,
-    graph: Option<&str>,
-) -> Result<Option<String>> {
-    let Some(server) = server else {
-        return Ok(None);
-    };
-    // RFC-011 Decision 2: a value containing `://` is a literal base URL
-    // (bypasses the operator-config registry); otherwise it is a config name.
-    // Either must be a server address: a scope that names a server never falls
-    // through to storage resolution.
-    let base_url = if server.contains("://") {
-        crate::graph_http::ServerTransport::parse(server)?;
-        server.to_string()
-    } else {
-        let Some(entry) = operator_config.servers.get(server) else {
-            let known = operator_config
-                .servers
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ");
-            color_eyre::eyre::bail!(
-                "unknown server '{server}' — servers defined in the operator config: [{known}] (add it under servers: in ~/.omnigraph/config.yaml)"
-            );
-        };
-        crate::graph_http::ServerTransport::parse(&entry.url).map_err(|error| {
-            color_eyre::eyre::eyre!("server '{server}' in the operator config: {error}")
-        })?;
-        entry.url.clone()
-    };
-    let base = base_url.trim_end_matches('/');
-    Ok(Some(match graph {
-        Some(graph) => {
-            require_graph_segment(graph)?;
-            format!("{base}/graphs/{graph}")
-        }
-        None => base.to_string(),
-    }))
-}
-
-/// A graph name is one path segment of the graph's served route, in the
-/// graph-id alphabet. Any other character could move the request off that
-/// route once the URL parser reads it: a dot segment in any spelling
-/// (`%2e`, a tab or newline it strips), `/`, `\` or `%2F`.
-fn require_graph_segment(graph: &str) -> Result<()> {
+/// A graph identifier is one unambiguous URL/storage path segment.
+pub(crate) fn require_graph_segment(graph: &str) -> Result<()> {
     if graph.is_empty()
         || !graph
             .bytes()
@@ -383,25 +220,6 @@ fn require_graph_segment(graph: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Apply `--server`/`--graph` to a command's uri/target slots: exclusive
-/// with both (loud error, not silent precedence), no-op when absent.
-pub(crate) fn apply_server_flag(
-    operator_config: &OperatorConfig,
-    server: Option<&str>,
-    graph: Option<&str>,
-    uri: Option<String>,
-) -> Result<Option<String>> {
-    if server.is_none() {
-        return Ok(uri);
-    }
-    if uri.is_some() {
-        color_eyre::eyre::bail!(
-            "--server is exclusive with a positional URI — pick one way to address the graph"
-        );
-    }
-    resolve_server_flag_with_config(operator_config, server, graph)
 }
 
 pub(crate) fn apply_bearer_token(
@@ -687,46 +505,6 @@ pub(crate) async fn remote_no_content(
     ))
 }
 
-/// The graph URI a command addresses (RFC-011): the scope-resolved URI string
-/// (positional URI / `--store` / `--profile` / `defaults.store`). No
-/// omnigraph.yaml `cli.graph` fallback — an absent address is a loud error.
-pub(crate) fn resolve_uri(cli_uri: Option<String>) -> Result<String> {
-    if crate::client::is_catalogue_scope(cli_uri.as_deref()) {
-        return Err(crate::client::catalogue_scope_refusal("this command"));
-    }
-    cli_uri.ok_or_else(|| {
-        color_eyre::eyre::eyre!(
-            "no graph addressed — pass a positional URI, --store <uri>, --server <name>, \
-             --profile <name>, or set a default scope in ~/.omnigraph/config.yaml"
-        )
-    })
-}
-
-pub(crate) fn resolve_cli_graph(cli_uri: Option<String>) -> Result<ResolvedCliGraph> {
-    let uri = resolve_uri(cli_uri)?;
-    Ok(ResolvedCliGraph {
-        is_remote: is_remote_uri(&uri),
-        uri,
-    })
-}
-
-pub(crate) fn resolve_local_graph(
-    cli_uri: Option<String>,
-    operation: &str,
-) -> Result<ResolvedCliGraph> {
-    let graph = resolve_cli_graph(cli_uri)?;
-    if graph.is_remote {
-        bail!(
-            "`{}` is a direct (storage-native) command and needs direct storage \
-             access; the resolved target is a remote server ({}). Pass the \
-             graph's file://, s3://, or az:// URI.",
-            operation,
-            graph.uri
-        );
-    }
-    Ok(graph)
-}
-
 pub(crate) fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
     let s = s.trim();
     if s.is_empty() {
@@ -755,105 +533,6 @@ pub(crate) fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
         _ => bail!("unknown duration unit '{}'. Supported: s, m, h, d, w", unit),
     };
     Ok(std::time::Duration::from_secs(secs))
-}
-
-pub(crate) fn resolve_local_uri(cli_uri: Option<String>, operation: &str) -> Result<String> {
-    Ok(resolve_local_graph(cli_uri, operation)?.uri)
-}
-
-/// Resolve a direct (storage-native) verb's address to a storage URI through the
-/// one RFC-011 scope path — the maintenance verbs (optimize/repair/cleanup) plus
-/// `schema plan` and `lint`'s graph-target path. Every primitive funnels here: a
-/// positional URI, `--store`, `--cluster <root> --graph <id>`, a `--profile`
-/// cluster binding, or operator defaults — all resolved at the `Direct`
-/// capability (so a server scope is rejected, a cluster scope is allowed when the
-/// verb opts into cluster addressing), then mapped to a storage URI by
-/// `resolve_storage_uri`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn resolve_maintenance_uri(
-    input: &InvocationConfig,
-    profile: Option<&str>,
-    store: Option<&str>,
-    cluster: Option<&str>,
-    graph: Option<&str>,
-    cli_uri: Option<String>,
-    operation: &str,
-    stderr: &mut dyn Write,
-) -> Result<String> {
-    let scope = scope::resolve_scope(
-        input.get(stderr)?,
-        input.profile(),
-        planes::Capability::Direct,
-        scope::ScopeFlags {
-            profile,
-            store,
-            server: None,
-            cluster,
-            graph,
-            uri: cli_uri,
-        },
-    )?;
-    resolve_storage_uri(
-        scope.uri,
-        scope.cluster.as_deref(),
-        scope.cluster_graph.as_deref(),
-        operation,
-    )
-    .await
-}
-
-/// Map a resolved direct address to a storage URI: a cluster scope
-/// (`--cluster <root> --graph <id>`, or a `--profile` cluster binding) resolves
-/// the graph's storage URI from the **served cluster state**; otherwise the
-/// ordinary positional-URI path. When a cluster scope carries no graph
-/// selection (RFC-011 D7), enumerate the catalog: a sole graph is used
-/// automatically, otherwise error and list the candidates so the operator can
-/// pass `--graph <id>`.
-pub(crate) async fn resolve_storage_uri(
-    cli_uri: Option<String>,
-    cluster: Option<&str>,
-    cluster_graph: Option<&str>,
-    operation: &str,
-) -> Result<String> {
-    match (cluster, cluster_graph) {
-        (Some(cluster), Some(graph_id)) => resolve_cluster_graph_uri(cluster, graph_id).await,
-        (Some(cluster), None) => {
-            let graph_id = resolve_sole_cluster_graph(cluster).await?;
-            resolve_cluster_graph_uri(cluster, &graph_id).await
-        }
-        (None, None) => resolve_local_uri(cli_uri, operation),
-        (None, Some(_)) => {
-            bail!("internal error: a graph was selected without a cluster scope")
-        }
-    }
-}
-
-/// Pick the graph for a cluster scope that has no `--graph`/`default_graph`
-/// (RFC-011 D7): exactly one applied graph → use it; zero → error; more than
-/// one → error and list the candidates. Never auto-picks among several.
-async fn resolve_sole_cluster_graph(cluster: &str) -> Result<String> {
-    let ids = omnigraph_cluster::cluster_graph_ids(cluster)
-        .await
-        .map_err(|diagnostic| color_eyre::eyre::eyre!("{}", diagnostic.message))?;
-    match ids.as_slice() {
-        [only] => Ok(only.clone()),
-        [] => bail!("cluster `{cluster}` has no applied graphs; run `cluster apply` first"),
-        many => bail!(
-            "cluster `{cluster}` has {} graphs: [{}]; pass --graph <id> to select one",
-            many.len(),
-            many.join(", ")
-        ),
-    }
-}
-
-/// Look up a graph's storage URI from a cluster's applied state ledger. Uses
-/// the lightweight `resolve_graph_storage_uri` (NOT the full serving-snapshot
-/// validation), so maintenance — especially `repair` — works even when an
-/// unrelated catalog payload is corrupt or a recovery sweep is pending.
-async fn resolve_cluster_graph_uri(cluster: &str, graph_id: &str) -> Result<String> {
-    omnigraph_cluster::resolve_graph_storage_uri(cluster, graph_id)
-        .await
-        .map_err(|diagnostic| color_eyre::eyre::eyre!("{}", diagnostic.message))
 }
 
 pub(crate) fn resolve_branch(
@@ -1121,50 +800,6 @@ mod tests {
         );
     }
 
-    // RFC-011 Decision 2: `--server` accepts a literal URL (value with `://`),
-    // bypassing the operator-config registry — so no config / OMNIGRAPH_HOME is
-    // read on this path (hermetic).
-    #[test]
-    fn server_flag_accepts_a_literal_url() {
-        assert_eq!(
-            resolve_server_flag_with_config(
-                &OperatorConfig::default(),
-                Some("https://graph.example.com"),
-                None
-            )
-            .unwrap(),
-            Some("https://graph.example.com".to_string())
-        );
-        // trailing slash trimmed; `--graph` appends the multi-graph path.
-        assert_eq!(
-            resolve_server_flag_with_config(
-                &OperatorConfig::default(),
-                Some("https://graph.example.com/"),
-                Some("knowledge")
-            )
-            .unwrap(),
-            Some("https://graph.example.com/graphs/knowledge".to_string())
-        );
-
-        let config: OperatorConfig = yaml_serde::from_str(
-            "servers:\n  captured:\n    url: https://captured.example.com/proxy/\n",
-        )
-        .unwrap();
-        assert_eq!(
-            resolve_server_flag_with_config(&config, Some("captured"), Some("knowledge")).unwrap(),
-            Some("https://captured.example.com/proxy/graphs/knowledge".to_string())
-        );
-        assert_eq!(
-            apply_server_flag(&config, Some("captured"), Some("knowledge"), None).unwrap(),
-            Some("https://captured.example.com/proxy/graphs/knowledge".to_string())
-        );
-        let error = resolve_server_flag_with_config(&config, Some("missing"), None)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("unknown server 'missing'"), "{error}");
-        assert!(error.contains("[captured]"), "{error}");
-    }
-
     #[test]
     fn actor_resolution_uses_supplied_config_and_explicit_override() {
         let config: OperatorConfig =
@@ -1179,86 +814,54 @@ mod tests {
         );
     }
 
-    // A literal `--server` is a server address: every other scheme is refused
-    // as an address here, before storage resolution could try it. `unix:///…`
-    // names a socket and composes graph URLs like any root on a Unix
-    // platform, and is refused as an address elsewhere.
     #[test]
-    fn server_flag_resolves_unix_sockets_and_refuses_other_schemes_issue_979() {
-        let refusal = |root: &str| {
-            let error = resolve_server_flag_with_config(
-                &OperatorConfig::default(),
-                Some(root),
-                Some("knowledge"),
-            )
-            .unwrap_err()
-            .to_string();
+    fn server_targets_validate_unix_sockets_and_refuse_other_schemes_issue_979() {
+        for root in ["HTTP://h:8080", "https://h/prefix"] {
             assert!(
-                error.starts_with("invalid server address: "),
-                "{root}: {error}"
+                crate::targets::validate_server_endpoint(root).is_ok(),
+                "{root}"
             );
-            assert!(!error.contains("storage"), "{root}: {error}");
-            error
-        };
+        }
         for root in [
-            "HTTP://h:8080",
-            "https://h/prefix",
-            "unix:///tmp/og.sock",
-            "UNIX:///tmp/og.sock",
+            "ftp://h/x",
+            "s3://bucket/graph.omni",
+            "file:///tmp/graph.omni",
+            "https://user:secret@host",
+            "https://host?q=1",
         ] {
-            assert!(is_remote_uri(root), "{root}");
+            assert!(
+                crate::targets::validate_server_endpoint(root).is_err(),
+                "{root}"
+            );
         }
-        assert!(!is_remote_uri("s3://bucket/graph.omni"));
-        assert!(!is_remote_uri("/tmp/a://b"));
-        for (root, expected) in [
-            ("ftp://h/x", "`ftp://` is not a server scheme"),
-            ("s3://bucket/graph.omni", "`s3://` is not a server scheme"),
-            ("file:///tmp/graph.omni", "`file://` is not a server scheme"),
-        ] {
-            let error = refusal(root);
-            assert!(error.contains(expected), "{root}: {error}");
-        }
-
         #[cfg(unix)]
         {
-            assert_eq!(
-                resolve_server_flag_with_config(
-                    &OperatorConfig::default(),
-                    Some("unix:///tmp/og.sock/"),
-                    Some("knowledge")
-                )
-                .unwrap(),
-                Some("unix:///tmp/og.sock/graphs/knowledge".to_string())
-            );
             for root in [
                 "unix:///tmp/og.sock",
                 "UNIX:///tmp/og.sock",
-                "unix:///tmp/gate way/og.sock",
                 "unix:///tmp/gate%20way/og.sock",
             ] {
                 assert!(
-                    resolve_server_flag_with_config(&OperatorConfig::default(), Some(root), None)
-                        .is_ok(),
+                    crate::targets::validate_server_endpoint(root).is_ok(),
                     "{root}"
                 );
             }
-            for (root, expected) in [
-                ("unix://host/tmp/og.sock", "unix:///ABSOLUTE/PATH.sock"),
-                ("unix:///", "unix:///ABSOLUTE/PATH.sock"),
-                ("unix:///tmp/og/..", "unix:///ABSOLUTE/PATH.sock"),
-                ("unix:///tmp/og.sock?x=1", "unix:///ABSOLUTE/PATH.sock"),
-                ("unix:///tmp/og.sock#f", "unix:///ABSOLUTE/PATH.sock"),
-                ("unix:///tmp/og%00.sock", "NUL byte"),
+            for root in [
+                "unix://host/tmp/og.sock",
+                "unix:///",
+                "unix:///tmp/og/..",
+                "unix:///tmp/og.sock?x=1",
+                "unix:///tmp/og.sock#f",
+                "unix:///tmp/og%00.sock",
             ] {
-                let error = refusal(root);
-                assert!(error.contains(expected), "{root}: {error}");
+                assert!(
+                    crate::targets::validate_server_endpoint(root).is_err(),
+                    "{root}"
+                );
             }
         }
         #[cfg(not(unix))]
-        for root in ["unix:///tmp/og.sock", "UNIX:///tmp/og.sock"] {
-            let error = refusal(root);
-            assert!(error.contains("needs a Unix platform"), "{root}: {error}");
-        }
+        assert!(crate::targets::validate_server_endpoint("unix:///tmp/og.sock").is_err());
     }
 
     // `branch delete` interpolates the branch into the URL path. The composed

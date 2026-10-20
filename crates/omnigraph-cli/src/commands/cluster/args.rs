@@ -1,4 +1,4 @@
-//! Existing cluster grammar, shared by direct, served and managed handlers.
+//! Cluster source, deployment and lifecycle operations over one selected target.
 
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
@@ -14,62 +14,56 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Preview local configuration against storage or --server; with --managed,
-    /// plan a pushed revision (--rev, or the bound head).
+    /// Preview local source against a direct or server target, or a managed pushed revision.
     Plan {
-        /// Directory containing cluster.yaml or the managed folder context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
+        /// Directory containing cluster.yaml (default . for direct/server targets).
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
-        /// With --managed, select an exact pushed revision.
+        /// For a managed target, select an exact pushed revision.
         #[arg(long = "rev")]
         revision: Option<String>,
         #[command(flatten)]
         run: ClusterRunArgs,
     },
-    /// Apply a captured bundle. --server submits and waits for live activation;
-    /// direct storage apply requires stopped serving. With --cluster ROOT and
-    /// --deployment-id, reconcile the original deployment without source files.
-    /// With --managed, apply an exact saved --plan instead.
+    /// Apply local source, or apply an exact managed --plan.
+    /// An ID without --config only observes/reconciles a direct deployment.
+    /// Direct storage apply requires stopped serving.
     Apply {
-        /// Directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
+        /// Source directory (default . only when no deployment ID is supplied).
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
-        /// Original durable deployment identity; never allocates a retry.
+        /// Full deployment identity. Resubmitting an existing ID only observes it.
         #[arg(long)]
         deployment_id: Option<String>,
         /// Attest prior writers and accepted graph/control I/O are quiescent.
-        #[arg(long, requires = "deployment_id")]
+        #[arg(long, requires = "deployment_id", conflicts_with = "config")]
         writers_stopped: bool,
-        /// With --managed, the exact prepared preview to apply (required).
+        /// For a managed target, the exact prepared preview to apply (required).
         #[arg(long)]
         plan: Option<String>,
         #[command(flatten)]
         run: ClusterRunArgs,
     },
     /// Read deployment status without scanning graphs. --deployment-id selects
-    /// an exact durable receipt through --server or --cluster ROOT.
-    /// With --managed, read cluster projections or a positional delivery ID.
+    /// a direct/server receipt; a positional ID selects a managed delivery.
     Status {
-        /// With --managed, observe this exact deployment delivery.
+        /// For a managed target, observe this exact deployment delivery.
         #[arg(value_name = "DEPLOYMENT_ID", group = "status_deployment")]
         run_id: Option<String>,
         #[arg(long, group = "status_deployment")]
         deployment_id: Option<String>,
-        /// With --server or --managed, wait for this exact deployment's outcome.
+        /// For a server or managed target, wait for this exact deployment's outcome.
         #[arg(long, requires = "status_deployment")]
         wait: bool,
         /// Bound the local wait (default 300s, maximum 3600s); never cancels work.
         #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: Option<u64>,
-        /// Directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -89,9 +83,6 @@ pub(crate) enum ClusterCommand {
     ForceUnlock {
         /// Exact lock id from cluster status or a state_lock_held diagnostic.
         lock_id: String,
-        /// Directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -105,41 +96,26 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// With --managed, create an empty cluster and bind an unbound folder to its identity.
+    /// Create an empty managed cluster and return its complete identity.
     Create {
         name: String,
-        #[arg(long)]
-        api: String,
-        /// Select the organization when the folder is not yet bound.
-        #[arg(long)]
-        organization: Option<String>,
-        /// Unbound configuration folder to bind after creation.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
         run: ClusterRunArgs,
     },
-    /// With --managed, list the clusters visible in the selected organization.
+    /// For a managed target, list the clusters visible in the selected organization.
     List {
-        #[arg(long)]
-        api: String,
-        #[arg(long)]
-        organization: Option<String>,
-        /// Configuration folder supplying an optional managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         #[arg(long)]
         json: bool,
     },
-    /// With --managed, list explicitly enrolled cluster members.
+    /// For a managed target, list explicitly enrolled cluster members.
     Members {
         #[command(subcommand)]
         command: ClusterMembersCommand,
     },
-    /// With --managed, download an exact configuration revision into a new directory.
+    /// For a managed target, download an exact configuration revision into a new directory.
     Pull {
         /// New destination; existing files, directories and symlinks are never replaced.
         #[arg(long)]
@@ -147,60 +123,48 @@ pub(crate) enum ClusterCommand {
         /// Full lowercase Git commit ID; omission captures the current source head.
         #[arg(long = "rev")]
         revision: Option<String>,
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         #[arg(long)]
         json: bool,
     },
-    /// With --managed, upload only referenced configuration files to the managed repository.
+    /// For a managed target, upload only referenced configuration files to the managed repository.
     Push {
         #[arg(long)]
         expected_revision: String,
         #[arg(long)]
         message: String,
-        /// Configuration folder containing the managed context.
+        /// Source directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
     },
-    /// With --managed, delete this exact incarnation; nonzero retention waits to tombstone.
+    /// For a managed target, delete this exact incarnation; nonzero retention waits to tombstone.
     Delete {
         #[arg(long)]
         incarnation: String,
         #[arg(long, default_value_t = 86400, value_parser = clap::value_parser!(u32).range(0..=2592000))]
         retention_seconds: u32,
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
         run: ClusterRunArgs,
     },
-    /// With --managed, undo an exact retained deletion through the ordinary managed bootstrap.
+    /// For a managed target, undo an exact retained deletion through the ordinary managed bootstrap.
     UndoDelete {
         #[arg(long)]
         incarnation: String,
         #[arg(long)]
         deletion_id: String,
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
         run: ClusterRunArgs,
     },
-    /// With --managed, cache an identity credential for this cluster, or forget it locally.
+    /// For a managed target, cache an identity credential for this cluster, or forget it locally.
     Token {
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -211,34 +175,22 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         clear: bool,
     },
-    /// With --managed, inspect or wait for a service lifecycle operation.
+    /// For a managed target, inspect or wait for a service lifecycle operation.
     Operation {
         /// Exact service lifecycle operation.
         operation_id: String,
-        /// API origin for recovery before a folder context exists.
-        #[arg(long)]
-        api: Option<String>,
-        /// Select the organization when the folder is not yet bound.
-        #[arg(long)]
-        organization: Option<String>,
         /// Poll until the operation reaches its canonical outcome.
         #[arg(long)]
         wait: bool,
         /// Local wait deadline in seconds (default 300, maximum 3600).
         #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: Option<u64>,
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
     },
-    /// With --managed, read deployment delivery history with its provenance.
+    /// For a managed target, read deployment delivery history with its provenance.
     History {
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -248,13 +200,10 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         since: Option<String>,
     },
-    /// With --managed, cancel your queued delivery before its first dispatch attempt.
+    /// For a managed target, cancel your queued delivery before its first dispatch attempt.
     Cancel {
         #[arg(value_name = "DEPLOYMENT_ID")]
         run_id: String,
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -265,9 +214,6 @@ pub(crate) enum ClusterCommand {
 pub(crate) enum ClusterMembersCommand {
     /// List explicit cluster enrollment; graph permissions are evaluated by Cedar separately.
     List {
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
         /// Emit the API envelope instead of a readable member table.
         #[arg(long)]
         json: bool,
@@ -283,7 +229,7 @@ pub(crate) struct ClusterRunArgs {
     /// Expiry does not cancel accepted work.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub(crate) timeout: Option<u64>,
-    /// With --managed, reuse this key to safely replay the same request.
+    /// For a managed target, reuse this key to safely replay the same request.
     #[arg(long)]
     pub(crate) idempotency_key: Option<String>,
 }

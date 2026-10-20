@@ -11519,6 +11519,17 @@
               }
             ]
           },
+          "executed": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadExecutedOutput",
+                "description": "Present only when the request was a `load csv` statement whose plan\nthe engine ran (`mode overwrite`): what the plan measured."
+              }
+            ]
+          },
           "outcome": {
             "oneOf": [
               {
@@ -12629,6 +12640,43 @@
           "unsupported"
         ]
       },
+      "LoadExecutedOutput": {
+        "type": "object",
+        "description": "What a `load csv` statement's plan measured as it ran, beside the\nstatement's [`ChangeOutput`]: the source partitions and bytes it read, the\ncount its sink staged, and what each operator did. Absent for an append\nor merge load, which the keyed adapters run, and for every other change.",
+        "required": [
+          "partitions",
+          "rows",
+          "source_bytes",
+          "operators"
+        ],
+        "properties": {
+          "operators": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoadOperatorExecutedOutput"
+            },
+            "description": "One entry per node of the executed plan in post-order, the source\nfirst."
+          },
+          "partitions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Source partitions the plan read.",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Entities the sink staged.",
+            "minimum": 0
+          },
+          "source_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes of the captured source.",
+            "minimum": 0
+          }
+        }
+      },
       "LoadMode": {
         "type": "string",
         "description": "Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.",
@@ -12637,6 +12685,52 @@
           "append",
           "merge"
         ]
+      },
+      "LoadOperatorExecutedOutput": {
+        "type": "object",
+        "description": "What one operator of an executed load plan did.",
+        "required": [
+          "id",
+          "node",
+          "operator",
+          "rows",
+          "elapsed_compute_ns",
+          "wall_ns"
+        ],
+        "properties": {
+          "elapsed_compute_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds the operator was computing: the polls of its stream and of\nits workers, never the time it waited for its input or for storage.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The plan node's `id`, as the explain document numbers it.",
+            "minimum": 0
+          },
+          "node": {
+            "type": "string",
+            "description": "The plan node's kind: `CsvSource`, `Validate`, `FragmentWrite`."
+          },
+          "operator": {
+            "type": "string",
+            "description": "The operator the node built."
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What the operator emitted; the sink counts what it staged.",
+            "minimum": 0
+          },
+          "wall_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds from the operator's first poll to its end, waits included;\n`0` where no end was recorded.",
+            "minimum": 0
+          }
+        }
       },
       "MergeBaseOutput": {
         "type": "object",
