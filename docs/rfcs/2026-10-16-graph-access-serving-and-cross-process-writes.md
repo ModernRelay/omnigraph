@@ -11,8 +11,7 @@ updated: 2026-10-20
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
-blocked_on:
-  - "The target-dependent client commands require RFC 0059 implementation (PR #1090); its design was accepted in PR #675. Independent HTTP and engine changes do not depend on the removed local-serving work."
+blocked_on: []
 ---
 
 # RFC: Graph access and cross-process writes
@@ -81,7 +80,8 @@ positional URI, `--cluster`, `--managed`, `--direct` and implicit folder
 context. Each changes the path, the credential and sometimes the actor. RFC 0059
 replaces them with named targets in one breaking migration; its design was
 accepted in [#675](https://github.com/ModernRelay/omnigraph/pull/675), and
-[#1090](https://github.com/ModernRelay/omnigraph/pull/1090) owns implementation.
+[#1090](https://github.com/ModernRelay/omnigraph/pull/1090) implemented it on
+main.
 
 **Writers must stay in one process, and nothing enforces it.** The engine
 supports schema apply, branch creation and deletion, and cleanup from one writer
@@ -1112,8 +1112,8 @@ release note.
    The access route already shipped in
    [#1073](https://github.com/ModernRelay/omnigraph/pull/1073); independent
    remaining work stays in progress.
-2. **Targets and access reporting.** Reuse accepted RFC 0059 and its
-   implementation [#1090](https://github.com/ModernRelay/omnigraph/pull/1090).
+2. **Targets and access reporting.** Build on accepted RFC 0059 and its merged
+   implementation, [#1090](https://github.com/ModernRelay/omnigraph/pull/1090).
    Add the access command without a process registry or serving command.
 3. **Existing-server clients and operation parity.** An existing-server stdio MCP
    bridge, Studio opener and credential client integration connect to the
@@ -1251,10 +1251,10 @@ former dependency on `AppState::local` is withdrawn.
 [RFC 0059](https://github.com/ModernRelay/omnigraph/blob/main/docs/rfcs/0059-config-cli-coherency.md)
 was accepted in [#675](https://github.com/ModernRelay/omnigraph/pull/675).
 It owns the singular target group, inline addresses, one breaking migration,
-credential binding and `credential get`. Its implementation remains separately
-tracked in [#1090](https://github.com/ModernRelay/omnigraph/pull/1090).
-This RFC consumes that contract without adding live-server fields or another
-selection state. Target-dependent client commands wait for the implementation;
+credential binding and `credential get`, and
+[#1090](https://github.com/ModernRelay/omnigraph/pull/1090) implemented it on
+main. This RFC consumes that contract without adding live-server fields or
+another selection state. Target-dependent client commands build on it;
 independent HTTP and engine changes do not depend on a second serving model.
 
 ### A6. Defects found
@@ -1409,3 +1409,5 @@ proposal.
   ordinary cluster-backed fixtures. RFC 0059's former reference to this
   separate local-serving proposal never accepted it and creates no remaining
   serving dependency.
+- 2026-10-20: #1090 merged RFC 0059's implementation, so `blocked_on` is empty
+  and the target-dependent commands build on main.
