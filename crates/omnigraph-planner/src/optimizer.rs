@@ -16,9 +16,9 @@ use omnigraph_compiler::types::Direction;
 use crate::cost::{
     AccessPath, AntiJoinStrategy, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
     HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
-    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, chain_rows, choose_access_path,
-    choose_anti_join_strategy, choose_expand_mode, choose_validate_access, direction_probe_factor,
-    estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
+    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, ValidateIndexCoverage, chain_rows,
+    choose_access_path, choose_anti_join_strategy, choose_expand_mode, choose_validate_access,
+    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
 };
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::key_set::{KeySetTree, key_set_tree};
@@ -3714,10 +3714,21 @@ impl Lowering<'_> {
                 candidates.peek().is_some()
                     && candidates.all(|fact| fact.fully_covers_btree(column))
             });
+        let index_coverage = if indexed {
+            ValidateIndexCoverage::Full
+        } else if facts.iter().any(|fact| {
+            columns.contains(&fact.column.as_str())
+                && matches!(fact.kind, crate::source::IndexKind::Btree { usable: true })
+                && fact.may_narrow()
+        }) {
+            ValidateIndexCoverage::Partial
+        } else {
+            ValidateIndexCoverage::Absent
+        };
         let inputs = ValidateCostInputs {
             input_rows: estimated_rows,
             consulted_rows: node.as_ref().and_then(|node| node.row_count),
-            indexed,
+            index_coverage,
         };
         let access = if overwrite {
             choose_validate_access(&spec.check, inputs)
@@ -3736,6 +3747,7 @@ impl Lowering<'_> {
                 "estimated_rows": estimated_rows,
                 "consulted_rows": inputs.consulted_rows,
                 "index_full_coverage": indexed,
+                "index_coverage": index_coverage,
                 "index_facts": facts,
                 "indexed_row_factor": HASH_JOIN_RATIO,
                 "probe_calls": costs.map(|(_, _, calls)| calls),

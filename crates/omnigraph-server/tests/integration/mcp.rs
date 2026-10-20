@@ -1338,10 +1338,19 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
         stale["result"]["structuredContent"]["status"], 412,
         "{stale}"
     );
-    assert!(
-        stale["result"]["structuredContent"]
-            .get("outcome_unknown")
-            .is_none()
+    // The refusal is the route's own error body: its code and a
+    // disposition that says nothing was written.
+    let refusal = &stale["result"]["structuredContent"];
+    assert_eq!(refusal["error"]["code"], "precondition_failed", "{stale}");
+    assert_eq!(
+        refusal["error"]["disposition"],
+        json!({"effects": "none", "action": "refresh"}),
+        "{stale}"
+    );
+    assert_eq!(
+        refusal.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["error", "status"],
+        "{stale}"
     );
     assert_eq!(
         manifest_dataset_version(&graph_path(temp.path())).await,
@@ -1419,8 +1428,8 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
     assert_eq!(refusal["status"], 409, "{refused}");
     assert!(refusal["error"]["key_conflict"].is_object(), "{refused}");
     assert_eq!(
-        refusal["error"]["outcome"],
-        json!({"execution": "unknown", "effects": "unknown", "action": "refresh"}),
+        refusal["error"]["disposition"],
+        json!({"effects": "partial", "action": "refresh"}),
         "{refused}"
     );
     let branches = call(&app, "secret", "branches_list", json!({"graph":"default"})).await;

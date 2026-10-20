@@ -971,7 +971,7 @@ mod tests {
         let first = runtime.try_observe().unwrap();
         let producer = first.clone();
         assert_eq!(
-            runtime.try_observe().err().unwrap().status,
+            runtime.try_observe().err().unwrap().status(),
             StatusCode::TOO_MANY_REQUESTS
         );
         drop(first);

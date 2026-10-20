@@ -296,8 +296,8 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         "{missing_body}"
     );
     assert_eq!(
-        missing_body["outcome"],
-        json!({"execution": "not_started", "effects": "none", "action": "refresh"}),
+        missing_body["disposition"],
+        json!({"effects": "none", "action": "refresh"}),
         "an unreadable source refuses the load before its publication: {missing_body}"
     );
     assert_eq!(

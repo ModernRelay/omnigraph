@@ -86,7 +86,7 @@ route.
 ## Typed failures and recovery
 
 - `429 Too Many Requests`: the write did not start. Honor `Retry-After`, then
-  retry. The CLI marks this case with exit `75` and an `outcome` whose
+  retry. The CLI marks this case with exit `75` and a `disposition` whose
   `action` is `retry`, only when no earlier step of the command took effect.
 - Structured `read_set_conflict` means an input changed before publication.
   Refresh and reconsider the operation, including schema/table identity changes;

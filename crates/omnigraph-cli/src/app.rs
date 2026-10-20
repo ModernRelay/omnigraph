@@ -184,8 +184,8 @@ fn finish(
                     }
                     writeln!(
                         stderr,
-                        "outcome: {}",
-                        serde_json::to_string(&failure.outcome())?
+                        "disposition: {}",
+                        serde_json::to_string(&failure.disposition())?
                     )?;
                     stderr.flush()?;
                 }
@@ -194,7 +194,7 @@ fn finish(
         })();
         if let Err(delivery) = delivered {
             // stdout may be closed or contain a partial result. Retain the
-            // complete outcome in the returned error, which main reports on
+            // complete disposition in the returned error, which main reports on
             // stderr, rather than losing it to the output error.
             return Err(UndeliveredFailure { failure, delivery }.into());
         }

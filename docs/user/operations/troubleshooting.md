@@ -4,10 +4,10 @@ CLI failures include a human-readable message. Add `--json` where supported to
 receive structured fields suitable for automation. Every HTTP error the server
 answers, an unknown route, a method the route does not serve and a malformed
 body, query string or path parameter included, uses a JSON body with `error`,
-`code`, `outcome` and optional details for conflicts, limits, Blob ranges,
+`code`, `disposition` and optional details for conflicts, limits, Blob ranges,
 external sources, or recovery. A malformed request is `400`, a body without a
-JSON content type `415`. MCP tool calls report errors in their own result shapes
-([MCP](mcp.md#results-and-errors)).
+JSON content type `415`. MCP tool calls report the same body beside the HTTP
+status ([MCP](mcp.md#results-and-errors)).
 
 Do not parse human-readable error text when a structured field is present.
 
@@ -21,21 +21,28 @@ means the data request was not sent. HTTP discovery refusals retain their status
 
 ## HTTP errors
 
+Each `code` is sent under the statuses `ErrorCode` in `openapi.json` names
+beside its meaning: one, except `branch_start_refusal`, which is `409`, or `410`
+for `not_retained`.
+
 | Status | Meaning | Usual action |
 |---:|---|---|
 | 400 | Invalid request, query, schema, configuration, or external-Blob policy, including an update that must carry a stored external Blob reference the policy does not admit | Correct the request; retrying unchanged will fail again. For a stored reference, assign that property in the same update (a new value or null), or admit its base in the policy |
 | 401 | Missing or invalid bearer token | Supply a token configured by the server. The CLI sends a token only to the server it is keyed to; see [server credentials](../cli/index.md#use-a-server) |
 | 403 | The resolved actor is not authorized | Change policy or use an authorized identity |
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
-| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, or incompatible full-text index | Inspect structured details; not every conflict is retryable |
-| 410 | Required change-feed history was reclaimed | Capture and durably install a new baseline, then resume from its terminal cursor |
-| 412 | Blob entity-tag or graph-commit precondition failed | Refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit |
-| 413 | Request or operation exceeded a bounded resource limit | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
-| 416 | Blob byte range is outside the value | Use the returned length to choose a valid range |
+| 405 | The path is served, but not with this method (`method_not_allowed`) | Use a method the `Allow` header lists |
+| 408 | The request body did not arrive before its deadline (`request_timeout`) | Send the request again; nothing was admitted |
+| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, or a commit no branch can start at (`branch_start_refusal`) | Inspect structured details; not every conflict is retryable |
+| 410 | Required change-feed history was reclaimed, or the commit a branch start names (`branch_start_refusal`, `not_retained`) | Capture and durably install a new baseline, then resume from its terminal cursor; start the branch at a retained commit |
+| 412 | Blob entity-tag or graph-commit precondition failed (`precondition_failed`), or `actor_mismatch` | Refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit |
+| 413 | Request or operation exceeded a bounded resource limit (`payload_too_large`) | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
+| 415 | The body's content type is not one the route accepts (`unsupported_media_type`) | Send JSON with `Content-Type: application/json`, or the type the route names |
+| 416 | Blob byte range is outside the value (`range_not_satisfiable`) | Use the returned length to choose a valid range |
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
-| 429 | Server or per-actor admission limit reached | Use the whole-command outcome below before retrying; preserve `Retry-After` |
+| 429 | Server or per-actor admission limit reached | Use the whole-command disposition below before retrying; preserve `Retry-After` |
 | 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery, change-route or streamed-response failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path; see below |
-| 503 | Admission is closed, or a published schema change requires completion | Inspect the structured error; generic 503 is not permission to repeat a write |
+| 503 | Admission is closed or the graph is not served (`service_unavailable`, `graph_unavailable`, both with `Retry-After`), or a published schema change requires completion (`recovery_required`) | Inspect the structured error; generic 503 is not permission to repeat a write |
 
 A `GET` or `HEAD /blob` 500 logs `error_kind="blob_pre_header_internal"` with a
 `stage`. `target` is a failure resolving a snapshot target for a policy-gated
@@ -68,24 +75,34 @@ the same way. See [Diagnostics](../queries/diagnostics.md).
 
 ## Failed data-write commands
 
-Every server error body, and every CLI data-write and read failure, carries an `outcome`:
-`execution` is `not_started` or `unknown`, `effects` is `none` or `unknown` to
-match, and `action` is `retry`, `refresh`, `recover` or `reconcile`. The server
-decides it for the request it answered by the first row that matches:
+Every server error body, and every CLI data-write and read failure, carries a
+`disposition`: `effects` is `none`, `partial` or `unknown`, and `action` is
+`fix`, `refresh`, `retry`, `recover` or `reconcile`. The server decides it for
+the request it answered by the first row that matches:
 
-| Error | `execution` | `action` |
+| Error | `effects` | `action` |
 |---|---|---|
-| Any error before the request submitted a write | `not_started` | `recover` for a recovery intent or index rebuild; `retry` for `429` or `503`; else `refresh` |
+| Any error before the request submitted a write | `none` | the refusal's own |
 | A write whose completion the server could not settle; `code` becomes `outcome_unknown` unless the action is `recover` | `unknown` | `reconcile`, or `recover` |
-| A refusal after an earlier step of the write published, such as a load that forked its missing branch; `code` is kept | `unknown` | `refresh` |
-| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), or a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a resource limit, an external Blob source, a query diagnostic) | `not_started` | `retry` for `429`, else `refresh` |
+| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a resource limit, an external Blob source, a query diagnostic), or a failure the engine proved published nothing, such as a storage failure before publication; `code` is kept | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
 | Any other error after a write, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
 
-The CLI reports the server's outcome when that request was the command's only
-effectful one, and otherwise its own account of the whole command, so a lost
-response is `unknown` with `reconcile`. A read command changes nothing, so its
-failure is always `not_started` with `effects: none`. JSON mode writes the
-failure to stdout; human mode prints the `outcome` line on stderr. HTTP failures also retain
+A refusal's own action follows its code: `recover` for a recovery intent or a
+full-text index to build, `retry` for `too_many_requests`,
+`service_unavailable`, `graph_unavailable` and `request_timeout`, `fix` for
+`unauthorized`, `bad_request`, `api_contract_mismatch`, `actor_mismatch`,
+`not_found`, `method_not_allowed`, `unattached_cannot_publish`,
+`branch_start_refusal`, `payload_too_large`, `unsupported_media_type` and
+`range_not_satisfiable`, and
+`refresh` for the rest: `forbidden`, `precondition_failed`, `conflict`,
+`external_blob_source`, `change_feed_gap` and `internal`. A write the server
+could not settle answers `500`.
+
+The CLI reports the server's disposition when that request was the command's
+only effectful one, and otherwise its own account of the whole command, so a
+lost response is `unknown` with `reconcile`. A read command changes nothing, so
+its failure always has `effects: none`. JSON mode writes the failure to stdout;
+human mode prints the `disposition` line on stderr. HTTP failures also retain
 `http_status` and, when present, the original `retry_after` string.
 
 This includes `commit publish` and `commit drop`, as well as their `mutate`
@@ -94,19 +111,20 @@ current state before another attempt; an output failure does not undo the write.
 The same applies to `load`, `blob put`, `blob clear` and `schema apply`: a closed
 output pipe or failed result flush can follow a successful write. The CLI exits with a failure
 and does not repeat the operation. If stdout cannot carry a JSON failure, stderr
-reports the undelivered diagnostic and its outcome, and the exit still follows it.
+reports the undelivered diagnostic and its disposition, and the exit still
+follows it.
 
 For the data commands the CLI classifies (queries, reads, `load`, `mutate`,
 branch, commit, schema and Blob commands, aliases and target commands), the
-exit follows from the outcome:
+exit follows from the disposition:
 
 | CLI exit | What to do |
 |---:|---|
 | 0 | The operation succeeded or was a no-op. A merge can separately report a source-deletion failure without losing its successful result. |
-| 1 | `not_started`: the command changed nothing. Inspect the action and details, correct the cause and run it again. |
-| 2 | `unknown`: the command may have had effects. Reconcile or recover as `action` says before another attempt; a conflict, resource limit, incomplete response or lost connection does not by itself permit repeating the write. |
+| 1 | `effects: none`: the command changed nothing. Inspect the action and details, correct the cause and run it again. |
+| 2 | `effects: unknown` or `partial`: the command may have had effects, or an earlier step of it did. Read the target, and reconcile or recover as `action` says, before another attempt; a conflict, resource limit, incomplete response or lost connection does not by itself permit repeating the write. |
 | 4 | A condition you set did not hold, with no earlier command effects: a verified write precondition or an `--as` assertion. Re-read the branch and choose a new precondition deliberately. |
-| 75 | `not_started` with `retry`: the server refused before starting, as when the actor is busy. Honor `Retry-After` and bound any caller retry. |
+| 75 | `effects: none` with `retry`: the server refused before starting, as when the actor is busy. Honor `Retry-After` and bound any caller retry. |
 | 64 | The argument parser refused the command line before anything ran (`EX_USAGE`); an addressing refusal inside a command, such as two scope flags, exits 1. |
 
 Maintenance commands (`init`, `upgrade`, `optimize`, `rebuild-full-text-indexes`,
@@ -115,8 +133,8 @@ managed commands keep their own exits for now: their exit 1 does not by itself
 say that nothing changed, so read their report.
 
 A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
-`api_contract_mismatch` exits 1 with `execution: not_started`, `effects: none`
-and `action: refresh`. The server answers these before it admits the write:
+`api_contract_mismatch` exits 1 with `effects: none`, and `action: refresh` for
+the policy denial and `fix` for the others. The server answers these before it admits the write:
 bearer authentication, then the API contract header, then policy. Fix the
 credential, the policy grant or the client before running the command again.
 When the CLI sent no credential, the refusal also carries `missing_credential`:
@@ -127,20 +145,23 @@ The status counts only with its matching `code` in a response that carries the
 server's API contract header: a bare `403` from a proxy stays `unknown` with
 `reconcile`, and a refusal that also reports recovery work stays `recover`.
 
-`refresh` means inspect current inputs and correct the command; it does not grant
-automatic replay. `recover` means finish the reported recovery obligation.
+`fix` means correct the credential, input, path or client; sent unchanged, the
+command fails the same way. `refresh` means read the current state and decide
+again; it does not grant automatic replay. `partial` effects mean an earlier
+step stands although the failing one wrote nothing; read the target before
+deciding. `recover` means finish the reported recovery obligation.
 `reconcile` means establish the original operation's outcome before another
 attempt. Only `retry` with exit 75 grants the bounded retry described above; the
 CLI performs no automatic retry.
 
-The outcome covers the entire command. A later refused subrequest cannot undo
-an earlier branch creation, load or publication. An embedded write's own
+The disposition covers the entire command. A later refused subrequest cannot
+undo an earlier branch creation, load or publication. An embedded write's own
 refusal says what the engine did, projected as a server would project it: a
 policy refusal precedes every publication, a `load --from` fork included, so it
-is `not_started` on both planes. The engine marks a refusal that follows a fork
-which did publish, and that refusal is `unknown` on both planes. A `load
---from` onto a branch that already exists forks nothing. Any later failure,
-such as rendering a committed receipt, stays `unknown`.
+has `effects: none` on both planes. The engine marks a refusal that follows a
+fork which did publish, and that refusal has `effects: partial` on both planes.
+A `load --from` onto a branch that already exists forks nothing. Any later
+failure, such as rendering a committed receipt, stays `unknown`.
 Disconnecting an admitted HTTP write does not cancel it: the server keeps
 running the original operation, and a lost response can leave the caller's
 outcome unknown. There is no durable request-result lookup in this release.
@@ -150,7 +171,7 @@ outcome unknown. There is no durable request-result lookup in this release.
 A `409` is not one universal retry signal:
 
 - A read-set or version conflict means another writer changed an input. Inspect
-  the whole-command outcome and re-read before deciding on a new operation.
+  the whole-command disposition and re-read before deciding on a new operation.
 - A key conflict means strict insertion found an existing ID. Change the ID or
   use merge/upsert semantics; repeating the strict insert is not useful.
 - A merge conflict requires an explicit resolution on one branch before

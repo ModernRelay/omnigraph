@@ -3074,6 +3074,64 @@ async fn commit_list_and_change_feed_cross_the_upgrade() {
     }
 }
 
+/// A commit written before the storage upgrade starts no branch: its
+/// `__manifest` version is in the earlier format, which only the legacy
+/// history reads, so the start is refused before any effect. A commit
+/// written after the upgrade starts one.
+#[tokio::test]
+async fn branch_start_refuses_a_commit_written_before_the_upgrade() {
+    use crate::db::{ReadTarget, SnapshotId};
+    use crate::error::{BranchStartRefusal, CompletionEvidence};
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let source = engine_source().await;
+    assert_eq!(
+        execute(&source.root).await.outcome,
+        UpgradeOutcome::Completed
+    );
+    let graph = Arc::new(Omnigraph::open(&source.root).await.unwrap());
+    insert(&graph, "main", "d").await;
+    let branches = graph.branch_list().await.unwrap();
+    let main_version = version_of(&source.root, None).await;
+    for commit in [id(1), id(2), id(3), id(4)] {
+        let refused = graph
+            .branch_create_from(ReadTarget::snapshot(SnapshotId::new(commit.clone())), "old")
+            .await
+            .expect_err("a pre-upgrade commit starts no branch");
+        assert_eq!(
+            refused.completion_evidence(),
+            Some(CompletionEvidence::BeforeEffect),
+            "{refused}"
+        );
+        let refused = refused.into_completion_evidence().0;
+        assert!(
+            matches!(
+                &refused,
+                OmniError::BranchStartRefused {
+                    reason: BranchStartRefusal::EarlierStorageFormat,
+                    graph_commit_id,
+                } if *graph_commit_id == commit
+            ),
+            "{commit}: {refused:?}"
+        );
+    }
+    assert_eq!(graph.branch_list().await.unwrap(), branches);
+    assert_eq!(version_of(&source.root, None).await, main_version);
+
+    let newest = graph.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let created = graph
+        .branch_create_from(ReadTarget::snapshot(SnapshotId::new(newest.clone())), "new")
+        .await
+        .unwrap();
+    assert_eq!(
+        (created.from.as_str(), created.from_commit_id.as_str()),
+        ("main", newest.as_str())
+    );
+    assert_eq!(names(&graph, "new").await, ["a", "c", "d"]);
+}
+
 /// Publish a lineage-only commit on `branch` of `root` under the release
 /// budget `release_bytes` and return the commit the head then holds.
 async fn publish(

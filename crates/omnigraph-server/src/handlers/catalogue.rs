@@ -7,7 +7,6 @@
 //! before any effect.
 
 use axum::extract::State;
-use axum::extract::rejection::JsonRejection;
 use axum::{Extension, Json};
 use omnigraph::catalogue::{CATALOGUE_SCOPE, CatalogueScope};
 use omnigraph::db::ReadTarget;
@@ -17,6 +16,7 @@ use omnigraph_policy::{PolicyAction, PolicyRequest};
 use super::dispatch::{classify, refuse_empty_file, refuse_process_settings};
 use super::{authorize_request, query_params_from_json, render_error, select_named_query_decl};
 use crate::api::{self, QueryRequest, ReadOutput, ReadTargetOutput, SchemaOutput};
+use crate::extract::ApiJson;
 use crate::identity::AuthenticatedActor;
 use crate::{ApiError, AppState};
 
@@ -61,10 +61,8 @@ impl AppState {
 pub(crate) async fn catalogue_query(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
-    request: std::result::Result<Json<QueryRequest>, JsonRejection>,
+    ApiJson(request): ApiJson<QueryRequest>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
-    let Json(request) = request
-        .map_err(|rejection| ApiError::json_rejection("invalid query request", rejection))?;
     state.authorize_catalogue_read(actor.as_ref().map(|Extension(actor)| actor))?;
     if request.branch.is_some() || request.snapshot.is_some() {
         return Err(ApiError::bad_request(format!(

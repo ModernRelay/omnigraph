@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use color_eyre::Report;
 use omnigraph_api_types::{
-    ErrorCode, ErrorOutput, OutcomeAction as Action, OutcomeEffects as Effects,
-    OutcomeExecution as Execution, OutcomeOutput,
+    DispositionAction as Action, DispositionEffects as Effects, DispositionOutput, ErrorCode,
+    ErrorOutput,
 };
 use reqwest::StatusCode;
 use serde::Serialize;
@@ -237,8 +237,8 @@ impl<T> EngineWrite<T> for std::result::Result<T, omnigraph::error::OmniError> {
 }
 
 /// The failure the CLI prints for a command: the server's error body, its
-/// `outcome` reconciled with what this command's own requests show, and the
-/// transport facts beside it.
+/// `disposition` reconciled with what this command's own requests show, and
+/// the transport facts beside it.
 #[derive(Debug, Serialize)]
 pub(crate) struct Failure {
     #[serde(flatten)]
@@ -257,11 +257,11 @@ pub(crate) struct Failure {
 }
 
 impl Failure {
-    /// The whole command's outcome, which `classify` always sets.
-    pub(crate) fn outcome(&self) -> OutcomeOutput {
+    /// The whole command's disposition, which `classify` always sets.
+    pub(crate) fn disposition(&self) -> DispositionOutput {
         self.output
-            .outcome
-            .expect("a classified failure carries its outcome")
+            .disposition
+            .expect("a classified failure carries its disposition")
     }
 
     pub(crate) fn classify(error: Report, evidence: Evidence) -> Self {
@@ -308,16 +308,16 @@ impl Failure {
             evidence.retry_after
         };
         let missing_credential = remote.and_then(|remote| remote.missing_credential.clone());
-        // A server states the outcome of the one request it answered; that is
-        // the whole command's outcome only when that request was the
-        // command's sole effectful one.
+        // A server states the disposition of the one request it answered; that
+        // is the whole command's only when that request was the command's sole
+        // effectful one.
         let served = remote
             .filter(|_| single)
-            .and_then(|remote| remote.output.outcome)
+            .and_then(|remote| remote.output.disposition)
             .or_else(|| {
                 precondition
                     .filter(|_| single)
-                    .and_then(|value| value.output.outcome)
+                    .and_then(|value| value.output.disposition)
             });
         let output = if let Some(remote) = remote {
             remote.output.clone()
@@ -341,7 +341,7 @@ impl Failure {
                 },
             }
         };
-        let served = served.or_else(|| output.outcome.filter(|_| engine_write && embedded));
+        let served = served.or_else(|| output.disposition.filter(|_| engine_write && embedded));
         let not_started = read
             || admission.is_some()
             || conditional
@@ -353,6 +353,8 @@ impl Failure {
             || output.full_text_index_required.is_some()
         {
             Action::Recover
+        } else if let Some(action) = admission {
+            action
         } else if not_started
             || output.precondition_failure.is_some()
             || output.blob_precondition_failure.is_some()
@@ -363,17 +365,18 @@ impl Failure {
             || output.external_blob_source.is_some()
             || !output.merge_conflicts.is_empty()
             || output.diagnostic.is_some()
+            || output.branch_start_refusal.is_some()
         {
-            Action::Refresh
+            // A refusal of the request itself is fixed; any other is read
+            // again first.
+            match output.code.map(ErrorCode::action) {
+                Some(Action::Fix) => Action::Fix,
+                _ => Action::Refresh,
+            }
         } else {
             Action::Reconcile
         };
-        let outcome = served.unwrap_or(OutcomeOutput {
-            execution: if not_started {
-                Execution::NotStarted
-            } else {
-                Execution::Unknown
-            },
+        let disposition = served.unwrap_or(DispositionOutput {
             effects: if not_started {
                 Effects::None
             } else {
@@ -381,9 +384,9 @@ impl Failure {
             },
             action,
         });
-        let exit = exit_for(&outcome, conditional);
+        let exit = exit_for(&disposition, conditional);
         let mut output = output;
-        output.outcome = Some(outcome);
+        output.disposition = Some(disposition);
         Self {
             output,
             http_status,
@@ -404,38 +407,40 @@ fn embedded_write_output(engine: omnigraph::error::OmniError) -> ErrorOutput {
     use omnigraph::error::{CompletionEvidence, OmniError};
     if matches!(engine, OmniError::Policy(_)) {
         omnigraph_server::engine_error_output_after(engine, false)
-    } else if engine.completion_evidence() == Some(CompletionEvidence::PartlyPublished) {
+    } else if matches!(
+        engine.completion_evidence(),
+        Some(CompletionEvidence::PartlyPublished { .. })
+    ) {
         omnigraph_server::engine_error_output_after(engine, true)
     } else {
         omnigraph_server::engine_error_output(engine)
     }
 }
 
-/// The exit a failure's outcome selects: busy and safe to retry (75), a
-/// condition the caller set (4), effects unknown (2), or not started (1).
-fn exit_for(outcome: &OutcomeOutput, conditional: bool) -> i32 {
-    if outcome.execution == Execution::NotStarted && outcome.action == Action::Retry {
-        crate::EXIT_RETRY
-    } else if conditional {
-        crate::EXIT_PRECONDITION_FAILED
-    } else if outcome.execution == Execution::Unknown {
-        crate::EXIT_OUTCOME_UNKNOWN
-    } else {
-        1
+/// The exit a failure's disposition selects: busy and safe to retry (75), a
+/// condition the caller set (4), effects that may exist or that an earlier
+/// step left (2), or no effects (1).
+fn exit_for(disposition: &DispositionOutput, conditional: bool) -> i32 {
+    match (disposition.effects, disposition.action) {
+        (Effects::None, Action::Retry) => crate::EXIT_RETRY,
+        _ if conditional => crate::EXIT_PRECONDITION_FAILED,
+        (Effects::Unknown | Effects::Partial, _) => crate::EXIT_OUTCOME_UNKNOWN,
+        (Effects::None, _) => 1,
     }
 }
 
 /// The typed refusals the server sends before it admits a write, each code
-/// under its own status. A busy actor may retry the whole command; failed
-/// authentication, an unsupported contract, a refused `--as` assertion or a
-/// policy denial needs a changed credential, client or grant first.
+/// under its own status, and what each asks for. A busy actor may retry the
+/// whole command; failed authentication, an unsupported contract or a refused
+/// `--as` assertion needs a fixed credential or client, and a policy denial a
+/// changed grant.
 fn admission_refusal(status: StatusCode, code: Option<&ErrorCode>) -> Option<Action> {
     match (status, code?) {
-        (StatusCode::TOO_MANY_REQUESTS, ErrorCode::TooManyRequests) => Some(Action::Retry),
-        (StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized)
-        | (StatusCode::BAD_REQUEST, ErrorCode::ApiContractMismatch)
-        | (StatusCode::PRECONDITION_FAILED, ErrorCode::ActorMismatch)
-        | (StatusCode::FORBIDDEN, ErrorCode::Forbidden) => Some(Action::Refresh),
+        (StatusCode::TOO_MANY_REQUESTS, code @ ErrorCode::TooManyRequests)
+        | (StatusCode::UNAUTHORIZED, code @ ErrorCode::Unauthorized)
+        | (StatusCode::BAD_REQUEST, code @ ErrorCode::ApiContractMismatch)
+        | (StatusCode::PRECONDITION_FAILED, code @ ErrorCode::ActorMismatch)
+        | (StatusCode::FORBIDDEN, code @ ErrorCode::Forbidden) => Some(code.action()),
         _ => None,
     }
 }
@@ -453,6 +458,7 @@ pub(crate) fn is_plain_refusal(output: &ErrorOutput) -> bool {
         && output.blob_precondition_failure.is_none()
         && output.change_feed_gap.is_none()
         && output.change_diff_refusal.is_none()
+        && output.branch_start_refusal.is_none()
         && output.full_text_index_rebuild_required.is_none()
         && output.full_text_index_required.is_none()
         && output.diagnostic.is_none()
@@ -471,14 +477,15 @@ mod tests {
         }
     }
 
-    fn outcome(failure: &Failure) -> serde_json::Value {
-        serde_json::to_value(failure.output.outcome.as_ref().unwrap()).unwrap()
+    fn disposition(failure: &Failure) -> serde_json::Value {
+        serde_json::to_value(failure.disposition()).unwrap()
     }
 
     /// An embedded load's policy refusal ran nothing, its fork included: the
-    /// engine checks policy before any publication. An error the engine marks
+    /// engine checks policy before any publication. A refusal the engine marks
     /// as following an earlier publication, as a load's refusal after its
-    /// fork is, follows that publication, whatever its kind.
+    /// fork is, left that publication standing, and an untyped error after it
+    /// may have done more.
     #[test]
     fn an_embedded_compound_write_reports_what_the_engine_did() {
         let refused = Failure::classify(
@@ -488,34 +495,46 @@ mod tests {
         assert_eq!(refused.exit, 1);
         assert_eq!(refused.output.code, Some(ErrorCode::Forbidden));
         assert_eq!(
-            outcome(&refused),
-            serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
+            disposition(&refused),
+            serde_json::json!({"effects":"none","action":"refresh"}),
         );
         let alone = Failure::classify(
             EngineWriteError(OmniError::manifest("not valid graph NDJSON")).into(),
             embedded_write(),
         );
-        assert_eq!(outcome(&alone)["execution"], "not_started");
+        assert_eq!(disposition(&alone)["effects"], "none");
         assert_eq!(alone.exit, 1);
         // A refusal says what to read again; an untyped error must be
         // reconciled against the graph.
-        for (after_fork, action) in [
-            (OmniError::manifest("not valid graph NDJSON"), "reconcile"),
-            (OmniError::key_conflict("node:Person", "Bob"), "refresh"),
-            (OmniError::Policy("change denied".into()), "refresh"),
+        for (after_fork, effects, action) in [
+            (
+                OmniError::manifest("not valid graph NDJSON"),
+                "unknown",
+                "reconcile",
+            ),
+            (
+                OmniError::key_conflict("node:Person", "Bob"),
+                "partial",
+                "refresh",
+            ),
+            (
+                OmniError::Policy("change denied".into()),
+                "partial",
+                "refresh",
+            ),
         ] {
             let message = after_fork.to_string();
             let failure = Failure::classify(
                 EngineWriteError(after_fork.after_earlier_publication()).into(),
                 embedded_write(),
             );
-            assert_eq!(outcome(&failure)["execution"], "unknown", "{message}");
-            assert_eq!(outcome(&failure)["action"], action, "{message}");
+            assert_eq!(disposition(&failure)["effects"], effects, "{message}");
+            assert_eq!(disposition(&failure)["action"], action, "{message}");
             assert_eq!(failure.exit, crate::EXIT_OUTCOME_UNKNOWN, "{message}");
         }
     }
 
-    /// A read changes nothing, so an engine error is never an unknown outcome.
+    /// A read changes nothing, so an engine error never has unknown effects.
     #[test]
     fn an_embedded_read_error_keeps_its_own_code() {
         let failure = Failure::classify(
@@ -527,7 +546,7 @@ mod tests {
             },
         );
         assert_ne!(failure.output.code, Some(ErrorCode::OutcomeUnknown));
-        assert_eq!(outcome(&failure)["execution"], "not_started");
+        assert_eq!(disposition(&failure)["effects"], "none");
         assert_eq!(failure.exit, 1);
     }
 }

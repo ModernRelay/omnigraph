@@ -109,3 +109,70 @@ fn branch_delete_manifest_reads_bounded_per_surviving_branch() {
         })
     });
 }
+
+/// Budget for a start at a past commit: it probes every object of each pin
+/// its source head does not also hold, so its requests grow with the
+/// fragments of those pins. On this fixture each earlier insert adds one
+/// `Person` fragment, one data file, so the slope is one probe request per
+/// added fragment; the manifest, transaction and index objects stay
+/// constant. A probe that opens, lists or reads an object more than once per
+/// fragment re-trips this gate.
+const START_PER_FRAGMENT_BUDGET: u64 = 1;
+
+#[test]
+fn branch_start_at_a_commit_probes_once_per_pinned_object() {
+    use crate::helpers::cost::measure_insert;
+    use omnigraph::db::{ReadTarget, SnapshotId};
+    on_big_stack(|| {
+        cost_harness(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db = local_graph(&dir).await;
+
+            let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+            let mut inserted = 0u64;
+            for n in [4u64, 12] {
+                while inserted < n {
+                    measure_insert(&db, &format!("p_{inserted:02}")).await;
+                    inserted += 1;
+                }
+                let start = db.list_commits(Some("main")).await.unwrap()[0]
+                    .graph_commit_id
+                    .clone();
+                // One more insert, so the start's `Person` pin is not the
+                // head's and its objects are probed.
+                measure_insert(&db, &format!("p_{inserted:02}")).await;
+                inserted += 1;
+                let (res, io) = measure(db.branch_create_from(
+                    ReadTarget::snapshot(SnapshotId::new(start)),
+                    &format!("at_{n:02}"),
+                ))
+                .await;
+                res.unwrap();
+                eprintln!(
+                    "inserts={n}: START data_reads={} manifest_reads={} data_open_count={}",
+                    io.data_reads, io.manifest_reads, io.data_open_count
+                );
+                curve.push((n, io));
+            }
+
+            let added_fragments = curve[1].0 - curve[0].0;
+            let budget = added_fragments * START_PER_FRAGMENT_BUDGET + SLOPE_SLACK;
+            let read_delta = curve[1].1.data_reads.saturating_sub(curve[0].1.data_reads);
+            assert!(
+                read_delta >= added_fragments,
+                "the start must probe each added fragment's data file: {read_delta} reads \
+                 across {added_fragments} added fragments"
+            );
+            assert!(
+                read_delta <= budget,
+                "a start at a past commit grew {read_delta} data reads across \
+                 {added_fragments} added fragments (budget {budget}): the retention probe \
+                 must send one request per pinned object"
+            );
+            assert_eq!(
+                curve[0].1.data_open_count, curve[1].1.data_open_count,
+                "the probe opens each probed pin once, whatever its fragment count"
+            );
+        })
+    });
+}
