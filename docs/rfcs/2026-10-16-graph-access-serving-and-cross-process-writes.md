@@ -366,12 +366,13 @@ object.
   [storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093)
   defines.** It committed; it did not commit, because it was refused before any
   effect, lost its conflict or failed before its manifest request could land;
-  or its publication is pending, because its manifest request got no definite
+  or its outcome is unknown, because its manifest request got no definite
   answer. This RFC owns only how they are reported. A write the server could
-  not settle answers `outcome_unknown`, never a plain `internal`; a later write
-  to a branch whose publication is pending answers `service_unavailable`, a
-  definite refusal that took no effect. Every other error keeps its code, and
-  its disposition follows from what the server knows:
+  not settle answers `outcome_unknown`, never a plain `internal`, and later
+  writes to its branch proceed: its version key fences it, so the branch's
+  next publication either builds on the late commit or takes its version
+  first. Every other error keeps its code, and its disposition follows from
+  what the server knows:
 
   | Error | `effects` | `action` |
   |---|---|---|
@@ -380,15 +381,11 @@ object.
   | Any of those after an earlier publication of the same operation, such as the fork a load makes before its rows, which the engine marks on its error | `partial` | the code's |
   | Any other error after a write | `unknown` | `reconcile` |
   | An attempt the server could not settle (`outcome_unknown`) | `unknown` | `reconcile`, `recover` when recovery is required |
-  | A later write to a branch whose publication is pending (`service_unavailable`) | `none` | `retry` |
-
-  That `service_unavailable` covers one branch: reads and the other branches
-  keep serving.
 
   A later phase adds `disposition.check`, what a later read needs to settle an
-  unknown write: the identity storage outcomes per operation gives a pending
-  publication, its branch and its publication id (a graph commit id, or a
-  control fact's attempt id), with the branch's head before the write. It arrives with the attempt identity of
+  unknown write: its branch and its publication id (a graph commit id, or a
+  control fact's attempt id), with the branch's head before the write. The
+  outcome is final once the branch moves past the attempted version. It arrives with the attempt identity of
   [cross-process writes](#cross-process-writes). Until then a caller settles a
   row publication from the branch it sent and that branch's head, and a
   control fact from the registration, tombstone or drop record it names, since
@@ -747,19 +744,24 @@ the check runs where the precondition already runs, on every attempt.
 writes records it. The attempt id is a control fact's identity, as the graph
 commit id is a row publication's:
 
-- **Read-back.** After a lost acknowledgement, the publisher reads the version it
-  attempted, with three results. The attempt landed when that version holds a
-  fact with its attempt id. It lost when the version is readable and holds
-  anything else, or is absent and the request never reached the store. It stays
-  pending when the version cannot be read. The row read-back compares heads,
-  which cannot tell two control facts apart, since neither moves the head.
+- **Read-back.** After a lost acknowledgement, the publisher settles the
+  attempt as [#1092](https://github.com/ModernRelay/omnigraph/pull/1092) splits
+  a row publication's. A request its request record shows was never sent lost.
+  A version that holds a fact with the attempt id landed. A version that holds
+  another fact lost, unless the store acknowledged this attempt. Anything else,
+  an absent version at checkout or a failed read, stays unknown, and the
+  version key settles it. The row read-back compares heads, which cannot tell
+  two control facts apart, since neither moves the head.
 - **The owner's retry.** A fact with the operation's own attempt id is its own
   landed attempt, never a refusal: the operation goes on to its follow-ups,
   the ref, the deregistration, the archive and unlink, or the tag release.
-- **Pending publications.** A control fact whose request stays ambiguous is
-  pending under its attempt id, as a row publication is under its graph commit
-  id in [storage outcomes per
-  operation](https://github.com/ModernRelay/omnigraph/pull/1093).
+- **Unknown outcomes.** A control fact whose request stays ambiguous is fenced
+  by its version key, as a row publication is in [storage outcomes per
+  operation](https://github.com/ModernRelay/omnigraph/pull/1093): the chain's
+  next publication either loads it or takes its version first. A read of the
+  registration, tombstone or drop record is final only after the chain moves
+  past the attempted version. The attempt id stays on the fact, in the log and
+  in `disposition.check`.
 
 The refusals in the table apply to facts with another attempt id, with two
 convergent exceptions: a delete that finds its branch tombstoned by another
@@ -790,8 +792,9 @@ its candidate's drop record.
    point, which cleanup retains while the registration names it. Listings read
    registrations too: `branch list`, with the details
    [#1012](https://github.com/ModernRelay/omnigraph/pull/1012) adds, lists such
-   a branch as not ready. Its registration fills the name, the parent and the
-   fork commit; `head` and `created_at` stay absent until its ref exists.
+   a branch as not ready. Its registration fills `name`, `from` and
+   `from_commit_id`; `head`, `created_at` and `updated_at` stay absent until its
+   ref exists, so #1012 makes them optional.
 
    Until [schema apply with live branches](https://github.com/ModernRelay/omnigraph/pull/963)
    lands, a registration also refuses, on any attempt, when main's schema
@@ -1052,10 +1055,12 @@ Extend the existing owners in [the testing map](../dev/testing.md):
 - **Server, `boot_settings.rs`:** preserve cluster-only boot, applied-state
   authority and the existing lifecycle while changing HTTP error contracts.
 - **CLI, existing command/config owners:** target and credential behavior
-  follows RFC 0059; `access` answers for root, graph-store, standalone and
-  server targets, refuses catalogue and managed ones, and tells an absent
-  store (`not_found`) from a damaged one (`internal`), as
-  `cli_data::access_reports_what_the_caller_may_do_at_a_target` checks;
+  follows RFC 0059; `access` answers for direct graph, direct root and server targets, a direct
+  graph in a cluster layout reading the ledger at its root, refuses direct
+  catalogue and managed targets, and tells an absent store (`not_found`) from
+  a damaged one (`internal`), as
+  `cli_data::access_reports_what_the_caller_may_do_at_a_target` checks in
+  [#1104](https://github.com/ModernRelay/omnigraph/pull/1104);
   `version --json` reports the protocols implemented. Target listing remains
   configuration-only and contains no live-process registry.
 - **CLI, MCP bridge owner:** relay to an existing server, credential refresh
@@ -1091,8 +1096,9 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   - Each precondition kind refuses on an attempt a fact names and passes one it
     does not.
   - With two control facts on one chain, a lost acknowledgement reads back as
-    landed only for the fact carrying the attempt's own id, and an unreadable
-    attempted version stays pending.
+    landed only for the fact carrying the attempt's own id, a never-sent
+    request reads back as lost, and an unreadable or absent attempted version
+    stays unknown until the chain moves past it.
   - A delete and a drop that find another attempt's fact complete the
     follow-ups and succeed.
   - An operation retried with its attempt id goes on to its follow-ups.
@@ -1491,3 +1497,10 @@ proposal.
   `retained_merge_bases`, a not-ready fork point); a crash loses the attempt id,
   so only delete and drop converge after one; `branch list` fills a not-ready
   branch from its registration.
+- 2026-10-20: Followed storage outcomes per operation's version-key fence: an
+  unknown publication, row or control fact, is recorded nowhere and blocks
+  nothing; the branch's next publication builds on it or takes its version,
+  and a read of the fact is final only after the chain moves past it. The
+  pending-branch `service_unavailable` row is gone. Read-back follows #1092's
+  split, a not-ready branch's absent fields are named, and the access evidence
+  uses RFC 0059's target kinds.
