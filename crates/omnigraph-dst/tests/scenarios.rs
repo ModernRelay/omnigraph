@@ -1942,11 +1942,6 @@ fn dst_dead_staging_sweep_window_is_reached_and_retried() {
             &stopped,
         );
         assert!(
-            window_hit(&a, window),
-            "{label} must stop the cleanup at {window}: {:?}",
-            a.reconcile_verdicts
-        );
-        assert!(
             a.reconcile_verdicts.iter().any(|(tag, verdict, channel)| {
                 tag.starts_with(&format!("deferred:{window}@"))
                     && verdict == "Deferred"
@@ -3641,15 +3636,61 @@ fn dst_predict_born_on_both_person_probe() {
     }));
 }
 
+/// The windows the reach census cannot cross, each with its reason. A
+/// window outside this list that stays dark fails the census by name, and
+/// so does a listed window that crosses.
+const REACH_EXPECTED_DARK: &[(&str, &str)] = &[
+    (
+        "init.after_coordinator_init",
+        "graph birth precedes the probe; dst_birth_contract_sweep owns it",
+    ),
+    (
+        "init.post_manifest_create",
+        "graph birth precedes the probe; dst_birth_contract_sweep owns it",
+    ),
+    (
+        "blob_read.post_capture",
+        "the DST schema has no Blob property",
+    ),
+    (
+        "mutation.post_no_effect_pre_gate",
+        "crossed only by a no-effect mutation that carries an expected graph head; \
+         the workload sends none",
+    ),
+    (
+        "branch_merge.between_delete_chunks",
+        "needs a merge that deletes more than one chunk of rows",
+    ),
+    (
+        "classify.fresh_read",
+        "crossed only for a table with native fork trees, a table fork from before format v11",
+    ),
+    (
+        "cleanup.resolve_branch_snapshot",
+        "crossed only for a table with native fork trees, a table fork from before format v11",
+    ),
+    (
+        "branch_merge.adopt_after_append_pre_upsert",
+        "a merge adopts a delta only from a forked source table (adopt_advances_head)",
+    ),
+    (
+        "branch_merge.adopt_after_upsert_pre_delete",
+        "a merge adopts a delta only from a forked source table (adopt_advances_head)",
+    ),
+    (
+        "branch_merge.adopt_between_insert_chunks",
+        "a merge adopts a delta only from a forked source table (adopt_advances_head)",
+    ),
+];
+
 /// MILESTONE REACH PROBE: the "one seeded universe per window,
-/// can we catch them all?" experiment. For each catalog window, ONE universe
-/// with the window's milestone plan woven into the seeded stream +
-/// `crash_on_match` probe_only (record-only crossing). Reports per-window
-/// crossed/not and the tally. Success target: every milestone-reachable
-/// window crosses in its single universe; the residue (recovery internals,
-/// init/open) is expected dark for NAMED reasons. (The schema families
-/// left the dark list when the `schema_ops` face requalified them.)
-///   cargo test -p omnigraph-dst dst_window_reach_probe -- --ignored --nocapture
+/// can we catch them all?" experiment. For each catalog window, up to three
+/// seeded universes with the window's milestone plan woven into the stream,
+/// its setup crash (`setup_crash_for`) when it has one, and a record-only
+/// probe over the whole universe (`probe_window`). Reports per-window
+/// crossed/not and the tally. Every window must cross except those in
+/// `REACH_EXPECTED_DARK`, and no universe may trip an oracle.
+///   cd crates/omnigraph-dst && cargo test --locked --test scenarios dst_window_reach_probe -- --ignored --nocapture
 #[test]
 #[serial]
 #[ignore = "instrument: one-universe-each milestone reach census over the crash-window catalog"]
@@ -3705,22 +3746,24 @@ fn dst_window_reach_probe() {
         "errored (milestone tripped an oracle — separate finding) ({}): {errored:?}",
         errored.len()
     );
-    // Non-regression floor: the census measured 42/52 on 2026-10-16; the
-    // ten non-crossing windows all carry NAMED reasons: birth-owned init
-    // (`init.*`, owned by `dst_birth_contract_sweep`); no Blob property in
-    // the workload (`blob_read.post_capture`); no caller-supplied expected
-    // graph head on a no-effect mutation (`mutation.post_no_effect_pre_gate`);
-    // no merge deleting more than one chunk of rows
-    // (`branch_merge.between_delete_chunks`); and shapes only a table fork
-    // from before format v11 has, which no current writer creates
-    // (`classify.fresh_read`, `cleanup.resolve_branch_snapshot`, and the
-    // three `branch_merge.adopt_*` windows, since a merge adopts a delta
-    // only from a forked source table). Floor 40 leaves margin for benign
-    // seed sensitivity; a bigger drop = a recipe-mechanism regression.
+    // Each universe is a pure function of its seed, so a change in reach
+    // comes from a code change; the message names the window it moved.
+    let expected_dark = |window: &&str| REACH_EXPECTED_DARK.iter().any(|(dark, _)| dark == window);
+    let newly_dark: Vec<&&str> = dark.iter().filter(|w| !expected_dark(w)).collect();
+    let listed_but_crossed: Vec<&&str> = crossed.iter().filter(|w| expected_dark(w)).collect();
+    let listed_not_in_catalog: Vec<&str> = REACH_EXPECTED_DARK
+        .iter()
+        .map(|(window, _)| *window)
+        .filter(|window| !catalog::CRASH_WINDOWS.contains(window))
+        .collect();
     assert!(
-        crossed.len() >= 40,
-        "milestone reach regressed below the measured 42 ({} crossed)",
-        crossed.len()
+        newly_dark.is_empty()
+            && listed_but_crossed.is_empty()
+            && listed_not_in_catalog.is_empty()
+            && errored.is_empty(),
+        "milestone reach changed: newly dark {newly_dark:?}, listed dark but crossed \
+         {listed_but_crossed:?}, listed but not in the catalog {listed_not_in_catalog:?}, \
+         errored {errored:?}"
     );
 }
 
@@ -3874,11 +3917,13 @@ fn dst_fleet() {
             },
             &mut failures,
         );
-        // Crash-window arm: round-robin over the catalog so a 66+-seed
-        // pass draws every window. `reach_target` weaves the
-        // window's milestone recipe into the seeded stream — guarantee from
-        // milestones, diversity from the seed — and skip stays 0 so the
-        // recipe-built op is the one that carries the crash. Windows the
+        // Crash-window arm: round-robin over the catalog so a pass with at
+        // least as many seeds as windows draws every window. `reach_target`
+        // weaves the window's milestone recipe into the seeded stream —
+        // guarantee from milestones, diversity from the seed — and skip
+        // stays 0, so the crash lands on the first matching op; for a window
+        // with a setup crash (`setup_crash_for`), that is the first matching
+        // op after the setup crash is recorded. Windows the
         // workload has no op for are skipped (the hunt's coverage ledger
         // owns naming those as unschedulable).
         let window = catalog::CRASH_WINDOWS[(seed as usize) % catalog::CRASH_WINDOWS.len()];

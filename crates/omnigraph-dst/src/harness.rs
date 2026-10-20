@@ -859,6 +859,11 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "load" if window == "load.post_branch_create_pre_stage" => vec![ForkLoad],
         "load" => vec![DataOnBranch], // LoadMerge/Append on main
         "mutation" | "graph_publish" | "publish" | "classify" => vec![MutateMain],
+        // Index maintenance builds only missing indexes, and so does a
+        // sampled Optimize: one that runs before the first EnsureIndices
+        // leaves `ensure_indices.post_table_effect` nothing to build. The
+        // census seeds cross it because none of them samples an Optimize
+        // first.
         "ensure_indices" => vec![MutateMain, EnsureIndicesMain],
         "cleanup" => vec![MutateMain, CleanupMain],
         "optimize" => vec![MutateMain],
