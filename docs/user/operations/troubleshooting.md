@@ -101,9 +101,12 @@ could not settle answers `500`.
 The CLI reports the server's disposition when that request was the command's
 only effectful one, and otherwise its own account of the whole command, so a
 lost response is `unknown` with `reconcile`. A read command changes nothing, so
-its failure always has `effects: none`. JSON mode writes the failure to stdout;
-human mode prints the `disposition` line on stderr. HTTP failures also retain
-`http_status` and, when present, the original `retry_after` string.
+its failure always has `effects: none`. JSON mode writes the failure to stdout,
+or to stderr when part of the result, such as a streamed page, already reached
+stdout, so stdout holds one document. Human mode prints the `disposition` line
+on stderr. A target refusal on these commands exits 1 with `action: fix`. HTTP
+failures also retain `http_status` and, when present, the original
+`retry_after` string.
 
 This includes `commit publish` and `commit drop`, as well as their `mutate`
 statement forms. If a response or result output is lost, inspect the commit's
