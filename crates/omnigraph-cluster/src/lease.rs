@@ -1,28 +1,38 @@
 //! The cluster lock's lease: heartbeats, self-fencing and takeover.
 //!
-//! A held version-3 lock (`state_lock`) carries `lease_seconds`. Its owner
-//! renews it by creating `__cluster/lease/<lock_id>/beat-<seq>.json`, put-if-
-//! absent, every third of a lease. A successor that finds the lock held
-//! watches those beats: a new beat means the owner is alive, and the
-//! successor refuses. When no beat appears for a lease and a half of the
-//! successor's own monotonic time, the successor claims the lock once by
-//! creating `__cluster/lease/<lock_id>/superseded.json` put-if-absent, then
-//! replaces `lock.json` with its own record.
+//! A held version-3 lock (`state_lock`) carries `lease_seconds`; only S3
+//! locks are leased. Its owner renews it by creating
+//! `__cluster/lease/<lock_id>/beat-<seq>.json`, put-if-absent, every third
+//! of a lease. A successor that finds the lock held watches those beats: a
+//! new beat means the owner is alive, and the successor refuses. When no
+//! beat appears for a lease and a half of the successor's own monotonic
+//! time, the successor claims the lock once by creating
+//! `__cluster/lease/<lock_id>/superseded.json` put-if-absent, then replaces
+//! `lock.json` with its own record by if-match on the version it first read.
 //!
-//! The owner fences itself first. It measures from the send time of its last
-//! acknowledged beat, and when two beats in a row go unacknowledged, or a
-//! claim names its lock, it stops: the holder closes admission and storage
-//! mutation and exits, and never resumes, because a successor may already
-//! act. The gap between the owner's two-thirds of a lease and the
-//! successor's one and a half leases covers clock-rate drift and scheduling
-//! delay; the protocol needs no synchronized clocks.
+//! The owner fences itself first. It measures from the time it first sent
+//! its last acknowledged beat, and when two thirds of a lease pass without a
+//! newer one, or a claim names its lock, it stops: the holder closes
+//! admission and storage mutation and exits, and never resumes, because a
+//! successor may already act. The gap between the owner's two thirds of a
+//! lease and the successor's lease and a half covers clock-rate drift and
+//! scheduling delay; the protocol needs no synchronized clocks.
 //!
-//! Only operations every supported backend provides are used: create-if-
-//! absent, list, read, and delete of this owner's own fresh keys. Local
-//! roots have no conditional update, so `lock.json` is replaced there by an
-//! overwrite after the claim has serialized successors; a local write ends
-//! with its process, so a dead owner sends nothing late. On S3 the
-//! replacement is if-match on the version the successor first read.
+//! Heartbeats, the watch and the claim go through the root outside the
+//! owner's storage scope, on a client with the backend's own retries. A beat
+//! is a key only its owner creates, under a lock id no other process uses, so
+//! a request that lands late only keeps a successor waiting. A beat that is
+//! already present when its owner sends it is that owner's own earlier
+//! request, which landed after the beat's first send: the owner counts it as
+//! acknowledged from that first send. A beat that gets no answer is sent
+//! again soon, under the same key, until the owner's deadline.
+//!
+//! Only operations S3 provides are used: create-if-absent, list, read,
+//! delete of this owner's own keys, and the if-match replacement of
+//! `lock.json`. Local roots have no conditional update, so a successor could
+//! not replace a record without racing its owner's release; their locks
+//! carry no lease, and a dead owner's lock waits for an operator's exact-ID
+//! unlock as before.
 //!
 //! The lease coordinates liveness. It is not a fence for the requests a dead
 //! owner sent before it fenced: those are fresh keys, which stay unreachable,
@@ -69,10 +79,16 @@ fn beat_interval(seconds: u32) -> Duration {
     lease(seconds) / 3
 }
 
-/// The owner fences when this long has passed since the send time of its
-/// last acknowledged beat: two missed beats.
+/// The owner fences when this long has passed since the first send of its
+/// last acknowledged beat: two beat intervals.
 fn owner_deadline(seconds: u32) -> Duration {
     lease(seconds) * 2 / 3
+}
+
+/// How soon a beat that got no answer is sent again: a quarter of a beat
+/// interval, so several attempts fit before the owner's deadline.
+fn reissue_pause(seconds: u32) -> Duration {
+    beat_interval(seconds) / 4
 }
 
 /// A successor takes over after this much beat silence: a lease and a half.
@@ -170,7 +186,9 @@ impl LeaseKeeper {
             adapter,
             dir: dir.clone(),
             seq: 0,
+            first_sent: None,
             acknowledged: Instant::now(),
+            answered: true,
         };
         beat.once().await;
         let task = tokio::spawn({
@@ -180,8 +198,13 @@ impl LeaseKeeper {
                     // The deadline is a timer of its own: a beat request that
                     // hangs must not postpone the owner's fence.
                     let deadline = beat.acknowledged + owner_deadline(seconds);
+                    let pause = if beat.answered {
+                        beat_interval(seconds)
+                    } else {
+                        reissue_pause(seconds)
+                    };
                     let next = async {
-                        tokio::time::sleep(beat_interval(seconds)).await;
+                        tokio::time::sleep(pause).await;
                         beat.once().await
                     };
                     tokio::select! {
@@ -239,12 +262,18 @@ struct Beat {
     adapter: Arc<dyn StorageAdapter>,
     dir: String,
     seq: u64,
-    /// The send time of the last acknowledged beat.
+    /// When the first request for beat `seq` was sent.
+    first_sent: Option<Instant>,
+    /// The first send time of the last acknowledged beat.
     acknowledged: Instant,
+    /// Whether the last request got an answer; one that did not is sent
+    /// again sooner.
+    answered: bool,
 }
 
 impl Beat {
-    /// Check for a claim, send the next beat, and report a fence.
+    /// Check for a claim, send beat `seq` (again, if an earlier request for
+    /// it got no answer), and report a fence.
     async fn once(&mut self) -> Option<LeaseFenced> {
         if let Ok(Some(_)) = self
             .adapter
@@ -253,25 +282,27 @@ impl Beat {
         {
             return Some(LeaseFenced::Superseded);
         }
-        let sent = Instant::now();
+        let sent = *self.first_sent.get_or_insert_with(Instant::now);
         let payload = format!("{{\"seq\":{}}}", self.seq);
         match self
             .adapter
             .write_text_if_absent(&beat_uri(&self.dir, self.seq), &payload)
             .await
         {
-            Ok(true) => {
+            // `false`: the beat is already present, which only this owner's
+            // own earlier request for it can have done, no earlier than its
+            // first send. Either way it is visible now and was sent no
+            // earlier than `sent`.
+            Ok(_) => {
                 self.acknowledged = sent;
+                self.answered = true;
                 if let Some(stale) = self.seq.checked_sub(2) {
                     let _ = self.adapter.delete(&beat_uri(&self.dir, stale)).await;
                 }
                 self.seq += 1;
+                self.first_sent = None;
             }
-            // The beat is this owner's own earlier request, which landed at
-            // a time this owner does not know: it moves on without
-            // refreshing its acknowledged time.
-            Ok(false) => self.seq += 1,
-            Err(_) => {}
+            Err(_) => self.answered = false,
         }
         None
     }
@@ -319,15 +350,23 @@ pub async fn watch_and_claim(
             since = Instant::now();
         }
     }
-    let payload = format!(
-        "{{\"successor_lock_id\":\"{successor_lock_id}\",\"newest_beat\":{}}}",
-        newest.map_or_else(|| "null".to_string(), |seq| seq.to_string())
-    );
-    Ok(if adapter.write_text_if_absent(&claim, &payload).await? {
-        Watch::Claimed
-    } else {
-        Watch::Alive
+    let payload = serde_json::json!({
+        "successor_lock_id": successor_lock_id,
+        "newest_beat": newest,
     })
+    .to_string();
+    if adapter.write_text_if_absent(&claim, &payload).await? {
+        return Ok(Watch::Claimed);
+    }
+    // A claim is already present. A retry finds this successor's own claim
+    // when an earlier attempt landed unacknowledged; any other is another
+    // successor's.
+    let own = adapter
+        .read_text_if_exists(&claim)
+        .await?
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|claim| claim["successor_lock_id"] == successor_lock_id);
+    Ok(if own { Watch::Claimed } else { Watch::Alive })
 }
 
 #[cfg(test)]
@@ -337,17 +376,21 @@ mod tests {
     use omnigraph_storage::{
         ListDirBounds, ObjectStorageAdapter, StorageError, StorageFailure, StorageFailureKind,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const ROOT: &str = "cluster";
     const SECONDS: u32 = 30;
 
     /// An in-memory store that can stop acknowledging beats, the way a
-    /// partitioned owner's requests stop coming back.
+    /// partitioned owner's requests stop coming back; lose the answer to
+    /// beats it applied; and answer a claim it applied as already present,
+    /// the way a retried create whose first attempt landed is answered.
     #[derive(Debug)]
     struct Beats {
         inner: Arc<dyn StorageAdapter>,
         refuse: AtomicBool,
+        lost_answers: AtomicUsize,
+        claim_retried: AtomicBool,
     }
 
     impl Beats {
@@ -355,6 +398,8 @@ mod tests {
             Arc::new(Self {
                 inner: Arc::new(ObjectStorageAdapter::in_memory()),
                 refuse: AtomicBool::new(false),
+                lost_answers: AtomicUsize::new(0),
+                claim_retried: AtomicBool::new(false),
             })
         }
     }
@@ -397,13 +442,29 @@ mod tests {
             uri: &str,
             contents: &str,
         ) -> omnigraph_storage::Result<bool> {
-            if uri.contains("/beat-") && self.refuse.load(Ordering::SeqCst) {
-                return Err(StorageError::Backend(StorageFailure::new(
+            let unanswered = || {
+                StorageError::Backend(StorageFailure::new(
                     StorageFailureKind::Transient,
                     "beat request unanswered",
-                )));
+                ))
+            };
+            if uri.contains("/beat-") && self.refuse.load(Ordering::SeqCst) {
+                return Err(unanswered());
             }
-            self.inner.write_text_if_absent(uri, contents).await
+            let created = self.inner.write_text_if_absent(uri, contents).await?;
+            if created
+                && uri.contains("/beat-")
+                && self
+                    .lost_answers
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err(unanswered());
+            }
+            if uri.ends_with("/superseded.json") && self.claim_retried.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            Ok(created)
         }
         async fn exists(&self, uri: &str) -> omnigraph_storage::Result<bool> {
             self.inner.exists(uri).await
@@ -517,6 +578,51 @@ mod tests {
         );
         assert!(started.elapsed() <= owner_deadline(SECONDS) + beat_interval(SECONDS));
         assert!(started.elapsed() < successor_silence(SECONDS));
+    }
+
+    /// A beat the store applied but whose answer was lost is the owner's own:
+    /// the owner sends it again soon, finds it present, and counts it from
+    /// its first send. Lost answers never fence a live owner, and a
+    /// successor keeps seeing its beats.
+    #[tokio::test(start_paused = true)]
+    async fn a_beat_whose_answer_was_lost_still_renews_the_lease_issue_1067() {
+        let store = Beats::new();
+        let keeper = LeaseKeeper::start(store.clone(), ROOT, "owner", SECONDS).await;
+        store.lost_answers.store(6, Ordering::SeqCst);
+        assert_eq!(
+            fenced_within(&keeper, lease(SECONDS) * 4).await,
+            None,
+            "an applied beat renews the lease even when its answer is lost"
+        );
+        assert_eq!(store.lost_answers.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "successor")
+                .await
+                .unwrap(),
+            Watch::Alive
+        );
+    }
+
+    /// A successor whose claim landed while its answer was lost finds the
+    /// claim on its retry and recognizes it as its own; another successor's
+    /// claim is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_successor_recognizes_its_own_claim_issue_1067() {
+        let store = Beats::new();
+        drop(LeaseKeeper::start(store.clone(), ROOT, "owner", SECONDS).await);
+        store.claim_retried.store(true, Ordering::SeqCst);
+        assert_eq!(
+            watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "first")
+                .await
+                .unwrap(),
+            Watch::Claimed
+        );
+        assert_eq!(
+            watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "second")
+                .await
+                .unwrap(),
+            Watch::Alive
+        );
     }
 
     /// A claim on its lock fences the owner at its next beat.

@@ -292,24 +292,35 @@ unqualified and its prior retained-lock shutdown behavior is unchanged. Older
 tools refuse the new released record. This supplies neither
 distributed fencing nor generic runtime reuse.
 
-On local and S3 roots a held lock is version 3 and carries `lease_seconds`
+On S3 roots a held lock is version 3 and carries `lease_seconds`
 (`lease.rs`, `state_lock.rs`). Its owner creates
 `__cluster/lease/<lock_id>/beat-<seq>.json` put-if-absent every third of a
 lease, first before it admits work, and checks for
-`__cluster/lease/<lock_id>/superseded.json` before each beat. A timer of its
-own fences the owner two thirds of a lease after the send time of its last
-acknowledged beat, or at once on a claim: the server closes admission and
-exits 2 without releasing. A serving acquisition that finds a version-3 lock
-watches the beat listing on its own monotonic clock; a new beat refuses it,
-and a lease and a half of silence lets it create the claim, once, then replace
-`lock.json`: by if-match on S3, by overwrite on a local root, where the claim
-has serialized successors and a dead process sends nothing late. A clean
-release stops beating, deletes the lease directory, then releases as above.
-The lease coordinates liveness only; requests a dead owner sent before it
-fenced are fresh keys, conditional publications or audited mutable keys,
-which the storage-outcomes RFC (2026-10-19) argues cannot corrupt state.
-Version-1 locks from older binaries and Azure locks carry no lease and keep
-exact-ID unlock.
+`__cluster/lease/<lock_id>/superseded.json` before each beat. The lease's
+requests go through the root outside the owner's storage scope, on a client
+with the backend's retries (`ClusterStore::lease_adapter`): a failed beat
+neither unsettles the scope nor stops when the scope closes for a release.
+A beat already present is the owner's own earlier request and counts from
+the first send of that beat; an unanswered beat is sent again after a
+quarter of a beat interval. A timer of its own fences the owner two thirds
+of a lease after the first send of its last acknowledged beat, or at once on
+a claim: the server closes admission and exits 2 without releasing. A
+serving acquisition that finds a version-3 lock watches the beat listing on
+its own monotonic clock. A new beat refuses it. An empty listing starts the
+silence and the first beat that appears restarts it, because the owner
+writes its lock before its first beat lands. A lease and a half of silence
+lets it create the claim, once (a claim already present is its own only when
+it names this successor's lock id), then replace `lock.json` by if-match on
+the version it first read. The owner's clean release is if-match on the
+version it read, so of the two exactly one applies. A clean release stops
+beating, deletes the lease directory, then releases as above. The lease
+coordinates liveness only; requests a dead owner sent before it fenced are
+fresh keys, conditional publications or audited mutable keys, which the
+storage-outcomes RFC (2026-10-19) argues cannot corrupt state. Local roots
+have no conditional update, so a successor could not replace `lock.json`
+without racing an exact-owner delete the old owner already sent; local
+locks, Azure locks and version-1 locks from older binaries carry no lease and
+keep exact-ID unlock.
 
 Do not bypass the cluster API with direct filesystem writes, edit `state.json`, or derive a second mutable inventory. Content digests and live observations are recomputed from the declared and durable authorities.
 

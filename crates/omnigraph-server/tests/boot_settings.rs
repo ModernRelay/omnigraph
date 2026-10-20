@@ -43,7 +43,7 @@ async fn cluster_management_policy_can_boot_beside_legacy_catalog_rules() {
 }
 
 #[tokio::test]
-async fn v2_settings_capture_holds_admission_across_drop_until_its_lease_lapses() {
+async fn v2_settings_capture_holds_admission_across_drop_and_refuses_another_server() {
     let temp = converged_cluster_dir("").await;
     let root = format!("file://{}", temp.path().display());
     omnigraph_cluster::upgrade_deployment_ledger(
@@ -75,25 +75,15 @@ async fn v2_settings_capture_holds_admission_across_drop_until_its_lease_lapses(
         fs::read(temp.path().join("__cluster/state.json")).unwrap(),
         state_before
     );
-    // The dropped admission keeps its lock record, but its lease stops
-    // renewing: another server takes it over only once the heartbeats have
-    // been silent for a lease and a half (30 s by default; the last beat
-    // went at most a third of a lease before the drop).
     let graph = temp.path().join("graphs/knowledge.omni");
-    let started = std::time::Instant::now();
-    let successor = AppState::open_with_bearer_tokens(graph.to_string_lossy(), Vec::new())
-        .await
-        .unwrap();
+    let blocked = AppState::open_with_bearer_tokens(graph.to_string_lossy(), Vec::new()).await;
     assert!(
-        started.elapsed() >= std::time::Duration::from_secs(35),
-        "took over after {:?}",
-        started.elapsed()
+        blocked
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("state_lock_held")
     );
-    let lock: Value =
-        serde_json::from_slice(&fs::read(temp.path().join("__cluster/lock.json")).unwrap())
-            .unwrap();
-    assert_ne!(lock["lock_id"], lock_id, "the successor holds the lock");
-    drop(successor);
 }
 
 #[tokio::test]
@@ -1464,9 +1454,6 @@ mod owned_shutdown {
                 .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE")
                 .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET")
                 .env("OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX", "1")
-                // A short cluster lease, so a restart after a crash takes the
-                // lock over within the journey's own deadlines.
-                .env("OMNIGRAPH_CLUSTER_LEASE_SECONDS", "2")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()
@@ -2181,42 +2168,12 @@ mod owned_shutdown {
                 output_thread.join().unwrap();
                 assert!(!root.join("__cluster/lock.json").exists());
             } else {
-                let retained_lock = retained_lock.unwrap();
                 assert_eq!(
                     fs::read(root.join("__cluster/lock.json")).unwrap(),
-                    retained_lock,
-                    "an owner that did not settle keeps its lock"
+                    retained_lock.unwrap()
                 );
-                // Its heartbeats stopped with it. A restarted server takes the
-                // lock over after a lease and a half of silence, with no
-                // unlock, and serves the same graphs.
-                let restarted = Instant::now();
-                let (mut successor, address, output_thread) = spawn_owned_child(root, "v2-finish");
-                wait_ready(&address, &mut successor.0, "serving").await;
-                assert!(
-                    restarted.elapsed() >= Duration::from_secs(3),
-                    "takeover waits out a lease and a half"
-                );
-                let successor_lock = fs::read(root.join("__cluster/lock.json")).unwrap();
-                assert_ne!(
-                    successor_lock, retained_lock,
-                    "the successor holds a new lock"
-                );
-                assert_eq!(
-                    unsafe { libc::kill(successor.0.id() as libc::pid_t, libc::SIGTERM) },
-                    0
-                );
-                let deadline = Instant::now() + Duration::from_secs(15);
-                let status = loop {
-                    if let Some(status) = successor.0.try_wait().unwrap() {
-                        break status;
-                    }
-                    assert!(Instant::now() < deadline, "successor shutdown timed out");
-                    std::thread::sleep(Duration::from_millis(10));
-                };
-                assert_eq!(status.code(), Some(0));
-                output_thread.join().unwrap();
-                assert!(!root.join("__cluster/lock.json").exists());
+                let refusal = cluster_settings(root).await.unwrap_err();
+                assert!(refusal.to_string().contains("state_lock_held"), "{refusal}");
             }
             return;
         }

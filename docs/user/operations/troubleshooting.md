@@ -158,10 +158,10 @@ between graph roots.
 - Apply refuses existing unmanaged roots and missing managed graphs that remain
   declared. Restore authoritative data to keep a missing graph, or remove its
   declaration to delete it; see [deployment boundaries](../clusters/index.md#deployment-boundaries).
-- A server restarted after a crash takes over its predecessor's leased lock
+- A server restarted after a crash takes over its predecessor's leased S3 lock
   once the predecessor's heartbeats have been silent for a lease and a half
-  (45 seconds by default). A lock with no lease (an older binary's, an Azure
-  root's) requires prior-owner and accepted-I/O quiescence, exclusion of other
+  (45 seconds by default). A lock with no lease (on a local or Azure root, or
+  an older binary's) requires prior-owner and accepted-I/O quiescence, exclusion of other
   admissions/unlocks, and its exact ID; follow
   [ownership transfer](../deployment.md#writer-topology).
 - Directory boot reads `cluster.yaml` to resolve storage, but served graph,

@@ -66,12 +66,13 @@ impl StateLockFile {
         }
     }
 
-    /// A held lock of `kind`: leased on local and S3 roots, whose successors
-    /// can take over a silent owner; unleased on Azure, whose admission
-    /// wrapper owns that decision.
+    /// A held lock of `kind`: leased on S3, whose if-match lets a successor
+    /// replace a silent owner's record without racing that owner's release;
+    /// unleased on local roots, which have no conditional update, and on
+    /// Azure, whose admission wrapper owns that decision.
     fn held(operation: &str, kind: StorageKind, lease_seconds: u32) -> Self {
         let mut lock = Self::new(operation);
-        if kind != StorageKind::Azure {
+        if kind == StorageKind::S3 {
             lock.version = LEASED_LOCK_VERSION;
             lock.lease_seconds = Some(lease_seconds);
         }
@@ -163,14 +164,15 @@ impl StateLockGuard {
         self.release_on_drop = false;
     }
 
-    /// Start renewing a leased lock. A guard of an unleased lock keeps none.
-    async fn start_lease(mut self) -> Self {
+    /// Start renewing a leased lock through `lease_adapter` (`lease`). A
+    /// guard of an unleased lock keeps none.
+    async fn start_lease(mut self, lease_adapter: Arc<dyn StorageAdapter>) -> Self {
         if let Some(seconds) = self.lock.lease_seconds() {
             match cluster_root_from_lock_uri(&self.uri) {
                 Ok(root) => {
                     self.lease = Some(Box::new(
                         crate::lease::LeaseKeeper::start(
-                            Arc::clone(&self.adapter),
+                            lease_adapter,
                             &root,
                             self.lock.lock_id(),
                             seconds,
@@ -261,14 +263,20 @@ async fn release_remote_lock_if_owned(adapter: &Arc<dyn StorageAdapter>, uri: &s
 /// operation refuses a held lock at once, as an operator would.
 const SERVE_OPERATION: &str = "serve";
 
+/// Acquire the lock at `lock_uri` through `adapter`. A leased lock's
+/// heartbeats, and a successor's watch and claim, go through
+/// `lease_adapter`: the same root outside the owner's storage scope, with
+/// the backend's own retries (`lease`).
 pub(crate) async fn acquire_state_lock(
     adapter: Arc<dyn StorageAdapter>,
+    lease_adapter: Arc<dyn StorageAdapter>,
     kind: StorageKind,
     lock_uri: &str,
     operation: &str,
 ) -> Result<StateLockAcquire, StateLockError> {
     acquire_state_lock_leased(
         adapter,
+        lease_adapter,
         kind,
         lock_uri,
         operation,
@@ -279,6 +287,7 @@ pub(crate) async fn acquire_state_lock(
 
 async fn acquire_state_lock_leased(
     adapter: Arc<dyn StorageAdapter>,
+    lease_adapter: Arc<dyn StorageAdapter>,
     kind: StorageKind,
     lock_uri: &str,
     operation: &str,
@@ -312,10 +321,18 @@ async fn acquire_state_lock_leased(
                     .is_some()
         } else if let Some(seconds) = previous
             .lease_seconds()
-            .filter(|_| operation == SERVE_OPERATION)
+            .filter(|_| operation == SERVE_OPERATION && kind == StorageKind::S3)
         {
             take_over(
-                &adapter, kind, lock_uri, &root, &previous, &version, seconds, &lock, &payload,
+                &adapter,
+                lease_adapter.as_ref(),
+                lock_uri,
+                &root,
+                &previous,
+                &version,
+                seconds,
+                &lock,
+                &payload,
             )
             .await?
         } else {
@@ -331,20 +348,22 @@ async fn acquire_state_lock_leased(
             release_on_drop: kind != StorageKind::S3,
             lease: None,
         };
-        return Ok(StateLockAcquire::Acquired(guard.start_lease().await));
+        return Ok(StateLockAcquire::Acquired(
+            guard.start_lease(lease_adapter).await,
+        ));
     }
     Ok(StateLockAcquire::Held)
 }
 
-/// Take over a leased lock whose owner has gone silent (`lease`): watch its
-/// heartbeats, claim it once, then replace `lock.json` with `lock`. On S3
-/// the replacement is if-match on the version first read, so a clean release
-/// in between wins; on a local root the claim has serialized successors and
-/// a local write ends with its process, so an overwrite is safe.
+/// Take over an S3 leased lock whose owner has gone silent (`lease`): watch
+/// its heartbeats, claim it once, then replace `lock.json` with `lock` by
+/// if-match on the version first read. The old owner's clean release is
+/// if-match on the version it read too, so of a release and a replacement
+/// in flight together exactly one applies, and the loser refuses.
 #[allow(clippy::too_many_arguments)]
 async fn take_over(
     adapter: &Arc<dyn StorageAdapter>,
-    kind: StorageKind,
+    lease_adapter: &dyn StorageAdapter,
     lock_uri: &str,
     root: &str,
     previous: &StateLockFile,
@@ -359,7 +378,7 @@ async fn take_over(
         "cluster lock is held by a leased owner; watching its heartbeats before taking it over"
     );
     let watched = crate::lease::watch_and_claim(
-        adapter.as_ref(),
+        lease_adapter,
         root,
         previous.lock_id(),
         seconds,
@@ -369,24 +388,17 @@ async fn take_over(
     if watched == crate::lease::Watch::Alive {
         return Ok(false);
     }
-    let replaced = match kind {
-        StorageKind::S3 => adapter
-            .write_text_if_match(lock_uri, payload, version)
-            .await?
-            .is_some(),
-        StorageKind::Local => {
-            adapter.write_text(lock_uri, payload).await?;
-            true
-        }
-        StorageKind::Azure => false,
-    };
+    let replaced = adapter
+        .write_text_if_match(lock_uri, payload, version)
+        .await?
+        .is_some();
     if replaced {
         tracing::warn!(
             previous = previous.lock_id(),
             successor = lock.lock_id(),
             "took over a silent owner's cluster lock"
         );
-        let _ = adapter
+        let _ = lease_adapter
             .delete_prefix(&crate::lease::lease_dir(root, previous.lock_id()))
             .await;
     }
@@ -516,6 +528,7 @@ pub(crate) async fn verify_bootstrap_lock(
 
 pub(crate) async fn claim_bootstrap_lock(
     adapter: Arc<dyn StorageAdapter>,
+    lease_adapter: Arc<dyn StorageAdapter>,
     kind: StorageKind,
     uri: &str,
     lock_id: &str,
@@ -547,7 +560,7 @@ pub(crate) async fn claim_bootstrap_lock(
         release_on_drop: false,
         lease: None,
     }
-    .start_lease()
+    .start_lease(lease_adapter)
     .await)
 }
 
@@ -628,27 +641,29 @@ mod tests {
     /// A serving owner that dies keeps its lock, and its heartbeats stop. A
     /// restarted server refuses while a live owner beats, then takes over a
     /// silent owner's lock after a lease and a half, with no unlock; an
-    /// operation other than serving refuses a held lock at once.
+    /// operation other than serving refuses a held lock at once. The store
+    /// is in memory with S3's conditional semantics, the one backend whose
+    /// locks are leased.
     #[tokio::test]
     async fn a_restarted_server_takes_over_a_silent_owners_lock_issue_1067() {
         const LEASE: u32 = 2;
-        let dir = tempfile::tempdir().unwrap();
-        let root = format!("file://{}", dir.path().display());
-        let storage = storage_handle_for_uri(&root).unwrap();
-        let lock_uri = format!("{root}/__cluster/lock.json");
+        let store: Arc<dyn StorageAdapter> =
+            Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
+        let lock_uri = "/lease-tests/__cluster/lock.json";
+        let root = cluster_root_from_lock_uri(lock_uri).unwrap();
         let acquire = |operation: &'static str| {
             acquire_state_lock_leased(
-                storage.adapter(),
-                storage.kind(),
-                &lock_uri,
+                store.clone(),
+                store.clone(),
+                StorageKind::S3,
+                lock_uri,
                 operation,
                 LEASE,
             )
         };
-        let StateLockAcquire::Acquired(mut owner) = acquire("serve").await.unwrap() else {
+        let StateLockAcquire::Acquired(owner) = acquire("serve").await.unwrap() else {
             panic!("a fresh root is free");
         };
-        owner.hold_on_drop();
         assert_eq!(owner.lock.lease_seconds(), Some(LEASE));
         let started = tokio::time::Instant::now();
         assert!(matches!(
@@ -675,16 +690,74 @@ mod tests {
             started.elapsed() >= std::time::Duration::from_secs(u64::from(LEASE)) * 3 / 2,
             "takeover waits out a lease and a half of silence"
         );
-        let stored =
-            StateLockFile::parse(&storage.adapter().read_text(&lock_uri).await.unwrap()).unwrap();
+        let stored = StateLockFile::parse(&store.read_text(lock_uri).await.unwrap()).unwrap();
         assert_eq!(stored.lock_id(), successor.lock_id());
         assert_ne!(stored.lock_id(), previous);
         assert!(
-            !dir.path()
-                .join(format!("__cluster/lease/{previous}"))
-                .exists(),
+            store
+                .list_dir(&crate::lease::lease_dir(&root, &previous))
+                .await
+                .unwrap()
+                .is_empty(),
             "the superseded owner's beats are removed"
         );
+    }
+
+    /// The old owner's clean release and a successor's replacement are both
+    /// if-match on the version each read, so the one that lands first wins
+    /// and the other refuses: a release cannot remove a successor's record.
+    #[tokio::test]
+    async fn a_release_and_a_takeover_never_both_apply_issue_1067() {
+        let store: Arc<dyn StorageAdapter> =
+            Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
+        let lock_uri = "/lease-tests/__cluster/lock.json";
+        let StateLockAcquire::Acquired(owner) = acquire_state_lock_leased(
+            store.clone(),
+            store.clone(),
+            StorageKind::S3,
+            lock_uri,
+            "serve",
+            2,
+        )
+        .await
+        .unwrap() else {
+            panic!("a fresh root is free");
+        };
+        let (_, read_by_owner) = store
+            .read_text_versioned_if_exists_bounded(lock_uri, 64 * 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        // A successor replaced the record after the owner read it.
+        let successor = StateLockFile::held("serve", StorageKind::S3, 2);
+        let replaced = serde_json::to_string_pretty(&successor).unwrap();
+        assert!(
+            store
+                .write_text_if_match(lock_uri, &replaced, &read_by_owner)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let released =
+            serde_json::to_string_pretty(&StateLockFile::parse(&replaced).unwrap().mark_released())
+                .unwrap();
+        assert!(
+            store
+                .write_text_if_match(lock_uri, &released, &read_by_owner)
+                .await
+                .unwrap()
+                .is_none(),
+            "the owner's release against the version it read refuses"
+        );
+        assert!(
+            release_settled_lock(&store, StorageKind::S3, lock_uri, owner.lock_id())
+                .await
+                .is_err(),
+            "a settled release no longer owns the lock"
+        );
+        let stored = StateLockFile::parse(&store.read_text(lock_uri).await.unwrap()).unwrap();
+        assert_eq!(stored.lock_id(), successor.lock_id());
+        assert!(!stored.is_released());
     }
 
     #[tokio::test]
@@ -693,9 +766,15 @@ mod tests {
         let root = format!("file://{}", dir.path().display());
         let storage = storage_handle_for_uri(&root).unwrap();
         let lock_uri = format!("{root}/__cluster/lock.json");
-        let guard = match acquire_state_lock(storage.adapter(), storage.kind(), &lock_uri, "apply")
-            .await
-            .unwrap()
+        let guard = match acquire_state_lock(
+            storage.adapter(),
+            storage.adapter(),
+            storage.kind(),
+            &lock_uri,
+            "apply",
+        )
+        .await
+        .unwrap()
         {
             StateLockAcquire::Acquired(guard) => guard,
             StateLockAcquire::Held => panic!("fresh lock unexpectedly held"),
@@ -719,26 +798,41 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .len(),
-            6,
-            "a local lock records its lease"
+            5,
+            "a local lock records no lease"
         );
-        assert_eq!(
-            parsed.lease_seconds(),
-            Some(crate::lease::DEFAULT_LEASE_SECONDS)
-        );
-        assert!(matches!(
-            acquire_state_lock(storage.adapter(), storage.kind(), &lock_uri, "apply")
+        assert_eq!(parsed.lease_seconds(), None);
+        // A local root has no conditional update to replace a record with,
+        // so even a server refuses a held local lock at once.
+        for operation in ["apply", SERVE_OPERATION] {
+            let started = std::time::Instant::now();
+            assert!(matches!(
+                acquire_state_lock(
+                    storage.adapter(),
+                    storage.adapter(),
+                    storage.kind(),
+                    &lock_uri,
+                    operation
+                )
                 .await
                 .unwrap(),
-            StateLockAcquire::Held
-        ));
+                StateLockAcquire::Held
+            ));
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        }
 
         drop(guard);
         assert!(!lock_path.exists());
         assert!(matches!(
-            acquire_state_lock(storage.adapter(), storage.kind(), &lock_uri, "apply")
-                .await
-                .unwrap(),
+            acquire_state_lock(
+                storage.adapter(),
+                storage.adapter(),
+                storage.kind(),
+                &lock_uri,
+                "apply",
+            )
+            .await
+            .unwrap(),
             StateLockAcquire::Acquired(_)
         ));
     }

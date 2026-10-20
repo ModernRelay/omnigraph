@@ -110,8 +110,8 @@ The next server can start normally with the same `--target`. An initial
 `--bootstrap-handoff` receipt is only for the first process; omit it on later
 starts. The data, history and applied configuration remain in place.
 
-Uncertain or interrupted work retains admission and exits nonzero; on local and
-S3 roots a restarted server takes it over through the lock's lease
+Uncertain or interrupted work retains admission and exits nonzero; on S3 roots
+a restarted server takes it over through the lock's lease
 ([restart after a failure](operations/storage-failures.md#restart-after-a-failure)). S3 release
 uses a conditional marker, so a lost release response cannot delete a later
 owner's lock. A nonclean exit is still a reason to inspect the original outcome,

@@ -66,14 +66,15 @@ exits 2. Their effects are not scoped to one write's storage keys.
 
 ## Restart after a failure
 
-On local and S3 roots the cluster lock carries a lease, so an orchestrator can
-restart a failed server with no operator step. Set its restart policy to
-restart on failure (Railway `ON_FAILURE`, Kubernetes `restartPolicy: Always`).
+On S3 roots the cluster lock carries a lease, so an orchestrator can restart a
+failed server with no operator step. Set its restart policy to restart on
+failure (Railway `ON_FAILURE`, Kubernetes `restartPolicy: Always`).
 
 - The lock's owner renews the lease with heartbeat objects under
-  `__cluster/lease/` every third of a lease. When two heartbeats in a row go
-  unanswered, or a successor claims the lock, it stops writing and exits 2
-  without releasing.
+  `__cluster/lease/` every third of a lease. Heartbeats retry on their own, and
+  one whose answer was lost counts once a retry finds it. When no heartbeat
+  is answered for two thirds of a lease, or a successor claims the lock, the
+  owner stops writing and exits 2 without releasing.
 - A restarted server that finds the lock held watches those heartbeats. It
   refuses with `state_lock_held` while they continue, and takes the lock over
   once they have been silent for a lease and a half.
@@ -88,10 +89,12 @@ restart on failure (Railway `ON_FAILURE`, Kubernetes `restartPolicy: Always`).
   nothing references, makes a conditional publication the new owner also
   contends for, or writes a reused key whose late landing is harmless.
 
-A lock with no lease, one an older binary wrote or one on an Azure root, still
-needs the exact-ID unlock described under
-[writer topology](../deployment.md#writer-topology). Older binaries refuse the
-leased (version 3) lock record; do not delete it to bypass the version check.
+A lock with no lease still needs the exact-ID unlock described under
+[writer topology](../deployment.md#writer-topology). Local and Azure locks have
+no lease, and neither does a lock an older binary wrote. A local root has no
+conditional update, so a successor could not replace the lock without racing a
+release the old owner already sent. Older binaries refuse the leased
+(version 3) lock record; do not delete it to bypass the version check.
 
 ## Logs
 

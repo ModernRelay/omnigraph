@@ -2562,12 +2562,6 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         "removes a superseded owner's lease directory after takeover; its lock id is never reused and its fence latched before the claim",
     ),
     (
-        "omnigraph-cluster/state_lock.rs",
-        ".write_text(",
-        1,
-        "local takeover once the claim serialized successors; a local write completes before it returns and a dead process sends nothing late",
-    ),
-    (
         "omnigraph-cluster/store.rs",
         ".delete(",
         1,
