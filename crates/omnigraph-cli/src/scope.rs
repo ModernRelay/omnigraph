@@ -1,5 +1,5 @@
 //! Capture exactly one destination. Command inputs never participate in routing.
-use crate::cli::{Cli, Command};
+use crate::cli::{BlobCommand, BranchCommand, Cli, Command, CommitCommand, SchemaCommand};
 use crate::operator::InvocationConfig;
 use crate::planes::{self, Requirement};
 use crate::targets::{
@@ -229,10 +229,72 @@ pub(crate) async fn direct_graph_uri(
     }
 }
 
+/// The write scope known without opening a graph or interpreting stored code.
+/// Commit-addressed and opaque source operations must not claim a default branch.
+#[derive(Clone, Copy)]
+pub(crate) enum WriteScope<'a> {
+    Branch(&'a str),
+    Commit(&'a str),
+    StoredMutation(&'a str),
+    BackendResolved,
+}
+
+impl std::fmt::Display for WriteScope<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Branch(branch) => write!(f, "branch={branch}"),
+            Self::Commit(commit) => write!(f, "commit={commit}"),
+            Self::StoredMutation(name) => {
+                write!(f, "stored-mutation={name}; branch=backend-resolved")
+            }
+            Self::BackendResolved => f.write_str("branch=backend-resolved"),
+        }
+    }
+}
+
+pub(crate) fn command_write_scope(command: &Command) -> Option<WriteScope<'_>> {
+    match command {
+        Command::Load(args) => Some(WriteScope::Branch(args.branch.as_deref().unwrap_or("main"))),
+        Command::Branch { command } => match command {
+            BranchCommand::Create { name, .. } | BranchCommand::Delete { name, .. } => {
+                Some(WriteScope::Branch(name))
+            }
+            BranchCommand::Merge { into, .. } => {
+                Some(WriteScope::Branch(into.as_deref().unwrap_or("main")))
+            }
+            BranchCommand::List { .. }
+            | BranchCommand::Diff { .. }
+            | BranchCommand::MergeBase { .. } => None,
+        },
+        Command::Blob {
+            command: BlobCommand::Put { branch, .. } | BlobCommand::Clear { branch, .. },
+        } => Some(WriteScope::Branch(branch.as_deref().unwrap_or("main"))),
+        Command::RebuildFullTextIndexes(args) => Some(WriteScope::Branch(&args.branch)),
+        Command::Init(_)
+        | Command::Schema {
+            command: SchemaCommand::Apply { .. },
+        } => Some(WriteScope::Branch("main")),
+        Command::Commit {
+            command:
+                CommitCommand::Publish { commit_id, .. } | CommitCommand::Drop { commit_id, .. },
+        } => Some(WriteScope::Commit(commit_id)),
+        // mutate resolves its scope from the existing source preparation below
+        // the initial destination barrier. Root/whole-graph work has no branch.
+        _ => None,
+    }
+}
+
+pub(crate) fn report_write_scope(scope: WriteScope<'_>, stderr: &mut dyn Write) -> Result<()> {
+    writeln!(stderr, "target write scope: {scope}")?;
+    stderr.flush()?;
+    Ok(())
+}
+
 pub(crate) fn report(
     input: &InvocationConfig,
     target: &ResolvedTarget,
     graph: Option<&str>,
+    write_scope: Option<WriteScope<'_>>,
     stderr: &mut dyn Write,
 ) -> Result<()> {
     let source = match &target.provenance {
@@ -286,9 +348,10 @@ pub(crate) fn report(
     };
     writeln!(
         stderr,
-        "target {} ({source}): {destination}{}{}",
+        "target {} ({source}): {destination}{}{}{}",
         target.label(),
         graph.map_or_else(String::new, |g| format!("; graph={g}")),
+        write_scope.map_or_else(String::new, |scope| format!("; {scope}")),
         config
     )?;
     stderr.flush()?;

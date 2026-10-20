@@ -17,6 +17,7 @@ pub(crate) mod import;
 
 pub(crate) const TARGET_CONFIG_VERSION: u32 = 1;
 pub(crate) const TARGET_PROTOCOL: u32 = 1;
+pub(crate) const CREDENTIAL_PROTOCOL: u32 = 1;
 
 #[derive(Debug)]
 pub(crate) struct TargetError {
@@ -638,7 +639,10 @@ impl TargetEntry {
 }
 
 impl TargetBinding {
-    pub(crate) fn digest(&self) -> String {
+    pub(crate) fn digest(&self) -> Result<String> {
+        let endpoint_identity = |endpoint: &str| -> Result<serde_json::Value> {
+            Ok(RequestTarget::of(endpoint, endpoint)?.binding_identity())
+        };
         let identity = match self {
             Self::DirectGraph { uri, provider } => {
                 serde_json::json!({"kind":"direct","scope":"graph","uri":uri,"provider":provider})
@@ -648,16 +652,24 @@ impl TargetBinding {
             }
             Self::DirectCatalogue => serde_json::json!({"kind":"direct","scope":"catalogue"}),
             Self::Server { endpoint, auth, .. } => {
-                serde_json::json!({"kind":"server","endpoint":endpoint,"credential":match auth {ServerAuth::Token{owner}=>Some(owner),ServerAuth::Anonymous=>None}})
+                serde_json::json!({"kind":"server","endpoint":endpoint_identity(endpoint)?,"credential":match auth {ServerAuth::Token{owner}=>Some(owner),ServerAuth::Anonymous=>None}})
             }
             Self::Managed(binding) => {
-                serde_json::json!({"kind":"managed","api":binding.api,"organization_id":binding.organization_id,"cluster":binding.cluster.as_ref().map(|c|(&c.cluster_id,&c.cluster_incarnation,&c.endpoint)),"control_auth":binding.control_auth})
+                let cluster = match &binding.cluster {
+                    Some(cluster) => Some(serde_json::json!({
+                        "id": cluster.cluster_id,
+                        "incarnation": cluster.cluster_incarnation,
+                        "endpoint": cluster.endpoint.as_deref().map(endpoint_identity).transpose()?,
+                    })),
+                    None => None,
+                };
+                serde_json::json!({"kind":"managed","api":endpoint_identity(&binding.api)?,"organization_id":binding.organization_id,"cluster":cluster,"control_auth":binding.control_auth})
             }
         };
-        format!(
+        Ok(format!(
             "sha256:{:x}",
             Sha256::digest(identity.to_string().as_bytes())
-        )
+        ))
     }
 }
 
@@ -842,7 +854,9 @@ pub(crate) struct TargetOutput {
 }
 impl TargetOutput {
     pub(crate) fn of(name: &str, entry: &TargetEntry, base: &Path) -> Self {
-        let binding = entry.binding_at(name, base);
+        let binding = entry
+            .binding_at(name, base)
+            .and_then(|binding| binding.digest());
         let mut safe_entry = entry.clone();
         for raw in [
             &mut safe_entry.uri,
@@ -865,7 +879,7 @@ impl TargetOutput {
         Self {
             name: name.into(),
             entry: safe_entry,
-            binding: binding.as_ref().ok().map(TargetBinding::digest),
+            binding: binding.as_ref().ok().cloned(),
             error: binding.err().map(|e| e.to_string()),
         }
     }

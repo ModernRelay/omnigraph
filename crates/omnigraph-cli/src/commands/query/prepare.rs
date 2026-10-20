@@ -8,7 +8,7 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph_api_types::{branch_statement_refusals, query_file_refusals};
 use omnigraph_compiler::query::ast::{
     BranchRead, BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, EmptyFile, FileBody,
-    LoadStmt, QueryFile, SettingStmt, show_statement_name,
+    LoadStmt, MutationWriteMode, QueryFile, SettingStmt, show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::settings::SettingId;
@@ -42,11 +42,39 @@ pub(super) enum ReadOperation<'a> {
 }
 
 pub(super) enum MutationOperation<'a> {
-    AdHoc(&'a str),
+    AdHoc {
+        source: &'a str,
+        request_branch: bool,
+    },
     Stored(&'a str),
     Branch(&'a str, BranchWrite),
     Commit(&'a str, CommitWrite),
     Load(&'a str, LoadStmt),
+}
+
+impl MutationOperation<'_> {
+    pub(super) fn write_scope<'a>(
+        &'a self,
+        branch: Option<&'a str>,
+    ) -> crate::scope::WriteScope<'a> {
+        use crate::scope::WriteScope;
+        match self {
+            Self::AdHoc { request_branch, .. } => branch
+                .or(request_branch.then_some("main"))
+                .map_or(WriteScope::BackendResolved, WriteScope::Branch),
+            Self::Stored(name) => {
+                branch.map_or(WriteScope::StoredMutation(name), WriteScope::Branch)
+            }
+            Self::Branch(_, BranchWrite::Create { name, .. } | BranchWrite::Delete { name }) => {
+                WriteScope::Branch(name)
+            }
+            Self::Branch(_, BranchWrite::Merge { into, .. }) => {
+                WriteScope::Branch(into.as_deref().unwrap_or("main"))
+            }
+            Self::Commit(_, write) => WriteScope::Commit(write.graph_commit_id()),
+            Self::Load(..) => WriteScope::Branch(branch.unwrap_or("main")),
+        }
+    }
 }
 
 pub(super) fn prepare_read<'a>(
@@ -195,7 +223,31 @@ pub(super) fn prepare_mutation<'a>(
             if let Ok(file) = &parsed {
                 refuse_prefix_this_door_cannot_run(remote, file)?;
             }
-            Ok(MutationOperation::AdHoc(source))
+            // Reuse the parser result for diagnostics only. Unknown/newer source
+            // stays opaque, and an unattached child inherits a backend-recorded
+            // branch rather than the request's ordinary main default.
+            let request_branch = parsed
+                .as_ref()
+                .ok()
+                .and_then(|file| {
+                    let FileBody::Queries(queries) = &file.body else {
+                        return None;
+                    };
+                    let query = match envelope.name {
+                        Some(name) => queries.iter().find(|query| query.name == name),
+                        None if queries.len() == 1 => queries.first(),
+                        None => None,
+                    }?;
+                    Some(!matches!(
+                        query.write_mode,
+                        MutationWriteMode::Unattached { base: Some(_) }
+                    ))
+                })
+                .unwrap_or(false);
+            Ok(MutationOperation::AdHoc {
+                source,
+                request_branch,
+            })
         }
     }
 }
@@ -315,12 +367,36 @@ mod tests {
         ));
         assert!(matches!(
             prepare_mutation(QueryInput::Supplied(source), invocation(), true).unwrap(),
-            MutationOperation::AdHoc(forwarded) if forwarded == source
+            MutationOperation::AdHoc { source: forwarded, request_branch: false } if forwarded == source
         ));
         assert!(matches!(
             prepare_read(QueryInput::Stored, invocation(), true).unwrap(),
             ReadOperation::Stored("selected")
         ));
+        assert_eq!(
+            prepare_mutation(QueryInput::Supplied(source), invocation(), true)
+                .unwrap()
+                .write_scope(None)
+                .to_string(),
+            "branch=backend-resolved"
+        );
+        assert_eq!(
+            prepare_mutation(QueryInput::Stored, invocation(), true)
+                .unwrap()
+                .write_scope(None)
+                .to_string(),
+            "stored-mutation=selected; branch=backend-resolved"
+        );
+        // A child snapshot's recorded branch is not the request's main default.
+        let child =
+            "query q() as unattached branch on \"base-id\" { insert Person { name: \"new\" } }";
+        assert_eq!(
+            prepare_mutation(QueryInput::Supplied(child), envelope(), true)
+                .unwrap()
+                .write_scope(None)
+                .to_string(),
+            "branch=backend-resolved"
+        );
     }
 
     #[test]

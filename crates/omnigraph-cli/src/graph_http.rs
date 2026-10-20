@@ -144,6 +144,25 @@ impl RequestTarget {
         Self { endpoint, segments }
     }
 
+    /// Protocol-1 binding identity: exactly the endpoint and path used by
+    /// credential scope matching, never a URL's display spelling. Unix paths
+    /// retain their decoded bytes so distinct non-UTF-8 sockets cannot alias.
+    pub(crate) fn binding_identity(&self) -> serde_json::Value {
+        let endpoint = match &self.endpoint {
+            Endpoint::Tcp { scheme, host, port } => serde_json::json!({
+                "transport": "tcp", "scheme": scheme, "host": host, "port": port
+            }),
+            #[cfg(unix)]
+            Endpoint::Unix(socket) => {
+                use std::os::unix::ffi::OsStrExt;
+                serde_json::json!({
+                    "transport": "unix", "socket": socket.as_os_str().as_bytes()
+                })
+            }
+        };
+        serde_json::json!({"endpoint": endpoint, "segments": self.segments})
+    }
+
     /// Whether this target is `base` or lies under it: the same endpoint, and
     /// a path whose leading segments are all of `base`'s.
     pub(crate) fn is_under(&self, base: &Self) -> bool {

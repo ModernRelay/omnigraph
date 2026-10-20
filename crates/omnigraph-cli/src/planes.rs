@@ -160,32 +160,82 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// An explicit actor applies only to an actor-consuming operation. Match mixed
+/// families exhaustively so new leaves need a decision; read-only families
+/// refuse as a whole. Served targets still derive identity from credentials.
 fn accepts_actor(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Mutate(_)
-            | Command::Load(_)
-            | Command::RebuildFullTextIndexes(_)
-            | Command::Branch {
-                command: BranchCommand::Create { .. }
-                    | BranchCommand::Delete { .. }
-                    | BranchCommand::Merge { .. }
-            }
-            | Command::Blob {
-                command: BlobCommand::Put { .. } | BlobCommand::Clear { .. }
-            }
-            | Command::Commit {
-                command: CommitCommand::Publish { .. } | CommitCommand::Drop { .. }
-            }
-            | Command::Schema {
-                command: SchemaCommand::Apply { .. }
-            }
-            | Command::Cluster {
-                command: ClusterCommand::Plan { .. }
-                    | ClusterCommand::Apply { .. }
-                    | ClusterCommand::UpgradeLedger { .. }
-            }
-    )
+    match command {
+        Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => true,
+        Command::Branch { command } => match command {
+            BranchCommand::Create { .. }
+            | BranchCommand::Delete { .. }
+            | BranchCommand::Merge { .. } => true,
+            BranchCommand::List { .. }
+            | BranchCommand::Diff { .. }
+            | BranchCommand::MergeBase { .. } => false,
+        },
+        Command::Blob { command } => match command {
+            BlobCommand::Put { .. } | BlobCommand::Clear { .. } => true,
+            BlobCommand::Get { .. } | BlobCommand::Stat { .. } => false,
+        },
+        Command::Commit { command } => match command {
+            CommitCommand::Publish { .. } | CommitCommand::Drop { .. } => true,
+            CommitCommand::List { .. }
+            | CommitCommand::Show { .. }
+            | CommitCommand::Changes { .. } => false,
+        },
+        Command::Schema { command } => match command {
+            SchemaCommand::Apply { .. } => true,
+            SchemaCommand::Plan { .. }
+            | SchemaCommand::Show { .. }
+            | SchemaCommand::UpgradeSystemColumns { .. } => false,
+        },
+        Command::Cluster { command } => match command {
+            // Plan checks the intended actor; apply and upgrade attribute it.
+            // validate_target separately refuses --as on served/managed targets.
+            ClusterCommand::Plan { .. }
+            | ClusterCommand::Apply { .. }
+            | ClusterCommand::UpgradeLedger { .. } => true,
+            ClusterCommand::Validate { .. }
+            | ClusterCommand::Status { .. }
+            | ClusterCommand::Observe { .. }
+            | ClusterCommand::ForceUnlock { .. }
+            | ClusterCommand::Create { .. }
+            | ClusterCommand::List { .. }
+            | ClusterCommand::Members { .. }
+            | ClusterCommand::Pull { .. }
+            | ClusterCommand::Push { .. }
+            | ClusterCommand::Delete { .. }
+            | ClusterCommand::UndoDelete { .. }
+            | ClusterCommand::Token { .. }
+            | ClusterCommand::Operation { .. }
+            | ClusterCommand::History { .. }
+            | ClusterCommand::Cancel { .. } => false,
+        },
+        Command::Query(_)
+        | Command::Snapshot(_)
+        | Command::Export(_)
+        | Command::Diff(_)
+        | Command::Changes { .. }
+        | Command::Graphs { .. }
+        | Command::Queries { .. }
+        | Command::Policy { .. }
+        | Command::Organization { .. }
+        | Command::Init(_)
+        | Command::Upgrade(_)
+        | Command::Optimize(_)
+        | Command::Repair(_)
+        | Command::Cleanup(_)
+        | Command::Lint(_)
+        | Command::Alias(_)
+        | Command::Embed(_)
+        | Command::Login { .. }
+        | Command::Logout { .. }
+        | Command::Target { .. }
+        | Command::Credential { .. }
+        | Command::Skill { .. }
+        | Command::Version { .. } => false,
+    }
 }
 
 /// Reject unsupported access kinds before any credential lookup or backend request.
@@ -367,7 +417,14 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Embed(_) => "embed",
         Command::Init(_) => "init",
         Command::Load(_) => "load",
-        Command::Branch { .. } => "branch",
+        Command::Branch { command } => match command {
+            BranchCommand::Create { .. } => "branch create",
+            BranchCommand::List { .. } => "branch list",
+            BranchCommand::Delete { .. } => "branch delete",
+            BranchCommand::Merge { .. } => "branch merge",
+            BranchCommand::Diff { .. } => "branch diff",
+            BranchCommand::MergeBase { .. } => "branch merge-base",
+        },
         Command::Schema { command } => match command {
             SchemaCommand::Plan { .. } => "schema plan",
             SchemaCommand::Apply { .. } => "schema apply",
@@ -456,6 +513,127 @@ mod tests {
                 .any(|c| matches!(c.get_name(), "use" | "profile"))
         );
     }
+    #[test]
+    fn actor_flag_matrix_matches_consumption_issue_1023() {
+        use clap::Parser;
+
+        let cases: &[(&[&str], bool)] = &[
+            (&["mutate", "-e", "q"], true),
+            (&["load", "--data", "d.jsonl", "--mode", "append"], true),
+            (&["rebuild-full-text-indexes"], true),
+            (&["branch", "create", "b"], true),
+            (&["branch", "delete", "b"], true),
+            (&["branch", "merge", "b"], true),
+            (&["branch", "list"], false),
+            (&["branch", "diff", "b"], false),
+            (&["branch", "merge-base", "b"], false),
+            (
+                &["blob", "put", "node", "Document", "readme", "content"],
+                true,
+            ),
+            (
+                &["blob", "clear", "node", "Document", "readme", "content"],
+                true,
+            ),
+            (
+                &["blob", "get", "node", "Document", "readme", "content"],
+                false,
+            ),
+            (
+                &["blob", "stat", "node", "Document", "readme", "content"],
+                false,
+            ),
+            (&["commit", "publish", "c"], true),
+            (&["commit", "drop", "c"], true),
+            (&["commit", "list"], false),
+            (&["commit", "show", "c"], false),
+            (&["commit", "changes", "c"], false),
+            (&["schema", "apply", "--schema", "s.pg"], true),
+            (&["schema", "plan", "--schema", "s.pg"], false),
+            (&["schema", "show"], false),
+            (&["schema", "upgrade-system-columns"], false),
+            (&["cluster", "plan"], true),
+            (&["cluster", "apply"], true),
+            (&["cluster", "upgrade-ledger", "--writers-stopped"], true),
+            (&["cluster", "validate"], false),
+            (&["cluster", "status"], false),
+            (&["cluster", "observe"], false),
+            (&["cluster", "force-unlock", "lock"], false),
+            (&["cluster", "create", "c"], false),
+            (&["cluster", "list"], false),
+            (&["cluster", "members", "list"], false),
+            (&["cluster", "pull", "--out", "out"], false),
+            (
+                &[
+                    "cluster",
+                    "push",
+                    "--expected-revision",
+                    "rev",
+                    "--message",
+                    "m",
+                ],
+                false,
+            ),
+            (&["cluster", "delete", "--incarnation", "inc"], false),
+            (
+                &[
+                    "cluster",
+                    "undo-delete",
+                    "--incarnation",
+                    "inc",
+                    "--deletion-id",
+                    "id",
+                ],
+                false,
+            ),
+            (&["cluster", "token"], false),
+            (&["cluster", "operation", "id"], false),
+            (&["cluster", "history"], false),
+            (&["cluster", "cancel", "id"], false),
+            (&["query", "-e", "q"], false),
+            (&["snapshot"], false),
+            (&["export"], false),
+            (&["diff", "--from", "a", "--to", "b"], false),
+            (&["changes", "poll"], false),
+            (&["changes", "baseline", "--out", "out"], false),
+            (&["optimize"], false),
+            (&["cleanup"], false),
+        ];
+        for &(args, accepts_actor) in cases {
+            let argv = ["omnigraph"]
+                .into_iter()
+                .chain(args.iter().copied())
+                .chain(["--as", "act-writer"]);
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let result = super::guard_addressing(&cli);
+            assert_eq!(result.is_ok(), accepts_actor, "{args:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn as_refusal_names_the_subcommand() {
+        use clap::Parser;
+
+        let cases: &[(&[&str], &str)] = &[
+            (&["branch", "list"], "branch list"),
+            (&["branch", "diff", "b"], "branch diff"),
+            (&["branch", "merge-base", "b"], "branch merge-base"),
+            (&["commit", "show", "c"], "commit show"),
+            (&["snapshot"], "snapshot"),
+            (&["export"], "export"),
+            (&["schema", "show"], "schema show"),
+        ];
+        for &(args, label) in cases {
+            let argv = ["omnigraph"]
+                .into_iter()
+                .chain(args.iter().copied())
+                .chain(["--as", "act-reader"]);
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let error = super::guard_addressing(&cli).unwrap_err().to_string();
+            assert_eq!(error, format!("{label} does not accept --as"));
+        }
+    }
+
     #[test]
     fn removed_flags_fail_before_configuration_or_io() {
         for flag in [

@@ -91,7 +91,8 @@ provider:
 ```
 
 S3's endpoint is optional and defaults to the service endpoint for its explicit
-region. Azure's endpoint is optional and defaults to its explicit account's
+region, including the bucket when `virtual_hosted_style: true`. A custom virtual-host
+endpoint must already include the bucket. Azure's endpoint is optional and defaults to its explicit account's
 Blob endpoint. For Azurite, set `emulator: true` and optionally its HTTP service
 endpoint. Local targets may omit `provider`, or use `provider: {kind: local}`.
 Native provider credentials remain outside the operator file.
@@ -101,6 +102,24 @@ An inline cloud target captures these settings from the provider environment
 for that invocation. Inline S3 requires an explicit region; with `AWS_PROFILE`,
 it also requires an explicit service endpoint. The CLI passes the same captured
 destination to admission, control objects and Lance data access.
+
+Native authentication retains its provider's credential refresh behavior. Target
+bindings fix request signing, certificate validation and conditional-write settings;
+unsupported ambient proxy, encryption, checksum or transport overrides refuse.
+Nonempty `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` variables, including lowercase
+spellings, also refuse for cloud targets. Optional `OBJECT_STORE_CLIENT_MAX_RETRIES`
+and `OBJECT_STORE_CLIENT_RETRY_TIMEOUT` settings are captured for the invocation,
+limited to 0–3 retries and 1–180 seconds. Changing those settings after capture
+refuses instead of changing the bound client's behavior.
+
+Before a backend mutation, stderr identifies the resolved destination and the
+branch when it is known from the command. Ordinary mutations and loads default
+to `main`; branch statements report the branch they change, and commit operations
+report their commit ID. Source-dependent scope is printed after source preparation
+and before dispatch. Stored mutations or backend-interpreted source without an
+explicit branch report `branch=backend-resolved` rather than guessing a branch.
+A failed diagnostic write or flush prevents dispatch; stdout keeps its existing
+result format.
 
 ```bash
 omnigraph target list --json
@@ -117,7 +136,7 @@ its credential, so log out before removing the last target that owns it.
 `credential get --target prod` exports a server credential only to a pipe or
 file; it refuses terminal output. `--json` includes the owning endpoint.
 Target administration and credential JSON reports include `protocol: 1`;
-`version --json` reports that value as `target_protocol`.
+`version --json` reports their versions as `protocols: {"target": 1, "credential": 1}`.
 
 The operator config and credentials files are each limited to 1 MiB.
 Unknown fields, duplicate YAML keys, unsupported format versions and legacy

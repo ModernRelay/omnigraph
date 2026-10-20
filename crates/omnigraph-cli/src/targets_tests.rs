@@ -397,3 +397,134 @@ fn captured_request_scope_refuses_nested_owner_and_keeps_its_snapshot() {
         );
     }
 }
+
+#[test]
+fn target_listing_digest_uses_credential_endpoint_identity() {
+    let mut target =
+        entry(r#"{"kind":"server","endpoint":"https://example.com","credential":"auth"}"#);
+    let output = |target: &TargetEntry| {
+        TargetOutput::of("primary", target, Path::new("."))
+            .binding
+            .unwrap()
+    };
+    for endpoints in [
+        [
+            "https://example.com",
+            "https://EXAMPLE.com:443",
+            "https://example.com/",
+        ],
+        [
+            "https://example.com/api",
+            "https://EXAMPLE.com:443/api/",
+            "https://example.com/old/../api",
+        ],
+    ] {
+        target.endpoint = Some(endpoints[0].into());
+        let expected = output(&target);
+        for endpoint in endpoints {
+            target.endpoint = Some(endpoint.into());
+            assert_eq!(output(&target), expected, "{endpoint}");
+        }
+    }
+    target.endpoint = Some("https://example.com".into());
+    let expected = output(&target);
+    for endpoint in [
+        "http://example.com",
+        "https://other.example.com",
+        "https://example.com:444",
+        "https://example.com/api",
+    ] {
+        target.endpoint = Some(endpoint.into());
+        assert_ne!(output(&target), expected, "{endpoint}");
+    }
+    target.endpoint = Some("https://example.com".into());
+    target.default_graph = Some("another-graph".into());
+    assert_eq!(
+        TargetOutput::of("alias", &target, Path::new("."))
+            .binding
+            .unwrap(),
+        expected,
+        "target names and graph defaults do not identify a server binding"
+    );
+    target.credential = Some("another-owner".into());
+    assert_ne!(output(&target), expected);
+    target.credential = None;
+    target.auth = Some(TargetAuth::Anonymous);
+    assert_ne!(output(&target), expected);
+}
+
+#[test]
+fn managed_listing_digest_normalizes_endpoints_and_keeps_authority() {
+    let base = serde_json::json!({
+        "kind": "managed",
+        "scope": "cluster",
+        "api": "https://control.example",
+        "organization_id": "org",
+        "cluster_id": "cluster",
+        "cluster_incarnation": "incarnation",
+        "endpoint": "https://data.example/api",
+        "control_auth": "human-device"
+    });
+    let output = |value: &serde_json::Value| {
+        TargetOutput::of("managed", &entry(&value.to_string()), Path::new("."))
+            .binding
+            .unwrap()
+    };
+    let expected = output(&base);
+    for endpoint in [
+        "https://data.example/api/",
+        "https://DATA.example:443/api",
+        "https://data.example/old/../api/",
+    ] {
+        let mut changed = base.clone();
+        changed["endpoint"] = endpoint.into();
+        changed["api"] = "https://CONTROL.example:443/".into();
+        changed["default_graph"] = "other".into();
+        assert_eq!(output(&changed), expected, "{endpoint}");
+    }
+    for (field, value) in [
+        ("api", "https://another-control.example"),
+        ("organization_id", "other-org"),
+        ("cluster_id", "other-cluster"),
+        ("cluster_incarnation", "next-incarnation"),
+        ("endpoint", "https://data.example:444/api"),
+        ("endpoint", "https://data.example/other"),
+        ("control_auth", "automation-env"),
+    ] {
+        let mut changed = base.clone();
+        changed[field] = value.into();
+        assert_ne!(output(&changed), expected, "{field}={value}");
+    }
+    let mut no_endpoint = base;
+    no_endpoint.as_object_mut().unwrap().remove("endpoint");
+    assert_ne!(output(&no_endpoint), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_listing_digest_keeps_decoded_socket_bytes() {
+    let output = |endpoint: &str| {
+        let target = entry(
+            &serde_json::json!({
+                "kind": "server", "endpoint": endpoint, "auth": "anonymous"
+            })
+            .to_string(),
+        );
+        TargetOutput::of("unix", &target, Path::new("."))
+            .binding
+            .unwrap()
+    };
+    for (plain, encoded) in [
+        ("unix:///tmp/target.sock", "unix:///tmp/target%2Esock"),
+        ("unix:///tmp/a b.sock", "unix:///tmp/a%20b.sock"),
+        ("unix:///tmp/%ff.sock", "unix:///tmp/%FF.sock"),
+    ] {
+        assert_eq!(output(plain), output(encoded));
+    }
+    assert_ne!(output("unix:///tmp/a.sock"), output("unix:///tmp/b.sock"));
+    assert_ne!(
+        output("unix:///tmp/%FF.sock"),
+        output("unix:///tmp/%FE.sock"),
+        "distinct non-UTF-8 socket paths must not share lossy display identity"
+    );
+}

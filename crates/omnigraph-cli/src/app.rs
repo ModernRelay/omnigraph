@@ -334,7 +334,13 @@ async fn run(
         } else {
             cli.graph.as_deref()
         };
-        scope::report(&operator, target, graph, stderr)?;
+        scope::report(
+            &operator,
+            target,
+            graph,
+            scope::command_write_scope(&cli.command),
+            stderr,
+        )?;
     }
     let managed_data = if let Some(targets::ResolvedTarget {
         binding: targets::TargetBinding::Managed(binding),

@@ -1360,6 +1360,9 @@ impl ObjectStorageAdapter {
         // CanonicalAzureRoot captured the backend selection.
         let mut builder = MicrosoftAzureBuilder::new();
         for (key, value) in &root.azure_options {
+            if matches!(key.as_str(), "client_max_retries" | "client_retry_timeout") {
+                continue;
+            }
             let key = AzureConfigKey::from_str(key).map_err(|_| {
                 StorageError::backend(
                     StorageFailureKind::Configuration,
@@ -1375,6 +1378,15 @@ impl ObjectStorageAdapter {
             .with_use_emulator(false);
         if scope.is_some() {
             builder = builder.with_retry(single_attempt_retry_config());
+        } else if root.azure_options.contains_key("client_max_retries") {
+            builder = builder.with_retry(binding::captured_retry_config(
+                root.azure_options
+                    .get("client_max_retries")
+                    .map(String::as_str),
+                root.azure_options
+                    .get("client_retry_timeout")
+                    .map(String::as_str),
+            )?);
         }
         let store = builder.build().map_err(|_| {
             StorageError::backend(

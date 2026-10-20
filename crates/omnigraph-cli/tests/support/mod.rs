@@ -1501,35 +1501,42 @@ policies:
     cluster_dir
 }
 
+/// An operator home whose configuration names [`PARITY_ACTOR`] for the direct
+/// arm of [`run_both`]. Reads ignore it; writes resolve it without a second
+/// read/write classifier in the harness.
+pub fn parity_operator_home(root: &Path) -> PathBuf {
+    let home = root.join("parity-operator-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.yaml"),
+        format!("target_config_version: 1\noperator:\n  actor: {PARITY_ACTOR}\n"),
+    )
+    .unwrap();
+    home
+}
+
 /// Run one CLI invocation per arm with identical verb args: locally against
-/// `local_graph` and remotely against `server`. Actor-bearing operations
-/// use `--as` locally and an equivalent bearer identity remotely; reads
-/// reject `--as`. Returns raw outputs for parity comparison.
+/// `local_graph` and remotely against `server`. Actor-bearing operations resolve
+/// `operator.actor` from `local_operator_home` locally and an equivalent bearer
+/// identity remotely. Returns raw outputs for parity comparison.
 pub fn run_both(
     local_graph: &Path,
+    local_operator_home: &Path,
     server: &TestServer,
     args: &[&str],
 ) -> (std::process::Output, std::process::Output) {
     // The same global --target grammar addresses both direct and served arms.
     // Direct writes carry no Cedar policy; the served parity policy permits
-    // act-parity, so both arms still agree.
+    // act-parity, so both arms still agree. Explicit --as on an actorless read
+    // remains an error; the harness itself needs no list of actor-bearing verbs.
     let mut local = cli();
-    local.args(args).arg("--target").arg(local_graph);
+    local
+        .env("OMNIGRAPH_HOME", local_operator_home)
+        .args(args)
+        .arg("--target")
+        .arg(local_graph);
     if args.first() == Some(&"blob") {
         local.env("NO_COLOR", "1");
-    }
-    // Only actor-bearing writes carry --as on the direct arm. The served
-    // arm always resolves its actor from the bearer credential.
-    let actor = match args {
-        ["blob", verb, ..] => matches!(*verb, "put" | "clear"),
-        ["branch", verb, ..] => matches!(*verb, "create" | "delete" | "merge"),
-        ["commit", verb, ..] => matches!(*verb, "publish" | "drop"),
-        ["schema", "apply", ..] => true,
-        [verb, ..] => matches!(*verb, "mutate" | "load" | "rebuild-full-text-indexes"),
-        [] => false,
-    };
-    if actor {
-        local.arg("--as").arg(PARITY_ACTOR);
     }
 
     let mut remote = cli();

@@ -139,7 +139,7 @@ commit 9c2b3679e8f66062252e7ed6270a9478b4b77413
   "channel": "edge",
   "commit": "9c2b3679e8f66062252e7ed6270a9478b4b77413",
   "http_contract": "0.13",
-  "target_protocol": 1,
+  "protocols": { "target": 1, "credential": 1 },
   "internal_schema": {
     "writes": 16,
     "serves": [14, 16]
@@ -161,8 +161,8 @@ accepts only an exact match and returns its own value on every response,
 including `HEAD /healthz` ([HTTP contract](operations/server.md#http-contract)).
 When several CLIs are installed, for example one in `~/.local/bin` and an
 older one from Homebrew, choose by this field, not by the package version.
-`target_protocol` identifies the `protocol` used by target administration and
-credential JSON reports.
+`protocols.target` and `protocols.credential` identify the `protocol` used by
+target administration and credential JSON reports, respectively.
 `internal_schema.writes` is the storage-format stamp this binary's commits
 write, and `internal_schema.serves` is the inclusive range, lowest first, that
 normal open accepts; `snapshot --json` reports a graph's own stamp as

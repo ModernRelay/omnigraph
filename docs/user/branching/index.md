@@ -160,8 +160,8 @@ commit was the head. Use it to try a fix or a revert where a change was made,
 then merge the branch as usual; the commit is its merge base.
 
 ```bash
-omnigraph commit list graph.omni --branch main --json
-omnigraph branch create fix/import --from-commit <commit-id> --store graph.omni
+omnigraph commit list --target ./graph.omni --branch main --json
+omnigraph branch create fix/import --from-commit <commit-id> --target ./graph.omni
 ```
 
 The statement is `branch create "fix/import" from commit "<commit-id>"`, and

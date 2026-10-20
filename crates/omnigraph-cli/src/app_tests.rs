@@ -682,6 +682,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
             &crate::operator::InvocationConfig::at(None, None),
             &server_test_target(&server.origin),
             Some("knowledge"),
+            Some(crate::scope::WriteScope::Branch("main")),
             &mut stderr,
         )?;
         execute_load(
@@ -722,6 +723,82 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
     );
     assert!(server.requests().is_empty());
     server.assert_complete();
+}
+
+#[tokio::test]
+async fn mutation_scope_delivery_failure_precedes_writable_open() {
+    use crate::cli::Command;
+    use crate::commands::query::{GraphScope, run_mutate};
+
+    for source in [
+        "query add() { insert Person { slug: \"new\" } }",
+        "branch create review",
+    ] {
+        for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
+            let temp = tempfile::tempdir().unwrap();
+            let uri = temp.path().join("graph.omni").to_str().unwrap().to_owned();
+            omnigraph::db::Omnigraph::init(&uri, "node Person { slug: String @key }")
+                .await
+                .unwrap();
+            let client = GraphClient::embedded_test(uri.clone(), None);
+            let before = client
+                .snapshot("main")
+                .await
+                .unwrap()
+                .graph_manifest_version;
+            let parsed = crate::invocation::parse_from([
+                "omnigraph",
+                "mutate",
+                "--target",
+                &uri,
+                "-e",
+                source,
+                "--json",
+            ])
+            .unwrap();
+            let Command::Mutate(args) = parsed.cli.command else {
+                unreachable!()
+            };
+            let mut stdout = Vec::new();
+            let mut stderr = FailingOutput {
+                fault,
+                bytes: Vec::new(),
+            };
+            let error = run_mutate(
+                args,
+                GraphScope {
+                    operator: &crate::operator::InvocationConfig::at(None, None),
+                    target: &direct_test_target(&uri, false),
+                    graph: None,
+                    actor: None,
+                    yes: false,
+                },
+                None,
+                &mut crate::input::Input {
+                    reader: &mut io::empty(),
+                    is_terminal: false,
+                },
+                &mut stdout,
+                &mut stderr,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert!(stdout.is_empty());
+            assert_eq!(
+                client
+                    .snapshot("main")
+                    .await
+                    .unwrap()
+                    .graph_manifest_version,
+                before
+            );
+            assert_eq!(client.branch_list().await.unwrap().branches, ["main"]);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1225,6 +1302,7 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
                     &crate::operator::InvocationConfig::at(None, None),
                     &direct_test_target(&uri, false),
                     None,
+                    Some(crate::scope::WriteScope::Branch("search")),
                     &mut stderr,
                 )?;
                 rebuild_full_text_indexes(

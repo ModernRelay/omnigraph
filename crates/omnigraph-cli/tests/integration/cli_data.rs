@@ -4004,30 +4004,63 @@ fn branch_delete_rejects_main() {
 
 #[test]
 fn write_echoes_resolved_target_to_stderr() {
-    // Every write echoes its resolved target + access path to stderr; --json
-    // (stdout) is unaffected. A local load → "(direct, local)".
-    let temp = tempdir().unwrap();
-    let graph = graph_path(temp.path());
-    init_graph(&graph);
-    let data = fixture("test.jsonl");
-    let output = output_success(
-        cli()
-            .arg("load")
-            .arg("--mode")
-            .arg("append")
-            .arg("--data")
+    // Both default and explicit branches are visible without contaminating JSON.
+    for branch in [None, Some("review")] {
+        let temp = tempdir().unwrap();
+        let graph = graph_path(temp.path());
+        init_graph(&graph);
+        let data = fixture("test.jsonl");
+        let mut load = cli();
+        load.args(["load", "--mode", "append", "--data"])
             .arg(&data)
             .arg("--target")
             .arg(&graph)
-            .arg("--json"),
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("target ") && stderr.contains("(inline): direct graph "),
-        "missing write-target echo; stderr: {stderr}"
-    );
-    // stdout still parses as JSON — the echo went to stderr.
-    let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+            .arg("--json");
+        if let Some(branch) = branch {
+            load.args(["--branch", branch, "--from", "main"]);
+        }
+        let output = output_success(&mut load);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("(inline): direct graph "), "{stderr}");
+        let expected = format!("branch={}", branch.unwrap_or("main"));
+        assert!(stderr.contains(&expected), "missing branch: {stderr}");
+        let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+        let mut mutation = cli();
+        mutation
+            .args([
+                "mutate",
+                "-e",
+                "query add() { insert Person { name: \"new\" } }",
+                "--json",
+                "--target",
+            ])
+            .arg(&graph);
+        if let Some(branch) = branch {
+            mutation.args(["--branch", branch]);
+        }
+        let output = output_success(&mut mutation);
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&expected));
+        let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+        // A GQ control statement chooses its own destination, not main or the
+        // branch the previous invocation happened to use.
+        let output = output_success(
+            cli()
+                .args([
+                    "mutate",
+                    "-e",
+                    "branch create statement_branch",
+                    "--json",
+                    "--target",
+                ])
+                .arg(&graph),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("branch=statement_branch"), "{stderr}");
+        assert!(!stderr.contains("branch=main"), "{stderr}");
+        let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+    }
 }
 
 #[test]

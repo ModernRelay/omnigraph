@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use lance::io::{ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
-use lance_io::object_store::{ObjectStore, ObjectStoreProvider};
+use lance_io::object_store::{ObjectStore, ObjectStoreProvider, StorageOptions};
 use object_store::{aws::AmazonS3ConfigKey, azure::AzureConfigKey, path::Path};
 use omnigraph_storage::{CapturedStorageBinding, StorageIoScope, StorageKind};
 use std::{collections::HashMap, str::FromStr, sync::Arc};
@@ -80,9 +80,21 @@ impl ObjectStoreProvider for BoundProvider {
                 "a captured target cannot accept a dynamic storage-option provider; native credential refresh remains available",
             ));
         }
+        // Resolve the native provider's own environment merge before handing
+        // it a complete map. Azure retains its first environment snapshot;
+        // validating only today's process environment would miss that cache.
+        let mut options = StorageOptions::new(self.options(params.storage_options()));
+        match self.binding.kind() {
+            StorageKind::S3 => options.with_env_s3(),
+            StorageKind::Azure => options.with_env_azure(),
+            StorageKind::Local => {}
+        }
+        self.binding
+            .validate_native_options(&options.0)
+            .map_err(|error| lance_core::Error::invalid_input(error.to_string()))?;
         let mut params = params.clone();
         params.storage_options_accessor = Some(Arc::new(
-            StorageOptionsAccessor::with_static_options(self.options(params.storage_options())),
+            StorageOptionsAccessor::with_static_options(options.0),
         ));
         self.inner.new_store(base_path, &params).await
     }

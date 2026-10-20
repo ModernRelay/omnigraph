@@ -15,8 +15,8 @@ use crate::operator::InvocationConfig;
 use crate::output::write_json;
 use crate::targets::refusal;
 use crate::targets::{
-    self, ConfigEditLock, ResolvedTarget, ServerAuth, TARGET_PROTOCOL, TargetBinding, TargetEntry,
-    TargetOutput, TargetProvenance,
+    self, CREDENTIAL_PROTOCOL, ConfigEditLock, ResolvedTarget, ServerAuth, TARGET_PROTOCOL,
+    TargetBinding, TargetEntry, TargetOutput, TargetProvenance,
 };
 
 /// The most a `target add` entry on stdin may hold.
@@ -381,7 +381,7 @@ pub(crate) fn run_credential(
             if json {
                 return write_json(
                     &CredentialOutput {
-                        protocol: TARGET_PROTOCOL,
+                        protocol: CREDENTIAL_PROTOCOL,
                         target: name,
                         owner,
                         endpoint,

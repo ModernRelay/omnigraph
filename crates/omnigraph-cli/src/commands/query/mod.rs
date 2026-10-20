@@ -187,8 +187,9 @@ pub(crate) async fn run_mutate(
         },
         client.is_remote(),
     )?;
+    crate::scope::report_write_scope(operation.write_scope(branch.as_deref()), stderr)?;
     let output: ChangeOutput = match operation {
-        MutationOperation::AdHoc(source) => {
+        MutationOperation::AdHoc { source, .. } => {
             client
                 .mutate(
                     branch.as_deref(),

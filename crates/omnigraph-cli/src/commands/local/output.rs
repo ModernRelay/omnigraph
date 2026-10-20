@@ -45,9 +45,15 @@ pub(crate) struct VersionOutput {
     /// The full commit a packaged build was compiled from; null otherwise.
     pub(crate) commit: Option<&'static str>,
     pub(crate) http_contract: &'static str,
-    /// Protocol used by target administration and credential JSON reports.
-    pub(crate) target_protocol: u32,
+    /// Versions of the machine-readable CLI command contracts.
+    pub(crate) protocols: ProtocolVersionsOutput,
     pub(crate) internal_schema: InternalSchemaOutput,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProtocolVersionsOutput {
+    pub(crate) target: u32,
+    pub(crate) credential: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,7 +85,10 @@ impl VersionOutput {
             channel: omnigraph_api_types::build::RELEASE_CHANNEL,
             commit: omnigraph_api_types::build::SOURCE_COMMIT,
             http_contract: omnigraph_api_types::HTTP_API_CONTRACT,
-            target_protocol: crate::targets::TARGET_PROTOCOL,
+            protocols: ProtocolVersionsOutput {
+                target: crate::targets::TARGET_PROTOCOL,
+                credential: crate::targets::CREDENTIAL_PROTOCOL,
+            },
             internal_schema: InternalSchemaOutput {
                 writes: INTERNAL_MANIFEST_SCHEMA_VERSION,
                 serves: [
