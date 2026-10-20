@@ -133,7 +133,9 @@ and `tests/integration/lane_b.rs`.
   exercises the same constructors as the hunt and fleet, including the
   hunt's probe pass. Returned table errors are attributed; native-fork
   reconciliation failures reported only through tracing are outside this
-  deferral channel.
+  deferral channel. Windows no universe can cross are named with their
+  reasons in `harness::REACH_EXPECTED_DARK`: the reach census asserts that
+  list, and the hunt and the fleet do not schedule its windows.
 - **Injected storage faults**: `Scenario::faults` installs a seeded `FaultPlan`
   on the adapter and optionally Lance. Latency uses virtual time. Lance supports
   errors, latency and lost acknowledgements; adapter text corruption and
