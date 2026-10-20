@@ -2743,7 +2743,7 @@ fn openapi_describes_api_contract_admission_and_response_identity() {
                 assert!(
                     parameters
                         .iter()
-                        .any(|parameter| parameter["name"] == "Omnigraph-Expect-Actor"),
+                        .any(|parameter| parameter["name"] == "Omnigraph-If-Actor"),
                     "{method} {path}"
                 );
                 // The router's own refusals reach every protected operation,

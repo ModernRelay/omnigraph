@@ -53,7 +53,7 @@ pub(crate) struct Cli {
 
     /// Actor id for direct-engine writes and actor-bound cluster operations;
     /// overrides `operator.actor`. On a served write it is an assertion: the
-    /// request carries `omnigraph-expect-actor`, and the server refuses it
+    /// request carries `omnigraph-if-actor`, and the server refuses it
     /// before anything runs when the bearer token resolves to another actor.
     /// With a policy configured but no actor set, a direct operation is
     /// denied — see docs/user/operations/policy.md.

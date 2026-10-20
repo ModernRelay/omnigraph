@@ -3769,11 +3769,11 @@ fn server_scope_refuses_a_non_server_scheme_issue_979() {
 fn as_on_a_served_write_asserts_the_actor() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
     use omnigraph_api_types::{
-        EXPECT_ACTOR_HEADER, HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
+        HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER, IF_ACTOR_HEADER,
     };
 
     // A served write resolves its actor from the bearer token. `--as` rides
-    // along as `omnigraph-expect-actor`, and the server's refusal of another
+    // along as `omnigraph-if-actor`, and the server's refusal of another
     // actor is a condition the caller set: nothing ran, exit 4.
     let writes: [&[&str]; 3] = [
         &[
@@ -3818,7 +3818,7 @@ fn as_on_a_served_write_asserts_the_actor() {
         assert_eq!(
             write_request
                 .headers
-                .get(EXPECT_ACTOR_HEADER)
+                .get(IF_ACTOR_HEADER)
                 .map(String::as_str),
             Some("act-nope"),
             "{write:?}: {write_request:?}"

@@ -84,7 +84,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -206,7 +206,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -306,7 +306,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -501,7 +501,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -654,7 +654,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -776,7 +776,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -878,7 +878,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -1052,7 +1052,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1198,7 +1198,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -1341,7 +1341,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1389,7 +1389,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -1532,7 +1532,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1609,7 +1609,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -1731,7 +1731,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1967,7 +1967,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -2257,7 +2257,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not strongly match the selected managed Blob validator; actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "If-Match did not strongly match the selected managed Blob validator; actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Accept-Ranges": {
                 "schema": {
@@ -2503,7 +2503,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -2707,7 +2707,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator; actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator; actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "ETag": {
                 "schema": {
@@ -2944,7 +2944,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -3108,7 +3108,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator; actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator; actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "ETag": {
                 "schema": {
@@ -3369,7 +3369,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -3565,7 +3565,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not strongly match the selected managed Blob validator; HEAD responses have no body; actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "If-Match did not strongly match the selected managed Blob validator; HEAD responses have no body; actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Accept-Ranges": {
                 "schema": {
@@ -3686,7 +3686,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -3829,7 +3829,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -3940,7 +3940,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -4156,7 +4156,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -4363,7 +4363,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -4548,7 +4548,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -4703,7 +4703,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -4898,7 +4898,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -5071,7 +5071,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -5214,7 +5214,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -5357,7 +5357,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -5500,7 +5500,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -5703,7 +5703,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -5888,7 +5888,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -6043,7 +6043,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -6217,7 +6217,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -6418,7 +6418,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -6561,7 +6561,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -6704,7 +6704,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -6847,7 +6847,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -6967,7 +6967,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -7103,7 +7103,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -7292,7 +7292,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -7456,7 +7456,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -7620,7 +7620,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -7763,7 +7763,7 @@
             }
           },
           "412": {
-            "description": "The target head moved past the commit's captured parent; the commit can only be dropped; actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "The target head moved past the commit's captured parent; the commit can only be dropped; actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -7949,7 +7949,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -8113,7 +8113,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -8268,7 +8268,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -8459,7 +8459,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -8614,7 +8614,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -8809,7 +8809,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -8991,7 +8991,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -9187,7 +9187,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -9363,7 +9363,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -9558,7 +9558,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -9722,7 +9722,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -9917,7 +9917,7 @@
             }
           },
           "412": {
-            "description": "Graph-commit precondition failed; the write had no effect; actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "Graph-commit precondition failed; the write had no effect; actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -10072,7 +10072,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -10215,7 +10215,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -10337,7 +10337,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -10538,7 +10538,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -10732,7 +10732,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -10933,7 +10933,7 @@
             }
           },
           "412": {
-            "description": "Stored mutation graph-commit precondition failed; the write had no effect; actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "Stored mutation graph-commit precondition failed; the write had no effect; actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11109,7 +11109,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -11304,7 +11304,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11459,7 +11459,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -11602,7 +11602,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11723,7 +11723,7 @@
             }
           },
           {
-            "name": "Omnigraph-Expect-Actor",
+            "name": "Omnigraph-If-Actor",
             "in": "header",
             "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
             "required": false,
@@ -11866,7 +11866,7 @@
             }
           },
           "412": {
-            "description": "actor_mismatch when Omnigraph-Expect-Actor names another actor than the credential resolves to",
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -13436,7 +13436,7 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "The registry of error codes. A server sends each code under the HTTP statuses named with it; a code without one never appears in an HTTP response.\n\n- `unauthorized` (401): The request carries no credential the server accepts: a bearer token is missing, unknown or expired. Supply one the server is configured to verify.\n- `forbidden` (403): The credential's actor may not do this: policy denies the action, or the action needs a policy permit the server has not been given.\n- `bad_request` (400): The request is malformed or invalid: a body, query string, path parameter or header that does not decode, a query the compiler refuses (see `diagnostic`), or a value refused before any effect.\n- `api_contract_mismatch` (400): The request lacks exactly one `Omnigraph-Http-Api` header naming the contract this server speaks. Authentication and this check precede graph access and effects.\n- `actor_mismatch` (412): The request's `Omnigraph-Expect-Actor` header names another actor than its credential resolves to. Nothing ran.\n- `outcome_unknown` (500): A write whose completion the server could not settle: it may or may not have published. Read the target before writing again; never replay the write blindly. An MCP write call that was cancelled or passed its deadline answers it too.\n- `precondition_failed` (412): A request precondition no longer holds: the branch head moved past `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's `If-Match` names a value the cell no longer holds (a write's `blob_precondition_failure` names the current one). Nothing was written.\n- `recovery_required` (503): An overlapping durable recovery intent must be resolved first; see `recovery_required`.\n- `external_blob_source` (424): An admitted external Blob source could not be probed or read; see `external_blob_source`.\n- `change_feed_gap` (410): Retained history can no longer reconstruct a change continuation; see `change_feed_gap`. Resume from a new baseline.\n- `not_found` (404): The graph, branch, commit, query, entity or route the request names does not exist, or the caller may not learn that it does.\n- `method_not_allowed` (405): The request path is served, but not with the request's method.\n- `request_timeout` (408): The request body did not arrive before its deadline; nothing was admitted.\n- `conflict` (409): The request conflicts with the graph's current state: a concurrent change, an existing id, a merge conflict, an index that must be built first, or a commit that cannot be diffed. The details say which.\n- `branch_start_refusal` (409, 410): `branch create` could not start the branch at the commit `from_commit` named, and nothing was created; see `branch_start_refusal`, whose `not_retained` reason answers 410.\n- `unattached_cannot_publish` (409): The commit is an unattached snapshot, a kind that never publishes. Distinct from `conflict`, the authority-moved refusal of a publishable proposal.\n- `payload_too_large` (413): The request body, or the work it asks for, exceeds a bounded limit; `resource_limit` names the limit when it is the operation's. Split or reduce the request.\n- `unsupported_media_type` (415): The request body's content type is not one the route accepts.\n- `range_not_satisfiable` (416): The requested Blob byte range lies outside the value; see `blob_range`.\n- `too_many_requests` (429): Admission capacity is exhausted: an actor's, the server's, or the MCP endpoint's concurrent tool calls. Nothing started; retry after `Retry-After`.\n- `service_unavailable` (503): Operation admission is closed, or a deployment observation raced an owner change. Nothing started; retry after `Retry-After`, reconciling any earlier write first.\n- `graph_unavailable` (503): A known graph is not being served. The request did not start, so it may be retried once the graph is served again.\n- `internal` (500): The server failed. An error before any write took no effect; see the server log.\n- `cancelled` (no HTTP status): MCP only: the client cancelled a read tool call. A cancelled write answers `outcome_unknown`.\n- `deadline_exceeded` (no HTTP status): MCP only: a read tool call passed its deadline. A write that does answers `outcome_unknown`.\n- `result_too_large` (no HTTP status): MCP only: a tool result exceeds the result limit. Narrow the read.",
+        "description": "The registry of error codes. A server sends each code under the HTTP statuses named with it; a code without one never appears in an HTTP response.\n\n- `unauthorized` (401): The request carries no credential the server accepts: a bearer token is missing, unknown or expired. Supply one the server is configured to verify.\n- `forbidden` (403): The credential's actor may not do this: policy denies the action, or the action needs a policy permit the server has not been given.\n- `bad_request` (400): The request is malformed or invalid: a body, query string, path parameter or header that does not decode, a query the compiler refuses (see `diagnostic`), or a value refused before any effect.\n- `api_contract_mismatch` (400): The request lacks exactly one `Omnigraph-Http-Api` header naming the contract this server speaks. Authentication and this check precede graph access and effects.\n- `actor_mismatch` (412): The request's `Omnigraph-If-Actor` header names another actor than its credential resolves to. Nothing ran.\n- `outcome_unknown` (500): A write whose completion the server could not settle: it may or may not have published. Read the target before writing again; never replay the write blindly. An MCP write call that was cancelled or passed its deadline answers it too.\n- `precondition_failed` (412): A request precondition no longer holds: the branch head moved past `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's `If-Match` names a value the cell no longer holds (a write's `blob_precondition_failure` names the current one). Nothing was written.\n- `recovery_required` (503): An overlapping durable recovery intent must be resolved first; see `recovery_required`.\n- `external_blob_source` (424): An admitted external Blob source could not be probed or read; see `external_blob_source`.\n- `change_feed_gap` (410): Retained history can no longer reconstruct a change continuation; see `change_feed_gap`. Resume from a new baseline.\n- `not_found` (404): The graph, branch, commit, query, entity or route the request names does not exist, or the caller may not learn that it does.\n- `method_not_allowed` (405): The request path is served, but not with the request's method.\n- `request_timeout` (408): The request body did not arrive before its deadline; nothing was admitted.\n- `conflict` (409): The request conflicts with the graph's current state: a concurrent change, an existing id, a merge conflict, an index that must be built first, or a commit that cannot be diffed. The details say which.\n- `branch_start_refusal` (409, 410): `branch create` could not start the branch at the commit `from_commit` named, and nothing was created; see `branch_start_refusal`, whose `not_retained` reason answers 410.\n- `unattached_cannot_publish` (409): The commit is an unattached snapshot, a kind that never publishes. Distinct from `conflict`, the authority-moved refusal of a publishable proposal.\n- `payload_too_large` (413): The request body, or the work it asks for, exceeds a bounded limit; `resource_limit` names the limit when it is the operation's. Split or reduce the request.\n- `unsupported_media_type` (415): The request body's content type is not one the route accepts.\n- `range_not_satisfiable` (416): The requested Blob byte range lies outside the value; see `blob_range`.\n- `too_many_requests` (429): Admission capacity is exhausted: an actor's, the server's, or the MCP endpoint's concurrent tool calls. Nothing started; retry after `Retry-After`.\n- `service_unavailable` (503): Operation admission is closed, or a deployment observation raced an owner change. Nothing started; retry after `Retry-After`, reconciling any earlier write first.\n- `graph_unavailable` (503): A known graph is not being served. The request did not start, so it may be retried once the graph is served again.\n- `internal` (500): The server failed. An error before any write took no effect; see the server log.\n- `cancelled` (no HTTP status): MCP only: the client cancelled a read tool call. A cancelled write answers `outcome_unknown`.\n- `deadline_exceeded` (no HTTP status): MCP only: a read tool call passed its deadline. A write that does answers `outcome_unknown`.\n- `result_too_large` (no HTTP status): MCP only: a tool result exceeds the result limit. Narrow the read.",
         "enum": [
           "unauthorized",
           "forbidden",
