@@ -1,5 +1,5 @@
 //! `PairBuffer`: the one output buffer of both joins, over the left side they
-//! collect (`collect_left`): the `(left row, right row)` index pairs of each
+//! collect (`CollectedSide`): the `(left row, right row)` index pairs of each
 //! right batch, filtered and re-batched to the batch size. It chooses no pair.
 
 use std::mem::size_of;
@@ -8,39 +8,16 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::{DataFusionError, Result as DfResult};
-use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::StreamExt;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
 
 use super::filter::conjoined_mask;
 use super::memory::WorkMemory;
-use super::producer::BatchSender;
+use super::shape::BatchSender;
 use super::{conform, external};
 use crate::engine::scan::hconcat_batches;
 
 /// The refusal name the pool reports when an output batch does not fit.
 const OUTPUT: &str = "cross join output";
-
-/// The left input as one held batch charged as `owner`; `input_rows` counts
-/// the streamed right side alone, whose batches bound each output.
-pub(super) async fn collect_left(
-    mut left: SendableRecordBatchStream,
-    schema: &SchemaRef,
-    memory: &WorkMemory,
-    owner: &str,
-) -> DfResult<RecordBatch> {
-    let held = memory.child(owner)?;
-    let mut batches = Vec::new();
-    while let Some(batch) = left.next().await {
-        let batch = batch?;
-        held.hold(&batch)?;
-        held.entries::<RecordBatch>(1)?;
-        batches.push(batch);
-    }
-    let batch = held.concat(schema, &batches)?;
-    memory.hold(&batch)?;
-    Ok(batch)
-}
 
 /// The rows of `batch` as `u32` indices into it.
 fn row_count(batch: &RecordBatch, side: &str) -> DfResult<u32> {
@@ -301,10 +278,13 @@ mod tests {
     use datafusion::execution::memory_pool::MemoryPool;
     use omnigraph_compiler::query::ast::{CompOp, Literal};
 
+    use datafusion::physical_plan::SendableRecordBatchStream;
+    use futures::StreamExt;
+
     use super::*;
     use crate::engine::operators::fixtures::{context, pairs, text_batch, text_pairs};
     use crate::engine::operators::joined_schema;
-    use crate::engine::operators::producer::producer_stream;
+    use crate::engine::operators::shape::Source;
 
     fn matters(values: &[(&str, &str)]) -> RecordBatch {
         text_batch(["m.mid", "m.number"], values)
@@ -327,7 +307,7 @@ mod tests {
         let schema = joined_schema(&left.schema(), &batches[0].0.schema()).unwrap();
         let declared = Arc::clone(&schema);
         let memory = Arc::new(WorkMemory::new(ctx, "test join").unwrap());
-        let stream = producer_stream(schema, memory, None, move |memory, sender| async move {
+        let stream = Source::inner(schema, memory, move |memory, sender| async move {
             let mut buffer = PairBuffer::new(
                 left,
                 declared,
@@ -474,7 +454,7 @@ mod tests {
             ),
         );
         let memory = Arc::new(WorkMemory::new(ctx, "test join").unwrap());
-        let stream = producer_stream(schema, memory, None, move |memory, sender| async move {
+        let stream = Source::inner(schema, memory, move |memory, sender| async move {
             let mut buffer = PairBuffer::new(
                 left,
                 declared,

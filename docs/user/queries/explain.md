@@ -236,8 +236,9 @@ profile is returned beside the rows by the run that produced them
 entries (on every planner document since version 7, on diff and merge
 documents only before it) carry a pipeline `id` and `depends_on`, with
 `source`, `operators` and `sink` as objects whose `id` joins the
-`physical_plan` node ids; the engine refuses to lower a plan whose operator
-declares an emission other than the cut the document prints. Saved physical
+`physical_plan` node ids; an operator's emission is set by the shape wrapper
+the engine builds its stream through, the one the planner's cut names, so the
+printed pipelines are the executed ones. Saved physical
 plans use a `bound_plan_version: 9` envelope whose `body` contains `plan` and
 `values`. Unversioned plans and other versions are refused with a regeneration
 instruction, including plans without traversal nodes.

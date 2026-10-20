@@ -12,14 +12,15 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 
-use super::{breaker_properties, breaker_stream, external, polled};
+use super::external;
+use super::shape::{Breaker, work};
 use crate::db::Snapshot;
 use crate::error::OmniError;
 
 pub(crate) struct MetadataCountExec {
     type_key: String,
     snapshot: Snapshot,
-    properties: Arc<PlanProperties>,
+    shape: Breaker,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -28,7 +29,7 @@ impl MetadataCountExec {
         Self {
             type_key,
             snapshot,
-            properties: breaker_properties(schema),
+            shape: Breaker::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -58,7 +59,7 @@ impl ExecutionPlan for MetadataCountExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -82,12 +83,10 @@ impl ExecutionPlan for MetadataCountExec {
         let snapshot = self.snapshot.clone();
         let type_key = self.type_key.clone();
         let schema = self.schema();
-        let stream = breaker_stream(
-            "MetadataCountExec",
-            Arc::clone(&schema),
-            &ctx,
-            &self.metrics,
-            move |memory| async move {
+        let memory = work(ctx, "MetadataCountExec", &self.metrics)?;
+        Ok(self
+            .shape
+            .stream(memory, &self.metrics, move |memory| async move {
                 let dataset = snapshot
                     .open_lance_dataset(&type_key)
                     .await
@@ -103,8 +102,6 @@ impl ExecutionPlan for MetadataCountExec {
                 let value: ArrayRef = Arc::new(Int64Array::from(vec![count]));
                 let columns = schema.fields().iter().map(|_| Arc::clone(&value)).collect();
                 RecordBatch::try_new(schema, columns).map_err(Into::into)
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+            }))
     }
 }
