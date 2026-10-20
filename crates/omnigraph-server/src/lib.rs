@@ -3423,7 +3423,7 @@ pub fn build_app(state: AppState) -> Router {
     //   4. `resolve_graph_handle` — captures `serving::GraphRequest` based on
     //      the active mode (single: the only handle; multi: lookup by
     //      `{graph_id}` in the URI path).
-    let per_graph_protected = Router::new()
+    let per_graph_routes = Router::new()
         .route("/snapshot", get(server_snapshot))
         .route("/access", get(server_access))
         // Register HEAD explicitly. Axum's GET fallback would invoke the GET
@@ -3475,17 +3475,13 @@ pub fn build_app(state: AppState) -> Router {
         .route("/commits/{commit_id}/changes", get(server_commit_changes))
         .route("/diff", get(server_diff))
         .route("/changes", get(server_changes_feed))
-        .route("/changes/baseline", post(server_changes_baseline))
-        .route_layer(middleware::from_fn_with_state(
+        .route("/changes/baseline", post(server_changes_baseline));
+    let per_graph_protected = guarded(&state, per_graph_routes, |routes| {
+        routes.route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,
         ))
-        .route_layer(middleware::from_fn(require_expected_actor))
-        .route_layer(middleware::from_fn(http_contract::require_contract))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer_auth,
-        ));
+    });
 
     // Management endpoints (`GET /graphs`) live alongside the per-graph
     // router. They go through bearer auth but NOT through
@@ -3493,54 +3489,34 @@ pub fn build_app(state: AppState) -> Router {
     //
     // Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not
     // exposed — inventory additions use the server-owned deployment route.
-    let management = Router::new()
-        .route("/graphs", get(server_graphs_list))
-        .route("/graphs/discovery", get(server_graphs_discovery))
-        .route_layer(middleware::from_fn(require_expected_actor))
-        .route_layer(middleware::from_fn(http_contract::require_contract))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer_auth,
-        ));
+    let management = guarded(
+        &state,
+        Router::new()
+            .route("/graphs", get(server_graphs_list))
+            .route("/graphs/discovery", get(server_graphs_discovery)),
+        |routes| routes,
+    );
 
-    let deployments = Router::new()
+    let deployment_routes = Router::new()
         .route("/cluster/plan", post(deployment::plan))
         .route(
             "/cluster/deployments",
             get(deployment::status).post(deployment::apply),
         )
-        .route("/cluster/deployments/{id}", get(deployment::lookup))
-        .layer(DefaultBodyLimit::max(deployment::REQUEST_BYTES))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            |State(state): State<AppState>, request: Request, next: Next| async move {
-                ingress::admit(&state, request, next).await
-            },
-        ))
-        .route_layer(middleware::from_fn(require_expected_actor))
-        .route_layer(middleware::from_fn(http_contract::require_contract))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer_auth,
-        ));
+        .route("/cluster/deployments/{id}", get(deployment::lookup));
+    let deployments = guarded(&state, deployment_routes, |routes| {
+        admitted(
+            &state,
+            routes.layer(DefaultBodyLimit::max(deployment::REQUEST_BYTES)),
+        )
+    });
 
-    let catalogue = Router::new()
+    let catalogue_routes = Router::new()
         .route("/query", post(handlers::catalogue::catalogue_query))
         .route("/schema", get(handlers::catalogue::catalogue_schema))
         .route("/{*rest}", any(handlers::catalogue::catalogue_refused))
-        .route("/", any(handlers::catalogue::catalogue_refused))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            |State(state): State<AppState>, request: Request, next: Next| async move {
-                ingress::admit(&state, request, next).await
-            },
-        ))
-        .route_layer(middleware::from_fn(require_expected_actor))
-        .route_layer(middleware::from_fn(http_contract::require_contract))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer_auth,
-        ));
+        .route("/", any(handlers::catalogue::catalogue_refused));
+    let catalogue = guarded(&state, catalogue_routes, |routes| admitted(&state, routes));
 
     // RFC-011 cluster-only: per-graph routes always nest under
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
@@ -3560,14 +3536,50 @@ pub fn build_app(state: AppState) -> Router {
     if state.has_credential_source() {
         app = app.merge(mcp::router(state.clone()));
     }
-    // After every route, so the method fallback reaches each of them, and
-    // inside the layers, so both answer with the contract header.
+    // The unrouted answer, and the method fallback of the public routes. A
+    // protected route already has its own, from `guarded`, which this one
+    // leaves alone. Inside the layers, so both answer with the contract
+    // header.
     app.fallback(unrouted)
         .method_not_allowed_fallback(method_not_served)
         .layer(middleware::from_fn(http_contract::identify_response))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// A protected router: its routes, then `inner` (the router's own layers),
+/// then the guards every protected router shares, outer first: bearer
+/// authentication, the HTTP contract and the actor assertion.
+///
+/// The method fallback goes on first, so the guards wrap it: a method the
+/// path does not serve is refused by them like one it serves, and a request
+/// learns which methods a path serves only once they admit it. Installed
+/// after the guards, as the router-wide fallback in `build_app` is, it would
+/// answer before them: axum replaces a route's default fallback wholesale,
+/// layers included.
+fn guarded(
+    state: &AppState,
+    routes: Router<AppState>,
+    inner: impl FnOnce(Router<AppState>) -> Router<AppState>,
+) -> Router<AppState> {
+    inner(routes.method_not_allowed_fallback(method_not_served))
+        .route_layer(middleware::from_fn(require_expected_actor))
+        .route_layer(middleware::from_fn(http_contract::require_contract))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_auth,
+        ))
+}
+
+/// `routes` behind workload admission.
+fn admitted(state: &AppState, routes: Router<AppState>) -> Router<AppState> {
+    routes.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        |State(state): State<AppState>, request: Request, next: Next| async move {
+            ingress::admit(&state, request, next).await
+        },
+    ))
 }
 
 /// An unrouted path answers the error body every other refusal does.
