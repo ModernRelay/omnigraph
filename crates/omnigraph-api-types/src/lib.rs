@@ -27,11 +27,18 @@ use utoipa::{IntoParams, ToSchema};
 /// re-exported so a wire consumer needs no second dependency for it.
 pub use omnigraph_compiler::settings;
 
-/// The single request/response discriminator for the v0.13 HTTP contract.
+/// The single request/response discriminator for the v0.14 HTTP contract.
 /// This is independent of the package version and graph-storage stamp.
 pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
 /// Exact header value; consumers must reject missing or repeated values.
-pub const HTTP_API_CONTRACT: &str = "0.13";
+pub const HTTP_API_CONTRACT: &str = "0.14";
+/// An optional request header naming the actor the caller expects its
+/// credential to resolve to. The server refuses a mismatch with
+/// [`ErrorCode::ActorMismatch`] before graph lookup or effects; a matching
+/// value changes nothing, so the header can only narrow a request. Contract
+/// 0.14 introduced it, so a server that speaks [`HTTP_API_CONTRACT`] enforces
+/// it and an older one refuses the request before reading the header.
+pub const IF_ACTOR_HEADER: &str = "omnigraph-if-actor";
 
 /// How a binary identifies its build: the one derivation the CLI's
 /// `omnigraph version`, the server's `/healthz` and its MCP server info all
@@ -2014,6 +2021,9 @@ pub enum ErrorCode {
     /// 400: the request lacks the exact supported HTTP contract header.
     /// Authentication and contract admission precede graph access and effects.
     ApiContractMismatch,
+    /// 412: the request's `omnigraph-if-actor` header names another actor
+    /// than its credential resolves to. Nothing ran.
+    ActorMismatch,
     NotFound,
     /// 405 Method Not Allowed — the route exists but the active server
     /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph

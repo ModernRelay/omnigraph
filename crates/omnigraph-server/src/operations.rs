@@ -271,6 +271,14 @@ impl OperationRuntime {
                     );
                 }
                 let owner = if result.uncertain {
+                    // The failure's class was logged in this request's span
+                    // when the engine error was mapped.
+                    if let Err(error) = &result.result {
+                        tracing::error!(
+                            status = %error.status,
+                            "owned write ended without a definite outcome"
+                        );
+                    }
                     owner.finish(true);
                     None
                 } else {

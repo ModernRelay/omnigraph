@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use color_eyre::Result;
 use color_eyre::eyre::bail;
-use omnigraph_api_types::{ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
+use omnigraph_api_types::{
+    ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER, IF_ACTOR_HEADER,
+};
 use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 
@@ -295,6 +297,10 @@ pub(crate) struct GraphHttpClient {
     /// Why this client's requests carry no credential, attached to a 401
     /// response so its refusal says how to bind one.
     missing_credential: Option<Box<MissingCredential>>,
+    /// The actor `--as` asserts, sent as `omnigraph-if-actor` on every
+    /// data request, so the server refuses a credential that resolves to
+    /// another actor before anything runs.
+    expected_actor: Option<String>,
     /// Self-hosted requests retain the selected owner across every composed route.
     /// Managed authority is independent and never uses operator server declarations.
     request_scope: Option<crate::targets::ServerRequestScope>,
@@ -373,6 +379,7 @@ impl GraphHttpClient {
             transport,
             health_url,
             missing_credential: None,
+            expected_actor: None,
             request_scope: None,
         })
     }
@@ -394,6 +401,12 @@ impl GraphHttpClient {
         self
     }
 
+    /// Assert `actor` on every data request this client sends.
+    pub(crate) fn with_expected_actor(mut self, actor: Option<&str>) -> Self {
+        self.expected_actor = actor.map(str::to_owned);
+        self
+    }
+
     /// Blob delivery retains its existing streaming deadline instead of
     /// inheriting the managed JSON request's total thirty-second deadline.
     pub(crate) fn blob_delivery(&self) -> Result<Self> {
@@ -402,6 +415,7 @@ impl GraphHttpClient {
             transport: self.transport.clone(),
             health_url: self.health_url.clone(),
             missing_credential: self.missing_credential.clone(),
+            expected_actor: self.expected_actor.clone(),
             request_scope: self.request_scope.clone(),
         })
     }
@@ -415,9 +429,11 @@ impl GraphHttpClient {
     }
 
     pub(crate) async fn send(&self, request: RequestBuilder) -> Result<Response> {
-        let request = request
-            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .build()?;
+        let mut request = request.header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT);
+        if let Some(actor) = &self.expected_actor {
+            request = request.header(IF_ACTOR_HEADER, actor);
+        }
+        let request = request.build()?;
         // Validate the exact route before even public discovery. A nested endpoint
         // declaration cannot silently replace the already captured credential owner.
         self.validate_scope(request.url())?;

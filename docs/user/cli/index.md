@@ -164,8 +164,8 @@ A token is sent only within its configured endpoint scope: the same scheme,
 host, port and path boundary. The deepest configured scope wins. Editing an
 endpoint does not move an existing saved token to the new endpoint. Inline
 server addresses use a matching configured owner, or send no credential.
-The server resolves the actor from the token; clients cannot override it with
-`--as`.
+The server resolves the actor from the token; on a served write `--as` only
+asserts it.
 
 ### Use a server through a Unix socket
 

@@ -72,7 +72,7 @@ cell:
 
 ```http
 PUT /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.13
+Omnigraph-Http-Api: 0.14
 Content-Type: application/octet-stream
 If-Match: "<current ETag>"
 
@@ -143,7 +143,7 @@ The CLI refuses input over 32 MiB and a malformed `--if-match` before it
 addresses the graph. The value must also fit `write_max_bytes`: the process's
 `OMNIGRAPH_WRITE_MAX_BYTES` for a `--target` write, the server's for a served
 one. `--as` names the actor of a `--target` write; a served
-write takes its actor from the bearer token. A served Blob `412` exits 4, as a
+write takes its actor from the bearer token, and `--as` there only asserts it. A served Blob `412` exits 4, as a
 graph-commit precondition does; an embedded one exits 1. Each write is sent
 once: after an unknown outcome, read the cell before writing again.
 
@@ -204,7 +204,7 @@ Servers expose the same logical selector with GET and HEAD:
 
 ```http
 GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.13
+Omnigraph-Http-Api: 0.14
 ```
 
 Both methods follow the [HTTP contract](operations/server.md#http-contract),

@@ -83,7 +83,8 @@ async fn execute(
         mut machine,
         explicit_config,
     } = parsed;
-    let observe = command_outcome::applies(&cli);
+    let classify = command_outcome::applies(&cli);
+    let observe = command_outcome::observes(&cli);
     // Rendering runs inside observation. The completion path retains that
     // same evidence when flushing, including after a dispatched write.
     // The dispatch future contains every command variant. Keep that
@@ -104,12 +105,20 @@ async fn execute(
     } else {
         (admission::scope(invocation).await, None)
     };
-    finish(result, evidence, machine, stdout, stderr)
+    let (evidence, observed) = if classify {
+        (evidence, None)
+    } else {
+        (None, evidence)
+    };
+    finish(result, evidence, observed, machine, stdout, stderr)
 }
 
+/// `evidence` classifies a data command's failure; `observed` only decides
+/// whether another command's refused `--as` assertion exits 4.
 fn finish(
     result: Result<Completion>,
     evidence: Option<command_outcome::Evidence>,
+    observed: Option<command_outcome::Evidence>,
     machine: Option<MachineErrors>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -212,6 +221,9 @@ fn finish(
         }
         return Ok(Completion::exit(failure.exit));
     }
+    let actor_refused = observed
+        .as_ref()
+        .is_some_and(|observed| command_outcome::actor_assertion_refused(&error, observed));
     if let Some(output) = error_output_of(&error) {
         let refusal = RemoteRefusalOutput {
             output: &output,
@@ -229,10 +241,18 @@ fn finish(
                     writeln!(stderr, "{}", render_diagnostic(&output, diagnostic))?;
                     stderr.flush()?;
                 }
+                None if actor_refused => {
+                    writeln!(stderr, "{}", output.error)?;
+                    stderr.flush()?;
+                }
                 None => return Err(error),
             },
         }
-        return Ok(Completion::exit(1));
+        return Ok(Completion::exit(if actor_refused {
+            EXIT_PRECONDITION_FAILED
+        } else {
+            1
+        }));
     }
     if let Some(contract) = error.downcast_ref::<graph_http::ApiContractError>() {
         match machine {

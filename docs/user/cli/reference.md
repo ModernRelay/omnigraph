@@ -28,10 +28,11 @@ relative filesystem address; a bare name selects a registered target.
 `init --schema graph.pg ./graph.omni` remains a creation convenience; it cannot
 be combined with `--target`.
 
-`--as ACTOR` attributes supported direct operations. Served targets derive their
-actor from credentials and refuse `--as`. `--yes` supplies noninteractive consent
-for destructive operations on nonlocal storage. The retired `--quiet` cannot
-hide the destination.
+`--as ACTOR` attributes supported direct operations. A served target derives its
+actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
+exiting 4 on a mismatch ([Assert the actor](../operations/server.md#assert-the-actor));
+a managed target refuses it. `--yes` supplies noninteractive consent for destructive
+operations on nonlocal storage. The retired `--quiet` cannot hide the destination.
 
 ## Commands
 

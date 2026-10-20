@@ -32,7 +32,15 @@ pub(crate) async fn run(
         .target
         .ok_or_else(|| color_eyre::eyre::eyre!("cluster operation requires a target"))?;
     if matches!(target.binding, TargetBinding::Server { .. }) {
-        crate::cluster_remote::run(scope.operator, &command, target, stdout, stderr).await?;
+        crate::cluster_remote::run(
+            scope.operator,
+            &command,
+            target,
+            scope.actor,
+            stdout,
+            stderr,
+        )
+        .await?;
         return Ok(Completion::success());
     }
     let TargetBinding::DirectRoot { uri: root, .. } = &target.binding else {
