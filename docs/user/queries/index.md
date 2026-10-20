@@ -42,6 +42,10 @@ parameter must be supplied; omission fails before query execution. A trailing
 `@instruction("...")` attach metadata for clients that expose stored queries
 as tools.
 
+A parameter carries the whole range of its declared type: a `U64` parameter
+takes every value from `0` to `18446744073709551615`. Send a 64-bit integer
+as a decimal string, so a value past 2^53 keeps every digit.
+
 ## Match patterns
 
 A match binds nodes and follows typed relationships. For edge alternatives,

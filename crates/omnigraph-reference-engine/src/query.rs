@@ -4460,12 +4460,13 @@ fn resolve_to_string(expr: &IRExpr, params: &ParamMap) -> Option<String> {
     }
 }
 
-/// Resolve an expression to an integer value (literal or param).
+/// Resolve an expression to an integer value (literal or param). A value
+/// outside v1's `i64` range has no v1 meaning and resolves to nothing.
 fn resolve_to_int(expr: &IRExpr, params: &ParamMap) -> Option<i64> {
     match expr {
-        IRExpr::Literal(Literal::Integer(n)) => Some(*n),
+        IRExpr::Literal(Literal::Integer(n)) => i64::try_from(*n).ok(),
         IRExpr::Param(name) => match params.get(name)? {
-            Literal::Integer(n) => Some(*n),
+            Literal::Integer(n) => i64::try_from(*n).ok(),
             _ => None,
         },
         _ => None,
@@ -4703,7 +4704,7 @@ fn literal_to_expr(lit: &Literal) -> Option<datafusion::prelude::Expr> {
     Some(match lit {
         Literal::Null => df_lit(datafusion::scalar::ScalarValue::Null),
         Literal::String(s) => df_lit(s.clone()),
-        Literal::Integer(n) => df_lit(*n),
+        Literal::Integer(n) => df_lit(i64::try_from(*n).ok()?),
         Literal::Float(f) => df_lit(*f),
         Literal::Bool(b) => df_lit(*b),
         // Date/DateTime pass through as strings here. Against a typed Date

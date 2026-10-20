@@ -102,82 +102,61 @@ impl ToParam for bool {
 
 impl ToParam for i8 {
     fn to_param(self) -> crate::error::Result<Literal> {
-        Ok(Literal::Integer(i64::from(self)))
+        Ok(Literal::Integer(i128::from(self)))
     }
 }
 
 impl ToParam for i16 {
     fn to_param(self) -> crate::error::Result<Literal> {
-        Ok(Literal::Integer(i64::from(self)))
+        Ok(Literal::Integer(i128::from(self)))
     }
 }
 
 impl ToParam for i32 {
     fn to_param(self) -> crate::error::Result<Literal> {
-        Ok(Literal::Integer(i64::from(self)))
+        Ok(Literal::Integer(i128::from(self)))
     }
 }
 
 impl ToParam for i64 {
     fn to_param(self) -> crate::error::Result<Literal> {
-        Ok(Literal::Integer(self))
+        Ok(Literal::Integer(i128::from(self)))
     }
 }
 
 impl ToParam for isize {
     fn to_param(self) -> crate::error::Result<Literal> {
-        let value = i64::try_from(self).map_err(|_| {
-            CompilerError::Execution(format!(
-                "param value {} exceeds current engine range for numeric literals (max {})",
-                self,
-                i64::MAX
-            ))
-        })?;
-        Ok(Literal::Integer(value))
+        Ok(Literal::Integer(i128::from(self)))
     }
 }
 
 impl ToParam for u8 {
     fn to_param(self) -> crate::error::Result<Literal> {
-        Ok(Literal::Integer(i64::from(self)))
+        Ok(Literal::Integer(i128::from(self)))
     }
 }
 
 impl ToParam for u16 {
     fn to_param(self) -> crate::error::Result<Literal> {
-        Ok(Literal::Integer(i64::from(self)))
+        Ok(Literal::Integer(i128::from(self)))
     }
 }
 
 impl ToParam for u32 {
     fn to_param(self) -> crate::error::Result<Literal> {
-        Ok(Literal::Integer(i64::from(self)))
+        Ok(Literal::Integer(i128::from(self)))
     }
 }
 
 impl ToParam for u64 {
     fn to_param(self) -> crate::error::Result<Literal> {
-        let value = i64::try_from(self).map_err(|_| {
-            CompilerError::Execution(format!(
-                "param value {} exceeds current engine range for numeric literals (max {})",
-                self,
-                i64::MAX
-            ))
-        })?;
-        Ok(Literal::Integer(value))
+        Ok(Literal::Integer(i128::from(self)))
     }
 }
 
 impl ToParam for usize {
     fn to_param(self) -> crate::error::Result<Literal> {
-        let value = i64::try_from(self).map_err(|_| {
-            CompilerError::Execution(format!(
-                "param value {} exceeds current engine range for numeric literals (max {})",
-                self,
-                i64::MAX
-            ))
-        })?;
-        Ok(Literal::Integer(value))
+        Ok(Literal::Integer(i128::from(self)))
     }
 }
 
@@ -392,7 +371,7 @@ fn json_value_to_literal_typed(
                 let value = i32::try_from(value).map_err(|_| {
                     RunInputError::message(format!("param '{}': value {} exceeds I32", key, value))
                 })?;
-                Ok(Literal::Integer(i64::from(value)))
+                Ok(Literal::Integer(i128::from(value)))
             }
             JsonParamMode::JavaScript => {
                 let value = parse_i64_param(key, value, mode)?;
@@ -402,10 +381,13 @@ fn json_value_to_literal_typed(
                         key, value
                     ))
                 })?;
-                Ok(Literal::Integer(i64::from(value)))
+                Ok(Literal::Integer(i128::from(value)))
             }
         },
-        "I64" => Ok(Literal::Integer(parse_i64_param(key, value, mode)?)),
+        "I64" => {
+            let value = parse_i64_param(key, value, mode)?;
+            Ok(Literal::Integer(i128::from(value)))
+        }
         "U32" => {
             let value = parse_u64_param(key, value, mode)?;
             let value = match mode {
@@ -419,29 +401,11 @@ fn json_value_to_literal_typed(
                     ))
                 })?,
             };
-            Ok(Literal::Integer(i64::from(value)))
+            Ok(Literal::Integer(i128::from(value)))
         }
         "U64" => {
             let value = parse_u64_param(key, value, mode)?;
-            let value = match mode {
-                JsonParamMode::Standard => i64::try_from(value).map_err(|_| {
-                    RunInputError::message(format!(
-                        "param '{}': value {} exceeds current engine range for U64 (max {})",
-                        key,
-                        value,
-                        i64::MAX
-                    ))
-                })?,
-                JsonParamMode::JavaScript => i64::try_from(value).map_err(|_| {
-                    RunInputError::message(format!(
-                        "param '{}': value {} exceeds current engine range for U64 parameters (max {})",
-                        key,
-                        value,
-                        i64::MAX
-                    ))
-                })?,
-            };
-            Ok(Literal::Integer(value))
+            Ok(Literal::Integer(i128::from(value)))
         }
         "F32" | "F64" => {
             let value = value.as_f64().ok_or_else(|| match mode {
@@ -600,7 +564,7 @@ fn json_value_to_literal_inferred(
         Value::Number(number) => match mode {
             JsonParamMode::Standard => {
                 if let Some(value) = number.as_i64() {
-                    Ok(Literal::Integer(value))
+                    Ok(Literal::Integer(i128::from(value)))
                 } else if let Some(value) = number.as_f64() {
                     Ok(Literal::Float(value))
                 } else {
@@ -618,7 +582,7 @@ fn json_value_to_literal_inferred(
                             key, value
                         )));
                     }
-                    Ok(Literal::Integer(value))
+                    Ok(Literal::Integer(i128::from(value)))
                 } else if let Some(value) = number.as_u64() {
                     if value > JS_MAX_SAFE_INTEGER_U64 {
                         return Err(RunInputError::message(format!(
@@ -626,15 +590,7 @@ fn json_value_to_literal_inferred(
                             key, value
                         )));
                     }
-                    let value = i64::try_from(value).map_err(|_| {
-                        RunInputError::message(format!(
-                            "param '{}': integer {} exceeds supported range (max {})",
-                            key,
-                            value,
-                            i64::MAX
-                        ))
-                    })?;
-                    Ok(Literal::Integer(value))
+                    Ok(Literal::Integer(i128::from(value)))
                 } else if let Some(value) = number.as_f64() {
                     Ok(Literal::Float(value))
                 } else {
@@ -917,18 +873,39 @@ mod tests {
         assert!(matches!(date, Literal::Date(ref value) if value == "2026-03-06"));
     }
 
+    /// Issue 918: a `U64` parameter carries its whole range; the value is
+    /// narrowed only at a typed boundary, from the declared type.
     #[test]
-    fn to_param_rejects_unsigned_values_outside_engine_range() {
-        let error = u64::MAX.to_param().expect_err("oversized u64 should fail");
+    fn to_param_keeps_unsigned_values_above_the_signed_range_issue_918() {
+        let literal = u64::MAX.to_param().expect("u64 param");
 
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "execution error: param value {} exceeds current engine range for numeric literals (max {})",
-                u64::MAX,
-                i64::MAX
-            )
-        );
+        assert!(matches!(
+            literal,
+            Literal::Integer(value) if value == i128::from(u64::MAX)
+        ));
+    }
+
+    /// Issue 918: a `U64` parameter bound above `i64::MAX` binds, in the
+    /// decimal string form the wire uses for a 64-bit integer.
+    #[test]
+    fn a_u64_param_above_the_signed_range_binds_issue_918() {
+        let query = find_named_query(
+            "query find($id: U64) { match { $u: User } return { $u } }",
+            "find",
+        )
+        .expect("query should parse");
+
+        let params = json_params_to_param_map(
+            Some(&json!({ "id": "18446744073709551615" })),
+            &query.params,
+            JsonParamMode::Standard,
+        )
+        .expect("params should bind");
+
+        assert!(matches!(
+            params.get("id"),
+            Some(Literal::Integer(value)) if *value == i128::from(u64::MAX)
+        ));
     }
 
     #[test]

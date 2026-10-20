@@ -1405,7 +1405,7 @@ mod typed_search_value_tests {
     fn widened_integer(value: i64) -> IRExpr {
         IRExpr::Cast {
             expr: Box::new(IRExpr::Literal(
-                Literal::Integer(value),
+                Literal::Integer(i128::from(value)),
                 scalar(ScalarType::I32, false),
             )),
             ty: scalar(ScalarType::I64, false),
@@ -1473,7 +1473,7 @@ mod typed_search_value_tests {
             IRExpr::Literal(Literal::Null, scalar(ScalarType::I64, true)),
             IRExpr::Literal(Literal::Integer(-1), scalar(ScalarType::I64, false)),
             IRExpr::Literal(
-                Literal::Integer(i64::from(u32::MAX) + 1),
+                Literal::Integer(i128::from(u32::MAX) + 1),
                 scalar(ScalarType::I64, false),
             ),
             IRExpr::Param("missing".into(), scalar(ScalarType::I64, false)),
@@ -1511,7 +1511,7 @@ mod typed_search_value_tests {
 
     #[test]
     fn nearest_vector_conversion_preserves_the_recorded_list_domain() {
-        let value = (1_i64 << 62) + (1_i64 << 38) + 1;
+        let value = (1_i128 << 62) + (1_i128 << 38) + 1;
         let expected = 2_f32.powi(62);
         assert!(value as f32 > expected);
         let literal = Literal::List(vec![Literal::Integer(value)]);
