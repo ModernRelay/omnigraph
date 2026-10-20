@@ -1881,14 +1881,16 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(snapshot["graph_branch"], "main");
 
     // Authentication and policy refuse before admission or staging, so the CLI
-    // reports a write that never started and leaves no reconciliation to do.
+    // reports a write that never started and leaves no reconciliation to do: a
+    // credential to fix, or a policy to read again.
     let refused_before_effects = |output: &std::process::Output, status: u16| {
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         let body = parse_stdout_json(output);
         assert_eq!(body["http_status"], status, "{body}");
+        let action = if status == 401 { "fix" } else { "refresh" };
         assert_eq!(
             body["disposition"],
-            serde_json::json!({"effects":"none","action":"refresh"}),
+            serde_json::json!({"effects":"none","action":action}),
             "{body}"
         );
         body

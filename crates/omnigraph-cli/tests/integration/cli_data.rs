@@ -2515,7 +2515,7 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
         assert_eq!(
             error["disposition"],
             serde_json::json!({
-                "effects":"none", "action":"refresh"
+                "effects":"none", "action":"fix"
             })
         );
         let requests = server.requests();
@@ -3646,7 +3646,7 @@ fn as_on_a_served_write_asserts_the_actor() {
         assert_eq!(error["code"], "actor_mismatch", "{write:?}: {error}");
         assert_eq!(
             error["disposition"],
-            json!({"effects":"none","action":"refresh"}),
+            json!({"effects":"none","action":"fix"}),
             "{write:?}: {error}"
         );
         let requests = server.requests();
