@@ -1104,8 +1104,15 @@ pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Wr
 /// prints; a mutation's prints the affected counts.
 pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) -> Result<()> {
     match &output.outcome {
-        Some(BranchOutcomeOutput::Created { from, name }) => {
-            writeln!(writer, "created branch {name} from {from}")?;
+        Some(BranchOutcomeOutput::Created {
+            from,
+            name,
+            from_commit_id,
+        }) => {
+            writeln!(
+                writer,
+                "created branch {name} from {from} at {from_commit_id}"
+            )?;
         }
         Some(BranchOutcomeOutput::Deleted { name }) => writeln!(writer, "deleted branch {name}")?,
         Some(BranchOutcomeOutput::Merged {
