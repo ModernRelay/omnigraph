@@ -2522,7 +2522,7 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
         assert_eq!(
             error["disposition"],
             serde_json::json!({
-                "effects":"none", "action":"refresh"
+                "effects":"none", "action":"fix"
             })
         );
         let requests = server.requests();
@@ -2941,7 +2941,7 @@ fn an_embedded_load_reports_its_fork_from_the_engine() {
     assert_eq!(existing.status.code(), Some(1), "{existing:?}");
     assert_eq!(
         parse_stdout_json(&existing)["disposition"],
-        json!({"effects":"none","action":"refresh"}),
+        json!({"effects":"none","action":"fix"}),
         "{existing:?}"
     );
     assert_eq!(branches(), before, "no fork onto an existing branch");
@@ -2949,10 +2949,12 @@ fn an_embedded_load_reports_its_fork_from_the_engine() {
     let forked = load("fresh");
     assert_eq!(forked.status.code(), Some(2), "{forked:?}");
     let body = parse_stdout_json(&forked);
-    // The fork stands and the refused load wrote nothing.
+    // The fork published, and the engine marks the load's later error as
+    // following it without proving that the failing step wrote nothing, so
+    // the whole command's effects are unknown.
     assert_eq!(
         body["disposition"],
-        json!({"effects":"partial","action":"refresh"}),
+        json!({"effects":"unknown","action":"reconcile"}),
         "{body}"
     );
     assert!(branches().contains("fresh"), "the fork published");
@@ -3808,7 +3810,7 @@ fn as_on_a_served_write_asserts_the_actor() {
         assert_eq!(error["code"], "actor_mismatch", "{write:?}: {error}");
         assert_eq!(
             error["disposition"],
-            json!({"effects":"none","action":"refresh"}),
+            json!({"effects":"none","action":"fix"}),
             "{write:?}: {error}"
         );
         let requests = server.requests();
