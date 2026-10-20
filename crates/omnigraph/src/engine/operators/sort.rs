@@ -21,7 +21,8 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 
 use super::memory::WorkMemory;
-use super::{breaker_properties, breaker_stream, drain, empty_stream, external, polled};
+use super::shape::{Breaker, empty, work};
+use super::{drain, external};
 use crate::engine::lower::HIDDEN;
 use crate::error::{OmniError, Result};
 
@@ -40,7 +41,7 @@ pub(crate) struct SortExec {
     fetch: Option<usize>,
     /// The input columns the output keeps, in input order.
     visible: Vec<usize>,
-    properties: Arc<PlanProperties>,
+    shape: Breaker,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -77,7 +78,7 @@ impl SortExec {
             keys,
             fetch,
             visible,
-            properties: breaker_properties(schema),
+            shape: Breaker::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -124,7 +125,7 @@ impl ExecutionPlan for SortExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -156,21 +157,18 @@ impl ExecutionPlan for SortExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "SortExec has one partition");
-        let schema: SchemaRef = self.schema();
         if self.fetch == Some(0) {
-            return Ok(polled(&self.metrics, empty_stream(schema)));
+            return Ok(empty(&self.metrics, self.schema()));
         }
         let input_schema = self.input.schema();
         let input = self.input.execute(0, Arc::clone(&ctx))?;
+        let memory = work(ctx, "SortExec", &self.metrics)?;
         let keys = Arc::new(self.keys.clone());
         let fetch = self.fetch;
         let visible = self.visible.clone();
-        let stream = breaker_stream(
-            "SortExec",
-            schema,
-            &ctx,
-            &self.metrics,
-            move |reservation| async move {
+        Ok(self
+            .shape
+            .stream(memory, &self.metrics, move |reservation| async move {
                 let sorted = match fetch {
                     Some(fetch) => top_k(input, &input_schema, &keys, fetch, &reservation).await?,
                     None => {
@@ -184,9 +182,7 @@ impl ExecutionPlan for SortExec {
                     }
                 };
                 Ok(sorted.project(&visible)?)
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+            }))
     }
 }
 

@@ -14,11 +14,12 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 
-use super::expand::{ExpandExecution, ExpandStep, GraphEnv};
+use super::expand::{ExpandExecution, ExpandShape, ExpandStep, GraphEnv};
 use super::memory::WorkMemory;
-use super::producer::{BatchSender, producer_stream};
+use super::shape::{BatchSender, Flow, Source, Streamed, work};
 use super::{Switch, drain_one, external};
 use crate::engine::graph::{
     ExpandedPairs, PreparedEdge, bound_edge_pair_schema, execute_expand, prepare_selected_edges,
@@ -33,25 +34,36 @@ use crate::table_store::ORDERED_SCAN_EXECUTION_BATCH_ROWS;
 /// the picked bytes, so the chunk bounds that reservation by row width.
 pub(super) const EXPAND_OUTPUT_ROWS: usize = 256;
 
-/// The `switch` gauge on `metrics` records the mode the traversal ends on,
-/// one side of the `Expand` node's declared switch.
+/// The traversal's stream through the shape its operator holds: a one-hop
+/// or budgeted step is driven one input batch at a time, a costed multi-hop
+/// step holds its whole input first. The `switch` gauge on `metrics` records
+/// the mode the traversal ends on, one side of the `Expand` node's declared
+/// switch. The input executes under `ctx` as given; the traversal's own
+/// reservation clamps its batch size to `EXPAND_OUTPUT_ROWS`.
 pub(super) fn execute(
-    input: SendableRecordBatchStream,
-    input_schema: SchemaRef,
-    schema: SchemaRef,
+    shape: &ExpandShape,
+    input: Arc<dyn ExecutionPlan>,
     step: ExpandStep,
     env: Arc<GraphEnv>,
     ctx: Arc<TaskContext>,
     metrics: &ExecutionPlanMetricsSet,
 ) -> Result<SendableRecordBatchStream> {
-    if step.single_hop() && step.edge_binding.is_none() {
-        if let ExpandExecution::Named(named) = &step.execution {
-            let named = named.clone();
-            return super::single_hop::execute(input, schema, step, named, env, ctx, metrics);
-        }
+    let schema = shape.properties().eq_properties.schema().clone();
+    let input_schema = input.schema();
+    if let (ExpandShape::Streaming(streaming), true, None, ExpandExecution::Named(named)) = (
+        shape,
+        step.single_hop(),
+        &step.edge_binding,
+        &step.execution,
+    ) {
+        let memory = work(Arc::clone(&ctx), "ExpandExec", metrics)?;
+        memory.metric("input_rows", 0);
+        let body =
+            super::single_hop::SingleHop::new(schema, step.clone(), named.clone(), env, metrics);
+        return Ok(streaming.produce(memory, metrics, move || input.execute(0, ctx), body));
     }
     let switch = Switch::gauge(metrics);
-    let ctx = Arc::new(TaskContext::new(
+    let clamped = Arc::new(TaskContext::new(
         ctx.task_id(),
         ctx.session_id(),
         ctx.session_config().clone().with_batch_size(
@@ -65,101 +77,197 @@ pub(super) fn execute(
         ctx.window_functions().clone(),
         ctx.runtime_env(),
     ));
-    let mut work = WorkMemory::new(ctx, "ExpandExec")?;
-    work.set_metrics(metrics.clone());
-    work.metric("input_rows", 0);
-    let memory = Arc::new(work);
-    let declared = Arc::clone(&schema);
-    Ok(producer_stream(
-        schema,
-        memory,
-        Some(metrics),
-        move |memory, sender| async move {
-            if step.budgeted() && !memory.traversal_limited() {
+    let memory = work(clamped, "ExpandExec", metrics)?;
+    memory.metric("input_rows", 0);
+    match shape {
+        ExpandShape::Breaker(breaker) => {
+            let input = input.execute(0, ctx)?;
+            let emit_step = step.clone();
+            let emit_env = Arc::clone(&env);
+            let declared = Arc::clone(&schema);
+            Ok(breaker.held(
+                memory,
+                metrics,
+                move |memory| async move { drain_one(input, &input_schema, &memory).await },
+                move |wide, memory, sender| async move {
+                    if wide.num_rows() == 0 {
+                        return Ok(());
+                    }
+                    emit_unbound(
+                        &wide, &emit_step, &emit_env, None, &switch, &memory, &sender, &declared,
+                    )
+                    .await
+                },
+            ))
+        }
+        ExpandShape::Streaming(streaming) => {
+            let body = Batches {
+                declared: Arc::clone(&schema),
+                input_schema,
+                step,
+                env,
+                switch,
+                windows: None,
+                prepared: None,
+            };
+            Ok(streaming.produce(memory, metrics, move || input.execute(0, ctx), body))
+        }
+    }
+}
+
+/// The per-batch body of a streaming traversal that is not the named one
+/// hop: a budgeted step re-cuts its input into exact source windows and
+/// expands each as it fills; a bound-edge one hop expands each input batch.
+struct Batches {
+    declared: SchemaRef,
+    input_schema: SchemaRef,
+    step: ExpandStep,
+    env: Arc<GraphEnv>,
+    switch: Gauge,
+    /// The window cutter of a budgeted step, opened before the input runs.
+    windows: Option<SourceWindows>,
+    prepared: Option<Arc<Vec<PreparedEdge>>>,
+}
+
+impl Batches {
+    /// One input batch or source window expanded; a budgeted step prepares
+    /// its member datasets at the first.
+    async fn expand(
+        &mut self,
+        wide: Arc<RecordBatch>,
+        memory: &Arc<WorkMemory>,
+        sender: &BatchSender,
+    ) -> Result<()> {
+        let Self {
+            declared,
+            step,
+            env,
+            switch,
+            prepared,
+            ..
+        } = self;
+        let prepared = if step.budgeted() {
+            Some(match prepared {
+                Some(prepared) => Arc::clone(prepared),
+                None => {
+                    let edges = Arc::new(
+                        prepare_selected_edges(env, step, memory)
+                            .await
+                            .map_err(external)?,
+                    );
+                    *prepared = Some(Arc::clone(&edges));
+                    edges
+                }
+            })
+        } else {
+            None
+        };
+        if step.edge_binding.is_some() {
+            emit_bound(&wide, step, env, prepared, memory, sender, declared).await
+        } else {
+            emit_unbound(
+                &wide,
+                step,
+                env,
+                prepared.as_deref().map(Vec::as_slice),
+                switch,
+                memory,
+                sender,
+                declared,
+            )
+            .await
+        }
+    }
+
+    /// The windows of a budgeted step that `batch` fills, each expanded as
+    /// it is cut.
+    async fn window(
+        &mut self,
+        batch: RecordBatch,
+        memory: &Arc<WorkMemory>,
+        sender: &BatchSender,
+    ) -> Result<()> {
+        let Some(windows) = self.windows.as_mut() else {
+            return Err(DataFusionError::Internal(
+                "budgeted expansion windowed before it opened".into(),
+            ));
+        };
+        windows.feed(batch)?;
+        loop {
+            let Some(window) = self
+                .windows
+                .as_mut()
+                .map(SourceWindows::next_full)
+                .transpose()?
+                .flatten()
+            else {
+                return Ok(());
+            };
+            self.expand(Arc::new(window.batch), memory, sender).await?;
+        }
+    }
+}
+
+impl Streamed for Batches {
+    fn open<'a>(&'a mut self, memory: &'a Arc<WorkMemory>) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            if !self.step.budgeted() {
+                return Ok(true);
+            }
+            if !memory.traversal_limited() {
                 return Err(external(OmniError::manifest_internal(
                     "budgeted expansion has no traversal work limit",
                 )));
             }
-            if step.budgeted() {
-                Switch::IndexedScan.record(&switch);
-                record_expand_path(true);
-                memory.metric("expand_indexed", 1);
-                let mut input =
-                    SourceWindows::new(input, Arc::clone(&input_schema), Arc::clone(&memory));
-                let mut prepared = None;
-                while let Some(window) = input.next().await? {
-                    let prepared = match &prepared {
-                        Some(prepared) => Arc::clone(prepared),
-                        None => {
-                            let edges = Arc::new(
-                                prepare_selected_edges(&env, &step, &memory)
-                                    .await
-                                    .map_err(external)?,
-                            );
-                            prepared = Some(Arc::clone(&edges));
-                            edges
-                        }
-                    };
-                    let wide = Arc::new(window.batch);
-                    if step.edge_binding.is_some() {
-                        emit_bound(
-                            &wide,
-                            &step,
-                            &env,
-                            Some(Arc::clone(&prepared)),
-                            &memory,
-                            &sender,
-                            &declared,
-                        )
-                        .await?;
-                    } else {
-                        emit_unbound(
-                            &wide,
-                            &step,
-                            &env,
-                            Some(prepared.as_slice()),
-                            &switch,
-                            &memory,
-                            &sender,
-                            &declared,
-                        )
-                        .await?;
-                    }
-                }
-                return Ok(());
+            Switch::IndexedScan.record(&self.switch);
+            record_expand_path(true);
+            memory.metric("expand_indexed", 1);
+            self.windows = Some(SourceWindows::new(
+                Arc::clone(&self.input_schema),
+                Arc::clone(memory),
+            )?);
+            Ok(true)
+        })
+    }
+
+    fn batch<'a>(
+        &'a mut self,
+        batch: RecordBatch,
+        memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, Result<Flow>> {
+        Box::pin(async move {
+            if self.step.budgeted() {
+                self.window(batch, memory, sender).await?;
+                return Ok(Flow::Continue);
             }
-            if step.edge_binding.is_none() && !step.single_hop() {
-                let wide = Arc::new(drain_one(input, &input_schema, &memory).await?);
-                if wide.num_rows() == 0 {
-                    return Ok(());
-                }
-                return emit_unbound(
-                    &wide, &step, &env, None, &switch, &memory, &sender, &declared,
-                )
-                .await;
+            memory.metric("input_rows", batch.num_rows());
+            if batch.num_rows() == 0 {
+                return Ok(Flow::Continue);
             }
-            let mut input = input;
-            while let Some(batch) = input.next().await {
-                let batch = batch?;
-                memory.metric("input_rows", batch.num_rows());
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let input_memory = memory.child("expand input batch")?;
-                input_memory.hold(&batch)?;
-                let wide = Arc::new(batch);
-                if step.edge_binding.is_some() {
-                    emit_bound(&wide, &step, &env, None, &memory, &sender, &declared).await?;
-                } else {
-                    emit_unbound(
-                        &wide, &step, &env, None, &switch, &memory, &sender, &declared,
-                    )
-                    .await?;
-                }
+            let input_memory = memory.child("expand input batch")?;
+            input_memory.hold(&batch)?;
+            self.expand(Arc::new(batch), memory, sender).await?;
+            Ok(Flow::Continue)
+        })
+    }
+
+    fn finish<'a>(
+        &'a mut self,
+        memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let last = match self.windows.as_mut() {
+                Some(windows) => windows.flush()?,
+                None => None,
+            };
+            if let Some(window) = last {
+                self.expand(Arc::new(window.batch), memory, sender).await?;
             }
             Ok(())
-        },
-    ))
+        })
+    }
 }
 
 /// Exact source windows make scan admission independent of upstream batches.
@@ -170,61 +278,88 @@ struct SourceWindow {
     _memory: WorkMemory,
 }
 
+/// The cutter of exact source windows: fed one input batch at a time, it
+/// hands out each window as it fills (`next_full`), charged piece by piece
+/// so a consumer that stops admits no more, and the last on `flush`.
 struct SourceWindows {
-    input: SendableRecordBatchStream,
     schema: SchemaRef,
     memory: Arc<WorkMemory>,
     pending: Option<(RecordBatch, usize, WorkMemory)>,
+    pieces: Vec<RecordBatch>,
+    rows: usize,
+    work: WorkMemory,
 }
 
 impl SourceWindows {
-    fn new(input: SendableRecordBatchStream, schema: SchemaRef, memory: Arc<WorkMemory>) -> Self {
-        Self {
-            input,
+    fn new(schema: SchemaRef, memory: Arc<WorkMemory>) -> Result<Self> {
+        let work = memory.child("expand source window")?;
+        Ok(Self {
             schema,
             memory,
             pending: None,
-        }
+            pieces: Vec::new(),
+            rows: 0,
+            work,
+        })
     }
 
-    async fn next(&mut self) -> Result<Option<SourceWindow>> {
-        let work = self.memory.child("expand source window")?;
-        let mut pieces = Vec::new();
-        let mut rows = 0;
-        while rows < SOURCE_WINDOW_ROWS {
+    /// Hold `batch` as the input the next windows are cut from; the previous
+    /// one must be used up (`next_full` returned `None`).
+    fn feed(&mut self, batch: RecordBatch) -> Result<()> {
+        if self.pending.is_some() {
+            return Err(DataFusionError::Internal(
+                "expand source window fed before its pending batch was cut".into(),
+            ));
+        }
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let lease = self.memory.child("expand pending source batch")?;
+        lease.hold(&batch)?;
+        self.pending = Some((batch, 0, lease));
+        Ok(())
+    }
+
+    /// The next full window cut from the pending input, `None` once the
+    /// pending input is used up with the window still short.
+    fn next_full(&mut self) -> Result<Option<SourceWindow>> {
+        while self.rows < SOURCE_WINDOW_ROWS {
+            let Some((batch, offset, lease)) = self.pending.take() else {
+                return Ok(None);
+            };
             self.memory.check()?;
-            if self.pending.is_none() {
-                let Some(batch) = self.input.next().await.transpose()? else {
-                    break;
-                };
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let lease = self.memory.child("expand pending source batch")?;
-                lease.hold(&batch)?;
-                self.pending = Some((batch, 0, lease));
-            }
-            let (batch, offset, lease) = self.pending.take().expect("pending batch populated");
-            let take = (SOURCE_WINDOW_ROWS - rows).min(batch.num_rows() - offset);
-            work.charge_traversal(take as u64)?;
-            work.entries::<RecordBatch>(1)?;
+            let take = (SOURCE_WINDOW_ROWS - self.rows).min(batch.num_rows() - offset);
+            self.work.charge_traversal(take as u64)?;
+            self.work.entries::<RecordBatch>(1)?;
             let piece = batch.slice(offset, take);
-            work.hold(&piece)?;
-            pieces.push(piece);
+            self.work.hold(&piece)?;
+            self.pieces.push(piece);
             self.memory.metric("input_rows", take);
-            rows += take;
+            self.rows += take;
             if offset + take < batch.num_rows() {
                 self.pending = Some((batch, offset + take, lease));
             }
         }
-        if rows == 0 {
+        self.cut().map(Some)
+    }
+
+    /// What is gathered, as the last window; `None` when nothing is.
+    fn flush(&mut self) -> Result<Option<SourceWindow>> {
+        if self.rows == 0 {
             return Ok(None);
         }
-        let batch = work.concat(&self.schema, &pieces)?;
-        Ok(Some(SourceWindow {
+        self.cut().map(Some)
+    }
+
+    fn cut(&mut self) -> Result<SourceWindow> {
+        let pieces = std::mem::take(&mut self.pieces);
+        let batch = self.work.concat(&self.schema, &pieces)?;
+        let work = std::mem::replace(&mut self.work, self.memory.child("expand source window")?);
+        self.rows = 0;
+        Ok(SourceWindow {
             batch,
             _memory: work,
-        }))
+        })
     }
 }
 
@@ -416,10 +551,9 @@ impl PartitionStream for EdgePairs {
         let env = Arc::clone(&self.env);
         let memory = Arc::clone(&self.memory);
         let schema = Arc::clone(&self.schema);
-        producer_stream(
+        Source::inner(
             Arc::clone(&self.schema),
             memory,
-            None,
             move |memory, sender: BatchSender| async move {
                 let sender = &sender;
                 for (index, member) in step.members().iter().enumerate() {
