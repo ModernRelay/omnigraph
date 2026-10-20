@@ -507,10 +507,13 @@ fn snapshot_access(
 }
 
 /// A store's access, by the policy installed where it lives. A graph in a
-/// cluster's layout answers as `--cluster` answers for it. Any other store is
-/// a standalone graph, which carries no policy, and the engine allows every
-/// action on a handle without one; that answer holds only for a graph that
-/// opens, so the store opens first.
+/// cluster's layout answers by the ledger applied at the root it sits under.
+/// `--cluster DIR` reads the ledger where the `storage:` of `DIR/cluster.yaml`
+/// points, so the two answers differ when that `storage:` names another root,
+/// as an edit not yet applied does. Any other store is a standalone graph,
+/// which carries no policy, and the engine allows every action on a handle
+/// without one; that answer holds only for a graph that opens, so the store
+/// opens first.
 async fn store_access(
     uri: &str,
     actor: Option<String>,
