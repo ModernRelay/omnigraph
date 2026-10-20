@@ -6134,8 +6134,9 @@ fn login_and_credential_get_follow_the_target_credential_owner() {
 /// `access` says what the caller may do: a cluster graph's applied policy
 /// decides for the declared actor, whether the cluster or the graph's store
 /// is addressed, a standalone graph without a policy allows everything once it
-/// opens, a store that holds no graph refuses, and a server answers through
-/// its access route with the target's token.
+/// opens, a store that holds no graph refuses, a damaged one keeps its own
+/// failure, and a server answers through its access route with the target's
+/// token.
 #[test]
 fn access_reports_what_the_caller_may_do_at_a_target() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
@@ -6241,6 +6242,21 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
     let refusal = parse_stdout_json(&missing);
     assert_eq!(refusal["code"], "not_found", "{refusal}");
     assert_eq!(refusal["outcome"]["execution"], "not_started", "{refusal}");
+    // A graph whose manifest names a missing object is damaged, not absent:
+    // the open's own failure stands.
+    let damaged = temp.path().join("damaged.omni");
+    init_graph(&damaged);
+    fs::remove_dir_all(damaged.join("__manifest").join("data")).unwrap();
+    let failure = output_failure(
+        cli()
+            .arg("access")
+            .arg("--store")
+            .arg(&damaged)
+            .args(["--branch", "main", "--json"]),
+    );
+    let failure = parse_stdout_json(&failure);
+    assert_eq!(failure["code"], "internal", "{failure}");
+    assert_eq!(failure["outcome"]["execution"], "not_started", "{failure}");
 
     // A standalone graph without a policy allows every action.
     let graph = graph_path(temp.path());

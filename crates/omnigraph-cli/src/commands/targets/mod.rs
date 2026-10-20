@@ -543,24 +543,22 @@ async fn store_access(
     )
 }
 
-/// Open a standalone graph read-only and let it go. Storage that reports
-/// what the open reads absent holds no graph, so that refuses as a missing
-/// graph; any other failure stays the open's own.
+/// Open a standalone graph read-only and let it go. A root where the engine
+/// finds no graph refuses as a missing graph. Every failure of the open
+/// itself stays the engine's own: a graph whose manifest names a missing
+/// object is damaged, not absent.
 async fn require_standalone_graph(uri: &str) -> Result<()> {
-    use omnigraph::error::{OmniError, StorageFailureKind};
-    match omnigraph::db::Omnigraph::open_read_only(uri).await {
-        Ok(_) => Ok(()),
-        Err(OmniError::Storage(failure)) if failure.kind == StorageFailureKind::NotFound => {
-            Err(CliRefusal::report(
-                ErrorCode::NotFound,
-                format!(
-                    "no graph at `{}`: {failure}",
-                    omnigraph::storage::redacted_storage_uri(uri)
-                ),
-            ))
-        }
-        Err(error) => Err(error.into()),
+    if !omnigraph::db::Omnigraph::exists(uri).await? {
+        return Err(CliRefusal::report(
+            ErrorCode::NotFound,
+            format!(
+                "no graph at `{}`",
+                omnigraph::storage::redacted_storage_uri(uri)
+            ),
+        ));
     }
+    omnigraph::db::Omnigraph::open_read_only(uri).await?;
+    Ok(())
 }
 
 /// `access`: who the caller is at a target and what it may do there. A

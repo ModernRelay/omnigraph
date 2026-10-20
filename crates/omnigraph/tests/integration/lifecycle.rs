@@ -904,10 +904,36 @@ async fn refresh_detects_identity_aba_when_source_bytes_are_unchanged() {
     );
 }
 
+/// An open of a root without a graph fails, and so does the open of a graph
+/// whose live manifest names a missing object, with the same storage kind.
+/// `exists` tells them apart: only a root without a `__manifest` dataset is
+/// absent, so a damaged graph never reads as a missing one.
 #[tokio::test]
-async fn open_nonexistent_fails() {
-    let result = Omnigraph::open("/tmp/nonexistent_omnigraph_test_xyz").await;
-    assert!(result.is_err());
+async fn open_nonexistent_fails_and_exists_reports_only_dataset_absence() {
+    use omnigraph::error::StorageFailureKind;
+    let not_found = |error: omnigraph::error::OmniError| {
+        assert_eq!(
+            error.storage_failure().map(|failure| failure.kind),
+            Some(StorageFailureKind::NotFound),
+            "{error}"
+        );
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent");
+    let absent = absent.to_str().unwrap();
+    assert!(!Omnigraph::exists(absent).await.unwrap());
+    not_found(Omnigraph::open(absent).await.err().unwrap());
+    not_found(Omnigraph::open_read_only(absent).await.err().unwrap());
+
+    let root = dir.path().join("graph");
+    let uri = root.to_str().unwrap();
+    drop(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    assert!(Omnigraph::exists(uri).await.unwrap());
+
+    fs::remove_dir_all(root.join("__manifest").join("data")).unwrap();
+    assert!(Omnigraph::exists(uri).await.unwrap());
+    not_found(Omnigraph::open_read_only(uri).await.err().unwrap());
 }
 
 #[tokio::test]

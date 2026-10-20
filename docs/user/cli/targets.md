@@ -138,7 +138,9 @@ with the target's token. For direct storage the CLI decides itself
   refuses with `graph_unavailable`.
 - A standalone graph carries no policy, so once its store opens every action is
   allowed, as direct writes do; its `graph_id` is `default`. A store that holds
-  no graph refuses with `not_found`.
+  no graph refuses with `not_found`. A graph that fails to open for another
+  reason, such as a manifest that names a missing file, keeps that failure's
+  own code.
 
 An action listed for a branch is one the policy allows there, not one the
 branch supports: `schema_apply` on a branch other than `main` does not make
