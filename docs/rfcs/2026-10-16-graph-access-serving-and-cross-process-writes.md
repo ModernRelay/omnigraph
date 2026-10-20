@@ -1039,7 +1039,10 @@ Extend the existing owners in [the testing map](../dev/testing.md):
 - **Server, `boot_settings.rs`:** preserve cluster-only boot, applied-state
   authority and the existing lifecycle while changing HTTP error contracts.
 - **CLI, existing command/config owners:** target and credential behavior
-  follows RFC 0059; `access` answers for direct and server targets;
+  follows RFC 0059; `access` answers for root, graph-store, standalone and
+  server targets, refuses catalogue and managed ones, and tells an absent
+  store (`not_found`) from a damaged one (`internal`), as
+  `cli_data::access_reports_what_the_caller_may_do_at_a_target` checks;
   `version --json` reports the protocols implemented. Target listing remains
   configuration-only and contains no live-process registry.
 - **CLI, MCP bridge owner:** relay to an existing server, credential refresh
