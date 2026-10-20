@@ -1118,10 +1118,13 @@ release note.
 3. **Existing-server clients and operation parity.** An existing-server stdio MCP
    bridge, Studio opener and credential client integration connect to the
    ordinary cluster-backed server. The dependent bridge
-   [#1084](https://github.com/ModernRelay/omnigraph/pull/1084) remains a draft:
-   remove its auto-hosting and direct-target serving paths, and its dependency
-   on the discontinued PRs, before it can merge. Add the operation
-   inventory and parity evidence. This phase does not retire the server binary.
+   [#1084](https://github.com/ModernRelay/omnigraph/pull/1084) is closed unmerged.
+   Useful existing-server MCP adapter logic may be selectively reused in a
+   future separate PR, without its auto-hosting, direct-target serving or
+   discontinued dependencies. No cherry-pick or implementation is part of this
+   disposition; the future client proposal remains draft. Add the operation
+   inventory and parity evidence with that work. This phase does not retire the
+   server binary.
 4. **Cross-process writes.** Qualify the engine control-fact, recovery, cost
    and upgrade design. Only then lift its single-writer-process boundary.
    Until then the current boundary and cluster admission remain unchanged.
@@ -1398,8 +1401,11 @@ proposal.
   parity, existing-server MCP/Studio clients and cross-process engine work.
   RFC 0059's design is accepted by #675; #1090 remains its implementation,
   separate from this draft. The three serving PRs are closed unmerged and
-  #980 is closed as not planned; #1084 remains draft until its client-only
-  scope is implemented. Constructor cleanup (#1021) remains independent with
+  #980 is closed as not planned. #1084 is also closed unmerged; useful
+  existing-server MCP adapter logic may be selectively reused in a future
+  separate PR. No cherry-pick or implementation is part of this
+  change, and the future client proposal remains draft. Constructor
+  cleanup (#1021) remains independent with
   ordinary cluster-backed fixtures. RFC 0059's former reference to this
   separate local-serving proposal never accepted it and creates no remaining
   serving dependency.
