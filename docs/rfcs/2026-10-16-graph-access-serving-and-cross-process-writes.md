@@ -3,16 +3,16 @@ rfc: "2026-10-16-graph-access-serving-and-cross-process-writes"
 title: "Graph access, serving and cross-process writes"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-18
+updated: 2026-10-19
 discussion: https://github.com/ModernRelay/omnigraph/issues/980
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "Named targets and CLI coherency (RFC 0059, PR #675) must be accepted with the singular `target` group, no compatibility interval and no transport flags: every command here addresses graphs only through `--target`."
+  - "RFC 0059's accepted revision (PR #1090) must land: every command here addresses graphs through its `--target`, and it owns the target grammar and the `target` and `credential` commands."
 ---
 
 # RFC: Graph access, serving and cross-process writes
@@ -26,8 +26,10 @@ principles rather than from the commands that exist today. One idea organizes
 it: **you name what you act on, and the path, credential, actor and process
 follow from that name.** Seven rules follow from the idea:
 
-1. **Name the target, never the path.** Every command addresses a graph through
-   an RFC 0059 target. No command takes a transport flag.
+1. **Name the target, never the transport.** Every command addresses a graph
+   through RFC 0059's `--target`: a configured name, or an inline address,
+   which is a complete binding written on the command line. No command takes a
+   transport flag.
 2. **Correctness lives in the engine, across processes and machines.** Branch
    creation and deletion, dropping a proposal and cleanup decide through the
    `__manifest` version compare-and-swap, as row writes, merges and schema apply
@@ -51,13 +53,13 @@ follow from that name.** Seven rules follow from the idea:
 
 | Rule | Delivered by |
 |---|---|
-| 1 | RFC 0059's targets with the changes in [Addressing](#addressing), and the `target` group's `add` and `remove` defined here |
+| 1 | RFC 0059's targets, which own the grammar and the `target` and `credential` commands; this RFC adds the listing's `local_servers` |
 | 2 | [Cross-process writes](#cross-process-writes) in the engine |
 | 3 | [One set of operations](#one-set-of-operations) and its inventory test |
 | 4 | `omnigraph serve`, its ***local server*** for you and its deployment for others; `omnigraph studio`; `omnigraph mcp` |
 | 5 | [Identity](#identity) and the `Omnigraph-If-Actor` request header |
 | 6 | [Dispositions and refusals](#dispositions-and-refusals) |
-| 7 | `omnigraph target list`, `omnigraph access` and `GET /graphs/{graph_id}/access` |
+| 7 | `omnigraph target list`, `omnigraph access`, and the access route [#1073](https://github.com/ModernRelay/omnigraph/pull/1073) added |
 
 `omnigraph serve` is for programs that speak only HTTP or MCP, such as
 OmniGraph Studio and agents. `omnigraph-server` serves clusters to others today
@@ -66,8 +68,9 @@ you. `omnigraph credential get` hands a server target's static token to a
 calling process, so self-hosted servers with static tokens work in every client.
 
 The engine phase adds `__manifest` rows under the next storage stamp; nothing
-else changes the storage format. The HTTP API gains an access route, an actor
-precondition header and a `disposition` object on error responses. Changes
+else changes the storage format. The HTTP API gains an actor precondition
+header and a `disposition` object on error responses; the access route it
+relies on shipped in [#1073](https://github.com/ModernRelay/omnigraph/pull/1073). Changes
 with a wider blast radius are in
 [Appendix A](#appendix-a-changes-for-separate-decisions), each with a
 recommended RFC or issue.
@@ -128,10 +131,12 @@ means a usage error, a managed refusal, or a server that stopped with an
 uncertain write; exit 4 means a failed precondition on data commands and
 `recovery_required` on managed ones.
 
-**Clients learn their limits from refusals.** No route says which actor a
-credential resolves to or which actions it may take, so a client shows every
-action and learns from a 403. That is the common case for self-hosted static
-tokens without a graph policy.
+**Clients learn their limits from refusals.** Until
+[#1073](https://github.com/ModernRelay/omnigraph/pull/1073) added
+`GET /graphs/{graph_id}/access`, no route said which actor a credential
+resolves to or which actions it may take, so a client showed every action and
+learned from a 403. That is the common case for self-hosted static tokens
+without a graph policy, and the CLI still has no command that asks.
 
 **Clients keep their own registries, and they drift.** Studio parses the CLI's
 `config.yaml` and `credentials` file itself, finds a token by server name where
@@ -163,9 +168,9 @@ boundaries, and asks RFC 0059 for three changes.
 
 ```text
 # Where things are, and who I am there
-omnigraph target list|show|add|remove [NAME]
+omnigraph target list|show|add|remove|import [NAME]   # RFC 0059
 omnigraph login|logout --target NAME
-omnigraph credential get --target NAME          # a static token, to a pipe only
+omnigraph credential get --target NAME          # RFC 0059: a static token, to a pipe only
 omnigraph access --target NAME [--branch B]     # my actor and allowed actions
 
 # The graph: each command is one HTTP route and one MCP tool
@@ -184,7 +189,7 @@ omnigraph cluster validate|plan|apply|status
 
 # Reaching a graph from other programs
 omnigraph serve  --target NAME [--write]          # for you
-omnigraph serve  <cluster root> --listen ADDR     # for others
+omnigraph serve  --target ROOT --listen ADDR     # for others: a cluster root
 omnigraph studio --target NAME
 omnigraph mcp    --target NAME [--write]
 ```
@@ -193,37 +198,32 @@ The tree is abridged: `snapshot`, `changes`, `graphs`, `init`, `upgrade`,
 `repair`, `lint`, `queries`, `policy`, `embed`, `alias`, `skill` and `version`
 keep their places. The data, history, schema, upkeep and cluster commands exist
 today; this RFC changes how they are addressed, how `--as` behaves on them and
-how they report failure. `target`, `credential`, `access`, `serve`, `studio`
-and `mcp` are new; `index rebuild` is today's `rebuild-full-text-indexes`; `use`
+how they report failure. `access`, `serve`, `studio` and `mcp` are new here,
+`target` and `credential` are RFC 0059's; `index rebuild` is today's `rebuild-full-text-indexes`; `use`
 and `profile`, which select and inspect RFC 0059's predecessors, retire with
 them. Groups are singular nouns followed by a verb, as `branch list` already is.
 
 ### Addressing
 
-Every command addresses its graph the same way: `--target NAME`, else
-`defaults.target`, else an error; `--graph ID` for a target that holds several
-graphs, else the target's `default_graph`; and `--branch NAME` where the
+RFC 0059 owns addressing, and this RFC adds nothing to it. Every command
+selects its destination the same way: `--target NAME|ADDRESS`, else
+`defaults.target`, else an error. A name selects a configured target. An inline
+address, a path, a storage URI or a server endpoint, is a complete binding
+written on the command line, and a root-only command reads an inline storage
+address as a root. `--graph ID` selects a graph within a root or a server, else
+the target's `default_graph`, and `--branch NAME` selects a branch where the
 operation takes one. A direct graph target already names its graph and rejects
-`--graph`. A target says where the graph lives and how to reach it: through
-storage, a server or the managed service, as RFC 0059's kinds define.
+`--graph`.
 
 No command takes a transport flag. `--server`, `--profile`, `--store`, a
 positional URI, `--cluster` as an address, `--managed`, `--direct` and folder
-context are retired without a compatibility interval, and a legacy-format
-operator home refuses every command (`legacy_operator_config`).
+context retire in one release, and a legacy-format operator home refuses every
+command (`legacy_operator_config`) until `target import` converts it.
 
-The one literal address is a cluster root, taken by the commands a deployment's
-own tooling runs on its root without an operator home: `serve --listen` and the
-root-scoped cluster administration commands (`cluster status`, `observe`,
-`force-unlock`, `upgrade-ledger` and `apply --writers-stopped`). A deployment is
-configured by its environment, not by a person's operator home, and a
-deployment manager that verifies a process's command can read the root from
-its arguments. Each takes the root as its first positional argument and refuses
-`--target` beside it.
-
-This asks RFC 0059 for three changes: the singular `target` group with `list`,
-`show`, `add` and `remove`; no compatibility interval; and the retirement of
-every transport flag at once. [Appendix A5](#a5-rfc-0059-alignment) tracks them.
+A deployment's own tooling, which runs without an operator home, passes its
+cluster root inline, `omnigraph serve --target s3://bucket/root --listen ADDR`,
+and runs the root-scoped administration commands the same way. One selector
+serves people, agents and deployments.
 
 ### Targets
 
@@ -231,10 +231,10 @@ Every server a client uses is a target in the operator configuration, and the
 CLI is that file's only program writer. Studio, the agents it runs and terminal
 agents then see the same servers, and each stored token exists once.
 
-`omnigraph target list --json` lists the targets and aliases RFC 0059's resolver
-reads, and the live local servers of direct targets, without secrets and
-without a network request. `omnigraph target show NAME --json` prints one entry
-in the same shape.
+RFC 0059's `omnigraph target list --json` lists the targets and aliases its
+resolver reads, without secrets and without a network request, and
+`omnigraph target show NAME --json` prints one entry in the same shape. This
+RFC adds the live local servers of direct targets:
 
 ```json
 {"protocol":1,"default_target":"staging",
@@ -259,28 +259,11 @@ in the same shape.
   `omnigraph serve --target NAME --reuse --json`, which returns the live local
   server's line.
 
-`omnigraph target add NAME --json` reads one target entry, the same fields the
-operator configuration holds, on standard input; `omnigraph target remove NAME`
-removes one. Both:
-
-- validate through RFC 0059's resolver: a complete binding, an endpoint scope
-  for the credential owner (`target_invalid`), and no duplicate name
-  (`target_exists`); `remove` refuses a name it does not hold
-  (`target_unknown`);
-- change only that entry, keep the rest of the file's text, write through a
-  temporary file and rename, and refuse (`config_not_editable`) when they cannot
-  do that safely;
-- never change `defaults.target` and never store a secret. A token is stored
-  with `omnigraph login --target NAME`, which reads it on standard input;
-- `remove` refuses the default target (`target_is_default`) and leaves its
-  credential, which `omnigraph logout --target NAME` removes.
-
-RFC 0059 says "Add no target administration group" and "Register targets by
-editing operator config". This RFC asks for `add` and `remove` as the one
-exception: a GUI must add servers without becoming a second writer of a strictly
-validated file. It adds no selection command and no current-target state, which
-is what that rule protects against; `git config`, `kubectl config set-context`
-and `gh config set` play the same part for their tools.
+`target add`, `remove` and `import` and `credential get` are RFC 0059's: one
+entry on standard input, an edit that keeps the rest of the file's text under
+an exclusive lock and reads the file back, and no command that stores a secret,
+selects a target or sets `defaults.target`. A GUI adds a server through
+`target add`, so it never becomes a second writer of a strictly validated file.
 
 ### Serving
 
@@ -307,7 +290,8 @@ same-account client attaches by reading it.
 | Target kind (RFC 0059) | `serve` | `studio` | `mcp` | `credential get` |
 |---|---|---|---|---|
 | Direct graph, standalone | A local server for the graph | Opens Studio, which attaches to or starts a local server | Relays to the live local server, or hosts one | Refused: a local server's token is in its record |
-| Direct root of a cluster, or a direct graph inside one | A local server for the cluster | As above | As above | Refused |
+| Direct root of a cluster | A local server for the cluster | As above | As above | Refused |
+| Direct graph inside a cluster root | Refused (`target_invalid`), naming the root | Refused | Refused | Refused |
 | Direct catalogue (`og_catalog`) | Refused | Refused | Refused | Refused |
 | Server with a token owner | Refused: the graph already has a server | Opens Studio on it | Relays to the server's `/mcp` with the owner's token | Returns the owner's token |
 | Server with anonymous access | Refused | Opens Studio on it | Relays without a token | Refused (`credential_anonymous`) |
@@ -316,8 +300,9 @@ same-account client attaches by reading it.
 | Managed account | Refused | Refused | Refused | Refused |
 
 A command refuses a kind its column marks refused (`target_kind_unsupported`).
-A direct graph target inside a cluster root serves its cluster, and the ready
-line names that graph as `graph_id`.
+A direct graph target inside a cluster root refuses (`target_invalid`) and
+names the root: a cluster's graph is served with its cluster, through a root
+target and `--graph`, so one destination keeps one binding.
 
 #### Access and actor
 
@@ -369,21 +354,24 @@ apply` against the root refuses the same way. A clean shutdown releases
 admission on local and S3 roots, as a deployment's does. Admission has no
 lease: after a crash, as after any owner's, the lock stays until `omnigraph
 cluster force-unlock` names it once the process is gone.
-[#1067](https://github.com/ModernRelay/omnigraph/issues/1067) proposes a leased takeover, so a successor restarts without an
-operator; on local roots, which have no update-if-unchanged, that needs lock
-generations written if absent. Azure roots keep their
+[Storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093)
+gives admission a lease with heartbeats, so a successor takes over after a
+lease and a half of silence without an operator. Azure roots keep their
 existing rule that even a clean exit retains admission.
 
 #### Lifetime and output
 
 A local server runs in the foreground until interrupted, or until its parent
 closes it, and shuts down through the server's bounded shutdown. It handles a
-storage write of unknown outcome as a deployment does. Today that stops the
-process, which keeps its admission and exits 2; after
-[#1067](https://github.com/ModernRelay/omnigraph/issues/1067), the write's own
-request reports `outcome_unknown` and the server keeps serving. Read-write local
-servers wait for that change, so one storage error cannot take a graph away from
-Studio. Nothing replays the write. Logs and the startup line (the resolved
+storage outcome as a deployment does, which
+[storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093)
+defines: an ambiguous manifest request leaves its publication pending, the
+write reports `outcome_unknown`, later writes to that branch refuse with
+`service_unavailable` until a re-issue settles it, and the server keeps
+serving. Read-write local servers wait for that change
+([#1096](https://github.com/ModernRelay/omnigraph/pull/1096)), so one storage
+error cannot take a graph away from Studio. No client replays the write; only
+the server re-issues its pending manifest request. Logs and the startup line (the resolved
 target, access mode, actor and URL) go to stderr. With `--json`, stdout carries
 exactly one line, when it is ready:
 
@@ -406,14 +394,16 @@ pipe, as Studio and `omnigraph mcp` do.
 
 #### One local server per destination
 
-A local server is identified by its ***destination***: the canonical root
-together with every non-secret setting of the target's binding that selects the
-backing store, such as an S3-compatible endpoint or an Azure account. Two
+A local server is identified by its ***destination***: its scope, graph or
+cluster, the canonical root, and every non-secret setting of the target's
+binding that selects the backing store, such as an S3-compatible endpoint or an
+Azure account. Two
 targets with the same `s3://bucket/graph` on different endpoints are different
 destinations; two targets whose bindings name the same root and the same store
 settings are one destination, whatever their names. When the CLI cannot
 establish a target's destination from its binding, it refuses to start or
-reuse a local server for it (`local_server_destination_unknown`).
+reuse a local server for it (`local_server_destination_unknown`); phase 3
+establishes one for a local root only, so a cloud root refuses.
 
 `serve` elects one local server per destination. It takes the destination's
 election lock, a file named by the destination's digest in the records
@@ -454,7 +444,7 @@ every client one URL, one token and one actor
 
 #### Serving for others
 
-`omnigraph serve <cluster root> --listen ADDR` is a deployment. `--listen`
+`omnigraph serve --target ROOT --listen ADDR` is a deployment. `--listen`
 replaces `--bind` and has no default, so serving for others is always a
 deliberate choice of address. Everything else carries over from
 `omnigraph-server` unchanged:
@@ -471,10 +461,12 @@ deliberate choice of address. Everything else carries over from
 - admission, snapshot capture before binding, clean release, and the
   `OMNIGRAPH_LISTEN_ADDR=` line and logs on stdout;
 - exit 0 on clean shutdown and 2 when it stops with an unknown outcome or an
-  exhausted shutdown grace, whose triggers [#1067](https://github.com/ModernRelay/omnigraph/issues/1067) narrows.
+  exhausted shutdown grace, whose triggers
+  [storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093)
+  narrows to a panic and lost write ownership.
 
-It takes the cluster root as its one positional argument and refuses a root that
-is not a cluster (`serve_requires_cluster`). `/healthz`, `/readyz`,
+It takes the cluster root through `--target`, a root target or an inline root
+address, and refuses a root that is not a cluster (`serve_requires_cluster`). `/healthz`, `/readyz`,
 `--bootstrap-handoff`, provider and data-token trust, and `/mcp`'s host rules,
 including OIDC identity trust admitting its resource's host, behave as they do
 today. Without `--listen`, `serve` never binds anything but `127.0.0.1`. The
@@ -602,11 +594,16 @@ object.
   a lost response becomes `unknown` and `reconcile` and is never replayed.
   Every command reports it, not only data writes. A separate field for whether
   the operation ran would only repeat `effects`.
-- **A write has three results.** It is committed, not committed, or of unknown
-  outcome, the same on every surface, as
-  [#1067](https://github.com/ModernRelay/omnigraph/issues/1067) proposes. A server that could not settle the attempt itself
-  answers `outcome_unknown`, never a plain `internal`. Every other error keeps
-  its code, and its disposition follows from what the server knows:
+- **A write has three results, which
+  [storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093)
+  defines.** It committed; it did not commit, because it was refused before any
+  effect, lost its conflict or failed before its manifest request could land;
+  or its publication is pending, because its manifest request got no definite
+  answer. This RFC owns only how they are reported. A write the server could
+  not settle answers `outcome_unknown`, never a plain `internal`; a later write
+  to a branch whose publication is pending answers `service_unavailable`, a
+  definite refusal that took no effect. Every other error keeps its code, and
+  its disposition follows from what the server knows:
 
   | Error | `effects` | `action` |
   |---|---|---|
@@ -615,12 +612,15 @@ object.
   | Any of those after an earlier publication of the same operation, such as the fork a load makes before its rows, which the engine marks on its error | `partial` | the code's |
   | Any other error after a write | `unknown` | `reconcile` |
   | An attempt the server could not settle (`outcome_unknown`) | `unknown` | `reconcile`, `recover` when recovery is required |
+  | A later write to a branch whose publication is pending (`service_unavailable`) | `none` | `retry` |
 
-  `disposition.check` carries what a later read needs to settle an unknown write:
-  the branch, its head before the write and the attempt's transaction id. It
-  arrives with the attempt identity of
+  A later phase adds `disposition.check`, what a later read needs to settle an
+  unknown write: the identity storage outcomes per operation gives a pending
+  publication, its branch and graph commit id, with the branch's head before
+  the write. It arrives with the attempt identity of
   [cross-process writes](#cross-process-writes); until then a caller settles
-  from the branch it sent and that branch's head.
+  from the branch it sent and that branch's head. The body below is that later
+  phase's:
 
   ```json
   {"error":"the write may have published","code":"outcome_unknown",
@@ -645,7 +645,8 @@ Each exit has one meaning on every plane. Cluster commands keep reporting
 `Diagnostic` findings inside their results; a failed command still ends with
 the one envelope.
 
-The new codes:
+The new codes, with the target and credential codes RFC 0059 defines, since the
+registry holds every code:
 
 | Code | Commands | When |
 |---|---|---|
@@ -661,13 +662,14 @@ The new codes:
 | `local_server_destination_unknown` | `serve`, `mcp` | The target's binding does not establish its destination |
 | `local_server_access_mismatch` | `serve --reuse --write`, `mcp --write` | The live local server is read-only |
 | `local_server_cli_incompatible` | `serve --reuse`, `mcp` | The live local server's CLI speaks another HTTP contract or cannot serve the graph's storage format |
-| `local_server_records_unsafe` | `serve`, `mcp`, `target list`, `target show` | The record directory has another owner, group or other permission bits, or is a symlink |
+| `local_server_records_unsafe` | `serve`, `mcp`, `target list`, `target show` | The record directory has another owner, group or other permission bits, or is a symlink, or the machine has no host identifier |
+| `local_server_read_write_unavailable` | `serve --write`, `mcp --write` | A read-write local server waits for per-operation storage outcomes |
 | `studio_unavailable` | `studio` | Studio is not installed, or nothing on this platform handles its links |
 | `studio_transport_unsupported` | `studio` | The server target is on a Unix socket |
 | `credential_terminal` | `credential get` | Stdout is a terminal |
 | `credential_anonymous` | `credential get` | The server target uses anonymous access |
 | `credential_missing` | `credential get` | No token is stored for the target's owner |
-| `target_invalid` | `target add` | The entry fails RFC 0059's resolver |
+| `target_invalid` | `target add`, `serve`, `studio`, `mcp` | The entry fails RFC 0059's resolver, or a direct graph target lies inside a cluster root |
 | `target_exists` | `target add` | The name is taken |
 | `target_unknown` | `target show`, `target remove` | No target has the name |
 | `target_is_default` | `target remove` | The target is `defaults.target` |
@@ -677,15 +679,18 @@ The new codes:
 | `commit_dropped` | `commit publish` | The proposal was dropped first |
 | `commit_published` | `commit drop` | The proposal was published first |
 | `outcome_unknown` | Every write | The server could not settle whether the attempt published |
-| `storage_unavailable` | Every write | Storage is failing broadly and writes are refused for now, with `Retry-After` ([#1067](https://github.com/ModernRelay/omnigraph/issues/1067)) |
 
 A read-only local server's write routes and its loopback guard answer with the
 existing `forbidden`.
 
 ### Access
 
-`omnigraph access --target NAME [--graph G] [--branch B] [--target-branch T]`
-says who you are at a target and what you may do:
+[#1073](https://github.com/ModernRelay/omnigraph/pull/1073) added the route
+at contract `0.13`. Its `AccessOutput` is `actor`, `graph_id`, `graph_wide`,
+`branch`, `target_branch` and `actions`. This RFC adds the command, whose
+output adds `protocol`, `target` and `source`, and the answer for direct
+targets. `omnigraph access --target NAME [--graph G] [--branch B]
+[--target-branch T]` says who you are at a target and what you may do:
 
 ```json
 {"protocol":1,"target":"staging","graph_id":"knowledge","actor":"act-me","source":"server",
@@ -913,7 +918,7 @@ OIDC server can scope a token per client, so clients obtain those themselves
 
 ### Self-hosted servers with static tokens
 
-A person hosting their own graphs runs `omnigraph serve <cluster root> --listen
+A person hosting their own graphs runs `omnigraph serve --target ROOT --listen
 ADDR` with static tokens and adds the deployment as a target. Four settings
 decide how complete a client's experience is:
 
@@ -926,34 +931,43 @@ decide how complete a client's experience is:
 
 ## Design
 
-### Engine: control operations on the version CAS
+### Engine: control facts on the version CAS
 
-Checked against main and Lance 11.0.0's source on 2026-10-18.
+Checked against main and Lance 13.0.0's source on 2026-10-19.
 
 **What already holds across processes.** Every `__manifest` publication is an
 `Operation::Overwrite` committed with zero retries. Lance writes the next
 version only if it is absent: a hard link that fails on an existing target on
 local disks, `If-None-Match: *` on S3 and Azure. A concurrent commit therefore
 loses with `CommitConflict` instead of being rebased. The publisher maps that to
-`RowLevelCasContention`, reloads, rechecks its precondition (`ExactGraphHead`,
+`RowLevelCasContention` and reloads. On every attempt,
+`check_publish_precondition` rechecks its precondition (`ExactGraphHead`,
 `ExactGraphVersion` or `ExactCandidate`) and its expected table versions, and
-retries within its budget of five. Ordinary writes, loads, merges, optimize and
-index maintenance rest on this, and their in-process gates only save wasted
-staging. The module says so: "cross-process writers on one graph remain
-one-winner-CAS at publish". A loser's detached staging is unreachable and
+the loop retries up to `PUBLISHER_RETRY_BUDGET`, five times, six attempts in
+all. A precondition that no longer holds ends the attempt with
+`ReadSetChanged`; nothing re-parents silently. Ordinary writes, loads, merges,
+optimize and index maintenance rest on this, and their in-process gates only
+save wasted staging. The module says so: "cross-process writers on one graph
+remain one-winner-CAS at publish". A loser's detached staging is unreachable and
 collectible, as invariant 5 requires. Schema apply against a writer or another
-apply is already decided the same way. The one linear `__manifest` commit,
-optimize's removal of stale auto-cleanup configuration, can only make a
-concurrent schema apply refuse.
+apply is already decided the same way. Optimize's config commit that strips
+stale auto-cleanup configuration (`Dataset::update_config`) also moves
+`__manifest`'s version, so it can only make a concurrent schema apply refuse.
+
+Two facts of the publisher shape the fix. A publication that changes rows must
+record a graph commit (`publish_with_precondition` refuses one without a
+lineage intent), so the head commit is the state of the `table` rows. And the
+preconditions read the branch binding, its native branch identifier and the
+head commit id, nothing else: a version that keeps the head passes them.
 
 **What does not.** The rest of a branch's state lives in Lance refs, and Lance
-gives refs weaker guarantees: `Branches::create` is put-if-absent, but
-`replace_metadata` is an unconditional read-modify-write, `delete` is
-unconditional, no Lance commit reads a ref, and object stores offer no
-conditional delete. Local storage has no update-if-unchanged primitive at all
-(`PutMode::Update` returns `NotImplemented`), so the one compare-and-swap that
-works on every backend is the one manifests use: a numbered object written if
-absent. Five races depend on the process-local gates
+gives refs weaker guarantees. In Lance 13, `Branches::create` is put-if-absent,
+but `replace_metadata` reads the ref and puts it back with no version check,
+`delete` removes it unconditionally, no Lance commit reads a ref, and object
+stores offer no conditional delete. Local storage has no update-if-unchanged
+primitive at all (`PutMode::Update` returns `NotImplemented`), so the one
+compare-and-swap that works on every backend is the one manifests use: a
+numbered object written if absent. Five races depend on the process-local gates
 (`WriteQueueManager::for_root`, a process-wide registry, and the schema gate,
 whose exclusive side branch creation takes):
 
@@ -962,101 +976,136 @@ whose exclusive side branch creation takes):
 | Branch delete beside a publisher | The publisher passes its precondition, the delete retires, archives and unlinks the ref, then the publisher's commit lands in the retired tree. It acknowledges a write no live branch shows, and the branch's settled history lacks it. |
 | Two creates of one logical name | Each mints its own `{logical}.{ULID}` ref, so neither put-if-absent conflicts. Two live incarnations result, and every resolution of the name fails until someone intervenes. |
 | A create during schema apply | Apply checks that main is the only branch, a create in another process adds one without moving main, and apply's `ExactGraphVersion` still succeeds. The new branch keeps the old contract, and merging it fails. System-column upgrade has the same window. |
-| Cleanup during a two-phase create | Lance writes the new tree, then its ref. Cleanup can classify the tree as ref-less, and its forced Lance delete can remove the tree, and the ref if it has landed. |
+| Cleanup during a two-phase create | Lance writes the new tree, then its ref. Cleanup can classify the tree as ref-less, and its forced Lance delete can remove the tree, and the ref if it has landed. `reclaim_ref_absent_tree` says the single-writer gate is what stops a create between its last ref read and the delete. |
 | Publish beside drop of one proposal | Drop releases the proposal's tags and deletes its tag object; publish's `ExactCandidate` never reads the tag. Both acknowledge, and a merge proposal's released source tag can let a third process's cleanup sweep a pin the publish then names. |
 
-Each fix moves the deciding step onto a `__manifest` chain's version CAS, and
-leaves every other step a derived, idempotent follow-up:
+Each fix moves the deciding step onto a `__manifest` chain's version CAS through
+one new kind of row.
 
-1. **Retirement is a publication.** Branch delete first publishes a
-   head-preserving tombstone version on the branch's own `__manifest` chain,
-   with zero retries. A concurrent publisher either loses that version and
-   reloads into the tombstone, or wins it and the delete reloads into the new
-   head and retries. History settlement reads the chain up to the tombstone, so
-   it is complete. The retirement marker, the `BranchContents` archive and the
-   unlink follow as today, and a crash between them leaves a tombstoned branch
-   that the next delete, cleanup or `repair` finishes. A publisher reading a
-   tombstone refuses with `branch_deleted`.
-2. **The branch namespace is registered on main.** Creating a branch publishes a
-   head-preserving registration of its logical name and native identity on
-   main's `__manifest`, after the native ref exists; deleting it publishes the
-   matching deregistration after the tombstone. Two creates of one name race on
-   main's version: the loser reloads, finds the name registered, reclaims its
-   own native ref and tree, which nobody else can have registered, and refuses
-   with `branch_exists`. Because each create mints its own ULID, a ref conflict
-   on that exact name can only be its own retried request, which Lance's
-   `put_ref_if_absent` reports as `RefConflict` without checking; the create
-   reads the ref back and treats it as landed. Unretired, registered refs define
-   the logical branches. Because a create now moves main's version, schema
-   apply's `ExactGraphVersion` loses to a create made after its main-only check,
-   and so does system-column upgrade.
-3. **Cleanup reclaims only what no registration can still claim.** A tree that
-   no registration names and no tombstone retired, such as a create's tree
-   before it registers, is reclaimed only after the collector's existing
-   seven-day orphan age, whatever the retention policy, and through a delete of
-   that tree alone, with the ref rechecked first. Tombstoned trees follow
-   today's rules for retired trees. Cleanup never calls
-   Lance's forced branch delete, which deletes a ref it finds. This is the one
-   place age decides, as it already does for orphan objects: an unregistered
-   tree names no publication authority the collector could consult.
-4. **Drop is a publication.** Dropping a proposal publishes a head-preserving
-   drop record on its target branch's chain before it releases any tag.
-   Publish's `ExactCandidate` reload sees the record and refuses
-   (`commit_dropped`); a drop that reloads into a published candidate refuses
-   (`commit_published`). Tags are released only after the record is durable,
-   so no published pin can lose its protection. Publish's precondition is a
-   graph-head expectation, so a head-preserving record costs other writers on
-   the branch a reload, not a refusal.
+**Control facts.** A ***control fact*** is a `__manifest` row that changes no
+`table` row and no schema contract, and so records no graph commit: a branch's
+tombstone on its own chain, a branch's registration on main, and a proposal's
+drop record on its target branch's chain. The row-change rule becomes: a
+publication that changes `table` rows or the schema contract records a graph
+commit, and one that writes only control facts records none. The publisher
+loads a chain's control facts with its other rows on every attempt, and
+`check_publish_precondition` fails closed, whatever the precondition, when a
+fact names the attempt's branch, name or candidate:
+
+| Fact | Chain | An attempt refuses when | Refusal |
+|---|---|---|---|
+| Tombstone | The branch's own | Its chain tombstones its native branch | `branch_deleted` |
+| Registration | main | It registers a logical name main already registers | `branch_exists` |
+| Drop record | The target branch's | It publishes a candidate a drop record names | `commit_dropped` |
+
+A fact that does not name the attempt leaves it unaffected: a registration costs
+main's writers a reload within their retry budget, since their head did not
+move, and a drop record costs the branch's other writers the same. A check made
+only before the first attempt would leave open the window the facts close, so
+the check runs where the precondition already runs, on every attempt.
+
+1. **Retirement is a publication.** Branch delete first publishes a tombstone on
+   the branch's own chain. A concurrent publisher either loses that version,
+   reloads and refuses with `branch_deleted`, or wins it, and the delete
+   reloads into the new head and tombstones that. History settlement reads the
+   chain up to the tombstone, so it is complete. Delete then publishes the
+   deregistration on main, and the retirement marker, the `BranchContents`
+   archive and the unlink follow as today. A crash between them leaves a
+   tombstoned branch that refuses writes, which the next delete, cleanup or
+   `repair` finishes.
+2. **A branch exists when main registers it.** Create mints the native name
+   `{logical}.{ULID}` and first publishes its registration on main: the logical
+   name, that native name and the fork point it branches from. Only then does it
+   create the native ref and tree. The registration is the branch's visibility
+   point: list, resolve, schema apply, system-column upgrade and cleanup read
+   the logical branches from main's registrations, in the attempt that
+   publishes, and a ref no registration names is no branch. Two creates of one
+   name race on main's version, and the loser refuses with `branch_exists`
+   before it has written anything. A crash after the registration and before
+   the ref leaves a registered branch with no ref, which refuses reads and
+   writes as not ready; the next create of that name, its delete or `repair`
+   completes it from the recorded fork point, which cleanup retains while the
+   registration names it, or removes it.
+
+   Until [schema apply with live branches](https://github.com/ModernRelay/omnigraph/pull/963)
+   lands, a registration also refuses, on any attempt, when main's schema
+   contract is no longer the one its fork point carries (`schema_changed`, the
+   branch-start refusal [#1016](https://github.com/ModernRelay/omnigraph/pull/1016)
+   defines), and schema apply's `ExactGraphVersion` refuses when a registration
+   moved main's version after its live-branch check. Whichever publishes second
+   refuses, so no branch outlives an apply with the old contract. Once PR 963
+   lands, its rule wins: a branch keeps its contract until a merge, a
+   registration no longer reads main's contract, and a registration is never
+   the reason an apply refuses. PR 963 then decides what apply pins in place of
+   main's exact version.
+3. **Cleanup reclaims only what no registration names.** A create registers
+   before its tree exists, so a tree that no registration names and no
+   tombstone retired is no create in progress. The collector lists trees
+   before it reads main's registrations, so any listed tree whose create is in
+   flight is already registered in what it reads. It reclaims such a tree with
+   no age threshold, through a delete of that tree alone, and never calls
+   Lance's forced branch delete, which deletes a ref it finds. Tombstoned trees
+   follow today's rules for retired trees. The deciding authority is the
+   registration set, never an age, as invariant 5 requires. Lance 13's stock
+   `cleanup_old_versions` now also reaches unreferenced data newer than the
+   retained manifests
+   ([lance#8944](https://github.com/lance-format/lance/pull/8944)), so the engine
+   keeps never calling it on a graph table.
+4. **Drop is a publication.** Dropping a proposal publishes a drop record on
+   its target branch's chain before it releases any tag. An attempt to publish
+   that candidate refuses with `commit_dropped`, and a drop that reloads into a
+   published candidate refuses with `commit_published`. Tags are released only
+   after the record is durable, so no published pin can lose its protection.
 5. **The gates stay as contention optimizations.** No correctness argument rests
    on `for_root`, the schema gate or the branch gates any longer, and their
    comments say so. The exclusive schema permit around branch creation becomes
    shared.
 
 **Late requests are harmless by construction.** Every storage mutation in this
-design is one of three kinds, the classification
-[#1067](https://github.com/ModernRelay/omnigraph/issues/1067) proposes for all of them:
+design falls in one of the key classes
+[storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093)
+defines:
 
-- a fresh, uniquely named object, such as a data, deletion, index or
-  transaction file or a detached manifest, which nothing names until a
-  publication does;
-- a conditional publication, a `__manifest` version written only if absent;
-- a follow-up of a publication whose late or repeated landing changes nothing
-  logical: retirement's marker rewrite, the archive, the unlink, a losing
-  create's reclaim and a drop's tag release.
+- a fresh key, such as a data, deletion, index or transaction file or a
+  detached manifest, which nothing names until a publication does;
+- a conditional key, a `__manifest` version written only if absent;
+- a mutable key written only as a follow-up of a publication, whose late or
+  repeated landing changes nothing logical: retirement's marker rewrite, the
+  archive, the unlink and a drop's tag release.
 
-The marker rewrite is unconditional in Lance 11: `Branches::replace_metadata`
-reads the ref, edits it and puts it back with no version check. A late one can
-even recreate a ref the delete already unlinked. That ref is retired and
-unregistered, so it names no logical branch, and cleanup reclaims it. A guard
-against unconditional writes of mutable keys, as #1067 proposes, admits these
-only as follow-ups of a publication.
+The marker rewrite is unconditional in Lance 13: a late one can even recreate a
+ref the delete already unlinked. That ref is tombstoned and deregistered, so it
+names no logical branch, and cleanup reclaims it. A guard against unconditional
+writes of mutable keys admits these only as follow-ups of a publication.
 
-**Format.** Tombstones, registrations and drop records are new `__manifest`
-rows, so a graph that uses them carries the next storage stamp, which older
-binaries refuse to open, as they refuse every newer stamp. A branch publishes
-the stamp with its first new row; `omnigraph upgrade`'s stamp-only route
-registers every live branch on main in one publication, from the census it
-already takes. [Schema apply with live
+**Format.** Control facts are new `__manifest` rows under the next storage
+stamp. Only `omnigraph upgrade`'s stamp-only route raises a graph to it, and
+that route's one publication on main registers every live branch from the
+census it already takes, with writers stopped as it already requires; an
+ordinary publication never raises the stamp, so no registration can hide a
+live branch. Once main carries the stamp, older binaries refuse the graph and
+each other branch takes the stamp with its next publication. Until a graph is
+upgraded, the new binary keeps today's branch protocol and its
+one-writer-process boundary. [Schema apply with live
 branches](https://github.com/ModernRelay/omnigraph/pull/963) also proposes a
 stamp; whichever lands second takes the next one, and the two are independent.
 Downgrade is export and load.
 
-**Cost.** Branch creation and deletion each gain one zero-retry `__manifest`
-publication on main, and deletion one on the branch; drop gains one. Each is
-also one more version main's or the branch's writers may reload past, within
-their existing retry budget; their preconditions are graph-head expectations,
-so they do not refuse. Only schema apply and system-column upgrade, which fix
-main's exact version, refuse instead, which is the point. Row writes, loads and
-merges are otherwise unchanged. `integration/branch_control_cost.rs` measures
-the added requests per backend.
+**Cost.** Branch creation gains one zero-retry publication on main, deletion one
+on the branch and one on main, and drop one on the target branch. Each is one
+more version its chain's writers may reload past within their retry budget; a
+fact that does not name them never makes them refuse. Only schema apply and
+system-column upgrade, which pin main's exact version, refuse instead, which is
+the point until PR 963. Row writes, loads and merges are otherwise unchanged.
+`integration/branch_control_cost.rs` measures the added requests per backend.
 
 **Recovery.** Every new durable step is a publication or a follow-up of one. A
 crash after a tombstone and before the unlink leaves a branch that refuses
-writes and that cleanup and `repair` complete. A crash after a create's native
-ref and before its registration leaves an unregistered tree that cleanup
-reclaims after the orphan age. A crash after a drop record and before the tag
-release leaves tags that expire with their captured authority, as a proposal's
-tags already do.
+writes, which delete, cleanup and `repair` complete. A crash after a
+registration and before its ref leaves a branch that refuses as not ready until
+a create, its delete or `repair` completes or removes it. A crash after a drop
+record and before the tag release leaves tags that expire with their captured
+authority, as a proposal's tags already do.
 
 ### `omnigraph-server` becomes a library
 
@@ -1064,7 +1113,7 @@ The `omnigraph-server` crate keeps every route, layer and lifecycle and loses
 its binary. `omnigraph serve` calls it in both forms:
 
 - **For others**, through the entry point the binary's `main` uses today, which
-  becomes public with the options it parses: the cluster root, the listen
+  becomes public with the options it parses: the cluster root target, the listen
   address and the settings in [Serving for others](#serving-for-others). Its
   output and exit behavior are the binary's.
 - **For you**, through the local embedding API below.
@@ -1113,7 +1162,8 @@ pub enum LocalOpenError {
     /// the server; tests open it inside `with_local_read_write`.
     ReadWriteUnavailable,
     ActorRequired,
-    /// The root is a graph inside a cluster: serve the cluster.
+    /// The root is a graph inside a cluster; the error names the cluster
+    /// root to target instead.
     ClusterGraph { root: String, cluster: String },
     Root(String),
     Open(OmniError),
@@ -1228,15 +1278,17 @@ The existing convenience constructors stay until
 
 | Change | Contract |
 |---|---|
-| `GET /graphs/{graph_id}/access` | [Access](#access); requires authentication like every graph route, and no graph action |
+| `GET /graphs/{graph_id}/access` | Shipped in [#1073](https://github.com/ModernRelay/omnigraph/pull/1073) at contract `0.13`; [Access](#access) adds the command around it |
 | `Omnigraph-If-Actor` request header | [Identity](#identity); `412 actor_mismatch` before graph lookup |
 | `disposition` on every error body | [Dispositions and refusals](#dispositions-and-refusals); the existing fields keep their meaning |
 | `ErrorCode` | Grows to the one registry; OpenAPI lists every code with the statuses servers send it under |
 
-The HTTP contract version moves once for all four, from `0.13` to `0.14`,
-with `openapi.json` regenerated through the server's OpenAPI test. The bump
-lands with the actor header, whose silent loss on an older server is the one
-that matters, and the other three ride it in the same release. Servers keep accepting exactly
+The HTTP contract version moves once, from `0.13` to `0.14`, with
+`openapi.json` regenerated through the server's OpenAPI test. The bump lands
+with the actor header ([#1074](https://github.com/ModernRelay/omnigraph/pull/1074)),
+whose silent loss on an older server is the one that matters; `disposition`
+and the registry ride it ([#1076](https://github.com/ModernRelay/omnigraph/pull/1076)),
+and the access route already shipped at `0.13`. Servers keep accepting exactly
 one version. A client that talks to deployments of several versions, as a
 manager of long-lived deployments does, reads each one's version from
 `/healthz`, which needs no header and names it, and speaks that version to it.
@@ -1286,7 +1338,9 @@ A client that refuses unknown fields in error bodies must accept
 
 Records live in one directory per OS account, resolved from the account rather
 than from `HOME`, `TMPDIR`, `XDG_*` or `OMNIGRAPH_HOME`, so a GUI process, a
-terminal and an agent with its own CLI home find the same local servers. The
+terminal and an agent with its own CLI home find the same local servers.
+`OMNIGRAPH_LOCAL_SERVERS_DIR` names another directory, which the same owner and
+mode checks guard; the record format does not depend on it. The
 home directory comes from the account database, as the CLI's managed-session
 locks already resolve it (`managed/auth/coordination.rs`):
 
@@ -1380,10 +1434,10 @@ waits on it.
   operations' authority checks part of it.
 - **Crash convergence (5).** Every new durable step is either a zero-retry
   publication on a `__manifest` chain or a derived, idempotent follow-up of
-  one: retirement's marker, archive and unlink; a losing create's reclaim; a
+  one: retirement's marker, archive and unlink; a registered create's ref; a
   drop's tag release. A crash between them leaves state the next attempt,
   cleanup or `repair` completes, and nothing becomes visible before its
-  publication.
+  publication. Cleanup decides from the registration set, never from an age.
 - **Bounded and observable (11).** One local server per destination, elected;
   fixed shapes for the record and the JSON lines; server limits and the
   owned-operation lifecycle unchanged; one registry of codes and one
@@ -1437,7 +1491,7 @@ Reverting the client commands removes them with no data migration. Reverting
 the binary fold restores the binary from the same library. The cross-process
 phase is the one irreversible change: it adds `__manifest` rows under the next
 storage stamp, which older binaries refuse, and a graph goes back only by
-export and load ([Engine](#engine-control-operations-on-the-version-cas)).
+export and load ([Engine](#engine-control-facts-on-the-version-cas)).
 
 ## Alternatives
 
@@ -1579,7 +1633,14 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   against create, delete against a publisher, cleanup against an in-flight
   create, publish against drop, schema apply and system-column upgrade against
   create, and cleanup against cleanup, each proving which side won and that the
-  loser left nothing visible.
+  loser left nothing visible. Each control fact is checked on a retry, not only
+  on a first attempt: a publisher whose first attempt loses the CAS to a
+  tombstone, or a candidate publish that loses it to a drop record, must
+  refuse on the attempt after.
+- **Catalog, publisher tests:** a publication of control facts alone records no
+  graph commit and leaves every `table` row and the head unchanged; each
+  precondition kind refuses on an attempt a fact names and passes one it does
+  not.
 - **Engine, `tests/detached_commit_matrix.rs`:** the other-process actor runs by
   default for the control operations, not only under `OMNIGRAPH_MATRIX=full`.
 - **DST:** actors that model separate processes get separate write-queue
@@ -1587,8 +1648,9 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   gates hid; today all actors share `for_root`.
 - **Engine, `integration/branch_control_cost.rs`:** the added publications per
   create, delete and drop, per backend.
-- **Storage upgrade:** the stamp-only route registers every live branch,
-  older binaries refuse the new stamp, and the cross-version fences cover it.
+- **Storage upgrade:** the stamp-only route registers every live branch in its
+  one publication, no ordinary publication raises the stamp, older binaries
+  refuse the new stamp, and the cross-version fences cover it.
 
 Run CLI integration tests with `RUST_MIN_STACK=16777216`. Until the binary
 fold lands they also need `omnigraph-server` built first.
@@ -1602,7 +1664,7 @@ repositories' changes are listed as dependencies, made and reviewed there.
 
 | Area | Change |
 |---|---|
-| Engine | Retirement as a tombstone publication on the branch's chain; branch registration and deregistration on main's `__manifest`; drop as a publication on the target branch's chain; cleanup's unregistered-tree rule and a ref-absent-only tree delete in place of Lance's forced delete; the new stamp and its upgrade census; the gates' comments rewritten as contention optimizations; `branch_deleted`, `branch_exists`, `commit_dropped` and `commit_published`. |
+| Engine and catalog | Control facts and their check in `check_publish_precondition` on every attempt; retirement as a tombstone publication on the branch's chain; registration before the native ref, and deregistration, on main's `__manifest`; drop as a publication on the target branch's chain; cleanup's registration-set rule and a tree-only delete in place of Lance's forced delete; the new stamp, raised only by the upgrade census; the gates' comments rewritten as contention optimizations; `branch_deleted`, `branch_exists`, `commit_dropped` and `commit_published`. |
 | `omnigraph-api-types` | The code registry, `disposition`, the access output and the operation table. |
 | `omnigraph-server` | A library only: the deployment entry point made public; `AppState::local` for graphs and clusters, `LocalScope`, `LocalBinding`, `LocalOptions`, `LocalCredential`, `LocalOpenError`; `serve_local` with the lifecycle shared with deployments, returning `ServeOutcome` and printing nothing to stdout; `install_log_subscriber`; the access route; `Omnigraph-If-Actor`; `disposition` on error bodies; read-only refusal in `ingress::admit` with `forbidden`; the exhaustive local-server class of every `PolicyAction`; the new MCP tools. |
 | `omnigraph-cli` | `serve` (with `--write`, `--reuse`, `--port`, `--json`, and `--listen` for deployments), `studio`, `mcp`, `target`, `credential get` and `access`, each with its `commands/` module and `app.rs` arm; `protocols` in `version --json`; one failure path and the exit table; `--as` as an assertion; the loopback guard; server records in the per-platform directories, reusing the `coordination.rs` home resolution and checks; the MCP bridge with its `readOnlyHint` filter; the platform opener with its scheme-handler check; `queries list` for server targets and `load --json` printing the route's body; later, the Studio installer with code-signature verification. |
@@ -1619,7 +1681,7 @@ repositories' changes are listed as dependencies, made and reviewed there.
 | Connections | Remove the operator-config and credentials parsers (`graph_store/src/cli_config.rs`), the name-based token lookup and Studio's own server list: list targets and aliases with `omnigraph target list --json`, add a server with `omnigraph target add` and `omnigraph login --target NAME` on standard input, and move existing keychain servers the same way once. |
 | Static tokens | Obtain them with `omnigraph credential get --json`, keep them in memory, send them only to URLs under `endpoint`, and run it again after a 401. |
 | Access | Show only the actions `omnigraph access` or the access route allows, for the target, graph and branch on screen; hide write affordances on a read-only local server. |
-| Failures | Read `code` and `disposition` from every error body; never resubmit on `unknown`, and settle it from `disposition.check`. Show writes as degraded, not the graph as gone, on `storage_unavailable` or a degraded readiness report. |
+| Failures | Read `code` and `disposition` from every error body; never resubmit on `unknown`, and settle it from `disposition.check`. Show writes as degraded, not the graph as gone, on a pending publication's `service_unavailable` or a degraded readiness report. |
 | Agents | Keep the agent gateway for panel agents and point it at the local server's URL and token; say when a read-only local server refuses their branch writes. Create each conversation's CLI home with `omnigraph target add` under that home's `OMNIGRAPH_HOME`, so the CLI writes its format, and refuse `--target` in the agent wrapper as it refuses `--server` and `--as`. Never pass the captured environment to agents. Bring the agent panel to Windows. |
 | Releases | Configure the Apple secrets so every release is Developer ID signed and notarized; the workflow already does both when they are set, but releases so far are pre-releases signed ad hoc. A fixed, documented team identifier the CLI can pin; full releases with version-free asset names, so a latest URL resolves for each architecture; an updater inside the app; a package identity when Windows ships as an installer rather than a zip. Installing Studio waits for these ([omnigraph-studio#3](https://github.com/ModernRelay/omnigraph-studio/issues/3)). |
 | Specs | Rewrite spec 012's E1–E5 and E15 as this RFC, drop spec 013's note that the launcher passes its CLI path, and update specs 002 (links), 003 (connections), 011 and 013 (agents). |
@@ -1655,10 +1717,11 @@ with its single-bullet `changelog.d` note, the public Rust APIs included.
    `disposition` on every failure with the three write results and
    `outcome_unknown`, the exit codes, `Omnigraph-If-Actor` and the `--as`
    assertion, and `GET /graphs/{graph_id}/access`, under one HTTP contract
-   bump. This is the
+   bump. The access route shipped in
+   [#1073](https://github.com/ModernRelay/omnigraph/pull/1073). This is the
    result surface [#1067](https://github.com/ModernRelay/omnigraph/issues/1067) asks for in its sixth step. `implementation: in-progress`.
-2. **Targets.** `target list|show|add|remove` with RFC 0059, `credential get`,
-   `access`, and `protocols` in `version --json`.
+2. **Targets.** RFC 0059's targets and `credential get`
+   ([#1090](https://github.com/ModernRelay/omnigraph/pull/1090)), and `access`.
 3. **Read-only local servers.** `AppState::local` for graphs and clusters,
    `serve_local`, records, the guard, `serve`, `studio`, `local_servers` in the
    listing, `mcp` with read tools, user docs and the skill.
@@ -1666,8 +1729,9 @@ with its single-bullet `changelog.d` note, the public Rust APIs included.
    --write`, and `serve --listen` replacing the `omnigraph-server` binary in
    images, archives, tests and docs. The user page states the interim
    one-writer-process boundary. Read-write local servers wait for
-   [#1067](https://github.com/ModernRelay/omnigraph/issues/1067)'s first change: a storage error ends its own operation, not the
-   process, and its trigger is logged.
+   [storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093)
+   ([#1096](https://github.com/ModernRelay/omnigraph/pull/1096)): a storage error
+   ends its own operation, not the process, and its trigger is logged.
 5. **Cross-process writes.** The engine changes in
    [Cross-process writes](#cross-process-writes); the support boundary is
    lifted and the interim note removed.
@@ -1794,22 +1858,17 @@ against the graph URI while the route id is `default`.
 
 ### A5. RFC 0059 alignment
 
-This RFC asks RFC 0059, at `323068fa`, for three changes, the first in two
-parts; none has a reply yet:
-
-| Ask | State |
-|---|---|
-| The singular `target` group with `list` and `show` | Not added; defined here |
-| `target add` and `remove` | Contradicted by its "Add no target administration group"; asked as the one exception, with the reasoning in [Targets](#targets) |
-| No compatibility interval | Rejected so far: it keeps legacy adapters for an interval |
-| Retiring every transport flag at once, `--server`, `--profile`, `--store`, positional URIs, `--cluster` as an address, `--managed`, `--direct`, `use`, `profile` and folder context | Planned, after its interval |
-
-It already adopted a server target's authentication binding: a token owner
-bound to an endpoint scope, or anonymous access.
-
-**Recommendation:** a third comment on
-[PR #675](https://github.com/ModernRelay/omnigraph/pull/675) stating the three
-changes and pointing at this RFC.
+RFC 0059's accepted revision, in
+[PR #1090](https://github.com/ModernRelay/omnigraph/pull/1090), answers the
+three asks an earlier draft of this RFC made of
+[PR #675](https://github.com/ModernRelay/omnigraph/pull/675): the singular
+`target` group with `list`, `show`, `add`, `remove` and `import`; no
+compatibility interval, with one breaking release that removes every other
+destination selector; and `credential get`. It also adds inline addresses:
+`--target` takes a name or a literal path, storage URI or server endpoint on
+every command. This RFC takes that grammar as rule 1 and links to RFC 0059 for
+it and for the `target` and `credential` commands rather than restating them.
+It adds one field, the listing's `local_servers`.
 
 ### A6. Defects found
 
@@ -1919,3 +1978,20 @@ changes and pointing at this RFC.
   action. Records accept only a 32-hexadecimal machine id, Windows records wait
   for their own pull request, and the MCP bridge's relay rules match the
   implementation.
+- 2026-10-19: Addressed the review of `c4641d79`. Control facts replace the
+  head-preserving rows: a tombstone, a registration or a drop record changes no
+  `table` row and records no graph commit, and `check_publish_precondition`
+  reads the facts that name an attempt on every attempt, so a writer refuses
+  whatever its precondition. A create registers before it writes its ref, which
+  makes the registration the branch's visibility point and gives cleanup an
+  authority to read in place of the seven-day age. Until PR 963 lands, a
+  registration refuses when main's contract moved past its fork; after it, PR
+  963's rule wins. Only the upgrade census raises the new stamp. RFC 0059's
+  accepted revision in PR #1090 owns addressing, inline addresses included,
+  and the `target` and `credential` commands; deployments pass their root
+  through `--target`. The access route is #1073's, and this RFC adds the
+  command. A direct graph inside a cluster refuses and names the root. Storage
+  outcomes and pending publications are PR 1093's; this RFC keeps the
+  registry, `disposition` and the exit table, drops `storage_unavailable`, and
+  labels `disposition.check` as a later phase. The file keeps its new name,
+  chosen before it merges, so the registry records one name.
