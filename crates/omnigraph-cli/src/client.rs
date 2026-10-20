@@ -39,8 +39,8 @@ use omnigraph_api_types::{
     GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryRequest, ReadOutput,
     SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
     branch_read_output, change_baseline_output, change_feed_output, change_scope,
-    commit_changes_output, commit_output, diff_output, merge_base_output, read_output,
-    schema_apply_output, show_read_output, snapshot_payload,
+    commit_changes_output, commit_output, diff_output, load_executed_output, merge_base_output,
+    read_output, schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchRead, BranchWrite, CommitWrite};
@@ -1459,6 +1459,7 @@ impl GraphClient {
                     actor_id: actor.map(String::from),
                     commit: receipt.commit.as_ref().map(commit_output),
                     outcome: None,
+                    executed: None,
                 })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("mutate")),
@@ -1592,6 +1593,7 @@ impl GraphClient {
                     actor_id: actor.clone(),
                     commit,
                     outcome: Some(outcome),
+                    executed: None,
                 })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("branch write statement")),
@@ -1686,6 +1688,7 @@ impl GraphClient {
                     actor_id: actor.clone(),
                     commit,
                     outcome: Some(outcome),
+                    executed: None,
                 })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("commit write statement")),
@@ -1742,6 +1745,7 @@ impl GraphClient {
                 let receipt = session
                     .load_csv_as_with_receipt(branch.unwrap_or("main"), &request, actor.as_deref())
                     .await?;
+                let executed = receipt.executed_plan().map(load_executed_output);
                 Ok(ChangeOutput {
                     branch: receipt.result.branch,
                     query_name,
@@ -1750,6 +1754,7 @@ impl GraphClient {
                     actor_id: actor.clone(),
                     commit: Some(commit_output(&receipt.commit)),
                     outcome: None,
+                    executed,
                 })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("load statement")),

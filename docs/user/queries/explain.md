@@ -158,9 +158,19 @@ fragment, `partial` when coverage is incomplete or unknown, `absent` without a
 full-text index); and
 `memory_limit`, the query pool in bytes. Selector statements also capture
 `traversal_work_limit`, shared across the execution, and `has_wildcard_traversal`,
-retained through rewrites so historical replay can enforce the target rule. Query
-plans omit `pipelines` and node `properties.schema`: complete pipeline schemas
-are derived when lowering. Result nodes declare their output through `columns`. Every query scan records its pinned `version`, or
+retained through rewrites so historical replay can enforce the target rule. Every
+planned document carries `pipelines`, the physical plan cut at each node whose
+operator emits nothing before it has seen its whole input (`Sort`, `Aggregate`,
+`AntiJoin`, `RankFuse`, a load's `Validate`, a costed multi-hop `Expand`) and
+at a join's build side (a hash join's build, the collected left side of a
+cross join or a contains join): each entry names its `source`, its streaming
+`operators` in run order, the `sink` it drains into (the breaker node, a
+join's build side, or the `consumer`) and `depends_on`, the pipelines drained
+before it starts. The pipelines describe the plan: a correlated block the
+engine answers from the bulk CSR degree (a single-hop, filter-free existence
+or row-count test) prints its inner pipeline without running it. Query plans
+omit node `properties.schema`: complete pipeline
+schemas are derived when lowering. Result nodes declare their output through `columns`. Every query scan records its pinned `version`, or
 `null` when that type has no dataset in the requested snapshot.
 The explain document's `statistics` includes one `index_facts(<table>)`
 entry per read table, with index names, columns, kinds and fragment coverage.
@@ -224,10 +234,12 @@ declared policy: `node` `gate` (a pre-pass gate's `plan`, `prefilter`,
 overfetch `rung`. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
-`Executed::profile`). The row schema is `explain_version` 6: `pipelines`
-entries (present on planner-routed diff and merge documents, never on a
-query's) carry a pipeline `id` and `depends_on`, with `source`, `operators`
-and `sink` as objects whose `id` joins the `physical_plan` node ids. Saved physical
+`Executed::profile`). The row schema is `explain_version` 7: `pipelines`
+entries (on every planner document since version 7, on diff and merge
+documents only before it) carry a pipeline `id` and `depends_on`, with
+`source`, `operators` and `sink` as objects whose `id` joins the
+`physical_plan` node ids; the engine refuses to lower a plan whose operator
+declares an emission other than the cut the document prints. Saved physical
 plans use a `bound_plan_version: 9` envelope whose `body` contains `plan` and
 `values`; version 7 records each aggregate's `distinct` flag, version 8
 types each node's ordering and declares ranked scans' eligibility and policy,
@@ -343,8 +355,16 @@ The `plan` rows are the query explain's, with these values for a load:
 |---|---|
 | `datafusion` | `unavailable`: a load's operators are lowered at execution, under the statement's transaction |
 | `route` | `engine` for overwrite, which runs the plan; `executor` for append and merge, which the plan describes while the keyed adapters run them (`reason` then says `mode_on_executor`) |
-| `explain_version` | the shared counter, `6` since load nodes exist |
+| `explain_version` | the shared counter, `7` since every route prints `pipelines` |
 | `operation` | `kind` (`load`), `mode`, and `tables`: the target and each consulted committed table with its `type_key` and `version` |
 
 An executed load's receipt carries the same document and an `executed`
-object with `partitions`, `rows` and `source_bytes`.
+object with `partitions`, `rows`, `source_bytes` and `operators`: one entry
+per node of the plan in post-order (the source first), each with the node's
+`id` and `node` kind, the `operator` it built, the `rows` it emitted (the
+sink counts the rows it staged), `elapsed_compute_ns`, the time its stream
+and its workers were polled, and `wall_ns`, the span from its first poll to
+its end with every wait included. The statement's answer, the `ChangeOutput`
+of `omnigraph mutate --json` and of `POST /mutate`, carries the object as
+`executed` beside the counts and the commit. The compute and wall numbers
+are measurements of one run; a GQT case pins only the rows.

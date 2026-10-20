@@ -2383,6 +2383,71 @@ fn explain_load_statement_answers_the_plan_as_rows() {
     );
 }
 
+/// `load csv … mode overwrite` through the embedded `mutate` door answers its
+/// `ChangeOutput` with `executed`, the plan's measurement in post-order; the
+/// wire shape has no GQT expression (a served host refuses `expect plan` on a load).
+#[test]
+fn load_statement_answers_the_executed_plan_beside_the_change() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let sources = temp.path().join("sources");
+    fs::create_dir(&sources).unwrap();
+    let csv_path = sources.join("people.csv");
+    let csv = "name,age\nzed,41\nyul,39\n";
+    fs::write(&csv_path, csv).unwrap();
+    let statement = format!(
+        "load csv \"file://{}\" into node:Person mode overwrite header",
+        csv_path.display()
+    );
+
+    let payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("mutate")
+            .arg("--store")
+            .arg(&graph)
+            .arg("--yes")
+            .arg("-e")
+            .arg(&statement)
+            .arg("--json"),
+    ));
+    assert_eq!(payload["query_name"], "load csv", "{payload}");
+    assert_eq!(payload["affected_nodes"], 2, "{payload}");
+    assert!(
+        payload["commit"]["graph_commit_id"].is_string(),
+        "{payload}"
+    );
+    let executed = &payload["executed"];
+    assert_eq!(executed["partitions"], 1, "{payload}");
+    assert_eq!(executed["rows"], 2, "{payload}");
+    assert_eq!(executed["source_bytes"], csv.len(), "{payload}");
+    let operators: Vec<(&str, &str, u64)> = executed["operators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operator| {
+            (
+                operator["node"].as_str().unwrap(),
+                operator["operator"].as_str().unwrap(),
+                operator["rows"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        operators,
+        [
+            ("CsvSource", "CsvSourceExec", 2),
+            ("Validate", "ValidateExec", 2),
+            ("FragmentWrite", "DataSinkExec", 2),
+        ],
+        "{payload}"
+    );
+    for operator in executed["operators"].as_array().unwrap() {
+        assert!(operator["wall_ns"].as_u64().unwrap() > 0, "{payload}");
+        assert!(operator["elapsed_compute_ns"].is_u64(), "{payload}");
+    }
+}
+
 /// GitHub #365: the embedded transport must preserve the typed stale-head
 /// details all the way through the CLI boundary. A writable open may complete
 /// older work, so this cannot claim whole-command no effects or exit 4.

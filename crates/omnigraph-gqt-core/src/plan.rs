@@ -38,9 +38,10 @@ use omnigraph_planner::ValidationScope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::load_plan::PipelineClaim;
 use crate::report::Row;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -203,6 +204,11 @@ pub(crate) enum PlanLine {
     ValidationScope {
         scope: String,
     },
+    /// The document's `pipelines` hold `claim` at its position: the physical
+    /// plan cut at the operators that hold their whole input.
+    Pipeline {
+        claim: PipelineClaim,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -252,6 +258,15 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             lines.push(PlanLine::ValidationScope {
                 scope: scope.to_string(),
             });
+            continue;
+        }
+        if let Some(pipeline) = line.strip_prefix("pipeline ") {
+            let Some(claim) = PipelineClaim::parse(pipeline) else {
+                return Err(refused(
+                    "is `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`",
+                ));
+            };
+            lines.push(PlanLine::Pipeline { claim });
             continue;
         }
         if let Some(gq) = line.strip_prefix("no cast ") {
@@ -1481,6 +1496,16 @@ pub(crate) fn plan_mismatch(
         .unwrap_or_default();
     for line in lines {
         match line {
+            PlanLine::Pipeline { claim } => {
+                let printed = PipelineClaim::of_document(explain);
+                if !printed.contains(claim) {
+                    let printed: Vec<String> = printed.iter().map(PipelineClaim::spell).collect();
+                    return Some(format!(
+                        "expect plan: pipeline {}; the document prints {printed:?}",
+                        claim.spell()
+                    ));
+                }
+            }
             PlanLine::ValidationScope { scope } => {
                 let reported = explain
                     .get("validation")

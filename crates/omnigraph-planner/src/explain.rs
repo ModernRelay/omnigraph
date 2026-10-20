@@ -25,7 +25,10 @@ use crate::validate::ValidationSummary;
 /// arrived with the same bump.
 /// Version 6: the load node kinds `CsvSource`, `Validate` and
 /// `FragmentWrite` were added, and `operation` carries `mode` for a load.
-pub const EXPLAIN_VERSION: u32 = 6;
+/// Version 7: `pipelines` is present on every planned document and is cut at
+/// every node whose operator holds its whole input, not only at a join's
+/// build side; a pipeline's `sink` may name such a breaker node.
+pub const EXPLAIN_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySummary {
@@ -131,9 +134,10 @@ pub struct Explain {
     pub logical_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub physical_plan: Option<Value>,
-    /// The pipelines the push operators build from a diff or merge plan: per
-    /// pipeline its source, its operators and its sink, in run order. Absent
-    /// for a query, which the engine lowers to one DataFusion plan.
+    /// The physical plan cut into pipelines at every node that holds its whole
+    /// input (`PhysicalPlan::pipelines`): per pipeline its source, its
+    /// operators and its sink, in run order, on every planned route. Absent
+    /// only when no physical plan was built.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipelines: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

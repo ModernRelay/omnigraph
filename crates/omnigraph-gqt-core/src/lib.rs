@@ -3977,7 +3977,7 @@ async fn run_control_step(
             let executed = outcome.as_ref().ok().map(|receipt| {
                 (
                     receipt.plan.as_ref().map(|explain| explain.to_value()),
-                    receipt.executed,
+                    receipt.executed.clone(),
                 )
             });
             check_write_expect(host, name, expect, outcome).map_err(&fail)?;
