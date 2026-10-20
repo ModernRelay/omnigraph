@@ -83,7 +83,7 @@ the request it answered by the first row that matches:
 |---|---|---|
 | Any error before the request submitted a write | `none` | the refusal's own |
 | A write whose completion the server could not settle; `code` becomes `outcome_unknown` unless the action is `recover` | `unknown` | `reconcile`, or `recover` |
-| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), or a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a resource limit, an external Blob source, a query diagnostic) | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
+| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a resource limit, an external Blob source, a query diagnostic), or a failure the engine proved published nothing, such as a storage failure before publication; `code` is kept | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
 | Any other error after a write, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
 
 A refusal's own action follows its code: `recover` for a recovery intent or a

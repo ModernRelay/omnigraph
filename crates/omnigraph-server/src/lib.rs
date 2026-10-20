@@ -488,6 +488,9 @@ pub struct ApiError {
     /// as the fork a load makes of a missing branch does, so a refusal of a
     /// later step follows that publication.
     compound: bool,
+    /// Set when the engine proved the failing step published nothing itself,
+    /// with no-effect or no-publication evidence, whatever its type.
+    unpublished: bool,
 }
 
 #[derive(Debug)]
@@ -1058,6 +1061,7 @@ impl ApiError {
             completion_uncertain: false,
             owned_write: false,
             compound: false,
+            unpublished: false,
         }
     }
 
@@ -1305,9 +1309,10 @@ impl ApiError {
     /// compound operation follows its earlier step, such as the branch a load
     /// forks before its rows. Otherwise only the refusals a write meets before
     /// it starts (authentication, the contract, the actor assertion, policy,
-    /// admission capacity, a request precondition) and the typed refusals an
-    /// engine gives before its one publication took none; after an earlier
-    /// step published, those refusals leave that step's effects alone.
+    /// admission capacity, a request precondition), the typed refusals an
+    /// engine gives before its one publication, and a step the engine proved
+    /// published nothing took none; after an earlier step published, those
+    /// leave that step's effects alone.
     ///
     /// The action is what the failing step asks of its caller, unless its
     /// effects are unknown, which must be reconciled first.
@@ -1357,7 +1362,7 @@ impl ApiError {
                         | ApiErrorDetails::Diagnostic(_)
                 )
             );
-            match (refused_before_start || typed_refusal) && !recovery {
+            match ((refused_before_start || typed_refusal) && !recovery) || self.unpublished {
                 true if self.compound => DispositionEffects::Partial,
                 true => DispositionEffects::None,
                 false => DispositionEffects::Unknown,
@@ -1611,14 +1616,20 @@ impl ApiError {
                 | omnigraph::error::CompletionEvidence::Unpublished,
             ) => {
                 response.completion_uncertain = false;
+                response.unpublished = true;
             }
             Some(omnigraph::error::CompletionEvidence::Uncertain) => {
                 response.completion_uncertain = true;
             }
-            // The graph moved before this failure; what the failing step did
-            // is what its status says, as with no evidence.
-            Some(omnigraph::error::CompletionEvidence::PartlyPublished) => {
+            // The graph moved before this failure. A failing step that proved
+            // it published nothing settled; without that proof, what it did is
+            // what its status says, as with no evidence.
+            Some(omnigraph::error::CompletionEvidence::PartlyPublished { step_unpublished }) => {
                 response.compound = true;
+                if step_unpublished {
+                    response.completion_uncertain = false;
+                    response.unpublished = true;
+                }
             }
             None => {}
         }
@@ -2387,6 +2398,41 @@ mod api_error_tests {
         ] {
             assert_eq!(write.code, Some(ErrorCode::OutcomeUnknown));
             assert_eq!(write.disposition, unknown(DispositionAction::Reconcile));
+        }
+
+        // A step the engine settled keeps its proof: before or after an
+        // earlier publication of the same operation it published nothing
+        // itself and keeps its code. Without the proof it may have published.
+        let failed_put = || OmniError::Io(std::io::Error::other("detached manifest put failed"));
+        for (error, code, disposition) in [
+            (
+                failed_put().unpublished(),
+                ErrorCode::Internal,
+                none(DispositionAction::Refresh),
+            ),
+            (
+                failed_put().unpublished().after_earlier_publication(),
+                ErrorCode::Internal,
+                partial(DispositionAction::Refresh),
+            ),
+            (
+                failed_put().after_earlier_publication(),
+                ErrorCode::OutcomeUnknown,
+                unknown(DispositionAction::Reconcile),
+            ),
+            (
+                failed_put()
+                    .unpublished()
+                    .after_earlier_publication()
+                    .with_completion_evidence(omnigraph::error::CompletionEvidence::Uncertain),
+                ErrorCode::OutcomeUnknown,
+                unknown(DispositionAction::Reconcile),
+            ),
+        ] {
+            let message = error.to_string();
+            let output = engine_error_output_after(error, true);
+            assert_eq!(output.code, Some(code), "{message}");
+            assert_eq!(output.disposition, disposition, "{message}");
         }
 
         // A typed refusal of the write's one publication did not start it;

@@ -6,7 +6,9 @@
   `fix` for a request the caller must correct (its credential, input, path or
   client), `refresh` for a refusal by the state it met, `retry`, `recover` or
   `reconcile`. A write whose completion the server could not settle answers
-  `code: outcome_unknown` instead of `internal`. Errors that had no `code` now
+  `code: outcome_unknown` instead of `internal`; a failure the engine proved
+  published nothing keeps its code, with `effects: none`, or `partial` after an
+  earlier step published. Errors that had no `code` now
   have one: `precondition_failed`, `recovery_required`, `external_blob_source`
   and `change_feed_gap`, beside their details, and a deployment status read
   that raced an owner change answers `service_unavailable`. Refusals that
