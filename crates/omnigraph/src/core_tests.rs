@@ -112,11 +112,25 @@ mod fts_compat_tests {
         verify_index(&cloud_reader, &index).await.unwrap();
         let cold = tracked_store.io_stats_incremental();
         let methods: Vec<_> = cold.requests.iter().map(|request| request.method).collect();
+        // object_store 0.14 routes a single bounded range through get_opts.
+        // Keep the observable contract pinned: one HEAD, then exactly the
+        // validated certificate extent, without an unbounded payload read.
         assert_eq!(
             methods,
-            vec!["get_opts", "get_ranges"],
+            vec!["get_opts", "get_opts"],
             "HEAD then payload GET"
         );
+        let certificate_bytes = index
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|file| file.path == CERTIFICATE_FILE)
+            .unwrap()
+            .size_bytes;
+        assert_eq!(cold.requests[0].range, None);
+        assert_eq!(cold.requests[1].range, Some(0..certificate_bytes));
+        assert!(cold.requests.iter().all(|request| request.path == path));
         verify_index(&cloud_reader, &index).await.unwrap();
         assert!(tracked_store.io_stats_incremental().requests.is_empty());
 

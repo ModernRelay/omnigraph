@@ -1067,6 +1067,15 @@ mod tests {
                 fault: self.clone(),
             })
         }
+
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            // Listings must pass through the fault store and its accounting.
+            None
+        }
     }
 
     #[derive(Debug)]

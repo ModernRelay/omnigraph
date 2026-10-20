@@ -3073,7 +3073,7 @@
           "branches"
         ],
         "summary": "Create a new branch.",
-        "description": "Forks `name` off of `from` (defaults to `main`). The new branch shares\nbacking dataset data with its parent until it is mutated. Returns 409 if `name`\nalready exists. The GQ statement `branch create` on `POST /mutate` runs\nthe same body.",
+        "description": "Forks `name` off of `from` (defaults to `main`) at its head, or starts it\nat the published graph commit `from_commit` with that commit's data and\nhistory. The receipt names the branch forked and the commit the new\nbranch starts at. The new branch shares backing dataset data with its\nparent until it is mutated. Returns 409 if `name` already exists. The GQ\nstatement `branch create` on `POST /mutate` runs the same body.",
         "operationId": "cluster_createBranch",
         "parameters": [
           {
@@ -3131,7 +3131,7 @@
             }
           },
           "400": {
-            "description": "Bad request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "description": "Bad request, or both `from` and `from_commit`; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3193,6 +3193,27 @@
               }
             }
           },
+          "404": {
+            "description": "`from` names no branch, or `from_commit` names no commit the actor may branch from",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "408": {
             "description": "Request body deadline exceeded before operation admission",
             "headers": {
@@ -3215,7 +3236,28 @@
             }
           },
           "409": {
-            "description": "Branch already exists",
+            "description": "Branch already exists, or the commit `from_commit` names cannot start a branch; see branch_start_refusal",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The commit `from_commit` names is no longer retained; see branch_start_refusal",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -9832,7 +9874,8 @@
         "required": [
           "uri",
           "from",
-          "name"
+          "name",
+          "from_commit_id"
         ],
         "properties": {
           "actor_id": {
@@ -9843,6 +9886,10 @@
           },
           "from": {
             "type": "string"
+          },
+          "from_commit_id": {
+            "type": "string",
+            "description": "The graph commit the new branch starts at: `from`'s head when the\nbranch was created, or the commit `from_commit` named. For a commit\nstart, `from` is the branch that wrote the commit."
           },
           "name": {
             "type": "string"
@@ -9863,7 +9910,14 @@
               "string",
               "null"
             ],
-            "description": "Parent branch to fork from. Defaults to `main`."
+            "description": "Parent branch to fork from; the new branch starts at its head.\nMutually exclusive with `from_commit`. Defaults to `main`."
+          },
+          "from_commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A published graph commit id to start the new branch at, with that\ncommit's data and history. Mutually exclusive with `from`."
           },
           "name": {
             "type": "string",
@@ -10019,14 +10073,18 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "`name` was forked off `from`.",
+            "description": "`name` was forked off `from` at the commit `from_commit_id`: the\nhead of `from`, or the commit a `from commit \"<id>\"` start named,\nwhich `from` wrote.",
             "required": [
               "from",
               "name",
+              "from_commit_id",
               "kind"
             ],
             "properties": {
               "from": {
+                "type": "string"
+              },
+              "from_commit_id": {
                 "type": "string"
               },
               "kind": {
@@ -10122,6 +10180,49 @@
           }
         ],
         "description": "The effect of a branch statement sent to `POST /mutate`, tagged by `kind`.\nA merge conflict has no kind: it is the 409 `POST /branches/merge` answers.\nThe statement grammar is `BranchStmt` in `omnigraph-compiler`."
+      },
+      "BranchStartRefusalOutput": {
+        "type": "object",
+        "description": "A branch create refused at the graph commit `from_commit` named; nothing\nwas created.",
+        "required": [
+          "reason",
+          "graph_commit_id"
+        ],
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `branch_deleted`, the branch that wrote the commit."
+          },
+          "graph_commit_id": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/BranchStartRefusalReason"
+          },
+          "type_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `not_retained`, the graph type whose stored version cleanup reclaimed."
+          }
+        }
+      },
+      "BranchStartRefusalReason": {
+        "type": "string",
+        "description": "Why a branch could not start at the graph commit `from_commit` named.",
+        "enum": [
+          "not_retained",
+          "schema_changed",
+          "earlier_storage_format",
+          "branch_deleted",
+          "unpublished_commit",
+          "unattached_snapshot",
+          "unknown"
+        ]
       },
       "ChangeBaselineOutput": {
         "type": "object",
@@ -10928,6 +11029,17 @@
               {
                 "$ref": "#/components/schemas/BlobRangeOutput",
                 "description": "Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.\n`start..end` is half-open and `length` is the selected Blob length."
+              }
+            ]
+          },
+          "branch_start_refusal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BranchStartRefusalOutput",
+                "description": "Set with HTTP 409, or 410 for `not_retained`, when `branch create`\ncannot start a branch at the commit `from_commit` named."
               }
             ]
           },

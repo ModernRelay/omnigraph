@@ -16,9 +16,9 @@ use omnigraph::instrumentation::{QueryIoProbes, capture_query_io_probes, with_qu
 use omnigraph::loader::LoadMode;
 use omnigraph::{MutationReceipt, Session};
 use omnigraph_compiler::query::ast::{
-    BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite, EmptyFile, Expr,
-    FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt, UnattachedBase,
-    show_statement_name,
+    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite,
+    EmptyFile, Expr, FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt,
+    UnattachedBase, show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::{
@@ -289,7 +289,7 @@ pub struct ControlStep {
 pub enum ControlWrite {
     Create {
         name: String,
-        from: Option<String>,
+        from: Option<BranchCreateFrom>,
         expect: WriteExpect,
     },
     Delete {
@@ -2238,11 +2238,29 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                     source: source.clone(),
                                 }
                             }
-                            BranchStmt::Write(write) => Pending::Control {
-                                ordinal,
-                                prefix: file.settings,
-                                write: ControlSource::Branch(write),
-                            },
+                            BranchStmt::Write(write) => {
+                                if let BranchWrite::Create {
+                                    from: Some(BranchCreateFrom::Commit(commit)),
+                                    ..
+                                } = &write
+                                    && let Some(name) = bound_operand(commit)
+                                {
+                                    if !bound_names.contains(name) {
+                                        return Err(format!(
+                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                                        ));
+                                    }
+                                    if source.matches("${").count() == 1 {
+                                        substitutable_lines
+                                            .extend(section.body.iter().map(|(i, _)| *i));
+                                    }
+                                }
+                                Pending::Control {
+                                    ordinal,
+                                    prefix: file.settings,
+                                    write: ControlSource::Branch(write),
+                                }
+                            }
                         });
                         continue;
                     }
@@ -3893,11 +3911,17 @@ async fn run_control_step(
             from,
             expect,
         } => {
-            let parent = from.as_deref().unwrap_or(MAIN_BRANCH);
+            let start = match from {
+                Some(BranchCreateFrom::Commit(commit)) => ReadTarget::snapshot(SnapshotId::new(
+                    resolve_operand(commit, bindings).map_err(&fail)?,
+                )),
+                Some(BranchCreateFrom::Branch(parent)) => ReadTarget::branch(parent.as_str()),
+                None => ReadTarget::branch(MAIN_BRANCH),
+            };
             let outcome = operation(
                 host,
                 step.ordinal,
-                db.branch_create_from_as(ReadTarget::branch(parent), branch, None),
+                db.branch_create_from_as(start, branch, None),
             )
             .await
             .map_err(&fail)?;

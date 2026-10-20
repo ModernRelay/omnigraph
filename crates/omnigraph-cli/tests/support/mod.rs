@@ -1269,6 +1269,7 @@ pub fn scrub_volatile(value: &mut serde_json::Value) {
     const VOLATILE_KEYS: &[&str] = &[
         // identity-bearing per-instance values
         "commit_id",
+        "from_commit_id",
         "id",
         "__id",
         "parent_id",
