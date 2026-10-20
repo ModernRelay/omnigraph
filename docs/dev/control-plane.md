@@ -307,8 +307,8 @@ quarter of a beat interval. A timer of its own fences the owner two thirds
 of a lease after the first send of its last acknowledged beat, or at once on
 a claim. The first beat races the same deadline counted from the send of the
 lock's own write, because a successor may count silence from the moment the
-record is visible; when it lapses, acquisition fails and the server does not
-serve. A fence closes the owner's storage scope before it is reported, so no
+record is visible; when it lapses, or the claim read after beat 0 finds a
+claim, acquisition fails and the server does not serve. A fence closes the owner's storage scope before it is reported, so no
 mutation is sent after a successor may claim, whatever the shutdown grace;
 the server then closes admission and exits 2 without releasing. A
 serving acquisition that finds a version-3 lock watches the beat listing on

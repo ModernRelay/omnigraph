@@ -312,27 +312,36 @@ fn fence_holder(scope: Option<&StorageIoScope>, fence: LeaseFenced) {
 
 impl Beat {
     /// Send beat 0 until it is acknowledged, or a claim names the lock.
+    /// The claim is read again after the beat, so a holder never admits
+    /// work on a lock a claim already names.
     async fn first(&mut self, seconds: u32) -> Option<LeaseFenced> {
         loop {
             if let Some(fence) = self.once().await {
                 return Some(fence);
             }
             if self.answered {
-                return None;
+                return self.claimed().await;
             }
             tokio::time::sleep(reissue_pause(seconds)).await;
+        }
+    }
+
+    async fn claimed(&self) -> Option<LeaseFenced> {
+        match self
+            .adapter
+            .read_text_if_exists(&claim_uri(&self.dir))
+            .await
+        {
+            Ok(Some(_)) => Some(LeaseFenced::Superseded),
+            _ => None,
         }
     }
 
     /// Check for a claim, send beat `seq` (again, if an earlier request for
     /// it got no answer), and report a fence.
     async fn once(&mut self) -> Option<LeaseFenced> {
-        if let Ok(Some(_)) = self
-            .adapter
-            .read_text_if_exists(&claim_uri(&self.dir))
-            .await
-        {
-            return Some(LeaseFenced::Superseded);
+        if let Some(fence) = self.claimed().await {
+            return Some(fence);
         }
         let sent = *self.first_sent.get_or_insert_with(Instant::now);
         let payload = format!("{{\"seq\":{}}}", self.seq);
@@ -447,6 +456,7 @@ mod tests {
         lost_answers: AtomicUsize,
         hang: AtomicBool,
         claim_retried: AtomicBool,
+        claim_with_next_beat: AtomicBool,
     }
 
     impl Beats {
@@ -458,6 +468,7 @@ mod tests {
                 lost_answers: AtomicUsize::new(0),
                 hang: AtomicBool::new(false),
                 claim_retried: AtomicBool::new(false),
+                claim_with_next_beat: AtomicBool::new(false),
             })
         }
     }
@@ -526,6 +537,13 @@ mod tests {
                 return Err(unanswered());
             }
             let created = self.inner.write_text_if_absent(uri, contents).await?;
+            if beat && self.claim_with_next_beat.swap(false, Ordering::SeqCst) {
+                // A successor claims while this beat is in flight.
+                let dir = uri.rsplit_once('/').unwrap().0;
+                self.inner
+                    .write_text_if_absent(&claim_uri(dir), "{}")
+                    .await?;
+            }
             if created && beat && take_one(&self.lost_answers) {
                 return Err(unanswered());
             }
@@ -752,6 +770,17 @@ mod tests {
                 .is_err(),
             "a fenced holder's storage scope refuses mutations"
         );
+    }
+
+    /// A claim that appears while beat 0 is in flight keeps the holder from
+    /// serving: the claim is read again after the beat, before admission.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_during_the_first_beat_keeps_the_holder_from_serving_issue_1067() {
+        let store = Beats::new();
+        store.claim_with_next_beat.store(true, Ordering::SeqCst);
+        let started =
+            LeaseKeeper::start(store.clone(), ROOT, "owner", SECONDS, Instant::now(), None).await;
+        assert_eq!(started.err(), Some(LeaseFenced::Superseded));
     }
 
     /// A claim on its lock fences the owner at its next beat.
