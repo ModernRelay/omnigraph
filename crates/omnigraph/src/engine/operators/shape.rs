@@ -1076,7 +1076,7 @@ mod tests {
             let metrics = ExecutionPlanMetricsSet::new();
             let memory = work(context.task_ctx(), "produce test", &metrics).unwrap();
             let (open, opened) = tokio::sync::oneshot::channel::<()>();
-            let (unstall, stall) = tokio::sync::oneshot::channel::<()>();
+            let (release, gate) = tokio::sync::oneshot::channel::<()>();
             let executed = Arc::new(AtomicUsize::new(0));
             let pulled_past_first = Arc::new(AtomicUsize::new(0));
             let input = {
@@ -1085,7 +1085,7 @@ mod tests {
                 move || {
                     executed.fetch_add(1, Ordering::SeqCst);
                     Ok(then_flagged(batch(1), flag, async move {
-                        stall.await.unwrap();
+                        gate.await.unwrap();
                         batch(2)
                     }))
                 }
@@ -1117,7 +1117,7 @@ mod tests {
             )
             .await;
             assert!(futures::poll!(stream.next()).is_pending());
-            unstall.send(()).unwrap();
+            release.send(()).unwrap();
             assert_eq!(next(&mut stream).await, Some(batch(2)));
             assert_eq!(next(&mut stream).await, Some(batch(9)));
             assert!(next(&mut stream).await.is_none());
@@ -1165,11 +1165,11 @@ mod tests {
     #[tokio::test]
     async fn streaming_map_emits_per_batch_and_last_ends_without_pulling() {
         let metrics = ExecutionPlanMetricsSet::new();
-        let (unstall, stall) = tokio::sync::oneshot::channel::<()>();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
         let pulled_past_first = Arc::new(AtomicUsize::new(0));
         let flag = Arc::clone(&pulled_past_first);
         let input = then_flagged(batch(1), flag, async move {
-            stall.await.unwrap();
+            gate.await.unwrap();
             batch(2)
         });
         let mut seen = 0;
@@ -1189,7 +1189,7 @@ mod tests {
             "the map pulls the second batch, which is stalled",
         )
         .await;
-        unstall.send(()).unwrap();
+        release.send(()).unwrap();
         assert_eq!(next(&mut stream).await, Some(batch(2)));
         assert!(next(&mut stream).await.is_none());
 
