@@ -283,9 +283,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
 /// subcommand added to it until that subcommand is classified here.
 fn consumes_actor(cmd: &Command) -> bool {
     match cmd {
-        Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => {
-            true
-        }
+        Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => true,
         Command::Branch { command } => match command {
             BranchCommand::Create { .. }
             | BranchCommand::Delete { .. }
