@@ -111,7 +111,8 @@ each batch is announced with its contract version in a breaking release note.
   - 412: only for a failed `If-*` precondition;
   - 413: only for a body;
   - 429: per actor, with `Retry-After`;
-  - 503: server-wide, with `Retry-After` when retrying is safe.
+  - 503: unavailable for the scope the code names, the server, a graph or one
+    branch with a pending publication, with `Retry-After` when retrying is safe.
 
 ### Error body and headers
 
