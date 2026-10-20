@@ -577,7 +577,7 @@ over a string query, whose embedding needs the embedding client, gets a
 `--- expect plan` compares it; case settings and query prefixes apply.
 A load statement's explain (`explain load csv …`) answers the same document
 under the same `explain_version`, its `datafusion` row saying the operators
-are lowered only at execution ([explain.md](../user/queries/explain.md#explaining-a-load-statement)).
+are lowered only at execution ([explain-load.md](../user/queries/explain-load.md)).
 Destination hydration uses the planned projection; edge-property attach
 retains its complete property projection.
 

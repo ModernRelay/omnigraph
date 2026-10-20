@@ -2,7 +2,7 @@
 
 `explain` before a read declaration returns the query's v2 plan instead of
 its rows, regardless of the selected execution engine; before a `load csv`
-statement it returns the load's plan ([below](#explaining-a-load-statement)).
+statement it returns the load's plan ([explaining a load statement](explain-load.md)).
 It is a statement:
 one per file, never beside a declaration. The query is compiled and planned
 against the target's schema and snapshot without executing it. Planning
@@ -294,77 +294,3 @@ require the load's `change` permission on that branch before source access.
 Every read executes on engine v2, the one value of the session setting
 `engine`, so explain describes the route the query runs. See
 [session settings](index.md#session-settings).
-
-## Explaining a load statement
-
-`explain` before a `load csv` statement returns the load's accepted plan
-instead of running the load:
-
-```gq
-explain load csv "s3://imports/knows.csv" into edge:Knows mode overwrite delimiter "|" header
-```
-
-The statement accepts every load option. It reads metadata, but no payload,
-and publishes nothing. HTTP and MCP require `change` on the target branch
-before the external Blob policy check or metadata probe. A source over
-`load_source_max_bytes` refuses as `csv_source_bytes`, as a load would.
-
-The answer is the planner's document, in the same rows a query's explain
-uses: trees `logical_initial`, `logical` and `physical` in pre-order, then the `plan` rows.
-A load plan has three nodes, from the root down:
-
-| `node` | `detail` fields |
-|---|---|
-| `FragmentWrite` | `table`, `version`, `mode`, `adapter`; the physical row adds `max_input_bytes`, `max_workers` |
-| `Validate` | `table` and `checks`, every check of the load in the order it runs, which is the refusal precedence |
-| `CsvSource` | `format`, `source`, `source_bytes`, `estimated_rows`, `delimiter`, `header`, `columns`, `table`, `version`; the physical row adds `max_partitions`, `max_workers`, `fallback` |
-
-Each entry of `checks` carries `check` (`value`, `unique`, `edge_ri`,
-`cardinality` or `retained_edges`), its identity fields, `consults` (the
-committed table it reads, or `null`) and, on the physical node, `access`:
-
-- `unique` carries `columns` and `role` (`key` or `unique`).
-- `edge_ri` and `cardinality` carry `endpoint` (`from` or `to`) and
-  `node_type`.
-- `retained_edges`, on a node overwrite, carries `edge_table` and `endpoint`.
-
-`access` is the path the check reads committed state by:
-
-| `access` | Meaning |
-|---|---|
-| `delta` | the check reads no committed state: a `@key` group, or a non-key `@unique` group under overwrite, whose committed view is empty |
-| `probe` | a filtered key lookup; uniqueness uses chunks of 8,192 keys |
-| `scan` | one projected scan of the key columns, matched in memory |
-
-Overwrite endpoint checks cost probes and scans using estimated input rows,
-the consulted table's row count, and usable BTREE coverage at the accepted
-version. A probe first pays its key list, one entry per input row, so an
-unindexed endpoint check scans, and a partially or fully indexed table keeps
-`probe` only while the key list is small against it. Unknown counts and equal
-costs keep `probe`; statistics record `index_coverage` and both costs.
-`cardinality` and `retained_edges` always use `probe`. Node overwrite scans
-old node IDs to find removals; retained-edge access describes the filtered
-lookup in the incident edge table. Append and merge always use `probe`.
-
-The `FragmentWrite` row's `mode` pairs with its `adapter`: an overwrite writes
-`fragments`, an append uses `strict_insert`, and a merge uses `upsert`.
-
-The `plan` rows are the query explain's, with these values for a load:
-
-| `node` | `detail` |
-|---|---|
-| `datafusion` | `unavailable`: a load's operators are lowered at execution, under the statement's transaction |
-| `route` | `engine` for overwrite, which runs the plan; `executor` for append and merge, which the plan describes while the keyed adapters run them (`reason` then says `mode_on_executor`) |
-| `explain_version` | the shared counter, `7` since every route prints `pipelines` |
-| `operation` | `kind` (`load`), `mode`, and `tables`: the target and each consulted committed table with its `type_key` and `version` |
-
-An executed load's receipt carries the same document and an `executed`
-object with `partitions`, `rows`, `source_bytes` and `operators`: one entry
-per node of the plan in post-order (the source first), each with the node's
-`id` and `node` kind, the `operator` it built, the `rows` it emitted (the
-sink counts the rows it staged), `elapsed_compute_ns`, the time its stream
-and its workers were polled, and `wall_ns`, the span from its first poll to
-its end with every wait included. The statement's answer, the `ChangeOutput`
-of `omnigraph mutate --json` and of `POST /mutate`, carries the object as
-`executed` beside the counts and the commit. The compute and wall numbers
-are measurements of one run; a GQT case pins only the rows.

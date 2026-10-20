@@ -13,7 +13,7 @@ deployment.
 ## Model and data
 
 - [Schema language](schema/index.md)
-- [Query language](queries/index.md), [session settings](queries/settings.md), [explain](queries/explain.md), and the [engine catalogue](queries/catalogue.md)
+- [Query language](queries/index.md), [session settings](queries/settings.md), [explain](queries/explain.md), [explaining a load statement](queries/explain-load.md), and the [engine catalogue](queries/catalogue.md)
 - [Traversal patterns and edge selections](queries/traversal.md)
 - [Diagnostics](queries/diagnostics.md)
 - [Mutations and loading](mutations/index.md)

@@ -190,7 +190,7 @@ load csv "person.csv" into node:Person mode append delimiter "|" header
 
 A `--- expect plan` section directly after a `load csv` step's `--- expect ok`
 pins the load's planner document and executed report, read from the load's
-receipt ([explaining a load statement](../../docs/user/queries/explain.md#explaining-a-load-statement)).
+receipt ([explaining a load statement](../../docs/user/queries/explain-load.md)).
 Each line is one fact; a fact the section does not mention is unchecked, as
 for a query plan. The forms: `load route: <plan|pipeline>` (the document's
 `engine` or `executor` route); `load scan: partitions <n> fallback
@@ -643,7 +643,7 @@ completed finalization; `pass key_to_id` records a safe key narrowing.
 A `load csv` step may carry an `--- expect plan` section directly after its
 `--- expect ok`.
 Its lines are checked against the planner document in the executed load's
-receipt ([Explaining a load statement](../../docs/user/queries/explain.md#explaining-a-load-statement)).
+receipt ([Explaining a load statement](../../docs/user/queries/explain-load.md)).
 Each line is one fact claim, and a fact no line mentions is unchecked:
 
 ```text

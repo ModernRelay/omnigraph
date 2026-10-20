@@ -6,4 +6,4 @@
   a GQT load step's `--- expect plan` section accepts
   `load executed <Node>: rows <n>` lines ([explain guide][load-executed-guide]).
 
-[load-executed-guide]: ../docs/user/queries/explain.md#explaining-a-load-statement
+[load-executed-guide]: ../docs/user/queries/explain-load.md
