@@ -2194,7 +2194,7 @@ query nullable_vectors() {
     .unwrap();
     let run = |binary: &Path, args: &[&str]| {
         let output = run_old(binary, args);
-        assert_ok(&args.join(" "), &output);
+        assert_ok(&format!("{} {}", binary.display(), args.join(" ")), &output);
         output
     };
     let rows = |binary: &Path, selector: &str, value: &str, name: &str| {
@@ -2206,8 +2206,17 @@ query nullable_vectors() {
         let response = support::parse_stdout_json(&run(
             binary,
             &[
-                "query", name, "--query", query_path, "--store", uri, selector, value, "--params",
-                params, "--json",
+                "query",
+                name,
+                "--query",
+                query_path,
+                if binary == old { "--store" } else { "--target" },
+                uri,
+                selector,
+                value,
+                "--params",
+                params,
+                "--json",
             ],
         ));
         if name == "nullable_vectors" {
@@ -2216,13 +2225,22 @@ query nullable_vectors() {
         response["rows"].clone()
     };
     let export = |binary: &Path, branch: &str| {
-        canonical_export_rows(&run(binary, &["export", uri, "--branch", branch]).stdout)
+        let args = if binary == old {
+            vec!["export", uri, "--branch", branch]
+        } else {
+            vec!["export", "--target", uri, "--branch", branch]
+        };
+        canonical_export_rows(&run(binary, &args).stdout)
     };
     let history = |binary: &Path, branch: &str| {
-        support::parse_stdout_json(&run(
-            binary,
-            &["commit", "list", uri, "--branch", branch, "--json"],
-        ))
+        let args = if binary == old {
+            vec!["commit", "list", uri, "--branch", branch, "--json"]
+        } else {
+            vec![
+                "commit", "list", "--target", uri, "--branch", branch, "--json",
+            ]
+        };
+        support::parse_stdout_json(&run(binary, &args))
     };
     run(&old, &["init", "--schema", schema.to_str().unwrap(), uri]);
     run(
@@ -2427,14 +2445,15 @@ query nullable_vectors() {
             "append",
             "--data",
             additions.to_str().unwrap(),
+            "--target",
             uri,
         ],
     );
     run(
         &current,
-        &["mutate", "revise", "--query", query_path, "--store", uri],
+        &["mutate", "revise", "--query", query_path, "--target", uri],
     );
-    run(&current, &["rebuild-full-text-indexes", uri]);
+    run(&current, &["rebuild-full-text-indexes", "--target", uri]);
     let rebuilt_files = graph_files(&graph);
     let new_certificates: Vec<_> = rebuilt_files
         .iter()
@@ -2455,9 +2474,16 @@ query nullable_vectors() {
             "lance11.0.0-frostem1.20260821.3-v1"
         );
     }
-    run(&current, &["optimize", uri]);
-    run(&current, &["cleanup", uri, "--keep", "100", "--confirm"]);
-    assert_writes_format(&current, uri, 16);
+    run(&current, &["optimize", "--target", uri]);
+    run(
+        &current,
+        &["cleanup", "--target", uri, "--keep", "100", "--confirm"],
+    );
+    assert_eq!(
+        support::parse_stdout_json(&run(&current, &["snapshot", "--target", uri, "--json"]))["internal_schema_version"],
+        16,
+        "the candidate must preserve storage format 16"
+    );
     runtime.block_on(async {
         let manifest = lance::Dataset::open(graph.join("__manifest").to_str().unwrap())
             .await
@@ -2477,7 +2503,7 @@ query nullable_vectors() {
         rows(&current, "--branch", "main", "nullable_vectors"),
         json!([{"v.name":"new-null"}, {"v.name":"old-null"}])
     );
-    let written_export = run(&current, &["export", uri]);
+    let written_export = run(&current, &["export", "--target", uri]);
     for name in ["old-blob", "new-blob"] {
         assert_eq!(
             exported_row_with_data_value(&written_export.stdout, "name", name)["data"]["payload"],
