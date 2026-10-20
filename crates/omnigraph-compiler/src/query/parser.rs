@@ -109,12 +109,14 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
                         statement = Some(FileBody::Show(parse_setting_target(inner)?));
                     }
                     Rule::explain_stmt => {
-                        statement = Some(FileBody::Explain(parse_explain_stmt(inner)?));
+                        statement = Some(parse_explain_stmt(inner)?);
                     }
                     Rule::statement_trailer => {
                         let subject = match statement {
                             Some(FileBody::Show(_)) => "a show statement",
-                            Some(FileBody::Explain(_)) => "an `explain` statement",
+                            Some(FileBody::Explain(_) | FileBody::ExplainLoad(_)) => {
+                                "an `explain` statement"
+                            }
                             Some(FileBody::Commit(_)) => "a commit statement",
                             Some(FileBody::Load(_)) => "a load statement",
                             _ => "a branch statement",
@@ -174,15 +176,25 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
     })
 }
 
+/// `explain` wraps one query declaration or one load statement; the wrapped
+/// statement parses exactly as it does bare.
 fn parse_explain_stmt(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<QueryDecl, QueryDiagnostic> {
-    let decl = pair
+) -> std::result::Result<FileBody, QueryDiagnostic> {
+    let wrapped = pair
         .into_inner()
-        .find(|inner| inner.as_rule() == Rule::query_decl)
-        .expect("grammar: explain_stmt holds one query_decl after kw_explain");
-    let position = position_of(&decl);
-    parse_query_decl(decl).map_err(|error| compiler_error_to_diagnostic(error, position))
+        .find(|inner| matches!(inner.as_rule(), Rule::query_decl | Rule::load_stmt))
+        .expect("grammar: explain_stmt holds one query_decl or load_stmt after kw_explain");
+    match wrapped.as_rule() {
+        Rule::load_stmt => Ok(FileBody::ExplainLoad(parse_load_stmt(wrapped)?)),
+        Rule::query_decl => {
+            let position = position_of(&wrapped);
+            parse_query_decl(wrapped)
+                .map(FileBody::Explain)
+                .map_err(|error| compiler_error_to_diagnostic(error, position))
+        }
+        other => unreachable!("grammar: explain_stmt wraps no {other:?}"),
+    }
 }
 
 /// The position of `pair`'s start in the source it was parsed from.
@@ -311,6 +323,18 @@ fn parse_branch_stmt(
     let dry_run = has(Rule::dry_run_clause);
     let between = has(Rule::kw_to);
     let page = parse_diff_page_clause(&form)?;
+    let from_commit = form
+        .clone()
+        .into_inner()
+        .find(|inner| inner.as_rule() == Rule::create_from_commit)
+        .map(|pair| {
+            let literal = pair
+                .into_inner()
+                .find(|inner| inner.as_rule() == Rule::string_lit)
+                .expect("grammar: create_from_commit names one string literal");
+            decode_graph_commit_id(&literal)
+        })
+        .transpose()?;
     let names = form
         .into_inner()
         .filter(|inner| inner.as_rule() == Rule::branch_name)
@@ -318,9 +342,12 @@ fn parse_branch_stmt(
         .collect::<std::result::Result<Vec<_>, QueryDiagnostic>>()?;
     let mut names = names.into_iter();
     match (rule, names.next(), names.next()) {
-        (Rule::branch_create, Some(name), from) => {
-            Ok(BranchStmt::Write(BranchWrite::Create { name, from }))
-        }
+        (Rule::branch_create, Some(name), from) => Ok(BranchStmt::Write(BranchWrite::Create {
+            name,
+            from: from_commit
+                .map(BranchCreateFrom::Commit)
+                .or(from.map(BranchCreateFrom::Branch)),
+        })),
         (Rule::branch_delete, Some(name), None) => {
             Ok(BranchStmt::Write(BranchWrite::Delete { name }))
         }

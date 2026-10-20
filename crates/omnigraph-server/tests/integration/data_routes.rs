@@ -2572,6 +2572,7 @@ async fn branch_merge_receipts_keep_own_publication_when_a_later_writer_finishes
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_statements_dispatch_to_their_route_bodies() {
     let (_temp, app) = app_for_loaded_graph().await;
+    let loaded = main_head_commit_id(&app).await;
 
     let (status, body) = json_response(
         &app,
@@ -2591,7 +2592,12 @@ async fn branch_statements_dispatch_to_their_route_bodies() {
             "affected_edges": 0,
             "actor_id": null,
             "commit": null,
-            "outcome": {"kind": "created", "from": "main", "name": "feature"}
+            "outcome": {
+                "kind": "created",
+                "from": "main",
+                "name": "feature",
+                "from_commit_id": loaded,
+            }
         })
     );
 
@@ -2626,7 +2632,13 @@ async fn branch_statements_dispatch_to_their_route_bodies() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["outcome"],
-        json!({"kind": "created", "from": "feature", "name": "review/x"})
+        json!({
+            "kind": "created",
+            "from": "feature",
+            "name": "review/x",
+            "from_commit_id": loaded,
+        }),
+        "a branch with no commit of its own starts at the head it inherited"
     );
     let (_, body) =
         json_response(&app, json_post("/query", &json!({"query": "branch list"}))).await;
@@ -3012,6 +3024,7 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "b0".to_string(),
     };
     let post_create = || {
@@ -3395,8 +3408,26 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
             body["error"],
             format!("commit '{id}' is unattached and cannot publish")
         );
+        // An unattached snapshot never becomes branch history, so no branch
+        // starts at it.
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/branches",
+                &json!({"from_commit": id, "name": "from-snapshot"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["branch_start_refusal"],
+            json!({"reason": "unattached_snapshot", "graph_commit_id": id}),
+            "{body}"
+        );
     }
     assert_eq!(main_head_commit_id(&app).await, head_before);
+    let (_, branches) = get_json(&app, g("/branches")).await;
+    assert_eq!(branches["branches"], json!(["main"]));
 
     let response = app
         .clone()
@@ -4403,6 +4434,112 @@ fn explain_plan_rows<'a>(body: &'a Value, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// `explain load csv` through `POST /query`: the planner's document as explain rows (`logical`,
+/// `physical`, then `plan` rows), no head moved, `branch` honored; `snapshot`, `name`, `params` meet
+/// the envelope refusals; `/mutate` refuses the read; a source no base admits is denied unprobed.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_answers_an_explain_load_statement_as_rows() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let external_dir = tempfile::tempdir().unwrap();
+    let csv_path = external_dir.path().join("people.csv");
+    fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+    let external_base = format!("file://{}/", external_dir.path().display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(external_base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
+    let head = main_head_commit_id(&app).await;
+    let statement = format!(
+        "explain load csv \"file://{}\" into node:Person mode overwrite header",
+        csv_path.display()
+    );
+
+    for request in [
+        json!({"query": statement}),
+        json!({"query": statement, "branch": "main"}),
+    ] {
+        let (status, body) = json_response(&app, json_post("/query", &request)).await;
+        assert_eq!(status, StatusCode::OK, "{request}: {body}");
+        assert_eq!(body["query_name"], "load csv", "{body}");
+        assert_eq!(body["columns"], json!(["tree", "depth", "node", "detail"]));
+        assert_eq!(body["graph_commit_id"], head, "{body}");
+        let physical = explain_tree(&body, "physical");
+        assert_eq!(physical["node"], "FragmentWrite", "{physical}");
+        assert_eq!(physical["mode"], "overwrite", "{physical}");
+        assert_eq!(physical["table"], "node:Person", "{physical}");
+        let validate = &physical["inputs"][0];
+        assert_eq!(validate["node"], "Validate", "{physical}");
+        assert_eq!(validate["inputs"][0]["node"], "CsvSource", "{physical}");
+        assert_eq!(explain_tree(&body, "logical")["node"], "FragmentWrite");
+        assert_eq!(explain_plan_rows(&body, "route"), ["engine"], "{body}");
+        assert_eq!(explain_plan_rows(&body, "explain_version"), ["6"], "{body}");
+    }
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "an explain publishes nothing"
+    );
+    assert!(csv_path.exists(), "the source is only probed");
+
+    let cases = [
+        (
+            "/query",
+            json!({"query": statement, "snapshot": head}),
+            "a branch statement names its branches itself; drop the request target",
+        ),
+        (
+            "/query",
+            json!({"query": statement, "name": "load csv"}),
+            "a branch statement takes no name and no parameters",
+        ),
+        (
+            "/query",
+            json!({"query": statement, "params": {}}),
+            "a branch statement takes no name and no parameters",
+        ),
+        (
+            "/mutate",
+            json!({"query": statement}),
+            "statement 'explain' is a read; use POST /query",
+        ),
+        (
+            "/mutate",
+            json!({"query": statement, "branch": "main"}),
+            "statement 'explain' is a read; use POST /query",
+        ),
+    ];
+    for (path, request, expected) in cases {
+        let (status, body) = json_response(&app, json_post(path, &request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {request}: {body}");
+        assert_eq!(body["error"], expected, "{path} {request}: {body}");
+    }
+
+    let (_denied_temp, denied_app) = app_for_loaded_graph().await;
+    let (status, body) = json_response(
+        &denied_app,
+        json_post(
+            "/query",
+            &json!({"query": format!("explain {LOAD_CSV_PEOPLE}")}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ingress is denied for this graph"),
+        "{body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn query_endpoint_answers_an_explain_statement_as_rows() {
     let (_temp, app) = app_for_loaded_graph().await;
@@ -5286,6 +5423,7 @@ async fn remote_branch_list_create_merge_flow_works() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, create_body) = json_response(
@@ -5302,6 +5440,11 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(create_status, StatusCode::OK);
     assert_eq!(create_body["from"], "main");
     assert_eq!(create_body["name"], "feature");
+    let loaded = main_head_commit_id(&app).await;
+    assert_eq!(
+        create_body["from_commit_id"], loaded,
+        "the receipt names the head the branch starts at"
+    );
 
     // Target namespace inventory reads the ancestor ref before it can clone
     // or reclaim anything. A failed read must leave server admission open.
@@ -5433,6 +5576,77 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(read_status, StatusCode::OK);
     assert_eq!(read_body["row_count"], 1);
     assert_eq!(read_body["rows"][0]["p.name"], "Zoe");
+
+    // A branch started at the commit main held before the merge reads that
+    // commit's rows, not main's head.
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches",
+            &json!({"from_commit": loaded, "name": "before-zoe"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["from"], "main", "the branch that wrote the commit");
+    assert_eq!(body["from_commit_id"], loaded);
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({
+                "query": fs::read_to_string(fixture("test.gq")).unwrap(),
+                "name": "get_person",
+                "params": {"name": "Zoe"},
+                "branch": "before-zoe",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["row_count"], 0);
+
+    // A commit id no commit has is not found, and a start is a branch or a
+    // commit, never both.
+    let unknown = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches",
+            &json!({"from_commit": unknown, "name": "nowhere"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], format!("commit '{unknown}' not found"));
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches",
+            &json!({"from": "main", "from_commit": loaded, "name": "both"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        "request may specify from or from_commit, not both"
+    );
+    let (_, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/branches"))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        body["branches"],
+        json!(["before-zoe", "feature", "main"]),
+        "refused starts create nothing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5441,6 +5655,7 @@ async fn remote_branch_delete_flow_works() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, _) = json_response(
@@ -5489,6 +5704,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, _) = json_response(
@@ -5526,6 +5742,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
 
     let create_child = BranchCreateRequest {
         from: Some("feature".to_string()),
+        from_commit: None,
         name: "feature-child".to_string(),
     };
     let (create_child_status, _) = json_response(
@@ -5587,6 +5804,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, _) = json_response(
@@ -6875,6 +7093,7 @@ async fn mutate_graph_commit_precondition_issue_365() {
     let inherited_head = head_commit_id(&app).await;
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "fresh-cas".to_string(),
     };
     let (status, body) = json_response(
@@ -7347,6 +7566,91 @@ async fn commit_changes_pages_are_ordered_with_cause_once() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(second["changes"][0]["id"], "Loaded C");
     assert!(second["next_page_token"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_list_pages_answer_for_the_head_their_first_page_named() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let person = |name: &str| format!(r#"{{"type":"Person","data":{{"name":"{name}","age":1}}}}"#);
+    for name in ["Page A", "Page B", "Page C"] {
+        load_commit(&app, &person(name)).await;
+    }
+    let (status, whole) = get_json(&app, g("/commits")).await;
+    assert_eq!(status, StatusCode::OK, "{whole}");
+    assert!(
+        whole.get("head_commit_id").is_none() && whole.get("next_page_token").is_none(),
+        "an unpaged listing keeps its shape: {whole}"
+    );
+    let whole = whole["commits"].as_array().unwrap().clone();
+    assert!(whole.len() > 4, "test setup: several pages of two");
+
+    let (status, first) = get_json(&app, g("/commits?branch=main&limit=2")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["head_commit_id"], whole[0]["graph_commit_id"]);
+    assert_eq!(first["commits"], json!(whole[..2]));
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("a first page of two continues")
+        .to_string();
+
+    load_commit(&app, &person("Page D")).await;
+    let mut paged = first["commits"].as_array().unwrap().clone();
+    let mut next = Some(token.clone());
+    while let Some(token) = next {
+        let (status, page) =
+            get_json(&app, g(&format!("/commits?limit=2&page_token={token}"))).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["head_commit_id"], first["head_commit_id"], "{page}");
+        paged.extend(page["commits"].as_array().unwrap().iter().cloned());
+        next = page["next_page_token"].as_str().map(str::to_string);
+    }
+    assert_eq!(
+        paged, whole,
+        "later pages answer for the head the first page named"
+    );
+    let (status, rest) = get_json(&app, g(&format!("/commits?page_token={token}"))).await;
+    assert_eq!(status, StatusCode::OK, "{rest}");
+    assert_eq!(
+        rest["commits"],
+        json!(whole[2..]),
+        "100 commits per page by default"
+    );
+    assert!(rest.get("next_page_token").is_none(), "{rest}");
+
+    for (uri, expected) in [
+        (
+            format!("/commits?branch=feature&page_token={token}"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/commits?page_token=not-a-token".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/commits?limit=0".to_string(), StatusCode::BAD_REQUEST),
+        (
+            "/commits?limit=2&unpublished=true".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/commits?page_token={token}&unattached=true"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/commits?limit=1001".to_string(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ] {
+        let (status, body) = get_json(&app, g(&uri)).await;
+        assert_eq!(status, expected, "{uri}: {body}");
+    }
+    let (_, body) = get_json(&app, g("/commits?page_token=not-a-token")).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("change cursor rejected: "),
+        "a rejected page token keeps the continuation prefix: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

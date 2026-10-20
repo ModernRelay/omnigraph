@@ -79,7 +79,11 @@ pub(crate) async fn catalogue_query(
         body @ FileBody::Explain(_) => body
             .into_read_declarations()
             .map_err(ApiError::bad_request)?,
-        FileBody::Branch(_) | FileBody::Commit(_) | FileBody::Load(_) | FileBody::Show(_) => {
+        FileBody::Branch(_)
+        | FileBody::Commit(_)
+        | FileBody::Load(_)
+        | FileBody::ExplainLoad(_)
+        | FileBody::Show(_) => {
             return Err(ApiError::bad_request(format!(
                 "`{CATALOGUE_SCOPE}` serves read query declarations and `explain` only"
             )));

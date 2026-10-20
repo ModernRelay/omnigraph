@@ -338,7 +338,11 @@ pub async fn init_and_load(dir: &tempfile::TempDir) -> Session {
 
 /// The standard rows under a compatible schema, for schema-size instruments.
 pub async fn init_and_load_with_schema(dir: &tempfile::TempDir, schema: &str) -> Session {
-    let uri = dir.path().to_str().unwrap();
+    init_and_load_at(dir.path().to_str().unwrap(), schema).await
+}
+
+/// [`init_and_load_with_schema`] at a graph uri on any backend.
+pub async fn init_and_load_at(uri: &str, schema: &str) -> Session {
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
     // Mutation/load publish only exact data effects; physical indexes are
@@ -880,4 +884,20 @@ async fn write_ranged_external_blob_row(
         .await
         .unwrap();
     table_uri
+}
+
+/// `token` with its payload edited and its checksum recomputed, as any caller
+/// can: a continuation's envelope is `base64url(json ‖ sha256(json))`.
+pub fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let bytes = engine.decode(token).unwrap();
+    let (payload, _) = bytes.split_at(bytes.len() - 32);
+    let mut payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    edit(&mut payload);
+    let mut encoded = serde_json::to_vec(&payload).unwrap();
+    let checksum = sha2::Sha256::digest(&encoded);
+    encoded.extend_from_slice(&checksum);
+    engine.encode(encoded)
 }

@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::settings::{SessionSettings, SettingId, SettingValue, Source};
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent, Session};
 use omnigraph_api_types::{
@@ -43,7 +43,7 @@ use omnigraph_api_types::{
     schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::{BranchRead, BranchWrite, CommitWrite};
+use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
 use omnigraph_compiler::query::parser::parse_query;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
@@ -58,11 +58,12 @@ use crate::cli::CliLoadMode;
 use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::helpers::{
     PreconditionFailedCli, apply_bearer_token, apply_server_flag, branch_statement_change_request,
-    branch_statement_query_request, is_remote_uri, precondition_failed_cli, query_params_from_json,
-    remote_json, remote_json_bounded, remote_no_content, remote_response_json_bounded, remote_url,
-    resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag,
-    select_named_query,
+    branch_statement_query_request, is_remote_uri, missing_credential, precondition_failed_cli,
+    query_params_from_json, remote_json, remote_json_bounded, remote_no_content,
+    remote_response_json_bounded, remote_url, resolve_actor_with_config, resolve_cli_graph,
+    resolve_server_flag_with_config, select_named_query, served_client_with_config,
 };
+use crate::operator::{InvocationConfig, OperatorConfig};
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
 const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
@@ -259,11 +260,13 @@ pub(crate) fn is_catalogue_scope(uri: Option<&str>) -> bool {
 /// a policy-gated `/graphs` proceeds — the bare URL
 /// is then correct, or the real request surfaces the failure. Only fires on the
 /// no-graph path. Contract/discovery failures always stop without fallback.
-async fn require_graph_for_multi_graph_server(scope: &crate::scope::ResolvedScope) -> Result<()> {
+async fn require_graph_for_multi_graph_server(
+    probe: &GraphClient,
+    scope: &crate::scope::ResolvedScope,
+) -> Result<()> {
     let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
         return Ok(());
     };
-    let probe = GraphClient::registry_client(server)?;
     let resp = match probe.list_graphs().await {
         Ok(resp) => resp,
         Err(error) if error.downcast_ref::<ApiContractError>().is_some() => return Err(error),
@@ -327,14 +330,19 @@ impl GraphClient {
 
     /// The single owner of registry (`GET /graphs`) addressing: the bare base
     /// URL of `server` (a config name or literal URL) — never `/graphs/<id>`
-    /// — with the keyed bearer-token chain. Synchronous: pure config
-    /// resolution, no I/O. Used by the RFC-011 D7 multi-graph probe and the
-    /// `graphs list` registry factory.
-    fn registry_client(server: &str) -> Result<Self> {
-        let base = resolve_server_flag(Some(server), None)?.expect("server name is present");
-        let token = resolve_remote_bearer_token(Some(&base))?;
+    /// — with the keyed bearer-token chain. Uses the caller's captured config;
+    /// credential is captured for both discovery and data. Used by the RFC-011 D7 multi-graph probe
+    /// and the `graphs list` registry factory.
+    fn registry_client(
+        input: &InvocationConfig,
+        operator: &OperatorConfig,
+        server: &str,
+    ) -> Result<Self> {
+        let base = resolve_server_flag_with_config(operator, Some(server), None)?
+            .expect("server name is present");
+        let (http, token) = served_client_with_config(input, operator, &base, &base)?;
         Ok(GraphClient::Remote {
-            http: GraphHttpClient::new(&base)?,
+            http,
             base_url: base,
             token,
             response_limit: None,
@@ -352,9 +360,16 @@ impl GraphClient {
     /// default would make `graphs list` unusable in any profile that sets
     /// one, and the registry is server-scoped either way). An explicit
     /// `--graph` never reaches here — the addressing guard rejects it.
-    pub(crate) fn resolve_registry(server: Option<&str>, profile: Option<&str>) -> Result<Self> {
+    pub(crate) fn resolve_registry(
+        input: &InvocationConfig,
+        server: Option<&str>,
+        profile: Option<&str>,
+        stderr: &mut dyn Write,
+    ) -> Result<Self> {
+        let operator = input.get(stderr)?;
         let scope = crate::scope::resolve_scope(
-            &crate::operator::load_operator_config()?,
+            operator,
+            input.profile(),
             crate::planes::Capability::Served,
             crate::scope::ScopeFlags {
                 profile,
@@ -371,8 +386,8 @@ impl GraphClient {
                  --profile <name>, or set `defaults.server` in ~/.omnigraph/config.yaml"
             );
         };
-        // `resolve_server_flag` refuses any scope that is not a server address.
-        Self::registry_client(server)
+        // Server resolution refuses any scope that is not a server address.
+        Self::registry_client(input, operator, server)
     }
 
     /// Resolve the addressing (positional URI / `--target` / `--server`)
@@ -381,7 +396,29 @@ impl GraphClient {
     /// fork. Mirrors the read verbs' current preamble (`resolve_uri`
     /// path, not the policy-bearing `resolve_cli_graph`). Used by reads
     /// and `query` (which opens without policy, like the reads).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn resolve(
+        input: &InvocationConfig,
+        capability: crate::planes::Capability,
+        server: Option<&str>,
+        graph: Option<&str>,
+        uri: Option<String>,
+        profile: Option<&str>,
+        store: Option<&str>,
+        stderr: &mut dyn Write,
+    ) -> Result<Self> {
+        let operator = input.get(stderr)?;
+        Self::resolve_with_config(
+            input, operator, capability, server, graph, uri, profile, store,
+        )
+        .await
+    }
+
+    /// Reuse the caller's validated configuration for routing and presentation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn resolve_with_config(
+        input: &InvocationConfig,
+        operator: &OperatorConfig,
         capability: crate::planes::Capability,
         server: Option<&str>,
         graph: Option<&str>,
@@ -397,7 +434,8 @@ impl GraphClient {
         // classification; every current caller is a data-plane (`Any`) verb —
         // registry-scoped `graphs list` uses `resolve_registry` instead.
         let scope = crate::scope::resolve_scope(
-            &crate::operator::load_operator_config()?,
+            operator,
+            input.profile(),
             capability,
             crate::scope::ScopeFlags {
                 profile,
@@ -408,20 +446,37 @@ impl GraphClient {
                 uri,
             },
         )?;
-        require_graph_for_multi_graph_server(&scope).await?;
+        // The no-graph probe and eventual request use one acquired credential.
+        // Keep discovery at the read path's existing validation boundary.
+        let registry =
+            if let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) {
+                let registry = Self::registry_client(input, operator, server)?;
+                require_graph_for_multi_graph_server(&registry, &scope).await?;
+                Some(registry)
+            } else {
+                None
+            };
         let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         if server.is_none() && is_catalogue_scope(uri.as_deref()) {
             return Ok(GraphClient::Catalogue);
         }
         let via_server = server.is_some();
-        let server_root = resolve_server_flag(server, None)?;
-        let uri = apply_server_flag(server_root.as_deref(), graph, uri)?;
-        let token = resolve_remote_bearer_token(uri.as_deref())?;
+        let server_root = resolve_server_flag_with_config(operator, server, None)?;
+        let uri = apply_server_flag(operator, server_root.as_deref(), graph, uri)?;
         let uri = crate::helpers::resolve_uri(uri)?;
         reject_positional_remote(via_server, &uri)?;
         if is_remote_uri(&uri) {
+            if let Some(registry) = registry {
+                return Ok(registry);
+            }
+            let (http, token) = served_client_with_config(
+                input,
+                operator,
+                server_root.as_deref().expect("remote server scope"),
+                &uri,
+            )?;
             Ok(GraphClient::Remote {
-                http: GraphHttpClient::new(server_root.as_deref().expect("remote server scope"))?,
+                http,
                 base_url: uri,
                 token,
                 response_limit: None,
@@ -437,8 +492,10 @@ impl GraphClient {
     /// carries `policy_file`/`graph_id`/`selected`), and with the actor
     /// resolved up front. The embedded arm then opens WITH policy. The
     /// resolution order matches the write arms exactly: server flag →
-    /// bearer token → graph.
+    /// graph → the served credential.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn resolve_with_policy(
+        input: &InvocationConfig,
         capability: crate::planes::Capability,
         server: Option<&str>,
         graph: Option<&str>,
@@ -446,12 +503,15 @@ impl GraphClient {
         cli_as: Option<&str>,
         profile: Option<&str>,
         store: Option<&str>,
+        stderr: &mut dyn Write,
     ) -> Result<Self> {
         // RFC-011 scope translation (see `resolve`); explicit addressing passes
         // through unchanged, and the caller threads its verb's declared
         // capability.
+        let operator = input.get(stderr)?;
         let scope = crate::scope::resolve_scope(
-            &crate::operator::load_operator_config()?,
+            operator,
+            input.profile(),
             capability,
             crate::scope::ScopeFlags {
                 profile,
@@ -462,10 +522,12 @@ impl GraphClient {
                 uri,
             },
         )?;
-        Self::resolve_with_policy_scope(scope, cli_as).await
+        Self::resolve_with_policy_scope(input, operator, scope, cli_as).await
     }
 
     async fn resolve_with_policy_scope(
+        input: &InvocationConfig,
+        operator: &OperatorConfig,
         scope: crate::scope::ResolvedScope,
         cli_as: Option<&str>,
     ) -> Result<Self> {
@@ -474,9 +536,8 @@ impl GraphClient {
             return Err(catalogue_scope_refusal("a write"));
         }
         let via_server = server.is_some();
-        let server_root = resolve_server_flag(server, None)?;
-        let uri = apply_server_flag(server_root.as_deref(), graph, scope.uri.clone())?;
-        let token = resolve_remote_bearer_token(uri.as_deref())?;
+        let server_root = resolve_server_flag_with_config(operator, server, None)?;
+        let uri = apply_server_flag(operator, server_root.as_deref(), graph, scope.uri.clone())?;
         let resolved = resolve_cli_graph(uri)?;
         reject_positional_remote(via_server, &resolved.uri)?;
         if resolved.is_remote {
@@ -490,16 +551,24 @@ impl GraphClient {
                 );
             }
             // Complete local addressing/identity validation before discovery.
-            require_graph_for_multi_graph_server(&scope).await?;
-            Ok(GraphClient::Remote {
-                http: GraphHttpClient::new(server_root.as_deref().expect("remote server scope"))?,
+            // With no selected graph, this is already the registry address.
+            let (http, token) = served_client_with_config(
+                input,
+                operator,
+                server_root.as_deref().expect("remote server scope"),
+                &resolved.uri,
+            )?;
+            let client = GraphClient::Remote {
+                http,
                 base_url: resolved.uri,
                 token,
                 response_limit: None,
                 catalogue: is_catalogue_scope(graph),
-            })
+            };
+            require_graph_for_multi_graph_server(&client, &scope).await?;
+            Ok(client)
         } else {
-            let actor = resolve_cli_actor(cli_as)?;
+            let actor = resolve_actor_with_config(operator, cli_as);
             Ok(GraphClient::Embedded {
                 uri: resolved.uri,
                 actor,
@@ -546,8 +615,8 @@ impl GraphClient {
 
     /// Writable verbs alone acquire durable cluster admission. Direct-store
     /// access carries no Cedar policy (RFC-011), the actor rides the `_as` APIs.
-    async fn open_write(uri: &str) -> Result<Session> {
-        Self::open_write_session(uri, &[]).await
+    async fn open_write(uri: &str, stderr: &mut dyn Write) -> Result<Session> {
+        Self::open_write_session(uri, &[], stderr).await
     }
 
     /// Read dispatch uses no writable opener or retained writer admission.
@@ -556,8 +625,23 @@ impl GraphClient {
         uri: &str,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<Session> {
+        Self::open_read_session_with_external_blob_policy(uri, settings, None).await
+    }
+
+    /// An embedded read session, with `external_blob_policy` installed on
+    /// its fresh handle when given: `explain load csv "file://…"` probes its
+    /// source under the same base a direct load installs.
+    async fn open_read_session_with_external_blob_policy(
+        uri: &str,
+        settings: &[(SettingId, SettingValue)],
+        external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+    ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
         let db = crate::admission::open_read_only(uri, None).await?;
+        let db = match external_blob_policy {
+            Some(policy) => db.with_external_blob_policy(policy)?,
+            None => db,
+        };
         let mut session = Arc::new(db).session(defaults, sources);
         for (id, value) in settings {
             session.set(*id, value, Source::Request)?;
@@ -571,8 +655,9 @@ impl GraphClient {
     async fn open_write_session(
         uri: &str,
         settings: &[(SettingId, SettingValue)],
+        stderr: &mut dyn Write,
     ) -> Result<Session> {
-        Self::open_write_session_with_external_blob_policy(uri, settings, None).await
+        Self::open_write_session_with_external_blob_policy(uri, settings, None, stderr).await
     }
 
     /// An embedded write session, with `external_blob_policy` installed on
@@ -582,9 +667,10 @@ impl GraphClient {
         uri: &str,
         settings: &[(SettingId, SettingValue)],
         external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+        stderr: &mut dyn Write,
     ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
-        crate::admission::ensure_graph(uri).await?;
+        crate::admission::ensure_graph(uri, stderr).await?;
         crate::command_outcome::writable_open();
         let db = Omnigraph::open(uri).await?;
         let db = match external_blob_policy {
@@ -792,7 +878,63 @@ impl GraphClient {
                     .iter()
                     .map(commit_output)
                     .collect::<Vec<_>>();
-                Ok(CommitListOutput { commits })
+                Ok(CommitListOutput {
+                    commits,
+                    head_commit_id: None,
+                    next_page_token: None,
+                })
+            }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("list commits")),
+        }
+    }
+
+    /// `commit list --limit`/`--page-token`: one page of the branch's history
+    /// (`None` = main), `GET /commits?limit=&page_token=` or the engine's
+    /// paged listing.
+    pub(crate) async fn list_commits_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<CommitListOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+                ..
+            } => {
+                let limit_value = limit.map(|limit| limit.to_string());
+                let mut query = Vec::new();
+                if let Some(branch) = branch {
+                    query.push(("branch", branch));
+                }
+                if let Some(page_token) = page_token {
+                    query.push(("page_token", page_token));
+                }
+                if let Some(limit) = limit_value.as_deref() {
+                    query.push(("limit", limit));
+                }
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["commits"], &query)?,
+                    None,
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Self::open_read_session(uri, &[]).await?;
+                let page = db.list_commits_page(branch, page_token, limit).await?;
+                Ok(CommitListOutput {
+                    commits: page.commits.iter().map(commit_output).collect(),
+                    head_commit_id: Some(page.head_commit_id),
+                    next_page_token: page.next_page_token,
+                })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("list commits")),
         }
@@ -840,7 +982,11 @@ impl GraphClient {
                     .iter()
                     .map(commit_output)
                     .collect::<Vec<_>>();
-                Ok(CommitListOutput { commits })
+                Ok(CommitListOutput {
+                    commits,
+                    head_commit_id: None,
+                    next_page_token: None,
+                })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("list unpublished commits")),
         }
@@ -888,7 +1034,11 @@ impl GraphClient {
                     .iter()
                     .map(commit_output)
                     .collect::<Vec<_>>();
-                Ok(CommitListOutput { commits })
+                Ok(CommitListOutput {
+                    commits,
+                    head_commit_id: None,
+                    next_page_token: None,
+                })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("list unattached commits")),
         }
@@ -1145,6 +1295,7 @@ impl GraphClient {
     /// `from` if missing. Returns the CLI `LoadOutput`; each arm keeps its
     /// own mapping (remote uses the logical graph-batch result, embedded reads
     /// the engine `LoadResult` directly).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn load(
         &self,
         branch: &str,
@@ -1152,6 +1303,7 @@ impl GraphClient {
         data: &str,
         mode: CliLoadMode,
         settings: &[(SettingId, SettingValue)],
+        stderr: &mut dyn Write,
     ) -> Result<LoadOutput> {
         match self {
             GraphClient::Remote {
@@ -1197,7 +1349,7 @@ impl GraphClient {
                 ))
             }
             GraphClient::Embedded { uri, actor } => {
-                let session = Self::open_write_session(uri, settings).await?;
+                let session = Self::open_write_session(uri, settings, stderr).await?;
                 let data = std::fs::read_to_string(data)?;
                 let receipt = session
                     .load_graph_batch_as_with_receipt(
@@ -1229,6 +1381,7 @@ impl GraphClient {
     /// without earlier whole-command effects.
     ///
     /// A `--set` value travels in the `settings` field of `POST /mutate`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn mutate(
         &self,
         branch: Option<&str>,
@@ -1237,6 +1390,7 @@ impl GraphClient {
         params_json: Option<&Value>,
         expected_head: Option<&str>,
         settings: &[(SettingId, SettingValue)],
+        stderr: &mut dyn Write,
     ) -> Result<ChangeOutput> {
         match self {
             GraphClient::Remote {
@@ -1274,7 +1428,7 @@ impl GraphClient {
                 let (selected_name, query_params) =
                     select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
-                let session = Self::open_write_session(uri, settings).await?;
+                let session = Self::open_write_session(uri, settings, stderr).await?;
                 let actor = actor.as_deref();
                 let receipt = session
                     .mutate_as_with_optional_branch_receipt(
@@ -1323,6 +1477,7 @@ impl GraphClient {
         query_source: &str,
         write: BranchWrite,
         settings: &[(SettingId, SettingValue)],
+        stderr: &mut dyn Write,
     ) -> Result<ChangeOutput> {
         match self {
             GraphClient::Remote {
@@ -1389,16 +1544,26 @@ impl GraphClient {
                 let query_name = write.statement_name().to_string();
                 let (branch, commit, outcome) = match write {
                     BranchWrite::Create { name, from } => {
-                        let from = from.unwrap_or_else(|| "main".to_string());
-                        self.branch_create_from(&from, &name).await?;
+                        let start = match from {
+                            Some(BranchCreateFrom::Commit(commit)) => {
+                                ReadTarget::snapshot(SnapshotId::new(commit))
+                            }
+                            Some(BranchCreateFrom::Branch(branch)) => ReadTarget::branch(branch),
+                            None => ReadTarget::branch("main"),
+                        };
+                        let created = self.branch_create(start, &name, stderr).await?;
                         (
                             name.clone(),
                             None,
-                            BranchOutcomeOutput::Created { from, name },
+                            BranchOutcomeOutput::Created {
+                                from: created.from,
+                                name,
+                                from_commit_id: created.from_commit_id,
+                            },
                         )
                     }
                     BranchWrite::Delete { name } => {
-                        self.branch_delete(&name).await?;
+                        self.branch_delete(&name, stderr).await?;
                         (name.clone(), None, BranchOutcomeOutput::Deleted { name })
                     }
                     BranchWrite::Merge {
@@ -1407,7 +1572,7 @@ impl GraphClient {
                         as_commit,
                     } => {
                         let target = into.unwrap_or_else(|| "main".to_string());
-                        let mut session = Self::open_write_session(uri, settings).await?;
+                        let mut session = Self::open_write_session(uri, settings, stderr).await?;
                         Self::apply_prefix(&mut session, query_source)?;
                         let result = session
                             .branch_merge_as_with_options(
@@ -1452,6 +1617,7 @@ impl GraphClient {
         query_source: &str,
         write: CommitWrite,
         settings: &[(SettingId, SettingValue)],
+        stderr: &mut dyn Write,
     ) -> Result<ChangeOutput> {
         match self {
             GraphClient::Remote {
@@ -1498,7 +1664,7 @@ impl GraphClient {
             }
             GraphClient::Embedded { uri, actor } => {
                 let query_name = write.statement_name().to_string();
-                let mut session = Self::open_write_session(uri, settings).await?;
+                let mut session = Self::open_write_session(uri, settings, stderr).await?;
                 Self::apply_prefix(&mut session, query_source)?;
                 let target = session
                     .get_commit(write.graph_commit_id())
@@ -1548,6 +1714,7 @@ impl GraphClient {
         stmt: omnigraph_compiler::query::ast::LoadStmt,
         external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
         settings: &[(SettingId, SettingValue)],
+        stderr: &mut dyn Write,
     ) -> Result<ChangeOutput> {
         match self {
             GraphClient::Remote {
@@ -1578,6 +1745,7 @@ impl GraphClient {
                     uri,
                     settings,
                     external_blob_policy,
+                    stderr,
                 )
                 .await?;
                 Self::apply_prefix(&mut session, query_source)?;
@@ -1600,7 +1768,11 @@ impl GraphClient {
 
     /// `commit publish <id>`: `POST /commits/{id}/publish`, or the engine
     /// call; the answer is the published commit, checked to be the one asked.
-    pub(crate) async fn commit_publish(&self, commit_id: &str) -> Result<CommitOutput> {
+    pub(crate) async fn commit_publish(
+        &self,
+        commit_id: &str,
+        stderr: &mut dyn Write,
+    ) -> Result<CommitOutput> {
         let published: CommitOutput = match self {
             GraphClient::Remote {
                 http,
@@ -1618,7 +1790,7 @@ impl GraphClient {
                 .await?
             }
             GraphClient::Embedded { uri, actor } => {
-                let session = Self::open_write_session(uri, &[]).await?;
+                let session = Self::open_write_session(uri, &[], stderr).await?;
                 commit_output(
                     &session
                         .publish_commit_as(commit_id, actor.as_deref())
@@ -1636,7 +1808,7 @@ impl GraphClient {
     }
 
     /// `commit drop <id>`: `DELETE /commits/{id}` (204), or the engine call.
-    pub(crate) async fn commit_drop(&self, commit_id: &str) -> Result<()> {
+    pub(crate) async fn commit_drop(&self, commit_id: &str, stderr: &mut dyn Write) -> Result<()> {
         match self {
             GraphClient::Remote {
                 http,
@@ -1653,7 +1825,7 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, actor } => {
-                let session = Self::open_write_session(uri, &[]).await?;
+                let session = Self::open_write_session(uri, &[], stderr).await?;
                 session
                     .drop_commit_as(commit_id, actor.as_deref())
                     .await
@@ -1864,6 +2036,42 @@ impl GraphClient {
         }
     }
 
+    /// `explain load csv …` against `target`: `POST /query` when served; the
+    /// embedded arm opens read-only with `external_blob_policy` installed so
+    /// the source's metadata probe is authorized as a direct load's would be.
+    pub(crate) async fn explain_load(
+        &self,
+        target: ReadTarget,
+        query_source: &str,
+        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<ReadOutput> {
+        match self {
+            GraphClient::Remote { .. } => {
+                self.query(Some(target), query_source, None, None, settings)
+                    .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let mut session = Self::open_read_session_with_external_blob_policy(
+                    uri,
+                    settings,
+                    external_blob_policy,
+                )
+                .await?;
+                Self::apply_prefix(&mut session, query_source)?;
+                let (result, graph_commit_id) = session.explain_load(target.clone(), &stmt).await?;
+                Ok(read_output(
+                    stmt.statement_name().to_string(),
+                    &target,
+                    result,
+                    graph_commit_id,
+                )?)
+            }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("explain load")),
+        }
+    }
+
     /// `invoke_named` — run a stored query **by catalog name** (RFC-011 D3).
     /// Served-only: the catalog is server-owned, so a `--store` (embedded)
     /// scope has nothing to resolve the name against. `expect_mutation` carries
@@ -1918,10 +2126,12 @@ impl GraphClient {
         }
     }
 
-    pub(crate) async fn branch_create_from(
+    /// Create `name` at `start`: a branch's head, or a published graph commit.
+    pub(crate) async fn branch_create(
         &self,
-        from: &str,
+        start: ReadTarget,
         name: &str,
+        stderr: &mut dyn Write,
     ) -> Result<BranchCreateOutput> {
         match self {
             GraphClient::Remote {
@@ -1934,31 +2144,43 @@ impl GraphClient {
                     http,
                     Method::POST,
                     remote_url(base_url, &["branches"], &[])?,
-                    Some(serde_json::to_value(BranchCreateRequest {
-                        from: Some(from.to_string()),
-                        name: name.to_string(),
+                    Some(serde_json::to_value(match start {
+                        ReadTarget::Branch(branch) => BranchCreateRequest {
+                            from: Some(branch),
+                            from_commit: None,
+                            name: name.to_string(),
+                        },
+                        ReadTarget::Snapshot(commit) => BranchCreateRequest {
+                            from: None,
+                            from_commit: Some(commit.as_str().to_string()),
+                            name: name.to_string(),
+                        },
                     })?),
                     token.as_deref(),
                 )
                 .await
             }
             GraphClient::Embedded { uri, actor } => {
-                let db = Self::open_write(uri).await?;
+                let db = Self::open_write(uri, stderr).await?;
                 let actor = actor.as_deref();
-                db.branch_create_from_as(ReadTarget::branch(from), name, actor)
-                    .await?;
+                let created = db.branch_create_from_as(start, name, actor).await?;
                 Ok(BranchCreateOutput {
                     uri: uri.clone(),
-                    from: from.to_string(),
+                    from: created.from,
                     name: name.to_string(),
                     actor_id: actor.map(String::from),
+                    from_commit_id: created.from_commit_id,
                 })
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("branch create from")),
         }
     }
 
-    pub(crate) async fn branch_delete(&self, name: &str) -> Result<BranchDeleteOutput> {
+    pub(crate) async fn branch_delete(
+        &self,
+        name: &str,
+        stderr: &mut dyn Write,
+    ) -> Result<BranchDeleteOutput> {
         match self {
             GraphClient::Remote {
                 http,
@@ -1976,7 +2198,7 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, actor } => {
-                let db = Self::open_write(uri).await?;
+                let db = Self::open_write(uri, stderr).await?;
                 let actor = actor.as_deref();
                 db.branch_delete_as(name, actor).await?;
                 Ok(BranchDeleteOutput {
@@ -1998,6 +2220,7 @@ impl GraphClient {
         as_commit: bool,
         dry_run: bool,
         settings: &[(SettingId, SettingValue)],
+        stderr: &mut dyn Write,
     ) -> Result<BranchMergeOutput> {
         // Dispatch, receipt validation and optional deletion all use the names
         // as given, so refuse one the engine and the server would refuse before
@@ -2044,7 +2267,7 @@ impl GraphClient {
                 }
             }
             GraphClient::Embedded { uri, actor } => {
-                let session = Self::open_write_session(uri, settings).await?;
+                let session = Self::open_write_session(uri, settings, stderr).await?;
                 let actor = actor.as_deref();
                 let result = session
                     .branch_merge_as_with_options(source, into, actor, as_commit)
@@ -2196,6 +2419,7 @@ impl GraphClient {
         &self,
         schema_source: &str,
         validate: F,
+        stderr: &mut dyn Write,
     ) -> Result<SchemaApplyOutput>
     where
         F: FnOnce(&Catalog) -> omnigraph::error::Result<()>,
@@ -2206,7 +2430,7 @@ impl GraphClient {
                  `cluster apply --server <SERVER> --config <CONFIG>`"
             ),
             GraphClient::Embedded { uri, actor } => {
-                let db = Self::open_write(uri).await?;
+                let db = Self::open_write(uri, stderr).await?;
                 let result = db
                     .apply_schema_as_with_catalog_check(schema_source, actor.as_deref(), validate)
                     .await?;
@@ -2345,7 +2569,7 @@ impl GraphClient {
                     StatusCode::OK
                 };
                 if status != expected_status {
-                    return Err(remote_blob_error(status));
+                    return Err(remote_blob_error(status, missing_credential(&response)));
                 }
                 let headers = managed_response_headers(response.headers())?;
                 if let Some(range) = range {
@@ -2426,7 +2650,7 @@ impl GraphClient {
                         let (uri, snapshot_id) = external_response_headers(response.headers())?;
                         Ok(BlobStatOutput::external(query, snapshot_id, uri))
                     }
-                    status => Err(remote_blob_error(status)),
+                    status => Err(remote_blob_error(status, missing_credential(&response))),
                 }
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("blob stat")),
@@ -2443,11 +2667,12 @@ impl GraphClient {
         bytes: Option<bytes::Bytes>,
         if_match: Option<&str>,
         precondition: Option<omnigraph::BlobPrecondition>,
+        stderr: &mut dyn Write,
     ) -> Result<BlobWriteOutput> {
         let branch = query.branch.as_deref().unwrap_or("main");
         match self {
             GraphClient::Embedded { uri, actor } => {
-                let session = Self::open_write_session(uri, &[]).await?;
+                let session = Self::open_write_session(uri, &[], stderr).await?;
                 let cell = blob_write_cell(query);
                 let outcome = match bytes {
                     Some(bytes) => {
@@ -2786,7 +3011,11 @@ mod tests {
             server: Some(server.origin.clone()),
             ..Default::default()
         };
-        let error = require_graph_for_multi_graph_server(&scope)
+        let input = InvocationConfig::at(None, None);
+        let probe =
+            GraphClient::registry_client(&input, &OperatorConfig::default(), &server.origin)
+                .unwrap();
+        let error = require_graph_for_multi_graph_server(&probe, &scope)
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<ApiContractError>().is_some());
@@ -2903,9 +3132,13 @@ mod tests {
         let gateway = crate::unix_gateway_fixture::UnixGateway::new(&server.origin);
         let root = gateway.url();
         let http = GraphHttpClient::new(&root).unwrap();
-        let base = resolve_server_flag(Some(&root), Some("knowledge"))
-            .unwrap()
-            .unwrap();
+        let base = resolve_server_flag_with_config(
+            &OperatorConfig::default(),
+            Some(&root),
+            Some("knowledge"),
+        )
+        .unwrap()
+        .unwrap();
         let value: Value = remote_json(
             &http,
             Method::GET,
@@ -2934,12 +3167,21 @@ mod tests {
         assert_eq!(gateway.connections(), 2, "both requests used the socket");
         server.assert_complete();
 
-        let escaped = resolve_server_flag(Some(&root), Some("../.."))
-            .unwrap()
-            .unwrap();
+        // `--graph` refuses anything but one plain segment before any URL is
+        // composed; the transport still refuses a composed URL that climbs
+        // out of the root.
+        let refusal =
+            resolve_server_flag_with_config(&OperatorConfig::default(), Some(&root), Some("../.."))
+                .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("a graph name is one path segment"),
+            "{refusal}"
+        );
         for outside in [
             format!("{root}2/graphs"),
-            remote_url(&escaped, &["snapshot"], &[]).unwrap(),
+            remote_url(&format!("{root}/graphs/../.."), &["snapshot"], &[]).unwrap(),
         ] {
             let error = http.request(Method::GET, outside.clone()).unwrap_err();
             assert!(
@@ -3022,6 +3264,7 @@ mod tests {
                             file.path().to_str().unwrap(),
                             CliLoadMode::Append,
                             &[],
+                            &mut std::io::sink(),
                         )
                         .await
                         .map(|_| ()),
@@ -3277,6 +3520,7 @@ mod tests {
                                         as_commit: false,
                                     },
                                     &[],
+                                    &mut std::io::sink(),
                                 )
                                 .await,
                             "/graphs/knowledge/mutate",
@@ -3307,6 +3551,7 @@ mod tests {
                                     None,
                                     (form == "conditional").then_some("head-before"),
                                     &[],
+                                    &mut std::io::sink(),
                                 )
                                 .await,
                             if form == "conditional" {
@@ -3499,6 +3744,7 @@ mod tests {
                         None,
                         None,
                         &settings,
+                        &mut std::io::sink(),
                     )
                     .await
                     .map(|_| ()),
@@ -3513,7 +3759,15 @@ mod tests {
             (
                 "branch merge",
                 client
-                    .branch_merge("review", "main", false, false, false, &settings)
+                    .branch_merge(
+                        "review",
+                        "main",
+                        false,
+                        false,
+                        false,
+                        &settings,
+                        &mut std::io::sink(),
+                    )
                     .await
                     .map(|_| ()),
             ),
@@ -3605,6 +3859,7 @@ mod tests {
                 None,
                 None,
                 &settings,
+                &mut std::io::sink(),
             )
             .await
             .unwrap();
@@ -3616,16 +3871,33 @@ mod tests {
                 None,
                 Some("head-before"),
                 &settings,
+                &mut std::io::sink(),
             )
             .await
             .unwrap();
         client
-            .branch_merge("review", "main", false, false, false, &settings)
+            .branch_merge(
+                "review",
+                "main",
+                false,
+                false,
+                false,
+                &settings,
+                &mut std::io::sink(),
+            )
             .await
             .unwrap();
 
         client
-            .mutate(Some("main"), "mutation m() {}", Some("m"), None, None, &[])
+            .mutate(
+                Some("main"),
+                "mutation m() {}",
+                Some("m"),
+                None,
+                None,
+                &[],
+                &mut std::io::sink(),
+            )
             .await
             .unwrap();
         let requests = server.workflow_requests();
@@ -3712,7 +3984,13 @@ mod tests {
         // the trailing slash trimmed and no `/graphs/<id>` segment. A literal
         // `://` --server value bypasses the operator server registry, so a
         // developer's real config cannot change the outcome.
-        let client = GraphClient::resolve_registry(Some("http://server.invalid:9/"), None).unwrap();
+        let client = GraphClient::resolve_registry(
+            &InvocationConfig::at(None, None),
+            Some("http://server.invalid:9/"),
+            None,
+            &mut std::io::sink(),
+        )
+        .unwrap();
         assert_eq!(client.uri(), "http://server.invalid:9");
         assert!(client.is_remote());
     }

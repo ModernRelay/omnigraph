@@ -236,8 +236,8 @@ other keys, except the leading search function, must be return aliases or
 expressions written in return (`T42`), like `count($d)` after `return { count($d) as deals }`.
 
 For ordinary returns, `nearest(...)` orders by ascending distance and `bm25`
-and `rrf` by descending score, including through traversals. The search
-function must lead; subsequent keys precede the identity tiebreak. Projected
+and `rrf` by descending score, including through traversals, ranking the binding named whichever binding `match` declares first ([details](../search/index.md#ranking-a-traversal-reached-binding); `rrf` arms on two connected bindings: `T59`).
+The search function must lead; subsequent keys precede the identity tiebreak. Projected
 scores must repeat that leading function (`T33`); the [Search guide](../search/index.md)
 defines their names and types. Rank expressions under aggregates (`T32`) and
 search predicates in return (`T35`) are refused.

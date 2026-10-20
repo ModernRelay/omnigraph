@@ -1,11 +1,10 @@
 //! Storage trait surface — MR-793.
 //!
 //! `TableStorage` is the engine-internal trait that exposes the
-//! staged-write primitives (`stage_append`, `stage_keyed_write`,
-//! `stage_merge_insert`, `stage_overwrite`, `stage_create_indices`) plus
-//! `commit_staged` as the canonical way for new engine writers to advance
-//! Lance HEAD without coupling
-//! "write bytes" with "advance HEAD" in one Lance API call.
+//! staged-write primitives (`stage_keyed_write`, `stage_overwrite`,
+//! `stage_delete`, `stage_create_indices`) separately from their commit.
+//! Graph-table effects commit detached before one manifest publication;
+//! staging never advances Lance HEAD.
 //!
 //! `delete_where` was the final data-write residual until MR-A: Lance 7.0's
 //! `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write
@@ -52,8 +51,6 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::Expr;
 use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
-#[cfg(test)]
-use lance::dataset::{WhenMatched, WhenNotMatched};
 use omnigraph_compiler::SystemColumns;
 
 use crate::db::{DatasetEntry, Snapshot};
@@ -773,16 +770,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         write_budget: WriteBudget,
     ) -> Result<SendableRecordBatchStream>;
 
-    #[cfg(test)]
-    async fn stage_merge_insert(
-        &self,
-        snapshot: SnapshotHandle,
-        batch: RecordBatch,
-        key_columns: Vec<String>,
-        when_matched: WhenMatched,
-        when_not_matched: WhenNotMatched,
-    ) -> Result<StagedHandle>;
-
     async fn commit_staged(
         &self,
         snapshot: SnapshotHandle,
@@ -839,6 +826,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         batch: RecordBatch,
+    ) -> Result<StagedHandle>;
+
+    /// Stage an overwrite from the batches as they were produced: one
+    /// `Operation::Overwrite` whose fragments hold every row, sized by Lance;
+    /// see `TableStore::stage_overwrite_batches`.
+    async fn stage_overwrite_batches(
+        &self,
+        snapshot: &SnapshotHandle,
+        batches: Vec<RecordBatch>,
     ) -> Result<StagedHandle>;
 
     /// Stage a rename-only column alteration; see
@@ -1323,21 +1319,6 @@ impl TableStorage for TableStore {
         .await
     }
 
-    #[cfg(test)]
-    async fn stage_merge_insert(
-        &self,
-        snapshot: SnapshotHandle,
-        batch: RecordBatch,
-        key_columns: Vec<String>,
-        when_matched: WhenMatched,
-        when_not_matched: WhenNotMatched,
-    ) -> Result<StagedHandle> {
-        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::stage_merge_insert(self, ds, batch, key_columns, when_matched, when_not_matched)
-            .await
-            .map(StagedHandle::new)
-    }
-
     async fn commit_staged(
         &self,
         snapshot: SnapshotHandle,
@@ -1418,6 +1399,16 @@ impl TableStorage for TableStore {
         batch: RecordBatch,
     ) -> Result<StagedHandle> {
         TableStore::stage_overwrite(self, snapshot.dataset(), batch)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn stage_overwrite_batches(
+        &self,
+        snapshot: &SnapshotHandle,
+        batches: Vec<RecordBatch>,
+    ) -> Result<StagedHandle> {
+        TableStore::stage_overwrite_batches(self, snapshot.dataset(), batches)
             .await
             .map(StagedHandle::new)
     }

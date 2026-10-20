@@ -388,7 +388,9 @@ impl Omnigraph {
             .await?;
         // The validator evidence comes from the exact detached version the pin
         // will name, read before publication; nothing after the CAS reads
-        // storage, so a later write cannot change this outcome.
+        // storage, so a later write cannot change this outcome. A failure in
+        // this span is definite: the detached version exists, no manifest
+        // names it.
         let managed = match value {
             BlobCellValue::Bytes(bytes) => {
                 let detached = committed
@@ -402,23 +404,28 @@ impl Omnigraph {
                             "Blob write committed no detached version of '{}'",
                             resolved.table_key
                         ))
+                        .unpublished()
                     })?;
                 let (row_id, written) = locate_blob_cell(detached.dataset(), id_column, cell)
-                    .await?
+                    .await
+                    .map_err(OmniError::unpublished)?
                     .ok_or_else(|| {
                         OmniError::blob_integrity(format!(
                             "the detached commit of '{}' lost id '{}'",
                             resolved.table_key, cell.id
                         ))
+                        .unpublished()
                     })?;
                 let length = u64::try_from(bytes.len()).map_err(|_| {
                     OmniError::manifest_internal("Blob write payload length exceeds u64")
+                        .unpublished()
                 })?;
                 if written != (BlobDescriptor::Managed { length }) {
                     return Err(OmniError::blob_integrity(format!(
                         "the detached commit of '{}.{}' stores {written:?}, expected a managed value of {length} bytes",
                         cell.type_name, cell.property
-                    )));
+                    ))
+                    .unpublished());
                 }
                 Some((
                     length,
@@ -429,7 +436,8 @@ impl Omnigraph {
                         resolved.stable_property_id,
                         row_id,
                         cell,
-                    )?,
+                    )
+                    .map_err(OmniError::unpublished)?,
                 ))
             }
             BlobCellValue::Null => None,

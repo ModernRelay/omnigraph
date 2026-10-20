@@ -136,6 +136,9 @@ struct TableStatistics {
     file_bytes: Option<u64>,
     column_bytes: HashMap<String, u64>,
     index_facts: Vec<IndexFact>,
+    /// The pinned version's current fragments: one with none holds no row a
+    /// full-text call could answer differently.
+    fragments: usize,
 }
 
 impl<'a> QuerySource<'a> {
@@ -179,19 +182,36 @@ impl<'a> QuerySource<'a> {
     /// values, so one explain document reads the same on every operation, and
     /// the memory limit `gather` captured, which sizes the run's pool.
     pub(crate) fn bounds(&self) -> Bounds {
-        Bounds {
-            hydration_chunk_hard_bytes: 2 * crate::storage_layer::KEYED_WRITE_MAX_BYTES,
-            key_width_bytes: KEY_WIDTH_BYTES,
-            ordered_scan_memory_bytes: crate::table_store::ORDERED_SCAN_MEMORY_BYTES,
-            ordered_scan_max_input_batch_bytes:
-                crate::table_store::ORDERED_SCAN_MAX_INPUT_BATCH_BYTES,
-            build_key_cap_rows: super::push::BUILD_KEY_CAP_ROWS as u64,
-            query_memory_pool_bytes: self.memory_limit,
-            late_materialization_only: false,
-        }
+        engine_bounds(
+            self.memory_limit,
+            crate::storage_layer::KEYED_WRITE_MAX_BYTES,
+        )
     }
 
     fn take_source_failure(&self) -> Option<OmniError> {
+        self.take_source_failure_inner()
+    }
+}
+
+/// The engine's bounds for one plan: the change-feed constants, the pool
+/// `memory_limit` sizes, and the bound on one staged load input (the session's
+/// `write_max_bytes` for a load, the keyed constant for a query's document).
+pub(crate) fn engine_bounds(memory_limit: u64, load_write_max_bytes: u64) -> Bounds {
+    Bounds {
+        hydration_chunk_hard_bytes: 2 * crate::storage_layer::KEYED_WRITE_MAX_BYTES,
+        key_width_bytes: KEY_WIDTH_BYTES,
+        ordered_scan_memory_bytes: crate::table_store::ORDERED_SCAN_MEMORY_BYTES,
+        ordered_scan_max_input_batch_bytes: crate::table_store::ORDERED_SCAN_MAX_INPUT_BATCH_BYTES,
+        build_key_cap_rows: super::push::BUILD_KEY_CAP_ROWS as u64,
+        query_memory_pool_bytes: memory_limit,
+        late_materialization_only: false,
+        load_workers_max: 1,
+        load_write_max_bytes,
+    }
+}
+
+impl<'a> QuerySource<'a> {
+    fn take_source_failure_inner(&self) -> Option<OmniError> {
         self.source_failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -245,8 +265,16 @@ impl<'a> QuerySource<'a> {
 }
 
 impl PlanSource for QuerySource<'_> {
+    /// A table the snapshot does not hold has no rows, so nothing is refused;
+    /// otherwise the coverage its pinned index facts and fragments establish,
+    /// the rule replay applies to the same version.
     fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
-        FullTextCoverage::of_facts(&self.index_facts(type_key), property)
+        match self.table_stats.get(type_key) {
+            Some(stats) => {
+                FullTextCoverage::of_table(&stats.index_facts, property, stats.fragments)
+            }
+            None => FullTextCoverage::Full,
+        }
     }
 
     fn canonical_key_id(
@@ -476,10 +504,12 @@ fn unsupported_query(diagnostic: Box<omnigraph_compiler::QueryDiagnostic>) -> Om
 }
 
 /// A planning failure outside the gate: a refusal by design keeps its
-/// diagnostic, anything else is a planner defect.
+/// diagnostic, a full-text index with no segment is the typed conflict (as
+/// in the gate's [`unaccepted`]), anything else is a planner defect.
 fn plan_error(error: PlanError) -> OmniError {
     match error {
         PlanError::Unsupported(diagnostic) => unsupported_query(diagnostic),
+        PlanError::FullTextIndexRequired { index } => OmniError::FullTextIndexRequired { index },
         other => no_plan(other),
     }
 }
@@ -569,11 +599,13 @@ impl KeyIds for CatalogKeys<'_> {
 }
 
 /// The failure of a read's planning or acceptance: a refusal by design is the
-/// caller's error with its diagnostic, an exhausted validation limit is a
-/// resource outcome, and anything else is a planner defect.
+/// caller's error with its diagnostic, a full-text index with no segment is
+/// the typed conflict, an exhausted validation limit is a resource outcome,
+/// and anything else is a planner defect.
 fn unaccepted(reason: Unrouted) -> OmniError {
     match reason {
         Unrouted::UnsupportedQuery { diagnostic } => unsupported_query(diagnostic),
+        Unrouted::FullTextIndexRequired { index } => OmniError::FullTextIndexRequired { index },
         Unrouted::ValidationExhausted { limit, value } => OmniError::ResourceLimitExceeded {
             resource: format!("plan validation {limit}"),
             limit: value,
@@ -658,9 +690,13 @@ pub(crate) async fn replayed_coverage_holds(
         let actual = match snapshot.dataset(type_key) {
             Some(_) => {
                 let dataset = snapshot.open_lance_dataset(type_key).await?;
-                FullTextCoverage::of_facts(&indexes::gather(&dataset).await?, property)
+                FullTextCoverage::of_table(
+                    &indexes::gather(&dataset).await?,
+                    property,
+                    dataset.get_fragments().len(),
+                )
             }
-            None => FullTextCoverage::Absent,
+            None => FullTextCoverage::Full,
         };
         if actual != *recorded {
             return Err(refuse(format!(
@@ -712,6 +748,15 @@ pub(crate) async fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQ
     .await
     .map_err(|reason| source.unaccepted(reason))?;
     Ok(ExplainedQuery { explain, accepted })
+}
+
+/// Index metadata from the accepted table version; no table payload is read.
+pub(crate) async fn load_index_facts(
+    snapshot: &Snapshot,
+    type_key: &str,
+) -> Result<Vec<IndexFact>> {
+    let dataset = snapshot.open_lance_dataset(type_key).await?;
+    indexes::gather(&dataset).await
 }
 
 async fn query_table_statistics(
@@ -782,6 +827,7 @@ async fn query_table_statistics(
                 file_bytes: destination.then_some(size).flatten(),
                 column_bytes: HashMap::new(),
                 index_facts: indexes::gather(&dataset).await?,
+                fragments: dataset.get_fragments().len(),
             },
         );
     }
@@ -1011,6 +1057,7 @@ query people() { match { $p: Person } return { count($p) as n } }
                 snapshot: Some(&view.snapshot),
                 catalog: &catalog,
                 graph_index: Arc::new(GraphIndexHandle::none()),
+                load: None,
             };
             let lowering = Lowering::new(bound, &context);
             assert_eq!(lowering.plan.assumptions().memory_limit, CAPTURED);

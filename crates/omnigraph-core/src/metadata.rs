@@ -126,6 +126,22 @@ pub struct TableVersionMetadata {
 }
 
 impl TableVersionMetadata {
+    /// Conservative owned-string allocation of a clone; shared state is excluded.
+    pub fn clone_allocation_bytes(&self) -> usize {
+        [
+            Some(self.manifest_path.as_str()),
+            self.e_tag.as_deref(),
+            self.naming_scheme.as_deref(),
+            self.table_fork_owner.as_deref(),
+            self.transaction_uuid.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0usize, |bytes, value| {
+            bytes.saturating_add(value.len().saturating_mul(2).saturating_add(32))
+        })
+    }
+
     pub fn from_dataset(root_uri: &str, table_path: &str, dataset: &Dataset) -> Result<Self> {
         Ok(Self {
             manifest_path: full_manifest_object_store_path(

@@ -331,12 +331,15 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "commit_target_branch"),
     ("db/omnigraph.rs", "list_commits"),
+    ("db/omnigraph.rs", "list_commits_page"),
+    ("db/omnigraph.rs", "list_commits_page_readable"),
     ("db/omnigraph.rs", "list_unpublished_commits"),
     ("db/omnigraph.rs", "list_unattached_commits"),
     ("exec/query_doors.rs", "query"),
     ("exec/query_doors.rs", "query_with_head"),
     ("exec/query_doors.rs", "run_query_at"),
     ("exec/query_doors.rs", "explain_query"),
+    ("exec/query_doors.rs", "explain_load"),
     ("exec/query_doors.rs", "query_inspected"),
     ("exec/query_doors.rs", "replay_bound_plan"),
 ];
@@ -466,6 +469,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "published_record",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "capture_change_cut",
     ),
     (
@@ -482,6 +490,16 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "list_commits",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "first_parent_page",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "first_parent_below",
     ),
     (
         "omnigraph-catalog/lib.rs",
@@ -628,6 +646,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "branch_create_at",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "branch_delete_captured",
         WriteProtocol::NativeRefControl,
     ),
@@ -659,6 +683,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "create_branch",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "create_branch_at",
         WriteProtocol::NativeRefControl,
     ),
     (
@@ -832,6 +862,7 @@ gateway_surfaces! {
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
+        "stage_overwrite_batches",
         "stage_rename_columns", "stage_schema_evolution", "stage_delete", "stage_create_indices",
         "stage_compaction", "stage_index_fold",
     ],
@@ -869,6 +900,7 @@ gateway_surfaces! {
         "has_btree_index", "has_fts_index", "has_fts_postings",
         "has_vector_index", "first_row_id_for_filter",
         "with_external_blob_policy", "preflight_external_blob_uris", "read_external_object",
+        "external_object_size",
         "preflight_persisted_blob_selection", "prepare_keyed_write_batch_with_preflight",
         "prepare_overwrite_blob_references_with_preflight",
         "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
@@ -879,6 +911,7 @@ gateway_surfaces! {
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
+        "stage_overwrite_batches",
         "stage_rename_columns", "renamed_schema", "stage_schema_evolution",
         "plan_schema_evolution", "stage_delete", "stage_create_indices", "stage_compaction",
         "stage_index_fold", "stage_full_text_declarations",
@@ -994,6 +1027,7 @@ durable_calls! {
     ("omnigraph-core/instrumentation.rs", ".delete(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".delete_prefix(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/lance_access.rs", ".put_opts(", 1, WriteProtocol::Composed("Lance-realm object-store seam forwarding (dst only)")),
+    ("omnigraph-core/read_memo.rs", ".put_opts(", 1, WriteProtocol::Composed("statement read-memo forwarding: the memo intercepts immutable-path reads only and passes the caller's put untouched to the wrapped store")),
     ("omnigraph-core/storage.rs", ".write_bytes(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("omnigraph-core/storage.rs", ".write_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("omnigraph-core/storage.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
@@ -1026,7 +1060,7 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 32, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 33, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
@@ -2846,6 +2880,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
     let coordinator_methods = [
         "init_commit_with_session",
         "branch_create",
+        "branch_create_at",
         "branch_delete_captured",
         "commit_updates_with_actor",
         "commit_updates_with_actor_with_expected",
@@ -2889,6 +2924,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         "init_commit",
         "commit_changes_with_lineage_and_precondition",
         "create_branch",
+        "create_branch_at",
         "delete_branch",
         "delete_branch_with_expected",
     ] {
@@ -2924,6 +2960,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         "commit_changes_with_lineage",
         "commit_changes_with_lineage_and_precondition",
         "create_branch",
+        "create_branch_at",
         "delete_branch",
         "delete_branch_with_expected",
     ];
@@ -3007,6 +3044,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "db/manifest.rs: omnigraph_catalog::INTERNAL_MANIFEST_SCHEMA_VERSION",
     "db/manifest.rs: omnigraph_catalog::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION",
     "db/manifest.rs: omnigraph_catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE",
+    "error.rs: omnigraph_core::error::BranchStartRefusal",
     "error.rs: omnigraph_core::error::CompletionEvidence",
     "error.rs: omnigraph_core::error::ManifestConflictDetails",
     "error.rs: omnigraph_core::error::ManifestError",
@@ -3019,6 +3057,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "error.rs: omnigraph_core::error::StorageFailureKind",
     "instrumentation.rs: omnigraph_core::instrumentation::capture_query_io_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::CountingStorageAdapter",
+    "instrumentation.rs: omnigraph_core::instrumentation::ExternalPayloadReadHold",
     "instrumentation.rs: omnigraph_core::instrumentation::MergeTimingReading",
     "instrumentation.rs: omnigraph_core::instrumentation::MergeWriteProbes",
     "instrumentation.rs: omnigraph_core::instrumentation::ProbedStores",
@@ -3032,6 +3071,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::RrfGateVerdict",
     "instrumentation.rs: omnigraph_core::instrumentation::StageWriteProbes",
     "instrumentation.rs: omnigraph_core::instrumentation::StorageReadCounts",
+    "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_held",
     "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_stalled",
     "instrumentation.rs: omnigraph_core::instrumentation::with_merge_write_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_io_probes",

@@ -235,7 +235,7 @@ impl std::error::Error for QueryDiagnostic {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::codes::{P001, Q001, T1};
+    use crate::query::codes::{P002, Q001, T1};
 
     #[test]
     fn position_counts_lines_and_character_columns() {
@@ -252,10 +252,11 @@ mod tests {
         assert_eq!(parse.to_string(), "parse error: expected `(`");
         let typed = QueryDiagnostic::typecheck(T1, "unknown node type `X`").with_fix("declare X");
         assert_eq!(typed.to_string(), "type error: T1: unknown node type `X`");
-        let plan = QueryDiagnostic::plan(P001, "`nearest()` orders `$t`").with_expression("x");
+        let plan = QueryDiagnostic::plan(P002, "`$a <*> $b` has no finite traversal work limit")
+            .with_expression("x");
         assert_eq!(
             plan.to_string(),
-            "plan error: P001: `nearest()` orders `$t`"
+            "plan error: P002: `$a <*> $b` has no finite traversal work limit"
         );
         assert_eq!(plan.stage.as_ref().map(|stage| stage.name), Some("plan"));
     }

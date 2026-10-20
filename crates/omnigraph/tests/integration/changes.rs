@@ -4735,19 +4735,3 @@ async fn graph_diff_pages_answer_for_the_first_pages_endpoints() {
         OmniError::ChangeCursorRejected { .. }
     ));
 }
-
-/// `token` with its payload edited and its checksum recomputed, as any caller
-/// can: a continuation's envelope is `base64url(json ‖ sha256(json))`.
-fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
-    use base64::Engine;
-    use sha2::Digest;
-    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let bytes = engine.decode(token).unwrap();
-    let (payload, _) = bytes.split_at(bytes.len() - 32);
-    let mut payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
-    edit(&mut payload);
-    let mut encoded = serde_json::to_vec(&payload).unwrap();
-    let checksum = sha2::Sha256::digest(&encoded);
-    encoded.extend_from_slice(&checksum);
-    engine.encode(encoded)
-}

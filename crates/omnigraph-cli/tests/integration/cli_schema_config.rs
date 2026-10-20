@@ -21,17 +21,34 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
     };
     use omnigraph_api_types::HTTP_API_CONTRACT;
 
+    // The release workflows stamp both at compile time; the test binary is
+    // built with whatever this build was given, normally neither.
+    let channel = option_env!("OMNIGRAPH_RELEASE_CHANNEL");
+    let commit = option_env!("OMNIGRAPH_SOURCE_VERSION");
+    let version = match (channel, commit) {
+        (Some("edge"), Some(commit)) => {
+            format!("{}-edge+{}", env!("CARGO_PKG_VERSION"), &commit[..7])
+        }
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    };
+
     // The first two lines keep their earlier text and position; the contract
-    // line follows them.
+    // line follows them, then the commit of a packaged build.
     let output = output_success(cli().arg("version"));
     let stdout = stdout_string(&output);
+    let mut expected = vec![
+        format!("omnigraph {version}"),
+        format!("internal-schema {WRITES} (serves v{LOWEST} to v{WRITES})"),
+        format!("http-contract {HTTP_API_CONTRACT}"),
+    ];
+    expected.extend(commit.map(|commit| format!("commit {commit}")));
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), expected);
+
+    // `--version` prints the first line alone.
+    let output = output_success(cli().arg("--version"));
     assert_eq!(
-        stdout.lines().collect::<Vec<_>>(),
-        [
-            format!("omnigraph {}", env!("CARGO_PKG_VERSION")),
-            format!("internal-schema {WRITES} (serves v{LOWEST} to v{WRITES})"),
-            format!("http-contract {HTTP_API_CONTRACT}"),
-        ],
+        stdout_string(&output).trim_end(),
+        format!("omnigraph {version}")
     );
 
     // Equality with the whole object pins the field set: a field added or
@@ -41,11 +58,44 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
     assert_eq!(
         json,
         serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": version,
+            "channel": channel,
+            "commit": commit,
             "http_contract": HTTP_API_CONTRACT,
             "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
         }),
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn clap_exit_status_survives_closed_output() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    for (args, expected, uses_stderr) in [
+        (vec!["--help"], 0, false),
+        (vec!["--version"], 0, false),
+        (vec!["query", "--help"], 0, false),
+        (vec!["--unknown-option"], 2, true),
+    ] {
+        // Close the reader before spawning, avoiding the race in `| head -n0`.
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let mut command = cli_process();
+        command.args(&args).stdin(Stdio::null());
+        if uses_stderr {
+            command.stderr(Stdio::from(writer));
+        } else {
+            command.stdout(Stdio::from(writer));
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+    }
 }
 
 /// `skills/omnigraph`, the one copy of the skill the binary embeds.
@@ -246,6 +296,7 @@ fn help_groups_commands_by_capability() {
     // ordering — to avoid brittle full-text assertions on clap's help body.
     let output = output_success(cli().arg("--help"));
     let stdout = stdout_string(&output);
+    assert!(output.stderr.is_empty(), "{output:?}");
 
     assert!(
         stdout.contains("COMMANDS BY CAPABILITY"),
@@ -278,6 +329,14 @@ fn help_groups_commands_by_capability() {
         pos("optimize") < pos("cluster"),
         "direct commands should be listed before the control command"
     );
+
+    // Help must exit before cross-level validation requires a managed plan.
+    let output = output_success(cli().args(["cluster", "apply", "--managed", "--help"]));
+    assert!(
+        stdout_string(&output).contains("Usage: omnigraph cluster apply"),
+        "{output:?}"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]
@@ -396,30 +455,34 @@ fn schema_plan_json_reports_supported_additive_change() {
 
 #[test]
 fn schema_plan_with_server_flag_errors_wrong_plane() {
+    let temp = tempdir().unwrap();
     let server = support::managed_http::IntentApiFixture::graph(Vec::new());
     for command in ["plan", "apply"] {
-        let output = output_failure(
-            cli()
-                .args(["schema", command, "--schema"])
-                .arg(fixture("test.pg"))
-                .args(["--server", &server.origin]),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!(
-                "`schema {command}` is a direct (storage-native) command"
-            )),
-            "schema {command} wrong-capability message not found; got: {stderr}"
-        );
-        if command == "apply" {
-            assert!(stderr.contains("cluster apply --server"), "{stderr}");
-        } else {
-            assert!(stderr.contains("Pass a storage URI."), "{stderr}");
+        for schema in [fixture("test.pg"), temp.path().join("missing.pg")] {
+            let output = output_failure(
+                cli()
+                    .args(["schema", command, "--schema"])
+                    .arg(&schema)
+                    .args(["--server", &server.origin]),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(&format!(
+                    "`schema {command}` is a direct (storage-native) command"
+                )),
+                "schema {command} must reject its plane before reading {schema:?}; got: {stderr}"
+            );
+            if command == "apply" {
+                assert!(stderr.contains("cluster apply --server"), "{stderr}");
+            } else {
+                assert!(stderr.contains("Pass a storage URI."), "{stderr}");
+            }
+            assert!(output.stdout.is_empty());
+            assert!(
+                server.requests().is_empty(),
+                "refuse before discovery or dispatch"
+            );
         }
-        assert!(
-            server.requests().is_empty(),
-            "refuse before discovery or dispatch"
-        );
     }
     server.assert_complete();
 }
@@ -905,10 +968,11 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
             serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"apply_correction_or_restart"}]})
         };
         let server = IntentApiFixture::graph(vec![IntentReply::json(200, reply.clone())]);
+        let operator = KeyedServer::new(&server.origin);
         let mut command = cli();
         command
             .current_dir(directory.path())
-            .env("OMNIGRAPH_BEARER_TOKEN", &token)
+            .envs(operator.env(&token))
             .args(["graphs", "list", "--server", &server.origin]);
         if json_output {
             command.arg("--json");
@@ -1071,16 +1135,35 @@ fn registry_profile_home() -> tempfile::TempDir {
 
 #[test]
 fn graphs_list_without_scope_needs_server() {
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
     // No addressing and no operator defaults: the served-registry resolver
     // asks for a server scope — not the graph-shaped "no graph addressed"
     // advice, which points at flags graphs list cannot consume.
-    let output = output_failure(cli().arg("graphs").arg("list"));
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("`graphs list` needs a server scope")
-            && stderr.contains("--server <name|url> or --profile <name>"),
-        "expected the needs-a-server-scope error in stderr; got:\n{stderr}"
-    );
+    for ambient in [
+        None,
+        Some(OsString::new()),
+        #[cfg(unix)]
+        Some(OsString::from_vec(vec![0xff])),
+    ] {
+        let mut command = cli();
+        command
+            .args(["graphs", "list"])
+            .env_remove("OMNIGRAPH_PROFILE");
+        if let Some(value) = &ambient {
+            command.env("OMNIGRAPH_PROFILE", value);
+        }
+        let output = output_failure(&mut command);
+        assert!(output.stdout.is_empty(), "{ambient:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("`graphs list` needs a server scope")
+                && stderr.contains("--server <name|url> or --profile <name>"),
+            "expected the needs-a-server-scope error for {ambient:?}; got:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1089,20 +1172,34 @@ fn graphs_list_rejects_store_bound_profile() {
     // is server-scoped, so resolution fails with scope-shaped advice instead
     // of the late embedded-arm engine-limitation message.
     let home = registry_profile_home();
-    let output = output_failure(
-        cli()
+    for (profile, ambient) in [
+        (Some("localdev"), None),
+        (None, Some("localdev")),
+        (Some("localdev"), Some("unknown-profile")),
+    ] {
+        let mut command = cli();
+        command
             .env("OMNIGRAPH_HOME", home.path())
-            .arg("graphs")
-            .arg("list")
-            .arg("--profile")
-            .arg("localdev"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("requires a server")
-            && stderr.contains("profile 'localdev' resolves a store scope"),
-        "expected the served store-scope rejection in stderr; got:\n{stderr}"
-    );
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["graphs", "list"]);
+        if let Some(value) = ambient {
+            command.env("OMNIGRAPH_PROFILE", value);
+        }
+        if let Some(value) = profile {
+            command.args(["--profile", value]);
+        }
+        let output = output_failure(&mut command);
+        assert!(
+            output.stdout.is_empty(),
+            "{profile:?}/{ambient:?}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("requires a server")
+                && stderr.contains("profile 'localdev' resolves a store scope"),
+            "expected the served store-scope rejection for {profile:?}/{ambient:?}; got:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1111,21 +1208,35 @@ fn graphs_list_rejects_cluster_bound_profile() {
     // points at `cluster status` for cluster-graph enumeration instead of the
     // misleading graph-data-command error.
     let home = registry_profile_home();
-    let output = output_failure(
-        cli()
+    for (profile, ambient) in [
+        (Some("brain-admin"), None),
+        (None, Some("brain-admin")),
+        (Some("brain-admin"), Some("unknown-profile")),
+    ] {
+        let mut command = cli();
+        command
             .env("OMNIGRAPH_HOME", home.path())
-            .arg("graphs")
-            .arg("list")
-            .arg("--profile")
-            .arg("brain-admin"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("requires a server")
-            && stderr.contains("profile 'brain-admin' resolves a cluster scope")
-            && stderr.contains("cluster status"),
-        "expected the served cluster-scope rejection in stderr; got:\n{stderr}"
-    );
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["graphs", "list"]);
+        if let Some(value) = ambient {
+            command.env("OMNIGRAPH_PROFILE", value);
+        }
+        if let Some(value) = profile {
+            command.args(["--profile", value]);
+        }
+        let output = output_failure(&mut command);
+        assert!(
+            output.stdout.is_empty(),
+            "{profile:?}/{ambient:?}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("requires a server")
+                && stderr.contains("profile 'brain-admin' resolves a cluster scope")
+                && stderr.contains("cluster status"),
+            "expected the served cluster-scope rejection for {profile:?}/{ambient:?}; got:\n{stderr}"
+        );
+    }
 }
 
 #[test]

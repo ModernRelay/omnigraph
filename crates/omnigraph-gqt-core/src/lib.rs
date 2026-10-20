@@ -16,9 +16,9 @@ use omnigraph::instrumentation::{QueryIoProbes, capture_query_io_probes, with_qu
 use omnigraph::loader::LoadMode;
 use omnigraph::{MutationReceipt, Session};
 use omnigraph_compiler::query::ast::{
-    BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite, EmptyFile, Expr,
-    FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt, UnattachedBase,
-    show_statement_name,
+    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite,
+    EmptyFile, Expr, FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt,
+    UnattachedBase, show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::{
@@ -54,9 +54,11 @@ use omnigraph::storage::StorageAdapter;
 pub use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
 pub use served::{ServerTarget, admit_served, execute_steps_served};
 
+mod load_plan;
 mod plan;
 mod report;
 mod shape;
+use load_plan::{LoadPlanExpect, load_plan_mismatch, parse_load_plan_body};
 use plan::{PlanExpect, parse_plan_body, plan_mismatch, validate_plan_columns};
 
 use shape::{
@@ -287,7 +289,7 @@ pub struct ControlStep {
 pub enum ControlWrite {
     Create {
         name: String,
-        from: Option<String>,
+        from: Option<BranchCreateFrom>,
         expect: WriteExpect,
     },
     Delete {
@@ -318,6 +320,9 @@ pub enum ControlWrite {
         stmt: LoadStmt,
         branch: Option<String>,
         expect: WriteExpect,
+        /// `--- expect plan` after the step's `--- expect ok`: facts of the
+        /// accepted plan and the executed report the receipt carries.
+        plan: Option<LoadPlanExpect>,
     },
 }
 
@@ -1713,6 +1718,7 @@ fn complete_control_step(
             stmt,
             branch,
             expect: complete_write_expect(name, mode, section)?,
+            plan: None,
         },
         ControlSource::Branch(BranchWrite::Create { name: branch, from }) => ControlWrite::Create {
             name: branch,
@@ -1945,6 +1951,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut awaiting_shape: Option<Step> = None;
     let mut awaiting_plan: Option<Step> = None;
     let mut awaiting_same_as_v1: Option<Step> = None;
+    let mut awaiting_load_plan = false;
     let mut ordinal = 0usize;
     let mut seams = BTreeMap::new();
     let mut source_lines = BTreeMap::new();
@@ -2002,6 +2009,9 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         let expect_word = if kind == "expect" { rest.trim() } else { "" };
         if !expect_word.starts_with("shape") {
             settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
+        }
+        if expect_word != "plan" {
+            awaiting_load_plan = false;
         }
         if let Some(step) = awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_V1)) {
             push_step(&mut items, &mut open_loop, step);
@@ -2228,11 +2238,29 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                     source: source.clone(),
                                 }
                             }
-                            BranchStmt::Write(write) => Pending::Control {
-                                ordinal,
-                                prefix: file.settings,
-                                write: ControlSource::Branch(write),
-                            },
+                            BranchStmt::Write(write) => {
+                                if let BranchWrite::Create {
+                                    from: Some(BranchCreateFrom::Commit(commit)),
+                                    ..
+                                } = &write
+                                    && let Some(name) = bound_operand(commit)
+                                {
+                                    if !bound_names.contains(name) {
+                                        return Err(format!(
+                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                                        ));
+                                    }
+                                    if source.matches("${").count() == 1 {
+                                        substitutable_lines
+                                            .extend(section.body.iter().map(|(i, _)| *i));
+                                    }
+                                }
+                                Pending::Control {
+                                    ordinal,
+                                    prefix: file.settings,
+                                    write: ControlSource::Branch(write),
+                                }
+                            }
                         });
                         continue;
                     }
@@ -2280,7 +2308,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         });
                         continue;
                     }
-                    FileBody::Explain(_) => {
+                    FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
                         return Err(format!(
                             "an `explain` statement under `--- {kind}` is refused; assert the plan with `--- expect plan`"
                         ));
@@ -2544,10 +2572,34 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 }
                 if rest.trim() == "plan" {
                     let Some(mut step) = awaiting_plan.take() else {
-                        return Err(format!(
-                            "line {}: `--- expect plan` must directly follow a query step's `--- expect shape`",
-                            section.header_line + 1
-                        ));
+                        if !awaiting_load_plan {
+                            return Err(format!(
+                                "line {}: `--- expect plan` must directly follow a query step's `--- expect shape` or a `load csv` step's `--- expect ok`",
+                                section.header_line + 1
+                            ));
+                        }
+                        awaiting_load_plan = false;
+                        let lines = parse_load_plan_body(&section.body)
+                            .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
+                        let last = match open_loop.as_mut() {
+                            Some((_, _, steps)) => steps.last_mut(),
+                            None => match items.last_mut() {
+                                Some(Item::Step(step)) => Some(step),
+                                _ => None,
+                            },
+                        };
+                        let Some(Step::Control(ControlStep {
+                            write: ControlWrite::Load { plan, .. },
+                            ..
+                        })) = last
+                        else {
+                            return Err(format!(
+                                "line {}: internal: the step awaiting a load plan is not a `load csv` step",
+                                section.header_line + 1
+                            ));
+                        };
+                        *plan = Some(LoadPlanExpect { lines });
+                        continue;
                     };
                     let lines = parse_plan_body(&section.body)
                         .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
@@ -2647,6 +2699,16 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     }
                 };
+                awaiting_load_plan = matches!(
+                    &completed,
+                    Step::Control(ControlStep {
+                        write: ControlWrite::Load {
+                            expect: WriteExpect::Ok,
+                            ..
+                        },
+                        ..
+                    })
+                );
                 if matches!(completed.read_expect(), Some(QueryExpect::Rows { .. })) {
                     substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
                     awaiting_shape = Some(completed);
@@ -3849,11 +3911,17 @@ async fn run_control_step(
             from,
             expect,
         } => {
-            let parent = from.as_deref().unwrap_or(MAIN_BRANCH);
+            let start = match from {
+                Some(BranchCreateFrom::Commit(commit)) => ReadTarget::snapshot(SnapshotId::new(
+                    resolve_operand(commit, bindings).map_err(&fail)?,
+                )),
+                Some(BranchCreateFrom::Branch(parent)) => ReadTarget::branch(parent.as_str()),
+                None => ReadTarget::branch(MAIN_BRANCH),
+            };
             let outcome = operation(
                 host,
                 step.ordinal,
-                db.branch_create_from_as(ReadTarget::branch(parent), branch, None),
+                db.branch_create_from_as(start, branch, None),
             )
             .await
             .map_err(&fail)?;
@@ -3908,6 +3976,7 @@ async fn run_control_step(
             stmt,
             branch,
             expect,
+            plan,
         } => {
             let target = branch.as_deref().unwrap_or(MAIN_BRANCH);
             let request = omnigraph::loader::CsvLoadRequest::from_statement(stmt);
@@ -3929,9 +3998,31 @@ async fn run_control_step(
                 .as_ref()
                 .ok()
                 .map(|receipt| receipt.commit.graph_commit_id.clone());
-            check_write_expect(host, name, expect, outcome)
-                .map(|()| commit)
-                .map_err(fail)
+            let executed = outcome.as_ref().ok().map(|receipt| {
+                (
+                    receipt.plan.as_ref().map(|explain| explain.to_value()),
+                    receipt.executed,
+                )
+            });
+            check_write_expect(host, name, expect, outcome).map_err(&fail)?;
+            if let Some(expect) = plan {
+                let Some((Some(accepted), executed)) = executed else {
+                    return Err(fail(
+                        "`--- expect plan` on a load whose receipt carries no plan".to_string(),
+                    ));
+                };
+                host.observe(|| {
+                    let facts: Vec<String> = load_plan::plan_facts(&accepted, &executed)
+                        .iter()
+                        .map(load_plan::LoadFact::spell)
+                        .collect();
+                    format!("actual load plan: {facts:?}")
+                });
+                if let Some(message) = load_plan_mismatch(&expect.lines, &accepted, &executed) {
+                    return Err(fail(message));
+                }
+            }
+            Ok(commit)
         }
         ControlWrite::Merge {
             source,

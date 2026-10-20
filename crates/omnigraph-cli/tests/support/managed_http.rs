@@ -34,8 +34,8 @@ pub struct IntentReply {
     pub body: Vec<u8>,
 }
 
-/// Delivery faults applied only after a real server's successful merge or
-/// Blob write reply has been fully read. They cannot stand in for cancelling a
+/// Delivery faults applied only after a real server's successful merge, Blob
+/// write or commit control reply has been fully read. They cannot stand in for cancelling a
 /// server request.
 #[derive(Debug, Clone, Copy)]
 pub enum MergeDeliveryFault {
@@ -99,13 +99,29 @@ impl IntentApiFixture {
         Self::start(replies, None, Duration::ZERO, true)
     }
 
+    /// Change fixture state before the first discovery response without races
+    /// between a test thread and the client receiving that response.
+    pub fn graph_with_discovery_hook(
+        replies: Vec<IntentReply>,
+        before_discovery: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self::start_with_origin(
+            |_| replies,
+            None,
+            Duration::ZERO,
+            true,
+            None,
+            Some(Box::new(before_discovery)),
+        )
+    }
+
     pub fn graph_with_response_delay(replies: Vec<IntentReply>, delay: Duration) -> Self {
         assert!(delay <= Duration::from_secs(32), "fixture delay bound");
         Self::start(replies, None, delay, true)
     }
 
-    /// Forward discovery and one merge to an actual server, then break only
-    /// delivery of the successful merge response. Unexpected calls stay counted.
+    /// Forward discovery and one graph write to an actual server, then break
+    /// only delivery of its successful response. Unexpected calls stay counted.
     pub fn graph_merge_proxy(upstream: &str, fault: MergeDeliveryFault) -> Self {
         Self::start_with_origin(
             |_| Vec::new(),
@@ -113,6 +129,7 @@ impl IntentApiFixture {
             Duration::ZERO,
             true,
             Some(Forwarding::Merge(upstream.to_owned(), fault)),
+            None,
         )
     }
 
@@ -129,6 +146,7 @@ impl IntentApiFixture {
             Duration::ZERO,
             true,
             Some(Forwarding::Deployment(upstream.to_owned(), fault)),
+            None,
         )
     }
 
@@ -138,12 +156,12 @@ impl IntentApiFixture {
         delay: Duration,
         graph: bool,
     ) -> Self {
-        Self::start_with_origin(|_| replies, session, delay, graph, None)
+        Self::start_with_origin(|_| replies, session, delay, graph, None, None)
     }
 
     /// Build replies after binding the exact origin, for origin-bound signed claims.
     pub fn with_origin(replies: impl FnOnce(&str) -> Vec<IntentReply>) -> Self {
-        Self::start_with_origin(replies, None, Duration::ZERO, false, None)
+        Self::start_with_origin(replies, None, Duration::ZERO, false, None, None)
     }
 
     fn start_with_origin(
@@ -152,6 +170,7 @@ impl IntentApiFixture {
         delay: Duration,
         graph: bool,
         forwarding: Option<Forwarding>,
+        mut before_discovery: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
         use std::io::Write;
         use std::sync::atomic::Ordering;
@@ -245,6 +264,9 @@ impl IntentApiFixture {
                 };
                 received.lock().unwrap().push(request.clone());
                 let discovery = graph && request_line[0] == "HEAD" && request_line[1] == "/healthz";
+                if discovery && let Some(before_discovery) = before_discovery.take() {
+                    before_discovery();
+                }
                 if !discovery {
                     sleep(delay);
                 }
@@ -364,17 +386,32 @@ impl IntentApiFixture {
                             .split('?')
                             .next()
                             .is_some_and(|path| path.ends_with("/blob"));
+                    let segments: Vec<_> = request.path.split('/').collect();
+                    let commit_publish = request.method == "POST"
+                        && matches!(
+                            segments.as_slice(),
+                            ["", "graphs", _, "commits", _, "publish"]
+                        );
+                    let commit_drop = request.method == "DELETE"
+                        && matches!(segments.as_slice(), ["", "graphs", _, "commits", _]);
                     if let Forwarding::Merge(_, fault) = forwarding
                         && ((request.method == "POST"
                             && (request.path.ends_with("/branches/merge")
                                 || request.path.ends_with("/mutate")))
-                            || blob_write)
+                            || blob_write
+                            || commit_publish
+                            || commit_drop)
                     {
-                        assert_eq!(reply.status, 200, "upstream write must succeed");
+                        assert_eq!(
+                            reply.status,
+                            if commit_drop { 204 } else { 200 },
+                            "upstream write must succeed"
+                        );
                         captured_responses.lock().unwrap().push(reply.clone());
                         match fault {
                             MergeDeliveryFault::Disconnect => continue,
                             MergeDeliveryFault::Truncate => {
+                                assert!(!commit_drop, "a 204 response has no body to truncate");
                                 reply
                                     .headers
                                     .push(("content-length".into(), reply.body.len().to_string()));

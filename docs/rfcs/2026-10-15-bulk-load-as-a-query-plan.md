@@ -3,11 +3,11 @@ rfc: "2026-10-15-bulk-load-as-a-query-plan"
 title: "Bulk load as a query plan"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: partial
 authors:
   - azimafroozeh
 created: 2026-10-15
-updated: 2026-10-15
+updated: 2026-10-16
 discussion: null
 supersedes: []
 superseded_by: []
@@ -84,7 +84,11 @@ change in validation scope. The in-place alternative is compared below.
 - `explain` on a load statement prints the load plan. This is a grammar
   addition: today `explain` wraps only a query declaration
   (`crates/omnigraph-compiler/src/query/query.pest`). Explain reads no payload
-  bytes. Source metadata and catalog statistics supply estimates recorded in
+  bytes. Served explain-load calls require the load's `change` permission on
+  its target branch before any source metadata access. The HTTP query door
+  and MCP read tool perform that decision without admitting or executing a
+  write; graph `read` permission alone does not grant an external-source probe.
+  Source metadata and catalog statistics supply estimates recorded in
   the accepted plan; they do not establish exact row counts or safe CSV
   boundaries. Acceptance fixes the access paths, worker maximum and permitted
   fallback. Execution of that accepted artifact may reduce scan parallelism
@@ -211,7 +215,15 @@ not introduce a second set of semantic rules.
    table version, columns and compatible predicates. Deduplicating identical
    metadata/range fetches does not eliminate reads of distinct fragments or
    the differing key columns a check needs. This follows the cost-based
-   discipline of RFC 2026-10-08, index facts as planner input.
+   discipline of RFC 2026-10-08, index facts as planner input. Endpoint
+   probes use one filtered scan; uniqueness probes repeat it per key chunk.
+   The initial row-work model charges indexed lookups at the existing
+   dependent-scan factor of eight per estimated input row, and grants that
+   discount only to complete usable BTREE coverage. Without that proof it
+   charges each filtered scan the consulted table's row count. Building the
+   input lookup set is charged on both unindexed paths. Unknown counts and
+   equal costs retain probes. These are estimates, not promised I/O counts;
+   the plan records the input count, table count, index facts and both costs.
 4. **Validate one logical source and its final image.** All partitions form
    one logical input for validation, before staging coalesces any rows.
    Value, enum, Date and DateTime text guards keep their existing judgment,
@@ -520,10 +532,7 @@ Each step ships independently.
 3. Does load `explain` reuse query `explain_version` formats or a
    load-specific shape? Decided in the step-2 change; either encoding must
    carry the accepted estimates, access paths, worker maximum, fallback and
-   addressable constraint identities defined above.
+   addressable constraint identities defined above. Decided 2026-10-16 in
+   step 3: the query document, `explain_version` 6.
 
 ## Decision log
-
-- 2026-10-15: Created, from the LDBC SNB benchmark's load measurements and
-  the GQT one-call load measurements that located the cost in per-call
-  re-reads of validated-against tables.

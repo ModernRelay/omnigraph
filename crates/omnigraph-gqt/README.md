@@ -120,8 +120,9 @@ expected to succeed, binds the receipt's commit id to `$name`
 `--- query snapshot: $name` header reads at that commit instead of a branch,
 and a commit statement whose whole quoted operand is the name,
 `commit publish "${name}"` or `commit drop "${name}"`, is dispatched with the
-bound id; this is the one place `${` may appear in a statement body, and the
-engine receives an ordinary literal. A mutation declaration
+bound id, as is a `branch create <branch> from commit "${name}"` whose
+commit is the whole quoted operand; these are the places `${` may appear in a statement
+body, and the engine receives an ordinary literal. A mutation declaration
 `as unattached branch on "${name}"` (RFC "Unattached graph branches") is
 substituted the same way, and a `--- params` body may spell a bound name,
 `{"base": "${name}"}`, beside the loop variable; a `--- mutate` header without
@@ -185,6 +186,30 @@ id|firstName
 load csv "person.csv" into node:Person mode append delimiter "|" header
 
 --- expect ok
+```
+
+A `--- expect plan` section directly after a `load csv` step's `--- expect ok`
+pins the load's planner document and executed report, read from the load's
+receipt ([explaining a load statement](../../docs/user/queries/explain.md#explaining-a-load-statement)).
+Each line is one fact; a fact the section does not mention is unchecked, as
+for a query plan. The forms: `load route: <plan|pipeline>` (the document's
+`engine` or `executor` route); `load scan: partitions <n> fallback
+single_scan`; `load validate value <table> [a, b]`; `load validate unique
+<table> <key|unique> [a, b]: access <delta|probe|scan>`; `load validate
+edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`; `load validate
+cardinality <edge> <from|to> <Node>`; `load validate retained_edges <node>
+<edge> <from|to>: access <delta|probe|scan>`; `load write: <overwrite fragments|append strict_insert|
+merge upsert>`; `load executed: partitions <n> rows <m>`. The validate lines
+are the one `Validate` node's checks. Tables are qualified (`node:Person`, `edge:Knows`);
+an endpoint's referenced type is bare. A served environment refuses the
+section at admission, since the wire answer carries no plan.
+
+```text
+--- expect plan
+load route: plan
+load validate edge_ri edge:Knows from Person: access scan
+load write: overwrite fragments
+load executed: partitions 1 rows 2400
 ```
 
 ## Generated fixtures and loads
@@ -602,6 +627,55 @@ sequential choice. `access index_probe <physical-column>` requires a probe
 with that physical column in a leaf of `index_query`; it does not compare
 rendered search text, residuals or index names. `pass scan_access` records
 completed finalization; `pass key_to_id` records a safe key narrowing.
+
+A `load csv` step may carry an `--- expect plan` section directly after its
+`--- expect ok`.
+Its lines are checked against the planner document in the executed load's
+receipt ([Explaining a load statement](../../docs/user/queries/explain.md#explaining-a-load-statement)).
+Each line is one fact claim, and a fact no line mentions is unchecked:
+
+```text
+load route: plan|pipeline
+load scan: partitions <n> fallback single_scan
+load validate unique <table> key|unique [<cols>]: access delta|probe|scan
+load validate edge_ri <edge-table> from|to <node-type>: access probe|scan
+load validate cardinality <edge-table> from <node-type>
+load validate retained_edges <node-table> <edge-table> from|to: access delta|probe|scan
+load write: overwrite fragments
+load write: append strict_insert
+load write: merge upsert
+load executed: partitions <n> rows <m>
+```
+
+`load route` claims the document's route, `plan` for `engine` and `pipeline`
+for `executor`.
+`load scan` claims the `CsvSource` node's partition count and its `single_scan`
+fallback.
+A `load validate` line claims one check of the `Validate` node with that
+identity, and its `access` suffix claims the check's access path.
+`load write` claims the `FragmentWrite` node's mode and adapter.
+`load executed` claims the partitions and rows the load executed.
+
+```text
+--- csv knows.csv
+from|to
+1|2
+2|3
+
+--- mutate
+load csv "knows.csv" into edge:Knows mode overwrite delimiter "|" header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load scan: partitions 1 fallback single_scan
+load validate unique edge:Knows key [from, to]: access delta
+load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows to Person: access probe
+load write: overwrite fragments
+load executed: partitions 1 rows 2
+```
 
 ## Reference comparison
 

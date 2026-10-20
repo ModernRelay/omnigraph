@@ -9,7 +9,8 @@ use crate::error::{OmniError, Result};
 use crate::storage::{StorageAdapter, normalize_root_uri};
 
 use super::commit_graph::{
-    CommitGraph, GraphCommit, HistoryCache, Lineage, graph_commit_from_manifest_row,
+    CommitGraph, FirstParentPage, GraphCommit, HistoryCache, Lineage,
+    graph_commit_from_manifest_row,
 };
 use super::manifest::{
     BranchRecords, CapturedManifestProbe, CommitBuffer, DatasetUpdate, ExpectedTableVersions,
@@ -424,6 +425,61 @@ impl GraphCoordinator {
         self.manifest.commit_graph().load_commits().await
     }
 
+    /// The head this coordinator holds and up to `limit` commits of the
+    /// first-parent chain from `start` (that head when `None`), newest first;
+    /// `None` when no commit `start` names is found.
+    pub(crate) async fn first_parent_page(
+        &self,
+        start: Option<&str>,
+        limit: usize,
+    ) -> Result<(GraphCommit, Option<FirstParentPage>)> {
+        let graph = self.manifest.commit_graph();
+        let head = graph.head().clone();
+        let start = start.unwrap_or(&head.graph_commit_id);
+        let page = graph.first_parent_page(start, limit).await?;
+        Ok((head, page))
+    }
+
+    /// The first commit of the first-parent chain from the head this
+    /// coordinator holds whose generation is below `generation`; `None` when
+    /// the chain ends first. Generation falls along the chain, so this walks
+    /// every commit above it, a page of [`FIRST_PARENT_WALK_COMMITS`] at a
+    /// time.
+    pub(crate) async fn first_parent_below(&self, generation: u64) -> Result<Option<GraphCommit>> {
+        let graph = self.manifest.commit_graph();
+        let mut start = graph.head().graph_commit_id.clone();
+        loop {
+            // Each start is the head this coordinator holds or the first
+            // parent of a commit just read: a miss is a gap in the lineage.
+            let page = graph
+                .first_parent_page(&start, FIRST_PARENT_WALK_COMMITS)
+                .await?
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "graph commit '{start}' is on this branch's first-parent chain and neither \
+                         its `__manifest` nor `__history` holds it"
+                    ))
+                })?;
+            if let Some(below) = page
+                .commits
+                .into_iter()
+                .find(|commit| commit.generation < generation)
+            {
+                return Ok(Some(below));
+            }
+            match page.next {
+                Some(next) => start = next,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Whether the head or a commit the buffer holds is `commit_id`: those
+    /// commits are the first-parent run that ends at the head.
+    pub(crate) fn holds_commit(&self, commit_id: &str) -> bool {
+        self.manifest.held_commit(commit_id).is_some()
+    }
+
     pub async fn branch_list(&self) -> Result<Vec<String>> {
         self.manifest.list_graph_branches().await
     }
@@ -438,7 +494,9 @@ impl GraphCoordinator {
         self.manifest.native_branch()
     }
 
-    pub(crate) async fn branch_create(&mut self, name: &str) -> Result<()> {
+    /// Create `name` from the `__manifest` version this coordinator holds and
+    /// return the commit the new branch starts at: that version's head.
+    pub(crate) async fn branch_create(&mut self, name: &str) -> Result<String> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
 
@@ -446,7 +504,27 @@ impl GraphCoordinator {
         // it in two physical phases (shallow clone, then BranchContents); the
         // manifest coordinator classifies/reclaims a clone-only zombie before
         // a bounded retry. No graph-lineage branch is created or rolled back.
-        self.manifest.create_branch(&branch).await
+        self.manifest.create_branch(&branch).await?;
+        Ok(self.manifest.head().graph_commit_id.clone())
+    }
+
+    /// Create `name` at the published commit `record` names, which this
+    /// coordinator's branch incarnation wrote: the new branch's first
+    /// `__manifest` version is a clone of the version that published it.
+    pub(crate) async fn branch_create_at(
+        &mut self,
+        name: &str,
+        record: &HistoryRecord,
+    ) -> Result<()> {
+        let branch = normalize_branch_name(name)?
+            .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
+        self.manifest
+            .create_branch_at(
+                &branch,
+                record.commit.graph_manifest_version,
+                &record.commit.graph_commit_id,
+            )
+            .await
     }
 
     /// Delete the branch represented by an operation-local post-gate capture.
@@ -613,6 +691,24 @@ impl GraphCoordinator {
                     None => Err(commit_not_found(snapshot_id)),
                 }
             }
+        }
+    }
+
+    /// The record of the published commit `id`: held by this coordinator,
+    /// else in `__history`, else in a live branch. `None` for an id no
+    /// published commit has.
+    pub(crate) async fn published_record(&self, id: &str) -> Result<Option<HistoryRecord>> {
+        if let Some(record) = self.manifest.held_record(id) {
+            return Ok(Some(record));
+        }
+        let session = self.manifest.control_session();
+        match self
+            .history()
+            .read_record(self.root_uri(), &session, id)
+            .await?
+        {
+            Some(record) => Ok(Some(record)),
+            None => self.record_in_live_branches(id).await,
         }
     }
 
@@ -979,6 +1075,9 @@ impl GraphCoordinator {
         self.load_commits().await
     }
 }
+
+/// Commits one step of a whole-chain walk reads before the next.
+const FIRST_PARENT_WALK_COMMITS: usize = 1024;
 
 /// The state of a settled commit, from the `table` rows of its record.
 async fn settled_commit_state(

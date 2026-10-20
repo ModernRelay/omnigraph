@@ -33,6 +33,73 @@ pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
 /// Exact header value; consumers must reject missing or repeated values.
 pub const HTTP_API_CONTRACT: &str = "0.13";
 
+/// How a binary identifies its build: the one derivation the CLI's
+/// `omnigraph version`, the server's `/healthz` and its MCP server info all
+/// report. The release workflows (`.github/workflows/build-release-archives.yml`
+/// and `publish-image.yml`) stamp both values at compile time; a local or
+/// source build carries neither, and a malformed stamp fails the build.
+pub mod build {
+    /// `stable` or `edge` for a release build; none for any other build.
+    pub const RELEASE_CHANNEL: Option<&str> = option_env!("OMNIGRAPH_RELEASE_CHANNEL");
+    /// The full commit a packaged build was compiled from.
+    pub const SOURCE_COMMIT: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
+
+    pub(crate) const fn is_full_commit(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        if bytes.len() != 40 {
+            return false;
+        }
+        let mut index = 0;
+        while index < bytes.len() {
+            if !matches!(bytes[index], b'0'..=b'9' | b'a'..=b'f') {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    pub(crate) const fn is_release_channel(value: &[u8]) -> bool {
+        matches!(value, b"stable" | b"edge")
+    }
+
+    // A malformed stamp fails the build instead of reporting a version no
+    // release has.
+    const _: () = {
+        if let Some(commit) = SOURCE_COMMIT {
+            assert!(
+                is_full_commit(commit),
+                "OMNIGRAPH_SOURCE_VERSION must be a full lowercase commit id"
+            );
+        }
+        if let Some(channel) = RELEASE_CHANNEL {
+            assert!(
+                is_release_channel(channel.as_bytes()),
+                "OMNIGRAPH_RELEASE_CHANNEL must be stable or edge"
+            );
+            assert!(
+                SOURCE_COMMIT.is_some(),
+                "OMNIGRAPH_RELEASE_CHANNEL requires OMNIGRAPH_SOURCE_VERSION"
+            );
+        }
+    };
+
+    /// The version a binary of `package` reports. An edge build is a SemVer
+    /// pre-release of the package version, `0.14.0-edge+9c2b367`, naming its
+    /// commit; the edge publisher refuses a build whose package version is not
+    /// above the latest stable release, so it also sorts after that release.
+    pub fn reported_version(package: &str) -> String {
+        versioned(package, RELEASE_CHANNEL, SOURCE_COMMIT)
+    }
+
+    pub(crate) fn versioned(package: &str, channel: Option<&str>, commit: Option<&str>) -> String {
+        match (channel, commit) {
+            (Some("edge"), Some(commit)) => format!("{package}-edge+{}", &commit[..7]),
+            _ => package.to_string(),
+        }
+    }
+}
+
 /// Lowercase wire name for the raw graph-head conditional-write token.
 /// Documentation presents the canonical spelling
 /// `Omnigraph-If-Graph-Commit`; HTTP header names are case-insensitive.
@@ -122,8 +189,9 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = load_source_max_bytes_schema)]
     pub load_source_max_bytes: Option<i64>,
-    /// `query_memory_bytes`: the memory pool one read query runs under, at
-    /// least `1`; an `i64` like `traversal_work_limit`.
+    /// `query_memory_bytes`: the memory pool one read query runs under, and
+    /// the allowance a load statement's read-reuse buffers are admitted
+    /// against, at least `1`; an `i64` like `traversal_work_limit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = query_memory_bytes_schema)]
     pub query_memory_bytes: Option<i64>,
@@ -322,8 +390,13 @@ pub struct SnapshotOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchCreateRequest {
-    /// Parent branch to fork from. Defaults to `main`.
+    /// Parent branch to fork from; the new branch starts at its head.
+    /// Mutually exclusive with `from_commit`. Defaults to `main`.
     pub from: Option<String>,
+    /// A published graph commit id to start the new branch at, with that
+    /// commit's data and history. Mutually exclusive with `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit: Option<String>,
     /// Name of the new branch. Must not already exist.
     pub name: String,
 }
@@ -334,6 +407,10 @@ pub struct BranchCreateOutput {
     pub from: String,
     pub name: String,
     pub actor_id: Option<String>,
+    /// The graph commit the new branch starts at: `from`'s head when the
+    /// branch was created, or the commit `from_commit` named. For a commit
+    /// start, `from` is the branch that wrote the commit.
+    pub from_commit_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -544,8 +621,14 @@ pub struct ReadPageOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BranchOutcomeOutput {
-    /// `name` was forked off `from`.
-    Created { from: String, name: String },
+    /// `name` was forked off `from` at the commit `from_commit_id`: the
+    /// head of `from`, or the commit a `from commit "<id>"` start named,
+    /// which `from` wrote.
+    Created {
+        from: String,
+        name: String,
+        from_commit_id: String,
+    },
     /// `name` was removed.
     Deleted { name: String },
     /// `source` was merged into `target`; `merge` is the three-way result,
@@ -786,6 +869,16 @@ impl From<GraphCommitKind> for CommitKindOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
+    /// The head a paged listing's first page resolved; every later page
+    /// answers for its first-parent chain and repeats it as its page token
+    /// carries it, unchecked. Present only when the request set `limit` or
+    /// `page_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_commit_id: Option<String>,
+    /// Continue THIS listing below the last commit of the page. Absent on the
+    /// last page and on an unpaged listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
 }
 
 /// Logical operation of one change. Ordering rank is frozen:
@@ -1143,7 +1236,11 @@ pub struct QueryRequest {
     /// running it, as one result per plan node (fields `tree`, `depth`, `node`,
     /// `detail`: the logical, physical and available DataFusion trees, then `plan` entries for
     /// the passes and the document's other fields), under the same `params`,
-    /// `branch`, or `snapshot` as the query itself.
+    /// `branch`, or `snapshot` as the query itself. `explain load csv …` answers the accepted
+    /// load plan as the same results (`logical_initial`, `logical`, `physical`, then `plan`
+    /// entries), under `branch` alone: `snapshot`, `name` and `params` are refused.
+    /// It requires the load's `change` permission before probing source metadata,
+    /// reads no payload byte, and publishes nothing.
     #[schema(
         example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
     )]
@@ -1743,6 +1840,61 @@ pub struct SnapshotQuery {
     pub branch: Option<String>,
 }
 
+/// Query parameters for `GET /graphs/{graph_id}/access`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct AccessQuery {
+    /// A branch whose actions to report, by name; it need not exist.
+    pub branch: Option<String>,
+    /// With `branch`, the branch `branch_create` would create and
+    /// `branch_merge` would merge into, by name.
+    pub target_branch: Option<String>,
+}
+
+/// A graph action a policy decides, as the access route reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessAction {
+    Read,
+    Export,
+    Change,
+    SchemaApply,
+    BranchCreate,
+    BranchDelete,
+    BranchMerge,
+    CommitPublish,
+    CommitDrop,
+    InvokeQuery,
+}
+
+/// What the caller's own credential may do on one graph, by the graph's
+/// installed policy. It names actions, never the rules that allow them, and
+/// says nothing about any other actor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AccessOutput {
+    /// The actor the credential resolves to. Absent only on a server that runs
+    /// without authentication.
+    pub actor: Option<String>,
+    pub graph_id: String,
+    /// Actions allowed with no branch named: the graph-scoped ones, and the
+    /// branch-scoped ones a single rule allows on every branch (a rule with no
+    /// branch scope, `branch_scope: any` or `target_branch_scope: any`).
+    /// Rules that cover every branch only together, one for protected
+    /// branches and one for the rest, allow each named branch but leave the
+    /// action out of this list; read `actions` for a branch.
+    pub graph_wide: Vec<AccessAction>,
+    /// The branch asked about, when one was.
+    pub branch: Option<String>,
+    /// The target branch asked about, when one was.
+    pub target_branch: Option<String>,
+    /// With `branch`, the actions allowed on it, including `branch_delete`,
+    /// `commit_publish`, `commit_drop` and `schema_apply` with it as their
+    /// target. With `target_branch` as well, also `branch_create` and
+    /// `branch_merge` from `branch` into it. Empty without `branch`.
+    pub actions: Vec<AccessAction>,
+}
+
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct CommitListQuery {
     pub branch: Option<String>,
@@ -1756,6 +1908,16 @@ pub struct CommitListQuery {
     /// the branch's history. Refused together with `unpublished`.
     #[serde(default)]
     pub unattached: bool,
+    /// Commits per page of the branch's history, 1 to 1000; the page names
+    /// the head it resolved and a `next_page_token`. Without `limit` and
+    /// `page_token` the whole history is listed. Refused with `unpublished`
+    /// or `unattached`; above 1000 the request fails with 413.
+    #[param(minimum = 1, maximum = 1000)]
+    pub limit: Option<usize>,
+    /// Opaque continuation from the preceding page of this listing, sent with
+    /// the same `branch`; 100 commits per page unless `limit` is set. Later
+    /// pages answer for the head the first page resolved.
+    pub page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1959,6 +2121,42 @@ pub struct ChangeDiffRefusalOutput {
     pub type_name: Option<String>,
 }
 
+/// Why a branch could not start at the graph commit `from_commit` named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchStartRefusalReason {
+    /// HTTP 410: cleanup reclaimed data the commit's snapshot names.
+    NotRetained,
+    /// HTTP 409: the commit was written under an earlier schema.
+    SchemaChanged,
+    /// HTTP 409: the commit was written before the storage upgrade.
+    EarlierStorageFormat,
+    /// HTTP 409: the branch that wrote the commit was deleted, and may have
+    /// been created again under the same name since.
+    BranchDeleted,
+    /// HTTP 409: the commit is unpublished; publish it first.
+    UnpublishedCommit,
+    /// HTTP 409: the commit is an unattached snapshot, never branch history.
+    UnattachedSnapshot,
+    /// A reason added by a newer server; the branch was not created.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A branch create refused at the graph commit `from_commit` named; nothing
+/// was created.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BranchStartRefusalOutput {
+    pub reason: BranchStartRefusalReason,
+    pub graph_commit_id: String,
+    /// For `not_retained`, the graph type whose stored version cleanup reclaimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    /// For `branch_deleted`, the branch that wrote the commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
 /// A selected full-text index cannot safely serve the current analyzer (HTTP 409).
 /// This is not a retryable write conflict: an operator must rebuild the live
 /// branch's indexes. Historical snapshots stay unchanged; branch old content
@@ -1969,6 +2167,17 @@ pub struct FullTextIndexRebuildRequiredOutput {
     /// Human-readable diagnosis; branch on the enclosing detail's presence,
     /// not this text, to distinguish the operator-action-required condition.
     pub reason: String,
+}
+
+/// A full-text call read a declared full-text index that has no segment at
+/// the query's snapshot (HTTP 409), so no segment carries its analyzer. This
+/// is not a retryable conflict: an operator builds the branch's index
+/// (`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes
+/// --branch` elsewhere). Historical snapshots stay unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FullTextIndexRequiredOutput {
+    /// The index's property as `Type.property`.
+    pub index: String,
 }
 
 /// A source position: 1-based line and column (in characters) and the byte
@@ -2124,12 +2333,21 @@ pub struct ErrorOutput {
     /// commit or an unprovable schema boundary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
+    /// Set with HTTP 409, or 410 for `not_retained`, when `branch create`
+    /// cannot start a branch at the commit `from_commit` named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_start_refusal: Option<BranchStartRefusalOutput>,
     /// Set with HTTP 409 when a selected full-text index requires an explicit
     /// rebuild before search can succeed. Unlike a write-authority conflict,
     /// this condition is not cleared by retrying. This additive discriminator
     /// preserves the closed [`ErrorCode`] contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_index_rebuild_required: Option<FullTextIndexRebuildRequiredOutput>,
+    /// Set with HTTP 409 when a full-text call reads a declared index that
+    /// has no segment at the query's snapshot. Building the index clears it;
+    /// retrying does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text_index_required: Option<FullTextIndexRequiredOutput>,
     /// Set for a refused query: the diagnostics contract's code, position or
     /// stage, expectation and fix. `error` keeps the one-line rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2155,7 +2373,9 @@ impl ErrorOutput {
             blob_precondition_failure: None,
             change_feed_gap: None,
             change_diff_refusal: None,
+            branch_start_refusal: None,
             full_text_index_rebuild_required: None,
+            full_text_index_required: None,
             diagnostic: None,
         }
     }
@@ -2791,6 +3011,38 @@ pub struct GraphDiscoveryResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edge_builds_report_a_prerelease_naming_their_commit() {
+        use super::build::versioned;
+        let commit = "9c2b3679e8f66062252e7ed6270a9478b4b77413";
+        assert_eq!(
+            versioned("0.14.0", Some("edge"), Some(commit)),
+            "0.14.0-edge+9c2b367"
+        );
+        assert_eq!(versioned("0.14.0", Some("stable"), Some(commit)), "0.14.0");
+        assert_eq!(versioned("0.14.0", None, Some(commit)), "0.14.0");
+        assert_eq!(versioned("0.14.0", None, None), "0.14.0");
+    }
+
+    #[test]
+    fn build_stamps_accept_only_full_commits_and_known_channels() {
+        use super::build::{is_full_commit, is_release_channel};
+        assert!(is_full_commit("9c2b3679e8f66062252e7ed6270a9478b4b77413"));
+        for commit in [
+            "9c2b367",
+            "9C2B3679E8F66062252E7ED6270A9478B4B77413",
+            "9c2b3679e8f66062252e7ed6270a9478b4b7741g",
+            "",
+        ] {
+            assert!(!is_full_commit(commit), "{commit:?}");
+        }
+        assert!(is_release_channel(b"stable"));
+        assert!(is_release_channel(b"edge"));
+        for channel in ["nightly", "Edge", ""] {
+            assert!(!is_release_channel(channel.as_bytes()), "{channel:?}");
+        }
+    }
+
     use super::*;
     use omnigraph_compiler::settings::SettingScope;
     use serde_json::json;

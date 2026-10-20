@@ -76,6 +76,7 @@ time = { workspace = true }
 async-trait = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
+csv-core = "0.1.13"
 arc-swap = { workspace = true }
 
 [dev-dependencies]
@@ -86,7 +87,7 @@ tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,
 # so production builds (which exclude dev-deps) never see it.
-lance-io = { version = "11.0.0", features = ["test-util"] }
+lance-io = { version = "13.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
 # tests/forbidden_apis.rs walks the engine's sources.

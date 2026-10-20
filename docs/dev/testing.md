@@ -30,13 +30,13 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-planner` | In-source optimizer/cost tests and `tests/integration/query_plan.rs`, `tests/integration/registry.rs`, `tests/integration/lower_walk.rs`; plan assertions over real snapshots live in GQT | `PlanSource` fixtures for metadata and refusal states |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
 | `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, core, catalog, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |
-| `omnigraph-core` | In-file `#[cfg(test)]` tests (62 today) of the error type, branch names, branch control, Lance clone, metadata, full-text compatibility and instrumentation | Module-local fixtures |
-| `omnigraph-catalog` | In-source tests (52 today): `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
+| `omnigraph-core` | In-file `#[cfg(test)]` tests of the error type, branch names, branch control, Lance clone, metadata, full-text compatibility and instrumentation | Module-local fixtures |
+| `omnigraph-catalog` | In-source tests: `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
-| `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
+| `omnigraph-cli` | In-source application, runtime, parsing, output and transport tests plus `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-skill` | In-source `src/lib.rs`: the embedded table is sorted and `file` finds every path. The CLI owns the rest. In-source `src/skill.rs` holds the skill's command index (`references/commands.md`) and condensed reference (`SKILL.md`) to the clap tree and its storage-format line to `omnigraph version`; `integration/cli_schema_config.rs` owns `skill export` and `skill show`, including byte identity with `skills/omnigraph`; `scripts/check-docs.py` holds `metadata.version` and the declared HTTP contract to the CLI | None |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `integration/lane_b.rs`, `integration/torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
@@ -109,6 +109,14 @@ helper takes a seam declaring exactly its effect, that production code under
 it) arms it; a crossing never counts as arming. `scripts/seam_corpus.py`
 lists every seam with where it is declared and which cases cover it.
 
+The collector retry owners in `failpoints.rs` exercise each sweep window
+on file, RustFS/S3 and Azurite. The between-manifests fixture also reopens
+through `open_with_io_scope`, covering served file I/O's separate Lance
+provider. The DST dead-staging pin exercises the census, hunt and fleet
+constructors; its maintenance sensitivity owner requires a failed deferred
+cleanup retry to fail the universe. Neither local emulators nor shared-memory
+DST qualify live Azure lease loss or delayed accepted writes.
+
 When adding a new writer, update all of these layers. See [recovery.md](recovery.md).
 
 ### Blob behavior
@@ -132,14 +140,83 @@ Run this first for every Lance change:
 cargo test -p omnigraph-engine --test lance_surface_guards
 ```
 
-The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, index coverage and segment ownership, stable row IDs, vector ordering fences, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and its guard together.
+The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, the stock-cleanup sweep of old files used only by detached versions (with the attached manifest timestamp preceding the file and the file preceding the seven-day cutoff), index coverage and segment ownership, stable row IDs, native V2 vector ordering, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and replace its negative guard with the native behavior the caller now requires. A persisted layout still needs its own format decision.
+
+Qualify a dependency bump in both debug and release profiles: upstream unstable
+capabilities can have different gates under `debug_assertions`. Run the native
+surface guards in each profile, then the affected write, schema, branch,
+search, maintenance, Blob and bounded-memory owners listed in
+[the compatibility table](lance.md#current-compatibility-fences). Keep the
+canonical workspace, GQT, Clippy and configured object-store gates as separate
+evidence; a local file pass does not qualify S3 or Azure.
+
+Experimental-overlay fixtures keep their positive debug checks and assert
+release refusal with unstable opt-ins absent. The collector owner also runs
+cleanup and proves that the original and overlay inventories remain intact;
+the planning-cost owner continues its modern and legacy cases after refusal.
+Do not enable experimental capabilities to make release qualification pass.
+
+Cross-version evidence must begin with bytes written by the genuine predecessor,
+not a current fixture with a changed writer version. Check indexed and uncovered
+search, nullable vectors, managed Blob payloads, branches and historical reads
+before and after candidate writes, compaction and cleanup. Restore a whole-root
+backup and read the candidate-written root with the predecessor before claiming
+a qualified rollback. This is independent of graph-stamp conversion; unchanged
+V2_2 files and format 16 do not establish reader compatibility on their own.
 
 ## Server and CLI ownership
 
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
 workspace gate; its required-cell checks reject removed or ignored cases. The
 lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
-timeout without replaying a committed merge. Its deployment matrix holds a real
+timeout without replaying a committed merge or commit publication/drop (a drop's
+empty response has no body to truncate). Output unit tests inject write and flush
+failures; application tests check baseline file-lock custody through cursor flush,
+transfer receipt failures after a single dispatched write, and raw stream failures
+without mixed diagnostics. `blob_cli` unit tests own bounded stdin capture and
+interrupted reads. Extend `cli_data` for load consent and source-read ordering,
+Blob preconditions and output-file lifecycle; reuse its HTTP fixture and the
+existing parity matrix. Query semantics remain in GQT, not duplicated in these
+CLI boundary tests.
+Schema-family application tests verify that failed result delivery preserves an
+applied schema and its actor with one publication, and that an undeliverable
+target line precedes writable open. Init output failure leaves a readable graph;
+lint report failures and subsequent invocations remain reusable. Extend the
+existing `cli_schema_config`, `cli_cluster` and `cli_data` owners for addressing,
+cluster ownership and offline source-read ordering.
+
+Maintenance delivery tests use the existing output and application owners.
+They cover partial writes and flush failures, full-text rebuild publication and
+actor retention, and target-output failure before writable admission. Extend
+`cli_data` and `cli_cluster` for cleanup preview/consent and maintenance addressing;
+`crossversion_upgrade` retains ownership of storage-upgrade compatibility.
+
+Cluster delivery tests extend the application and output owners. Direct apply
+tests fail supplied stdout/stderr writes and flushes, then inspect the original
+receipt, retained lock, single deployment result and stable graph history. The
+served adapter's tests verify identity delivery before POST and receipt/timeout output failures without
+resubmission. `cli_cluster` and `cli_queries` own exact unlock refusals, graph
+filtering and wrong-plane refusal before configuration or HTTP access. The existing
+`system_remote` deployment matrix owns real server completion after delivery loss;
+these CLI changes require no additional query-semantic GQT cases.
+
+Local command tests in `commands/local` own supplied login input, credential
+changes after report failure, captured profile configuration, and completed skill
+or embedding files after output loss. `skill.rs` owns exact file delivery and its
+existing broken-pipe exception. Extend `cli_schema_config` for version and skill
+process behavior and `cli_data` for profile/embedding output. Its existing
+discovery-swap fixture also replaces the credential file, requiring registry
+probing and the subsequent command to retain the original token. Application and
+managed-output tests own completion, partial-write and flush failures; managed
+authentication/lifecycle fixtures own the pre-dispatch diagnostic gates and
+accepted-identity recovery output when stderr fails. Application tests keep
+single-result stdout intact and preserve delivered refusal statuses; served
+cluster tests retain typed refusals through failed hints. The binary's channel
+barrier test proves reported failures do not wait for blocked runtime work;
+`cli_schema_config` owns help/version/refusal statuses with closed streams.
+These are CLI boundary contracts; query-semantic GQT cases remain unchanged.
+
+The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server
@@ -162,7 +239,11 @@ are not generic native settlement. Server `boot_settings` exercises authenticate
 submission, parked requests, caller disconnect, pre-effect refusal, durable
 acceptance before completion, activation-in-progress observation and exact receipt
 access after management handoff. It also holds a merge across served schema
-planning to prove preview does not wait for the graph gate. In-source
+planning to prove preview does not wait for the graph gate, and its
+`owned_shutdown` journeys own process containment: a panic or an uncertain
+owned write exits 2 and retains the lock, while a proven unpublished staging
+failure with settled storage I/O is a 500 the server keeps serving through,
+with a clean SIGTERM still releasing the lock. In-source
 `deployment` tests suspend observer read futures across owner start, finish and complete
 turnover, exercising bounded re-observation for aggregate and exact status.
 CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
@@ -216,7 +297,8 @@ The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0
 
 The separate `Storage Upgrade Compatibility` CI job requires the
 `storage_upgrade` cases of `integration/crossversion_upgrade.rs` (the report on a fresh
-graph, the cluster-path refusal and the five genuine journeys:
+graph, the cluster-path refusal and the six genuine journeys:
+`genuine_lance11_storage_upgrade_round_trip`,
 `genuine_v13_storage_upgrade_preserves_history`,
 `genuine_v0_11_0_storage_upgrade_preserves_history`,
 `genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`,
@@ -224,6 +306,20 @@ graph, the cluster-path refusal and the five genuine journeys:
 `genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`), the engine
 `db::upgrade::tests`, `lance_version_columns` and `forbidden_apis`. Missing
 cases, empty runs and skipped required cases fail the job.
+
+The Lance dependency journey uses `OMNIGRAPH_LANCE11_BIN`. CI builds the exact
+main commit `0a62bb7b2aa5b99b012f413807c216277f7f9596`, pinned as
+`LANCE11_SOURCE_COMMIT`, and the test checks its actual manifest writer version
+is Lance 11.0.0. Both writers use graph format 16; this journey calls no
+`upgrade`. The predecessor builds full-text and vector indexes, managed Blobs,
+nullable outer vectors, an uncovered search tail, branches and history. Cold
+candidate reads must leave its whole root unchanged, including index UUIDs and
+analyzer certificates. Candidate writes, an explicit full-text rebuild, optimize and cleanup are followed by
+predecessor reads of the new state and retained snapshots, including an old
+untrained analyzer declaration and newly built candidate postings. Finally the test
+restores its offline whole-root byte-copy backup at the original path and reads
+it with both binaries. This qualifies those exercised shapes, not arbitrary
+external Lance datasets or every possible downgrade.
 
 The stamp-13 journey needs the stamp-13 CLI: the job builds it from the commit
 `ci.yml` pins as `STAMP_13_SOURCE_COMMIT` and exports `OMNIGRAPH_V13_BIN`. It
@@ -264,14 +360,14 @@ print `0.11.0`, so these journeys prove their source by the stamp
 `snapshot --json` reports, not by `--version`.
 
 Each journey resolver reads its variable, else the binary under
-`target/storage-upgrade-binaries/` (`stamp-13/`, `v0.11.0/`, `v0.10.0/`).
+`target/storage-upgrade-binaries/` (`lance-11/`, `stamp-13/`, `v0.11.0/`, `v0.10.0/`).
 Without a binary the journey prints a skip line locally and panics when
 `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1`, as CI sets. The v6 format fence
 reads `OMNIGRAPH_V6_BIN` alone and skips when it is unset, whatever that
 variable says. To run the
-crossversion scope locally, build the stamp-13 predecessor as for the v5 fence
-above, install the two releases with `scripts/install.sh` (`VERSION=v0.11.0`
-and `VERSION=v0.10.0`, each with its `INSTALL_DIR`), place the three binaries
+crossversion scope locally, build the pinned Lance 11 and stamp-13 predecessors
+as for the v5 fence above, install the two releases with `scripts/install.sh` (`VERSION=v0.11.0`
+and `VERSION=v0.10.0`, each with its `INSTALL_DIR`), place the four binaries
 in those directories and run the job's sequence (bash: the cases live in the
 CLI's `integration` binary, where a bare `crossversion_upgrade::` filter would
 add the module's other journeys, so the exact names come from the compiled
@@ -323,7 +419,7 @@ The system tests start workspace binaries on ephemeral localhost ports. Set `OMN
 Unix-only release qualification test. It creates genuine 0.12 receipts, stops
 the old server, converts the ledger, checks data/history/schema identity and
 historical reads, then applies live schema and policy changes. Storage is
-served at format 14 until the candidate's first publish stamps a branch 15.
+served at format 14 until the candidate's first publish stamps a branch 16.
 Ordinary CI keeps current-version live-deployment coverage; it does
 not download 0.12 or run this journey.
 
@@ -513,6 +609,15 @@ Historical HTTP records remain readable by `scripts/analyze-http-perf.py` and
 is available for GQT query and traversal workloads.
 
 Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; deterministic engine cost contracts remain in `crates/omnigraph/tests/`.
+
+The checkpoint and durable-head lookup instruments keep logical rows, ranges,
+fragments, and index pages exact while bounding local compacted physical I/O
+separately. Lance 13 batches page and column reads before nearby byte ranges
+coalesce; equal logical work can read fewer bytes through more physical ranges.
+Their local budgets cover the measured 20/80-publish samples. They do not qualify
+larger histories or the S3 path, and do not activate either proposed format.
+Re-audit those budgets on a substrate change instead of widening every counter
+or requiring an older byte-growth pattern to persist.
 
 ### DST storage-cost golden
 

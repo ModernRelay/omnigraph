@@ -110,9 +110,23 @@ Edit and validate the bundle, then submit it to the running owner:
 
 ```bash
 omnigraph cluster validate --config ./company-brain
-OMNIGRAPH_BEARER_TOKEN='secret' omnigraph cluster apply \
-  --server https://graph.example.com --config ./company-brain --json
+OMNIGRAPH_TOKEN_PRODUCTION='secret' omnigraph cluster apply \
+  --server production --config ./company-brain --json
 ```
+
+`production` names a server declared in the operator config, and the CLI sends
+its token only to that server's URL:
+
+```yaml
+# ~/.omnigraph/config.yaml
+servers:
+  production:
+    url: https://graph.example.com
+```
+
+`omnigraph login production` stores the token instead of the variable. A
+literal `--server https://…` URL that matches no declared server gets no token;
+see [server credentials](../cli/index.md#use-a-server).
 
 With `--server`, omitted `storage` binds the bundle to the selected server’s
 canonical root. An explicit absolute `storage` must match that root; relative
@@ -146,14 +160,20 @@ convergence and activation by polling the original ID. `--no-wait` instead retur
 after durable acceptance; drain and preparation may precede that acknowledgment.
 `--timeout SECONDS` bounds caller waiting, including acceptance (default 300,
 maximum 3600). Expiry exits 5 with the original ID and last observation; it does
-not cancel execution or prove failure. Resume observation with:
+not cancel execution or prove failure. After reporting expiry, the CLI does not
+wait for an unfinished background DNS lookup before exiting. A failed recovery
+hint also preserves the server's original refusal, including an outstanding
+deployment ID. Resume observation with:
 
 ```bash
 omnigraph cluster status --server production --deployment-id ID --wait --timeout 1800 --json
 ```
 
-The exact response contains `deployment`, `active` and `in_progress`. General
-cluster status retains its aggregate `status` object. An authenticated submitter
+The exact response contains `deployment`, `active` and `in_progress`. Default
+apply and status `--wait` return at activation, which can precede release of
+deployment admission. Repeat exact-ID status reads until `in_progress: false`
+before submitting another deployment; this confirms the observed deployment has
+released its admission. General cluster status retains its aggregate `status` object. An authenticated submitter
 can read its own durable receipt even after its deployment removes its management
 permission; general status and later deployments still require current permission.
 Lost submission responses are followed only by original-ID reads, never automatic
@@ -217,9 +237,16 @@ schema effects. It is not remote authentication.
 A lost connection does not mean failure. Observe the original ID:
 
 ```bash
-OMNIGRAPH_BEARER_TOKEN='secret' omnigraph cluster status \
-  --server https://graph.example.com --deployment-id '<DEPLOYMENT_ID>' --json
+OMNIGRAPH_TOKEN_PRODUCTION='secret' omnigraph cluster status \
+  --server production --deployment-id '<DEPLOYMENT_ID>' --json
 ```
+
+An output failure also returns nonzero without proving that deployment failed.
+Served apply must write and flush its deployment ID before submitting. Direct
+apply finishes its one deployment attempt even if its identity diagnostic cannot
+be written, then returns the output error with the original ID, root and lock
+information. Observe that identity before taking further action; failed output
+does not cause automatic resubmission.
 
 Status is read-only. `active` is false for an older result after a newer revision
 activates. Only the current runtime can prove activation; a durable completion

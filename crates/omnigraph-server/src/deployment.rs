@@ -16,11 +16,11 @@ use omnigraph_cluster::{
     GraphDeploymentResult, IdentityAuthorization,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 use tokio::time::{Duration, Instant};
 use utoipa::ToSchema;
 
-use crate::operations::OwnedResult;
+use crate::operations::{OperationRuntime, OwnedResponse, OwnedResult};
 use crate::workload::IngressLease;
 use crate::{
     ApiError, AppState, AuthenticatedActor, GraphId, GraphKey, PolicyAction, PolicyRequest,
@@ -72,25 +72,49 @@ impl DeploymentRuntime {
         Err(observation_changed())
     }
 
+    fn submit<T, R, F>(
+        self: &Arc<Self>,
+        operations: &OperationRuntime,
+        gate: OwnedMutexGuard<()>,
+        id: String,
+        reservation: R,
+        operation: F,
+    ) -> Result<OwnedResponse<T>, ApiError>
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        F: Future<Output = OwnedResult<T>> + Send + 'static,
+    {
+        let running = self.own(id, gate);
+        operations.submit((reservation, running), operation)
+    }
+
     // The deployment gate is already held; this is a derived process observation,
     // never durable execution permission or a second deployment queue.
-    fn own(self: &Arc<Self>, id: String) -> RunningDeployment {
+    fn own(self: &Arc<Self>, id: String, gate: OwnedMutexGuard<()>) -> RunningDeployment {
         let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
         current.0 = current.0.wrapping_add(1);
         current.1 = Some(id);
-        RunningDeployment(Arc::clone(self))
+        RunningDeployment {
+            runtime: Arc::clone(self),
+            gate: Some(gate),
+        }
     }
 }
 
-struct RunningDeployment(Arc<DeploymentRuntime>);
+struct RunningDeployment {
+    runtime: Arc<DeploymentRuntime>,
+    gate: Option<OwnedMutexGuard<()>>,
+}
 
 impl Drop for RunningDeployment {
     fn drop(&mut self) {
         let mut current = self
-            .0
+            .runtime
             .current
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        drop(self.gate.take());
         current.0 = current.0.wrapping_add(1);
         current.1 = None;
     }
@@ -426,15 +450,17 @@ pub(crate) async fn apply(
         .try_admit(&actor.actor_id, REQUEST_BYTES as u64)
         .map_err(ApiError::from_workload_reject)?;
     let operation_state = state.clone();
-    let running = state.deployments.own(request.deployment_id.clone());
     let (accepted, acceptance) = oneshot::channel();
-    let response = state
-        .operations
-        .submit((gate, reservation, ingress), async move {
-            let _running = running;
+    let response = state.deployments.submit(
+        &state.operations,
+        gate,
+        request.deployment_id.clone(),
+        (reservation, ingress),
+        async move {
             let result = execute(operation_state, owner, caller, request, accepted).await;
             OwnedResult::from(result)
-        })?;
+        },
+    )?;
     let result = response.result();
     tokio::pin!(result);
     tokio::select! {
@@ -847,8 +873,12 @@ mod tests {
         for change in ["start", "finish", "start_and_finish"] {
             for exact in [false, true] {
                 let runtime = Arc::new(DeploymentRuntime::default());
-                let _gate = runtime.gate.clone().try_lock_owned().unwrap();
-                let mut owner = (change == "finish").then(|| runtime.own("original".into()));
+                let mut owner = (change == "finish").then(|| {
+                    runtime.own(
+                        "original".into(),
+                        runtime.gate.clone().try_lock_owned().unwrap(),
+                    )
+                });
                 let (reading, read_started) = oneshot::channel();
                 let (release, released) = oneshot::channel();
                 let mut pause = Some((reading, released));
@@ -878,9 +908,17 @@ mod tests {
                 let transition = async {
                     read_started.await.unwrap();
                     match change {
-                        "start" => owner = Some(runtime.own("original".into())),
+                        "start" => {
+                            owner = Some(runtime.own(
+                                "original".into(),
+                                runtime.gate.clone().try_lock_owned().unwrap(),
+                            ))
+                        }
                         "finish" => drop(owner.take()),
-                        "start_and_finish" => drop(runtime.own("original".into())),
+                        "start_and_finish" => drop(runtime.own(
+                            "original".into(),
+                            runtime.gate.clone().try_lock_owned().unwrap(),
+                        )),
                         _ => unreachable!(),
                     }
                     release.send(()).unwrap();
@@ -907,18 +945,64 @@ mod tests {
                 drop(owner);
             }
         }
+
+        for delivery in ["consume", "disconnect_before", "disconnect_after"] {
+            let runtime = Arc::new(DeploymentRuntime::default());
+            let operations = OperationRuntime::new();
+            let gate = runtime.gate.clone().try_lock_owned().unwrap();
+            let (release, released) = oneshot::channel();
+            let (executed, execution_finished) = oneshot::channel();
+            let mut response = Some(
+                runtime
+                    .submit(&operations, gate, "original".into(), (), async move {
+                        released.await.unwrap();
+                        executed.send(()).unwrap();
+                        Ok::<_, ApiError>(()).into()
+                    })
+                    .unwrap(),
+            );
+            assert!(runtime.observation(Some("original")).1);
+            if delivery == "disconnect_before" {
+                drop(response.take());
+            }
+            release.send(()).unwrap();
+            execution_finished.await.unwrap();
+            if let Some(response) = response {
+                assert!(
+                    runtime.observation(Some("original")).1,
+                    "completed output still owns deployment admission: {delivery}"
+                );
+                assert!(runtime.gate.try_lock().is_err());
+                assert_eq!(operations.snapshot().active_writes, 1);
+                if delivery == "consume" {
+                    response.result().await.unwrap();
+                } else {
+                    drop(response);
+                }
+            }
+            assert!(!runtime.observation(None).1);
+            let next_gate = runtime.gate.clone().try_lock_owned().unwrap();
+            let successor = runtime.own("successor".into(), next_gate);
+            assert!(!runtime.observation(Some("original")).1);
+            assert!(runtime.observation(Some("successor")).1);
+            drop(successor);
+            assert_eq!(operations.snapshot().active_writes, 0);
+            assert!(!runtime.observation(None).1);
+        }
     }
 
     #[tokio::test]
     async fn deployment_observation_refuses_after_three_owner_changes_without_terminal_receipt() {
         for id in [None, Some("original")] {
             let runtime = Arc::new(DeploymentRuntime::default());
-            let _gate = runtime.gate.clone().try_lock_owned().unwrap();
             let mut reads = 0;
             let result = runtime
                 .observe(id, || {
                     reads += 1;
-                    drop(runtime.own("original".into()));
+                    drop(runtime.own(
+                        "original".into(),
+                        runtime.gate.clone().try_lock_owned().unwrap(),
+                    ));
                     std::future::ready(Ok("stale terminal receipt"))
                 })
                 .await;

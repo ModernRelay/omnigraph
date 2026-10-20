@@ -2,6 +2,8 @@
 //! main.rs in the modularization).
 
 use super::*;
+use crate::app::Completion;
+use omnigraph_api_types::CommitListOutput;
 
 pub(crate) fn graph_type_subject(type_key: &str) -> String {
     if let Some(type_name) = type_key.strip_prefix("node:") {
@@ -11,6 +13,225 @@ pub(crate) fn graph_type_subject(type_key: &str) -> String {
     } else {
         format!("dataset '{type_key}'")
     }
+}
+
+pub(crate) fn write_optimize(
+    uri: &str,
+    stats: &[omnigraph::db::DatasetOptimizeStats],
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    if json {
+        let value = serde_json::json!({
+            "uri": uri,
+            "datasets": stats.iter().map(|s| serde_json::json!({
+                "type_key": s.type_key,
+                "fragments_removed": s.fragments_removed,
+                "fragments_added": s.fragments_added,
+                "committed": s.committed,
+                "skipped": s.skipped.map(|r| r.as_str()),
+                "published_dataset_version": s.published_dataset_version,
+                "lance_head_version": s.lance_head_version,
+                "pending_indexes": s.pending_indexes.iter().map(|p| serde_json::json!({
+                    "property": p.property,
+                    "reason": p.reason,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        });
+        write_json(&value, stdout)?;
+    } else {
+        writeln!(stdout, "optimize {} — {} datasets", uri, stats.len())?;
+        for s in stats {
+            let subject = graph_type_subject(&s.type_key);
+            if let Some(reason) = s.skipped {
+                writeln!(stdout, "  {subject:<40} skipped ({reason})")?;
+            } else if s.committed {
+                writeln!(
+                    stdout,
+                    "  {:<40} frags {} → {} ✓",
+                    subject, s.fragments_removed, s.fragments_added
+                )?;
+            } else {
+                writeln!(stdout, "  {subject:<40} no-op")?;
+            }
+            for p in &s.pending_indexes {
+                writeln!(
+                    stdout,
+                    "    ↳ index pending on property '{}': {}",
+                    p.property, p.reason
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_full_text_rebuild(
+    uri: &str,
+    result: &omnigraph::db::FullTextIndexRebuildResult,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    let warnings = if result.rebuilt_indexes.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.",
+        ]
+    };
+    if json {
+        write_json(
+            &serde_json::json!({
+                "uri": uri,
+                "branch": result.branch,
+                "graph_commit_id": result.graph_commit_id,
+                "warnings": warnings,
+                "rebuilt_indexes": result.rebuilt_indexes.iter().map(|index| {
+                    serde_json::json!({
+                        "type_key": index.type_key,
+                        "property": index.property,
+                    })
+                }).collect::<Vec<_>>(),
+            }),
+            stdout,
+        )?;
+    } else {
+        for warning in &warnings {
+            writeln!(stderr, "warning: {warning}")?;
+        }
+        writeln!(
+            stdout,
+            "rebuild-full-text-indexes {} — branch {}, {} indexes rebuilt",
+            uri,
+            result.branch,
+            result.rebuilt_indexes.len(),
+        )?;
+        for index in &result.rebuilt_indexes {
+            writeln!(
+                stdout,
+                "  {}, property '{}'",
+                graph_type_subject(&index.type_key),
+                index.property,
+            )?;
+        }
+        if let Some(commit_id) = &result.graph_commit_id {
+            writeln!(stdout, "graph commit: {commit_id}")?;
+        } else {
+            writeln!(stdout, "no-op; no graph commit published")?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_repair(
+    uri: &str,
+    stats: &omnigraph::db::RepairStats,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    if json {
+        let value = serde_json::json!({
+            "uri": uri,
+            "graph_manifest_version": stats.graph_manifest_version,
+            "datasets": stats.datasets.iter().map(|s| serde_json::json!({
+                "type_key": s.type_key,
+                "published_dataset_version": s.published_dataset_version,
+                "lance_head_version": s.lance_head_version,
+                "classification": s.classification.as_str(),
+                "action": s.action.as_str(),
+                "operations": s.operations,
+                "error": s.error,
+            })).collect::<Vec<_>>(),
+        });
+        write_json(&value, stdout)?;
+    } else {
+        writeln!(stdout, "repair {} — {} datasets", uri, stats.datasets.len())?;
+        for s in &stats.datasets {
+            let drift = if s.published_dataset_version == s.lance_head_version {
+                format!("{}", s.published_dataset_version)
+            } else {
+                format!("{} → {}", s.published_dataset_version, s.lance_head_version)
+            };
+            let ops = if s.operations.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", s.operations.join(", "))
+            };
+            let err = s
+                .error
+                .as_ref()
+                .map(|err| format!(" ({err})"))
+                .unwrap_or_default();
+            writeln!(
+                stdout,
+                "  {:<40} {:<12} {:<22} {}{}{}",
+                graph_type_subject(&s.type_key),
+                s.action.as_str(),
+                s.classification.as_str(),
+                drift,
+                ops,
+                err
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_cleanup(
+    uri: &str,
+    policy: &omnigraph::db::CleanupPolicyOptions,
+    policy_desc: &str,
+    stats: &[omnigraph::db::DatasetCleanupStats],
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    let keep = policy.keep_versions;
+    let older_than_dur = policy.older_than;
+    if json {
+        let value = serde_json::json!({
+            "uri": uri,
+            "keep_versions": keep,
+            "older_than_secs": older_than_dur.map(|d| d.as_secs()),
+            "datasets": stats.iter().map(|s| serde_json::json!({
+                "type_key": s.type_key,
+                "bytes_removed": s.bytes_removed,
+                "old_versions_removed": s.old_versions_removed,
+                "error": s.error,
+                "manifests_removed": s.manifests_removed,
+                "unpublished_manifests": s.unpublished_manifests,
+                "unpublished_bytes": s.unpublished_bytes,
+                "foreign_versions": s.foreign_versions,
+            })).collect::<Vec<_>>(),
+        });
+        write_json(&value, stdout)?;
+    } else {
+        let total_bytes: u64 = stats.iter().map(|s| s.bytes_removed).sum();
+        let total_versions: u64 = stats.iter().map(|s| s.old_versions_removed).sum();
+        let failed: Vec<String> = stats
+            .iter()
+            .filter(|s| s.error.is_some())
+            .map(|s| graph_type_subject(&s.type_key))
+            .collect();
+        writeln!(
+            stdout,
+            "cleanup {} ({}) — removed {} versions ({} bytes) across {} datasets",
+            uri,
+            policy_desc,
+            total_versions,
+            total_bytes,
+            stats.len() - failed.len()
+        )?;
+        if !failed.is_empty() {
+            writeln!(
+                stdout,
+                "  {} dataset(s) failed and will be retried on the next cleanup: {}",
+                failed.len(),
+                failed.join(", ")
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -109,22 +330,38 @@ pub(crate) struct SchemaPlanOutput<'a> {
     pub(crate) steps: &'a [SchemaMigrationStep],
 }
 
-pub(crate) fn print_schema_apply_human(output: &SchemaApplyOutput) {
-    println!("schema apply for {}", output.uri);
-    println!("supported: {}", if output.supported { "yes" } else { "no" });
-    println!("applied: {}", if output.applied { "yes" } else { "no" });
-    println!("graph_manifest_version: {}", output.graph_manifest_version);
+pub(crate) fn write_schema_apply_human(
+    output: &SchemaApplyOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "schema apply for {}", output.uri)?;
+    writeln!(
+        writer,
+        "supported: {}",
+        if output.supported { "yes" } else { "no" }
+    )?;
+    writeln!(
+        writer,
+        "applied: {}",
+        if output.applied { "yes" } else { "no" }
+    )?;
+    writeln!(
+        writer,
+        "graph_manifest_version: {}",
+        output.graph_manifest_version
+    )?;
     if output.steps.is_empty() {
         if output.applied {
-            println!("schema source updated; no table migration steps");
+            writeln!(writer, "schema source updated; no table migration steps")?;
         } else {
-            println!("no schema changes");
+            writeln!(writer, "no schema changes")?;
         }
-        return;
+        return Ok(());
     }
     for step in &output.steps {
-        println!("- {}", render_schema_plan_step(step));
+        writeln!(writer, "- {}", render_schema_plan_step(step))?;
     }
+    Ok(())
 }
 
 pub(crate) fn query_kind_label(kind: QueryLintQueryKind) -> &'static str {
@@ -142,82 +379,105 @@ pub(crate) fn severity_label(severity: QueryLintSeverity) -> &'static str {
     }
 }
 
-pub(crate) fn print_query_lint_human(output: &QueryLintOutput) {
+pub(crate) fn write_query_lint_human(
+    output: &QueryLintOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
     for result in &output.results {
         match result.status {
             QueryLintStatus::Ok => {
-                println!(
+                writeln!(
+                    writer,
                     "OK    query `{}` ({})",
                     result.name,
                     query_kind_label(result.kind)
-                );
+                )?;
             }
             QueryLintStatus::Error => {
-                println!(
+                writeln!(
+                    writer,
                     "ERROR query `{}`: {}",
                     result.name,
                     result.error.as_deref().unwrap_or("unknown error")
-                );
+                )?;
             }
         }
 
         for warning in &result.warnings {
-            println!("WARN  query `{}`: {}", result.name, warning);
+            writeln!(writer, "WARN  query `{}`: {}", result.name, warning)?;
         }
     }
 
     for finding in &output.findings {
-        println!("{} {}", severity_label(finding.severity), finding.message);
+        writeln!(
+            writer,
+            "{} {}",
+            severity_label(finding.severity),
+            finding.message
+        )?;
     }
 
-    println!(
+    writeln!(
+        writer,
         "INFO  Lint complete: {} queries processed ({} error(s), {} warning(s), {} info item(s))",
         output.queries_processed, output.errors, output.warnings, output.infos
-    );
+    )?;
+    Ok(())
 }
 
-pub(crate) fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_query_lint(
+    output: &QueryLintOutput,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_query_lint_human(output);
+        write_query_lint_human(output, stdout)?;
     }
 
     if output.status == QueryLintStatus::Error {
-        io::stdout().flush()?;
-        std::process::exit(1);
+        stdout.flush()?;
+        return Ok(Completion::exit(1));
     }
 
+    Ok(Completion::success())
+}
+
+pub(crate) fn write_json<T: Serialize>(value: &T, writer: &mut dyn Write) -> Result<()> {
+    writeln!(writer, "{}", serde_json::to_string_pretty(value)?)?;
     Ok(())
 }
 
-pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
-}
-
-pub(crate) fn print_cluster_validate_human(output: &ValidateOutput) {
+pub(crate) fn write_cluster_validate_human(
+    output: &ValidateOutput,
+    stdout: &mut dyn Write,
+) -> Result<()> {
     if output.ok {
-        println!(
+        writeln!(
+            stdout,
             "cluster config valid: {} resource(s), {} dependency edge(s)",
             output.resources.len(),
             output.dependencies.len()
-        );
+        )?;
     } else {
-        println!("cluster config invalid");
+        writeln!(stdout, "cluster config invalid")?;
     }
-    print_cluster_diagnostics(&output.diagnostics);
+    write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
+pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Write) -> Result<()> {
     if output.ok {
-        println!("cluster plan: {} change(s)", output.changes.len());
+        writeln!(stdout, "cluster plan: {} change(s)", output.changes.len())?;
         match output.authority {
             omnigraph_cluster::LedgerAuthority::Observed => {
-                println!("  authority: observed (no lock taken, nothing written)");
+                writeln!(
+                    stdout,
+                    "  authority: observed (no lock taken, nothing written)"
+                )?;
             }
             omnigraph_cluster::LedgerAuthority::Unlocked => {
-                println!("  authority: unlocked (state.lock is false)");
+                writeln!(stdout, "  authority: unlocked (state.lock is false)")?;
             }
             omnigraph_cluster::LedgerAuthority::Locked => {}
         }
@@ -227,111 +487,133 @@ pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
             } else {
                 ""
             };
-            println!("  {:?} {}{bindings}", change.operation, change.resource);
+            writeln!(
+                stdout,
+                "  {:?} {}{bindings}",
+                change.operation, change.resource
+            )?;
             if let Some(migration) = &change.migration {
                 if !migration.supported {
-                    println!("      migration UNSUPPORTED:");
+                    writeln!(stdout, "      migration UNSUPPORTED:")?;
                 }
                 for step in &migration.steps {
-                    println!(
+                    writeln!(
+                        stdout,
                         "      {}",
                         serde_json::to_string(step).unwrap_or_else(|_| format!("{step:?}"))
-                    );
+                    )?;
                 }
             }
         }
         if output.changes.is_empty() {
-            println!("  no changes");
+            writeln!(stdout, "  no changes")?;
         }
     } else {
-        println!("cluster plan failed");
+        writeln!(stdout, "cluster plan failed")?;
     }
-    print_cluster_diagnostics(&output.diagnostics);
+    write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn print_cluster_status_human(output: &StatusOutput) {
+pub(crate) fn write_cluster_status_human(
+    output: &StatusOutput,
+    stdout: &mut dyn Write,
+) -> Result<()> {
     if output.ok {
         let state = &output.state_observations;
         if state.state_found {
-            println!(
+            writeln!(
+                stdout,
                 "cluster state: revision {}, {} resource(s)",
                 state.state_revision, state.resource_count
-            );
+            )?;
             if let Some(digest) = state.applied_config_digest.as_deref() {
-                println!("  applied config: {digest}");
+                writeln!(stdout, "  applied config: {digest}")?;
             }
             if state.locked {
-                println!("  lock: held{}", cluster_lock_summary(state));
+                writeln!(stdout, "  lock: held{}", cluster_lock_summary(state))?;
             } else {
-                println!("  lock: not held");
+                writeln!(stdout, "  lock: not held")?;
             }
         } else {
-            println!("cluster state missing");
+            writeln!(stdout, "cluster state missing")?;
         }
     } else {
-        println!("cluster status failed");
+        writeln!(stdout, "cluster status failed")?;
     }
-    print_cluster_diagnostics(&output.diagnostics);
+    write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn print_cluster_state_sync_human(output: &StateSyncOutput) {
+pub(crate) fn write_cluster_state_sync_human(
+    output: &StateSyncOutput,
+    stdout: &mut dyn Write,
+) -> Result<()> {
     let operation = match output.operation {
         omnigraph_cluster::StateSyncOperation::Observe => "observe",
     };
     if output.ok {
         let state = &output.state_observations;
-        println!(
+        writeln!(
+            stdout,
             "cluster {operation}: revision {}, {} resource(s)",
             state.state_revision, state.resource_count
-        );
+        )?;
         match output.authority {
             omnigraph_cluster::LedgerAuthority::Observed => {
-                println!("  authority: observed (no lock taken, nothing written)");
+                writeln!(
+                    stdout,
+                    "  authority: observed (no lock taken, nothing written)"
+                )?;
             }
             omnigraph_cluster::LedgerAuthority::Unlocked => {
-                println!("  authority: unlocked (state.lock is false)");
+                writeln!(stdout, "  authority: unlocked (state.lock is false)")?;
             }
             omnigraph_cluster::LedgerAuthority::Locked => {}
         }
         if let Some(cas) = state.state_cas.as_deref() {
-            println!("  state_cas: {cas}");
+            writeln!(stdout, "  state_cas: {cas}")?;
         }
         if state.lock_acquired {
-            println!("  lock: acquired{}", cluster_lock_summary(state));
+            writeln!(stdout, "  lock: acquired{}", cluster_lock_summary(state))?;
         } else if state.locked {
-            println!(
+            writeln!(
+                stdout,
                 "  lock: held by another process{}",
                 cluster_lock_summary(state)
-            );
+            )?;
         } else {
-            println!("  lock: not acquired");
+            writeln!(stdout, "  lock: not acquired")?;
         }
     } else {
-        println!("cluster {operation} failed");
+        writeln!(stdout, "cluster {operation} failed")?;
     }
-    print_cluster_diagnostics(&output.diagnostics);
+    write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn print_cluster_force_unlock_human(output: &ForceUnlockOutput) {
+pub(crate) fn write_cluster_force_unlock_human(
+    output: &ForceUnlockOutput,
+    stdout: &mut dyn Write,
+) -> Result<()> {
     if output.ok {
         if output.lock_removed {
-            println!(
+            writeln!(
+                stdout,
                 "cluster force-unlock: removed lock{}",
                 cluster_lock_summary(&output.state_observations)
-            );
+            )?;
         } else {
-            println!("cluster force-unlock: no lock removed");
+            writeln!(stdout, "cluster force-unlock: no lock removed")?;
         }
     } else {
-        println!("cluster force-unlock failed");
+        writeln!(stdout, "cluster force-unlock failed")?;
         if output.state_observations.locked {
-            println!(
+            writeln!(
+                stdout,
                 "  lock: held{}",
                 cluster_lock_summary(&output.state_observations)
-            );
+            )?;
         }
     }
-    print_cluster_diagnostics(&output.diagnostics);
+    write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
 pub(crate) fn cluster_lock_summary(state: &omnigraph_cluster::StateObservations) -> String {
@@ -375,92 +657,118 @@ pub(crate) fn diagnostic_detail_lines(
     lines
 }
 
-pub(crate) fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagnostic]) {
+pub(crate) fn write_cluster_diagnostics(
+    diagnostics: &[omnigraph_cluster::Diagnostic],
+    stdout: &mut dyn Write,
+) -> Result<()> {
     for diagnostic in diagnostics {
         let label = match diagnostic.severity {
             DiagnosticSeverity::Error => "ERROR",
             DiagnosticSeverity::Warning => "WARN ",
         };
-        println!(
+        writeln!(
+            stdout,
             "{label} {} {}: {}",
             diagnostic.code, diagnostic.path, diagnostic.message
-        );
+        )?;
         if let Some(detail) = &diagnostic.detail {
             let detail = omnigraph_api_types::DiagnosticOutput::from(detail.as_ref());
             for line in diagnostic_detail_lines(&detail) {
-                println!("{line}");
+                writeln!(stdout, "{line}")?;
             }
         }
     }
-}
-
-pub(crate) fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Result<()> {
-    if json {
-        print_json(output)?;
-    } else {
-        print_cluster_validate_human(output);
-    }
-    if !output.ok {
-        io::stdout().flush()?;
-        std::process::exit(1);
-    }
     Ok(())
 }
 
-pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_validate(
+    output: &ValidateOutput,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_cluster_plan_human(output);
+        write_cluster_validate_human(output, stdout)?;
     }
     if !output.ok {
-        io::stdout().flush()?;
-        std::process::exit(1);
+        stdout.flush()?;
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_plan(
+    output: &PlanOutput,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_cluster_status_human(output);
+        write_cluster_plan_human(output, stdout)?;
     }
     if !output.ok {
-        io::stdout().flush()?;
-        std::process::exit(1);
+        stdout.flush()?;
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_state_sync(output: &StateSyncOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_status(
+    output: &StatusOutput,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_cluster_state_sync_human(output);
+        write_cluster_status_human(output, stdout)?;
     }
     if !output.ok {
-        io::stdout().flush()?;
-        std::process::exit(1);
+        stdout.flush()?;
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_force_unlock(output: &ForceUnlockOutput, json: bool) -> Result<()> {
+pub(crate) fn finish_cluster_state_sync(
+    output: &StateSyncOutput,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
     if json {
-        print_json(output)?;
+        write_json(output, stdout)?;
     } else {
-        print_cluster_force_unlock_human(output);
+        write_cluster_state_sync_human(output, stdout)?;
     }
     if !output.ok {
-        io::stdout().flush()?;
-        std::process::exit(1);
+        stdout.flush()?;
+        return Ok(Completion::exit(1));
     }
-    Ok(())
+    Ok(Completion::success())
 }
 
-pub(crate) fn print_load_human(payload: &LoadOutput) {
-    println!(
+pub(crate) fn finish_cluster_force_unlock(
+    output: &ForceUnlockOutput,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
+    if json {
+        write_json(output, stdout)?;
+    } else {
+        write_cluster_force_unlock_human(output, stdout)?;
+    }
+    if !output.ok {
+        stdout.flush()?;
+        return Ok(Completion::exit(1));
+    }
+    Ok(Completion::success())
+}
+
+pub(crate) fn write_load_human(payload: &LoadOutput, writer: &mut dyn Write) -> Result<()> {
+    writeln!(
+        writer,
         "loaded {} on branch {} with {}: {} entities across {} node types and {} edge types",
         payload.uri,
         payload.branch,
@@ -468,27 +776,37 @@ pub(crate) fn print_load_human(payload: &LoadOutput) {
         payload.total_entities,
         payload.nodes.len(),
         payload.edges.len()
-    );
+    )?;
     if payload.branch_created {
         if let Some(base) = &payload.base_branch {
-            println!("branch {} created from {}", payload.branch, base);
+            writeln!(writer, "branch {} created from {}", payload.branch, base)?;
         }
     }
     if let Some(diagnostic) = payload.embedding_generation {
-        println!("{}", diagnostic.message());
+        writeln!(writer, "{}", diagnostic.message())?;
     }
+    Ok(())
 }
 
-pub(crate) fn print_schema_plan_human(uri: &str, plan: &SchemaMigrationPlan) {
-    println!("schema plan for {}", uri);
-    println!("supported: {}", if plan.supported { "yes" } else { "no" });
+pub(crate) fn write_schema_plan_human(
+    uri: &str,
+    plan: &SchemaMigrationPlan,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "schema plan for {}", uri)?;
+    writeln!(
+        writer,
+        "supported: {}",
+        if plan.supported { "yes" } else { "no" }
+    )?;
     if plan.steps.is_empty() {
-        println!("no table migration steps");
-        return;
+        writeln!(writer, "no table migration steps")?;
+        return Ok(());
     }
     for step in &plan.steps {
-        println!("- {}", render_schema_plan_step(step));
+        writeln!(writer, "- {}", render_schema_plan_step(step))?;
     }
+    Ok(())
 }
 
 pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
@@ -677,154 +995,168 @@ pub(crate) fn render_annotations(
         .join(", ")
 }
 
-pub(crate) fn print_embed_human(output: &EmbedOutput) {
-    println!(
-        "embedded {} records (selected {}, cleaned {}) from {} -> {} [{} {}d]",
-        output.embedded_records,
-        output.selected_records,
-        output.cleaned_records,
-        output.input,
-        output.output,
-        output.mode,
-        output.dimension
-    );
-}
-
-pub(crate) fn print_snapshot_human(
+pub(crate) fn write_snapshot_human(
     graph_branch: &str,
     graph_manifest_version: u64,
     internal_schema_version: u32,
     entries: &[SnapshotDatasetOutput],
-) {
-    println!("graph_branch: {}", graph_branch);
-    println!("graph_manifest_version: {}", graph_manifest_version);
-    println!("internal_schema_version: {}", internal_schema_version);
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "graph_branch: {}", graph_branch)?;
+    writeln!(writer, "graph_manifest_version: {}", graph_manifest_version)?;
+    writeln!(
+        writer,
+        "internal_schema_version: {}",
+        internal_schema_version
+    )?;
     for entry in entries {
-        println!(
+        writeln!(
+            writer,
             "{} type '{}' published_dataset_version={} native_dataset_branch={} entities={}",
             entry.entity_kind.as_str(),
             entry.type_name,
             entry.published_dataset_version,
             entry.native_dataset_branch.as_deref().unwrap_or("main"),
             entry.entity_count
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// A Blob write receipt: the cell, the state it was left in and the commit
 /// that published it, or that nothing was published.
-pub(crate) fn print_blob_write_human(output: &omnigraph_api_types::BlobWriteOutput) {
+pub(crate) fn write_blob_write_human(
+    output: &omnigraph_api_types::BlobWriteOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
     let entity = match output.selector.entity {
         omnigraph_api_types::BlobEntityKind::Node => "node",
         omnigraph_api_types::BlobEntityKind::Edge => "edge",
     };
-    println!("entity: {entity}");
-    println!("type: {}", output.selector.r#type);
-    println!("id: {}", output.selector.id);
-    println!("property: {}", output.selector.property);
-    println!("branch: {}", output.branch);
+    writeln!(writer, "entity: {entity}")?;
+    writeln!(writer, "type: {}", output.selector.r#type)?;
+    writeln!(writer, "id: {}", output.selector.id)?;
+    writeln!(writer, "property: {}", output.selector.property)?;
+    writeln!(writer, "branch: {}", output.branch)?;
     match output.kind {
         omnigraph_api_types::BlobWriteStateOutput::Managed => {
-            println!("kind: managed");
+            writeln!(writer, "kind: managed")?;
             if let Some(size) = output.size {
-                println!("size: {size}");
+                writeln!(writer, "size: {size}")?;
             }
             if let Some(etag) = output.etag.as_deref() {
-                println!("etag: {etag}");
+                writeln!(writer, "etag: {etag}")?;
             }
         }
-        omnigraph_api_types::BlobWriteStateOutput::Null => println!("kind: null"),
+        omnigraph_api_types::BlobWriteStateOutput::Null => writeln!(writer, "kind: null")?,
     }
     if let Some(actor) = output.actor_id.as_deref() {
-        println!("actor: {actor}");
+        writeln!(writer, "actor: {actor}")?;
     }
     match &output.commit {
-        Some(commit) => println!("commit: {}", commit.graph_commit_id),
-        None => println!("commit: none (the cell was already null)"),
+        Some(commit) => writeln!(writer, "commit: {}", commit.graph_commit_id)?,
+        None => writeln!(writer, "commit: none (the cell was already null)")?,
     }
+    Ok(())
 }
 
-pub(crate) fn print_blob_stat_human(output: &BlobStatOutput) {
+pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Write) -> Result<()> {
     let entity = match output.selector.entity {
         omnigraph_api_types::BlobEntityKind::Node => "node",
         omnigraph_api_types::BlobEntityKind::Edge => "edge",
     };
-    println!("entity: {entity}");
-    println!("type: {}", output.selector.r#type);
-    println!("id: {}", output.selector.id);
-    println!("property: {}", output.selector.property);
+    writeln!(writer, "entity: {entity}")?;
+    writeln!(writer, "type: {}", output.selector.r#type)?;
+    writeln!(writer, "id: {}", output.selector.id)?;
+    writeln!(writer, "property: {}", output.selector.property)?;
     match output.kind {
         BlobContentKindOutput::Managed => {
-            println!("kind: managed");
+            writeln!(writer, "kind: managed")?;
             if let Some(size) = output.size {
-                println!("size: {size}");
+                writeln!(writer, "size: {size}")?;
             }
             if let Some(etag) = output.etag.as_deref() {
-                println!("etag: {etag}");
+                writeln!(writer, "etag: {etag}")?;
             }
         }
         BlobContentKindOutput::External => {
-            println!("kind: external");
+            writeln!(writer, "kind: external")?;
             if let Some(uri) = output.uri.as_deref() {
-                println!("uri: {uri}");
+                writeln!(writer, "uri: {uri}")?;
             }
         }
     }
     if let Some(branch) = output.target.branch.as_deref() {
-        println!("branch: {branch}");
+        writeln!(writer, "branch: {branch}")?;
     }
     if let Some(snapshot) = output.target.snapshot.as_deref() {
-        println!("snapshot: {snapshot}");
+        writeln!(writer, "snapshot: {snapshot}")?;
     }
-    println!("resolved_snapshot: {}", output.target.resolved_snapshot);
-}
-
-pub(crate) fn print_read_output(output: &ReadOutput, format: ReadOutputFormat) -> Result<()> {
-    println!(
-        "{}",
-        render_read(output, format, &resolve_table_render_options())?
-    );
+    writeln!(
+        writer,
+        "resolved_snapshot: {}",
+        output.target.resolved_snapshot
+    )?;
     Ok(())
 }
 
 /// A branch statement's `ChangeOutput` prints the line its `branch` verb
 /// prints; a mutation's prints the affected counts.
-pub(crate) fn print_change_human(output: &ChangeOutput) {
+pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) -> Result<()> {
     match &output.outcome {
-        Some(BranchOutcomeOutput::Created { from, name }) => {
-            println!("created branch {name} from {from}");
+        Some(BranchOutcomeOutput::Created {
+            from,
+            name,
+            from_commit_id,
+        }) => {
+            writeln!(
+                writer,
+                "created branch {name} from {from} at {from_commit_id}"
+            )?;
         }
-        Some(BranchOutcomeOutput::Deleted { name }) => println!("deleted branch {name}"),
+        Some(BranchOutcomeOutput::Deleted { name }) => writeln!(writer, "deleted branch {name}")?,
         Some(BranchOutcomeOutput::Merged {
             source,
             target,
             merge,
-        }) => println!("merged {source} into {target}: {}", merge.as_str()),
-        Some(BranchOutcomeOutput::Published) => println!(
+        }) => writeln!(writer, "merged {source} into {target}: {}", merge.as_str())?,
+        Some(BranchOutcomeOutput::Published) => writeln!(
+            writer,
             "published commit {} on {}",
             output
                 .commit
                 .as_ref()
                 .map_or("?", |commit| commit.graph_commit_id.as_str()),
             output.branch
-        ),
-        Some(BranchOutcomeOutput::Dropped { graph_commit_id }) => {
-            println!("dropped commit {graph_commit_id} on {}", output.branch)
-        }
-        None => println!(
+        )?,
+        Some(BranchOutcomeOutput::Dropped { graph_commit_id }) => writeln!(
+            writer,
+            "dropped commit {graph_commit_id} on {}",
+            output.branch
+        )?,
+        None => writeln!(
+            writer,
             "changed {} via {}: {} nodes, {} edges",
             output.branch, output.query_name, output.affected_nodes, output.affected_edges
-        ),
+        )?,
     }
     if let Some(actor_id) = &output.actor_id {
-        println!("actor_id: {}", actor_id);
+        writeln!(writer, "actor_id: {}", actor_id)?;
     }
+    Ok(())
 }
 
-pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
-    for commit in commits {
+pub(crate) fn write_commit_list_human(
+    list: &CommitListOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    if let Some(head_commit_id) = &list.head_commit_id {
+        writeln!(writer, "head_commit_id: {head_commit_id}")?;
+    }
+    for commit in &list.commits {
         let branch = commit.graph_branch.as_deref().unwrap_or("main");
-        println!(
+        writeln!(
+            writer,
             "{} graph_branch={} graph_manifest_version={}{}{}",
             commit.graph_commit_id,
             branch,
@@ -835,8 +1167,12 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
                 .map(|actor| format!(" actor={}", actor))
                 .unwrap_or_default(),
             commit_kind_suffix(commit),
-        );
+        )?;
     }
+    if let Some(next_page_token) = &list.next_page_token {
+        writeln!(writer, "next_page_token: {next_page_token}")?;
+    }
+    Ok(())
 }
 
 /// ` kind=unattached root=<id>` for an unattached snapshot, empty otherwise:
@@ -851,316 +1187,81 @@ fn commit_kind_suffix(commit: &CommitOutput) -> String {
     }
 }
 
-pub(crate) fn print_commit_human(commit: &CommitOutput) {
-    println!("graph_commit_id: {}", commit.graph_commit_id);
-    println!(
+pub(crate) fn write_commit_human(commit: &CommitOutput, writer: &mut dyn Write) -> Result<()> {
+    writeln!(writer, "graph_commit_id: {}", commit.graph_commit_id)?;
+    writeln!(
+        writer,
         "graph_branch: {}",
         commit.graph_branch.as_deref().unwrap_or("main")
-    );
-    println!("graph_manifest_version: {}", commit.graph_manifest_version);
+    )?;
+    writeln!(
+        writer,
+        "graph_manifest_version: {}",
+        commit.graph_manifest_version
+    )?;
     if !commit.published {
-        println!("published: false");
+        writeln!(writer, "published: false")?;
     }
-    println!(
+    writeln!(
+        writer,
         "kind: {}",
         match commit.kind {
             CommitKindOutput::Published => "published",
             CommitKindOutput::Unpublished => "unpublished",
             CommitKindOutput::Unattached => "unattached",
         }
-    );
+    )?;
     if let Some(root_commit_id) = &commit.root_commit_id {
-        println!("root_commit_id: {}", root_commit_id);
+        writeln!(writer, "root_commit_id: {}", root_commit_id)?;
     }
     if let Some(parent_commit_id) = &commit.parent_commit_id {
-        println!("parent_commit_id: {}", parent_commit_id);
+        writeln!(writer, "parent_commit_id: {}", parent_commit_id)?;
     }
     if let Some(merged_parent_commit_id) = &commit.merged_parent_commit_id {
-        println!("merged_parent_commit_id: {}", merged_parent_commit_id);
+        writeln!(
+            writer,
+            "merged_parent_commit_id: {}",
+            merged_parent_commit_id
+        )?;
     }
     if let Some(actor_id) = &commit.actor_id {
-        println!("actor_id: {}", actor_id);
+        writeln!(writer, "actor_id: {}", actor_id)?;
     }
-    println!("created_at: {}", commit.created_at);
+    writeln!(writer, "created_at: {}", commit.created_at)?;
+    Ok(())
 }
 
-pub(crate) fn print_policy_explain(
-    decision: &PolicyDecision,
-    actor_id: &str,
-    request: &PolicyRequest,
-) {
-    println!(
-        "decision: {}",
-        if decision.allowed { "allow" } else { "deny" }
-    );
-    println!("actor: {}", actor_id);
-    println!("action: {}", request.action);
-    if let Some(branch) = &request.branch {
-        println!("branch: {}", branch);
-    }
-    if let Some(target_branch) = &request.target_branch {
-        println!("target_branch: {}", target_branch);
-    }
-    if let Some(rule_id) = &decision.matched_rule_id {
-        println!("matched_rule: {}", rule_id);
-    }
-    println!("message: {}", decision.message);
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct QueriesIssue {
-    pub(crate) query: String,
-    pub(crate) message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) diagnostic: Option<omnigraph_api_types::DiagnosticOutput>,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct QueriesValidateOutput {
-    pub(crate) ok: bool,
-    pub(crate) breakages: Vec<QueriesIssue>,
-    pub(crate) warnings: Vec<QueriesIssue>,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct QueriesParam {
-    pub(crate) name: String,
-    #[serde(rename = "type")]
-    pub(crate) type_name: String,
-    pub(crate) nullable: bool,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct QueriesListItem {
-    pub(crate) name: String,
-    pub(crate) mcp_expose: bool,
-    pub(crate) tool_name: Option<String>,
-    pub(crate) mutation: bool,
-    /// `@description` from the query declaration — what the query is for.
-    /// Carried so the CLI catalog matches the HTTP `GET /queries` surface.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) description: Option<String>,
-    /// `@instruction` from the query declaration — how/when to invoke it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) instruction: Option<String>,
-    pub(crate) params: Vec<QueriesParam>,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct QueriesListOutput {
-    pub(crate) queries: Vec<QueriesListItem>,
-}
-
-pub(crate) fn finish_login(
-    server: &str,
-    credentials_path: &std::path::Path,
-    declared: bool,
-    json: bool,
+pub(crate) fn write_change_cause_human(
+    cause: &omnigraph_api_types::ChangeCauseOutput,
+    writer: &mut dyn Write,
 ) -> Result<()> {
-    if json {
-        print_json(&serde_json::json!({
-            "server": server,
-            "credentials_path": credentials_path.display().to_string(),
-            "declared": declared,
-        }))?;
-    } else {
-        println!(
-            "stored credential for '{server}' in {}",
-            credentials_path.display()
-        );
-    }
-    if !declared {
-        eprintln!(
-            "note: '{server}' is not declared under servers: in the operator config; the token applies once you add `servers:\n  {server}:\n    url: <server url>` to ~/.omnigraph/config.yaml"
-        );
-    }
-    Ok(())
-}
-
-pub(crate) fn finish_logout(
-    server: &str,
-    credentials_path: &std::path::Path,
-    json: bool,
-) -> Result<()> {
-    if json {
-        print_json(&serde_json::json!({
-            "server": server,
-            "credentials_path": credentials_path.display().to_string(),
-        }))?;
-    } else {
-        println!(
-            "removed credential for '{server}' from {}",
-            credentials_path.display()
-        );
-    }
-    Ok(())
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ProfileListItem {
-    pub(crate) name: String,
-    /// `server: <n>` / `cluster: <n>` / `store: <uri>` / `invalid: <reason>`.
-    pub(crate) binding: String,
-    /// `server` | `cluster` | `store` | `invalid`.
-    pub(crate) scope_kind: String,
-    /// The bound server/cluster name, or the store URI. `None` when invalid.
-    pub(crate) target: Option<String>,
-    pub(crate) valid: bool,
-    pub(crate) error: Option<String>,
-    pub(crate) default_graph: Option<String>,
-    pub(crate) active: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ProfileDetail {
-    /// Profile name, or `(defaults)` for the no-name flat-defaults view.
-    pub(crate) name: String,
-    /// `server` | `cluster` | `store` | `none`.
-    pub(crate) scope_kind: String,
-    /// The bound server/cluster name, or the store URI.
-    pub(crate) target: Option<String>,
-    /// Resolved endpoint: a server's URL / a cluster's root / the store URI;
-    /// `None` if a named server/cluster isn't defined in this config.
-    pub(crate) endpoint: Option<String>,
-    pub(crate) default_graph: Option<String>,
-    pub(crate) output_format: Option<String>,
-}
-
-pub(crate) fn print_profile_list(items: &[ProfileListItem], json: bool) -> Result<()> {
-    if json {
-        return print_json(&items);
-    }
-    if items.is_empty() {
-        println!("no profiles defined in the operator config");
-        return Ok(());
-    }
-    for item in items {
-        let active = if item.active { " (active)" } else { "" };
-        let graph = item
-            .default_graph
-            .as_deref()
-            .map(|g| format!(" · graph: {g}"))
-            .unwrap_or_default();
-        println!("{}{active}  {}{graph}", item.name, item.binding);
-    }
-    Ok(())
-}
-
-pub(crate) fn print_profile_detail(detail: &ProfileDetail, json: bool) -> Result<()> {
-    if json {
-        return print_json(detail);
-    }
-    println!("profile: {}", detail.name);
-    let target = detail
-        .target
-        .as_deref()
-        .map(|t| format!(" {t}"))
-        .unwrap_or_default();
-    println!("  scope:   {}{target}", detail.scope_kind);
-    if let Some(endpoint) = &detail.endpoint {
-        println!("  endpoint: {endpoint}");
-    } else if matches!(detail.scope_kind.as_str(), "server" | "cluster") {
-        println!("  endpoint: (undefined — name not in this config)");
-    }
-    if let Some(graph) = &detail.default_graph {
-        println!("  default graph: {graph}");
-    }
-    if let Some(format) = &detail.output_format {
-        println!("  output: {format}");
-    }
-    Ok(())
-}
-
-/// What this binary speaks, learned without contacting a server: the
-/// `omnigraph-http-api` value a server must match exactly, and the storage
-/// formats it writes and serves.
-#[derive(Debug, Serialize)]
-pub(crate) struct VersionOutput {
-    pub(crate) version: &'static str,
-    pub(crate) http_contract: &'static str,
-    pub(crate) internal_schema: InternalSchemaOutput,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct InternalSchemaOutput {
-    /// The stamp this binary's publications write.
-    pub(crate) writes: u32,
-    /// The inclusive range of stamps normal open serves, lowest first.
-    pub(crate) serves: [u32; 2],
-}
-
-impl InternalSchemaOutput {
-    /// The line `omnigraph version` prints; the agent skill states it verbatim.
-    pub(crate) fn line(&self) -> String {
-        let [lowest, highest] = self.serves;
-        format!(
-            "internal-schema {} (serves v{lowest} to v{highest})",
-            self.writes
-        )
-    }
-}
-
-impl VersionOutput {
-    pub(crate) fn current() -> Self {
-        use omnigraph::db::manifest::{
-            INTERNAL_MANIFEST_SCHEMA_VERSION, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
-        };
-        Self {
-            version: env!("CARGO_PKG_VERSION"),
-            http_contract: omnigraph_api_types::HTTP_API_CONTRACT,
-            internal_schema: InternalSchemaOutput {
-                writes: INTERNAL_MANIFEST_SCHEMA_VERSION,
-                serves: [
-                    MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
-                    INTERNAL_MANIFEST_SCHEMA_VERSION,
-                ],
-            },
-        }
-    }
-}
-
-pub(crate) fn print_version(output: &VersionOutput, json: bool) -> Result<()> {
-    if json {
-        return print_json(output);
-    }
-    println!("omnigraph {}", output.version);
-    println!("{}", output.internal_schema.line());
-    println!("http-contract {}", output.http_contract);
-    Ok(())
-}
-
-/// Table prefs cascade (RFC-011): operator defaults.table_* > built-in.
-pub(crate) fn resolve_table_render_options() -> ReadRenderOptions {
-    let operator = crate::operator::load_operator_config().unwrap_or_default();
-    ReadRenderOptions {
-        max_column_width: operator.defaults.table_max_column_width.unwrap_or(80),
-        cell_layout: operator.defaults.table_cell_layout.unwrap_or_default(),
-    }
-}
-
-pub(crate) fn print_change_cause_human(cause: &omnigraph_api_types::ChangeCauseOutput) {
-    println!("commit: {}", cause.graph_commit_id);
-    println!("branch: {}", cause.authored_branch);
+    writeln!(writer, "commit: {}", cause.graph_commit_id)?;
+    writeln!(writer, "branch: {}", cause.authored_branch)?;
     if let Some(parent_commit_id) = &cause.parent_commit_id {
-        println!("parent: {}", parent_commit_id);
+        writeln!(writer, "parent: {}", parent_commit_id)?;
     }
     if let Some(merged_parent_commit_id) = &cause.merged_parent_commit_id {
-        println!("merged_parent: {}", merged_parent_commit_id);
+        writeln!(writer, "merged_parent: {}", merged_parent_commit_id)?;
     }
     if let Some(actor_id) = &cause.actor_id {
-        println!("actor: {}", actor_id);
+        writeln!(writer, "actor: {}", actor_id)?;
     }
-    println!("authored_at: {}", cause.authored_at);
+    writeln!(writer, "authored_at: {}", cause.authored_at)?;
+    Ok(())
 }
 
-fn print_entity_change_row(change: &omnigraph_api_types::EntityChangeOutput) {
-    println!(
+fn write_entity_change_row(
+    change: &omnigraph_api_types::EntityChangeOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(
+        writer,
         "{} {} {} {}",
         change.op.as_str(),
         change.kind.as_str(),
         change.r#type.name,
         change.id
-    );
+    )?;
     // Edge endpoints (present on edge images only). An endpoint-moving update
     // must show BOTH pairs; `after.or(before)` alone silently hid the old
     // endpoints of a move.
@@ -1173,17 +1274,18 @@ fn print_entity_change_row(change: &omnigraph_api_types::EntityChangeOutput) {
         .as_ref()
         .and_then(|image| image.endpoints.as_ref());
     if let Some(rendered) = format_endpoint_change(before_endpoints, after_endpoints) {
-        println!("  {rendered}");
+        writeln!(writer, "  {rendered}")?;
     }
     // The before/after property values are the point of a change feed; the
     // previous output dropped them. Show inserted/deleted values, or the
     // changed keys of an update as `before -> after`.
     match (&change.before, &change.after) {
-        (None, Some(after)) => print_change_properties("  +", &after.properties),
-        (Some(before), None) => print_change_properties("  -", &before.properties),
-        (Some(before), Some(after)) => print_change_property_diff(before, after),
+        (None, Some(after)) => write_change_properties("  +", &after.properties, writer)?,
+        (Some(before), None) => write_change_properties("  -", &before.properties, writer)?,
+        (Some(before), Some(after)) => write_change_property_diff(before, after, writer)?,
         (None, None) => {}
     }
+    Ok(())
 }
 
 /// Render an edge change's endpoints for human output. An endpoint-moving
@@ -1224,22 +1326,28 @@ fn render_change_value(value: &serde_json::Value) -> String {
 /// null or empty.
 const ABSENT_PROPERTY: &str = "<absent>";
 
-fn print_change_properties(marker: &str, properties: &serde_json::Value) {
+fn write_change_properties(
+    marker: &str,
+    properties: &serde_json::Value,
+    writer: &mut dyn Write,
+) -> Result<()> {
     if let Some(map) = properties.as_object() {
         for (key, value) in map {
-            println!("{marker} {key}: {}", render_change_value(value));
+            writeln!(writer, "{marker} {key}: {}", render_change_value(value))?;
         }
     }
+    Ok(())
 }
 
-fn print_change_property_diff(
+fn write_change_property_diff(
     before: &omnigraph_api_types::ChangeImageOutput,
     after: &omnigraph_api_types::ChangeImageOutput,
-) {
+    writer: &mut dyn Write,
+) -> Result<()> {
     let (Some(before_map), Some(after_map)) =
         (before.properties.as_object(), after.properties.as_object())
     else {
-        return;
+        return Ok(());
     };
     let mut keys: Vec<&String> = before_map.keys().chain(after_map.keys()).collect();
     keys.sort();
@@ -1254,19 +1362,24 @@ fn print_change_property_diff(
             let after_str = after_value
                 .map(render_change_value)
                 .unwrap_or_else(|| ABSENT_PROPERTY.to_string());
-            println!("  {key}: {before_str} -> {after_str}");
+            writeln!(writer, "  {key}: {before_str} -> {after_str}")?;
         }
     }
+    Ok(())
 }
 
-pub(crate) fn print_commit_changes_human(page: &omnigraph_api_types::CommitChangesOutput) {
-    print_change_cause_human(&page.cause);
+pub(crate) fn write_commit_changes_human(
+    page: &omnigraph_api_types::CommitChangesOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    write_change_cause_human(&page.cause, writer)?;
     for change in &page.changes {
-        print_entity_change_row(change);
+        write_entity_change_row(change, writer)?;
     }
     if let Some(next_page_token) = &page.next_page_token {
-        println!("next_page_token: {}", next_page_token);
+        writeln!(writer, "next_page_token: {}", next_page_token)?;
     }
+    Ok(())
 }
 
 /// Incremental JSON rendering for an auto-paginated finite commit diff.
@@ -1386,13 +1499,19 @@ impl<W: Write> CommitChangesJsonStream<W> {
 }
 
 /// Incremental human rendering for an auto-paginated finite commit diff.
-pub(crate) struct CommitChangesHumanStream {
+/// A successful page includes a writer flush; callers stop on failure before
+/// requesting a continuation, just as with the JSON stream.
+pub(crate) struct CommitChangesHumanStream<W: Write> {
+    writer: W,
     cause: Option<omnigraph_api_types::ChangeCauseOutput>,
 }
 
-impl CommitChangesHumanStream {
-    pub(crate) fn new() -> Self {
-        Self { cause: None }
+impl<W: Write> CommitChangesHumanStream<W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
+            writer,
+            cause: None,
+        }
     }
 
     pub(crate) fn write_page(
@@ -1401,16 +1520,16 @@ impl CommitChangesHumanStream {
     ) -> Result<()> {
         match &self.cause {
             None => {
-                print_change_cause_human(&page.cause);
+                write_change_cause_human(&page.cause, &mut self.writer)?;
                 self.cause = Some(page.cause.clone());
             }
             Some(cause) if cause == &page.cause => {}
             Some(_) => bail!("commit changes continuation changed its cause while auto-paginating"),
         }
         for change in &page.changes {
-            print_entity_change_row(change);
+            write_entity_change_row(change, &mut self.writer)?;
         }
-        io::stdout().flush()?;
+        self.writer.flush()?;
         Ok(())
     }
 }
@@ -1435,22 +1554,27 @@ impl DiffEndpointsHeader {
     }
 }
 
-fn print_diff_endpoints_human(header: &DiffEndpointsHeader) {
+fn write_diff_endpoints_human(header: &DiffEndpointsHeader, writer: &mut dyn Write) -> Result<()> {
     if let Some(base_commit_id) = &header.base_commit_id {
-        println!("merge_base: {base_commit_id}");
+        writeln!(writer, "merge_base: {base_commit_id}")?;
     }
-    println!("from: {}", header.from_commit_id);
-    println!("to: {}", header.to_commit_id);
+    writeln!(writer, "from: {}", header.from_commit_id)?;
+    writeln!(writer, "to: {}", header.to_commit_id)?;
+    Ok(())
 }
 
-pub(crate) fn print_diff_human(page: &omnigraph_api_types::DiffOutput) {
-    print_diff_endpoints_human(&DiffEndpointsHeader::of(page));
+pub(crate) fn write_diff_human(
+    page: &omnigraph_api_types::DiffOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    write_diff_endpoints_human(&DiffEndpointsHeader::of(page), writer)?;
     for change in &page.changes {
-        print_entity_change_row(change);
+        write_entity_change_row(change, writer)?;
     }
     if let Some(next_page_token) = &page.next_page_token {
-        println!("next_page_token: {}", next_page_token);
+        writeln!(writer, "next_page_token: {}", next_page_token)?;
     }
+    Ok(())
 }
 
 /// Incremental JSON rendering for an auto-paginated graph diff: the endpoint
@@ -1516,37 +1640,54 @@ impl<W: Write> DiffJsonStream<W> {
 }
 
 /// Incremental human rendering for an auto-paginated graph diff.
-pub(crate) struct DiffHumanStream {
+/// Each page is flushed before the caller requests its continuation.
+pub(crate) struct DiffHumanStream<W: Write> {
+    writer: W,
     header: Option<DiffEndpointsHeader>,
 }
 
-impl DiffHumanStream {
-    pub(crate) fn new() -> Self {
-        Self { header: None }
+impl<W: Write> DiffHumanStream<W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
+            writer,
+            header: None,
+        }
     }
 
     pub(crate) fn write_page(&mut self, page: &omnigraph_api_types::DiffOutput) -> Result<()> {
         let header = DiffEndpointsHeader::of(page);
         match &self.header {
             None => {
-                print_diff_endpoints_human(&header);
+                write_diff_endpoints_human(&header, &mut self.writer)?;
                 self.header = Some(header);
             }
             Some(seen) if seen == &header => {}
             Some(_) => bail!("diff continuation changed its endpoints while auto-paginating"),
         }
         for change in &page.changes {
-            print_entity_change_row(change);
+            write_entity_change_row(change, &mut self.writer)?;
         }
-        io::stdout().flush()?;
+        self.writer.flush()?;
         Ok(())
     }
 }
 
-pub(crate) fn print_merge_base_human(output: &omnigraph_api_types::MergeBaseOutput) {
-    println!("merge_base: {}", output.merge_base.graph_commit_id);
-    println!("source: {} at {}", output.source, output.source_commit_id);
-    println!("target: {} at {}", output.target, output.target_commit_id);
+pub(crate) fn write_merge_base_human(
+    output: &omnigraph_api_types::MergeBaseOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "merge_base: {}", output.merge_base.graph_commit_id)?;
+    writeln!(
+        writer,
+        "source: {} at {}",
+        output.source, output.source_commit_id
+    )?;
+    writeln!(
+        writer,
+        "target: {} at {}",
+        output.target, output.target_commit_id
+    )?;
+    Ok(())
 }
 
 /// Incremental JSON rendering for one auto-paginated feed poll.
@@ -1653,15 +1794,17 @@ impl<W: Write> ChangeFeedJsonStream<W> {
 
 /// Incremental human rendering for one auto-paginated feed poll. A repeated
 /// cause at the start of a continuation page is suppressed so a split commit
-/// still reads as one block.
-pub(crate) struct ChangeFeedHumanStream {
+/// still reads as one block. Each page is flushed before the next fetch.
+pub(crate) struct ChangeFeedHumanStream<W: Write> {
+    writer: W,
     current_cause: Option<omnigraph_api_types::ChangeCauseOutput>,
     wrote_block: bool,
 }
 
-impl ChangeFeedHumanStream {
-    pub(crate) fn new() -> Self {
+impl<W: Write> ChangeFeedHumanStream<W> {
+    pub(crate) fn new(writer: W) -> Self {
         Self {
+            writer,
             current_cause: None,
             wrote_block: false,
         }
@@ -1681,41 +1824,49 @@ impl ChangeFeedHumanStream {
             };
             if !same_block {
                 if self.wrote_block {
-                    println!();
+                    writeln!(self.writer)?;
                 }
-                print_change_cause_human(&block.cause);
+                write_change_cause_human(&block.cause, &mut self.writer)?;
                 self.current_cause = Some(block.cause.clone());
                 self.wrote_block = true;
             }
             for change in &block.changes {
-                print_entity_change_row(change);
+                write_entity_change_row(change, &mut self.writer)?;
             }
         }
-        io::stdout().flush()?;
+        self.writer.flush()?;
         Ok(())
     }
 
-    pub(crate) fn finish(self, cursor: Option<&str>, caught_up: Option<bool>) {
+    pub(crate) fn finish(mut self, cursor: Option<&str>, caught_up: Option<bool>) -> Result<W> {
         if !self.wrote_block {
-            println!("(no new commits)");
+            writeln!(self.writer, "(no new commits)")?;
         }
         if let Some(cursor) = cursor {
-            println!();
-            println!("cursor: {cursor}");
+            writeln!(self.writer)?;
+            writeln!(self.writer, "cursor: {cursor}")?;
             if let Some(caught_up) = caught_up {
-                println!("caught_up: {caught_up}");
+                writeln!(self.writer, "caught_up: {caught_up}")?;
             }
         }
+        self.writer.flush()?;
+        Ok(self.writer)
     }
 }
 
-pub(crate) fn print_change_baseline_human(
+pub(crate) fn write_change_baseline_human(
     baseline: &omnigraph_api_types::ChangeBaselineOutput,
     out_path: &std::path::Path,
-) {
-    println!("snapshot: {}", out_path.display());
-    println!("snapshot_commit_id: {}", baseline.snapshot_commit_id);
-    println!("resume_cursor: {}", baseline.resume_cursor);
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(writer, "snapshot: {}", out_path.display())?;
+    writeln!(
+        writer,
+        "snapshot_commit_id: {}",
+        baseline.snapshot_commit_id
+    )?;
+    writeln!(writer, "resume_cursor: {}", baseline.resume_cursor)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1723,9 +1874,12 @@ mod tests {
     use omnigraph_compiler::schema::ast::Annotation;
     use omnigraph_compiler::schema::parser::parse_schema;
     use std::collections::BTreeMap;
+    use std::io::{self, Write};
 
     use super::{
-        ChangeFeedJsonStream, CommitChangesJsonStream, graph_type_subject, render_annotations,
+        ChangeFeedHumanStream, ChangeFeedJsonStream, CommitChangesHumanStream,
+        CommitChangesJsonStream, DiffHumanStream, DiffJsonStream, graph_type_subject,
+        render_annotations,
     };
 
     #[test]
@@ -1856,6 +2010,555 @@ mod tests {
         );
     }
 
+    fn assert_human_format(
+        expected: &str,
+        write: impl Fn(&mut dyn Write) -> color_eyre::Result<()>,
+    ) {
+        let mut bytes = Vec::new();
+        write(&mut bytes).unwrap();
+        assert_eq!(bytes, expected.as_bytes());
+        assert_writer_failure("human formatter", WriterFault::AfterPrefix, write);
+    }
+
+    fn assert_maintenance_report(
+        human: &str,
+        json: serde_json::Value,
+        render: impl Fn(bool, &mut dyn Write) -> color_eyre::Result<()>,
+    ) {
+        assert_human_format(human, |writer| render(false, writer));
+        let mut bytes = Vec::new();
+        render(true, &mut bytes).unwrap();
+        assert_eq!(
+            bytes,
+            format!("{}\n", serde_json::to_string_pretty(&json).unwrap()).as_bytes()
+        );
+        assert_writer_failure("maintenance JSON", WriterFault::AfterPrefix, |writer| {
+            render(true, writer)
+        });
+    }
+
+    #[tokio::test]
+    async fn maintenance_optimize_and_repair_reports_preserve_all_result_fields() {
+        use omnigraph::db::{
+            Omnigraph, PendingIndex, RepairAction, RepairClassification, RepairOptions, SkipReason,
+        };
+        // These engine result types are non_exhaustive. Obtain one valid value
+        // from a tiny graph, then set its public presentation fields; no engine
+        // outcome or storage behavior is asserted by this renderer test.
+        let temp = tempfile::tempdir().unwrap();
+        let uri = temp
+            .path()
+            .join("graph.omni")
+            .to_string_lossy()
+            .into_owned();
+        let db = Omnigraph::init(&uri, "node Person {\n    slug: String @key\n}\n")
+            .await
+            .unwrap();
+        let mut compacted = db.optimize().await.unwrap().pop().unwrap();
+        compacted.type_key = "node:Person".into();
+        compacted.fragments_removed = 3;
+        compacted.fragments_added = 1;
+        compacted.committed = true;
+        compacted.skipped = None;
+        compacted.published_dataset_version = None;
+        compacted.lance_head_version = None;
+        compacted.pending_indexes = vec![PendingIndex {
+            type_key: "node:Person".into(),
+            property: "embedding".into(),
+            reason: "no trainable vectors".into(),
+        }];
+        let mut skipped = compacted.clone();
+        skipped.type_key = "edge:Knows".into();
+        skipped.fragments_removed = 0;
+        skipped.fragments_added = 0;
+        skipped.committed = false;
+        skipped.skipped = Some(SkipReason::DriftNeedsRepair);
+        skipped.published_dataset_version = Some(4);
+        skipped.lance_head_version = Some(5);
+        skipped.pending_indexes.clear();
+        let mut noop = skipped.clone();
+        noop.type_key = "__manifest".into();
+        noop.skipped = None;
+        noop.published_dataset_version = None;
+        noop.lance_head_version = None;
+        let optimize = [compacted, skipped, noop];
+        assert_maintenance_report(
+            concat!(
+                "optimize graph — 3 datasets\n",
+                "  node type 'Person'                       frags 3 → 1 ✓\n",
+                "    ↳ index pending on property 'embedding': no trainable vectors\n",
+                "  edge type 'Knows'                        skipped (published dataset/Lance HEAD drift — run omnigraph repair)\n",
+                "  dataset '__manifest'                     no-op\n",
+            ),
+            serde_json::json!({
+                "uri":"graph",
+                "datasets":[
+                    {"type_key":"node:Person","fragments_removed":3,"fragments_added":1,"committed":true,"skipped":null,"published_dataset_version":null,"lance_head_version":null,"pending_indexes":[{"property":"embedding","reason":"no trainable vectors"}]},
+                    {"type_key":"edge:Knows","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":"drift_needs_repair","published_dataset_version":4,"lance_head_version":5,"pending_indexes":[]},
+                    {"type_key":"__manifest","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"published_dataset_version":null,"lance_head_version":null,"pending_indexes":[]},
+                ],
+            }),
+            |json, writer| super::write_optimize("graph", &optimize, json, writer),
+        );
+        assert_maintenance_report(
+            "optimize graph — 0 datasets\n",
+            serde_json::json!({"uri":"graph","datasets":[]}),
+            |json, writer| super::write_optimize("graph", &[], json, writer),
+        );
+
+        let mut repair = db.repair(RepairOptions::default()).await.unwrap();
+        let mut clean = repair.datasets.pop().unwrap();
+        clean.type_key = "node:Person".into();
+        clean.published_dataset_version = 4;
+        clean.lance_head_version = 4;
+        clean.classification = RepairClassification::NoDrift;
+        clean.action = RepairAction::NoOp;
+        clean.operations.clear();
+        clean.error = None;
+        let mut refused = clean.clone();
+        refused.type_key = "edge:Knows".into();
+        refused.lance_head_version = 6;
+        refused.classification = RepairClassification::ForeignDrift;
+        refused.action = RepairAction::Refused;
+        refused.operations = vec!["Append".into(), "Delete".into()];
+        refused.error = Some("foreign write".into());
+        repair.datasets = vec![clean, refused];
+        repair.graph_manifest_version = Some(9);
+        assert_maintenance_report(
+            concat!(
+                "repair graph — 2 datasets\n",
+                "  node type 'Person'                       no_op        no_drift               4\n",
+                "  edge type 'Knows'                        refused      foreign_drift          4 → 6 [Append, Delete] (foreign write)\n",
+            ),
+            serde_json::json!({
+                "uri":"graph", "graph_manifest_version":9,
+                "datasets":[
+                    {"type_key":"node:Person","published_dataset_version":4,"lance_head_version":4,"classification":"no_drift","action":"no_op","operations":[],"error":null},
+                    {"type_key":"edge:Knows","published_dataset_version":4,"lance_head_version":6,"classification":"foreign_drift","action":"refused","operations":["Append","Delete"],"error":"foreign write"},
+                ],
+            }),
+            |json, writer| super::write_repair("graph", &repair, json, writer),
+        );
+        repair.datasets.clear();
+        repair.graph_manifest_version = None;
+        assert_maintenance_report(
+            "repair graph — 0 datasets\n",
+            serde_json::json!({"uri":"graph","graph_manifest_version":null,"datasets":[]}),
+            |json, writer| super::write_repair("graph", &repair, json, writer),
+        );
+    }
+
+    #[test]
+    fn maintenance_cleanup_reports_preserve_partial_failure_and_policy() {
+        use omnigraph::db::{CleanupPolicyOptions, DatasetCleanupStats};
+        use std::time::Duration;
+        let policy = CleanupPolicyOptions {
+            keep_versions: Some(2),
+            older_than: Some(Duration::from_secs(60)),
+        };
+        let stats = [
+            DatasetCleanupStats {
+                type_key: "node:Person".into(),
+                bytes_removed: 12,
+                old_versions_removed: 3,
+                error: None,
+                manifests_removed: 4,
+                unpublished_manifests: 5,
+                unpublished_bytes: 6,
+                foreign_versions: vec![7, 8],
+            },
+            DatasetCleanupStats {
+                type_key: "edge:Knows".into(),
+                bytes_removed: 2,
+                old_versions_removed: 1,
+                error: Some("access denied".into()),
+                manifests_removed: 0,
+                unpublished_manifests: 0,
+                unpublished_bytes: 0,
+                foreign_versions: vec![],
+            },
+        ];
+        let description = "keep 2 versions, remove anything older than 60s";
+        assert_maintenance_report(
+            concat!(
+                "cleanup graph (keep 2 versions, remove anything older than 60s) — removed 4 versions (14 bytes) across 1 datasets\n",
+                "  1 dataset(s) failed and will be retried on the next cleanup: edge type 'Knows'\n",
+            ),
+            serde_json::json!({
+                "uri":"graph", "keep_versions":2,"older_than_secs":60,
+                "datasets":[
+                    {"type_key":"node:Person","bytes_removed":12,"old_versions_removed":3,"error":null,"manifests_removed":4,"unpublished_manifests":5,"unpublished_bytes":6,"foreign_versions":[7,8]},
+                    {"type_key":"edge:Knows","bytes_removed":2,"old_versions_removed":1,"error":"access denied","manifests_removed":0,"unpublished_manifests":0,"unpublished_bytes":0,"foreign_versions":[]},
+                ],
+            }),
+            |json, writer| {
+                super::write_cleanup("graph", &policy, description, &stats, json, writer)
+            },
+        );
+        let policy = CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::from_secs(60)),
+        };
+        assert_maintenance_report(
+            "cleanup graph (remove anything older than 60s) — removed 0 versions (0 bytes) across 0 datasets\n",
+            serde_json::json!({"uri":"graph","keep_versions":null,"older_than_secs":60,"datasets":[]}),
+            |json, writer| {
+                super::write_cleanup(
+                    "graph",
+                    &policy,
+                    "remove anything older than 60s",
+                    &[],
+                    json,
+                    writer,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn maintenance_full_text_reports_keep_warning_stream_and_noop_distinct() {
+        use omnigraph::db::{FullTextIndexRebuildResult, RebuiltFullTextIndex};
+        let warning = "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.";
+        let result = FullTextIndexRebuildResult {
+            branch: "dev".into(),
+            graph_commit_id: Some("commit-1".into()),
+            rebuilt_indexes: vec![RebuiltFullTextIndex {
+                type_key: "node:Doc".into(),
+                property: "body".into(),
+            }],
+        };
+        assert_maintenance_report(
+            "rebuild-full-text-indexes graph — branch dev, 1 indexes rebuilt\n  node type 'Doc', property 'body'\ngraph commit: commit-1\n",
+            serde_json::json!({"uri":"graph","branch":"dev","graph_commit_id":"commit-1","warnings":[warning],"rebuilt_indexes":[{"type_key":"node:Doc","property":"body"}]}),
+            |json, writer| {
+                let mut stderr = Vec::new();
+                let output =
+                    super::write_full_text_rebuild("graph", &result, json, writer, &mut stderr);
+                assert_eq!(
+                    stderr,
+                    if json {
+                        Vec::new()
+                    } else {
+                        format!("warning: {warning}\n").into_bytes()
+                    }
+                );
+                output
+            },
+        );
+        assert_writer_failure("full-text warning", WriterFault::AfterPrefix, |stderr| {
+            let mut stdout = Vec::new();
+            let error =
+                super::write_full_text_rebuild("graph", &result, false, &mut stdout, stderr);
+            assert!(
+                stdout.is_empty(),
+                "warning is delivered before the human report"
+            );
+            error
+        });
+        let noop = FullTextIndexRebuildResult {
+            branch: "main".into(),
+            graph_commit_id: None,
+            rebuilt_indexes: vec![],
+        };
+        assert_maintenance_report(
+            "rebuild-full-text-indexes graph — branch main, 0 indexes rebuilt\nno-op; no graph commit published\n",
+            serde_json::json!({"uri":"graph","branch":"main","graph_commit_id":null,"warnings":[],"rebuilt_indexes":[]}),
+            |json, writer| {
+                let mut stderr = Vec::new();
+                let output =
+                    super::write_full_text_rebuild("graph", &noop, json, writer, &mut stderr);
+                assert!(stderr.is_empty());
+                output
+            },
+        );
+    }
+
+    #[test]
+    fn schema_human_reports_preserve_empty_unsupported_and_applied_shapes() {
+        use omnigraph_compiler::{SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind};
+
+        let added = SchemaMigrationStep::AddType {
+            type_kind: SchemaTypeKind::Node,
+            name: "Doc".to_string(),
+        };
+        for (plan, expected) in [
+            (
+                SchemaMigrationPlan {
+                    supported: true,
+                    steps: Vec::new(),
+                },
+                "schema plan for graph\nsupported: yes\nno table migration steps\n",
+            ),
+            (
+                SchemaMigrationPlan {
+                    supported: true,
+                    steps: vec![added.clone()],
+                },
+                "schema plan for graph\nsupported: yes\n- add node type 'Doc'\n",
+            ),
+            (
+                SchemaMigrationPlan {
+                    supported: false,
+                    steps: vec![SchemaMigrationStep::UnsupportedChange {
+                        entity: "Doc.body".to_string(),
+                        reason: "type changed".to_string(),
+                        code: None,
+                    }],
+                },
+                "schema plan for graph\nsupported: no\n- unsupported change on Doc.body: type changed\n",
+            ),
+        ] {
+            assert_human_format(expected, |writer| {
+                super::write_schema_plan_human("graph", &plan, writer)
+            });
+        }
+
+        for (applied, steps, expected) in [
+            (
+                false,
+                Vec::new(),
+                "schema apply for graph\nsupported: yes\napplied: no\ngraph_manifest_version: 7\nno schema changes\n",
+            ),
+            (
+                true,
+                Vec::new(),
+                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\nschema source updated; no table migration steps\n",
+            ),
+            (
+                true,
+                vec![added],
+                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\n- add node type 'Doc'\n",
+            ),
+        ] {
+            let output = omnigraph_api_types::SchemaApplyOutput {
+                uri: "graph".to_string(),
+                supported: true,
+                applied,
+                step_count: steps.len(),
+                graph_manifest_version: 7,
+                steps,
+            };
+            assert_human_format(expected, |writer| {
+                super::write_schema_apply_human(&output, writer)
+            });
+        }
+    }
+
+    #[test]
+    fn lint_report_preserves_text_status_and_report_flush_failures() {
+        use omnigraph_compiler::{
+            QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,
+            QueryLintSchemaSource, QueryLintSeverity, QueryLintStatus,
+        };
+
+        let output = QueryLintOutput {
+            status: QueryLintStatus::Error,
+            schema_source: QueryLintSchemaSource::file("schema.pg"),
+            query_path: "queries.gq".to_string(),
+            queries_processed: 3,
+            errors: 2,
+            warnings: 2,
+            infos: 1,
+            results: vec![
+                QueryLintQueryResult {
+                    name: "read_docs".to_string(),
+                    kind: QueryLintQueryKind::Read,
+                    status: QueryLintStatus::Ok,
+                    warnings: vec!["unused parameter".to_string()],
+                    error: None,
+                    operation: None,
+                },
+                QueryLintQueryResult {
+                    name: "update_docs".to_string(),
+                    kind: QueryLintQueryKind::Mutation,
+                    status: QueryLintStatus::Ok,
+                    warnings: Vec::new(),
+                    error: None,
+                    operation: None,
+                },
+                QueryLintQueryResult {
+                    name: "broken".to_string(),
+                    kind: QueryLintQueryKind::Read,
+                    status: QueryLintStatus::Error,
+                    warnings: Vec::new(),
+                    error: None,
+                    operation: None,
+                },
+            ],
+            findings: [
+                (QueryLintSeverity::Error, "invalid read"),
+                (QueryLintSeverity::Warning, "missing coverage"),
+                (QueryLintSeverity::Info, "index available"),
+            ]
+            .into_iter()
+            .map(|(severity, message)| QueryLintFinding {
+                severity,
+                code: "L000".to_string(),
+                message: message.to_string(),
+                type_name: None,
+                property: None,
+                query_names: Vec::new(),
+            })
+            .collect(),
+        };
+        let human = "OK    query `read_docs` (read)\nWARN  query `read_docs`: unused parameter\n\
+            OK    query `update_docs` (mutation)\nERROR query `broken`: unknown error\n\
+            ERROR invalid read\nWARN  missing coverage\nINFO  index available\n\
+            INFO  Lint complete: 3 queries processed (2 error(s), 2 warning(s), 1 info item(s))\n";
+        assert_human_format(human, |writer| {
+            super::write_query_lint_human(&output, writer)
+        });
+        for json in [false, true] {
+            let mut bytes = Vec::new();
+            let completion = super::finish_query_lint(&output, json, &mut bytes).unwrap();
+            assert_eq!(completion.code(), 1);
+            let expected = if json {
+                format!("{}\n", serde_json::to_string_pretty(&output).unwrap())
+            } else {
+                human.to_string()
+            };
+            assert_eq!(bytes, expected.as_bytes());
+            for fault in [WriterFault::AfterPrefix, WriterFault::Flush] {
+                assert_writer_failure("lint report", fault, |writer| {
+                    super::finish_query_lint(&output, json, writer).map(|_| ())
+                });
+            }
+        }
+
+        let clean = QueryLintOutput {
+            status: QueryLintStatus::Ok,
+            queries_processed: 0,
+            errors: 0,
+            warnings: 0,
+            infos: 0,
+            results: Vec::new(),
+            findings: Vec::new(),
+            ..output
+        };
+        let mut writer = FailingWriter {
+            fault: WriterFault::Flush,
+            bytes: Vec::new(),
+            flushes: 0,
+        };
+        assert_eq!(
+            super::finish_query_lint(&clean, false, &mut writer)
+                .unwrap()
+                .code(),
+            0
+        );
+        assert_eq!(
+            writer.flushes, 0,
+            "successful report flush stays with application completion"
+        );
+    }
+
+    #[test]
+    fn load_human_preserves_branch_and_embedding_diagnostics() {
+        let mut output = super::LoadOutput {
+            uri: "graph".to_string(),
+            branch: "work".to_string(),
+            mode: "append",
+            base_branch: Some("main".to_string()),
+            branch_created: true,
+            nodes: vec![omnigraph_api_types::GraphBatchDeclarationOutput {
+                name: "Doc".to_string(),
+                entities_loaded: 2,
+            }],
+            edges: Vec::new(),
+            total_entities: 2,
+            embedding_generation: Some(omnigraph_api_types::LoadEmbeddingGeneration::Unsupported),
+            commit: None,
+        };
+        assert_human_format(
+            "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n\
+             branch work created from main\n\
+             Loads do not generate embeddings. Supplied vectors are preserved; omitted vectors follow schema nullability. Supply vectors in the input or prepare them with omnigraph embed.\n",
+            |writer| super::write_load_human(&output, writer),
+        );
+        output.branch_created = false;
+        output.embedding_generation = None;
+        assert_human_format(
+            "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n",
+            |writer| super::write_load_human(&output, writer),
+        );
+    }
+
+    #[test]
+    fn blob_stat_human_preserves_managed_external_and_read_target_fields() {
+        let mut query = omnigraph_api_types::BlobReadQuery {
+            entity: omnigraph_api_types::BlobEntityKind::Node,
+            r#type: "Doc".to_string(),
+            id: "one".to_string(),
+            property: "body".to_string(),
+            branch: Some("work".to_string()),
+            snapshot: None,
+        };
+        let output =
+            omnigraph_api_types::BlobStatOutput::managed(&query, "resolved", 0, "\"etag\"");
+        assert_human_format(
+            "entity: node\ntype: Doc\nid: one\nproperty: body\nkind: managed\n\
+             size: 0\netag: \"etag\"\nbranch: work\nresolved_snapshot: resolved\n",
+            |writer| super::write_blob_stat_human(&output, writer),
+        );
+
+        query.entity = omnigraph_api_types::BlobEntityKind::Edge;
+        query.branch = None;
+        query.snapshot = Some("requested".to_string());
+        let output =
+            omnigraph_api_types::BlobStatOutput::external(&query, "resolved", "s3://bucket/body");
+        assert_human_format(
+            "entity: edge\ntype: Doc\nid: one\nproperty: body\nkind: external\n\
+             uri: s3://bucket/body\nsnapshot: requested\nresolved_snapshot: resolved\n",
+            |writer| super::write_blob_stat_human(&output, writer),
+        );
+    }
+
+    #[test]
+    fn blob_write_human_preserves_receipt_and_already_null_text() {
+        let mut output = omnigraph_api_types::BlobWriteOutput {
+            selector: omnigraph_api_types::BlobSelectorOutput {
+                entity: omnigraph_api_types::BlobEntityKind::Node,
+                r#type: "Doc".to_string(),
+                id: "one".to_string(),
+                property: "body".to_string(),
+            },
+            branch: "work".to_string(),
+            kind: omnigraph_api_types::BlobWriteStateOutput::Managed,
+            size: Some(0),
+            etag: Some("\"etag\"".to_string()),
+            actor_id: Some("actor".to_string()),
+            commit: Some(omnigraph_api_types::CommitOutput {
+                graph_commit_id: "published".to_string(),
+                graph_branch: Some("work".to_string()),
+                graph_manifest_version: 2,
+                parent_commit_id: None,
+                merged_parent_commit_id: None,
+                actor_id: Some("actor".to_string()),
+                created_at: 42,
+                published: true,
+                kind: omnigraph_api_types::CommitKindOutput::Published,
+                root_commit_id: None,
+            }),
+        };
+        assert_human_format(
+            "entity: node\ntype: Doc\nid: one\nproperty: body\nbranch: work\n\
+             kind: managed\nsize: 0\netag: \"etag\"\nactor: actor\ncommit: published\n",
+            |writer| super::write_blob_write_human(&output, writer),
+        );
+
+        output.selector.entity = omnigraph_api_types::BlobEntityKind::Edge;
+        output.kind = omnigraph_api_types::BlobWriteStateOutput::Null;
+        output.size = None;
+        output.etag = None;
+        output.actor_id = None;
+        output.commit = None;
+        assert_human_format(
+            "entity: edge\ntype: Doc\nid: one\nproperty: body\nbranch: work\n\
+             kind: null\ncommit: none (the cell was already null)\n",
+            |writer| super::write_blob_write_human(&output, writer),
+        );
+    }
+
     #[test]
     fn commit_json_stream_preserves_aggregate_shape_without_page_aggregation() {
         let cause = cause("commit-1");
@@ -1895,6 +2598,23 @@ mod tests {
             ["a", "b"]
         );
         assert!(rendered.next_page_token.is_none());
+
+        let mut human = Vec::new();
+        let mut stream = CommitChangesHumanStream::new(&mut human);
+        stream.write_page(&first).unwrap();
+        stream.write_page(&second).unwrap();
+        assert_eq!(
+            String::from_utf8(human).unwrap(),
+            "commit: commit-1\nbranch: main\nparent: parent\nactor: act-test\nauthored_at: 42\n\
+             insert node Person a\n  + name: a\ninsert node Person b\n  + name: b\n"
+        );
+        let mut single_page = Vec::new();
+        super::write_commit_changes_human(&first, &mut single_page).unwrap();
+        assert_eq!(
+            String::from_utf8(single_page).unwrap(),
+            "commit: commit-1\nbranch: main\nparent: parent\nactor: act-test\nauthored_at: 42\n\
+             insert node Person a\n  + name: a\nnext_page_token: continue\n"
+        );
     }
 
     #[test]
@@ -1964,5 +2684,194 @@ mod tests {
         assert_eq!(rendered.blocks[1].changes[0].id, "c");
         assert_eq!(rendered.cursor.as_deref(), Some("durable"));
         assert_eq!(rendered.caught_up, Some(true));
+
+        let mut human = ChangeFeedHumanStream::new(Vec::new());
+        human.write_page(&first).unwrap();
+        human.write_page(&second).unwrap();
+        let bytes = human
+            .finish(second.cursor.as_deref(), second.caught_up)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "commit: commit-1\nbranch: main\nparent: parent\nactor: act-test\nauthored_at: 42\n\
+             insert node Person a\n  + name: a\ninsert node Person b\n  + name: b\n\n\
+             commit: commit-2\nbranch: main\nparent: parent\nactor: act-test\nauthored_at: 42\n\
+             insert node Person c\n  + name: c\n\ncursor: durable\ncaught_up: true\n"
+        );
+        let empty = ChangeFeedHumanStream::new(Vec::new())
+            .finish(Some("durable"), Some(true))
+            .unwrap();
+        assert_eq!(
+            empty,
+            b"(no new commits)\n\ncursor: durable\ncaught_up: true\n"
+        );
+    }
+
+    #[test]
+    fn diff_streams_keep_one_header_and_single_pages_keep_the_continuation() {
+        let first = omnigraph_api_types::DiffOutput {
+            from_commit_id: "from".to_string(),
+            to_commit_id: "to".to_string(),
+            base_commit_id: Some("base".to_string()),
+            changes: vec![change("a")],
+            next_page_token: Some("continue".to_string()),
+        };
+        let second = omnigraph_api_types::DiffOutput {
+            changes: vec![change("b")],
+            next_page_token: None,
+            ..first.clone()
+        };
+        let mut json = DiffJsonStream::new(Vec::new());
+        json.write_page(&first).unwrap();
+        json.write_page(&second).unwrap();
+        let aggregate = omnigraph_api_types::DiffOutput {
+            changes: vec![change("a"), change("b")],
+            next_page_token: None,
+            ..first.clone()
+        };
+        assert_eq!(
+            json.finish().unwrap(),
+            format!("{}\n", serde_json::to_string_pretty(&aggregate).unwrap()).into_bytes()
+        );
+
+        let mut human = Vec::new();
+        let mut stream = DiffHumanStream::new(&mut human);
+        stream.write_page(&first).unwrap();
+        stream.write_page(&second).unwrap();
+        assert_eq!(
+            String::from_utf8(human).unwrap(),
+            "merge_base: base\nfrom: from\nto: to\n\
+             insert node Person a\n  + name: a\ninsert node Person b\n  + name: b\n"
+        );
+        let mut single_page = Vec::new();
+        super::write_diff_human(&first, &mut single_page).unwrap();
+        assert_eq!(
+            String::from_utf8(single_page).unwrap(),
+            "merge_base: base\nfrom: from\nto: to\n\
+             insert node Person a\n  + name: a\nnext_page_token: continue\n"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum WriterFault {
+        AfterPrefix,
+        Flush,
+    }
+
+    struct FailingWriter {
+        fault: WriterFault,
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = match self.fault {
+                WriterFault::AfterPrefix => {
+                    let remaining = 5 - self.bytes.len();
+                    if remaining == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "history output closed",
+                        ));
+                    }
+                    remaining.min(bytes.len())
+                }
+                WriterFault::Flush => bytes.len(),
+            };
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "history output closed",
+            ))
+        }
+    }
+
+    fn assert_writer_failure(
+        label: &str,
+        fault: WriterFault,
+        write: impl FnOnce(&mut dyn Write) -> color_eyre::Result<()>,
+    ) {
+        let mut writer = FailingWriter {
+            fault,
+            bytes: Vec::new(),
+            flushes: 0,
+        };
+        let error = write(&mut writer).unwrap_err();
+        assert!(
+            error.to_string().contains("history output closed"),
+            "{label} {fault:?}: {error}"
+        );
+        match fault {
+            WriterFault::AfterPrefix => {
+                assert_eq!(writer.bytes.len(), 5, "{label}");
+                assert_eq!(
+                    writer.flushes, 0,
+                    "a failed write must stop immediately: {label}"
+                );
+            }
+            WriterFault::Flush => {
+                assert!(!writer.bytes.is_empty(), "{label}");
+                assert_eq!(
+                    writer.flushes, 1,
+                    "the page must flush before returning: {label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn history_stream_pages_propagate_partial_write_and_flush_failures() {
+        let commit = omnigraph_api_types::CommitChangesOutput {
+            cause: cause("commit-1"),
+            changes: vec![change("a")],
+            next_page_token: Some("continue".to_string()),
+        };
+        let diff = omnigraph_api_types::DiffOutput {
+            from_commit_id: "from".to_string(),
+            to_commit_id: "to".to_string(),
+            base_commit_id: None,
+            changes: commit.changes.clone(),
+            next_page_token: commit.next_page_token.clone(),
+        };
+        let feed = omnigraph_api_types::ChangeFeedOutput {
+            blocks: vec![omnigraph_api_types::ChangeBlockOutput {
+                cause: commit.cause.clone(),
+                changes: commit.changes.clone(),
+            }],
+            next_page_token: commit.next_page_token.clone(),
+            cursor: None,
+            caught_up: None,
+        };
+        for fault in [WriterFault::AfterPrefix, WriterFault::Flush] {
+            assert_writer_failure("commit JSON", fault, |writer| {
+                CommitChangesJsonStream::new(writer).write_page(&commit)
+            });
+            assert_writer_failure("commit human", fault, |writer| {
+                CommitChangesHumanStream::new(writer).write_page(&commit)
+            });
+            assert_writer_failure("diff JSON", fault, |writer| {
+                DiffJsonStream::new(writer).write_page(&diff)
+            });
+            assert_writer_failure("diff human", fault, |writer| {
+                DiffHumanStream::new(writer).write_page(&diff)
+            });
+            assert_writer_failure("feed JSON", fault, |writer| {
+                ChangeFeedJsonStream::new(writer).write_page(&feed)
+            });
+            assert_writer_failure("feed human", fault, |writer| {
+                ChangeFeedHumanStream::new(writer).write_page(&feed)
+            });
+            assert_writer_failure("feed human terminal cursor", fault, |writer| {
+                ChangeFeedHumanStream::new(writer)
+                    .finish(Some("durable"), Some(true))
+                    .map(|_| ())
+            });
+        }
     }
 }

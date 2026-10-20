@@ -68,7 +68,7 @@ use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
+use omnigraph::error::{BranchStartRefusal, ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::storage::normalize_root_uri;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::json_params_to_param_map;
@@ -124,6 +124,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_graphs_list,
         handlers::server_graphs_discovery,
         handlers::server_snapshot,
+        handlers::server_access,
         handlers::server_blob_get,
         handlers::server_blob_head,
         handlers::server_blob_put,
@@ -190,7 +191,6 @@ impl utoipa::Modify for SecurityAddon {
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 const INGEST_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
 /// The maximum internal-schema (storage-format) version this binary supports.
 const SERVER_INTERNAL_SCHEMA_VERSION: u32 =
     omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
@@ -493,7 +493,9 @@ enum ApiErrorDetails {
     BlobPreconditionFailure(api::BlobPreconditionFailureOutput),
     ChangeFeedGap(api::ChangeFeedGapOutput),
     ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
+    BranchStartRefusal(api::BranchStartRefusalOutput),
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
+    FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
 }
 
@@ -1395,6 +1397,23 @@ impl ApiError {
         }
     }
 
+    /// HTTP 409, or 410 Gone when the commit is no longer retained: `branch
+    /// create` cannot start a branch at the commit `from` named, and nothing
+    /// was created. The `branch_start_refusal` detail carries the reason.
+    fn branch_start_refusal(message: String, details: api::BranchStartRefusalOutput) -> Self {
+        let status = match details.reason {
+            api::BranchStartRefusalReason::NotRetained => StatusCode::GONE,
+            _ => StatusCode::CONFLICT,
+        };
+        Self {
+            completion_uncertain: false,
+            status,
+            code: (status == StatusCode::CONFLICT).then_some(ErrorCode::Conflict),
+            message: message.into_boxed_str(),
+            details: Some(Box::new(ApiErrorDetails::BranchStartRefusal(details))),
+        }
+    }
+
     /// A refused query: HTTP 400 with the one-line message, plus the
     /// compiler's structured diagnostic when the refusal carries one.
     fn from_compiler(err: &omnigraph_compiler::error::CompilerError) -> Self {
@@ -1524,6 +1543,16 @@ impl ApiError {
                 )));
                 response
             }
+            error @ OmniError::FullTextIndexRequired { .. } => {
+                let mut response = Self::conflict(error.to_string());
+                let OmniError::FullTextIndexRequired { index } = error else {
+                    unreachable!()
+                };
+                response.details = Some(Box::new(ApiErrorDetails::FullTextIndexRequired(
+                    api::FullTextIndexRequiredOutput { index },
+                )));
+                response
+            }
             // Caller-side continuation fault (decode, checksum, or scope). The
             // "change cursor rejected: " prefix is a stable contract so raw
             // HTTP clients can tell it from a genuine retention gap.
@@ -1535,6 +1564,60 @@ impl ApiError {
             }
             error @ OmniError::ReadTargetNotFound { .. } => Self::not_found(error.to_string()),
             error @ OmniError::AmbiguousReadTarget { .. } => Self::bad_request(error.to_string()),
+            error @ OmniError::BranchStartRefused { .. } => {
+                let message = error.to_string();
+                let OmniError::BranchStartRefused {
+                    graph_commit_id,
+                    reason,
+                } = error
+                else {
+                    unreachable!()
+                };
+                let (reason, type_name, branch) = match reason {
+                    BranchStartRefusal::NotRetained { table_key, .. } => {
+                        let Ok((_, type_name)) = api::entity_type_parts(&table_key) else {
+                            return Self::internal(
+                                "branch start refusal named invalid graph type metadata",
+                            );
+                        };
+                        (
+                            api::BranchStartRefusalReason::NotRetained,
+                            Some(type_name.to_string()),
+                            None,
+                        )
+                    }
+                    BranchStartRefusal::SchemaChanged => {
+                        (api::BranchStartRefusalReason::SchemaChanged, None, None)
+                    }
+                    BranchStartRefusal::EarlierStorageFormat => (
+                        api::BranchStartRefusalReason::EarlierStorageFormat,
+                        None,
+                        None,
+                    ),
+                    BranchStartRefusal::BranchDeleted { branch } => (
+                        api::BranchStartRefusalReason::BranchDeleted,
+                        None,
+                        Some(branch),
+                    ),
+                    BranchStartRefusal::UnpublishedCommit => {
+                        (api::BranchStartRefusalReason::UnpublishedCommit, None, None)
+                    }
+                    BranchStartRefusal::UnattachedSnapshot => (
+                        api::BranchStartRefusalReason::UnattachedSnapshot,
+                        None,
+                        None,
+                    ),
+                };
+                Self::branch_start_refusal(
+                    message,
+                    api::BranchStartRefusalOutput {
+                        reason,
+                        graph_commit_id,
+                        type_name,
+                        branch,
+                    },
+                )
+            }
             // Retention loss under a change continuation: 410 with the
             // structured resume hint. Recovery is the baseline handshake.
             OmniError::ChangeFeedGap {
@@ -1628,8 +1711,15 @@ impl ApiError {
             OmniError::Completion { .. } => unreachable!("completion evidence was unwrapped"),
         };
         response.completion_uncertain |= uncertain;
+        // The engine's evidence is the authority: a definite failure, before
+        // any effect or after detached effects no manifest names, keeps the
+        // process serving whatever status it maps to. Without evidence the
+        // status-class default above stands, which fails closed for a 500.
         match evidence {
-            Some(omnigraph::error::CompletionEvidence::BeforeEffect) => {
+            Some(
+                omnigraph::error::CompletionEvidence::BeforeEffect
+                | omnigraph::error::CompletionEvidence::Unpublished,
+            ) => {
                 response.completion_uncertain = false;
             }
             Some(omnigraph::error::CompletionEvidence::Uncertain) => {
@@ -1744,8 +1834,14 @@ impl ApiError {
                 ApiErrorDetails::ChangeDiffRefusal(value) => {
                     output.change_diff_refusal = Some(value)
                 }
+                ApiErrorDetails::BranchStartRefusal(value) => {
+                    output.branch_start_refusal = Some(value)
+                }
                 ApiErrorDetails::FullTextIndexRebuildRequired(value) => {
                     output.full_text_index_rebuild_required = Some(value)
+                }
+                ApiErrorDetails::FullTextIndexRequired(value) => {
+                    output.full_text_index_required = Some(value)
                 }
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
             }
@@ -1802,6 +1898,28 @@ mod api_error_tests {
         let ordinary: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(ordinary.code, Some(ErrorCode::Conflict));
         assert!(ordinary.full_text_index_rebuild_required.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_full_text_index_with_no_segment_returns_required_conflict() {
+        let response = ApiError::from_omni(OmniError::FullTextIndexRequired {
+            index: "Doc.title".into(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
+        assert!(error.error.contains("has no segment"), "{}", error.error);
+        assert!(
+            error.error.contains("rebuild-full-text-indexes"),
+            "{}",
+            error.error
+        );
+        assert_eq!(error.full_text_index_required.unwrap().index, "Doc.title");
+        assert!(error.full_text_index_rebuild_required.is_none());
     }
 
     #[tokio::test]
@@ -1893,6 +2011,78 @@ mod api_error_tests {
         let gap = error.change_feed_gap.expect("structured feed gap");
         assert_eq!(gap.cursor.as_deref(), Some("opaque-cursor"));
         assert_eq!(gap.first_unreadable_commit_id, "01JTESTGAP");
+    }
+
+    #[tokio::test]
+    async fn branch_start_refusal_is_typed_409_or_410() {
+        for (reason, status, code, wire, type_name) in [
+            (
+                BranchStartRefusal::NotRetained {
+                    table_key: "node:Person".to_string(),
+                    published_dataset_version: 7,
+                },
+                StatusCode::GONE,
+                None,
+                api::BranchStartRefusalReason::NotRetained,
+                Some("Person".to_string()),
+            ),
+            (
+                BranchStartRefusal::SchemaChanged,
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::SchemaChanged,
+                None,
+            ),
+            (
+                BranchStartRefusal::EarlierStorageFormat,
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::EarlierStorageFormat,
+                None,
+            ),
+            (
+                BranchStartRefusal::BranchDeleted {
+                    branch: "gone".to_string(),
+                },
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::BranchDeleted,
+                None,
+            ),
+            (
+                BranchStartRefusal::UnpublishedCommit,
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::UnpublishedCommit,
+                None,
+            ),
+            (
+                BranchStartRefusal::UnattachedSnapshot,
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::UnattachedSnapshot,
+                None,
+            ),
+        ] {
+            let error = OmniError::branch_start_refused("01JTESTROOT", reason).before_effect();
+            let message = error.to_string();
+            let response = ApiError::from_omni(error).into_response();
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(error.error, message);
+            let refusal = error.branch_start_refusal.expect("structured refusal");
+            assert_eq!(refusal.reason, wire);
+            assert_eq!(refusal.graph_commit_id, "01JTESTROOT");
+            assert_eq!(refusal.type_name, type_name);
+            assert_eq!(
+                refusal.branch.as_deref(),
+                (wire == api::BranchStartRefusalReason::BranchDeleted).then_some("gone")
+            );
+        }
     }
 
     #[tokio::test]
@@ -2681,6 +2871,7 @@ pub fn build_app(state: AppState) -> Router {
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
+        .route("/access", get(server_access))
         // Register HEAD explicitly. Axum's GET fallback would invoke the GET
         // handler and could begin payload work before stripping the body; the
         // dedicated handler makes the zero-payload-read contract structural.

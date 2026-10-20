@@ -31,6 +31,9 @@
 //! graph, fall back to a binary under `target/storage-upgrade-binaries/`; with
 //! `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` an unresolved predecessor of a
 //! journey fails instead of skipping.
+//! `OMNIGRAPH_LANCE11_BIN` selects exact main0a62bb7b, a Lance11 writer of
+//! graph format16, for candidate/rollback reads without any storage conversion.
+//! It uses the same required/fallback resolver and is enrolled in the gate.
 //! The ignored 0.12.0 cluster-ledger journey is manual release qualification:
 //! storage is served at 14 until the candidate's first publish stamps a branch
 //! 16, followed by live deployment without restart.
@@ -162,19 +165,25 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     )];
     let predecessor = spawn_server_with_cluster_binary_env(root, &old_server, &server_env);
     let query = "query people() { match { $p: Person } return { $p.name, $p.age, $p.bio } }";
-    let served = |binary: &Path, base: &str, args: &[&str]| {
+    let served = |binary: &Path, server: &support::TestServer, args: &[&str]| {
         parse_stdout_json(&output_success(
             cli_at(binary)
-                .env("OMNIGRAPH_BEARER_TOKEN", "parity-tok")
+                .envs(server.credential("parity-tok"))
                 .args(args)
-                .args(["--server", base, "--graph", "knowledge", "--json"]),
+                .args([
+                    "--server",
+                    &server.base_url,
+                    "--graph",
+                    "knowledge",
+                    "--json",
+                ]),
         ))
     };
-    let apply = |binary: &Path, base: &str| {
+    let apply = |binary: &Path, server: &support::TestServer| {
         parse_stdout_json(&output_success(
             cli_at(binary)
-                .env("OMNIGRAPH_BEARER_TOKEN", "parity-tok")
-                .args(["cluster", "apply", "--server", base, "--config"])
+                .envs(server.credential("parity-tok"))
+                .args(["cluster", "apply", "--server", &server.base_url, "--config"])
                 .arg(root)
                 .arg("--json"),
         ))
@@ -206,16 +215,16 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         "node Person { name: String @key age: I32? bio: String? }\n",
     )
     .unwrap();
-    let old_applied = apply(&old, &predecessor.base_url);
+    let old_applied = apply(&old, &predecessor);
     assert_eq!(old_applied["active"], true, "{old_applied}");
     assert_eq!(
         old_applied["deployment"]["result"]["restart_required"],
         false
     );
     assert!(old_applied["deployment"]["result"]["activation"].is_object());
-    let old_snapshot = served(&old, &predecessor.base_url, &["snapshot"]);
+    let old_snapshot = served(&old, &predecessor, &["snapshot"]);
     assert_eq!(old_snapshot["internal_schema_version"], 14);
-    let old_history = served(&old, &predecessor.base_url, &["commit", "list"]);
+    let old_history = served(&old, &predecessor, &["commit", "list"]);
     assert_eq!(old_history["commits"].as_array().unwrap().len(), 3);
     let seeded_commit = old_history["commits"][1]["graph_commit_id"]
         .as_str()
@@ -229,13 +238,9 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         "--snapshot",
         seeded_commit,
     ];
-    let historical_rows = served(&old, &predecessor.base_url, &historical_args)["rows"].clone();
+    let historical_rows = served(&old, &predecessor, &historical_args)["rows"].clone();
     assert_eq!(historical_rows, json!([{"p.name":"Alice","p.age":31}]));
-    let old_read = served(
-        &old,
-        &predecessor.base_url,
-        &["query", "people", "-e", query],
-    );
+    let old_read = served(&old, &predecessor, &["query", "people", "-e", query]);
     assert_eq!(old_read["columns"], json!(["p.name", "p.age", "p.bio"]));
     let old_rows = old_read["rows"].clone();
     // JSON object rows omit null cells; the columns still prove the new field.
@@ -302,24 +307,17 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     let pid = candidate.id();
     let contract = omnigraph_api_types::HTTP_API_CONTRACT;
     assert_eq!(reported_contract(&candidate.base_url), contract);
+    assert_eq!(served(&current, &candidate, &["snapshot"]), old_snapshot);
     assert_eq!(
-        served(&current, &candidate.base_url, &["snapshot"]),
-        old_snapshot
-    );
-    assert_eq!(
-        served(&current, &candidate.base_url, &["commit", "list"]),
+        served(&current, &candidate, &["commit", "list"]),
         old_history
     );
     assert_eq!(
-        served(&current, &candidate.base_url, &historical_args)["rows"],
+        served(&current, &candidate, &historical_args)["rows"],
         historical_rows
     );
     assert_eq!(
-        served(
-            &current,
-            &candidate.base_url,
-            &["query", "people", "-e", query]
-        )["rows"],
+        served(&current, &candidate, &["query", "people", "-e", query])["rows"],
         old_rows
     );
     assert_eq!(reader(&candidate.base_url, contract, query).status(), 403);
@@ -336,7 +334,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         policy.replace("readers: [act-unbound]", "readers: [act-reader]"),
     )
     .unwrap();
-    let applied = apply(&current, &candidate.base_url);
+    let applied = apply(&current, &candidate);
     assert_eq!(applied["active"], true, "{applied}");
     assert_eq!(applied["deployment"]["result"]["converged"], true);
     let current_query = "query people() { match { $p: Person } return { $p.name, $p.email } }";
@@ -350,23 +348,20 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         new_state["applied_revision"]["schema_contracts"]["knowledge"]["schema_identity_domain"],
         original_domain
     );
-    let history = served(&current, &candidate.base_url, &["commit", "list"]);
+    let history = served(&current, &candidate, &["commit", "list"]);
     assert_eq!(
         &history["commits"].as_array().unwrap()[1..],
         old_history["commits"].as_array().unwrap()
     );
     fs::write(root.join("graph.policy.yaml"), policy).unwrap();
-    assert_eq!(apply(&current, &candidate.base_url)["active"], true);
+    assert_eq!(apply(&current, &candidate)["active"], true);
     assert_eq!(
         reader(&candidate.base_url, contract, current_query).status(),
         403
     );
+    assert_eq!(served(&current, &candidate, &["commit", "list"]), history);
     assert_eq!(
-        served(&current, &candidate.base_url, &["commit", "list"]),
-        history
-    );
-    assert_eq!(
-        served(&current, &candidate.base_url, &historical_args)["rows"],
+        served(&current, &candidate, &historical_args)["rows"],
         historical_rows
     );
     assert_eq!(candidate.id(), pid);
@@ -2093,6 +2088,413 @@ fn assert_lists_commit(listing: &serde_json::Value, expected: &serde_json::Value
     for (field, value) in expected.as_object().unwrap() {
         assert_eq!(&found[field], value, "commit {id} field {field} changed");
     }
+}
+
+/// Real predecessor processes own every initial byte. This qualifies the
+/// dependency transition at graph format 16, not an `upgrade` conversion.
+#[test]
+fn genuine_lance11_storage_upgrade_round_trip() {
+    use base64::Engine as _;
+    use serde_json::{Value, json};
+    use std::fs;
+
+    let Some(old) = storage_upgrade_predecessor(
+        "OMNIGRAPH_LANCE11_BIN",
+        "lance-11",
+        "the Lance 11 CLI built from main commit 0a62bb7b",
+    ) else {
+        return;
+    };
+    let current = assert_cmd::cargo::cargo_bin("omnigraph");
+    let temp = tempdir().unwrap();
+    let graph = temp.path().join("lance-transition.omni");
+    let uri = graph.to_str().unwrap();
+    let [schema, data, queries] = journey_fixture(temp.path());
+    let query_path = queries.to_str().unwrap();
+    fs::write(
+        &schema,
+        format!(
+            "{}\nnode BinaryAsset {{ name: String @key payload: Blob }}\n\
+             node NullableVector {{ name: String @key embedding: Vector(4)? }}\n",
+            fs::read_to_string(&schema)
+                .unwrap()
+                .replace("embedding: Vector(4)", "embedding: Vector(4) @index")
+        ),
+    )
+    .unwrap();
+    let payload = base64::engine::general_purpose::STANDARD.encode(vec![0xA5; 128 * 1024]);
+    fs::write(
+        &data,
+        format!(
+            "{}{}\n{}\n",
+            fs::read_to_string(&data).unwrap().replace("Introduction to Machine Learning", "organism seed"),
+            json!({"type":"BinaryAsset", "data":{"name":"old-blob", "payload":format!("base64:{payload}")}}),
+            json!({"type":"NullableVector", "data":{"name":"old-null", "embedding":null}}),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &queries,
+        format!(
+            "{}\n{}",
+            journey_query_source(),
+            r#"
+query terms($term: String) {
+    match { $d: Doc search($d.title, $term) }
+    return { $d.slug }
+    order { $d.slug }
+}
+query nullable_vectors() {
+    match { $v: NullableVector }
+    return { $v.name, $v.embedding }
+    order { $v.name }
+}
+"#,
+        ),
+    )
+    .unwrap();
+    let run = |binary: &Path, args: &[&str]| {
+        let output = run_old(binary, args);
+        assert_ok(&args.join(" "), &output);
+        output
+    };
+    let rows = |binary: &Path, selector: &str, value: &str, name: &str| {
+        let params = match name {
+            "vectors" => r#"{"q":[0.1,0.2,0.3,0.4]}"#,
+            "terms" => r#"{"term":"ORGANISM"}"#,
+            _ => "{}",
+        };
+        let response = support::parse_stdout_json(&run(
+            binary,
+            &[
+                "query", name, "--query", query_path, "--store", uri, selector, value, "--params",
+                params, "--json",
+            ],
+        ));
+        if name == "nullable_vectors" {
+            assert_eq!(response["columns"], json!(["v.name", "v.embedding"]));
+        }
+        response["rows"].clone()
+    };
+    let export = |binary: &Path, branch: &str| {
+        canonical_export_rows(&run(binary, &["export", uri, "--branch", branch]).stdout)
+    };
+    let history = |binary: &Path, branch: &str| {
+        support::parse_stdout_json(&run(
+            binary,
+            &["commit", "list", uri, "--branch", branch, "--json"],
+        ))
+    };
+    run(&old, &["init", "--schema", schema.to_str().unwrap(), uri]);
+    run(
+        &old,
+        &[
+            "load",
+            "--mode",
+            "overwrite",
+            "--data",
+            data.to_str().unwrap(),
+            uri,
+        ],
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let untrained_history = history(&old, "main");
+    let untrained_head = untrained_history["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .max_by_key(|commit| commit["graph_manifest_version"].as_u64().unwrap())
+        .unwrap()["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let untrained_terms = rows(&old, "--snapshot", &untrained_head, "terms");
+    assert_eq!(untrained_terms, json!([{"d.slug":"ml-intro"}]));
+    let untrained_files = graph_files(&graph);
+    runtime.block_on(async {
+        let db = Omnigraph::open(uri).await.unwrap();
+        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let docs = snapshot.open_dataset("node:Doc").await.unwrap();
+        assert!(docs.has_fts_index("title").await.unwrap());
+        assert!(!docs.has_fts_postings("title").await.unwrap());
+    });
+    assert_eq!(
+        graph_files(&graph),
+        untrained_files,
+        "first candidate open must not alter the untrained predecessor root"
+    );
+    run(
+        &old,
+        &[
+            "mutate",
+            "retitle",
+            "--query",
+            query_path,
+            "--store",
+            uri,
+            "--params",
+            r#"{"title":"organism indexed"}"#,
+        ],
+    );
+    run(&old, &["optimize", uri]);
+    run(&old, &["rebuild-full-text-indexes", uri]);
+    run(&old, &["branch", "create", "review", "--uri", uri]);
+    run(
+        &old,
+        &[
+            "mutate",
+            "retitle",
+            "--query",
+            query_path,
+            "--store",
+            uri,
+            "--branch",
+            "review",
+            "--params",
+            r#"{"title":"organism review"}"#,
+        ],
+    );
+    // A row not covered by the predecessor's full build exercises its analyzer
+    // in both the posting and flat-tail paths, without a candidate rebuild.
+    let tail = temp.path().join("tail.jsonl");
+    fs::write(
+        &tail,
+        format!(
+            "{}\n",
+            json!({"type":"Doc", "data":{
+                "slug":"old-tail", "title":"organism tail", "body":"uncovered predecessor row",
+                "embedding":[0.9,0.1,0.2,0.3]
+            }})
+        ),
+    )
+    .unwrap();
+    run(
+        &old,
+        &[
+            "load",
+            "--mode",
+            "append",
+            "--data",
+            tail.to_str().unwrap(),
+            uri,
+        ],
+    );
+    assert_writes_format(&old, uri, 16);
+    let before = graph_files(&graph);
+
+    runtime.block_on(async {
+        let manifest = lance::Dataset::open(graph.join("__manifest").to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest.manifest().writer_version.as_ref().unwrap().version,
+            "11.0.0"
+        );
+        let db = Omnigraph::open(uri).await.unwrap();
+        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let docs = snapshot.open_dataset("node:Doc").await.unwrap();
+        assert!(docs.has_fts_postings("title").await.unwrap());
+        assert!(docs.has_vector_index("embedding").await.unwrap());
+        assert!(docs.has_unindexed_fragments().await.unwrap());
+    });
+    const BRANCHES: [&str; 2] = ["main", "review"];
+    const QUERIES: [&str; 5] = ["docs", "edges", "vectors", "terms", "nullable_vectors"];
+    let exports = BRANCHES.map(|branch| export(&old, branch));
+    let histories = BRANCHES.map(|branch| history(&old, branch));
+    let heads: [String; 2] = std::array::from_fn(|index| {
+        histories[index]["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|commit| commit["graph_branch"].as_str().unwrap_or("main") == BRANCHES[index])
+            .max_by_key(|commit| commit["graph_manifest_version"].as_u64().unwrap())
+            .unwrap()["graph_commit_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    });
+    let answers = BRANCHES.map(|branch| QUERIES.map(|name| rows(&old, "--branch", branch, name)));
+    assert_eq!(
+        answers[0][3],
+        json!([{"d.slug":"ml-intro"}, {"d.slug":"old-tail"}])
+    );
+    assert_eq!(answers[1][3], json!([{"d.slug":"ml-intro"}]));
+    let certificates: Vec<_> = before
+        .iter()
+        .filter(|(path, _)| {
+            path.file_name()
+                .is_some_and(|name| name == "omnigraph_fts_compat.json")
+        })
+        .collect();
+    assert!(
+        !certificates.is_empty(),
+        "the predecessor must write certified postings"
+    );
+    for (path, bytes) in certificates {
+        let certificate: Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(
+            certificate["analyzer_generation"],
+            "lance11.0.0-frostem1.20260821.3-v1"
+        );
+        assert_eq!(
+            path.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            certificate["index_uuid"].as_str().unwrap()
+        );
+    }
+    // Each process is a cold reader. All UUIDs and certificate bytes must stay
+    // unchanged: accepting an old artifact cannot be disguised by rebuilding.
+    for (index, branch) in BRANCHES.into_iter().enumerate() {
+        assert_eq!(export(&current, branch), exports[index]);
+        for (query_index, name) in QUERIES.into_iter().enumerate() {
+            assert_eq!(
+                rows(&current, "--branch", branch, name),
+                answers[index][query_index]
+            );
+            assert_eq!(
+                rows(&current, "--snapshot", &heads[index], name),
+                answers[index][query_index]
+            );
+        }
+        for commit in histories[index]["commits"].as_array().unwrap() {
+            assert_lists_commit(&history(&current, branch), commit);
+        }
+    }
+    assert_eq!(
+        rows(&current, "--snapshot", &untrained_head, "terms"),
+        untrained_terms
+    );
+    assert_eq!(
+        graph_files(&graph),
+        before,
+        "candidate cold reads must preserve predecessor bytes"
+    );
+
+    let additions = temp.path().join("candidate.jsonl");
+    fs::write(&additions, format!("{}\n{}\n{}\n",
+        json!({"type":"Doc", "data":{"slug":"new-doc", "title":"organism candidate", "body":"new writer", "embedding":[0.2,0.1,0.4,0.3]}}),
+        json!({"type":"BinaryAsset", "data":{"name":"new-blob", "payload":format!("base64:{payload}")}}),
+        json!({"type":"NullableVector", "data":{"name":"new-null", "embedding":null}}),
+    )).unwrap();
+    run(
+        &current,
+        &[
+            "load",
+            "--mode",
+            "append",
+            "--data",
+            additions.to_str().unwrap(),
+            uri,
+        ],
+    );
+    run(
+        &current,
+        &["mutate", "revise", "--query", query_path, "--store", uri],
+    );
+    run(&current, &["rebuild-full-text-indexes", uri]);
+    let rebuilt_files = graph_files(&graph);
+    let new_certificates: Vec<_> = rebuilt_files
+        .iter()
+        .filter(|(path, _)| {
+            path.file_name()
+                .is_some_and(|name| name == "omnigraph_fts_compat.json")
+                && !before.contains_key(*path)
+        })
+        .collect();
+    assert!(
+        !new_certificates.is_empty(),
+        "the candidate must build new posting artifacts"
+    );
+    for (_, bytes) in new_certificates {
+        let certificate: Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(
+            certificate["analyzer_generation"],
+            "lance11.0.0-frostem1.20260821.3-v1"
+        );
+    }
+    run(&current, &["optimize", uri]);
+    run(&current, &["cleanup", uri, "--keep", "100", "--confirm"]);
+    assert_writes_format(&current, uri, 16);
+    runtime.block_on(async {
+        let manifest = lance::Dataset::open(graph.join("__manifest").to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest.manifest().writer_version.as_ref().unwrap().version,
+            "13.0.0"
+        );
+    });
+    assert_eq!(
+        rows(&current, "--branch", "main", "terms"),
+        json!([{"d.slug":"ml-intro"}, {"d.slug":"new-doc"}, {"d.slug":"old-tail"}])
+    );
+    // The JSON renderer omits null-valued keys; `rows` still asserts both
+    // projected column names so an omitted projection cannot satisfy this.
+    assert_eq!(
+        rows(&current, "--branch", "main", "nullable_vectors"),
+        json!([{"v.name":"new-null"}, {"v.name":"old-null"}])
+    );
+    let written_export = run(&current, &["export", uri]);
+    for name in ["old-blob", "new-blob"] {
+        assert_eq!(
+            exported_row_with_data_value(&written_export.stdout, "name", name)["data"]["payload"],
+            format!("base64:{payload}")
+        );
+    }
+    // Qualified rollback reads actual candidate data and index writes, including
+    // all-null nullable outer vectors, rather than only reopening old files.
+    for (index, branch) in BRANCHES.into_iter().enumerate() {
+        assert_eq!(export(&old, branch), export(&current, branch));
+        for (query_index, name) in QUERIES.into_iter().enumerate() {
+            assert_eq!(
+                rows(&old, "--branch", branch, name),
+                rows(&current, "--branch", branch, name)
+            );
+            for binary in [&old, &current] {
+                assert_eq!(
+                    rows(binary, "--snapshot", &heads[index], name),
+                    answers[index][query_index]
+                );
+            }
+        }
+        for commit in histories[index]["commits"].as_array().unwrap() {
+            assert_lists_commit(&history(&old, branch), commit);
+        }
+    }
+    for binary in [&old, &current] {
+        assert_eq!(
+            rows(binary, "--snapshot", &untrained_head, "terms"),
+            untrained_terms
+        );
+    }
+    // No backup command exists: reuse the owner's offline whole-root byte-copy
+    // restore at the original path, including native refs and index artifacts.
+    fs::remove_dir_all(&graph).unwrap();
+    for (path, bytes) in &before {
+        let destination = graph.join(path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(destination, bytes).unwrap();
+    }
+    for (index, branch) in BRANCHES.into_iter().enumerate() {
+        for binary in [&old, &current] {
+            assert_eq!(export(binary, branch), exports[index]);
+            for (query_index, name) in QUERIES.into_iter().enumerate() {
+                assert_eq!(
+                    rows(binary, "--branch", branch, name),
+                    answers[index][query_index]
+                );
+            }
+        }
+    }
+    assert_eq!(
+        graph_files(&graph),
+        before,
+        "restored backup remains byte-for-byte intact"
+    );
 }
 
 #[test]

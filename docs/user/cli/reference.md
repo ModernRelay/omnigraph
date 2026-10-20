@@ -44,9 +44,9 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
-| `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
+| `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
-| `commit list/show/changes/publish/drop` | Inspect history (`list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it) | direct or served |
+| `commit list/show/changes/publish/drop` | Inspect history (`list --limit`/`--page-token` for one page of it, `list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other and paging) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it); `publish` and `drop` take `--as` on a direct graph, the reads refuse it | direct or served |
 | `diff` | Net entity changes between two points: branches or commit ids (`--from`, `--to`) | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
@@ -224,9 +224,9 @@ aliases:
 Each profile binds exactly one of `server`, `cluster`, or `store`. Select it with
 `--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled by a profile.
 
-Bearer tokens never belong in `config.yaml`. Store a token with
-`omnigraph login <server>` or provide `OMNIGRAPH_BEARER_TOKEN` for the current
-invocation.
+Bearer tokens never belong in `config.yaml`. Bind one to a declared server with
+`omnigraph login <server>` or `OMNIGRAPH_TOKEN_<NAME>`; the CLI sends it only to
+URLs under that server's `url` (see [server credentials](index.md#use-a-server)).
 
 ## Managed cluster commands
 
@@ -323,7 +323,7 @@ omnigraph cluster apply --managed --plan PREVIEW_ID --idempotency-key DEPLOYMENT
 
 The canonical `OMNIGRAPH_CONTROL_API` must match the selected context. A
 missing or mismatched pair refuses before any request. These credentials are
-separate from `OMNIGRAPH_BEARER_TOKEN`, named servers, and operator profiles.
+separate from [server credentials](index.md#use-a-server) and operator profiles.
 
 `--managed` requires context except `create`, `list` and explicit-origin operation
 lookup; `--direct` is rejected. Managed API failures never trigger local deployment.

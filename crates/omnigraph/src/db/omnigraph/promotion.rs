@@ -112,6 +112,7 @@ async fn resolve_pinned_for_write(
                     entry.version_metadata.last_linear_version(),
                     &location,
                     Some(&caches.session),
+                    None,
                 )
                 .await?
         }

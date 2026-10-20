@@ -1730,11 +1730,10 @@ async fn issue_567_forced_prefilter_skips_the_nearest_gate_threshold() {
     );
 }
 
-/// Lance 11 still drops KNN ordering metadata when its sorted candidate stream
-/// is late-hydrated with ordinary node payload. Above one 8,192-row output
-/// batch, a parallel final coalesce can then put a later partition first. This
-/// engine-level cell proves the temporary one-output-partition fence is wired
-/// through the real stable-row-ID graph scan and preserves the complete rank.
+/// Lance 13 preserves KNN ordering metadata through V2 payload hydration.
+/// Above one 8,192-row output batch, the engine must merge parallel partitions
+/// by that order. This exercises the real stable-row-ID graph scan and proves
+/// the complete rank survives without the legacy V1 single-partition fence.
 #[tokio::test(flavor = "multi_thread")]
 async fn nearest_large_k_preserves_global_order_through_payload_hydration() {
     const ROWS_PER_FRAGMENT: usize = 5_000;
@@ -2731,5 +2730,92 @@ async fn full_text_analyzer_holds_after_first_rows_and_overwrites_issue_904() {
         hits("feature", "notes").await,
         ["n1", "n2"],
         "a type's first rows on a branch"
+    );
+}
+
+/// A full-text call refuses a declared index that has no segment at the
+/// query's snapshot, rather than answering with Lance's bare, case-sensitive
+/// tokenizer: a table version written before writers declared the analyzer
+/// is this case, built here with a raw Lance append to the table's creation
+/// version, published without index work. Planning and explain refuse alike
+/// (`FullTextIndexRequired`, before any scan); building the declared index
+/// lifts the refusal, and the call then folds case.
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
+    use lance::index::DatasetIndexExt;
+    use omnigraph::db::ReadTarget;
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, ANALYZER_SCHEMA).await.unwrap());
+    let entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .clone();
+    let mut raw = lance::Dataset::open(&format!("{uri}/{}", entry.dataset_path))
+        .await
+        .unwrap();
+    assert_eq!(raw.version().version, entry.published_dataset_version);
+    let body = raw.schema().field("body").unwrap().id;
+    assert!(
+        !raw.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.fields.contains(&body)),
+        "the creation version declares no segment on `body`"
+    );
+    let schema = std::sync::Arc::new(arrow_schema::Schema::from(raw.schema()));
+    let column = |values: [&str; 2]| {
+        std::sync::Arc::new(StringArray::from(values.to_vec())) as arrow_array::ArrayRef
+    };
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "__id" | "slug" => column(["d1", "d2"]),
+            "body" => column(["Deep Learning", "deep dive"]),
+            other => panic!("unexpected `Doc` field {other}"),
+        })
+        .collect::<Vec<_>>();
+    lance_append_inline(
+        &mut raw,
+        arrow_array::RecordBatch::try_new(schema, columns).unwrap(),
+    )
+    .await;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
+        .await
+        .unwrap();
+
+    let deep = params(&[("q", "deep")]);
+    let refused = |error: OmniError| match error {
+        OmniError::FullTextIndexRequired { index } => assert_eq!(index, "Doc.body"),
+        other => panic!("an index with no segment answered or failed otherwise: {other}"),
+    };
+    refused(
+        query_branch(&db, "main", ANALYZER_QUERIES, "docs", &deep)
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        db.explain_query(ReadTarget::branch("main"), ANALYZER_QUERIES, "docs", &deep)
+            .await
+            .unwrap_err(),
+    );
+
+    db.ensure_indices().await.unwrap();
+    assert_eq!(
+        first_column_sorted(
+            &query_branch(&db, "main", ANALYZER_QUERIES, "docs", &deep)
+                .await
+                .unwrap()
+        ),
+        ["d1", "d2"],
+        "the built index folds case"
     );
 }

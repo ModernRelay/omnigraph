@@ -28,8 +28,10 @@ omnigraph branch list --store graph.omni
 omnigraph branch delete review/abandoned --store graph.omni
 ```
 
-Creating a branch defaults to `main` when `--from` is omitted. A load can create
-a missing target branch by combining `--branch <name>` with `--from <base>`.
+Creating a branch defaults to `main` when `--from` is omitted. To start a
+branch at a past commit instead of a branch head, use `--from-commit`; see
+[start a branch at a commit](#start-a-branch-at-a-commit). A load can create a
+missing target branch by combining `--branch <name>` with `--from <base>`.
 
 Each branch operation is also a GQ statement, so a client that already sends
 `.gq` source needs no second transport. The three control writes go to
@@ -38,6 +40,7 @@ with no request target, name, or parameters:
 
 ```text
 branch create "review/add-benchmark" from main
+branch create "fix/import" from commit "<commit-id>"
 branch merge "review/add-benchmark" into main
 branch delete "review/abandoned"
 branch list
@@ -126,6 +129,63 @@ omnigraph commit show <commit-id> --uri graph.omni
 `main`; selecting a branch includes the history inherited at its fork plus its
 own commits.
 
+A long history can be read a page at a time:
+
+```bash
+omnigraph commit list graph.omni --branch main --limit 50 --json
+omnigraph commit list graph.omni --branch main --page-token <token> --json
+```
+
+`--limit` (1 to 1,000) returns one page with `head_commit_id`, the head the
+listing resolved, and `next_page_token` while older commits remain. Pass the
+token back with the same `--branch` for the next page, of 100 commits unless
+`--limit` sets the size. Later pages answer for that head even after the
+branch moves, so a page never repeats or skips a commit. A page reads only the
+history it returns; without `--limit` or `--page-token` the whole history is
+read and listed at once. Served under a policy, a caller whose `read` does
+not cover every branch continues only from a commit of the branch's history,
+and is refused with `400` otherwise: a commit the branch still holds, or one a
+branch the caller may read published, costs nothing more, and any other is
+looked for down the branch's history, which costs what the whole listing
+costs. Served, the same listing is
+`GET /commits?branch=<name>&limit=<n>` continued with `page_token=<token>`.
+Paging applies to a branch's history, not to `--unpublished` or
+`--unattached`.
+
+### Start a branch at a commit
+
+A branch can start at a published graph commit instead of a branch's head. It
+holds that commit's rows and history, as if it had been created while the
+commit was the head. Use it to try a fix or a revert where a change was made,
+then merge the branch as usual; the commit is its merge base.
+
+```bash
+omnigraph commit list graph.omni --branch main --json
+omnigraph branch create fix/import --from-commit <commit-id> --store graph.omni
+```
+
+The statement is `branch create "fix/import" from commit "<commit-id>"`, and
+`POST /branches` takes the id in `from_commit`, which excludes `from` (a
+request with both answers `400`). An id no commit has answers `404`. The
+receipt names the branch the new
+branch was forked off in `from`, for a commit start the branch that wrote the
+commit, and the commit it starts at in `from_commit_id`. Every receipt carries
+`from_commit_id`: for a start from a branch it is that branch's head when the
+branch was created. A branch starts only at a commit whose whole snapshot is
+still there under the graph's current schema; otherwise nothing is created:
+
+| `from_commit` names | Answer | `branch_start_refusal.reason` |
+|---|---|---|
+| A commit whose table versions `cleanup` reclaimed, wholly or in a run that stopped part way | `410` | `not_retained`, with the type in `type_name` |
+| A commit written under an earlier schema than the graph's | `409` | `schema_changed` |
+| A commit written before the storage upgrade | `409` | `earlier_storage_format` |
+| A commit of a branch that was deleted, even if a branch has since been created under its name | `409` | `branch_deleted`, with the branch in `branch` |
+| An [unpublished commit](#unpublished-commits) | `409` | `unpublished_commit`; publish it, then start at the published commit |
+| An [unattached snapshot](#unattached-branches) | `409` | `unattached_snapshot`; it never becomes branch history |
+
+While the new branch lives, `cleanup` keeps the commit's table versions, so a
+later start at the same commit succeeds too.
+
 ### Unpublished commits
 
 A mutation or a merge written `as commit` records its result as an unpublished
@@ -144,13 +204,14 @@ commit drop "<commit-id>"
 ```
 
 `commit publish` installs the commit on the branch it recorded as its target.
-A published commit is answered as it stands by a repeat publish and is never
-dropped. An unpublished commit expires once an ordinary write moves its target
-branch's head past the commit's parent, or when that branch is deleted or
-recreated, and can then only be dropped: a publish is refused (a moved head
-fails its precondition), reads at its id (`--snapshot`, `commit show`,
-`commit changes`) answer `not found`, and it leaves the `--unpublished`
-listing.
+The published commit keeps the actor and timestamp of the write that created
+it; the publish records no publisher. A published commit is answered as it
+stands by a repeat publish and is never dropped. An unpublished commit expires
+once an ordinary write moves its target branch's head past the commit's
+parent, or when that branch is deleted or recreated, and can then only be
+dropped: a publish is refused (a moved head fails its precondition), reads at
+its id (`--snapshot`, `commit show`, `commit changes`) answer `not found`, and
+it leaves the `--unpublished` listing.
 
 ```bash
 omnigraph branch merge feature --into main --as-commit --uri graph.omni

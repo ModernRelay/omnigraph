@@ -1,0 +1,89 @@
+# issue: none
+# notes: A node overwrite's plan carries one retained-edges stage per endpoint of every edge
+# notes: table that references the type; dropping a node a committed edge still points at
+# notes: refuses as an orphan edge before any fragment write, and keeping every referenced
+# notes: node lands the replacement while probing retained edges for removed, unreferenced p3.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    id: String @key
+    email: String @unique
+}
+edge Knows: Person -> Person {
+    w: I64
+}
+
+--- seed
+{"type":"Person","data":{"id":"p1","email":"p1@x"}}
+{"type":"Person","data":{"id":"p2","email":"p2@x"}}
+{"type":"Person","data":{"id":"p3","email":"p3@x"}}
+{"edge":"Knows","from":"p1","to":"p2","data":{"w":1}}
+
+--- csv drop_p2.csv
+id,email
+p1,a@x
+p3,c@x
+
+--- mutate
+load csv "drop_p2.csv" into node:Person mode overwrite header
+
+--- expect error: 'p2' not found in Person
+
+--- query
+query unchanged() {
+    match { $p: Person }
+    return { $p.id, $p.email }
+}
+
+--- expect unordered
+{"p.id": "p1", "p.email": "p1@x"}
+{"p.id": "p2", "p.email": "p2@x"}
+{"p.id": "p3", "p.email": "p3@x"}
+
+--- expect shape
+p.id: String
+p.email: String
+
+--- csv keep_referenced.csv
+id,email
+p1,a@x
+p2,b@x
+p4,d@x
+
+--- mutate
+load csv "keep_referenced.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load validate retained_edges node:Person edge:Knows from: access probe
+load validate retained_edges node:Person edge:Knows to: access probe
+load write: overwrite fragments
+load executed: partitions 1 rows 3
+
+--- query
+query replaced() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.email, $b.email }
+}
+
+--- expect unordered
+{"a.email": "a@x", "b.email": "b@x"}
+
+--- expect shape
+a.email: String
+b.email: String

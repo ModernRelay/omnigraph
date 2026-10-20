@@ -10,7 +10,7 @@ use lance::blob::blob_field;
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::types::{PropType, ScalarType};
+use omnigraph_compiler::types::PropType;
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep, SchemaShape,
     SchemaTypeKind, SystemColumns, build_catalog_from_ir, compile_schema_shape,
@@ -20,7 +20,7 @@ use omnigraph_compiler::{
 use crate::db::graph_coordinator::{
     CapturedLineage, GraphCoordinator, PublishedSnapshot, commit_not_found,
 };
-use crate::error::{ManifestErrorKind, OmniError, Result, dataset_subject};
+use crate::error::{BranchStartRefusal, ManifestErrorKind, OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
 use crate::seams::{decide_seam, fail};
 use crate::storage::{
@@ -80,6 +80,23 @@ use super::schema_state::{
 use super::snapshot::Snapshot;
 use super::{ReadTarget, ResolvedTarget, SnapshotId};
 
+/// Commits one page of a commit list holds when the caller sets no limit.
+pub const COMMIT_LIST_DEFAULT_PAGE_COMMITS: usize = 100;
+/// The most commits one page of a commit list may hold.
+pub const COMMIT_LIST_MAX_PAGE_COMMITS: usize = 1000;
+
+/// One page of a branch's commit list ([`Omnigraph::list_commits_page`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitListPage {
+    /// The head the first page resolved; every page of the list answers for
+    /// its first-parent chain.
+    pub head_commit_id: String,
+    /// Newest first.
+    pub commits: Vec<GraphCommit>,
+    /// Continues the list below `commits`; absent on its last page.
+    pub next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeOutcome {
     AlreadyUpToDate,
@@ -105,6 +122,41 @@ impl AddressedCommit {
             Self::Published(published) => published.graph_branch.as_deref(),
         }
     }
+}
+
+/// What a branch create started from: the branch it forked and the commit
+/// the new branch's head is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCreated {
+    /// The branch the new branch was forked off: the branch named, or for a
+    /// start at a commit, the branch that wrote the commit.
+    pub from: String,
+    /// The graph commit the new branch starts at: the branch's head when the
+    /// branch was created, or the named commit.
+    pub from_commit_id: String,
+}
+
+/// Where `branch_create_from_impl` starts the new branch: a branch's head
+/// when it is captured, or a published commit of the branch that wrote it.
+enum CreateStart {
+    Head(String),
+    Commit(GraphCommit),
+}
+
+/// Table versions a commit start opens at once, and objects it probes at
+/// once, to prove the commit is retained.
+const BRANCH_START_RETENTION_PROBES: usize = 8;
+
+/// A start at `commit_id` refused because cleanup reclaimed the version of
+/// `entry` the commit pins.
+fn branch_start_not_retained(commit_id: &str, entry: &crate::db::DatasetEntry) -> OmniError {
+    OmniError::branch_start_refused(
+        commit_id,
+        BranchStartRefusal::NotRetained {
+            table_key: entry.type_key.clone(),
+            published_dataset_version: entry.published_dataset_version,
+        },
+    )
 }
 
 /// A merge's disposition and the graph commit published by that invocation.
@@ -2306,6 +2358,7 @@ impl Omnigraph {
                 .set_read_caches(crate::db::manifest::SnapshotReadCaches {
                     session: self.read_caches.session.clone(),
                     handles: self.read_caches.handles.clone(),
+                    table_wrapper: None,
                 });
         }
         Ok(resolved)
@@ -3685,51 +3738,97 @@ impl Omnigraph {
         Ok(())
     }
 
-    pub async fn branch_create_from(&self, from: impl Into<ReadTarget>, name: &str) -> Result<()> {
+    pub async fn branch_create_from(
+        &self,
+        from: impl Into<ReadTarget>,
+        name: &str,
+    ) -> Result<BranchCreated> {
         self.branch_create_from_as(from, name, None).await
     }
 
-    /// Create a branch from a specific source branch with an explicit
-    /// actor for engine-layer policy enforcement (MR-722 fan-out).
+    /// Create `name` from `from` with an explicit actor for engine-layer
+    /// policy enforcement (MR-722 fan-out): a branch, whose head the new
+    /// branch starts at, or a published graph commit
+    /// ([`ReadTarget::Snapshot`]), which the new branch starts at with that
+    /// commit's data and history. Returns the branch forked and the commit
+    /// the new branch starts at.
     ///
     /// Scope is `BranchTransition { source, target }` — matches the
     /// HTTP-layer convention at `server_branch_create`
     /// (branch=Some(from), target_branch=Some(name)), so engine and
-    /// HTTP fire the same Cedar decision. Pinned-snapshot sources
-    /// (which aren't a branch ref) materialize as the sentinel
-    /// `<snapshot>` for the policy check; Cedar rules using
-    /// `branch_scope: any` still match, rules pinning a specific
-    /// source branch correctly do not.
+    /// HTTP fire the same Cedar decision. A commit start's source is the
+    /// branch a control on the commit addresses
+    /// ([`Self::commit_target_branch`]); a denial answers the not-found an
+    /// unknown id answers, so the id discloses neither existence nor
+    /// publication state. An unpublished commit and an unattached snapshot
+    /// are refused: neither is any branch's history.
     pub async fn branch_create_from_as(
         &self,
         from: impl Into<ReadTarget>,
         name: &str,
         actor: Option<&str>,
-    ) -> Result<()> {
-        let target = from.into();
-        let source_branch = match &target {
-            ReadTarget::Branch(b) => b.clone(),
-            _ => "<snapshot>".to_string(),
+    ) -> Result<BranchCreated> {
+        let start = match from.into() {
+            ReadTarget::Branch(branch) => {
+                self.enforce(
+                    omnigraph_policy::PolicyAction::BranchCreate,
+                    &omnigraph_policy::ResourceScope::BranchTransition {
+                        source: branch.clone(),
+                        target: name.to_string(),
+                    },
+                    actor,
+                )?;
+                CreateStart::Head(branch)
+            }
+            ReadTarget::Snapshot(id) => {
+                let addressed = self.addressed_commit(id.as_str()).await?;
+                let scope = omnigraph_policy::ResourceScope::BranchTransition {
+                    source: addressed.target_branch().unwrap_or("main").to_string(),
+                    target: name.to_string(),
+                };
+                match self.enforce(omnigraph_policy::PolicyAction::BranchCreate, &scope, actor) {
+                    Err(OmniError::Policy(_)) if actor.is_some() => {
+                        return Err(commit_not_found(&id));
+                    }
+                    decision => decision?,
+                }
+                match addressed {
+                    AddressedCommit::Published(commit) => CreateStart::Commit(commit),
+                    AddressedCommit::Proposal(_) => {
+                        return Err(OmniError::branch_start_refused(
+                            id.as_str(),
+                            BranchStartRefusal::UnpublishedCommit,
+                        )
+                        .before_effect());
+                    }
+                    AddressedCommit::Unattached(_) => {
+                        return Err(OmniError::branch_start_refused(
+                            id.as_str(),
+                            BranchStartRefusal::UnattachedSnapshot,
+                        )
+                        .before_effect());
+                    }
+                }
+            }
         };
-        self.enforce(
-            omnigraph_policy::PolicyAction::BranchCreate,
-            &omnigraph_policy::ResourceScope::BranchTransition {
-                source: source_branch,
-                target: name.to_string(),
-            },
-            actor,
-        )?;
-        self.branch_create_from_impl(target, name).await
+        // Keep the capture and the start proof out of every caller's frame.
+        Box::pin(self.branch_create_from_impl(start, name)).await
     }
 
-    async fn branch_create_from_impl(&self, from: impl Into<ReadTarget>, name: &str) -> Result<()> {
-        let target = from.into();
-        let ReadTarget::Branch(branch_name) = target else {
-            return Err(OmniError::manifest(
-                "branch creation from pinned snapshots is not supported yet".to_string(),
-            ));
+    async fn branch_create_from_impl(
+        &self,
+        start: CreateStart,
+        name: &str,
+    ) -> Result<BranchCreated> {
+        // The source a commit start clones is the branch incarnation that
+        // wrote the commit, where the version that published it lives.
+        let branch = match &start {
+            CreateStart::Head(branch) => normalize_branch_name(branch)?,
+            CreateStart::Commit(commit) => match commit.graph_branch.as_deref() {
+                Some(branch) => normalize_branch_name(branch)?,
+                None => None,
+            },
         };
-        let branch = normalize_branch_name(&branch_name)?;
         let target_branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         let _export_exclusion = self.reserve_export_destructive_control()?;
@@ -3753,10 +3852,21 @@ impl Omnigraph {
         self.ensure_schema_state_valid()
             .await
             .map_err(OmniError::before_effect)?;
-        let mut source_coord = self
-            .capture_branch_control_source(branch.as_deref())
-            .await
-            .map_err(OmniError::before_effect)?;
+        let (mut source_coord, start_record) = match &start {
+            CreateStart::Head(_) => (
+                self.capture_branch_control_source(branch.as_deref())
+                    .await
+                    .map_err(OmniError::before_effect)?,
+                None,
+            ),
+            CreateStart::Commit(commit) => {
+                let (source, record) =
+                    Box::pin(self.capture_commit_start_source(branch.as_deref(), commit))
+                        .await
+                        .map_err(OmniError::before_effect)?;
+                (source, Some(record))
+            }
+        };
         let (_control_catalog, _table_guards) = self
             .join_control_catalog_to_capture(
                 control_catalog,
@@ -3771,9 +3881,158 @@ impl Omnigraph {
         // A locally owned source coordinator cannot be swapped by a concurrent
         // `branch_create_from`; the ref write is durable whichever handle
         // issued it.
-        source_coord.branch_create(&target_branch).await?;
+        let created = match (start, start_record) {
+            (CreateStart::Head(from), _) => BranchCreated {
+                from_commit_id: source_coord.branch_create(&target_branch).await?,
+                from,
+            },
+            (CreateStart::Commit(commit), Some(record)) => {
+                self.prove_commit_start(&source_coord, &record)
+                    .await
+                    .map_err(OmniError::before_effect)?;
+                source_coord
+                    .branch_create_at(&target_branch, &record)
+                    .await?;
+                BranchCreated {
+                    from: commit.graph_branch.unwrap_or_else(|| "main".to_string()),
+                    from_commit_id: commit.graph_commit_id,
+                }
+            }
+            (CreateStart::Commit(_), None) => {
+                unreachable!("a commit start captures the commit's record with its source")
+            }
+        };
         self.invalidate_read_caches().await;
-        Ok(())
+        Ok(created)
+    }
+
+    /// The source a branch starting at the published `commit` clones, and
+    /// the commit's record read from it, captured under the control gates.
+    /// The branch incarnation that wrote the commit must still be the live
+    /// one under its name. A deleted name and a name created again since
+    /// are the same fact, so both answer `BranchDeleted`, before any effect
+    /// and on every door.
+    async fn capture_commit_start_source(
+        &self,
+        branch: Option<&str>,
+        commit: &GraphCommit,
+    ) -> Result<(GraphCoordinator, super::manifest::HistoryRecord)> {
+        let commit_id = commit.graph_commit_id.as_str();
+        let deleted = || {
+            OmniError::branch_start_refused(
+                commit_id,
+                BranchStartRefusal::BranchDeleted {
+                    branch: commit
+                        .graph_branch
+                        .clone()
+                        .unwrap_or_else(|| "main".to_string()),
+                },
+            )
+        };
+        let source = match self.capture_branch_control_source(branch).await {
+            Err(OmniError::BranchNotFound { .. }) => return Err(deleted()),
+            captured => captured?,
+        };
+        match source.published_record(commit_id).await? {
+            Some(record) if record.commit.native_branch.as_deref() == source.native_branch() => {
+                Ok((source, record))
+            }
+            Some(_) => Err(deleted()),
+            // Addressed as published, its record is held by no live
+            // incarnation of its branch now: that branch was deleted.
+            None if commit.graph_branch.is_some() => Err(deleted()),
+            None => Err(commit_not_found(&SnapshotId::new(commit_id))),
+        }
+    }
+
+    /// Prove under the control gates that a branch can start at `record`,
+    /// which the captured `source` wrote: the commit is at or below the
+    /// captured head; its schema is the accepted one; and every table
+    /// version its snapshot pins still opens with every object it
+    /// references, so the new branch's first manifest names a complete
+    /// snapshot that its base keeps from cleanup from then on.
+    async fn prove_commit_start(
+        &self,
+        source: &GraphCoordinator,
+        record: &super::manifest::HistoryRecord,
+    ) -> Result<()> {
+        let commit_id = record.commit.graph_commit_id.as_str();
+        if record.commit.graph_manifest_version > source.version() {
+            return Err(OmniError::manifest_internal(format!(
+                "commit '{commit_id}' names `__manifest` version {} above the captured head \
+                 version {} of the branch that wrote it",
+                record.commit.graph_manifest_version,
+                source.version()
+            )));
+        }
+        let snapshot = Snapshot::wrap(record.snapshot(self.root_uri())?);
+        // Every record carries the contract its commit was written under:
+        // the storage upgrade gives each converted commit one too. A commit
+        // from before the upgrade is refused where its `__manifest` version
+        // is cloned, which only the legacy history reads.
+        let Some(contract) = snapshot.schema_contract() else {
+            return Err(OmniError::manifest_internal(format!(
+                "the record of commit '{commit_id}' carries no schema contract"
+            )));
+        };
+        if Some(contract) != source.snapshot().schema_contract() {
+            return Err(OmniError::branch_start_refused(
+                commit_id,
+                BranchStartRefusal::SchemaChanged,
+            ));
+        }
+        // A pin the captured head also holds is a root of every collection,
+        // and the collector never deletes a root's files. Any other pin may
+        // be a version an interrupted cleanup already emptied: its sweep
+        // deletes a version's files before its manifest, so the manifest
+        // opening proves nothing about them, and each object it references
+        // is probed. These requests run under the exclusive schema permit,
+        // which every write in the process waits on, so the pins open and
+        // their objects are probed with bounded concurrency, stopping at the
+        // first missing object.
+        use futures::StreamExt;
+        let head = source.snapshot();
+        let entries: std::collections::BTreeMap<_, _> = snapshot
+            .datasets()
+            .filter(|entry| {
+                !head
+                    .datasets()
+                    .any(|held| held.same_physical_version(entry))
+            })
+            .map(|entry| (entry.type_key.clone(), entry.clone()))
+            .collect();
+        let mut opens = futures::stream::iter(entries.values().cloned())
+            .map(|entry| async move {
+                let dataset = match self.table_store.open_at_entry(&entry).await {
+                    Ok(dataset) => dataset,
+                    Err(OmniError::HistoricalVersionReclaimed { .. }) => {
+                        return Err(branch_start_not_retained(commit_id, &entry));
+                    }
+                    Err(error) => return Err(error),
+                };
+                let mut objects = collector::CollectorPathSnapshot::default();
+                collector::capture_dataset_paths(&mut objects, &dataset, &entry.type_key).await?;
+                Ok(objects)
+            })
+            .buffer_unordered(BRANCH_START_RETENTION_PROBES);
+        let mut objects = collector::CollectorPathSnapshot::default();
+        while let Some(opened) = opens.next().await {
+            objects.absorb(opened?);
+        }
+        match objects
+            .first_missing_location(BRANCH_START_RETENTION_PROBES)
+            .await?
+        {
+            None => Ok(()),
+            Some(type_key) => Err(branch_start_not_retained(
+                commit_id,
+                entries.get(&type_key).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "a branch start probe reported '{type_key}', which no probed pin names"
+                    ))
+                })?,
+            )),
+        }
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
@@ -3886,8 +4145,9 @@ impl Omnigraph {
     }
 
     /// List the branch's reachable graph lineage, **most recent first** (by
-    /// [`GraphCommit::lineage_key`] — the same total order head selection and
-    /// any future keyset pagination cursor derive from).
+    /// [`GraphCommit::lineage_key`], the order head selection derives from,
+    /// which along one first-parent chain is falling generation: the order
+    /// [`Self::list_commits_page`] walks).
     ///
     /// `branch: None` (or `"main"`) lists main's lineage projection. A named
     /// branch lists the history reachable from that branch's head: the main
@@ -3908,6 +4168,168 @@ impl Omnigraph {
         let mut commits = coordinator.list_commits().await?;
         commits.reverse();
         Ok(commits)
+    }
+
+    /// One page of [`Self::list_commits`]: up to `limit` commits
+    /// ([`COMMIT_LIST_DEFAULT_PAGE_COMMITS`] when `None`), newest first, and
+    /// a token that continues the list below them.
+    ///
+    /// The first page resolves the branch's head and names it; a continuation
+    /// (`page_token`) answers for that head's first-parent chain, whatever
+    /// the branch did since. The token carries a digest of the branch, never
+    /// its name. A page reads the branch's `__manifest` and the `__history`
+    /// extents its own commits occupy, so its cost follows the page, not the
+    /// history below it.
+    ///
+    /// The token is checksummed, not signed. A continuation is refused for
+    /// another graph or branch digest, but the commit it continues from, and
+    /// the head it names, are the caller's claim: the walk starts at any
+    /// commit this handle can find, on any branch. That is no authority for a
+    /// caller who may read every commit by id; a caller who may read only some
+    /// branches uses [`Self::list_commits_page_readable`].
+    pub async fn list_commits_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<CommitListPage> {
+        self.commit_list_page(branch, page_token, limit, None).await
+    }
+
+    /// [`Self::list_commits_page`] for a caller who may read only some
+    /// branches; `can_read` answers for a branch by name, as for
+    /// [`Self::diff_page_readable`]. A continuation lists from its commit only
+    /// when that commit is on `branch`'s history: held by the branch's
+    /// `__manifest` (its head or a buffered commit), published on a branch
+    /// `can_read` allows, or else the first commit below the token's
+    /// generation on the branch's first-parent chain from its head, a walk
+    /// that costs what [`Self::list_commits`] costs. Any other commit, unknown
+    /// or unreadable alike, is [`OmniError::ChangeCursorRejected`].
+    pub async fn list_commits_page_readable(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<CommitListPage> {
+        self.commit_list_page(branch, page_token, limit, Some(can_read))
+            .await
+    }
+
+    /// One commit list page; with `can_read`, a continuation's commit is held
+    /// to the branch's history.
+    async fn commit_list_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        can_read: Option<&mut ReadCheck<'_>>,
+    ) -> Result<CommitListPage> {
+        use crate::changes::token;
+
+        self.ensure_schema_state_valid().await?;
+        let limit = limit.unwrap_or(COMMIT_LIST_DEFAULT_PAGE_COMMITS);
+        if limit == 0 {
+            return Err(OmniError::manifest(
+                "commit list page limit must be greater than zero",
+            ));
+        }
+        if limit > COMMIT_LIST_MAX_PAGE_COMMITS {
+            return Err(OmniError::resource_limit(
+                "commit_list_page_commits",
+                COMMIT_LIST_MAX_PAGE_COMMITS as u64,
+                limit as u64,
+            ));
+        }
+        let branch = match branch {
+            Some(branch) => normalize_branch_name(branch)?,
+            None => None,
+        };
+        let graph_identity =
+            token::hashed_identity(&self.schema_view.load().schema_identity_domain);
+        let scope = token::BranchScopeV1::for_branch(branch.as_deref());
+        let resume = page_token
+            .map(token::decode_commit_list_page_token)
+            .transpose()?;
+        if let Some(resume) = &resume
+            && (resume.graph_identity != graph_identity || resume.branch != scope)
+        {
+            return Err(token::cursor_rejected(
+                "commit list page token does not match this graph and branch",
+            ));
+        }
+        let coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        let start = resume.as_ref().map(|resume| resume.next_commit_id.as_str());
+        let (head, page) = coordinator.first_parent_page(start, limit).await?;
+        // A commit the branch's history does not reach is refused as an
+        // unknown one is, so the refusal tells a caller nothing it may not read.
+        let unreached = || {
+            token::cursor_rejected(
+                "commit list page token names a commit off this branch's history",
+            )
+        };
+        let Some(page) = page else {
+            return Err(match (&resume, &can_read) {
+                (Some(_), Some(_)) => unreached(),
+                (Some(_), None) => token::cursor_rejected(
+                    "commit list page token names a commit this graph does not hold",
+                ),
+                (None, _) => OmniError::manifest_internal(format!(
+                    "the head '{}' of the branch is not held",
+                    head.graph_commit_id
+                )),
+            });
+        };
+        if let (Some(resume), Some(can_read)) = (&resume, can_read) {
+            // The cheap proofs first: a commit the branch's `__manifest` holds
+            // is on its first-parent run to the head, and one published on a
+            // branch the caller may read lists that branch's history. Only a
+            // commit neither covers, such as one an unreadable branch the
+            // branch forked from published, is looked for down the chain.
+            let first = &page.commits[0];
+            let reached = coordinator.holds_commit(&first.graph_commit_id)
+                || can_read(first.graph_branch.as_deref().unwrap_or("main"))
+                || coordinator
+                    .first_parent_below(resume.below_generation)
+                    .await?
+                    .is_some_and(|commit| commit.graph_commit_id == resume.next_commit_id);
+            if !reached {
+                return Err(unreached());
+            }
+        }
+        if let Some(resume) = &resume
+            && page
+                .commits
+                .first()
+                .is_some_and(|first| first.generation >= resume.below_generation)
+        {
+            return Err(token::cursor_rejected(
+                "commit list page token names a commit that is not below the page before it",
+            ));
+        }
+        let head_commit_id = match resume {
+            Some(resume) => resume.head_commit_id,
+            None => head.graph_commit_id,
+        };
+        let next_page_token = match (page.next, page.commits.last()) {
+            (Some(next_commit_id), Some(last)) => {
+                Some(token::encode_token(&token::CommitListPageTokenV1 {
+                    version: token::TOKEN_VERSION,
+                    kind: token::KIND_COMMIT_LIST_PAGE.to_string(),
+                    graph_identity,
+                    branch: scope,
+                    head_commit_id: head_commit_id.clone(),
+                    next_commit_id,
+                    below_generation: last.generation,
+                })?)
+            }
+            _ => None,
+        };
+        Ok(CommitListPage {
+            head_commit_id,
+            commits: page.commits,
+            next_page_token,
+        })
     }
 
     /// The unpublished commits whose target is `branch` (`None` = main) and

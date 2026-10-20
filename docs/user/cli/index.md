@@ -187,8 +187,65 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
   --server prod --graph knowledge
 ```
 
-The token is stored separately from `config.yaml`. A server resolves the actor
-from the token; clients cannot override it with `--as`.
+The server resolves the actor from its token; clients cannot override it with `--as`.
+
+`login` writes the token to `~/.omnigraph/credentials` with mode `0600`.
+`OMNIGRAPH_TOKEN_<NAME>`, the server name uppercased with `-` written as `_`,
+supplies it instead and outranks the stored one: `OMNIGRAPH_TOKEN_PROD` here.
+Two server names that spell the same variable, such as `a-b` and `a_b`, are
+refused when the config loads.
+
+The CLI sends the `prod` token only to URLs under its `url`: the same scheme,
+host and port, and a path that starts with the `url`'s path once `.` and `..`
+segments are resolved. A `unix://` server's token goes only to that socket.
+Any other request carries no credential, including a literal
+`--server https://…` URL that matches no declared server. If such a request
+gets HTTP 401, the CLI names the server to declare or the `omnigraph login`
+command to run; `--json` output carries this as `missing_credential` beside the
+server's own error. A `--graph` value must be one path segment of ASCII letters,
+digits, `-` or `_`; any other value is refused before a request is sent.
+
+Each invocation captures its operator home and ambient profile, then reads
+configuration once when needed. Editing it does not change the destination,
+actor defaults or presentation settings; unknown keys warn once. Ordinary graph
+clients retain the token selected during setup across registry discovery and
+execution, even if the credentials file changes. Managed session renewal follows
+its existing authentication flow.
+
+Named-server `login` without `--token` reads the first line of stdin. Credential
+writes by `login` and `logout` use the invocation's captured operator home.
+
+## Output and errors
+
+For `query` and `alias`, output selection follows `--json`, then `--format`,
+then the alias's `format`, then operator `defaults.output`, then `table`.
+The selected JSON or JSONL format also applies to structured execution errors:
+JSON writes an error object to stdout; JSONL writes one error line. Explicit
+`--format table` selects human output and diagnostics even when a default
+requests JSON.
+
+Before valid operator configuration and, for an alias, its selected binding have
+been captured, error formatting uses only explicit command-line flags.
+`mutate` still requires explicit `--json` for structured errors. For reads,
+unstructured transport failures and malformed error bodies remain diagnostics
+on stderr.
+
+Output delivery failures return nonzero without undoing completed work. A failed
+login/logout report may follow a completed credential change; skill export or
+embedding generation may have already written its files. The CLI does not repeat
+those operations to recover output. `skill show` keeps its existing exception:
+a reader closing the pipe early is accepted. Help and version also retain their
+normal exit status when their output pipe closes.
+
+A final flush failure does not append another JSON document after a returned
+result. A human data-write refusal delivered on stderr keeps its documented exit
+code even when stdout is unavailable. If a managed command has accepted a
+deployment or lifecycle operation but cannot report it on stderr, it attempts
+one recovery-only JSON record on stdout with the accepted identity and any
+retained idempotency key. This still exits nonzero and does not resubmit work.
+
+See [output formats](reference.md#query-inputs-and-output)
+and [diagnostics](../queries/diagnostics.md).
 
 ## Use a server through a Unix socket
 

@@ -369,6 +369,13 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         StatusCode::FORBIDDEN,
         "JWT must not inherit static no-policy read default"
     );
+    // The access route says the same: the credential resolves, and allows
+    // nothing with no branch named or on `main`.
+    let (status, body) = json_response(&app, get_request(&g("/access?branch=main"), &token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["actor"].is_string(), "{body}");
+    assert_eq!(body["graph_wide"], json!([]), "{body}");
+    assert_eq!(body["actions"], json!([]), "{body}");
     let (status, _) = json_response(
         &app,
         get_request(&g("/snapshot?branch=main"), "static-token"),
@@ -448,6 +455,7 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         (Method::GET, "/branches/merge-base"),
         (Method::GET, "/changes"),
         (Method::POST, "/changes/baseline"),
+        (Method::GET, "/access"),
     ] {
         for rejected in ["invalid.jwt.signature", &retired] {
             let response = app
@@ -560,7 +568,10 @@ async fn healthz_succeeds_after_startup() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["status"], "ok");
-    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        body["version"],
+        omnigraph_server::api::build::reported_version(env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(
         body["internal_schema_version"].as_u64().unwrap(),
         u64::from(omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
@@ -2439,6 +2450,7 @@ async fn branch_statements_take_their_routes_policy_decision() {
     assert_forbidden(status, body, "branch create by a reader");
     let create = BranchCreateRequest {
         from: None,
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (status, body) = json_response(
@@ -2462,6 +2474,43 @@ async fn branch_statements_take_their_routes_policy_decision() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["actor_id"], "act-ragnor");
     assert_eq!(body["outcome"]["kind"], "created");
+    let head = body["outcome"]["from_commit_id"]
+        .as_str()
+        .expect("the receipt names the commit the branch starts at")
+        .to_string();
+
+    // A commit start the actor may not branch from answers the 404 of a
+    // `from` that names nothing, on both doors: the id discloses nothing.
+    let at_head = format!("branch create at_head from commit \"{head}\"");
+    let (status, body) =
+        json_response(&app, statement_request("/mutate", "reader-token", &at_head)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let create_at_head = BranchCreateRequest {
+        from: None,
+        from_commit: Some(head.clone()),
+        name: "at_head".to_string(),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("authorization", "Bearer reader-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create_at_head).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) =
+        json_response(&app, statement_request("/mutate", "admin-token", &at_head)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["outcome"]["from"], "main",
+        "the branch that wrote the commit"
+    );
+    assert_eq!(body["outcome"]["from_commit_id"], head);
 
     let (status, body) = json_response(
         &app,
@@ -2483,7 +2532,10 @@ async fn branch_statements_take_their_routes_policy_decision() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["rows"], json!([{"name": "feature"}, {"name": "main"}]));
+    assert_eq!(
+        body["rows"],
+        json!([{"name": "at_head"}, {"name": "feature"}, {"name": "main"}])
+    );
     let (status, body) = json_response(
         &app,
         statement_request("/query", "admin-token", "branch list"),
@@ -2591,7 +2643,8 @@ async fn show_takes_the_scope_free_read_decision_as_branch_list_does() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn signed_identity_with_change_only_policy_cannot_show_settings() {
+async fn signed_identity_uses_statement_action_for_show_and_explain_load() {
+    use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
     let tokens = data_tokens::DataTokens::new();
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
@@ -2602,13 +2655,32 @@ async fn signed_identity_with_change_only_policy_cannot_show_settings() {
         tokens.actor
     );
     fs::write(&policy_path, policy).unwrap();
-    let state = AppState::open_with_bearer_tokens_and_policy(
+    let external_dir = tempfile::tempdir().unwrap();
+    let csv_path = external_dir.path().join("people.csv");
+    let csv = "name,age\nzed,41\n";
+    fs::write(&csv_path, csv).unwrap();
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            format!("file://{}/", external_dir.path().display()),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .with_external_blob_policy(external_policy)
+        .unwrap();
+    let policy_engine =
+        omnigraph_server::PolicyEngine::load_graph(&policy_path, graph.to_string_lossy().as_ref())
+            .unwrap();
+    let state = AppState::new_with_bearer_tokens_and_policy(
         graph.to_string_lossy().to_string(),
+        db,
         vec![("breakglass".into(), "explicit.static.credential".into())],
-        Some(&policy_path),
+        Some(policy_engine),
     )
-    .await
-    .unwrap()
     .with_data_token_trust(tokens.trust.clone());
     let app = build_app(state);
     let change_only = tokens.identity_token();
@@ -2621,6 +2693,51 @@ async fn signed_identity_with_change_only_policy_cannot_show_settings() {
         let (status, body) = json_response(&app, statement_request("/query", &read, source)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_show_rows(&body, "show by a read credential");
+    }
+
+    let before = manifest_dataset_version(&graph).await;
+    for (path, expected) in [
+        (csv_path, StatusCode::OK),
+        (
+            external_dir.path().join("absent.csv"),
+            StatusCode::FAILED_DEPENDENCY,
+        ),
+    ] {
+        let load = format!(
+            "load csv \"file://{}\" into node:Person mode overwrite header",
+            path.display()
+        );
+        let explain = format!("explain {load}");
+        for (route, source) in [("/mutate", load.as_str()), ("/query", explain.as_str())] {
+            let (status, body) = json_response(&app, statement_request(route, &read, source)).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("action 'change'"),
+                "{route}: {body}"
+            );
+            assert_forbidden(status, body, "source access by a read-only credential");
+        }
+
+        let (status, body) =
+            json_response(&app, statement_request("/query", &change_only, &explain)).await;
+        assert_eq!(status, expected, "{body}");
+        if status == StatusCode::OK {
+            let source = body["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["node"] == "CsvSource")
+                .unwrap();
+            let detail: Value = serde_json::from_str(source["detail"].as_str().unwrap()).unwrap();
+            assert_eq!(detail["source_bytes"], csv.len());
+        }
+        assert_eq!(
+            manifest_dataset_version(&graph).await,
+            before,
+            "explain publishes nothing"
+        );
     }
 }
 
@@ -2682,6 +2799,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, _) = json_response(
@@ -3350,6 +3468,165 @@ rules:
     assert_eq!(main_head().await, before);
 }
 
+/// A commit-list page token is checksummed, not signed. A caller allowed to
+/// read `main` only, who may neither list `secret` nor read its commits by
+/// id, pages `main` through continuations checked against `main`'s history,
+/// and a token re-signed to continue from a `secret` commit, deep in
+/// `__history`, or from a commit no branch holds, reads nothing. A caller
+/// with graph-wide `read` is taken at its token's word.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_commit_list_continuation_stays_on_a_readable_branch() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = omnigraph::session::Session::from_defaults(
+        Arc::new(Omnigraph::open(graph.to_str().unwrap()).await.unwrap()),
+        omnigraph::settings::SessionSettings::default()
+            .with("history_release_bytes", "2048")
+            .unwrap(),
+    );
+    db.branch_create_from(ReadTarget::branch("main"), "secret")
+        .await
+        .unwrap();
+    let person = |name: String, age: usize| {
+        format!(r#"{{"type":"Person","data":{{"name":"{name}","age":{age}}}}}"#)
+    };
+    for i in 0..24 {
+        db.load_with_receipt("secret", &person(format!("secret-{i}"), i), LoadMode::Merge)
+            .await
+            .unwrap();
+    }
+    for i in 0..4 {
+        db.load_with_receipt("main", &person(format!("main-{i}"), i), LoadMode::Merge)
+            .await
+            .unwrap();
+    }
+    let oldest_secret = db
+        .list_commits(Some("secret"))
+        .await
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|commit| commit.graph_branch.as_deref() == Some("secret"))
+        .unwrap();
+    drop(db);
+    // act-bruno reads protected branches (main) only; act-ada reads every
+    // branch, and so every commit by id.
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        "version: 1\ngroups:\n  team: [act-bruno]\n  admins: [act-ada]\nprotected_branches: [main]\nrules:\n  - id: team-read\n    allow: {actors: {group: team}, actions: [read], branch_scope: protected}\n  - id: admin-read\n    allow: {actors: {group: admins}, actions: [read], branch_scope: any}\n",
+    )
+    .unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![
+                ("act-bruno".to_string(), "team-token".to_string()),
+                ("act-ada".to_string(), "admin-token".to_string()),
+            ],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+    let get_as = |uri: &str, token: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(uri))
+            .method(Method::GET)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let get = |uri: &str| get_as(uri, "team-token");
+
+    for uri in [
+        "/commits?branch=secret".to_string(),
+        format!("/commits/{}", oldest_secret.graph_commit_id),
+    ] {
+        let (status, body) = json_response(&app, get(&uri)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+
+    let (status, whole) = json_response(&app, get("/commits?branch=main")).await;
+    assert_eq!(status, StatusCode::OK, "{whole}");
+    let (status, first) = json_response(&app, get("/commits?branch=main&limit=2")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let token = first["next_page_token"].as_str().unwrap().to_string();
+    let mut paged = first["commits"].as_array().unwrap().clone();
+    let mut next = Some(token.clone());
+    while let Some(token) = next {
+        let (status, page) = json_response(
+            &app,
+            get(&format!("/commits?branch=main&limit=2&page_token={token}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "a proven continuation: {page}");
+        paged.extend(page["commits"].as_array().unwrap().iter().cloned());
+        next = page["next_page_token"].as_str().map(str::to_string);
+    }
+    assert_eq!(serde_json::Value::Array(paged), whole["commits"]);
+
+    // A commit `secret` published and a commit no branch holds are refused
+    // alike, so the refusal says nothing about what exists.
+    let unknown = "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    for (next, below) in [
+        (oldest_secret.graph_commit_id.as_str(), u64::MAX),
+        (
+            oldest_secret.graph_commit_id.as_str(),
+            oldest_secret.generation + 1,
+        ),
+        (unknown, u64::MAX),
+    ] {
+        let forged = resign_change_token(&token, |payload| {
+            payload["next_commit_id"] = json!(next);
+            payload["below_generation"] = json!(below);
+        });
+        let (status, body) = json_response(
+            &app,
+            get(&format!("/commits?branch=main&limit=5&page_token={forged}")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{next} below {below}: {body}"
+        );
+        assert!(body["commits"].is_null(), "{body}");
+        assert_eq!(
+            body["error"],
+            "change cursor rejected: commit list page token names a commit off this branch's history",
+            "{body}"
+        );
+    }
+
+    // A caller with graph-wide `read` may read any commit by id, so its
+    // continuation is taken as the token says, without a proof.
+    let (status, shown) = json_response(
+        &app,
+        get_as(
+            &format!("/commits/{}", oldest_secret.graph_commit_id),
+            "admin-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    let forged = resign_change_token(&token, |payload| {
+        payload["next_commit_id"] = json!(oldest_secret.graph_commit_id);
+        payload["below_generation"] = json!(u64::MAX);
+    });
+    let (status, page) = json_response(
+        &app,
+        get_as(
+            &format!("/commits?branch=main&limit=1&page_token={forged}"),
+            "admin-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["commits"][0], shown, "{page}");
+}
+
 /// `token` with its payload edited and its checksum recomputed, as any caller
 /// can: a continuation's envelope is `base64url(json ‖ sha256(json))`.
 fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
@@ -3364,4 +3641,206 @@ fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -
     let checksum = sha2::Sha256::digest(&encoded);
     encoded.extend_from_slice(&checksum);
     engine.encode(encoded)
+}
+
+async fn access(app: &axum::Router, query: &str, token: Option<&str>) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .uri(g(&format!("/access{query}")))
+        .method(Method::GET);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    json_response(app, request.body(Body::empty()).unwrap()).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_reports_the_callers_own_actions_as_routes_decide_them() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_YAML).unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![
+                ("act-bruno".to_string(), "bruno-token".to_string()),
+                ("act-ragnor".to_string(), "ragnor-token".to_string()),
+            ],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+
+    // Branch-scoped grants count graph-wide only when a rule covers every
+    // branch; a target-scoped grant needs its target named. Branches are
+    // judged by name: `feature` does not exist.
+    for (token, query, expected) in [
+        (
+            "bruno-token",
+            "",
+            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+                   "branch":null,"target_branch":null,"actions":[]}),
+        ),
+        (
+            "bruno-token",
+            "?branch=main",
+            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+                   "branch":"main","target_branch":null,"actions":["read"]}),
+        ),
+        (
+            "bruno-token",
+            "?branch=feature&target_branch=main",
+            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+                   "branch":"feature","target_branch":"main","actions":["read","change"]}),
+        ),
+        (
+            "ragnor-token",
+            "?branch=main",
+            json!({"actor":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
+                   "branch":"main","target_branch":null,
+                   "actions":["read","export","branch_delete"]}),
+        ),
+        (
+            "ragnor-token",
+            "?branch=feature&target_branch=main",
+            json!({"actor":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
+                   "branch":"feature","target_branch":"main",
+                   "actions":["read","export","change","branch_merge"]}),
+        ),
+    ] {
+        let (status, body) = access(&app, query, Some(token)).await;
+        assert_eq!(status, StatusCode::OK, "{token} {query}: {body}");
+        assert_eq!(body, expected, "{token} {query}");
+    }
+
+    for query in [
+        "?target_branch=main",
+        "?branch=main&branch=feature",
+        "?actor=act-ragnor",
+        "?branch=%20main",
+    ] {
+        let (status, body) = access(&app, query, Some("bruno-token")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        let error: ErrorOutput = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            error.code,
+            Some(omnigraph_server::api::ErrorCode::BadRequest),
+            "{query}"
+        );
+    }
+    let (status, _) = access(&app, "", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Each remaining action behind a scope only its own slot satisfies: a
+    // route that put the branch in the other slot would report otherwise.
+    let temp_slots = init_loaded_graph().await;
+    let slots_policy = temp_slots.path().join("policy.yaml");
+    fs::write(
+        &slots_policy,
+        r#"
+version: 1
+groups:
+  slots: [act-slots]
+protected_branches: [main]
+rules:
+  - id: query
+    allow:
+      actors: { group: slots }
+      actions: [invoke_query]
+  - id: apply-protected
+    allow:
+      actors: { group: slots }
+      actions: [schema_apply]
+      target_branch_scope: protected
+  - id: commits-unprotected
+    allow:
+      actors: { group: slots }
+      actions: [commit_publish, commit_drop]
+      target_branch_scope: unprotected
+  - id: fork-into-unprotected
+    allow:
+      actors: { group: slots }
+      actions: [branch_create]
+      target_branch_scope: unprotected
+"#,
+    )
+    .unwrap();
+    let slots = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph_path(temp_slots.path()).to_string_lossy().to_string(),
+            vec![("act-slots".to_string(), "slots-token".to_string())],
+            Some(&slots_policy),
+        )
+        .await
+        .unwrap(),
+    );
+    for (query, actions) in [
+        (
+            "?branch=main&target_branch=feature",
+            json!(["schema_apply", "branch_create"]),
+        ),
+        (
+            "?branch=feature&target_branch=main",
+            json!(["commit_publish", "commit_drop"]),
+        ),
+    ] {
+        let (status, body) = access(&slots, query, Some("slots-token")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(body["graph_wide"], json!(["invoke_query"]), "{query}");
+        assert_eq!(body["actions"], actions, "{query}");
+    }
+
+    // Without a graph policy a static token only reads, as `authorize`
+    // decides; without authentication every graph action is open.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path()).to_string_lossy().to_string();
+    let app = build_app(
+        AppState::open_with_bearer_tokens(
+            graph.clone(),
+            vec![("act-bruno".to_string(), "bruno-token".to_string())],
+        )
+        .await
+        .unwrap(),
+    );
+    let (status, body) = access(&app, "?branch=main", Some("bruno-token")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["graph_wide"], json!(["read"]));
+    assert_eq!(body["actions"], json!(["read"]));
+    drop(app);
+
+    let app = build_app(AppState::open(graph).await.unwrap());
+    let (status, body) = access(&app, "?branch=main&target_branch=feature", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["actor"], Value::Null);
+    assert_eq!(
+        body["graph_wide"],
+        json!([
+            "read",
+            "export",
+            "change",
+            "schema_apply",
+            "branch_create",
+            "branch_delete",
+            "branch_merge",
+            "commit_publish",
+            "commit_drop",
+            "invoke_query"
+        ])
+    );
+    assert_eq!(
+        body["actions"],
+        json!([
+            "read",
+            "export",
+            "change",
+            "schema_apply",
+            "branch_delete",
+            "commit_publish",
+            "commit_drop",
+            "branch_create",
+            "branch_merge"
+        ])
+    );
 }

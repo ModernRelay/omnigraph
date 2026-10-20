@@ -3,7 +3,9 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use lance::Dataset;
+use lance::io::WrappingObjectStore;
 use lance::session::Session;
+use lance_io::object_store::ChainedWrappingObjectStore;
 use tokio::sync::Mutex;
 
 use crate::error::Result;
@@ -119,7 +121,8 @@ impl TableHandleCache {
 
     /// Return the dataset for `(dataset_path, branch, version, e_tag)`, reusing a
     /// held handle (0 open IO) or opening it once at `location` with the shared
-    /// `session` on a miss.
+    /// `session` on a miss. A `statement_wrapper` stacks over the per-query
+    /// instrumentation wrapper, so instrumentation sees only its misses.
     pub async fn get_or_open(
         &self,
         dataset_path: &str,
@@ -131,6 +134,7 @@ impl TableHandleCache {
         last_linear_version: Option<u64>,
         location: &str,
         session: Option<&Arc<Session>>,
+        statement_wrapper: Option<Arc<crate::read_memo::RangeMemoWrapper>>,
     ) -> Result<Dataset> {
         let key = TableHandleKey {
             table_path: dataset_path.to_string(),
@@ -145,6 +149,18 @@ impl TableHandleCache {
                 return Ok(ds);
             }
         }
+        let memo = statement_wrapper.clone();
+        let wrapper = match (statement_wrapper, crate::instrumentation::table_wrapper()) {
+            (Some(statement), Some(probe)) => {
+                // Native chains apply inner wrappers first; memo hits stay outside the probe.
+                Some(
+                    Arc::new(ChainedWrappingObjectStore::new(vec![probe, statement]))
+                        as Arc<dyn WrappingObjectStore>,
+                )
+            }
+            (Some(statement), None) => Some(statement as Arc<dyn WrappingObjectStore>),
+            (None, probe) => probe,
+        };
         // Miss: open without holding the lock (the open is async IO). A concurrent
         // double-miss opens twice and one wins the insert — correct (the dataset
         // at a version is immutable) and rare.
@@ -155,9 +171,12 @@ impl TableHandleCache {
             transaction_uuid,
             last_linear_version,
             session,
-            crate::instrumentation::table_wrapper(),
+            wrapper,
         )
         .await?;
+        if let (Some(memo), Some(session)) = (memo, session) {
+            memo.register_dataset(&ds, session).await;
+        }
         let mut inner = self.inner.lock().await;
         if let Some(existing) = inner.entries.get(&key).cloned() {
             return Ok(existing);

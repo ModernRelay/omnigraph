@@ -6,26 +6,26 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::QueryDiagnostic;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR, is_fresh_variable};
-use omnigraph_compiler::query::ast::AggFunc;
-use omnigraph_compiler::query::codes::{P001, P002, P004, P005};
+use omnigraph_compiler::query::ast::{AggFunc, LoadStmtMode};
+use omnigraph_compiler::query::codes::{P002, P004};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 
 use crate::cost::{
     AccessPath, AntiJoinStrategy, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
-    HASH_JOIN_POOL_DIVISOR, HYDRATE_ROW_RATIO, IndexCoverage, chain_rows, choose_access_path,
-    choose_anti_join_strategy, choose_expand_mode, direction_probe_factor, estimate_rows,
-    executed_hops, hydrate_chunk_bytes, scan_row_estimate,
+    HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
+    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, ValidateIndexCoverage, chain_rows,
+    choose_access_path, choose_anti_join_strategy, choose_expand_mode, choose_validate_access,
+    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
 };
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::key_set::{KeySetTree, key_set_tree};
 use crate::logical::{
-    ColumnRef, EDGE_TYPE_MEMBER, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId,
-    LogicalNode, LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
-    tiebreak_text,
+    ColumnRef, ConsultedImage, CsvSourceSpec, EDGE_TYPE_MEMBER, FragmentWriteSpec, GqFilter,
+    IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId, LogicalNode, LogicalPlan, Predicate,
+    RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm, ValidateSpec, tiebreak_text,
 };
 use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
@@ -62,6 +62,11 @@ pub struct Bounds {
     /// Set by the engine after a one-pass shape was refused at open: pass 6
     /// then hydrates by address whatever the manifest says.
     pub late_materialization_only: bool,
+    /// The most parsers, probe chunks or writers a load operator runs at
+    /// once; the phases are sequential, so the cap never multiplies.
+    pub load_workers_max: u32,
+    /// The bound every staged write input of a load is checked against.
+    pub load_write_max_bytes: u64,
 }
 
 pub const PASS_RESOLVE: &str = PassId::Resolve.name();
@@ -158,18 +163,215 @@ pub fn resolve(op: &Operation, source: &dyn PlanSource) -> Result<LogicalPlan, P
             plan.set_root(classify);
         }
         Operation::Query(ir) => resolve_query(&mut plan, ir, source)?,
+        Operation::Load {
+            ir,
+            tables,
+            source_bytes,
+        } => resolve_load(&mut plan, ir, tables, *source_bytes, source)?,
     }
     Ok(plan)
+}
+
+/// Stage 1, pass 1 for a load: the source leaf, one `Validate` carrying the
+/// IR's checks in its order, the write at the root; the source's schema is the
+/// target's typed delta, which the plan source answers for `SideId::Child`.
+fn resolve_load(
+    plan: &mut LogicalPlan,
+    ir: &omnigraph_compiler::ir::LoadIR,
+    tables: &[Side],
+    source_bytes: u64,
+    source: &dyn PlanSource,
+) -> Result<(), PlanError> {
+    let target = ir.target.table_key();
+    let version_of = |type_key: &str| {
+        tables
+            .iter()
+            .find(|side| side.table.type_key == type_key)
+            .map(|side| side.version)
+    };
+    let schema = source.schema(SideId::Child)?;
+    let source_node = plan.add(
+        LogicalNode::CsvSource {
+            spec: Box::new(CsvSourceSpec {
+                source: ir.source.clone(),
+                source_bytes,
+                estimated_rows: CsvSourceSpec::estimate_rows(source_bytes, ir.mapped_columns),
+                delimiter: ir.delimiter,
+                header: ir.header,
+                columns: ir.columns.clone(),
+                table: target.clone(),
+                version: version_of(&target),
+            }),
+        },
+        schema.clone(),
+    );
+    let checks = ir
+        .checks
+        .iter()
+        .map(|check| ValidateSpec {
+            check: check.check.clone(),
+            consults: check.consults.as_ref().map(|table| ConsultedImage {
+                table: table.clone(),
+                version: version_of(table),
+            }),
+            access: None,
+        })
+        .collect();
+    let validated = plan.add(
+        LogicalNode::Validate {
+            input: source_node,
+            table: target.clone(),
+            checks,
+        },
+        schema,
+    );
+    let write = plan.add(
+        LogicalNode::FragmentWrite {
+            input: validated,
+            spec: Box::new(FragmentWriteSpec {
+                table: target.clone(),
+                version: version_of(&target),
+                mode: ir.mode,
+            }),
+        },
+        write_count_schema(),
+    );
+    plan.set_root(write);
+    Ok(())
+}
+
+/// The one row a write leaves: `count`, the rows it wrote.
+pub fn write_count_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
 }
 
 /// Stage 1, pass 1 for a GQ query: the flat `IROp` pipeline folded into a
 /// tree, then a leading search function, the `return`, the remaining
 /// `order` keys and the `limit` above it.
+/// The node properties the query's full-text calls read the index of, as
+/// `(type name, property)`, first appearance first: `search`, `fuzzy` and
+/// `match_text` in any filter (correlated blocks included), and `bm25` in the
+/// leading order key or either arm of an `rrf()` there. Planning checks each
+/// one's coverage (`require_full_text_indexes`) and acceptance requires the
+/// plan to record it.
+pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
+    fn bindings(ops: &[IROp], out: &mut HashMap<String, String>) {
+        for op in ops {
+            match op {
+                IROp::NodeScan {
+                    variable,
+                    type_name,
+                    filters: _,
+                } => {
+                    out.insert(variable.clone(), type_name.clone());
+                }
+                IROp::Expand {
+                    dst_var, dst_type, ..
+                } => {
+                    out.insert(dst_var.clone(), dst_type.clone());
+                }
+                IROp::AntiJoin { inner, .. } => bindings(inner, out),
+                IROp::Filter(_) => {}
+            }
+        }
+    }
+    fn calls(expr: &IRExpr, out: &mut Vec<(String, String)>) {
+        match expr {
+            IRExpr::Search { field, .. }
+            | IRExpr::Fuzzy { field, .. }
+            | IRExpr::MatchText { field, .. }
+            | IRExpr::Bm25 { field, .. } => {
+                if let IRExpr::PropAccess {
+                    variable, property, ..
+                } = field.as_ref()
+                {
+                    out.push((variable.clone(), property.clone()));
+                }
+            }
+            IRExpr::Rrf {
+                primary, secondary, ..
+            } => {
+                calls(primary, out);
+                calls(secondary, out);
+            }
+            IRExpr::Binary { left, right, .. } => {
+                calls(left, out);
+                calls(right, out);
+            }
+            IRExpr::Not(inner, _)
+            | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::IsNull { expr: inner, .. } => calls(inner, out),
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(..)
+            | IRExpr::Param(..)
+            | IRExpr::Literal(..)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(..) => {}
+        }
+    }
+    fn filter_calls(ops: &[IROp], out: &mut Vec<(String, String)>) {
+        for op in ops {
+            match op {
+                IROp::NodeScan { filters, .. }
+                | IROp::Expand {
+                    dst_filters: filters,
+                    ..
+                } => filters.iter().for_each(|filter| calls(filter, out)),
+                IROp::Filter(filter) => calls(filter, out),
+                IROp::AntiJoin { inner, .. } => filter_calls(inner, out),
+            }
+        }
+    }
+    let mut types = HashMap::new();
+    bindings(&ir.pipeline, &mut types);
+    let mut variables = Vec::new();
+    filter_calls(&ir.pipeline, &mut variables);
+    if let Some(leading) = ir.order_by.first() {
+        calls(&leading.expr, &mut variables);
+    }
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for (variable, property) in variables {
+        if let Some(type_name) = types.get(&variable) {
+            let target = (type_name.clone(), property);
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
+/// Every full-text call reads its property's full-text index, whose analyzer
+/// (case folding, stemming) a segment carries: a trained one with postings or
+/// the untrained declaration every write records. Coverage may be full or
+/// partial, since Lance scans uncovered rows with that analyzer; an absent
+/// index means no segment records the analyzer at the pinned snapshot, and
+/// Lance would fall back to a bare, case-sensitive tokenizer, so the call is
+/// refused rather than answered differently. The type checker (`T27`)
+/// already required the declaration.
+fn require_full_text_indexes(ir: &QueryIR, source: &dyn PlanSource) -> Result<(), PlanError> {
+    for (type_name, property) in full_text_targets(ir) {
+        let type_key = format!("node:{type_name}");
+        if source.full_text_coverage(&type_key, &property) == FullTextCoverage::Absent {
+            return Err(PlanError::FullTextIndexRequired {
+                index: format!("{type_name}.{property}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn resolve_query(
     plan: &mut LogicalPlan,
     ir: &QueryIR,
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
+    require_full_text_indexes(ir, source)?;
     if ir.has_edge_selections() {
         let limit = source.traversal_work_limit().ok_or_else(|| {
             PlanError::refused(
@@ -2170,7 +2372,14 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             base: _,
             source: _,
             target: _,
-        } => {}
+        }
+        | LogicalNode::CsvSource { spec: _ }
+        | LogicalNode::Validate {
+            input: _,
+            table: _,
+            checks: _,
+        }
+        | LogicalNode::FragmentWrite { input: _, spec: _ } => {}
     }
     out
 }
@@ -2562,26 +2771,10 @@ impl Lowering<'_> {
             matches!(self.physical.node(id), Some(PhysicalNode::HashJoin { build, .. }) if *build == scan)
         });
         if destination {
-            let function = match access.kind {
-                RankKind::Nearest => "nearest",
-                RankKind::Bm25 => "bm25",
-            };
-            // Declaring the binding first makes it the component's scan root,
-            // which is ranked; the compiler picks the first-declared binding.
-            return Err(PlanError::Unsupported(Box::new(
-                QueryDiagnostic::plan(
-                    P001,
-                    format!(
-                        "`{function}()` orders `${binding}`, a traversal destination; engine v2 ranks only the binding a traversal starts from"
-                    ),
-                )
-                .with_expression(format!(
-                    "{function}(${binding}.{}, {})",
-                    access.property, access.query
-                ))
-                .with_fix(format!(
-                    "declare `${binding}` first in `match`, so the ranking starts the traversal"
-                )),
+            // Lowering roots the component holding the ranked binding at that
+            // binding, so a ranked scan a traversal reaches is its defect.
+            return Err(PlanError::Internal(format!(
+                "the ranked binding `${binding}` is a traversal destination; lowering roots a ranked binding's component at it"
             )));
         }
         self.unmark(scan);
@@ -3227,33 +3420,11 @@ impl Lowering<'_> {
                         &secondary_arm.binding,
                     )
                 {
-                    // One of two bindings a traversal connects always starts
-                    // it and the other is reached, and engine v2 ranks only the
-                    // binding a traversal starts from: no declaration order
-                    // serves both arms, so the refusal offers none.
-                    let call = |arm: &SearchArm| {
-                        let function = match arm.kind {
-                            RankKind::Nearest => "nearest",
-                            RankKind::Bm25 => "bm25",
-                        };
-                        format!(
-                            "{function}(${}.{}, {})",
-                            arm.binding, arm.property, arm.query
-                        )
-                    };
-                    return Err(PlanError::Unsupported(Box::new(
-                        QueryDiagnostic::plan(
-                            P005,
-                            format!(
-                                "`rrf()` ranks `${}` and `${}`, which one traversal connects; engine v2 ranks only the binding a traversal starts from, so one arm always ranks a traversal destination and no declaration order serves both",
-                                primary_arm.binding, secondary_arm.binding
-                            ),
-                        )
-                        .with_expression(format!(
-                            "rrf({}, {})",
-                            call(primary_arm),
-                            call(secondary_arm)
-                        )),
+                    // The type checker refuses these arms (`T59`): one
+                    // traversal cannot start at both ranked bindings.
+                    return Err(PlanError::Internal(format!(
+                        "`rrf()` ranks `${}` and `${}`, which one traversal connects; the type checker refuses those arms",
+                        primary_arm.binding, secondary_arm.binding
                     )));
                 }
                 let mut lowered_arms = Vec::with_capacity(2);
@@ -3460,7 +3631,133 @@ impl Lowering<'_> {
                     .physical
                     .add(PhysicalNode::ClassifyThreeWay { input: hydrated }))
             }
+            LogicalNode::CsvSource { spec } => {
+                let max_workers = self.bounds.load_workers_max.max(1);
+                let partitions_by_size = spec.source_bytes.div_ceil(SOURCE_PARTITION_BYTES).max(1);
+                let max_partitions =
+                    u32::try_from(partitions_by_size.min(u64::from(max_workers))).unwrap_or(1);
+                Ok(self.physical.add(PhysicalNode::CsvSource {
+                    spec: spec.clone(),
+                    max_partitions,
+                    max_workers,
+                }))
+            }
+            LogicalNode::Validate {
+                input,
+                table,
+                checks,
+            } => {
+                let estimated_rows = estimate_rows(self.logical, *input, self.source);
+                let lowered = self.lower(*input)?;
+                let checks = checks
+                    .iter()
+                    .map(|spec| ValidateSpec {
+                        access: Some(self.validate_access(spec, estimated_rows)),
+                        ..spec.clone()
+                    })
+                    .collect();
+                Ok(self.physical.add(PhysicalNode::Validate {
+                    input: lowered,
+                    table: table.clone(),
+                    checks,
+                    max_workers: self.bounds.load_workers_max.max(1),
+                }))
+            }
+            LogicalNode::FragmentWrite { input, spec } => {
+                let lowered = self.lower(*input)?;
+                Ok(self.physical.add(PhysicalNode::FragmentWrite {
+                    input: lowered,
+                    spec: spec.clone(),
+                    max_input_bytes: self.bounds.load_write_max_bytes,
+                    max_workers: self.bounds.load_workers_max.max(1),
+                }))
+            }
         }
+    }
+
+    /// Pass 9 costs the committed lookup from the accepted node count and
+    /// index metadata. Append and merge retain their executor's Probe path.
+    fn validate_access(
+        &mut self,
+        spec: &ValidateSpec,
+        estimated_rows: Option<u64>,
+    ) -> ValidateAccess {
+        let Some(image) = &spec.consults else {
+            return ValidateAccess::Delta;
+        };
+        let overwrite = self
+            .logical
+            .live()
+            .any(|(_, node)| matches!(node, LogicalNode::FragmentWrite { spec, .. } if spec.mode == LoadStmtMode::Overwrite));
+        let node = image
+            .table
+            .strip_prefix("node:")
+            .and_then(|name| self.source.node_type(name).ok());
+        let columns: Vec<&str> = match &spec.check {
+            omnigraph_compiler::ir::ValidateCheck::Unique { columns, .. } => {
+                columns.iter().map(String::as_str).collect()
+            }
+            omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. } => node
+                .as_ref()
+                .map(|node| node.columns.id)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        };
+        let facts = self.source.index_facts(&image.table);
+        let indexed = !columns.is_empty()
+            && columns.iter().all(|column| {
+                let mut candidates = facts
+                    .iter()
+                    .filter(|fact| fact.column == *column)
+                    .peekable();
+                candidates.peek().is_some()
+                    && candidates.all(|fact| fact.fully_covers_btree(column))
+            });
+        let index_coverage = if indexed {
+            ValidateIndexCoverage::Full
+        } else if facts.iter().any(|fact| {
+            columns.contains(&fact.column.as_str())
+                && matches!(fact.kind, crate::source::IndexKind::Btree { usable: true })
+                && fact.may_narrow()
+        }) {
+            ValidateIndexCoverage::Partial
+        } else {
+            ValidateIndexCoverage::Absent
+        };
+        let inputs = ValidateCostInputs {
+            input_rows: estimated_rows,
+            consulted_rows: node.as_ref().and_then(|node| node.row_count),
+            index_coverage,
+        };
+        let access = if overwrite {
+            choose_validate_access(&spec.check, inputs)
+        } else {
+            ValidateAccess::Probe
+        };
+        let costs = inputs.costs(&spec.check);
+        self.access_path = true;
+        self.decisions.push(StatisticSource {
+            statistic: format!("validate_access({})", spec.check.name()),
+            value: access.as_str().to_string(),
+            origin: serde_json::json!({
+                "check": spec.check,
+                "consulted_table": image.table,
+                "consulted_version": image.version,
+                "estimated_rows": estimated_rows,
+                "consulted_rows": inputs.consulted_rows,
+                "index_full_coverage": indexed,
+                "index_coverage": index_coverage,
+                "index_facts": facts,
+                "indexed_row_factor": HASH_JOIN_RATIO,
+                "probe_calls": costs.map(|(_, _, calls)| calls),
+                "probe_cost": costs.map(|(probe, _, _)| probe),
+                "scan_cost": costs.map(|(_, scan, _)| scan),
+                "overwrite": overwrite,
+            })
+            .to_string(),
+        });
+        access
     }
 
     fn scoped_scan(&self, id: NodeId) -> bool {
@@ -3883,6 +4180,7 @@ pub fn node_order(
                 .chain(tiebreak.iter().cloned().map(OrderKey::Identity))
                 .collect(),
         ),
+        PhysicalNode::Validate { input: from, .. } => input(*from),
         PhysicalNode::MetadataCount { .. }
         | PhysicalNode::CrossJoin { .. }
         | PhysicalNode::ContainsJoin { .. }
@@ -3890,7 +4188,9 @@ pub fn node_order(
         | PhysicalNode::Expand { .. }
         | PhysicalNode::AntiJoin { .. }
         | PhysicalNode::RankFuse { .. }
-        | PhysicalNode::Aggregate { .. } => None,
+        | PhysicalNode::Aggregate { .. }
+        | PhysicalNode::CsvSource { .. }
+        | PhysicalNode::FragmentWrite { .. } => None,
     }
 }
 
@@ -4238,6 +4538,40 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
+            PhysicalNode::CsvSource { spec, .. } => Properties {
+                schema: source.schema(SideId::Child)?,
+                ordering: None,
+                rows: Estimate::Known(spec.estimated_rows),
+                work_bytes: Estimate::Known(spec.source_bytes),
+                retained_limit: None,
+                sources: vec![StatisticSource {
+                    statistic: "estimated_rows".to_string(),
+                    value: spec.estimated_rows.to_string(),
+                    origin: format!(
+                        "source_bytes {} over the narrowest row, an upper bound",
+                        spec.source_bytes
+                    ),
+                }],
+            },
+            PhysicalNode::Validate { input, .. } => {
+                let input = props(plan, *input)?;
+                Properties {
+                    schema: input.schema.clone(),
+                    ordering: None,
+                    rows: input.rows,
+                    work_bytes: Estimate::Unknown,
+                    retained_limit: None,
+                    sources: Vec::new(),
+                }
+            }
+            PhysicalNode::FragmentWrite { .. } => Properties {
+                schema: write_count_schema(),
+                ordering: None,
+                rows: Estimate::Known(1),
+                work_bytes: Estimate::Unknown,
+                retained_limit: None,
+                sources: Vec::new(),
+            },
         };
         read.extend(properties.sources.iter().cloned());
         plan.set_properties(id, properties);

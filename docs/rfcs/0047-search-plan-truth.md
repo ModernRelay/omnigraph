@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-10-10
+updated: 2026-10-17
 discussion: "https://github.com/ModernRelay/omnigraph/pull/791"
 supersedes: []
 superseded_by: []
@@ -33,8 +33,9 @@ engine v2, the only query engine since v0.12.0 (PR #795), and on the compiler.
    prerequisites retain their distinct conflict response.
 2. **Full-text search on an unindexed property.** A property the schema does
    not declare `@index` is refused at compile time (`T27`); a declared index
-   that is not built is refused at planning (`FullTextIndexRequired`). Neither
-   falls back to Lance's case-sensitive flat scan.
+   with no segment at the query's snapshot is refused at planning
+   (`FullTextIndexRequired`). Neither falls back to Lance's case-sensitive
+   flat scan.
 3. **Ranking a traversal-introduced binding.** Declaration order stops
    mattering: the ranked binding roots its component, so a query ranks the
    binding it names whichever binding it declared first.
@@ -149,14 +150,15 @@ catalogue by the change that adds each refusal.
 
 - `T27`: a full-text predicate or ranking (`search`, `fuzzy`, `match_text`,
   `bm25`) on a String property that the schema does not declare `@index`. The
-  fix is to declare `@index` and build it (`omnigraph optimize`). The check
-  reads only the schema, never physical index state.
-- `FullTextIndexRequired`: the property is declared but its index has no
-  built segments at the query's snapshot. It is refused at planning, before
-  any scan, as HTTP `409` with a typed detail, the shape RFC 0043's
-  `FullTextIndexRebuildRequired` already has; both can fire on one graph.
-  Rows written after the last build keep today's behavior: Lance scans them
-  with the index's analyzer.
+  fix is to declare `@index`; every write then carries the index's analyzer.
+  The check reads only the schema, never physical index state.
+- `FullTextIndexRequired`: the property is declared but no segment of its
+  index exists at the query's snapshot, in a table version that has rows. It
+  is refused at planning, before any scan, as HTTP `409` with a typed detail,
+  the shape RFC 0043's `FullTextIndexRebuildRequired` already has; both can
+  fire on one graph. Any segment carries the analyzer, the untrained one
+  every write declares included, and Lance scans the rows it does not cover
+  with that analyzer: partial coverage is never a refusal.
 
 The analyzer-equivalent exact scan that later lets an unbuilt index answer
 instead of refusing belongs to the analyzed lexical search RFC.
@@ -774,7 +776,7 @@ attempt it can name.
 
 ### Full-text index presence as a planning fact
 
-`PlanSource` gains one fact: whether a property's full-text index has built
+`PlanSource` gains one fact: whether a property's full-text index has
 segments at the pinned dataset version. Step 2a introduced it as
 `full_text_coverage` (`full`, `partial` or `absent`), recorded per ranked
 property in `Assumptions.full_text` for the eligibility placement; step 3
@@ -795,6 +797,20 @@ again from the pinned dataset.
 The `T27` rule is the catalog predicate index reconciliation already uses (a
 non-enum, single-column String `@index`), moved into the compiler so the type
 checker and reconciliation cannot drift.
+
+As built, step 3 lands after the change that makes every write declare a
+declared full-text column's analyzer with an untrained segment (an empty
+fragment bitmap, no postings), which Lance applies to every row no segment
+covers. `absent` therefore means only a table version with rows written
+before that change and never indexed since. Such a version refuses every
+full-text call on the property until the index is built (`omnigraph
+optimize` on main, `omnigraph rebuild-full-text-indexes --branch` on
+another branch); a historical snapshot of it stays refused. A table version
+with no fragment, and a type the snapshot does not hold, count as full,
+since no row could be answered differently. Every full-text call's property
+is checked and recorded, filters included, not only ranked scans, so replay
+re-derives each from the pinned dataset, and acceptance refuses a plan that
+records none, or `absent`, for a call it makes.
 
 ### The ranked binding roots its component
 
@@ -1018,9 +1034,9 @@ and regressions. Step 7 can ship independently.
 | Step | Delivers | Closes |
 |---|---|---|
 | 1 | Diagnostics contract for parse and type refusals (PR #759, merged 2026-09-30) | None |
-| 2 | Planner refusals carry diagnostics; a refusal by design is a bad request | #786 |
-| 2a | Shared query/explain validation and acceptance; exact-subset rules, adaptive-policy checks, bounded/versioned replay evidence, GQT scope assertions. The order checks of a fusion and of a search-ordered aggregate land with step 5, which implements their order | supports steps 3-6 |
-| 3 | `T27` and `FullTextIndexRequired` | #747 |
+| 2 | Planner refusals carry diagnostics; a refusal by design is a bad request (PR #815, merged 2026-10-13) | #786 |
+| 2a | Shared query/explain validation and acceptance; exact-subset rules, adaptive-policy checks, bounded/versioned replay evidence, GQT scope assertions; the order checks of a fusion and of a search-ordered aggregate (PR #839, merged 2026-10-13) | supports steps 3-6 |
+| 3 | `T27` and `FullTextIndexRequired`, refusing only an index with no segment | #747 |
 | 4 | The ranked binding roots its component; the `rrf()` arms type error | #789 |
 | 5 | One total order: fused score column, `Sort` over fusion and search-ordered aggregates, `T37` retired, `T54` (PR #938, merged); its order checks land with step 2a | #787, #788 |
 | 6 | Read descriptors with producer ids and fusion-arm references | None |
@@ -1118,3 +1134,25 @@ None.
   rows: its order keys bind to return items, its sort is total through
   every unwritten group key with no identity tie-break, and it is outside
   the exact fragment.
+- 2026-10-17: step 3 rescoped after writers began declaring every declared
+  full-text column's analyzer with an untrained segment. An untrained
+  segment carries the analyzer to the rows it does not cover, so
+  `FullTextIndexRequired` refuses only a property with no segment at all in
+  a table version that has rows: one written before that change and never
+  indexed since. Requiring built postings, as first drafted, would have
+  refused fresh writes the analyzer already answers. A table with no
+  fragment, and a type the snapshot does not hold, count as covered. The
+  remedy names the commands that exist (`optimize` on main,
+  `rebuild-full-text-indexes --branch` elsewhere); a command that builds a
+  branch's missing indexes alone (#840) is separate work. Steps 2 and 2a are
+  recorded as merged.
+- 2026-10-17: step 4 implemented. Lowering roots the component holding the
+  bindings the leading order key ranks; a ranked binding no declaration
+  introduces gets a scan of its checked type, so declaring it changes no
+  plan. Correlated blocks have no order and keep the searched-binding rule.
+  The `rrf()` refusal moved from the planner to the type checker as `T59`,
+  which carries the refused expression, and the planner codes `P001` and
+  `P005` are withdrawn: a compiled query no longer reaches either, so the
+  planner keeps both checks as internal errors against a lowering defect.
+  An `rrf()` over one reached binding keeps its arm windows, so its nearest
+  arm still ranks the corpus before the traversal keeps the reached rows.
