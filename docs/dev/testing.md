@@ -35,6 +35,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
+| `omnigraph-mcp` | In-source protocol, settings, catalog and bounded-result tests | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
 | `omnigraph-cli` | In-source application, runtime, parsing, output and transport tests plus `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-skill` | In-source `src/lib.rs`: the embedded table is sorted and `file` finds every path. The CLI owns the rest. In-source `src/skill.rs` holds the skill's command index (`references/commands.md`) and condensed reference (`SKILL.md`) to the clap tree and its storage-format line to `omnigraph version`; `integration/cli_schema_config.rs` owns `skill export` and `skill show`, including byte identity with `skills/omnigraph`; `scripts/check-docs.py` holds `metadata.version` and the declared HTTP contract to the CLI | None |
@@ -245,10 +246,17 @@ target, discovery and refusals over the socket.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
+`omnigraph-mcp` owns protocol, catalog and formatting tests. Server
+`integration/mcp.rs` keeps the real HTTP fixture for authentication, policy,
+tool/route parity, limits and response lifetimes; `boot_settings` covers MCP
+across shutdown and restart. Extend these owners instead of adding a second
+server fixture to the MCP crate.
+
 Per-graph serving transitions extend these owners: in-source `registry` tests
 own capture/close ordering, drain-only deployment deadlines, affected activation
 scope, schema identity and candidate bounds;
-`operations`, `ingress` and `mcp` own detached execution and output lifetimes.
+`operations`, `ingress` and the server's MCP adapter own detached execution and
+output lifetimes.
 `stored_queries` parks a request before engine capture, `data_routes` retains
 disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
 availability. The same owners cover coherent schema/query batch activation; these assertions

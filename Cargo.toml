@@ -15,6 +15,7 @@ members = [
     "crates/omnigraph-azure-admission",
     "crates/omnigraph-bench",
     "crates/omnigraph-policy",
+    "crates/omnigraph-mcp",
     "crates/omnigraph-server",
     "crates/omnigraph-dst",
     "crates/omnigraph-gqt",

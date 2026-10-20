@@ -2,8 +2,9 @@
 
 `omnigraph-server` serves the Model Context Protocol at `/mcp`, so Claude,
 ChatGPT, Cursor and other MCP clients can work with a graph with a URL and the
-caller's own credential. It is the only OmniGraph MCP implementation; it
-replaces the `@modernrelay/omnigraph-mcp` npm package.
+caller's own credential. MCP shares the server's listener and lifecycle; no
+separate service is needed. It replaces the `@modernrelay/omnigraph-mcp` npm
+package.
 
 Every tool calls the same handler as its HTTP route, under the same actor and
 the same [policy](policy.md) action. A tool appearing in the list is not

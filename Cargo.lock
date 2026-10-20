@@ -5905,6 +5905,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-mcp"
+version = "0.14.0"
+dependencies = [
+ "axum",
+ "color-eyre",
+ "omnigraph-skill",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "omnigraph-planner"
 version = "0.14.0"
 dependencies = [
@@ -5989,12 +6003,11 @@ dependencies = [
  "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-mcp",
  "omnigraph-policy",
- "omnigraph-skill",
  "p256",
  "regex",
  "reqwest 0.12.28",
- "rmcp",
  "rsa",
  "serde",
  "serde_json",

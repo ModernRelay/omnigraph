@@ -16,6 +16,7 @@ cluster deployment state, and public CLI/HTTP surfaces.
 flowchart TB
     CLI[omnigraph CLI]
     HTTP[omnigraph-server]
+    MCP[omnigraph-mcp]
     CLUSTER[omnigraph-cluster]
     COMPILER[omnigraph-compiler]
     PLANNER[omnigraph-planner]
@@ -32,6 +33,7 @@ flowchart TB
     HTTP --> ENGINE
     HTTP --> CLUSTER
     HTTP --> POLICY
+    HTTP --> MCP
     CLUSTER --> ENGINE
     ENGINE --> COMPILER
     ENGINE --> PLANNER
@@ -96,10 +98,16 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-api-types` | Additive HTTP wire DTOs shared by server and CLI. |
 | `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. Client setup captures operator configuration for ordinary graph commands, aliases and served cluster commands; scope, endpoint, credential matching and direct-write actor selection use those captured values. Query and alias presentation uses the same captured configuration. |
 | `omnigraph-skill` | The `skills/omnigraph` agent skill, embedded byte for byte by its build script; the package root is `skills/`, so the skill tree stays its one copy. `omnigraph skill export` writes it. |
+| `omnigraph-mcp` | MCP SDK integration, boot settings, tool and resource catalog, argument decoding, result formatting and response deadlines. The server supplies execution through its adapter. |
 | `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, multi-graph serving and live deployment activation. |
 | `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable server process through the root-derived Blob lease. It is not a storage backend. |
 | `omnigraph-gqt-core` | GQT format, ordinary session execution and expectation checks, shared by the GQT runner and benchmark harness. It has no build script or test-only engine dependency. |
 | `omnigraph-reference-engine` | Engine v1, frozen (`publish = false`, hash-pinned by its `tests/frozen.rs`): the reference executor a GQT step's `--- expect same as v1` compares engine v2 against. Its input is the pinned `omnigraph_compiler::ir::untyped` read IR, produced by one-way erasure only at the test reference door. It depends only on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and third-party crates; `omnigraph-gqt` is the only crate that may depend on it (`forbidden_apis.rs` guards both), and no production door reaches it. |
+
+The server mounts `omnigraph-mcp` at `/mcp` on its existing listener. Its adapter
+dispatches to the same handlers as HTTP and retains authentication, OAuth
+metadata, graph admission and execution ownership. The MCP crate opens no graphs
+and owns no serving lifecycle.
 
 The CLI's [invocation parser](../../crates/omnigraph-cli/src/invocation.rs) owns
 command construction, explicit argument provenance and cross-level argument
