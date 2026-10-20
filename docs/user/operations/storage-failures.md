@@ -19,22 +19,31 @@ store throttled with `SlowDown`, and a manifest request the store refused
 outright.
 
 A manifest request whose answer was lost, timed out or throttled is re-issued
-unchanged, up to four times over about three seconds. A re-issue that creates
-the version publishes the commit once. A version that already exists is read
+unchanged, up to four times with about three seconds of pauses in total, plus
+the time spent on each storage request. A re-issue that creates the version
+publishes the commit once. A version that already exists is read
 back: it holds either this commit, and the write succeeds, or another commit,
-and the write meets an ordinary conflict. A dropped acknowledgement therefore
-ends as a committed write or a definite conflict, never a duplicate.
+and the write meets an ordinary conflict. Re-issuing the same conditional
+request never publishes a duplicate.
 
 ## Unknown publications
 
-A manifest request that no re-issue settles leaves its write's outcome unknown.
-The write answers 500 (`outcome_unknown` on MCP), and the server keeps serving.
-Each manifest version is created only if absent, so the request lands before
-the branch's next publication or never: the branch's next write either finds
-it and builds on it, or takes that version first, after which the late request
-can no longer land. A read that does not show the write is therefore not proof
-that it failed until another commit follows its base; read the branch's
-commits before repeating it.
+The outcome stays unknown if no re-issue settles the request or the committed
+version cannot be read back reliably. A local filesystem error can also occur
+after a write has taken effect, so an error alone does not prove that nothing
+was published. When the outcome remains unknown, the write answers 500
+(`outcome_unknown` on MCP), and the server keeps serving. Each manifest
+version is created only if absent, so the request lands before the branch's
+next publication or never: the branch's next write either finds it and builds
+on it, or takes that version first, after which the late request can no longer
+land. A read that does not show the write is therefore not proof that it
+failed until another commit follows its base; read the branch's commits before
+repeating it.
+
+The same rule applies when creating a proposal or an unattached snapshot: if
+its final authority check fails, deleting its tag does not prove that an earlier
+create request cannot still complete. That outcome remains unknown unless the
+candidate is proven expired.
 
 ## Retries
 

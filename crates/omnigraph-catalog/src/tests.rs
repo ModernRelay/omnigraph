@@ -14802,9 +14802,13 @@ enum ManifestFault {
     /// first one's request is held and applied when the test lands it, after
     /// every re-issue gave up.
     LandsAfterGiveUp,
+    /// A tag create succeeds after an internal retry, while an earlier copy
+    /// remains pending. Its authority probe fails, and the test lands the
+    /// earlier copy after the publisher has deleted the acknowledged tag.
+    CandidateTagReplay,
 }
 
-/// A manifest create held back to land after its client gave up.
+/// A conditional create held back to land after its client gave up.
 type DeferredCreate = (
     Arc<dyn object_store::ObjectStore>,
     object_store::path::Path,
@@ -14831,6 +14835,11 @@ impl ManifestRequestFault {
             deferred: Arc::default(),
             healed: Arc::default(),
         }
+    }
+
+    fn candidate_probe_unavailable(&self) -> bool {
+        self.fault == ManifestFault::CandidateTagReplay
+            && self.fired.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Apply the held create now; returns whether one was held.
@@ -14870,8 +14879,13 @@ impl lance::io::WrappingObjectStore for ManifestRequestFault {
         _: &str,
         original: Arc<dyn object_store::list::PaginatedListStore>,
     ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
-        // This wrapper faults puts only; listings pass through unchanged.
-        Some(original)
+        if self.fault == ManifestFault::CandidateTagReplay {
+            // The post-tag authority probe must observe the same read fault
+            // whether Lance uses a complete listing or a pushed-down page.
+            None
+        } else {
+            Some(original)
+        }
     }
 }
 
@@ -14910,6 +14924,10 @@ impl object_store::ObjectStore for ManifestRequestFaultStore {
             return self.original.put_opts(location, payload, options).await;
         };
         let transaction = directory.as_ref() == "_transactions";
+        let candidate_tag = directory.as_ref() == "tags"
+            && (name.as_ref().starts_with("unpublished_")
+                || name.as_ref().starts_with("unattached_"))
+            && matches!(options.mode, object_store::PutMode::Create);
         let numbered_manifest = directory.as_ref() == "_versions"
             && name.as_ref().ends_with(".manifest")
             && !name.as_ref().starts_with('d')
@@ -14919,6 +14937,22 @@ impl object_store::ObjectStore for ManifestRequestFaultStore {
         }
         let first = |hit: bool| hit && !self.fault.fired.swap(true, Ordering::SeqCst);
         match self.fault.fault {
+            ManifestFault::CandidateTagReplay if first(candidate_tag) => {
+                // Model a remote client's internal retry: one copy is
+                // acknowledged, but the earlier identical request can still
+                // reach the store after rollback removes this copy's key.
+                let result = self
+                    .original
+                    .put_opts(location, payload.clone(), options.clone())
+                    .await?;
+                *self.fault.deferred.lock().unwrap() = Some((
+                    Arc::clone(&self.original),
+                    location.clone(),
+                    payload,
+                    options,
+                ));
+                Ok(result)
+            }
             ManifestFault::TransactionPut if first(transaction) => Err(ambiguous_store_error(
                 "<Code>SlowDown</Code><Message>Please reduce your request rate.</Message>",
             )),
@@ -14970,6 +15004,9 @@ impl object_store::ObjectStore for ManifestRequestFaultStore {
         location: &object_store::path::Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        if self.fault.candidate_probe_unavailable() {
+            return Err(ambiguous_store_error("post-tag authority read unavailable"));
+        }
         self.original.get_opts(location, options).await
     }
 
@@ -14987,6 +15024,14 @@ impl object_store::ObjectStore for ManifestRequestFaultStore {
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        if self.fault.candidate_probe_unavailable() {
+            return futures::stream::once(async {
+                Err(ambiguous_store_error(
+                    "post-tag authority listing unavailable",
+                ))
+            })
+            .boxed();
+        }
         self.original.list(prefix)
     }
 
@@ -14994,6 +15039,11 @@ impl object_store::ObjectStore for ManifestRequestFaultStore {
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> object_store::Result<object_store::ListResult> {
+        if self.fault.candidate_probe_unavailable() {
+            return Err(ambiguous_store_error(
+                "post-tag authority listing unavailable",
+            ));
+        }
         self.original.list_with_delimiter(prefix).await
     }
 
@@ -15263,4 +15313,158 @@ async fn unknown_publication_lands_before_the_next_publication_or_never_issue_10
             );
         }
     }
+}
+
+/// Use Lance's stock object-store implementation of local files for the
+/// publisher session, so native filesystem shortcuts cannot bypass the read
+/// fault. The fixture and its verification still open the same files normally.
+#[derive(Debug)]
+struct FileObjectStoreProvider(Arc<dyn lance_io::object_store::ObjectStoreProvider>);
+
+#[async_trait]
+impl lance_io::object_store::ObjectStoreProvider for FileObjectStoreProvider {
+    async fn new_store(
+        &self,
+        url: url::Url,
+        params: &lance::io::ObjectStoreParams,
+    ) -> lance::Result<lance_io::object_store::ObjectStore> {
+        let url =
+            url::Url::parse(&url.as_str().replacen("file:", "file-object-store:", 1)).unwrap();
+        self.0.new_store(url, params).await
+    }
+
+    fn extract_path(&self, url: &url::Url) -> lance::Result<object_store::path::Path> {
+        self.0.extract_path(url)
+    }
+}
+
+/// A successful tag deletion does not fence an earlier conditional create
+/// that the remote client retried. The candidate can become addressable again
+/// after the failed authority probe, so that failure must stay uncertain.
+/// Rust rather than GQT: this asserts a deferred native tag request and the
+/// completion evidence of an operation that returned no candidate id.
+#[tokio::test]
+async fn candidate_tag_reappearing_after_rollback_stays_uncertain_issue_1067() {
+    let mut evidence = Vec::new();
+    for unattached in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut mc = ManifestCoordinator::init(uri, &build_test_catalog())
+            .await
+            .unwrap();
+        let before = main_rows(uri).await;
+        let before_version = mc.version();
+        let person = mc.snapshot().dataset("node:Person").unwrap().clone();
+        let update = append_person_and_make_update(uri, &person, "Alice").await;
+        let authority = GraphHeadExpectation::new(
+            None,
+            lance::dataset::refs::BranchIdentifier::main(),
+            mc.exact_graph_head(),
+        );
+        let registry = lance::io::ObjectStoreRegistry::default();
+        let provider = registry.get_provider("file-object-store").unwrap();
+        registry.insert("file", Arc::new(FileObjectStoreProvider(provider)));
+        let session = Arc::new(lance::session::Session::new(0, 0, Arc::new(registry)));
+        let publisher = GraphNamespacePublisher::new_with_session(uri, None, session);
+        let fault = ManifestRequestFault::new(ManifestFault::CandidateTagReplay);
+        let probes = crate::instrumentation::QueryIoProbes {
+            manifest_wrapper: Some(Arc::new(fault.clone())),
+            ..Default::default()
+        };
+        let result = crate::instrumentation::with_query_io_probes(probes, async {
+            let changes = [ManifestChange::Update(update.clone())];
+            let expected = expect_person(&person, 1);
+            if unattached {
+                publisher
+                    .write_unattached_candidate(
+                        &changes,
+                        &expected,
+                        &unattached_intent(None),
+                        &authority,
+                        &UnattachedWriteBase::Head,
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                let intent = LineageIntent {
+                    graph_commit_id: ulid::Ulid::new().to_string(),
+                    ..lineage_intent(None, None)
+                };
+                publisher
+                    .write_candidate(&changes, &expected, &intent, &authority, None)
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await;
+        let error = result.expect_err("the authority probe fails after tag creation");
+        assert!(
+            error.to_string().contains("post-tag authority"),
+            "{error:?}"
+        );
+        evidence.push((
+            unattached,
+            error.completion_evidence(),
+            error.is_manifest_publish_in_doubt(),
+        ));
+        let main = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(main.version().version, before_version);
+        assert_eq!(
+            main_rows(uri).await.records(),
+            before.records(),
+            "the live graph did not move"
+        );
+        assert!(
+            main.tags().list().await.unwrap().is_empty(),
+            "rollback removed the acknowledged tag"
+        );
+
+        assert!(
+            fault.land().await,
+            "the earlier conditional tag create was held"
+        );
+        let session = mc.control_session();
+        if unattached {
+            let snapshots = ManifestCoordinator::list_unattached(uri, &session, None)
+                .await
+                .unwrap();
+            assert_eq!(snapshots.len(), 1);
+            let snapshot = &snapshots[0];
+            snapshot.require_readable().unwrap();
+            snapshot.require_extendable().unwrap();
+            assert_eq!(
+                pinned_version(&snapshot.record.tables, &person),
+                update.published_dataset_version
+            );
+        } else {
+            let proposals = ManifestCoordinator::list_unpublished(uri, &session, None)
+                .await
+                .unwrap();
+            assert_eq!(proposals.len(), 1);
+            let proposal = &proposals[0];
+            proposal.require_publishable().unwrap();
+            mc.publish_unpublished(proposal).await.unwrap();
+            assert_eq!(
+                mc.exact_graph_head().as_deref(),
+                Some(proposal.property.graph_commit_id.as_str()),
+                "the resurrected proposal can still publish"
+            );
+        }
+    }
+    assert_eq!(
+        evidence,
+        [
+            (
+                false,
+                Some(crate::error::CompletionEvidence::Uncertain),
+                true
+            ),
+            (
+                true,
+                Some(crate::error::CompletionEvidence::Uncertain),
+                true
+            ),
+        ],
+        "deleting the acknowledged tag does not prove the candidate stayed unreachable"
+    );
 }

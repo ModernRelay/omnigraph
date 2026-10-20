@@ -627,6 +627,8 @@ mod tests {
         Held,
         Ambiguous,
         Refused,
+        LandedWithLocalError,
+        NativeConditionalPut,
     }
 
     impl ScriptedBackend {
@@ -657,12 +659,12 @@ mod tests {
         async fn commit(
             &self,
             manifest: &mut Manifest,
-            _indices: Option<Vec<IndexMetadata>>,
+            indices: Option<Vec<IndexMetadata>>,
             base_path: &Path,
-            _object_store: &ObjectStore,
-            _writer: ManifestWriter,
+            object_store: &ObjectStore,
+            writer: ManifestWriter,
             naming_scheme: ManifestNamingScheme,
-            _transaction: Option<Transaction>,
+            transaction: Option<Transaction>,
         ) -> std::result::Result<ManifestLocation, CommitError> {
             self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let answer = self.answers.lock().unwrap().pop_front().expect("scripted");
@@ -686,7 +688,29 @@ mod tests {
                 }),
                 Answer::Held => Err(CommitError::CommitConflict),
                 Answer::Ambiguous => Err(store_error("S3")),
-                Answer::Refused => Err(store_error("LocalFileSystem")),
+                Answer::Refused => Err(store_error(omnigraph_storage::OWNED_STORE_NAME)),
+                Answer::LandedWithLocalError | Answer::NativeConditionalPut => {
+                    let result = lance_table::io::commit::ConditionalPutCommitHandler
+                        .commit(
+                            manifest,
+                            indices,
+                            base_path,
+                            object_store,
+                            writer,
+                            naming_scheme,
+                            transaction,
+                        )
+                        .await;
+                    if matches!(answer, Answer::LandedWithLocalError) {
+                        // Windows' rename handler can create the destination
+                        // before source cleanup fails. Persist a real manifest
+                        // here so the re-issue meets its native precondition.
+                        result.expect("the manifest must exist before the local error");
+                        Err(store_error("LocalFileSystem"))
+                    } else {
+                        result
+                    }
+                }
             }
         }
     }
@@ -743,6 +767,11 @@ mod tests {
     async fn manifest_request_is_re_issued_until_the_store_answers_issue_1067() {
         use Answer::*;
         assert_eq!(resolve(&[Landed]).await, (true, 1, ManifestRequest::Landed));
+        assert_eq!(
+            resolve(&[LandedWithLocalError, NativeConditionalPut]).await,
+            (false, 2, ManifestRequest::Held),
+            "a local error after manifest creation must not be called a refusal"
+        );
         assert_eq!(
             resolve(&[Ambiguous, Ambiguous, Landed]).await,
             (true, 3, ManifestRequest::Landed),

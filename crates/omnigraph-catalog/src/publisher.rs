@@ -464,10 +464,10 @@ decide_seam! {
 decide_seam! {
     /// After the proposal tag of a write `as commit` names its candidate
     /// version and before the target authority is probed: the unpublished
-    /// commit is addressable, so a failure here is undone by releasing the
-    /// tag, or reported in doubt when that release fails too. It is never a
-    /// plain error, which would release a merge's input holds while the
-    /// proposal stays publishable.
+    /// commit is addressable. A failure here releases the tag, but remains
+    /// in doubt: deletion cannot fence an earlier tag create that a remote
+    /// client retried. A plain error would release a merge's input holds
+    /// while the proposal could become publishable again.
     pub static PROPOSE_POST_TAG_PRE_PROBE = ("propose.post_tag_pre_probe", AnyWrite, [Fail]);
 }
 
@@ -1313,6 +1313,26 @@ async fn create_candidate_tag(
     }
 }
 
+/// A failed post-tag probe proves expiry only when the target authority
+/// moved or its branch disappeared. Deleting the tag cannot settle any other
+/// failure: a remote client's earlier conditional create may still land once
+/// the key is absent again. Keep the publication in doubt so callers also
+/// retain any merge-input holds that a recreated proposal would need.
+fn candidate_probe_failed_after_release(
+    error: OmniError,
+    kind: CandidateKind,
+    graph_commit_id: &str,
+) -> OmniError {
+    if error.is_read_set_changed() || matches!(&error, OmniError::BranchNotFound { .. }) {
+        return error;
+    }
+    OmniError::manifest_publish_in_doubt(format!(
+        "{} '{graph_commit_id}' may remain addressable: its authority probe failed ({error}); \
+         deleting its tag cannot rule out a delayed create",
+        kind.noun()
+    ))
+}
+
 impl GraphNamespacePublisher {
     async fn write_candidate_attempt(
         &self,
@@ -1417,7 +1437,11 @@ impl GraphNamespacePublisher {
             Err(error) => {
                 return Err(
                     match super::unpublished::release_unpublished_tag(&dataset, &name).await {
-                        Ok(()) => error,
+                        Ok(()) => candidate_probe_failed_after_release(
+                            error,
+                            CandidateKind::Unpublished,
+                            &graph_commit_id,
+                        ),
                         Err(release) => OmniError::manifest_publish_in_doubt(format!(
                             "unpublished commit '{graph_commit_id}' may remain addressable: its \
                              authority probe failed ({error}) and the tag release failed \
@@ -2004,7 +2028,11 @@ impl GraphNamespacePublisher {
         .await;
         if let Err(refusal) = probe {
             return Err(match release_unattached_tag(&dataset, &name).await {
-                Ok(()) => refusal,
+                Ok(()) => candidate_probe_failed_after_release(
+                    refusal,
+                    CandidateKind::Unattached,
+                    &property.graph_commit_id,
+                ),
                 Err(release) => OmniError::manifest_publish_in_doubt(format!(
                     "unattached branch '{}' may remain addressable: its authority revalidation \
                      refused it ({refusal}) and the tag release failed ({release})",
