@@ -33,12 +33,14 @@ async fn argument_refusal_help_and_success_return_without_terminating_the_caller
         .await
         .unwrap();
         let error: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(completion.code(), 2, "{verb}: {error}");
+        // A classified command's target refusal exits as its disposition says.
+        assert_eq!(completion.code(), 1, "{verb}: {error}");
         assert_eq!(error["code"], "target_required");
-        if verb == "mutate" {
-            assert_eq!(error["disposition"]["effects"], "none");
-            assert_eq!(error["disposition"]["action"], "refresh");
-        }
+        assert_eq!(
+            error["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{verb}: {error}"
+        );
     }
 }
 
@@ -178,6 +180,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
             Some(evidence),
             None,
             Some(MachineErrors::Json),
+            false,
             &mut stdout,
             &mut stderr,
         )
@@ -211,6 +214,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
             Some(evidence),
             None,
             Some(MachineErrors::Json),
+            false,
             &mut stdout,
             &mut stderr,
         )
@@ -245,6 +249,7 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
             Some(evidence),
             None,
             machine,
+            false,
             &mut stdout,
             &mut stderr,
         )
@@ -268,7 +273,16 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
         fault: OutputFault::Flush,
         bytes: Vec::new(),
     };
-    let error = finish(result, Some(evidence), None, None, &mut stdout, &mut stderr).unwrap_err();
+    let error = finish(
+        result,
+        Some(evidence),
+        None,
+        None,
+        false,
+        &mut stdout,
+        &mut stderr,
+    )
+    .unwrap_err();
     let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
     let failure = serde_json::to_value(&undelivered.failure).unwrap();
     assert_eq!(failure["error"], "response lost after dispatch");
@@ -286,6 +300,41 @@ async fn output_failures_retain_dispatch_evidence_without_leaking_to_the_next_in
     );
     assert!(stdout.is_empty());
     assert!(String::from_utf8_lossy(&stderr.bytes).contains("disposition:"));
+}
+
+#[tokio::test]
+async fn a_failure_after_part_of_a_json_result_goes_to_stderr() {
+    // A streamed read can fail after its first page reached stdout; appending
+    // the failure envelope there would leave two documents in one stream.
+    for (result_started, on_stdout) in [(false, true), (true, false)] {
+        let (result, evidence) =
+            command_outcome::observe(command_outcome::CommandKind::Read, async {
+                command_outcome::dispatched(&Method::GET);
+                Err::<Completion, color_eyre::Report>(eyre!("response body ended early"))
+            })
+            .await;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let completion = finish(
+            result,
+            Some(evidence),
+            None,
+            Some(MachineErrors::Json),
+            result_started,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+        assert_eq!(completion.code(), 1);
+        let (envelope, other) = if on_stdout {
+            (&stdout, &stderr)
+        } else {
+            (&stderr, &stdout)
+        };
+        let failure: Value = serde_json::from_slice(envelope).unwrap();
+        assert_eq!(failure["disposition"]["effects"], "none");
+        assert!(other.is_empty(), "{result_started}: {other:?}");
+    }
 }
 
 #[tokio::test]
@@ -331,8 +380,16 @@ async fn delivered_refusals_keep_their_exit_status_when_unused_stdout_cannot_flu
             bytes: Vec::new(),
         };
         let mut stderr = Vec::new();
-        let completion =
-            finish(result, Some(evidence), None, None, &mut stdout, &mut stderr).unwrap();
+        let completion = finish(
+            result,
+            Some(evidence),
+            None,
+            None,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
         assert_eq!(completion.code(), expected);
         assert!(stdout.bytes.is_empty());
         let diagnostic = String::from_utf8(stderr).unwrap();
@@ -358,8 +415,16 @@ fn handled_nonzero_completions_do_not_flush_an_unrelated_or_failed_stream() {
             } else {
                 (&mut unused, &mut delivered)
             };
-            let completion =
-                finish(Ok(Completion::exit(code)), None, None, None, stdout, stderr).unwrap();
+            let completion = finish(
+                Ok(Completion::exit(code)),
+                None,
+                None,
+                None,
+                false,
+                stdout,
+                stderr,
+            )
+            .unwrap();
             assert_eq!(completion.code(), code);
             assert_eq!(delivered, b"already delivered and flushed\n");
             assert!(unused.bytes.is_empty());
@@ -629,6 +694,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                     Some(evidence),
                     None,
                     json.then_some(MachineErrors::Json),
+                    false,
                     &mut stdout,
                     &mut stderr,
                 );
@@ -729,6 +795,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
         Some(evidence),
         None,
         Some(MachineErrors::Json),
+        false,
         &mut stdout,
         &mut stderr,
     )
@@ -882,6 +949,7 @@ async fn transfer_reads_use_the_supplied_sink_and_propagate_delivery_errors() {
                 None,
                 None,
                 None,
+                false,
                 &mut stdout,
                 &mut stderr,
             )
@@ -1004,6 +1072,7 @@ async fn schema_apply_delivery_failure_retains_publication_and_actor() {
                 Some(evidence),
                 None,
                 json.then_some(MachineErrors::Json),
+                false,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1150,6 +1219,7 @@ async fn init_output_failure_preserves_the_initialized_graph() {
             None,
             None,
             None,
+            false,
             &mut stdout,
             &mut stderr,
         )
@@ -1278,6 +1348,7 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
                 None,
                 None,
                 json.then_some(MachineErrors::Json),
+                false,
                 &mut stdout,
                 &mut stderr,
             )
