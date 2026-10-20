@@ -2394,9 +2394,13 @@ mod owned_shutdown {
     /// 500, the next write on the same server publishes, reads keep serving,
     /// readiness stays `serving`, and a clean SIGTERM still releases the
     /// native lock. Nothing contains the process and nothing poisons the
-    /// storage scope. The fault is real backend I/O: a file planted where
-    /// the Person table's `data/` directory goes makes its first data-file
-    /// write fail.
+    /// storage scope. So is a failure of the publication's own transaction
+    /// file, which precedes the conditional manifest put: no manifest request
+    /// was sent, so the publication is not in doubt. The faults are real
+    /// backend I/O: a file planted where the Person table's `data/` directory
+    /// goes makes its first data-file write fail, and one planted where the
+    /// graph's `__manifest/_transactions/` goes makes the publisher's
+    /// transaction-file write fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn definite_write_failure_keeps_serving_and_releases_the_lock_issue_1067() {
         let temp = converged_cluster_dir("").await;
@@ -2451,6 +2455,15 @@ mod owned_shutdown {
         );
         fs::remove_file(&data_blocker).unwrap();
 
+        let transactions = graph.join("__manifest/_transactions");
+        let parked = graph.join("__manifest/_transactions.parked");
+        fs::rename(&transactions, &parked).unwrap();
+        fs::write(&transactions, b"not a directory").unwrap();
+        let unpublished = knowledge_response(&address, "mutate", &insert("unsent"));
+        assert!(unpublished.starts_with("HTTP/1.1 500"), "{unpublished}");
+        fs::remove_file(&transactions).unwrap();
+        fs::rename(&parked, &transactions).unwrap();
+
         let published = knowledge_response(&address, "mutate", &insert("after"));
         assert!(
             published.starts_with("HTTP/1.1 200"),
@@ -2468,8 +2481,8 @@ mod owned_shutdown {
         assert!(names.starts_with("HTTP/1.1 200"), "{names}");
         assert!(names.contains("after"), "{names}");
         assert!(
-            !names.contains("stranded"),
-            "the failed write published: {names}"
+            !names.contains("stranded") && !names.contains("unsent"),
+            "a failed write published: {names}"
         );
         wait_ready(&address, &mut child.0, "serving").await;
 

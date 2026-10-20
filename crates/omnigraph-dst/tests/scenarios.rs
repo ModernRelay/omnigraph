@@ -6392,3 +6392,126 @@ fn dst_source_guard_no_runtime_env_mutation() {
         }
     }
 }
+
+/// The graph's publication requests get a definite outcome under storage
+/// faults a served write meets: a throttled transaction-file put is
+/// `Unpublished`; a lost acknowledgement, an unanswered request and an
+/// abandoned request that lands late each end in exactly one commit, through
+/// the commit handler's re-issue; and a request no re-issue settles is in
+/// doubt, with nothing visible. The next write on the same handle publishes.
+#[tokio::test]
+#[serial]
+async fn dst_publication_requests_get_a_definite_outcome_issue_1067() {
+    use omnigraph::error::CompletionEvidence;
+    use omnigraph_dst::lance_faults::{
+        PublicationFault, PublicationFaultMode, PublicationTarget, set_publication_fault,
+    };
+
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Committed,
+        Unpublished,
+        InDoubt,
+    }
+
+    omnigraph_dst::lance_faults::install();
+    let reissues = omnigraph::manifest_request_reissues();
+    let cases = [
+        (
+            PublicationTarget::TransactionFile,
+            PublicationFaultMode::Throttled,
+            1,
+            Outcome::Unpublished,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::LostAck,
+            1,
+            Outcome::Committed,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::Unanswered,
+            1,
+            Outcome::Committed,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::LandsLate(std::time::Duration::from_millis(50)),
+            1,
+            Outcome::Committed,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::Unanswered,
+            1 + reissues,
+            Outcome::InDoubt,
+        ),
+    ];
+    for (n, (target, mode, times, expected)) in cases.into_iter().enumerate() {
+        let root = format!("shared-memory://dst-publication-{n}");
+        let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
+        let db = session(
+            Omnigraph::init_with_storage(&root, TEST_SCHEMA, storage, InitOptions::default())
+                .await
+                .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
+            .await
+            .expect("fixtures");
+        let persons = count_rows(&db, "node:Person").await;
+        let commits = db.list_commits(None).await.unwrap().len();
+        let fault = PublicationFault::new(target, mode, times);
+        set_publication_fault(Some(fault.clone()));
+        let result = mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Faulted")], &[("$age", 1)]),
+        )
+        .await;
+        set_publication_fault(None);
+        assert_eq!(
+            fault.hits(),
+            times,
+            "case {n}: the rule hit every request it aimed at"
+        );
+        // An abandoned request has had its chance to land.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let outcome = match &result {
+            Ok(_) => Outcome::Committed,
+            Err(error) if error.is_manifest_publish_in_doubt() => Outcome::InDoubt,
+            Err(error) => {
+                assert_eq!(
+                    error.completion_evidence(),
+                    Some(CompletionEvidence::Unpublished),
+                    "case {n}: {error:?}"
+                );
+                Outcome::Unpublished
+            }
+        };
+        assert_eq!(
+            outcome, expected,
+            "case {n} ({target:?}, {mode:?}): {result:?}"
+        );
+        let landed = usize::from(outcome == Outcome::Committed);
+        assert_eq!(
+            count_rows(&db, "node:Person").await,
+            persons + landed,
+            "case {n}"
+        );
+        assert_eq!(
+            db.list_commits(None).await.unwrap().len(),
+            commits + landed,
+            "case {n}: exactly one commit or none"
+        );
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "After")], &[("$age", 2)]),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("case {n}: the next write publishes: {error:?}"));
+    }
+}
