@@ -56,8 +56,7 @@ pub(crate) async fn run_access(
             let graph = crate::scope::graph_selection(target, graph)?
                 .expect("a root target selects its graph");
             let binding = crate::scope::capture_storage_binding(target)?;
-            let snapshot =
-                crate::commands::control::read_serving_snapshot_or_report(&binding).await?;
+            let snapshot = graph_snapshot(&binding, graph).await?;
             let actor = crate::helpers::resolve_actor(input, actor, stderr)?;
             ("direct", snapshot_access(&snapshot, graph, actor, &args)?)
         }
@@ -113,6 +112,68 @@ async fn server_access(
     crate::helpers::remote_json(&http, reqwest::Method::GET, url, None, token.as_deref()).await
 }
 
+/// The serving snapshot of the cluster at `root`, read for `graph`. When
+/// every applied graph is quarantined the reader serves nothing and refuses
+/// the whole snapshot; if `graph` is one it quarantined, that is the graph's
+/// unavailability, as a server answers it. Every other readiness failure
+/// stays the cluster's.
+async fn graph_snapshot(
+    root: &CapturedStorageBinding,
+    graph: &str,
+) -> Result<omnigraph_cluster::ServingSnapshot> {
+    omnigraph_cluster::read_serving_snapshot_with_binding(root)
+        .await
+        .map_err(|diagnostics| {
+            quarantined_alone(&diagnostics, graph)
+                .unwrap_or_else(|| crate::commands::control::not_servable(root, &diagnostics))
+        })
+}
+
+/// The refusal for `graph` when the reader refused only because every
+/// applied graph is quarantined and `graph` is among them.
+fn quarantined_alone(
+    diagnostics: &[omnigraph_cluster::Diagnostic],
+    graph: &str,
+) -> Option<color_eyre::Report> {
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == omnigraph_cluster::DiagnosticSeverity::Error)
+        .collect();
+    let only_quarantine = !errors.is_empty()
+        && errors
+            .iter()
+            .all(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs");
+    let reasons = graph_reasons(diagnostics, graph);
+    (only_quarantine && !reasons.is_empty()).then(|| quarantined(graph, &reasons))
+}
+
+/// The messages of the diagnostics the reader attributes to `graph`.
+fn graph_reasons<'a>(
+    diagnostics: &'a [omnigraph_cluster::Diagnostic],
+    graph: &str,
+) -> Vec<&'a str> {
+    let path = format!("graph.{graph}");
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.path == path)
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect()
+}
+
+fn quarantined(graph: &str, reasons: &[&str]) -> color_eyre::Report {
+    CodedRefusal::report(
+        ErrorCode::GraphUnavailable,
+        format!(
+            "graph `{graph}` is not served: {}",
+            if reasons.is_empty() {
+                "the cluster quarantined it".to_string()
+            } else {
+                reasons.join("; ")
+            }
+        ),
+    )
+}
+
 /// Check that the cluster serves `graph` before its policy is read. A
 /// quarantined graph's bundle is withheld from the snapshot and an unknown
 /// graph has none, so an absent bundle means "no policy" only for a served
@@ -123,23 +184,9 @@ fn served_graph(snapshot: &omnigraph_cluster::ServingSnapshot, graph: &str) -> R
         .iter()
         .any(|blocked| blocked.graph_id == graph)
     {
-        let path = format!("graph.{graph}");
-        let reasons: Vec<&str> = snapshot
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.path == path)
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect();
-        return Err(CodedRefusal::report(
-            ErrorCode::GraphUnavailable,
-            format!(
-                "graph `{graph}` is not served: {}",
-                if reasons.is_empty() {
-                    "the cluster quarantined it".to_string()
-                } else {
-                    reasons.join("; ")
-                }
-            ),
+        return Err(quarantined(
+            graph,
+            &graph_reasons(&snapshot.diagnostics, graph),
         ));
     }
     if !snapshot
@@ -241,7 +288,7 @@ async fn store_access(
         })?;
     if let Some(member) = member {
         let root = binding.for_uri(&member.root)?;
-        let snapshot = crate::commands::control::read_serving_snapshot_or_report(&root).await?;
+        let snapshot = graph_snapshot(&root, &member.graph_id).await?;
         return snapshot_access(&snapshot, &member.graph_id, actor, args);
     }
     require_standalone_graph(&binding).await?;

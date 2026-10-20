@@ -5549,6 +5549,44 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
     assert_eq!(by_store(), expected);
     assert_eq!(decide(Some("act-bruno"), "main"), main);
     fs::write(&config, applied).unwrap();
+    // Legacy recovery evidence quarantines the cluster's only graph, so the
+    // loader serves nothing; the graph is unavailable, not the cluster
+    // broken, through either address.
+    let recoveries = cluster.path().join("__cluster").join("recoveries");
+    fs::create_dir_all(&recoveries).unwrap();
+    fs::write(
+        recoveries.join("op-pending.json"),
+        json!({
+            "schema_version": 1,
+            "operation_id": "op-pending",
+            "started_at": "1970-01-01T00:00:00Z",
+            "kind": "schema_apply",
+            "graph_id": "knowledge",
+            "graph_uri": store.to_string_lossy(),
+            "desired_schema_digest": "pending",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for target in [cluster.path().to_path_buf(), store.clone()] {
+        let mut command = cli();
+        command.arg("access").arg("--target").arg(&target);
+        if target == cluster.path() {
+            command.args(["--graph", "knowledge"]);
+        }
+        let quarantined = output_failure(command.args(["--branch", "main", "--json"]));
+        assert_eq!(quarantined.status.code(), Some(1), "{quarantined:?}");
+        let refusal = parse_stdout_json(&quarantined);
+        assert_eq!(refusal["code"], "graph_unavailable", "{refusal}");
+        assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+        assert!(
+            refusal["error"]
+                .as_str()
+                .unwrap()
+                .contains("awaits recovery"),
+            "{refusal}"
+        );
+    }
 
     // A store that holds no graph has no policy to report.
     let temp = tempdir().unwrap();

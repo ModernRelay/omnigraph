@@ -128,23 +128,31 @@ pub(crate) async fn run_graphs(
 
 /// Read a cluster's serving snapshot for a control-plane tooling command,
 /// flattening the readiness `Diagnostic` list into one loud error. The single
-/// snapshot entry point for `policy`/`queries`/`access` so the not-servable
-/// message stays identical across them.
-pub(crate) async fn read_serving_snapshot_or_report(
+/// snapshot entry point for `policy`/`queries` so the not-servable message stays
+/// identical across them.
+async fn read_serving_snapshot_or_report(
     binding: &omnigraph::storage::CapturedStorageBinding,
 ) -> Result<omnigraph_cluster::ServingSnapshot> {
-    let diagnostic_cluster = omnigraph::storage::redacted_storage_uri(binding.uri());
-    let snapshot = omnigraph_cluster::read_serving_snapshot_with_binding(binding).await;
-    snapshot.map_err(|diagnostics| {
-        color_eyre::eyre::eyre!(
-            "cluster `{diagnostic_cluster}` is not servable:\n  {}",
-            diagnostics
-                .iter()
-                .map(|d| d.message.clone())
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        )
-    })
+    omnigraph_cluster::read_serving_snapshot_with_binding(binding)
+        .await
+        .map_err(|diagnostics| not_servable(binding, &diagnostics))
+}
+
+/// The one loud error for a cluster the serving snapshot reader refused:
+/// every readiness diagnostic, under the redacted root.
+pub(crate) fn not_servable(
+    binding: &omnigraph::storage::CapturedStorageBinding,
+    diagnostics: &[omnigraph_cluster::Diagnostic],
+) -> color_eyre::Report {
+    color_eyre::eyre::eyre!(
+        "cluster `{}` is not servable:\n  {}",
+        omnigraph::storage::redacted_storage_uri(binding.uri()),
+        diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    )
 }
 
 /// Resolve the Cedar policy bundle(s) for a direct-root policy target
