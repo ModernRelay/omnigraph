@@ -135,7 +135,7 @@ reports `key_conflict` on an already-committed pair, `merge` upserts it, and
 a supplied top-level `id` must equal the derivation exactly.
 
 ```bash
-omnigraph load --data batch.jsonl --mode merge graph.omni
+omnigraph load --data batch.jsonl --mode merge --target ./graph.omni
 ```
 
 One load request is one graph commit. Use `--branch <name> --from <base>` to
@@ -215,8 +215,8 @@ See [Explaining a load statement](../queries/explain-load.md).
 #### CLI and HTTP requests
 
 ```bash
-omnigraph mutate --store graph.omni -e 'load csv "file:///data/person_0_0.csv" into node:Person mode append delimiter "|" header'
-omnigraph mutate --server dev -e 'load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" header'
+omnigraph mutate --target ./graph.omni -e 'load csv "file:///data/person_0_0.csv" into node:Person mode append delimiter "|" header'
+omnigraph mutate --target dev -e 'load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" header'
 ```
 
 The CLI uses `--branch`; HTTP uses the request `branch`, with `main` as the
@@ -328,9 +328,9 @@ the caller read:
 
 ```bash
 # The JSON response includes the commit pinned for these rows.
-omnigraph query find_person --query queries.gq --store graph.omni --json
+omnigraph query find_person --query queries.gq --target ./graph.omni --json
 
-omnigraph mutate update_person --query queries.gq --store graph.omni \
+omnigraph mutate update_person --query queries.gq --target ./graph.omni \
   --params '{"name":"Ada"}' \
   --if-commit <graph_commit_id> --json
 ```
@@ -338,7 +338,7 @@ omnigraph mutate update_person --query queries.gq --store graph.omni \
 The condition compares the effective head of the target branch. Any
 intervening commit invalidates it, including a commit that changed an unrelated
 entity or type. On mismatch, nothing is written: the CLI exits with code 4
-against a server and with code 1 on an embedded graph such as this `--store`
+against a server and with code 1 on an embedded graph such as this `--target`
 run, and JSON output contains `precondition_failure` with `expected` and
 optional `actual` commit ids. Re-read the branch and decide again; do not blindly retry
 the old mutation. The precondition is still checked when the mutation would

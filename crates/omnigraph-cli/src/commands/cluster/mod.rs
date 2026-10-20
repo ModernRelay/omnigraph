@@ -4,18 +4,17 @@ mod args;
 pub(crate) use args::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 
 use crate::app::Completion;
-use crate::helpers::resolve_cluster_actor;
+use crate::helpers::resolve_actor;
 use crate::output::*;
+use crate::targets::{ResolvedTarget, TargetBinding};
 use color_eyre::eyre::{Result, bail};
-use omnigraph_cluster::{
-    force_unlock_config_dir, observe_config_dir, status_config_dir, validate_config_dir,
-};
+use omnigraph_cluster::validate_config_dir;
 use std::io::Write;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ClusterScope<'a> {
     pub(crate) operator: &'a crate::operator::InvocationConfig,
-    pub(crate) root: Option<&'a str>,
+    pub(crate) target: Option<&'a ResolvedTarget>,
     pub(crate) actor: Option<&'a str>,
 }
 
@@ -25,21 +24,35 @@ pub(crate) async fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
+    if let ClusterCommand::Validate { config, json } = command {
+        let output = validate_config_dir(config);
+        return finish_cluster_validate(&output, json, stdout);
+    }
+    let target = scope
+        .target
+        .ok_or_else(|| color_eyre::eyre::eyre!("cluster operation requires a target"))?;
+    if matches!(target.binding, TargetBinding::Server { .. }) {
+        crate::cluster_remote::run(scope.operator, &command, target, stdout, stderr).await?;
+        return Ok(Completion::success());
+    }
+    let TargetBinding::DirectRoot { uri: root, .. } = &target.binding else {
+        bail!("this cluster operation requires a direct-root or server target");
+    };
+    let binding = crate::scope::capture_storage_binding(target)?;
     match command {
-        ClusterCommand::Validate { config, json } => {
-            let output = validate_config_dir(config);
-            return finish_cluster_validate(&output, json, stdout);
-        }
         ClusterCommand::Plan { config, json, .. } => {
-            let output = omnigraph_cluster::plan_config_dir_as(
-                config,
-                resolve_cluster_actor(scope.operator, scope.actor, stderr)?,
+            let output = omnigraph_cluster::plan_config_dir_with_binding_as(
+                config
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+                &binding,
+                resolve_actor(scope.operator, scope.actor, stderr)?,
             )
             .await;
             return finish_cluster_plan(&output, json, stdout);
         }
         ClusterCommand::Observe { config, json } => {
-            let output = observe_config_dir(config).await;
+            let output = omnigraph_cluster::observe_config_dir_with_binding(config, &binding).await;
             return finish_cluster_state_sync(&output, json, stdout);
         }
         ClusterCommand::Apply {
@@ -49,17 +62,30 @@ pub(crate) async fn run(
             writers_stopped,
             ..
         } => {
-            let caller = omnigraph_cluster::DeploymentCaller::storage_owner(resolve_cluster_actor(
+            if writers_stopped && (config.is_some() || deployment_id.is_none()) {
+                bail!(
+                    "--writers-stopped requires source-free --deployment-id; it cannot select source apply"
+                );
+            }
+            if writers_stopped && !target.is_explicit() {
+                bail!("deployment recovery effects require an explicit --target");
+            }
+            let caller = omnigraph_cluster::DeploymentCaller::storage_owner(resolve_actor(
                 scope.operator,
                 scope.actor,
                 stderr,
             )?);
-            if let Some(root) = scope.root {
-                let id = deployment_id.as_deref().ok_or_else(|| color_eyre::eyre::eyre!("root-addressed apply requires --deployment-id; it only reconciles the original deployment"))?;
-                let result =
-                    omnigraph_cluster::reconcile_deployment(root, id, writers_stopped, &caller)
+            if let Some(id) = deployment_id.as_deref().filter(|_| config.is_none()) {
+                let result = omnigraph_cluster::reconcile_deployment_with_binding(
+                    &binding,
+                    id,
+                    writers_stopped,
+                    &caller,
+                )
+                .await;
+                let status =
+                    omnigraph_cluster::deployment_status_with_binding(&binding, None, &caller)
                         .await;
-                let status = omnigraph_cluster::deployment_status(root, None, &caller).await;
                 let custody = match &status {
                     Ok(status) => deployment_status_identity(status),
                     Err(_) => format!(
@@ -69,7 +95,7 @@ pub(crate) async fn run(
                 };
                 let lock_report = match &status {
                     Ok(status) => report_deployment_lock(status, stderr),
-                    Err(_) => Ok(()), // Preserve the existing best-effort status lookup.
+                    Err(_) => Ok(()),
                 };
                 let outcome_report = finish_core_deployment(result, json, stdout);
                 retain_delivery_identity(
@@ -80,7 +106,10 @@ pub(crate) async fn run(
                 )?;
             } else {
                 apply_source(
-                    &config,
+                    config
+                        .as_deref()
+                        .unwrap_or_else(|| std::path::Path::new(".")),
+                    &binding,
                     deployment_id.as_deref(),
                     &caller,
                     json,
@@ -94,18 +123,22 @@ pub(crate) async fn run(
             writers_stopped,
             json,
         } => {
-            let root = scope
-                .root
-                .ok_or_else(|| color_eyre::eyre::eyre!("upgrade-ledger requires --cluster ROOT"))?;
-            let caller = omnigraph_cluster::DeploymentCaller::storage_owner(resolve_cluster_actor(
+            if !target.is_explicit() {
+                bail!("upgrade-ledger requires an explicit --target");
+            }
+            let caller = omnigraph_cluster::DeploymentCaller::storage_owner(resolve_actor(
                 scope.operator,
                 scope.actor,
                 stderr,
             )?);
             let status = retain_delivery_identity(
                 core_deployment_result(
-                    omnigraph_cluster::upgrade_deployment_ledger(root, writers_stopped, &caller)
-                        .await,
+                    omnigraph_cluster::upgrade_deployment_ledger_with_binding(
+                        &binding,
+                        writers_stopped,
+                        &caller,
+                    )
+                    .await,
                     json,
                     stdout,
                 ),
@@ -129,76 +162,53 @@ pub(crate) async fn run(
             )?;
         }
         ClusterCommand::Status {
-            config,
             json,
             deployment_id,
             ..
         } => {
-            if let Some(root) = scope.root {
-                let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
-                let status = core_deployment_result(
-                    omnigraph_cluster::deployment_status(root, deployment_id.as_deref(), &caller)
-                        .await,
+            let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+            let status = core_deployment_result(
+                omnigraph_cluster::deployment_status_with_binding(
+                    &binding,
+                    deployment_id.as_deref(),
+                    &caller,
+                )
+                .await,
+                json,
+                stdout,
+            )?;
+            write_json(&status, stdout)?;
+        }
+        ClusterCommand::ForceUnlock { lock_id, json } => {
+            if !target.is_explicit() {
+                bail!("force-unlock requires an explicit --target");
+            }
+            let custody = format!(
+                "Cluster-root: {}\nRequested lock-ID: {lock_id}",
+                omnigraph::storage::redacted_storage_uri(root)
+            );
+            retain_delivery_identity(
+                core_deployment_result(
+                    omnigraph_cluster::force_unlock_storage_binding(&binding, &lock_id).await,
                     json,
                     stdout,
+                ),
+                custody.clone(),
+            )?;
+            let report = (|| -> Result<()> {
+                write_json(
+                    &serde_json::json!({"unlocked": true, "lock_id": lock_id}),
+                    stdout,
                 )?;
-                write_json(&status, stdout)?;
-            } else {
-                let output = status_config_dir(config).await;
-                return finish_cluster_status(&output, json, stdout);
-            }
+                stdout.flush()?;
+                Ok(())
+            })();
+            retain_delivery_identity(
+                report,
+                format!("{custody}; force-unlock completed; its receipt could not be delivered"),
+            )?;
         }
-        ClusterCommand::ForceUnlock {
-            lock_id,
-            config,
-            json,
-        } => {
-            if let Some(root) = scope.root {
-                let custody = format!(
-                    "Cluster-root: {}\nRequested lock-ID: {lock_id}",
-                    omnigraph::storage::redacted_storage_uri(root)
-                );
-                retain_delivery_identity(
-                    core_deployment_result(
-                        omnigraph_cluster::force_unlock_storage_root(root, &lock_id).await,
-                        json,
-                        stdout,
-                    ),
-                    custody.clone(),
-                )?;
-                let report = (|| -> Result<()> {
-                    write_json(
-                        &serde_json::json!({"unlocked": true, "lock_id": lock_id}),
-                        stdout,
-                    )?;
-                    stdout.flush()?;
-                    Ok(())
-                })();
-                retain_delivery_identity(
-                    report,
-                    format!(
-                        "{custody}; force-unlock completed; its receipt could not be delivered"
-                    ),
-                )?;
-            } else {
-                let output = force_unlock_config_dir(config, lock_id.clone()).await;
-                let mut custody = format!(
-                    "Cluster-state: {}\nRequested lock-ID: {lock_id}; force-unlock result: ok={}, lock_removed={}",
-                    omnigraph::storage::redacted_storage_uri(&output.state_observations.state_path),
-                    output.ok,
-                    output.lock_removed,
-                );
-                if let Some(lock) = &output.state_observations.lock_id {
-                    custody.push_str(&format!("\nObserved admission lock: {lock}"));
-                }
-                let report = (|| -> Result<Completion> {
-                    let completion = finish_cluster_force_unlock(&output, json, stdout)?;
-                    stdout.flush()?;
-                    Ok(completion)
-                })();
-                return retain_delivery_identity(report, custody);
-            }
-        }
+        ClusterCommand::Validate { .. } => unreachable!("local validation dispatches first"),
         ClusterCommand::Create { .. }
         | ClusterCommand::List { .. }
         | ClusterCommand::Members { .. }
@@ -209,9 +219,7 @@ pub(crate) async fn run(
         | ClusterCommand::Token { .. }
         | ClusterCommand::Operation { .. }
         | ClusterCommand::History { .. }
-        | ClusterCommand::Cancel { .. } => {
-            unreachable!("managed cluster commands dispatch first")
-        }
+        | ClusterCommand::Cancel { .. } => bail!("this operation requires a managed target"),
     }
     Ok(Completion::success())
 }
@@ -293,6 +301,7 @@ fn deployment_status_identity(status: &omnigraph_cluster::DeploymentStatus) -> S
 /// the deployment owner. Recovery identity survives a failed output stream.
 pub(crate) async fn apply_source(
     config: &std::path::Path,
+    binding: &omnigraph::storage::CapturedStorageBinding,
     requested_id: Option<&str>,
     caller: &omnigraph_cluster::DeploymentCaller,
     json: bool,
@@ -301,8 +310,8 @@ pub(crate) async fn apply_source(
 ) -> Result<()> {
     let mut custody = None;
     let mut custody_report = Ok(());
-    let result = omnigraph_cluster::apply_deployment(
-        config, requested_id, caller,
+    let result = omnigraph_cluster::apply_deployment_with_binding(
+        config, binding, requested_id, caller,
         |id, root, lock| {
             let root = omnigraph::storage::redacted_storage_uri(root);
             let message = format!("Deployment-ID: {id}\nCluster-root: {root}\nAdmission lock: {lock}; retain until prior work is quiescent, then exact-ID force-unlock");

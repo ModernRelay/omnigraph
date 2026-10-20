@@ -5,11 +5,10 @@ use std::{fs, io::Write, path::Path};
 
 use crate::app::Completion;
 use crate::client::GraphClient;
-use crate::helpers::{resolve_maintenance_uri, write_target};
 use crate::output::{
     SchemaPlanOutput, write_json, write_schema_apply_human, write_schema_plan_human,
 };
-use crate::planes::Capability;
+use crate::targets::ResolvedTarget;
 
 pub(crate) mod args;
 mod init;
@@ -19,18 +18,13 @@ pub(crate) use args::{InitArgs, LintArgs, SchemaCommand};
 pub(crate) use init::run_init;
 pub(crate) use lint::run_lint;
 
-/// Only the existing global arguments consumed by this command family.
+/// Captured target and the graph/actor inputs consumed by schema commands.
 #[derive(Clone, Copy)]
 pub(crate) struct SchemaScope<'a> {
     pub(crate) operator: &'a crate::operator::InvocationConfig,
-    pub capability: Capability,
-    pub server: Option<&'a str>,
-    pub graph: Option<&'a str>,
-    pub actor: Option<&'a str>,
-    pub profile: &'a Option<String>,
-    pub store: &'a Option<String>,
-    pub cluster: Option<&'a str>,
-    pub quiet: bool,
+    pub(crate) target: Option<&'a ResolvedTarget>,
+    pub(crate) graph: Option<&'a str>,
+    pub(crate) actor: Option<&'a str>,
 }
 
 pub(crate) async fn run_schema(
@@ -39,62 +33,27 @@ pub(crate) async fn run_schema(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
+    let target = scope
+        .target
+        .ok_or_else(|| eyre!("schema operation requires a target"))?;
     match command {
-        SchemaCommand::Plan { uri, schema, json } => {
-            let uri = resolve_maintenance_uri(
-                scope.operator,
-                scope.profile.as_deref(),
-                scope.store.as_deref(),
-                scope.cluster,
-                scope.graph,
-                uri,
-                "schema plan",
-                stderr,
-            )
-            .await?;
-            plan_schema(&uri, &schema, json, stdout).await?;
+        SchemaCommand::Plan { schema, json } => {
+            let uri = crate::scope::direct_graph_uri(target, scope.graph).await?;
+            let binding = crate::scope::capture_storage_binding(target)?.for_uri(&uri)?;
+            plan_schema(&binding, &schema, json, stdout).await?;
         }
-        SchemaCommand::Apply { uri, schema, json } => {
-            let client = GraphClient::resolve_with_policy(
-                scope.operator,
-                scope.capability,
-                scope.server,
-                scope.graph,
-                uri,
-                scope.actor,
-                scope.profile.as_deref(),
-                scope.store.as_deref(),
-                stderr,
-            )
-            .await?;
-            apply_schema(&client, &schema, json, scope.quiet, stdout, stderr).await?;
+        SchemaCommand::Apply { schema, json } => {
+            let client =
+                GraphClient::from_target(scope.operator, target, scope.graph, scope.actor, stderr)
+                    .await?;
+            apply_schema(&client, &schema, json, stdout, stderr).await?;
         }
-        SchemaCommand::UpgradeSystemColumns { uri, check, json } => {
-            return crate::schema_upgrade::run(
-                scope.operator,
-                scope.profile,
-                scope.store,
-                uri,
-                check,
-                json,
-                scope.quiet,
-                stdout,
-                stderr,
-            )
-            .await;
+        SchemaCommand::UpgradeSystemColumns { check, json } => {
+            return crate::schema_upgrade::run(target, check, json, stdout).await;
         }
-        SchemaCommand::Show { uri, json } => {
-            let client = GraphClient::resolve(
-                scope.operator,
-                scope.capability,
-                scope.server,
-                scope.graph,
-                uri,
-                scope.profile.as_deref(),
-                scope.store.as_deref(),
-                stderr,
-            )
-            .await?;
+        SchemaCommand::Show { json } => {
+            let client =
+                GraphClient::from_target(scope.operator, target, scope.graph, None, stderr).await?;
             show_schema(&client, json, stdout).await?;
         }
     }
@@ -102,13 +61,14 @@ pub(crate) async fn run_schema(
 }
 
 pub(crate) async fn plan_schema(
-    uri: &str,
+    binding: &omnigraph::storage::CapturedStorageBinding,
     schema: &Path,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<()> {
     let schema_source = fs::read_to_string(schema)?;
-    let db = crate::admission::open_read_only(uri, None).await?;
+    let uri = binding.uri();
+    let db = crate::admission::open_read_only_with_binding(binding, None).await?;
     let plan = db.plan_schema(&schema_source).await?;
     let output = SchemaPlanOutput {
         uri,
@@ -128,7 +88,6 @@ pub(crate) async fn apply_schema(
     client: &GraphClient,
     schema: &Path,
     json: bool,
-    quiet: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
@@ -137,8 +96,8 @@ pub(crate) async fn apply_schema(
     // `schema apply` against its storage root — that would bypass the
     // ledger. Mirrors `init`'s refusal. This command addresses
     // standalone storage only.
-    if !client.is_remote() {
-        if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(client.uri())
+    if let Some(binding) = client.storage_binding() {
+        if let Some(root) = omnigraph_cluster::cluster_root_for_graph_binding(binding)
             .await
             .map_err(|diagnostic| {
                 eyre!(
@@ -160,13 +119,6 @@ pub(crate) async fn apply_schema(
     // The embedded (direct-store) arm carries no stored-query
     // registry — the registry is cluster-owned (RFC-011), so a
     // standalone apply has nothing to validate against.
-    write_target(
-        quiet,
-        "schema apply",
-        client.uri(),
-        client.is_remote(),
-        stderr,
-    )?;
     let output = client
         .apply_schema(&schema_source, |_catalog| Ok(()), stderr)
         .await?;

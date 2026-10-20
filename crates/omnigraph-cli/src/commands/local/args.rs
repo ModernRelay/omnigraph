@@ -30,20 +30,3 @@ pub(crate) enum SkillCommand {
         path: String,
     },
 }
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ProfileCommand {
-    /// List the profiles defined in ~/.omnigraph/config.yaml.
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show a profile's resolved scope. With no name, shows the active
-    /// (`$OMNIGRAPH_PROFILE`) profile, else the flat operator defaults.
-    Show {
-        /// Profile name (optional).
-        name: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}

@@ -22,7 +22,7 @@ explain query adults() {
 ```
 
 ```bash
-omnigraph query --query explain.gq --store graph.omni --format kv
+omnigraph query --query explain.gq --target ./graph.omni --format kv
 ```
 
 The result is a table with one row per plan node, in the order an `EXPLAIN`
@@ -208,12 +208,10 @@ row `datafusion` reads `unavailable: …` with the reason.
 
 ## Profile
 
-The third surface beside the rows and explain is `profile`: what each node
-of the plan a `v2` run executed did, written back as rows in the explain row
-schema (`tree`, `depth`, `node`, `detail`) with `tree` `profile`, no `depth`,
-`node` the plan node's kind (`Scan`, `HashJoin`, `ContainsJoin`, `Expand`,
-`Sort`, `Page`, …) and `detail` one JSON object per node of the run, from the one operator
-the node built:
+The run's `profile` describes each plan node in the explain row schema
+(`tree`, `depth`, `node`, `detail`). Rows use `tree` `profile`, no `depth`,
+the plan node's kind in `node` (`Scan`, `HashJoin`, `ContainsJoin`, …),
+and its operator's JSON report in `detail`:
 
 | Key | Meaning |
 |---|---|
@@ -242,11 +240,26 @@ documents only before it) carry a pipeline `id` and `depends_on`, with
 the engine builds its stream through, the one the planner's cut names, so the
 printed pipelines are the executed ones. Saved physical
 plans use a `bound_plan_version: 9` envelope whose `body` contains `plan` and
-`values`; version 7 records each aggregate's `distinct` flag, version 8
-types each node's ordering and declares ranked scans' eligibility and policy,
-and version 9 records each `AntiJoin`'s `strategy`. Older unversioned plans and
-unsupported versions are refused with a
-regeneration instruction, including plans without traversal nodes.
+`values`. Unversioned plans and other versions are refused with a regeneration
+instruction, including plans without traversal nodes.
+
+A nearest scan also reports `node` `ann_metrics` for each measured attempt:
+
+| `detail` key | Meaning |
+|---|---|
+| `id`, `rung`, `attempt` | the scan node, overfetch pass and zero-based position in that pass's `probes.attempts` list |
+| `counts` | available `partitions_searched`, `partitions_ranked`, and prefilter loads, input rows, input batches and row IDs |
+| `cumulative_times_ns` | available index-open, partition-load/preparation, prefilter-wait, CPU-queue-wait, search, query-preparation, distance/top-k and result-materialization timings, plus prefilter load/input/build timings, in nanoseconds |
+
+`partitions_ranked` sums the total IVF partitions in each opened index delta;
+`partitions_searched` counts the partitions actually searched. Their ratio is
+not a recall measurement. This is a curated subset of native diagnostics;
+index cache hits, misses and comparison counts are not exposed here.
+
+Missing metrics are absent, not zero; an attempt without metrics has no row.
+Timings include waits, overlap and accumulate across concurrent partitions;
+their sum is not query latency. Diagnostics may vary on replay and do not
+change probe decisions, result ordering or replay policy.
 
 An `Aggregate` node's `aggregates` array aligns with `exprs`, with `null` for
 group keys. Each aggregate records its result `column`, `func`, declared `input`
@@ -258,9 +271,7 @@ Aggregate, Projection and MetadataCount also print `columns`, an ordered list
 such as `["total: F64?", "person: Person"]`. Names match executed result columns;
 `?` records declared nullability, so `count` is `I64?` even when execution
 returns no nulls. A node type names its complete projected object, excluding
-Blob and Vector properties. Saved version 1 through 5 plans must be regenerated
-for the current typed expression declarations, and version 6 to 8 plans for
-the fields versions 7 to 9 added.
+Blob and Vector properties.
 
 Expression-bearing plan fields have additive `typed_*` counterparts. Each
 expression tree records `op`, the existing GQ text in `gq`, its stored `type`,

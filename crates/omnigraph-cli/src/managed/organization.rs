@@ -1,7 +1,8 @@
 //! Selected-organization team administration; graph authority remains in Cedar.
+use super::args::OrganizationArgs;
 use super::*;
 use crate::cli::{
-    OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand as Invitations,
+    OrganizationCommand, OrganizationInvitationsCommand as Invitations,
     OrganizationMembersCommand as Members,
 };
 use std::collections::BTreeSet;
@@ -409,23 +410,6 @@ fn invitation_page_human(data: &Value, organization: &str) -> Result<String> {
     Ok(human)
 }
 
-async fn client(target: &OrganizationArgs) -> Result<Api> {
-    let context = read_context(&target.config)?;
-    let origin = match (&target.api, &context) {
-        (Some(api), _) => canonical_origin(api)?,
-        (None, Some(context)) => context.api.clone(),
-        (None, None) => {
-            return Err(Failure::refused(
-                "managed_context_required",
-                "organization commands require --api or a managed folder context",
-            ));
-        }
-    };
-    let selected =
-        selected_organization(context.as_ref(), &origin, target.organization.as_deref())?;
-    Api::authenticated(origin, selected).await
-}
-
 async fn request(
     api: &Api,
     method: Method,
@@ -439,6 +423,7 @@ async fn request(
     if !response.status.is_success() {
         return Err(Failure {
             body: response.body,
+            response_status: Some(response.status),
             exit: if response.status.is_client_error() {
                 2
             } else {
@@ -578,7 +563,8 @@ fn patch_human(data: &Value, patch: &Patch) -> Result<String> {
 }
 
 pub(super) async fn dispatch(
-    target: &OrganizationArgs,
+    binding: &Binding,
+    args: &OrganizationArgs,
     command: &OrganizationCommand,
     stderr: &mut dyn Write,
 ) -> Output {
@@ -617,14 +603,12 @@ pub(super) async fn dispatch(
             OrganizationCommand::Invitations { command: Invitations::List { after: Some(cursor) } } if !plain(cursor, 256) => return Err(Failure::refused("cursor_invalid", "invitation cursor must contain 1–256 bytes without control characters")),
             _ => None,
         };
-        // A bound or explicitly selected organization must agree with YAML before any HTTP.
-        if let Some(patch) = &patch {
-            let context = read_context(&target.config)?;
-            if target.organization.as_ref().is_some_and(|id| id != &patch.organization_id)
-                || context.as_ref().is_some_and(|c| c.organization_id != patch.organization_id)
-            { return Err(Failure::refused("context_mismatch", "the member patch belongs to another organization")); }
+        // The selected target constrains the patch before credentials or HTTP.
+        let organization = binding.organization()?;
+        if patch.as_ref().is_some_and(|patch| patch.organization_id != organization) {
+            return Err(Failure::refused("target_mismatch", "the member patch belongs to another organization"));
         }
-        let api = client(target).await?;
+        let api = binding.client().await?;
         let organization = api.account_id()?;
         if patch.as_ref().is_some_and(|patch| patch.organization_id != organization) {
             return Err(Failure::refused("context_mismatch", "the member patch belongs to another organization"));
@@ -684,7 +668,7 @@ pub(super) async fn dispatch(
             body,
             human: Some(human),
             exit,
-            json: target.json,
+            json: args.json,
             recovery: key.map(|key| json!({"idempotency_key":key})),
         },
         Err(mut error) => {
@@ -706,7 +690,7 @@ pub(super) async fn dispatch(
                     }
                 }
             }
-            Output::from_result(Err(error), target.json, 1)
+            Output::from_result(Err(error), args.json, 1)
         }
     }
 }

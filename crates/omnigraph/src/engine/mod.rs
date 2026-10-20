@@ -546,15 +546,7 @@ async fn execute_with_context(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         for (scan, report) in reports {
-            if !report.probes.is_empty() {
-                executed.decide(
-                    scan,
-                    0,
-                    report::Taken::Probes {
-                        attempts: report.probes,
-                    },
-                );
-            }
+            executed.record_probes(scan, 0, &report);
         }
         return Ok(PlanRun {
             result: QueryResult::new(fused.schema(), vec![fused]),
@@ -590,16 +582,8 @@ async fn execute_with_context(
             .unwrap_or_default()
     };
     let report = nearest_report(reports);
-    if let Some(NearestScan { id, .. }) = &nearest
-        && !report.probes.is_empty()
-    {
-        executed.decide(
-            *id,
-            0,
-            report::Taken::Probes {
-                attempts: report.probes.clone(),
-            },
-        );
+    if let Some(NearestScan { id, .. }) = &nearest {
+        executed.record_probes(*id, 0, &report);
     }
     let mut result_batch = result_batch;
     let mut report = report;
@@ -667,15 +651,7 @@ async fn execute_with_context(
                     Box::pin(run_once(&lowering, ctx, &wider, rung)).await?;
                 executed.record(rows);
                 let retried_report = nearest_report(retried_reports);
-                if !retried_report.probes.is_empty() {
-                    executed.decide(
-                        id,
-                        rung,
-                        report::Taken::Probes {
-                            attempts: retried_report.probes.clone(),
-                        },
-                    );
-                }
+                executed.record_probes(id, rung, &retried_report);
                 result_batch = retried;
                 report = retried_report;
                 if let PassStep::Exact { k } = step {

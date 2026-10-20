@@ -211,7 +211,7 @@ on `main`, or `omnigraph rebuild-full-text-indexes --branch <branch>` on
 another branch. Historical snapshots of that version stay refused. Run:
 
 ```bash
-omnigraph optimize graph.omni
+omnigraph optimize --target ./graph.omni
 ```
 
 after a large load or merge, and on a regular maintenance cadence, to refresh

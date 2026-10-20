@@ -16,12 +16,10 @@ default = []
 failpoints = ["omnigraph-seams/decide", "omnigraph-core/failpoints", "omnigraph-catalog/failpoints"]
 # Test-only authority (PR #527 review P1-5): the DST seams' INSTALLERS
 # (seeded IDs, logical clock, gate hook), the mutable Lance registry
-# re-export, the harness-added injected-storage constructors
-# (init_with_storage, open_read_only_with_storage), and the
-# bottom-listing (`dst_list_all_keys`) exist only under this non-default
+# re-export and bottom-listing (`dst_list_all_keys`) exist only under this non-default
 # feature. Default builds keep direct real-ID/real-clock paths and
-# expose no dst_* authority. Deliberate exception: `open_with_storage`
-# predates the harness and stays public unconditionally. Scope note:
+# expose no dst_* authority. Explicit-storage constructors are production APIs
+# for captured provider bindings, as well as embedding/test consumers. Scope note:
 # "default builds" means per-package builds (`-p`, and bare cargo via
 # default-members); any `--workspace` invocation unifies this feature IN
 # through the omnigraph-dst dev crate — release artifacts build with

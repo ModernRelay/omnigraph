@@ -56,7 +56,7 @@ query by_vector($q: Vector(4)) {
 --- expect shape
 d.slug: String
 --- expect plan
-scan Doc as $d: ranked nearest fetch 2
+scan Doc as $d: ranked nearest fetch 2 diagnostics present
 
 --- query
 set engine = v2;
@@ -73,7 +73,7 @@ query by_vector_among_members($q: Vector(4), $members: [String]) {
 --- expect shape
 d.slug: String
 --- expect plan
-scan Doc as $d: ranked nearest fetch 1
+scan Doc as $d: ranked nearest fetch 1 diagnostics present
 scan Doc as $d: filter reads [d.slug]
 
 --- query
@@ -93,5 +93,5 @@ query fused($q: Vector(4), $t: String) {
 --- expect shape
 d.slug: String
 --- expect plan
-scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: ranked nearest fetch 3 diagnostics present
 scan Doc as $d: ranked bm25

@@ -811,7 +811,9 @@ async fn stage_pending_table(
                 .await?
         }
         PreparedPendingTable::Overwrite { batches } => {
-            db.storage().stage_overwrite_batches(&ds, batches).await?
+            db.storage()
+                .stage_overwrite_batches(&ds, batches, write_budget)
+                .await?
         }
     };
     Ok(Some(StagedTableEntry {

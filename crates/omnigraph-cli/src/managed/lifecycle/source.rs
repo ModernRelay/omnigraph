@@ -9,15 +9,9 @@ const MAX_SOURCE: usize = 8 * 1024 * 1024;
 const MAX_EXPORT: usize = 64 * 1024 * 1024;
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(120);
 
-pub(super) async fn list(
-    config: &Path,
-    origin: &str,
-    organization: Option<&str>,
-) -> Result<(Value, i32)> {
-    let origin = canonical_origin(origin)?;
-    let context = read_context(config)?;
-    let selected = selected_organization(context.as_ref(), &origin, organization)?;
-    let body = client(&origin, selected)
+pub(super) async fn list(binding: &Binding) -> Result<(Value, i32)> {
+    let body = binding
+        .client()
         .await?
         .request(Method::GET, "/v1/clusters", None, None)
         .await?;
@@ -47,7 +41,7 @@ fn full_revision(revision: &str) -> bool {
 }
 
 pub(super) async fn pull(
-    config: &Path,
+    context: &Context,
     out: &Path,
     revision: Option<&str>,
 ) -> Result<(Value, i32)> {
@@ -59,8 +53,7 @@ pub(super) async fn pull(
     }
     // Refuse unsupported platforms and existing destinations before authentication or HTTP.
     let destination = destination(out)?;
-    let context = context_required(config)?;
-    let api = client(&context.api, Some(&context.organization_id)).await?;
+    let api = context.client().await?;
     let mut path = format!("/v1/clusters/{}/config/export", context.cluster);
     if let Some(revision) = revision {
         path.push_str(&format!("?revision={revision}"));
@@ -83,6 +76,7 @@ pub(super) async fn pull(
     if !response.status.is_success() {
         return Err(Failure {
             body: response.body,
+            response_status: Some(response.status),
             exit: if response.status.is_client_error() {
                 2
             } else {
@@ -91,7 +85,7 @@ pub(super) async fn pull(
         });
     }
     let mut body = response.body;
-    cluster_matches(&body, &context.cluster)?;
+    context.verify(&body)?;
     let actual_revision = body["data"]["revision"]
         .as_str()
         .ok_or_else(Failure::protocol)?;
@@ -107,7 +101,7 @@ pub(super) async fn pull(
     }
     let files = validate_files(&body["data"]["files"])?;
     let count = files.len();
-    publish(&destination, &files, &context)?;
+    publish(&destination, &files)?;
     // Contents belong in the destination, not terminal output or captured logs.
     body["data"]
         .as_object_mut()
@@ -241,7 +235,7 @@ fn write_failed() -> Failure {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn publish(destination: &Path, files: &BTreeMap<&str, &str>, context: &Context) -> Result<()> {
+fn publish(destination: &Path, files: &BTreeMap<&str, &str>) -> Result<()> {
     use std::ffi::CString;
     use std::fs::{File, OpenOptions};
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -339,18 +333,7 @@ fn publish(destination: &Path, files: &BTreeMap<&str, &str>, context: &Context) 
         )?;
         current.sync_all().map_err(|_| write_failed())?;
     }
-    let private = directory(&root, ".omnigraph")?;
-    write(
-        &private,
-        "context",
-        yaml_serde::to_string(context)
-            .map_err(|_| write_failed())?
-            .as_bytes(),
-    )?;
-    private
-        .sync_all()
-        .and_then(|()| root.sync_all())
-        .map_err(|_| write_failed())?;
+    root.sync_all().map_err(|_| write_failed())?;
     let destination_name = name(destination.file_name().ok_or_else(write_failed)?)?;
     // A concurrent creator wins. Never use ordinary rename, which can replace
     // an existing empty directory after the preflight existence check.
@@ -384,7 +367,7 @@ fn publish(destination: &Path, files: &BTreeMap<&str, &str>, context: &Context) 
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn publish(_: &Path, _: &BTreeMap<&str, &str>, _: &Context) -> Result<()> {
+fn publish(_: &Path, _: &BTreeMap<&str, &str>) -> Result<()> {
     Err(Failure::refused(
         "config_pull_unsupported",
         "atomic configuration download currently requires Linux or macOS",
@@ -434,13 +417,7 @@ mod tests {
         let destination = destination(&temp.path().join("checkout")).unwrap();
         std::fs::create_dir(&destination).unwrap();
         let files = BTreeMap::from([("cluster.yaml", "version: 1\n")]);
-        let context = Context {
-            version: 2,
-            cluster: "cluster-one".into(),
-            api: "https://control.example".into(),
-            organization_id: "org_one".into(),
-        };
-        assert!(publish(&destination, &files, &context).is_err());
+        assert!(publish(&destination, &files).is_err());
         assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }

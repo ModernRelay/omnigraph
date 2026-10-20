@@ -3,7 +3,7 @@ rfc: "0059"
 title: "Named targets and CLI coherency"
 track: maintainer
 status: accepted
-implementation: in-progress
+implementation: complete
 authors:
   - andrew
 created: 2026-09-06
@@ -44,13 +44,15 @@ no compatibility adapters; an operator file is either the new format or refused.
 
 Keep declarative plan/apply and existing deployment, identity and publication
 authority. This is a targeting change, not a new resource model or deployment
-protocol. Implementation is tracked in
-[PR #1090](https://github.com/ModernRelay/omnigraph/pull/1090); accepting this
-RFC does not merge or release that implementation. The
-[CLI reference](../user/cli/reference.md) owns currently supported behavior.
-Access reporting, local serving and the CLI MCP bridge are separate work under
+protocol. [PR #1090](https://github.com/ModernRelay/omnigraph/pull/1090)
+implements this contract for the 0.14.0 breaking release. The
+[CLI reference](../user/cli/reference.md) owns supported behavior and migration
+instructions; implementation completion does not itself publish a release.
+Access reporting remains separate work under
 [the graph-access RFC proposal](https://github.com/ModernRelay/omnigraph/pull/1017).
-They consume this target contract and are not prerequisites for its migration.
+The proposed second serving model is discontinued; the existing cluster-backed
+server remains the sole serving model. Any later CLI MCP bridge must connect to
+an existing server and is not a prerequisite for this migration.
 
 ## Motivation
 
@@ -133,7 +135,7 @@ No `workspace`, `service` or `deployment` command group is introduced.
 ### Before and after
 
 The following comparisons show the legacy commands and accepted post-migration
-syntax. The latter requires the implementation release. Assume `defaults.target: staging`, with `staging` and `production` as
+syntax. The latter ships with 0.14.0. Assume `defaults.target: staging`, with `staging` and `production` as
 server targets and `cloud` as a managed cluster target. For the direct-access
 example, the working directory is `/data/project` and `local` has
 `uri: file:///data/project/graph.omni`, so it names the same graph as `./graph.omni`.
@@ -670,6 +672,14 @@ never expose userinfo, bearer values, signed URLs or query-string credentials.
 Remove `--quiet`: its only current effect is suppressing the target line,
 which conflicts with this contract, so the breaking release refuses it.
 Destination and unknown-outcome evidence always remain visible. Do not invent a new progress flag.
+Report a known branch from command arguments or the already prepared source;
+ordinary mutations and loads use their existing `main` default. GQ branch
+statements report the branch they change. Commit-addressed operations report the
+commit ID, while opaque stored/backend-interpreted source without an explicit
+branch reports `branch=backend-resolved`. Do not perform an extra authoritative
+backend read merely to label a diagnostic or guess `main` for such operations.
+Source-dependent scope may follow the initial destination line, but both must be
+delivered and flushed before writable open or dispatch.
 Existing read-shaped operations can have recovery effects: classify the actual
 operation, including equivalent GQ statements, rather than trusting its verb.
 
@@ -951,14 +961,25 @@ registry or tests that merely repeat the implementation.
 | Inline targets | Name versus address, reserved `og_catalog`, relative-path guidance; direct scope by `--graph` and by root-only command, refusing a graph operation on a root without one; inline server credentials only under a configured owner's endpoint scope; invocation-local cloud capture reaching both storage paths; managed refuses inline; `init URI` equals the inline form. | `scope.rs`, `targets.rs`, `cli_data`, `cli_cluster` |
 | Administration | Each edit keeps the rest of the file's text, refuses an incomplete, conflicting or uneditable entry and the default's removal, never stores a secret or sets the default, and serializes under the lock; `credential get` refuses a terminal. | `targets.rs`, `cli_data` |
 
-This documentation change validates the decision record, links and spelling.
-Runtime evidence belongs to the implementation PR and its exact tested commit;
-documentation checks do not qualify the new contract. Before release, qualify the
-current command tree and both storage paths, canonical binding digests, protocol
-discovery, graph/branch diagnostics, recovery custody and the old/new binary
-combinations above. Update user docs, help and release notes with the implementation.
-Rebase and rerun affected owners when the dependency or command baseline changes;
-checks on a pre-Lance-13 base do not qualify the merged implementation.
+Implementation evidence is recorded in
+[PR #1090](https://github.com/ModernRelay/omnigraph/pull/1090), integrated with
+Lance 13 and the current command tree. The CLI unit and process owners cover the
+selection, refusal, recovery-custody and output matrix; direct/server parity also
+asserts recorded actors. Focused regressions reproduce canonical endpoint hash,
+protocol-discovery and pre-dispatch branch-diagnostic defects before their fixes.
+The isolated native-provider matrix exercises control-object and Lance reads and
+conditional creates against fake S3/Azure endpoints, including environment drift,
+Azure's cached options and rotating native credentials. It does not claim live
+cloud qualification.
+
+An old/new binary probe writes and queries a graph with the predecessor CLI,
+checks that the new CLI refuses its legacy operator file, imports that file
+explicitly, and verifies the same rows through the migrated default. It checks
+that the backup and isolated older home are preserved and that retired selectors
+refuse. User docs, embedded help/skill and the breaking release note accompany the
+implementation. Exact-head CI owns the full workspace, GQT, cloud-emulator and
+storage-upgrade gates before merge. Repeat affected owners when the dependency
+or command baseline changes; pre-Lance-13 checks do not qualify the merged code.
 
 The served query-catalog gap [#653](https://github.com/ModernRelay/omnigraph/issues/653)
 remains separate: reuse target resolution and current catalog authority, but do not
@@ -1050,15 +1071,13 @@ Kubernetes documentation and implementation were reviewed on 2026-10-14:
 
 ## Unresolved questions
 
-None for destination selection or the version 1 operator format. Implementation
-qualification remains required before release, including the cloud destination,
-legacy recovery-custody and old/new binary combinations listed above.
+None for destination selection or the version 1 operator format. Live cloud and
+identity-provider qualification retain their existing release requirements and
+support boundaries; fake-provider tests do not replace them.
 
-The designated breaking release is 0.14.0, conditional on implementation
-qualification. Operators using older binaries must keep a separate operator home and must not share a migrated home with them.
+The designated breaking release is 0.14.0. Operators using older binaries must keep a separate operator home and must not share a migrated home with them.
 The implementation's exact serialized fields are represented by
-[`TargetEntry` in PR #1090](https://github.com/ModernRelay/omnigraph/blob/84283920f89cc089ae36a3efec72610318bf9634/crates/omnigraph-cli/src/targets.rs);
-that unmerged implementation must conform to this decision. The only format marker
+[`TargetEntry`](../../crates/omnigraph-cli/src/targets.rs). The only format marker
 is `target_config_version: 1`. Managed account entries may omit `organization_id`
 only for human-device login discovery. Saved server credentials carry their
 endpoint scope. Managed pending/accepted records are kept in operator-owned
@@ -1134,5 +1153,15 @@ new submissions while preserving observation and exact retries.
   versus refreshable authentication semantics. Specify per-API/organization custody
   limits and serialization within each operator home. [PR #1080](https://github.com/ModernRelay/omnigraph/pull/1080)
   is closed in favor of [PR #1090](https://github.com/ModernRelay/omnigraph/pull/1090),
-  which owns the breaking implementation and its remaining qualification. Access,
-  local serving and the CLI MCP bridge remain independent follow-up work.
+  which owns the breaking implementation and its remaining qualification. Access
+  reporting remains independent follow-up work. The second serving model is
+  discontinued; useful MCP client logic may be proposed separately against the
+  existing server.
+
+- **2026-10-20, implementation:** Completed the target migration in PR #1090 on
+  Lance 13, including canonical protocol-1 identities, separate target/credential
+  protocol discovery, native provider-option confinement and truthful write-scope
+  diagnostics. Incorporated the remaining actor-classification and parity-harness
+  cleanup from PR #1059. Updated current command examples, migration guidance and
+  the evidence above. Access reporting, optional error refinements and future MCP
+  clients remain independent work.

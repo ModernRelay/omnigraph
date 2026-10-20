@@ -61,6 +61,7 @@ where
     let stdin_is_terminal = stdin.is_terminal();
     execute(
         parsed,
+        operator::InvocationConfig::capture(),
         &mut stdin,
         stdin_is_terminal,
         &mut io::stdout(),
@@ -71,21 +72,26 @@ where
 
 async fn execute(
     parsed: ParsedInvocation,
+    operator: operator::InvocationConfig,
     stdin: &mut dyn Read,
     stdin_is_terminal: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let ParsedInvocation {
-        cli, mut machine, ..
+        cli,
+        mut machine,
+        explicit_config,
     } = parsed;
     let observe = command_outcome::applies(&cli);
     // Rendering runs inside observation. The completion path retains that
     // same evidence when flushing, including after a dispatched write.
-    // The legacy dispatch future contains every command variant. Keep that
+    // The dispatch future contains every command variant. Keep that
     // large state off reusable callers' stacks (including libtest threads).
     let invocation = Box::pin(run(
         cli,
+        explicit_config,
+        operator,
         &mut machine,
         stdin,
         stdin_is_terminal,
@@ -139,6 +145,31 @@ fn finish(
     {
         stdout.flush()?;
         return Ok(Completion::exit(5));
+    }
+    if let Some(refusal) = error.downcast_ref::<targets::TargetError>()
+        && evidence
+            .as_ref()
+            .is_none_or(command_outcome::Evidence::has_no_effects)
+    {
+        let mut body = serde_json::json!({"error": refusal.to_string(), "code": refusal.code});
+        if let Some(evidence) = evidence {
+            let failure = command_outcome::Failure::classify(
+                color_eyre::eyre::eyre!(refusal.to_string()),
+                evidence,
+            );
+            body["command_outcome"] = serde_json::to_value(failure.command_outcome)?;
+        }
+        match machine {
+            Some(format) => {
+                write_machine(&body, format, stdout)?;
+                stdout.flush()?;
+            }
+            None => {
+                writeln!(stderr, "{refusal}")?;
+                stderr.flush()?;
+            }
+        }
+        return Ok(Completion::exit(2));
     }
     if let Some(evidence) = evidence {
         let failure = command_outcome::Failure::classify(error, evidence);
@@ -281,92 +312,99 @@ fn render_diagnostic(
 
 async fn run(
     cli: Cli,
+    explicit_config: bool,
+    operator: operator::InvocationConfig,
     machine: &mut Option<MachineErrors>,
     stdin: &mut dyn Read,
     stdin_is_terminal: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let operator = operator::InvocationConfig::capture();
+    let cwd = std::env::current_dir()?;
+    let target = scope::resolve(&cli, &operator, &cwd, explicit_config, stderr)?;
+    if let Some(target) = &target {
+        let graph = if let Command::Alias(args) = &cli.command {
+            let alias = &operator.get(stderr)?.aliases[&args.name];
+            scope::graph_selection(target, alias.graph.as_deref())?
+        } else if matches!(
+            planes::requirement(&cli.command),
+            planes::Requirement::Graph { .. }
+        ) {
+            scope::graph_selection(target, cli.graph.as_deref())?
+        } else {
+            cli.graph.as_deref()
+        };
+        scope::report(
+            &operator,
+            target,
+            graph,
+            scope::command_write_scope(&cli.command),
+            stderr,
+        )?;
+    }
+    let managed_data = if let Some(targets::ResolvedTarget {
+        binding: targets::TargetBinding::Managed(binding),
+        ..
+    }) = &target
+    {
+        if let Some(result) = managed::dispatch(&cli, binding, &operator, stderr).await {
+            return Ok(Completion::exit(result.emit(stdout, stderr)?));
+        }
+        match managed::data::client(&cli, binding).await {
+            Ok(client) => Some(client),
+            Err(output) => return Ok(Completion::exit(output.emit(stdout, stderr)?)),
+        }
+    } else {
+        None
+    };
+    let required_target = || {
+        target
+            .as_ref()
+            .expect("operation applicability requires a target")
+    };
     let mut input = crate::input::Input {
         reader: stdin,
         is_terminal: stdin_is_terminal,
     };
-    if cluster_remote::dispatch(&operator, &cli, stdout, stderr).await? {
-        return Ok(Completion::success());
-    }
-    if let Some(result) = managed::dispatch(&cli, stderr).await {
-        let code = result.emit(stdout, stderr)?;
-        return Ok(Completion::exit(code));
-    }
-    let managed_data = match managed::data::client(&operator, &cli, stderr).await {
-        Ok(client) => client,
-        Err(output) => {
-            let code = output.emit(stdout, stderr)?;
-            return Ok(Completion::exit(code));
-        }
-    };
-    // RFC-010 Slice 1: reject scope-addressing flags a verb can't consume,
-    // from one declared flag × capability matrix — before any per-command
-    // dispatch.
-    planes::guard_addressing(&cli)?;
-    // The verb's declared capability, threaded into scope resolution so the
-    // resolver and the guard share one classification (planes.rs).
-    let capability = planes::command_capability(&cli.command);
-    let maintenance_scope = commands::maintenance::MaintenanceScope {
-        operator: &operator,
-        profile: cli.profile.as_deref(),
-        store: cli.store.as_deref(),
-        cluster: cli.cluster.as_deref(),
-        graph: cli.graph.as_deref(),
-        actor: cli.as_actor.as_deref(),
-        yes: cli.yes,
-        quiet: cli.quiet,
-    };
     match cli.command {
-        Command::Login {
-            name, token, json, ..
-        } => {
-            commands::local::run_login(
-                &operator,
-                name.expect("clap requires a server name without --api"),
-                token,
-                json,
-                input.reader,
-                stdout,
-                stderr,
-            )?;
+        Command::Login { token, json } => commands::local::run_login(
+            &operator,
+            required_target(),
+            token,
+            json,
+            input.reader,
+            stdout,
+            stderr,
+        )?,
+        Command::Logout { json } => {
+            commands::local::run_logout(&operator, required_target(), json, stdout)?
         }
-        Command::Logout { name, json, .. } => {
-            commands::local::run_logout(
-                &operator,
-                name.expect("clap requires a server name without --api"),
-                json,
-                stdout,
-            )?;
+        Command::Target { command } => {
+            commands::targets::run_target(&operator, command, input.reader, stdout, stderr)?
         }
-        Command::Profile { command } => {
-            commands::local::run_profile(&operator, command, stdout, stderr)?
-        }
+        Command::Credential { command } => commands::targets::run_credential(
+            &operator,
+            required_target(),
+            command,
+            std::io::stdout().is_terminal(),
+            stdout,
+            stderr,
+        )?,
         Command::Skill { command } => commands::local::run_skill(command, stdout)?,
         Command::Version { json } => commands::local::run_version(json, stdout)?,
         Command::Embed(args) => commands::local::run_embed(args, stdout).await?,
         Command::Init(args) => {
-            commands::schema::run_init(args, stdout).await?;
+            commands::schema::run_init(args, required_target(), stdout).await?;
         }
         Command::Load(args) => {
             commands::transfer::run_load(
                 args,
                 commands::transfer::TransferScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
                     yes: cli.yes,
-                    quiet: cli.quiet,
                 },
                 managed_data,
                 &mut input,
@@ -380,14 +418,10 @@ async fn run(
                 command,
                 commands::history::HistoryScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
                     yes: cli.yes,
-                    quiet: cli.quiet,
                 },
                 &mut input,
                 stdout,
@@ -400,14 +434,10 @@ async fn run(
                 args,
                 commands::history::HistoryScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
                     yes: cli.yes,
-                    quiet: cli.quiet,
                 },
                 stdout,
                 stderr,
@@ -419,14 +449,10 @@ async fn run(
                 command,
                 commands::history::HistoryScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
                     yes: cli.yes,
-                    quiet: cli.quiet,
                 },
                 managed_data,
                 &mut input,
@@ -440,14 +466,10 @@ async fn run(
                 command,
                 commands::history::HistoryScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
                     yes: cli.yes,
-                    quiet: cli.quiet,
                 },
                 stdout,
                 stderr,
@@ -459,14 +481,9 @@ async fn run(
                 command,
                 commands::schema::SchemaScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: target.as_ref(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: &cli.profile,
-                    store: &cli.store,
-                    cluster: cli.cluster.as_deref(),
-                    quiet: cli.quiet,
                 },
                 stdout,
                 stderr,
@@ -478,14 +495,9 @@ async fn run(
                 args,
                 commands::schema::SchemaScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: target.as_ref(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: &cli.profile,
-                    store: &cli.store,
-                    cluster: cli.cluster.as_deref(),
-                    quiet: cli.quiet,
                 },
                 stdout,
                 stderr,
@@ -497,10 +509,8 @@ async fn run(
                 command,
                 commands::control::ControlScope {
                     operator: &operator,
-                    cluster: cli.cluster.as_deref(),
-                    profile: cli.profile.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
-                    server: cli.server.as_deref(),
                 },
                 stdout,
                 stderr,
@@ -512,14 +522,10 @@ async fn run(
                 args,
                 commands::history::HistoryScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
                     yes: cli.yes,
-                    quiet: cli.quiet,
                 },
                 stdout,
                 stderr,
@@ -531,14 +537,10 @@ async fn run(
                 args,
                 commands::transfer::TransferScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
                     yes: cli.yes,
-                    quiet: cli.quiet,
                 },
                 stdout,
                 stderr,
@@ -550,14 +552,10 @@ async fn run(
                 command,
                 commands::transfer::TransferScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
                     yes: cli.yes,
-                    quiet: cli.quiet,
                 },
                 input.reader,
                 input.is_terminal,
@@ -571,12 +569,9 @@ async fn run(
                 args,
                 commands::query::GraphScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
                     yes: cli.yes,
                 },
                 managed_data,
@@ -591,12 +586,9 @@ async fn run(
                 args,
                 commands::query::GraphScope {
                     operator: &operator,
-                    capability,
-                    server: cli.server.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
                     actor: cli.as_actor.as_deref(),
-                    profile: cli.profile.as_deref(),
-                    store: cli.store.as_deref(),
                     yes: cli.yes,
                 },
                 managed_data,
@@ -607,17 +599,16 @@ async fn run(
             .await?;
         }
         Command::Alias(args) => {
-            commands::query::run_alias(&operator, args, machine, stdout, stderr).await?
+            commands::query::run_alias(&operator, required_target(), args, machine, stdout, stderr)
+                .await?
         }
         Command::Policy { command } => {
             return commands::control::run_policy(
                 command,
                 commands::control::ControlScope {
                     operator: &operator,
-                    cluster: cli.cluster.as_deref(),
-                    profile: cli.profile.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
-                    server: cli.server.as_deref(),
                 },
                 stdout,
                 stderr,
@@ -625,45 +616,90 @@ async fn run(
             .await;
         }
         Command::Upgrade(args) => {
-            return commands::maintenance::run_upgrade(args, maintenance_scope, stdout, stderr)
-                .await;
+            return commands::maintenance::run_upgrade(
+                args,
+                commands::maintenance::MaintenanceScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    yes: cli.yes,
+                },
+                stdout,
+                stderr,
+            )
+            .await;
         }
         Command::Optimize(args) => {
-            return commands::maintenance::run_optimize(args, maintenance_scope, stdout, stderr)
-                .await;
+            return commands::maintenance::run_optimize(
+                args,
+                commands::maintenance::MaintenanceScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    yes: cli.yes,
+                },
+                stdout,
+                stderr,
+            )
+            .await;
         }
         Command::RebuildFullTextIndexes(args) => {
             return commands::maintenance::run_full_text_rebuild(
                 args,
-                maintenance_scope,
+                commands::maintenance::MaintenanceScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    yes: cli.yes,
+                },
                 stdout,
                 stderr,
             )
             .await;
         }
         Command::Repair(args) => {
-            return commands::maintenance::run_repair(args, maintenance_scope, stdout, stderr)
-                .await;
+            return commands::maintenance::run_repair(
+                args,
+                commands::maintenance::MaintenanceScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    yes: cli.yes,
+                },
+                stdout,
+                stderr,
+            )
+            .await;
         }
         Command::Cleanup(args) => {
             return commands::maintenance::run_cleanup(
                 args,
-                maintenance_scope,
+                commands::maintenance::MaintenanceScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    yes: cli.yes,
+                },
                 &mut input,
                 stdout,
                 stderr,
             )
             .await;
         }
-        Command::Use { .. } | Command::Organization { .. } => {
-            unreachable!("managed dispatch handles organization commands and use")
+        Command::Organization { .. } => {
+            unreachable!("managed dispatch handles organization commands")
         }
         Command::Cluster { command, .. } => {
             return commands::cluster::run(
                 command,
                 commands::cluster::ClusterScope {
                     operator: &operator,
-                    root: cli.cluster.as_deref(),
+                    target: target.as_ref(),
                     actor: cli.as_actor.as_deref(),
                 },
                 stdout,
@@ -676,10 +712,8 @@ async fn run(
                 command,
                 commands::control::ControlScope {
                     operator: &operator,
-                    cluster: cli.cluster.as_deref(),
-                    profile: cli.profile.as_deref(),
+                    target: required_target(),
                     graph: cli.graph.as_deref(),
-                    server: cli.server.as_deref(),
                 },
                 managed_data,
                 stdout,
