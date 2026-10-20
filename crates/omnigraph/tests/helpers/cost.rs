@@ -125,6 +125,15 @@ impl AttemptTracker {
 }
 
 impl WrappingObjectStore for AttemptTracker {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // Keep listings on the wrapped path so faults and request accounting apply.
+        None
+    }
+
     fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(AttemptTrackingStore {
             target,
@@ -365,6 +374,15 @@ impl PrefixCounter {
 }
 
 impl WrappingObjectStore for PrefixCounter {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // Keep listings on the wrapped path so faults and request accounting apply.
+        None
+    }
+
     fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(PrefixCountingStore {
             target,

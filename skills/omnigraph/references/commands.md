@@ -128,7 +128,8 @@ omnigraph branch merge <branch-name> --into main --delete-branch --store $REPO
 omnigraph branch delete <branch-name> --store $REPO
 ```
 
-All support `--json`. `--from` and `--into` default to `main`.
+All support `--json`. `--from` and `--into` default to `main`. `branch create
+--from-commit <commit-id>` starts the branch at a published commit instead.
 `--delete-branch` removes the source only after a successful merge publication.
 A served `branch delete --json` needs `--yes`.
 
@@ -288,7 +289,7 @@ omnigraph optimize $REPO --json
 ```
 
 Compacts fragments and reconciles declared scalar/vector index coverage without
-deleting retained versions. Lance 11 supports compaction of Blob-bearing data;
+deleting retained versions. Lance 13 supports compaction of Blob-bearing data;
 null,
 valid-empty, and non-empty Blob values remain distinct. Existing full-text
 indexes are preserved and any uncovered tail is scanned; use the explicit
@@ -304,8 +305,10 @@ omnigraph rebuild-full-text-indexes "$REPO" --branch main --json
 
 Direct storage only; `--cluster <root> --graph <id>` also works. Stop overlapping
 writers, preserve a verified whole-store backup, and rebuild every live branch
-that needs search after a Lance 11 upgrade. Do not mix old and new serving
-binaries. Rebuilds use default English analysis, replacing custom tokenizer
+that needs search when moving from uncertified pre-Lance-11 indexes. Certified
+Lance 11 indexes remain compatible under Lance 13 and need no rebuild solely
+for that dependency change. Do not mix fleets across an incompatible analyzer
+transition. Rebuilds use default English analysis, replacing custom tokenizer
 settings; JSON `warnings` reports this for actual work. Check the selected
 `branch`, `graph_commit_id`, and `rebuilt_indexes`; an empty list/null commit is
 a no-op, not a migration of other branches or historical snapshots. `--as` is

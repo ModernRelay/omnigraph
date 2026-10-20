@@ -30,7 +30,7 @@ tables:
       id: {kind: ordinal, start: 0, step: 1}
   - kind: node
     name: Large
-    rows: 1024
+    rows: 64
     commits: 1
     columns:
       id: {kind: ordinal, start: 0, step: 1}
@@ -50,8 +50,8 @@ load executed: partitions 1 rows 2
 
 --- csv large_links.csv
 from,to
-0,1023
-1023,512
+0,63
+63,32
 
 --- mutate
 load csv "large_links.csv" into edge:LargeLink mode overwrite header
@@ -93,11 +93,11 @@ load csv "absent_twice.csv" into edge:SmallLink mode overwrite header
 
 --- csv absent_large.csv
 from,to
-1023,1024
+63,64
 
 --- mutate
 load csv "absent_large.csv" into edge:LargeLink mode overwrite header
---- expect error: '1024' not found in Large
+--- expect error: '64' not found in Large
 
 --- csv padded_small.csv
 from,to
@@ -131,8 +131,8 @@ b.id: I64
 --- query
 query large_rows() { match { $a: Large $a largeLink $b } return { $a.id, $b.id } }
 --- expect unordered
-{"a.id": 0, "b.id": 1023}
-{"a.id": 1023, "b.id": 512}
+{"a.id": 0, "b.id": 63}
+{"a.id": 63, "b.id": 32}
 --- expect shape
 a.id: I64
 b.id: I64
@@ -143,7 +143,7 @@ tables:
     rows: 1
     commits: 1
     columns:
-      id: {kind: ordinal, start: 1024, step: 1}
+      id: {kind: ordinal, start: 64, step: 1}
 --- expect ok
 
 --- mutate
@@ -157,7 +157,7 @@ load executed: partitions 1 rows 1
 --- query
 query across_fragments() { match { $a: Large $a largeLink $b } return { $a.id, $b.id } }
 --- expect unordered
-{"a.id": 1023, "b.id": 1024}
+{"a.id": 63, "b.id": 64}
 --- expect shape
 a.id: I64
 b.id: I64

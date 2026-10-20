@@ -5,6 +5,7 @@ use crate::client::{self, GraphClient};
 use crate::helpers::{confirm_destructive, resolve_branch, write_target};
 use crate::output::{write_json, write_merge_base_human};
 use color_eyre::eyre::Result;
+use omnigraph::db::{ReadTarget, SnapshotId};
 use std::io::Write;
 
 pub(crate) async fn run_branch(
@@ -18,6 +19,7 @@ pub(crate) async fn run_branch(
         BranchCommand::Create {
             uri,
             from,
+            from_commit,
             name,
             json,
         } => {
@@ -33,7 +35,10 @@ pub(crate) async fn run_branch(
                 stderr,
             )
             .await?;
-            let from = resolve_branch(from, None, "main");
+            let start = match from_commit {
+                Some(commit) => ReadTarget::snapshot(SnapshotId::new(commit)),
+                None => ReadTarget::branch(resolve_branch(from, None, "main")),
+            };
             write_target(
                 scope.quiet,
                 "branch create",
@@ -41,14 +46,14 @@ pub(crate) async fn run_branch(
                 client.is_remote(),
                 stderr,
             )?;
-            let payload = client.branch_create_from(&from, &name, stderr).await?;
+            let payload = client.branch_create(start, &name, stderr).await?;
             if json {
                 write_json(&payload, stdout)?;
             } else {
                 writeln!(
                     stdout,
-                    "created branch {} from {}",
-                    payload.name, payload.from
+                    "created branch {} from {} at {}",
+                    payload.name, payload.from, payload.from_commit_id
                 )?;
             }
         }

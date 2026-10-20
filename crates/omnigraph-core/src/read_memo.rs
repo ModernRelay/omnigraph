@@ -12,6 +12,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lance::io::WrappingObjectStore;
+use object_store::list::PaginatedListStore;
 use object_store::path::Path;
 use object_store::{
     Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
@@ -69,6 +70,7 @@ impl MemoEntry {
             meta: self.meta,
             range: self.range,
             attributes: self.attributes,
+            extensions: Default::default(),
         }
     }
 }
@@ -259,29 +261,14 @@ impl WrappingObjectStore for RangeMemoWrapper {
             inner: original,
         })
     }
-}
 
-/// Stacks two store wrappers, `outer` over `inner`, into one
-/// [`WrappingObjectStore`] slot.
-#[derive(Debug)]
-pub struct StackedWrapper {
-    outer: Arc<dyn WrappingObjectStore>,
-    inner: Arc<dyn WrappingObjectStore>,
-}
-
-impl StackedWrapper {
-    pub fn new(
-        outer: Arc<dyn WrappingObjectStore>,
-        inner: Arc<dyn WrappingObjectStore>,
-    ) -> Arc<Self> {
-        Arc::new(Self { outer, inner })
-    }
-}
-
-impl WrappingObjectStore for StackedWrapper {
-    fn wrap(&self, store_prefix: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
-        self.outer
-            .wrap(store_prefix, self.inner.wrap(store_prefix, original))
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        // The memo intercepts GETs only; it never changes listing visibility.
+        Some(original)
     }
 }
 
@@ -302,6 +289,7 @@ impl RangeMemoStore {
             || options.if_modified_since.is_some()
             || options.if_unmodified_since.is_some()
             || options.version.is_some()
+            || !options.extensions.is_empty()
         {
             return None;
         }
@@ -366,6 +354,11 @@ impl ObjectStore for RangeMemoStore {
             return Ok(entry.into_result());
         }
         let result = self.inner.get_opts(location, options).await?;
+        // Opaque response context has neither a bounded retained size nor a
+        // reusable meaning. Preserve it on the original response, uncached.
+        if !result.extensions.is_empty() {
+            return Ok(result);
+        }
         let cost = result
             .range
             .end
@@ -444,6 +437,7 @@ impl ObjectStore for RangeMemoStore {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use lance_io::object_store::ChainedWrappingObjectStore;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
 
@@ -453,6 +447,7 @@ mod tests {
     struct CountingStore {
         inner: InMemory,
         gets: AtomicU64,
+        response_extensions: bool,
     }
 
     impl CountingStore {
@@ -460,6 +455,7 @@ mod tests {
             Arc::new(Self {
                 inner: InMemory::new(),
                 gets: AtomicU64::new(0),
+                response_extensions: false,
             })
         }
     }
@@ -494,8 +490,12 @@ mod tests {
             location: &Path,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
-            self.gets.fetch_add(1, Ordering::Relaxed);
-            self.inner.get_opts(location, options).await
+            let request = self.gets.fetch_add(1, Ordering::Relaxed) + 1;
+            let mut result = self.inner.get_opts(location, options).await?;
+            if self.response_extensions {
+                result.extensions.insert(request);
+            }
+            Ok(result)
         }
 
         fn delete_stream(
@@ -584,6 +584,122 @@ mod tests {
         whole.bytes().await.unwrap();
         store.get(&path).await.unwrap().bytes().await.unwrap();
         assert_eq!(counting.gets.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn opaque_request_and_response_context_bypass_the_memo() {
+        for response_extensions in [false, true] {
+            let counting = Arc::new(CountingStore {
+                inner: InMemory::new(),
+                gets: AtomicU64::new(0),
+                response_extensions,
+            });
+            seed(&counting, DATA_PATH).await;
+            let memo = RangeReadMemo::new(1024 * 1024);
+            memo.register_root("test", &Path::from("tables/x"), true);
+            let available = memo.state.lock().unwrap().remaining_bytes;
+            let store = RangeMemoWrapper::new(&memo)
+                .wrap("test", Arc::clone(&counting) as Arc<dyn ObjectStore>);
+            for request in 1_u64..=2 {
+                let mut options = bounded(16, 48);
+                if !response_extensions {
+                    options.extensions.insert(request);
+                }
+                let result = store
+                    .get_opts(&Path::from(DATA_PATH), options)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.extensions.get::<u64>().copied(),
+                    response_extensions.then_some(request)
+                );
+                assert_eq!(result.bytes().await.unwrap().as_ref(), &[7; 32]);
+            }
+            assert_eq!(counting.gets.load(Ordering::Relaxed), 2);
+            let state = memo.state.lock().unwrap();
+            assert!(state.entries.is_empty());
+            assert_eq!(state.remaining_bytes, available);
+        }
+    }
+
+    #[derive(Debug)]
+    struct PaginationWrapper {
+        name: &'static str,
+        allows_pushdown: bool,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl WrappingObjectStore for PaginationWrapper {
+        fn wrap(&self, store_prefix: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            assert_eq!(store_prefix, "test");
+            self.calls.lock().unwrap().push(self.name);
+            original
+        }
+
+        fn wrap_paginated(
+            &self,
+            store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            assert_eq!(store_prefix, "test");
+            self.calls.lock().unwrap().push(self.name);
+            self.allows_pushdown.then_some(original)
+        }
+    }
+
+    #[async_trait]
+    impl PaginatedListStore for PaginationWrapper {
+        async fn list_paginated(
+            &self,
+            _: Option<&str>,
+            _: object_store::list::PaginatedListOptions,
+        ) -> object_store::Result<object_store::list::PaginatedListResult> {
+            panic!("wrapping must not issue a listing")
+        }
+    }
+
+    #[test]
+    fn pagination_preserves_the_lister_and_each_wrappers_refusal() {
+        for inner_allows in [false, true] {
+            for outer_allows in [false, true] {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let wrapper = |name, allows_pushdown| {
+                    Arc::new(PaginationWrapper {
+                        name,
+                        allows_pushdown,
+                        calls: Arc::clone(&calls),
+                    })
+                };
+                let original: Arc<dyn PaginatedListStore> = wrapper("original", true);
+                let memo = RangeReadMemo::new(0);
+                let passed = RangeMemoWrapper::new(&memo)
+                    .wrap_paginated("test", Arc::clone(&original))
+                    .unwrap();
+                assert!(Arc::ptr_eq(&original, &passed));
+                let chained = ChainedWrappingObjectStore::new(vec![
+                    wrapper("inner", inner_allows),
+                    wrapper("outer", outer_allows),
+                ]);
+                let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                let wrapped = chained.wrap("test", Arc::clone(&store));
+                assert!(Arc::ptr_eq(&store, &wrapped));
+                assert_eq!(*calls.lock().unwrap(), vec!["inner", "outer"]);
+                calls.lock().unwrap().clear();
+                let result = chained.wrap_paginated("test", Arc::clone(&original));
+                assert_eq!(result.is_some(), inner_allows && outer_allows);
+                if let Some(result) = result {
+                    assert!(Arc::ptr_eq(&original, &result));
+                }
+                assert_eq!(
+                    *calls.lock().unwrap(),
+                    if inner_allows {
+                        vec!["inner", "outer"]
+                    } else {
+                        vec!["inner"]
+                    }
+                );
+            }
+        }
     }
 
     #[tokio::test]

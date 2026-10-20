@@ -17,8 +17,9 @@ use lance_core::datatypes::BlobHandling;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
     CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
-    RepairOptions,
+    RepairOptions, SnapshotId,
 };
+use omnigraph::error::{BranchStartRefusal, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
@@ -2337,6 +2338,74 @@ async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
         count_rows_branch(&db, "feature", "node:Person").await,
         feature_people_before,
         "time-only cleanup must honor the same live lazy-branch floor"
+    );
+}
+
+/// A branch started at a past commit keeps that commit retained: its first
+/// `__manifest` version is its base, which cleanup always retains with every
+/// table version it pins. A commit whose table versions cleanup reclaimed
+/// starts no branch: the refusal names the reclaimed table, and nothing is
+/// created.
+#[tokio::test]
+async fn cleanup_retains_the_commit_a_branch_starts_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let loaded = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+    let eve = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    add_person_fragments(&db).await;
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id));
+
+    db.branch_create_from(at(&loaded), "at-load").await.unwrap();
+    let people_at_load = count_rows_branch(&db, "at-load", "node:Person").await;
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        count_rows_branch(&db, "at-load", "node:Person").await,
+        people_at_load,
+        "the branch's base keeps the commit's table versions"
+    );
+    db.branch_create_from(at(&loaded), "again")
+        .await
+        .expect("a commit a live branch starts at stays retained");
+
+    let refused = db
+        .branch_create_from(at(&eve), "at-eve")
+        .await
+        .expect_err("cleanup reclaimed the Person version Eve's commit pins")
+        .into_completion_evidence()
+        .0;
+    assert!(
+        matches!(
+            &refused,
+            OmniError::BranchStartRefused {
+                graph_commit_id,
+                reason: BranchStartRefusal::NotRetained { table_key, .. },
+            } if graph_commit_id == &eve && table_key == "node:Person"
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        !db.branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "at-eve")
     );
 }
 
