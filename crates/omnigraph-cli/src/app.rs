@@ -325,6 +325,11 @@ pub(crate) fn error_output_of(error: &color_eyre::Report) -> Option<ErrorOutput>
     if let Some(remote) = error.downcast_ref::<RemoteErrorCli>() {
         return Some(remote.output.clone());
     }
+    if let Some(refusal) = error.downcast_ref::<crate::helpers::CodedRefusal>() {
+        let mut output = ErrorOutput::message(refusal.message.clone());
+        output.code = Some(refusal.code);
+        return Some(output);
+    }
     let diagnostic = if let Some(engine) = error.downcast_ref::<omnigraph::error::OmniError>() {
         engine.diagnostic()
     } else if let Some(compiler) = error.downcast_ref::<omnigraph_compiler::error::CompilerError>()
@@ -420,6 +425,18 @@ async fn run(
         }
         Command::Target { command } => {
             commands::targets::run_target(&operator, command, input.reader, stdout, stderr)?
+        }
+        Command::Access(args) => {
+            commands::targets::run_access(
+                &operator,
+                required_target(),
+                cli.graph.as_deref(),
+                cli.as_actor.as_deref(),
+                args,
+                stdout,
+                stderr,
+            )
+            .await?
         }
         Command::Credential { command } => commands::targets::run_credential(
             &operator,

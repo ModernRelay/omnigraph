@@ -55,6 +55,7 @@ prints the exact flags of the installed binary.
 | `logout` | — | Remove a stored token or a managed session |
 | `target` | `list` `show` `add` `remove` `import` | Manage complete target bindings |
 | `credential` | `get` | Export a server target token to a pipe |
+| `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -352,6 +353,7 @@ echo "$TOKEN" | omnigraph login --target production
 omnigraph logout --target production
 omnigraph target list --json
 omnigraph target show production --json
+omnigraph access --target production --branch main --json  # my actor and the actions I may take
 ```
 
 `~/.omnigraph/config.yaml` requires `target_config_version: 1` and complete

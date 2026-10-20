@@ -65,7 +65,8 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
         | Command::Snapshot(_)
         | Command::Export(_)
         | Command::Diff(_)
-        | Command::Changes { .. } => Some(Read),
+        | Command::Changes { .. }
+        | Command::Access(_) => Some(Read),
         Command::Load(_) | Command::Mutate(_) => Some(Write),
         Command::Branch { command, .. } => Some(match command {
             BranchCommand::Create { .. }

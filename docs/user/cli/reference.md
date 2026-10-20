@@ -68,10 +68,11 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
 | `target list/show/add/remove/import` | Inspect, edit or import complete target entries | local |
 | `credential get` | Export a server target’s static token to a pipe | registered server target |
+| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or served |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
 | `organization members/invitations` | Administer organization membership and invitations | managed account target |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
-| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`target`, `credential`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
+| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`target`, `credential`, `access`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 ## Query inputs and output
 

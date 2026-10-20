@@ -18,6 +18,7 @@ pub(crate) mod import;
 pub(crate) const TARGET_CONFIG_VERSION: u32 = 1;
 pub(crate) const TARGET_PROTOCOL: u32 = 1;
 pub(crate) const CREDENTIAL_PROTOCOL: u32 = 1;
+pub(crate) const ACCESS_PROTOCOL: u32 = 1;
 
 #[derive(Debug)]
 pub(crate) struct TargetError {

@@ -128,9 +128,9 @@ pub(crate) async fn run_graphs(
 
 /// Read a cluster's serving snapshot for a control-plane tooling command,
 /// flattening the readiness `Diagnostic` list into one loud error. The single
-/// snapshot entry point for `policy`/`queries` so the not-servable message stays
-/// identical across them.
-async fn read_serving_snapshot_or_report(
+/// snapshot entry point for `policy`/`queries`/`access` so the not-servable
+/// message stays identical across them.
+pub(crate) async fn read_serving_snapshot_or_report(
     binding: &omnigraph::storage::CapturedStorageBinding,
 ) -> Result<omnigraph_cluster::ServingSnapshot> {
     let diagnostic_cluster = omnigraph::storage::redacted_storage_uri(binding.uri());
