@@ -2,7 +2,7 @@
 rfc: "2026-10-16-graph-access-serving-and-cross-process-writes"
 title: "Graph access and cross-process writes"
 track: maintainer
-status: draft
+status: accepted
 implementation: in-progress
 authors:
   - ragnorc
@@ -20,7 +20,7 @@ blocked_on: []
 
 ## Summary
 
-This RFC proposes consistent graph access for people, agents and programs:
+This RFC decides consistent graph access for people, agents and programs:
 named targets, explicit actor assertions, one operation and failure contract,
 and engine correctness across writer processes. It uses the accepted
 [RFC 0059](https://github.com/ModernRelay/omnigraph/blob/main/docs/rfcs/0059-config-cli-coherency.md)
@@ -33,7 +33,7 @@ local-server boot path, generated policy or token mode, process registry,
 automatic hosting, or replacement for the `omnigraph-server` binary. Direct CLI
 and embedded access remain independent of HTTP serving.
 
-The remaining proposal has six rules:
+The design has six rules:
 
 1. **Name the target, never the transport.** CLI operations use RFC 0059's
    `--target` resolution and command applicability rules.
@@ -63,16 +63,16 @@ revisions is discontinued, including the work in
 [#1083](https://github.com/ModernRelay/omnigraph/pull/1083), now closed
 unmerged. The original local-serving issue
 [#980](https://github.com/ModernRelay/omnigraph/issues/980) is closed as not
-planned. Independent access, identity, disposition, operation-parity,
-client-connection and engine work stays in this draft. Historical serving decisions in the decision log are superseded
-by this disposition; they are not implementation requirements.
+planned. The independent access, identity, disposition, operation-parity,
+client-connection and engine work was accepted on 2026-10-20. Historical
+serving decisions in the decision log are superseded by this disposition; they
+are not implementation requirements.
 
 ## Motivation
 
 The original problem survey used OmniGraph main (`794cebab`), the managed
 control plane and OmniGraph Studio between 2026-10-16 and 2026-10-18. Later
-accepted decisions and landed work are named where they change that baseline;
-this scope amendment does not requalify the remaining engine proposal.
+accepted decisions and landed work are named where they change that baseline.
 
 **A caller picks a mechanism instead of naming a graph.** The CLI's help lists
 about eight ways to address one: `--server`, `--profile`, `--store`, a
@@ -1102,10 +1102,9 @@ work in [A2](#a2-oauth-for-standard-clients-and-managed-access) and
 
 ## Rollout
 
-Each phase is independently reviewable. No phase requires the discontinued
-local-serving work, and no draft interface is accepted merely because another
-phase lands. Implementation PRs carry their tests, user documentation and
-release note.
+Each phase is independently reviewable, and no phase requires the
+discontinued local-serving work. Implementation PRs link this RFC and carry
+their tests, user documentation and release note.
 
 1. **HTTP identity, access and failures.** Actor assertions, disposition, the
    code registry and exit consistency use the stated HTTP contract boundary.
@@ -1119,11 +1118,10 @@ release note.
    bridge, Studio opener and credential client integration connect to the
    ordinary cluster-backed server. The dependent bridge
    [#1084](https://github.com/ModernRelay/omnigraph/pull/1084) is closed unmerged.
-   Useful existing-server MCP adapter logic may be selectively reused in a
-   future separate PR, without its auto-hosting, direct-target serving or
-   discontinued dependencies. No cherry-pick or implementation is part of this
-   disposition; the future client proposal remains draft. Add the operation
-   inventory and parity evidence with that work. This phase does not retire the
+   Its existing-server MCP adapter logic may be selectively reused in a
+   separate PR, without its auto-hosting, direct-target serving or
+   discontinued dependencies. Add the operation inventory and parity evidence
+   with that work. This phase does not retire the
    server binary.
 4. **Cross-process writes.** Qualify the engine control-fact, recovery, cost
    and upgrade design. Only then lift its single-writer-process boundary.
@@ -1132,9 +1130,8 @@ release note.
    existing-server opener and Studio's signed release prerequisites exist
    ([omnigraph-studio#3](https://github.com/ModernRelay/omnigraph-studio/issues/3)).
 
-The RFC stays a draft while its remaining design is reviewed. Implementation
-status advances for retained work only; no discontinued serving phase counts
-toward acceptance or completion.
+Implementation status advances for retained work only; no discontinued
+serving phase counts toward completion.
 
 ## Unresolved questions
 
@@ -1144,7 +1141,7 @@ toward acceptance or completion.
    leaves open. The answer applies to ordinary engine and server operations,
    not a special local-serving mode.
 2. **Ordering storage-format work.** The cross-process phase and schema apply
-   with live branches both need a stamp. This draft assumes separate, ordered
+   with live branches both need a stamp. This RFC assumes separate, ordered
    upgrades; the implementation must assign the actual next stamp against its
    merge base.
 
@@ -1411,3 +1408,9 @@ proposal.
   serving dependency.
 - 2026-10-20: #1090 merged RFC 0059's implementation, so `blocked_on` is empty
   and the target-dependent commands build on main.
+- 2026-10-20: Accepted by maintainer decision (Ragnor): the actor assertion
+  (`Omnigraph-If-Actor`), the error-code registry and `disposition`, the exit
+  table, the `access` command, operation parity, the existing-server MCP
+  bridge and Studio opener, and the engine control-fact design with its
+  qualification gates. Appendix A's items stay separate decisions. The
+  phase 1 and 2 implementations are #1074, #1076, #1078 and #1081.
