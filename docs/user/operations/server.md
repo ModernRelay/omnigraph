@@ -63,10 +63,9 @@ Upgrade the CLI, server and HTTP integrations together. Every protected
 request requires exactly one `Omnigraph-Http-Api: 0.14`: graph, registry and
 cluster-deployment calls, including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
 duplicate, combined or unsupported values return `400 api_contract_mismatch`
-after authentication but before graph lookup, body decoding or execution. This
-HTTP identifier is separate from package/storage versions and grants no permission.
-The previous `0.13` value is refused; update integrations to the current routes,
-request/response shapes and credentials before changing their header.
+after authentication but before graph lookup, body decoding or execution. This HTTP identifier is
+separate from package/storage versions and grants no permission. The previous `0.13` value is
+refused; update integrations to the current routes, shapes and credentials before their header.
 
 Ordinary responses, including errors and streams, carry the same header. Check
 it before decoding or emitting the body. A missing/incompatible response header
@@ -115,17 +114,13 @@ actions remain denied.
 
 ### Assert the actor
 
-A client that means to act as a particular actor sends
-`Omnigraph-If-Actor: <actor>` with any protected request, `/mcp` included.
-The server compares it with the actor the credential resolved to, after
-authentication and the contract check and before graph lookup, body decoding
-or any effect (on `/mcp`, which has no contract check, after authentication and
-before admission): a match changes nothing, a mismatch is `412 actor_mismatch`
-with nothing run (a server without authentication resolves no actor), and a
-repeated, padded or empty header is `400 bad_request`. The header only narrows
-a request; it never supplies the actor. Contract `0.14` introduced it, so a
-server that would ignore it refuses the request's contract first. The CLI sends
-it for `--as` on served writes and on served `cluster plan` and `cluster apply`.
+A client that means to act as a particular actor sends `Omnigraph-If-Actor: <actor>` with any
+protected request, `/mcp` included. After authentication and the contract check (on `/mcp`,
+before admission), and before graph lookup or any effect, a match changes nothing and a mismatch
+is `412 actor_mismatch` with nothing run; a server without authentication resolves no actor. A
+repeated, padded or empty header is `400 bad_request`. The header never supplies the actor, and a
+server before contract `0.14` refuses the contract first. The CLI sends it for `--as` on served
+writes and on served `cluster plan` and `cluster apply`.
 
 ### Signed data credentials
 

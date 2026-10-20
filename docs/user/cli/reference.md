@@ -29,12 +29,10 @@ relative filesystem address; a bare name selects a registered target.
 be combined with `--target`.
 
 `--as ACTOR` attributes supported direct operations. A served target derives its
-actor from its credential and sends `--as` as the `Omnigraph-If-Actor`
-assertion: a mismatch exits 4 with nothing run (see
-[Assert the actor](../operations/server.md#assert-the-actor)); a managed target
-refuses `--as`. `--yes` supplies noninteractive consent for destructive
-operations on nonlocal storage. The retired `--quiet` cannot hide the
-destination.
+actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
+exiting 4 on a mismatch ([Assert the actor](../operations/server.md#assert-the-actor));
+a managed target refuses it. `--yes` supplies noninteractive consent for destructive
+operations on nonlocal storage. The retired `--quiet` cannot hide the destination.
 
 ## Commands
 

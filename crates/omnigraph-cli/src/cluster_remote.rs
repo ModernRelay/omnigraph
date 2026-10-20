@@ -682,7 +682,7 @@ mod tests {
             };
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let error = run(&input, &command, &target, &mut out, &mut err)
+            let error = run(&input, &command, &target, None, &mut out, &mut err)
                 .await
                 .unwrap_err();
             assert!(
