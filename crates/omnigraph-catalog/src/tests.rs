@@ -14828,6 +14828,14 @@ impl lance::io::WrappingObjectStore for ManifestRequestFault {
             fault: self.clone(),
         })
     }
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // This wrapper faults puts only; listings pass through unchanged.
+        Some(original)
+    }
 }
 
 #[derive(Debug)]
