@@ -1437,6 +1437,7 @@ impl ApiError {
         };
         Self {
             completion_uncertain: false,
+            scoped_unknown: false,
             status,
             code: (status == StatusCode::CONFLICT).then_some(ErrorCode::Conflict),
             message: message.into_boxed_str(),
