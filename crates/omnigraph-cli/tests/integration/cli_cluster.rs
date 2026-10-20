@@ -1675,7 +1675,10 @@ fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain
             .args(&args)
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        // A data command's target refusal exits by its disposition; the
+        // cluster commands keep the target refusal's own exit.
+        let exit = if args[0] == "cluster" { 2 } else { 1 };
+        assert_eq!(output.status.code(), Some(exit), "{args:?}: {output:?}");
         let problem = parse_stdout_json(&output);
         assert_eq!(problem["code"], code, "{args:?}: {problem}");
         assert!(
