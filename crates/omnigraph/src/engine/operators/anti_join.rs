@@ -28,10 +28,11 @@ use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{AggregateSpec, AntiJoinStrategy};
 
 use super::memory::WorkMemory;
+use super::shape::{Breaker, work};
 use super::subquery_aggregate::{
     RowCountPredicate, SubqueryAggregate, ValueAccumulator, absorb_inner_batches,
 };
-use super::{breaker_properties, breaker_stream, drain, drain_one, external, polled};
+use super::{drain, drain_one, external};
 use crate::engine::graph::{GraphIndexHandle, bulk_anti_join_mask};
 use crate::error::{OmniError, Result};
 
@@ -69,7 +70,7 @@ impl Drop for FilledSlot<'_> {
 pub(crate) struct OuterReferenceExec {
     outer_var: String,
     slot: Arc<OuterSlot>,
-    properties: Arc<PlanProperties>,
+    shape: Breaker,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -78,7 +79,7 @@ impl OuterReferenceExec {
         Self {
             outer_var,
             slot,
-            properties: breaker_properties(schema),
+            shape: Breaker::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -100,7 +101,7 @@ impl ExecutionPlan for OuterReferenceExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -121,22 +122,17 @@ impl ExecutionPlan for OuterReferenceExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "OuterReferenceExec has one partition");
-        let schema: SchemaRef = self.schema();
         let slot = Arc::clone(&self.slot);
-        let stream = breaker_stream(
-            "OuterReferenceExec",
-            schema,
-            &ctx,
-            &self.metrics,
-            move |_reservation| async move {
+        let memory = work(ctx, "OuterReferenceExec", &self.metrics)?;
+        Ok(self
+            .shape
+            .stream(memory, &self.metrics, move |_reservation| async move {
                 slot.take().ok_or_else(|| {
                     external(OmniError::manifest_internal(
                         "OuterReference executed without its outer batch",
                     ))
                 })
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+            }))
     }
 }
 
@@ -154,7 +150,7 @@ pub(crate) struct AntiJoinMaskExec {
     bulk: Option<(String, Direction)>,
     catalog: Arc<Catalog>,
     graph_index: Arc<GraphIndexHandle>,
-    properties: Arc<PlanProperties>,
+    shape: Breaker,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -188,7 +184,7 @@ impl AntiJoinMaskExec {
             bulk,
             catalog,
             graph_index,
-            properties: breaker_properties(schema),
+            shape: Breaker::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -260,7 +256,7 @@ impl ExecutionPlan for AntiJoinMaskExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -316,12 +312,10 @@ impl ExecutionPlan for AntiJoinMaskExec {
         let catalog = Arc::clone(&self.catalog);
         let graph_index = Arc::clone(&self.graph_index);
         let declared = Arc::clone(&schema);
-        let stream = breaker_stream(
-            "AntiJoinMaskExec",
-            schema,
-            &ctx,
-            &self.metrics,
-            move |reservation| async move {
+        let memory = work(ctx, "AntiJoinMaskExec", &self.metrics)?;
+        Ok(self
+            .shape
+            .stream(memory, &self.metrics, move |reservation| async move {
                 let wide = drain_one(outer, &declared, &reservation).await?;
                 reservation
                     .blocking(move |reservation| async move {
@@ -392,9 +386,7 @@ impl ExecutionPlan for AntiJoinMaskExec {
                         reservation.filter(&wide, &keep)
                     })
                     .await
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+            }))
     }
 }
 
