@@ -816,14 +816,14 @@ jobs:
   storage_upgrade_compatibility:
     name: Storage Upgrade Compatibility
     runs-on: ubuntu-latest
-    # Two builds use one target directory here: the genuine stamp-13
-    # predecessor CLI (one package, one bin, no test features), then the
-    # current tree's test targets. Their dependency feature sets differ (the
+    # Three builds use one target directory here: genuine stamp-13 and
+    # Lance 11 predecessor CLIs (one package, one bin, no test features),
+    # then the current tree's test targets. Their dependency feature sets differ (the
     # test builds enable dev-dependency features such as lance-io's defaults
     # and test-util), so the second build reuses only the dependency artifacts
     # whose features match. The v5 fence measured a cold predecessor CLI at
     # 25m40s.
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
     env:
@@ -930,6 +930,33 @@ jobs:
           cargo clean --workspace --locked \
             --target-dir "$GITHUB_WORKSPACE/target"
           echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV"
+
+      # Same graph format, genuinely older substrate. A version label alone
+      # cannot distinguish this writer from the candidate, so pin its source.
+      - name: Build genuine Lance 11 CLI
+        env:
+          LANCE11_SOURCE_COMMIT: 0a62bb7b2aa5b99b012f413807c216277f7f9596
+        run: |
+          set -euo pipefail
+          lance11_source="$RUNNER_TEMP/omnigraph-lance-11"
+          lance11_bin="$RUNNER_TEMP/omnigraph-lance-11-bin"
+          git fetch --no-tags --depth=1 origin "$LANCE11_SOURCE_COMMIT"
+          git worktree add --detach "$lance11_source" "$LANCE11_SOURCE_COMMIT"
+          test "$(git -C "$lance11_source" rev-parse HEAD)" = "$LANCE11_SOURCE_COMMIT"
+          # Run inside the predecessor checkout so its workspace configuration applies.
+          (cd "$lance11_source" && cargo build --locked \
+            --package omnigraph-cli \
+            --bin omnigraph \
+            --target-dir "$GITHUB_WORKSPACE/target")
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$lance11_bin"
+          test -x "$lance11_bin"
+          # Remove both path-package identities before linking the candidate tests.
+          cargo clean --workspace --locked \
+            --manifest-path "$lance11_source/Cargo.toml" \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          cargo clean --workspace --locked \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          echo "OMNIGRAPH_LANCE11_BIN=$lance11_bin" >> "$GITHUB_ENV"
 
       # The owner is the `crossversion_upgrade` module of the CLI's
       # `integration` binary. The exact case names come from the compiled

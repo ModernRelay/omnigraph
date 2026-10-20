@@ -564,6 +564,8 @@ struct BranchCreateArguments {
     name: String,
     #[serde(default)]
     from: Option<String>,
+    #[serde(default)]
+    from_commit: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1159,6 +1161,7 @@ impl GraphTools {
                     Some(Extension(actor)),
                     Json(crate::api::BranchCreateRequest {
                         from: args.from,
+                        from_commit: args.from_commit,
                         name: args.name,
                     }),
                 )
@@ -1765,7 +1768,8 @@ fn branch_create_schema() -> Value {
     arguments(
         json!({
             "name": text_schema("The new branch's name."),
-            "from": text_schema("Branch to fork. Defaults to `main`."),
+            "from": text_schema("Branch to fork; the new branch starts at its head. Defaults to `main`."),
+            "from_commit": text_schema("A published graph commit id to start the branch at instead of a branch head; excludes `from`."),
         }),
         &["name"],
     )

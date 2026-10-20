@@ -460,15 +460,11 @@ fn find_fragment(fragments: &[Fragment], id: u64) -> (Option<&Fragment>, u64) {
 /// at the fragment level. `uses_stable_row_ids()` alone is a dataset-level
 /// flag and cannot prove a specific fragment's sequence survives loading.
 ///
-/// The Inline bytes are decoded directly rather than through
-/// `load_sequence()`: pinned Lance 11's External arm of that method is
-/// `todo!()` (it panics, it does not `Err`), so the variant must be
-/// structurally unreachable here. And a clean decode alone does not prove the
-/// sequence covers the fragment — Lance's single-run fast path stamps its one
-/// version across every requested row without consulting the encoded length —
-/// so the sequence must be exactly `physical_rows` long. Absent, external,
-/// undecodable, short, or unmeasurable all mean "not provably complete" and
-/// route the interval to the exact ordered merge.
+/// Only inline bytes can prove this without another dataset read. Spilled
+/// column lineage needs dataset I/O and takes the exact ordered-merge path.
+/// A clean decode alone does not prove the sequence covers the fragment, so
+/// its length must equal `physical_rows`. Absent, spilled, undecodable, short,
+/// or unmeasurable metadata means "not provably complete".
 fn fragment_version_metadata_is_loadable(fragment: &Fragment) -> bool {
     let Some(lance_table::rowids::version::RowDatasetVersionMeta::Inline(data)) =
         fragment.last_updated_at_version_meta.as_ref()
@@ -979,22 +975,12 @@ mod tests {
     }
 
     #[test]
-    fn external_row_version_metadata_is_not_loadable() {
-        // Pinned Lance 11's `RowDatasetVersionMeta::External` arm of
-        // `load_sequence()` is `todo!()` — it panics rather than returning
-        // `Err`. The gate must classify the variant structurally instead of
-        // probing it, so an externally-stored sequence routes the interval to
-        // the exact ordered merge instead of aborting the poll.
+    fn spilled_row_version_metadata_is_not_loadable() {
+        // Column lineage needs dataset I/O. The metadata-only candidate gate
+        // must route it to the exact merge without trying to decode it inline.
         let mut fragment = Fragment::new(7);
-        fragment.last_updated_at_version_meta = Some(
-            lance_table::rowids::version::RowDatasetVersionMeta::External(
-                lance_table::format::ExternalFile {
-                    path: "external.versions".to_string(),
-                    offset: 0,
-                    size: 64,
-                },
-            ),
-        );
+        fragment.last_updated_at_version_meta =
+            Some(lance_table::rowids::version::RowDatasetVersionMeta::Column);
         assert!(!fragment_version_metadata_is_loadable(&fragment));
     }
 

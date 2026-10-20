@@ -680,6 +680,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
                 let meta = result.meta.clone();
                 let range = result.range.clone();
                 let attributes = result.attributes.clone();
+                let extensions = result.extensions.clone();
                 let mut data = result.bytes().await?.to_vec();
                 if !data.is_empty() {
                     let off = (canary.offset_seed as usize) % data.len();
@@ -694,6 +695,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
                     meta,
                     range,
                     attributes,
+                    extensions,
                 });
             }
         }
