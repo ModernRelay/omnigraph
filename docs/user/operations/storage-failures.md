@@ -18,16 +18,24 @@ store throttled with `SlowDown`, and a manifest request the store refused
 outright.
 
 A manifest request whose answer was lost, timed out or throttled is re-issued
-unchanged, up to four times over about three seconds. A re-issue that creates
-the version publishes the commit once. A version that already exists is read
+unchanged, up to four times with about three seconds of pauses in total, plus
+the time spent on each storage request. A re-issue that creates the version
+publishes the commit once. A version that already exists is read
 back: it holds either this commit, and the write succeeds, or another commit,
-and the write meets an ordinary conflict. A dropped acknowledgement therefore
-ends as a committed write or a definite conflict, never a duplicate.
+and the write meets an ordinary conflict. Re-issuing the same conditional
+request never publishes a duplicate.
 
-Only a manifest request that no re-issue settles leaves the write's outcome
-unknown. The write answers 500 (`outcome_unknown` on MCP), and the server
-contains itself as described under [Deployment](../deployment.md#binary). Do
+The outcome stays unknown if no re-issue settles the request or the committed
+version cannot be read back reliably. A local filesystem error can also occur
+after a write has taken effect, so an error alone does not prove that nothing
+was published. When the outcome remains unknown, the write answers 500
+(`outcome_unknown` on MCP), and the server contains itself as described under [Deployment](../deployment.md#binary). Do
 not retry such a write blindly; read the branch's commits first.
+
+The same rule applies when creating a proposal or an unattached snapshot: if
+its final authority check fails, deleting its tag does not prove that an earlier
+create request cannot still complete. That outcome remains unknown unless the
+candidate is proven expired.
 
 ## Logs
 

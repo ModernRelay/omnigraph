@@ -1,10 +1,9 @@
 - A served write whose publication fails before its manifest request is sent,
   for example on a throttled transaction-file put, now returns its 500 and
-  keeps serving instead of containing the process. A manifest request whose
-  answer is lost is re-issued unchanged until the store answers it, so a
-  dropped acknowledgement ends as a committed write or a definite conflict.
-  Only a request that no re-issue settles is still reported in doubt. The log
-  of a contained write now names the failure's class. See
-  [storage failures][publication-failures-definite].
+  keeps serving instead of containing the process. Ambiguous manifest requests
+  are re-issued unchanged and verified without publishing a duplicate; local
+  filesystem failures after publication and candidate-tag rollback remain in
+  doubt unless their outcome is proven. Contained writes now log the failure's
+  class. See [storage failures][publication-failures-definite].
 
 [publication-failures-definite]: ../docs/user/operations/storage-failures.md
