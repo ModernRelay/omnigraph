@@ -1097,6 +1097,67 @@ fn bind_order_key(
     ))
 }
 
+/// The namespace a mutation target resolves to.
+///
+/// A qualified name resolves only in the namespace it names. An unqualified
+/// name resolves in the namespace that declares it, and a name both namespaces
+/// declare is refused: the spelling does not say which one the statement
+/// means, and choosing one silently would retarget a stored query.
+fn resolve_mutation_target(
+    catalog: &Catalog,
+    kind: Option<MutationKind>,
+    type_name: &str,
+) -> Result<MutationTarget> {
+    match kind {
+        Some(MutationKind::Node) => {
+            if catalog.node_types.contains_key(type_name) {
+                Ok(MutationTarget::Node {
+                    type_name: type_name.to_string(),
+                })
+            } else {
+                Err(CompilerError::typed(
+                    T1,
+                    format!("unknown node type `{type_name}`"),
+                ))
+            }
+        }
+        Some(MutationKind::Edge) => {
+            if catalog.edge_types.contains_key(type_name) {
+                Ok(MutationTarget::Edge {
+                    type_name: type_name.to_string(),
+                })
+            } else {
+                Err(CompilerError::typed(
+                    T4,
+                    format!("unknown edge type `{type_name}`"),
+                ))
+            }
+        }
+        None => {
+            let node = catalog.node_types.contains_key(type_name);
+            let edge = catalog.edge_types.contains_key(type_name);
+            match (node, edge) {
+                (true, false) => Ok(MutationTarget::Node {
+                    type_name: type_name.to_string(),
+                }),
+                (false, true) => Ok(MutationTarget::Edge {
+                    type_name: type_name.to_string(),
+                }),
+                (true, true) => Err(CompilerError::typed(
+                    T60,
+                    format!(
+                        "type `{type_name}` is both a node type and an edge type; write `node:{type_name}` or `edge:{type_name}`"
+                    ),
+                )),
+                (false, false) => Err(CompilerError::typed(
+                    T10,
+                    format!("unknown node/edge type `{type_name}`"),
+                )),
+            }
+        }
+    }
+}
+
 fn typecheck_mutation(
     catalog: &Catalog,
     mutation: &Mutation,
@@ -1118,139 +1179,64 @@ fn typecheck_mutation(
 
             ensure_no_duplicate_assignment_names(&insert.assignments)?;
 
-            if let Some(node_type) = catalog.node_types.get(&insert.type_name) {
-                let mut assignments = Vec::with_capacity(insert.assignments.len());
-                for assignment in &insert.assignments {
-                    let prop_type =
-                        node_type
-                            .properties
-                            .get(&assignment.property)
-                            .ok_or_else(|| {
-                                CompilerError::typed(
-                                    T11,
-                                    format!(
-                                        "type `{}` has no property `{}`{}",
-                                        insert.type_name,
-                                        assignment.property,
-                                        identity_assignment_hint(&assignment.property)
-                                    ),
-                                )
-                            })?;
-                    assignments.push(typecheck_assignment(
-                        catalog,
-                        assignment,
-                        param_types,
-                        prop_type,
-                        &insert.type_name,
-                    )?);
-                }
-
-                let assigned_props: HashSet<&str> = insert
-                    .assignments
-                    .iter()
-                    .map(|assignment| assignment.property.as_str())
-                    .collect();
-                for (prop_name, prop_type) in &node_type.properties {
-                    if prop_type.nullable {
-                        continue;
-                    }
-                    if assigned_props.contains(prop_name.as_str()) {
-                        continue;
+            let target = resolve_mutation_target(catalog, insert.kind, &insert.type_name)?;
+            match target {
+                MutationTarget::Node { type_name } => {
+                    let node_type = catalog.node_types.get(&type_name).ok_or_else(|| {
+                        CompilerError::typed(T1, format!("unknown node type `{type_name}`"))
+                    })?;
+                    let mut assignments = Vec::with_capacity(insert.assignments.len());
+                    for assignment in &insert.assignments {
+                        let prop_type =
+                            node_type
+                                .properties
+                                .get(&assignment.property)
+                                .ok_or_else(|| {
+                                    CompilerError::typed(
+                                        T11,
+                                        format!(
+                                            "type `{}` has no property `{}`{}",
+                                            insert.type_name,
+                                            assignment.property,
+                                            identity_assignment_hint(&assignment.property)
+                                        ),
+                                    )
+                                })?;
+                        assignments.push(typecheck_assignment(
+                            catalog,
+                            assignment,
+                            param_types,
+                            prop_type,
+                            &insert.type_name,
+                        )?);
                     }
 
-                    if let Some(embed) = node_type.embed_sources.get(prop_name) {
-                        if assigned_props.contains(embed.source.as_str()) {
+                    let assigned_props: HashSet<&str> = insert
+                        .assignments
+                        .iter()
+                        .map(|assignment| assignment.property.as_str())
+                        .collect();
+                    for (prop_name, prop_type) in &node_type.properties {
+                        if prop_type.nullable {
                             continue;
                         }
-                        return Err(CompilerError::typed(
-                            T12,
-                            format!(
-                                "insert for `{}` must provide non-nullable property `{}` or @embed source `{}`",
-                                insert.type_name, prop_name, embed.source
-                            ),
-                        ));
-                    }
-
-                    return Err(CompilerError::typed(
-                        T12,
-                        format!(
-                            "insert for `{}` must provide non-nullable property `{}`",
-                            insert.type_name, prop_name
-                        ),
-                    ));
-                }
-                return Ok(CheckedMutationOp::Insert {
-                    target: MutationTarget::Node {
-                        type_name: insert.type_name.clone(),
-                    },
-                    assignments,
-                });
-            }
-
-            if let Some(edge_type) = catalog.edge_types.get(&insert.type_name) {
-                let mut has_from = false;
-                let mut has_to = false;
-                let mut assignments = Vec::with_capacity(insert.assignments.len());
-
-                for assignment in &insert.assignments {
-                    let prop_type = match assignment.property.as_str() {
-                        "from" => {
-                            has_from = true;
-                            meta_field_type()
+                        if assigned_props.contains(prop_name.as_str()) {
+                            continue;
                         }
-                        "to" => {
-                            has_to = true;
-                            meta_field_type()
+
+                        if let Some(embed) = node_type.embed_sources.get(prop_name) {
+                            if assigned_props.contains(embed.source.as_str()) {
+                                continue;
+                            }
+                            return Err(CompilerError::typed(
+                                T12,
+                                format!(
+                                    "insert for `{}` must provide non-nullable property `{}` or @embed source `{}`",
+                                    insert.type_name, prop_name, embed.source
+                                ),
+                            ));
                         }
-                        _ => edge_type
-                            .properties
-                            .get(&assignment.property)
-                            .ok_or_else(|| {
-                                CompilerError::typed(
-                                    T11,
-                                    format!(
-                                        "type `{}` has no property `{}`{}",
-                                        insert.type_name,
-                                        assignment.property,
-                                        identity_assignment_hint(&assignment.property)
-                                    ),
-                                )
-                            })?
-                            .clone(),
-                    };
-                    assignments.push(typecheck_assignment(
-                        catalog,
-                        assignment,
-                        param_types,
-                        &prop_type,
-                        &insert.type_name,
-                    )?);
-                }
 
-                if !has_from {
-                    return Err(CompilerError::typed(
-                        T12,
-                        format!(
-                            "insert for `{}` must provide required endpoint `from`",
-                            insert.type_name
-                        ),
-                    ));
-                }
-                if !has_to {
-                    return Err(CompilerError::typed(
-                        T12,
-                        format!(
-                            "insert for `{}` must provide required endpoint `to`",
-                            insert.type_name
-                        ),
-                    ));
-                }
-
-                for (prop_name, prop_type) in &edge_type.properties {
-                    if prop_type.nullable {
-                        continue;
-                    }
-                    if !insert.assignments.iter().any(|a| &a.property == prop_name) {
                         return Err(CompilerError::typed(
                             T12,
                             format!(
@@ -1259,24 +1245,97 @@ fn typecheck_mutation(
                             ),
                         ));
                     }
+                    Ok(CheckedMutationOp::Insert {
+                        target: MutationTarget::Node { type_name },
+                        assignments,
+                    })
                 }
-                return Ok(CheckedMutationOp::Insert {
-                    target: MutationTarget::Edge {
-                        type_name: insert.type_name.clone(),
-                    },
-                    assignments,
-                });
-            }
+                MutationTarget::Edge { type_name } => {
+                    let edge_type = catalog.edge_types.get(&type_name).ok_or_else(|| {
+                        CompilerError::typed(T4, format!("unknown edge type `{type_name}`"))
+                    })?;
+                    let mut has_from = false;
+                    let mut has_to = false;
+                    let mut assignments = Vec::with_capacity(insert.assignments.len());
 
-            Err(CompilerError::typed(
-                T10,
-                format!("unknown node/edge type `{}`", insert.type_name),
-            ))
+                    for assignment in &insert.assignments {
+                        let prop_type = match assignment.property.as_str() {
+                            "from" => {
+                                has_from = true;
+                                meta_field_type()
+                            }
+                            "to" => {
+                                has_to = true;
+                                meta_field_type()
+                            }
+                            _ => edge_type
+                                .properties
+                                .get(&assignment.property)
+                                .ok_or_else(|| {
+                                    CompilerError::typed(
+                                        T11,
+                                        format!(
+                                            "type `{}` has no property `{}`{}",
+                                            insert.type_name,
+                                            assignment.property,
+                                            identity_assignment_hint(&assignment.property)
+                                        ),
+                                    )
+                                })?
+                                .clone(),
+                        };
+                        assignments.push(typecheck_assignment(
+                            catalog,
+                            assignment,
+                            param_types,
+                            &prop_type,
+                            &insert.type_name,
+                        )?);
+                    }
+
+                    if !has_from {
+                        return Err(CompilerError::typed(
+                            T12,
+                            format!(
+                                "insert for `{}` must provide required endpoint `from`",
+                                insert.type_name
+                            ),
+                        ));
+                    }
+                    if !has_to {
+                        return Err(CompilerError::typed(
+                            T12,
+                            format!(
+                                "insert for `{}` must provide required endpoint `to`",
+                                insert.type_name
+                            ),
+                        ));
+                    }
+
+                    for (prop_name, prop_type) in &edge_type.properties {
+                        if prop_type.nullable {
+                            continue;
+                        }
+                        if !insert.assignments.iter().any(|a| &a.property == prop_name) {
+                            return Err(CompilerError::typed(
+                                T12,
+                                format!(
+                                    "insert for `{}` must provide non-nullable property `{}`",
+                                    insert.type_name, prop_name
+                                ),
+                            ));
+                        }
+                    }
+                    Ok(CheckedMutationOp::Insert {
+                        target: MutationTarget::Edge { type_name },
+                        assignments,
+                    })
+                }
+            }
         }
         Mutation::Update(update) => {
-            let node_type = if let Some(node_type) = catalog.node_types.get(&update.type_name) {
-                node_type
-            } else if catalog.edge_types.contains_key(&update.type_name) {
+            let target = resolve_mutation_target(catalog, update.kind, &update.type_name)?;
+            let MutationTarget::Node { type_name } = &target else {
                 return Err(CompilerError::typed(
                     T16,
                     format!(
@@ -1284,12 +1343,10 @@ fn typecheck_mutation(
                         update.type_name
                     ),
                 ));
-            } else {
-                return Err(CompilerError::typed(
-                    T10,
-                    format!("unknown node/edge type `{}`", update.type_name),
-                ));
             };
+            let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+                CompilerError::typed(T1, format!("unknown node type `{type_name}`"))
+            })?;
 
             if update.assignments.is_empty() {
                 return Err(CompilerError::typed(
@@ -1325,9 +1382,6 @@ fn typecheck_mutation(
                 )?);
             }
 
-            let target = MutationTarget::Node {
-                type_name: update.type_name.clone(),
-            };
             let predicate =
                 typecheck_mutation_where(catalog, &target, &update.predicate, param_types)?;
             Ok(CheckedMutationOp::Update {
@@ -1337,20 +1391,7 @@ fn typecheck_mutation(
             })
         }
         Mutation::Delete(delete) => {
-            let target = if catalog.node_types.contains_key(&delete.type_name) {
-                MutationTarget::Node {
-                    type_name: delete.type_name.clone(),
-                }
-            } else if catalog.edge_types.contains_key(&delete.type_name) {
-                MutationTarget::Edge {
-                    type_name: delete.type_name.clone(),
-                }
-            } else {
-                return Err(CompilerError::typed(
-                    T10,
-                    format!("unknown node/edge type `{}`", delete.type_name),
-                ));
-            };
+            let target = resolve_mutation_target(catalog, delete.kind, &delete.type_name)?;
             let predicate =
                 typecheck_mutation_where(catalog, &target, &delete.predicate, param_types)?;
             Ok(CheckedMutationOp::Delete { target, predicate })

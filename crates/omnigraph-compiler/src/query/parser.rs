@@ -1085,7 +1085,10 @@ fn parse_mutation_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Mutation> {
 
 fn parse_insert_mutation(pair: pest::iterators::Pair<Rule>) -> Result<InsertMutation> {
     let mut inner = pair.into_inner();
-    let type_name = inner.next().unwrap().as_str().to_string();
+    let target = inner
+        .next()
+        .expect("grammar: insert_stmt opens with mutation_target");
+    let (kind, type_name) = parse_mutation_target(target)?;
     let mut assignments = Vec::new();
     for item in inner {
         if let Rule::mutation_assignment = item.as_rule() {
@@ -1094,13 +1097,17 @@ fn parse_insert_mutation(pair: pest::iterators::Pair<Rule>) -> Result<InsertMuta
     }
     Ok(InsertMutation {
         type_name,
+        kind,
         assignments,
     })
 }
 
 fn parse_update_mutation(pair: pest::iterators::Pair<Rule>) -> Result<UpdateMutation> {
     let mut inner = pair.into_inner();
-    let type_name = inner.next().unwrap().as_str().to_string();
+    let target = inner
+        .next()
+        .expect("grammar: update_stmt opens with mutation_target");
+    let (kind, type_name) = parse_mutation_target(target)?;
 
     let mut assignments = Vec::new();
     let mut predicate = None;
@@ -1123,6 +1130,7 @@ fn parse_update_mutation(pair: pest::iterators::Pair<Rule>) -> Result<UpdateMuta
 
     Ok(UpdateMutation {
         type_name,
+        kind,
         assignments,
         predicate,
     })
@@ -1130,7 +1138,10 @@ fn parse_update_mutation(pair: pest::iterators::Pair<Rule>) -> Result<UpdateMuta
 
 fn parse_delete_mutation(pair: pest::iterators::Pair<Rule>) -> Result<DeleteMutation> {
     let mut inner = pair.into_inner();
-    let type_name = inner.next().unwrap().as_str().to_string();
+    let target = inner
+        .next()
+        .expect("grammar: delete_stmt opens with mutation_target");
+    let (kind, type_name) = parse_mutation_target(target)?;
     let predicate = inner
         .next()
         .ok_or_else(|| {
@@ -1139,8 +1150,32 @@ fn parse_delete_mutation(pair: pest::iterators::Pair<Rule>) -> Result<DeleteMuta
         .and_then(|pair| parse_mutation_predicate(pair, &type_name))?;
     Ok(DeleteMutation {
         type_name,
+        kind,
         predicate,
     })
+}
+
+/// The type a mutation names, with the namespace it qualified: `edge:Knows`
+/// names the edge namespace, a bare `Knows` names the type without one.
+fn parse_mutation_target(
+    pair: pest::iterators::Pair<Rule>,
+) -> Result<(Option<MutationKind>, String)> {
+    let mut kind = None;
+    let mut type_name = String::new();
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::load_kind => {
+                kind = Some(match part.as_str() {
+                    "node" => MutationKind::Node,
+                    "edge" => MutationKind::Edge,
+                    other => unreachable!("grammar: load_kind admits no {other}"),
+                });
+            }
+            Rule::type_name => type_name = part.as_str().to_string(),
+            other => unreachable!("grammar: mutation_target holds no {other}"),
+        }
+    }
+    Ok((kind, type_name))
 }
 
 fn parse_mutation_assignment(

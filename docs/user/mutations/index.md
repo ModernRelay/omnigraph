@@ -24,6 +24,20 @@ update Person set { display_name: $name } where email = $email
 delete Person where email = $email
 ```
 
+A node type and an edge type may share a name, so a mutation may name the
+namespace it targets: `node:Person` or `edge:Knows`, the spelling
+[`load csv`](#csv-loading) already uses. A qualified name resolves in that
+namespace only, so an edge of a type a node type also declares is written
+`insert edge:Link { from: "a", to: "b" }`.
+
+A bare name resolves in the namespace that declares it. A bare name both
+namespaces declare is refused (`T60`), because the statement does not say
+which one it means:
+
+```text
+type error: T60: type `Link` is both a node type and an edge type; write `node:Link` or `edge:Link`
+```
+
 A `where` on `update` or `delete` takes the same expressions as a read filter
 (see [Boolean expressions and nulls](../queries/index.md#boolean-expressions-and-nulls)):
 `and`, `or`, `not`, parentheses, the six comparisons, `starts_with`,

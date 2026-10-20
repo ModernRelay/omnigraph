@@ -1,0 +1,83 @@
+# issue: 921
+# red_on: main @ 4ba904d3; before the fix `insert Link {from: ..., to: ...}` is refused with `T11: type 'Link' has no property 'from'`, because the node namespace shadows the edge namespace.
+# notes: A node type and an edge type may share a name. A mutation names the namespace it means with `node:` or `edge:`, the spelling `load csv` already uses.
+# notes: A bare name both namespaces declare is refused instead of silently selecting one of them.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Link {
+    slug: String @key
+}
+edge Link: Link -> Link
+
+--- seed
+{"type":"Link","data":{"slug":"a"}}
+
+--- mutate
+query insert_link_edge() {
+    insert edge:Link { from: "a", to: "a" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query insert_link_node() {
+    insert node:Link { slug: "b" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query link_edge_is_read_back() {
+    match { $x: Link $x $e:link $y }
+    return { $x.slug }
+}
+
+--- expect unordered
+{"x.slug": "a"}
+
+--- expect shape
+x.slug: String
+
+--- mutate
+query insert_ambiguous_link() {
+    insert Link { slug: "c" }
+}
+
+--- expect error: T60: type `Link` is both a node type and an edge type; write `node:Link` or `edge:Link`
+
+--- mutate
+query delete_link_edge() {
+    delete edge:Link where @src = "a"
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- query
+query link_edge_is_gone() {
+    match { $x: Link $x $e:link $y }
+    return { $x.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+x.slug: String
+
+--- query
+query link_nodes_remain() {
+    match { $x: Link }
+    return { $x.slug }
+}
+
+--- expect unordered
+{"x.slug": "a"}
+{"x.slug": "b"}
+
+--- expect shape
+x.slug: String

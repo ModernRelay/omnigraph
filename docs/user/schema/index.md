@@ -39,6 +39,11 @@ Interfaces provide reusable properties. An edge's endpoint node types must
 already be declared. Query traversals spell an edge with a lowercase first
 letter (`worksAt` for `WorksAt`); lookup is otherwise case-insensitive.
 
+A node type and an edge type may share a name: the two kinds live in separate
+namespaces, and a name is unique inside each of them. A mutation that targets
+such a type names the namespace it means (`node:Link` or `edge:Link`); see
+[Mutations and Loads](../mutations/index.md#statements).
+
 ## Property types
 
 | Type | Values |

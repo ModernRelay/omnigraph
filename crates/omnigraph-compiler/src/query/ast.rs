@@ -1148,9 +1148,22 @@ pub enum Mutation {
     Delete(DeleteMutation),
 }
 
+/// The namespace a mutation target names, when the statement qualified it.
+///
+/// A node type and an edge type may share a name, so the namespace says which
+/// one the statement means; `None` is a target named without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationKind {
+    Node,
+    Edge,
+}
+
 #[derive(Debug, Clone)]
 pub struct InsertMutation {
     pub type_name: String,
+    /// The namespace the statement qualified, `None` when it named the type
+    /// without one.
+    pub kind: Option<MutationKind>,
     pub assignments: Vec<MutationAssignment>,
 }
 
@@ -1160,6 +1173,9 @@ pub struct InsertMutation {
 #[derive(Debug, Clone)]
 pub struct UpdateMutation {
     pub type_name: String,
+    /// The namespace the statement qualified, `None` when it named the type
+    /// without one.
+    pub kind: Option<MutationKind>,
     pub assignments: Vec<MutationAssignment>,
     pub predicate: Expr,
 }
@@ -1168,6 +1184,9 @@ pub struct UpdateMutation {
 #[derive(Debug, Clone)]
 pub struct DeleteMutation {
     pub type_name: String,
+    /// The namespace the statement qualified, `None` when it named the type
+    /// without one.
+    pub kind: Option<MutationKind>,
     pub predicate: Expr,
 }
 

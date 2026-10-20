@@ -75,6 +75,7 @@ codes! {
     T57 = "distinct applies only to count";
     T58 = "a Boolean return item compares aggregates with constants only";
     T59 = "an rrf() ranks two bindings one traversal connects";
+    T60 = "a mutation target names a type in both the node and the edge namespace";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
     // the binding it ranks, and `rrf()` arms one traversal connects are T59.

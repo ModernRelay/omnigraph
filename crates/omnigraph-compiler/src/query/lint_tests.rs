@@ -470,7 +470,7 @@ delete Person where slug = $slug
 }
 
 #[test]
-fn same_named_node_and_edge_mutation_keeps_the_typechecked_namespace() {
+fn same_named_node_and_edge_mutation_keeps_the_typechecked_namespace_issue_921() {
     let output = lint_query_file(
         &catalog(
             r#"
@@ -480,7 +480,7 @@ edge Shared: Shared -> Shared
         ),
         r#"
 query insert_shared($slug: String) {
-insert Shared { slug: $slug }
+insert node:Shared { slug: $slug }
 }
 "#,
         "/tmp/queries.gq",
