@@ -150,7 +150,7 @@ writes](https://github.com/ModernRelay/omnigraph/pull/1017).
 Resolution re-issues the identical manifest commit. If it lands, or a copy of
 it already landed, the pending write is committed. If another commit holds
 the version, the pending write is not committed. Either answer is logged with
-the graph commit id. A read made while the branch is pending is not final;
+the publication id. A read made while the branch is pending is not final;
 the refusal says so.
 
 Orchestrators should restart a failed server, for example Railway
