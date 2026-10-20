@@ -5182,8 +5182,12 @@ impl Omnigraph {
             let base_snapshot = if head_is_base {
                 target_txn.base.clone()
             } else {
-                let base =
-                    ManifestCoordinator::pinned_graph_commit(self.uri(), &base_commit).await?;
+                let base = ManifestCoordinator::pinned_graph_commit_with_session(
+                    self.uri(),
+                    &base_commit,
+                    &self.control_session(),
+                )
+                .await?;
                 if !dry_run {
                     input_guard.pin(&base.dataset).await?;
                 }

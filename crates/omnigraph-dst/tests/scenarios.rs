@@ -2899,8 +2899,117 @@ fn commit_list_cost_rows(replay: &str) -> String {
     rows
 }
 
-/// Storage calls per op kind plus reopened merge-history, branch-write, diff
-/// and commit-list scenarios, replayed identically and compared with
+/// The public overwrite route under two captured writer-buffer targets. The
+/// staged-table owner proves the native page layout; these rows pin storage
+/// actions without claiming that smaller pages always cost fewer requests.
+fn writer_buffer_cost_rows(replay: &str) -> String {
+    struct WriterBufferCost {
+        bytes: u64,
+        label: &'static str,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for WriterBufferCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            use arrow_array::{Int32Array, StringArray};
+
+            omnigraph_dst::cost::set_label("_writer_buffer_setup");
+            // Match the asymmetric 32-column shape of the staged overwrite
+            // owner: one hot string column and many tiny scalar columns.
+            let cold_fields = (0..29)
+                .map(|field| format!("c{field}: I32"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let schema = format!("node Wide {{ age: I32 payload: String {cold_fields} }}");
+            let payload = "x".repeat(12 * 1024);
+            let record = |age: i32| {
+                let mut data = serde_json::Map::new();
+                data.insert("age".into(), serde_json::json!(age));
+                data.insert("payload".into(), serde_json::json!(&payload));
+                for field in 0..29 {
+                    data.insert(format!("c{field}"), serde_json::json!(age * 100 + field));
+                }
+                serde_json::json!({"type": "Wide", "id": format!("row-{age}"), "data": data})
+                    .to_string()
+            };
+            let input = (0..3).map(record).collect::<Vec<_>>().join("\n");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    &schema,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(&record(9), LoadMode::Overwrite)
+                .await
+                .unwrap();
+            drop(db);
+            let settings = SessionSettings::default()
+                .with("write_max_bytes", &self.bytes.to_string())
+                .unwrap();
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                settings,
+            );
+            omnigraph_dst::cost::set_label(self.label);
+            let loaded = db.load_jsonl(&input, LoadMode::Overwrite).await;
+            omnigraph_dst::cost::set_label("_writer_buffer_verify");
+            assert_eq!(loaded.unwrap().nodes_loaded["Wide"], 3);
+            let batches = read_table(&db, "node:Wide").await;
+            let mut ages = Vec::new();
+            for batch in batches {
+                let age = batch["age"].as_any().downcast_ref::<Int32Array>().unwrap();
+                let written = batch["payload"]
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    ages.push(age.value(row));
+                    assert_eq!(written.value(row), payload);
+                    for field in 0..29 {
+                        let cold = batch
+                            .column_by_name(&format!("c{field}"))
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap();
+                        assert_eq!(cold.value(row), age.value(row) * 100 + field);
+                    }
+                }
+            }
+            ages.sort_unstable();
+            assert_eq!(ages, [0, 1, 2]);
+        }
+    }
+
+    let mut rows = String::new();
+    for (bytes, label) in [
+        (128 * 1024, "OverwriteWriter128KiB"),
+        (32 * 1024 * 1024, "OverwriteWriter32MiB"),
+    ] {
+        rows.push_str(&labeled_cost_rows(
+            format!("shared-memory://dst-writer-buffer-cost-{replay}-{label}"),
+            &WriterBufferCost { bytes, label },
+            label,
+        ));
+    }
+    rows
+}
+
+/// Storage calls per op kind plus reopened merge-history, branch-write, diff,
+/// commit-list and overwrite scenarios, replayed identically and compared with
 /// `cost_table.txt` (DST_REGEN_COSTS=1 to regen).
 #[test]
 #[serial]
@@ -2920,6 +3029,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&branch_write_cost_rows("a"));
     table.push_str(&diff_cost_rows("a"));
     table.push_str(&commit_list_cost_rows("a"));
+    table.push_str(&writer_buffer_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -2928,6 +3038,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&branch_write_cost_rows("b"));
     table2.push_str(&diff_cost_rows("b"));
     table2.push_str(&commit_list_cost_rows("b"));
+    table2.push_str(&writer_buffer_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"

@@ -213,7 +213,7 @@ pub(super) fn failure(error: &workos::Error) -> Failure {
         Some("access_denied") => Failure::refused("device_denied", "device sign-in was denied"),
         Some("expired_token") => Failure::refused(
             "device_expired",
-            "device sign-in expired; run login --api again",
+            "device sign-in expired; run login --target NAME again",
         ),
         _ => Failure::new(
             "identity_provider_unavailable",

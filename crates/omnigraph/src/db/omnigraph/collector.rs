@@ -887,8 +887,12 @@ async fn retained_merge_bases(
             if resolver.search().needs_import() {
                 if retired.is_none() {
                     retired = Some(
-                        ManifestCoordinator::retired_commit_graphs(db.root_uri(), &db.history)
-                            .await?,
+                        ManifestCoordinator::retired_commit_graphs_with_session(
+                            db.root_uri(),
+                            &db.history,
+                            &db.control_session(),
+                        )
+                        .await?,
                     );
                 }
                 for (native, graph) in retired.as_ref().expect("retired histories were loaded") {
@@ -1180,7 +1184,12 @@ pub(crate) async fn plan_collection(
     let (bases, imported_owners) = retained_merge_bases(db, &captured_lineages, live_count).await?;
     report.protected_manifest_branches.extend(imported_owners);
     for base in bases {
-        let pinned = ManifestCoordinator::pinned_graph_commit(db.root_uri(), &base).await?;
+        let pinned = ManifestCoordinator::pinned_graph_commit_with_session(
+            db.root_uri(),
+            &base,
+            &db.control_session(),
+        )
+        .await?;
         report
             .protected_manifest_branches
             .extend(pinned.dataset.manifest().branch.iter().cloned());
