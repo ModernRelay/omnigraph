@@ -108,7 +108,7 @@ fn as_on_a_served_cluster_command_exits_4_on_another_actor() {
             assert_eq!(requests.len(), 1, "{command}: {requests:?}");
             assert_eq!(requests[0].method, "GET", "{command}: {requests:?}");
             assert_eq!(
-                requests[0].headers["omnigraph-expect-actor"], "act-nope",
+                requests[0].headers["omnigraph-if-actor"], "act-nope",
                 "{command}: {requests:?}"
             );
             api.assert_complete();

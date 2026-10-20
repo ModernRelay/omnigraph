@@ -9,7 +9,7 @@
   `openapi.json` names each code's status and meaning, every protected
   operation documents the `404` and `405` its router answers, and header
   parameters are published as `Omnigraph-Http-Api` and
-  `Omnigraph-Expect-Actor`. Update clients that matched those refusals by
+  `Omnigraph-If-Actor`. Update clients that matched those refusals by
   `conflict` or `bad_request`, and regenerate clients that key on header
   parameter names. See [HTTP errors][error-code-statuses-guide].
 

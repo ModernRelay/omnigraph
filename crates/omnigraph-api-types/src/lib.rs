@@ -38,7 +38,7 @@ pub const HTTP_API_CONTRACT: &str = "0.14";
 /// value changes nothing, so the header can only narrow a request. Contract
 /// 0.14 introduced it, so a server that speaks [`HTTP_API_CONTRACT`] enforces
 /// it and an older one refuses the request before reading the header.
-pub const EXPECT_ACTOR_HEADER: &str = "omnigraph-expect-actor";
+pub const IF_ACTOR_HEADER: &str = "omnigraph-if-actor";
 
 /// How a binary identifies its build: the one derivation the CLI's
 /// `omnigraph version`, the server's `/healthz` and its MCP server info all
@@ -2037,7 +2037,7 @@ error_codes! {
     /// contract this server speaks. Authentication and this check precede
     /// graph access and effects.
     ApiContractMismatch = "api_contract_mismatch", [400];
-    /// The request's `Omnigraph-Expect-Actor` header names another actor
+    /// The request's `Omnigraph-If-Actor` header names another actor
     /// than its credential resolves to. Nothing ran.
     ActorMismatch = "actor_mismatch", [412];
     /// A write whose completion the server could not settle: it may or may

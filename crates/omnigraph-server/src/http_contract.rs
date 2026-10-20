@@ -11,7 +11,7 @@ use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::{Content, Ref, RefOr};
 
 use crate::ApiError;
-use crate::api::{EXPECT_ACTOR_HEADER, ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
+use crate::api::{ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER, IF_ACTOR_HEADER};
 
 /// The Title-Case spelling the published description and messages give a
 /// header. HTTP header names are case-insensitive; the constants stay
@@ -122,7 +122,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
     let mut schema = Object::with_type(Type::String);
     schema.enum_values = Some(vec![HTTP_API_CONTRACT.into()]);
     let contract_header = display_header_name(HTTP_API_CONTRACT_HEADER);
-    let expect_actor_header = display_header_name(EXPECT_ACTOR_HEADER);
+    let if_actor_header = display_header_name(IF_ACTOR_HEADER);
     for (path, item) in &mut doc.paths.paths {
         // OAuth resource metadata follows its standard protocol, as does MCP.
         if crate::mcp::is_resource_metadata_path(path) {
@@ -142,7 +142,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     .parameters
                     .get_or_insert_with(Vec::new)
                     .push(parameter);
-                let mut expected_actor = Parameter::new(expect_actor_header.as_str());
+                let mut expected_actor = Parameter::new(if_actor_header.as_str());
                 expected_actor.parameter_in = ParameterIn::Header;
                 expected_actor.required = utoipa::openapi::Required::False;
                 expected_actor.schema = Some(Object::with_type(Type::String).into());
@@ -159,7 +159,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     path,
                     "412",
                     &format!(
-                        "actor_mismatch when {expect_actor_header} names another actor than the credential resolves to"
+                        "actor_mismatch when {if_actor_header} names another actor than the credential resolves to"
                     ),
                 );
                 document_error(
