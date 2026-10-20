@@ -537,7 +537,7 @@ carried stored external reference the policy refuses fails as
 | A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
 | `commit publish` of an unpublished commit whose target head moved past its captured parent, or whose target incarnation is retired | `PreconditionFailed` naming the captured parent and the current head, or not found; the proposal stays retained until `cleanup` releases its expired tag |
 | `commit publish` or `commit drop` of a published commit id | Publish answers the established published commit; drop is a conflict |
-| A proposal tag's creation or deletion reports an ambiguous result | The tag is read back: a matching tag is success, a differing tag an integrity error, an unavailable readback `manifest_publish_in_doubt` |
+| A proposal tag's creation or deletion reports an ambiguous result | The tag is read back: a matching tag is success, a differing tag an integrity error, an unavailable readback `manifest_publish_in_doubt`. After a proposal or unattached snapshot tag is created, a failed authority probe remains in doubt even if rollback deletes the tag: an earlier conditional create may recreate it. Only proven expiry of the captured authority makes that refusal definite |
 
 The `Unpublished` annotations cover the named writer envelopes, the table
 store's staged-write and detached-commit sites, and every publisher failure

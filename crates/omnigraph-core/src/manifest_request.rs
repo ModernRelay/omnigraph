@@ -165,10 +165,11 @@ pub fn request_error_class(error: &Error) -> &'static str {
 /// A remote store's generic failure (a 5xx, a throttle, a timeout, a lost
 /// connection) is ambiguous, and so are an authorization failure and a join
 /// error, which can follow an earlier internal attempt of the same call that
-/// the server applied. The local filesystem answers synchronously, so its
-/// failure is definite; so are a missing key or container, an invalid path,
-/// an unsupported operation, and a refusal by the owning storage scope, which
-/// sends nothing. Anything this function cannot recognise is ambiguous.
+/// the server applied. A local filesystem failure is ambiguous too: Lance's
+/// Windows rename handler can create the manifest before deleting its staging
+/// file fails. A missing key or container, an invalid path, an unsupported
+/// operation, and a refusal by the owning storage scope, which sends nothing,
+/// are definite. Anything this function cannot recognise is ambiguous.
 pub fn classify_failed_request(error: &Error) -> FailedRequest {
     use object_store::Error as Store;
 
@@ -179,8 +180,7 @@ pub fn classify_failed_request(error: &Error) -> FailedRequest {
     };
     match store {
         Some(Store::Generic { store, .. })
-            if matches!(*store, "LocalFileSystem" | "InMemory")
-                || *store == omnigraph_storage::OWNED_STORE_NAME =>
+            if *store == "InMemory" || *store == omnigraph_storage::OWNED_STORE_NAME =>
         {
             FailedRequest::Refused
         }
@@ -238,7 +238,6 @@ mod tests {
     #[test]
     fn only_a_definite_refusal_rules_out_a_late_landing_issue_1067() {
         for error in [
-            generic("LocalFileSystem"),
             generic("InMemory"),
             generic(omnigraph_storage::OWNED_STORE_NAME),
             Error::not_found("missing"),
@@ -254,6 +253,7 @@ mod tests {
             );
         }
         for error in [
+            generic("LocalFileSystem"),
             generic("S3"),
             generic("MicrosoftAzure"),
             generic("fault injector"),
