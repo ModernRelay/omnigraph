@@ -11,7 +11,7 @@
 //! header/table projection), and cleanup-root planning.  Every operation is
 //! measured from a tracked cold open and then repeated on the same Dataset and
 //! Session.  Object-store reads/bytes include the cold open; Lance execution
-//! summaries separately report scan I/O and the pinned RC.1 debug counters.
+//! summaries separately report scan I/O and the pinned Lance debug counters.
 //!
 //! The fixture is a decision gate, not evidence that the format has shipped.
 //! Its assertions preserve observed blockers rather than treating flat
@@ -1026,6 +1026,13 @@ fn assert_bounded_growth(label: &str, shallow: u64, deep: u64, slack: u64) {
     );
 }
 
+fn assert_bounded_pair(label: &str, shallow: u64, deep: u64, ceiling: u64) {
+    assert!(
+        shallow <= ceiling && deep <= ceiling,
+        "{label} exceeded its absolute bound: shallow={shallow}, deep={deep}, ceiling={ceiling}"
+    );
+}
+
 fn assert_reconciled_physical_slopes(
     curve: &[CurvePoint],
     depths: &[u64],
@@ -1093,16 +1100,34 @@ fn assert_reconciled_physical_slopes(
                         );
                     }
                     HistoryLayout::Compacted => {
-                        // At the decision-scale endpoint Lance crosses one
-                        // additional range-read boundary in the compacted data
-                        // file.  Keep that physical transition visible and
-                        // bounded instead of calling the operation count flat.
-                        assert_bounded_growth(
-                            "reconciled compacted scan I/O operations",
-                            shallow.cost.scan_iops,
-                            deep.cost.scan_iops,
-                            1,
-                        );
+                        if backend == StorageBackend::Local {
+                            // Lance 13 decoder::RequestBatch groups page/column
+                            // reads before FileScheduler coalesces nearby ranges.
+                            // At 20/80 publishes each projection gains one physical
+                            // range; Show performs two scans, so its total gains
+                            // two. Logical rows/ranges/fragments remain exact.
+                            // Bound each sample by its complete operation budget;
+                            // do not widen the one-scan or S3 bounds to fit Show.
+                            let ceiling = match (operation, access) {
+                                (AuthorityOperation::Show, AccessMode::ColdOpen) => 7,
+                                (AuthorityOperation::Show, AccessMode::WarmRepeat) => 4,
+                                (_, AccessMode::ColdOpen) => 5,
+                                (_, AccessMode::WarmRepeat) => 2,
+                            };
+                            assert_bounded_pair(
+                                "local compacted scan I/O operations",
+                                shallow.cost.scan_iops,
+                                deep.cost.scan_iops,
+                                ceiling,
+                            );
+                        } else {
+                            assert_bounded_growth(
+                                "reconciled compacted scan I/O operations",
+                                shallow.cost.scan_iops,
+                                deep.cost.scan_iops,
+                                1,
+                            );
+                        }
                         assert_bounded_growth(
                             "reconciled compacted scan requests",
                             shallow.cost.scan_requests,

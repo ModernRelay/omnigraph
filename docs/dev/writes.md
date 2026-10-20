@@ -257,7 +257,7 @@ deterministically, whatever Lance's size and deletion heuristics select. It
 stages the rewrite detached with fragment ids above the base's high-water
 mark, so it needs no `ReserveFragments`; a lagging scalar or vector index is
 rebuilt whole as a detached commit chained on the rewrite under its name
-(Lance 11 folds only through a linear commit), keeping a vector index's
+(Lance 13 folds only through a linear commit), keeping a vector index's
 partition count; the batch publishes once with an exact CAS on every planned
 pin, and a pin a concurrent writer moved fails the run with a read-set
 conflict so the next run re-plans. A failure before publication leaves

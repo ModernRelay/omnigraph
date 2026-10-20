@@ -1730,11 +1730,10 @@ async fn issue_567_forced_prefilter_skips_the_nearest_gate_threshold() {
     );
 }
 
-/// Lance 11 still drops KNN ordering metadata when its sorted candidate stream
-/// is late-hydrated with ordinary node payload. Above one 8,192-row output
-/// batch, a parallel final coalesce can then put a later partition first. This
-/// engine-level cell proves the temporary one-output-partition fence is wired
-/// through the real stable-row-ID graph scan and preserves the complete rank.
+/// Lance 13 preserves KNN ordering metadata through V2 payload hydration.
+/// Above one 8,192-row output batch, the engine must merge parallel partitions
+/// by that order. This exercises the real stable-row-ID graph scan and proves
+/// the complete rank survives without the legacy V1 single-partition fence.
 #[tokio::test(flavor = "multi_thread")]
 async fn nearest_large_k_preserves_global_order_through_payload_hydration() {
     const ROWS_PER_FRAGMENT: usize = 5_000;

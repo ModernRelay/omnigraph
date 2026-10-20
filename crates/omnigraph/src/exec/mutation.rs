@@ -1767,9 +1767,9 @@ impl Omnigraph {
 
         // Accumulate the updated batch into the Merge-mode pending stream.
         // The accumulator may now contain entries with the same id as a
-        // prior insert or update on this table; `MutationStaging::finalize`
+        // prior insert or update on this table; `prepare_pending_table`
         // dedupes by id (last-occurrence wins) before issuing the single
-        // `stage_merge_insert` call at end-of-query.
+        // `stage_keyed_write` call at end-of-query.
         let updated_schema = updated.schema();
         staging.append_batch(&table_key, updated_schema, PendingMode::Upsert, updated)?;
 

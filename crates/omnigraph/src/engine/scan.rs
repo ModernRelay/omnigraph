@@ -409,7 +409,6 @@ pub(super) async fn execute_node_scan(
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                 Some(summary.clone());
                         }));
-                        scanner.target_parallelism(1);
                     }
                     Ok(())
                 })
