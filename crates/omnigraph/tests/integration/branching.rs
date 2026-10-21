@@ -10,7 +10,10 @@ use lance::Dataset;
 use lance_index::is_system_index;
 
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{BranchCreated, MergeOutcome, Omnigraph, ReadTarget, Snapshot, SnapshotId};
+use omnigraph::db::{
+    BranchCreated, BranchDetail, GraphCommit, MergeOutcome, Omnigraph, ReadTarget, Snapshot,
+    SnapshotId,
+};
 use omnigraph::error::{
     BranchStartRefusal, CompletionEvidence, ManifestErrorKind, MergeConflictKind, OmniError,
 };
@@ -281,6 +284,250 @@ async fn branch_create_open_list_and_lazy_branching_work() {
 
     let main = Omnigraph::open(uri).await.unwrap();
     assert_eq!(count_rows(&main, "node:Person").await, 4);
+}
+
+/// The newest commit `list_commits` reports for `branch`.
+async fn newest_commit(db: &Omnigraph, branch: &str) -> GraphCommit {
+    db.list_commits(Some(branch)).await.unwrap().remove(0)
+}
+
+/// Every branch's detail, keyed by name, from a listing that may read all.
+async fn detailed_branches(db: &Omnigraph) -> BTreeMap<String, BranchDetail> {
+    let listing = db.branch_list_detailed(&mut |_| true).await.unwrap();
+    let names: Vec<_> = listing.details.iter().map(|d| d.name.clone()).collect();
+    assert_eq!(names, listing.branches, "every readable branch has details");
+    listing
+        .details
+        .into_iter()
+        .map(|detail| (detail.name.clone(), detail))
+        .collect()
+}
+
+fn unix_micros_now() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    i64::try_from(elapsed.as_micros()).unwrap()
+}
+
+/// Where a branch's details say it started: `from` and `from_commit_id`.
+fn started(detail: &BranchDetail) -> (Option<&str>, Option<&str>) {
+    (detail.from.as_deref(), detail.from_commit_id.as_deref())
+}
+
+/// What a create receipt says the new branch started at.
+fn receipt(created: &BranchCreated) -> (Option<&str>, Option<&str>) {
+    (
+        Some(created.from.as_str()),
+        Some(created.from_commit_id.as_str()),
+    )
+}
+
+/// A branch's details answer what a client would otherwise derive from its
+/// whole commit list: its head, the branch and commit its current lifetime
+/// started from, as its create receipt said, when it was created and when it
+/// last moved. The start is fixed for the lifetime, so a merge moves the merge
+/// base but not the start; deleting and recreating the name starts a new
+/// lifetime with its own start and creation time; cleanup leaves every start
+/// readable.
+#[tokio::test]
+async fn branch_list_detailed_reports_head_start_and_lifetime() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let insert = |name: &str| mixed_params(&[("$name", name)], &[("$age", 30)]);
+    let loaded = newest_commit(&db, "main").await;
+
+    let before_create = unix_micros_now() / 1_000_000 * 1_000_000;
+    let created = db
+        .branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    let after_create = unix_micros_now();
+    let details = detailed_branches(&db).await;
+    let main = &details["main"];
+    assert_eq!(main.head, loaded);
+    assert_eq!((started(main), main.created_at), ((None, None), None));
+    assert_eq!(main.updated_at, loaded.created_at);
+    let unwritten = &details["feature"];
+    assert_eq!(
+        unwritten.head, loaded,
+        "an unwritten branch reads its start"
+    );
+    assert_eq!(started(unwritten), receipt(&created));
+    assert_eq!(created.from_commit_id, loaded.graph_commit_id);
+    let created_at = unwritten.created_at.unwrap();
+    assert!(
+        (before_create..=after_create).contains(&created_at),
+        "{before_create} <= {created_at} <= {after_create}"
+    );
+    assert_eq!(unwritten.updated_at, created_at);
+
+    mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Mia"))
+        .await
+        .unwrap();
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Eve"),
+    )
+    .await
+    .unwrap();
+    let written = newest_commit(&db, "feature").await;
+    assert_eq!(
+        written.parent_commit_id.as_deref(),
+        Some(loaded.graph_commit_id.as_str())
+    );
+    let child_created = db
+        .branch_create_from(ReadTarget::branch("feature"), "child")
+        .await
+        .unwrap();
+    assert_eq!(child_created.from_commit_id, written.graph_commit_id);
+    mutate_branch(
+        &db,
+        "child",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Kid"),
+    )
+    .await
+    .unwrap();
+    // A branch started at a past commit reads that commit as its start, from
+    // the version it was cloned at, once it has written its own head.
+    let at_load = db
+        .branch_create_from(
+            ReadTarget::snapshot(SnapshotId::new(loaded.graph_commit_id.clone())),
+            "at_load",
+        )
+        .await
+        .unwrap();
+    mutate_branch(
+        &db,
+        "at_load",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Old"),
+    )
+    .await
+    .unwrap();
+    let details = detailed_branches(&db).await;
+    let feature = &details["feature"];
+    assert_eq!(feature.head, written);
+    assert_eq!(feature.updated_at, written.created_at);
+    assert_eq!(
+        started(feature),
+        receipt(&created),
+        "a written branch keeps the commit it started at"
+    );
+    let child = &details["child"];
+    assert_eq!(child.head, newest_commit(&db, "child").await);
+    assert_eq!(started(child), receipt(&child_created));
+    let at_load_detail = &details["at_load"];
+    assert_eq!(at_load_detail.head, newest_commit(&db, "at_load").await);
+    assert_eq!(started(at_load_detail), receipt(&at_load));
+    assert_eq!(at_load.from_commit_id, loaded.graph_commit_id);
+
+    let main_head = newest_commit(&db, "main").await;
+    db.branch_merge("main", "feature").await.unwrap();
+    let merged = newest_commit(&db, "feature").await;
+    assert_eq!(
+        merged.merged_parent_commit_id.as_deref(),
+        Some(main_head.graph_commit_id.as_str())
+    );
+    let base = db.merge_base("feature", "main").await.unwrap().merge_base;
+    assert_eq!(base, main_head, "the merge moved the merge base");
+    let details = detailed_branches(&db).await;
+    assert_eq!(details["feature"].head, merged);
+    assert_eq!(
+        started(&details["feature"]),
+        receipt(&created),
+        "a merge does not move the start"
+    );
+
+    db.branch_delete("feature").await.unwrap();
+    let recreated_receipt = db
+        .branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    assert_eq!(recreated_receipt.from_commit_id, main_head.graph_commit_id);
+    let details = detailed_branches(&db).await;
+    assert_eq!(
+        details.keys().collect::<Vec<_>>(),
+        ["at_load", "child", "feature", "main"]
+    );
+    let recreated = &details["feature"];
+    assert_eq!(started(recreated), receipt(&recreated_receipt));
+    assert_eq!(recreated.head, main_head);
+    assert!(recreated.created_at.unwrap() >= created_at);
+    assert_eq!(
+        started(&details["child"]),
+        receipt(&child_created),
+        "`from` names the source as it was named then"
+    );
+
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Ann"),
+    )
+    .await
+    .unwrap();
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    let details = detailed_branches(&db).await;
+    assert_eq!(started(&details["feature"]), receipt(&recreated_receipt));
+    assert_eq!(started(&details["child"]), receipt(&child_created));
+    assert_eq!(started(&details["at_load"]), receipt(&at_load));
+
+    let mut asked = Vec::new();
+    let listing = db
+        .branch_list_detailed(&mut |name: &str| {
+            asked.push(name.to_string());
+            name != "child"
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        asked,
+        ["main", "at_load", "child", "feature"],
+        "asked once per branch"
+    );
+    assert_eq!(listing.branches, ["main", "at_load", "child", "feature"]);
+    assert_eq!(
+        listing
+            .details
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["main", "at_load", "feature"],
+        "a branch the caller may not read lists by name alone"
+    );
+
+    // A fast-forward into a branch that has written nothing publishes a new
+    // commit on it: the head and `updated_at` follow that commit, and the
+    // start stays where the branch was created.
+    let ff_created = db
+        .branch_create_from(ReadTarget::branch("main"), "ff")
+        .await
+        .unwrap();
+    mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Fay"))
+        .await
+        .unwrap();
+    let outcome = db.branch_merge("main", "ff").await.unwrap();
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
+    let fast_forwarded = newest_commit(&db, "ff").await;
+    let details = detailed_branches(&db).await;
+    let ff = &details["ff"];
+    assert_eq!(ff.head, fast_forwarded);
+    assert_eq!(started(ff), receipt(&ff_created));
+    assert_eq!(ff.updated_at, fast_forwarded.created_at);
 }
 
 #[tokio::test]

@@ -420,9 +420,58 @@ pub struct BranchCreateOutput {
     pub from_commit_id: String,
 }
 
+/// Query parameters for listing branches.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BranchListQuery {
+    /// `true` adds `details`: each branch's head, the branch and commit it
+    /// started from, when it was created, and when it last moved. Reads each
+    /// listed branch's latest version, and the version it was created from
+    /// once it has written a commit, never its commit history; the names
+    /// alone read neither.
+    #[serde(default)]
+    pub detailed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchListOutput {
+    /// Every live branch, sorted by name in byte order.
     pub branches: Vec<String>,
+    /// Present only with `detailed=true`: one entry per branch the caller
+    /// may `read`, in the order of `branches`. A branch the caller may not
+    /// read is listed in `branches` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Vec<BranchDetailOutput>>,
+}
+
+/// One live branch as `GET /branches?detailed=true` reports it. `from` and
+/// `from_commit_id` say where the branch started, as its `POST /branches`
+/// receipt did. A branch deleted and created again under the same name is a
+/// new lifetime: its start and creation time are the later creation's. The
+/// optional fields are absent on `main`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BranchDetailOutput {
+    pub name: String,
+    /// The commit a read of the branch sees: its newest commit, or the commit
+    /// it started at while it has written none.
+    pub head: CommitOutput,
+    /// The branch this one started from, as that branch was named then; it
+    /// may since have been deleted or recreated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The commit the branch started at. A later merge does not move it;
+    /// `GET /branches/merge-base` answers where two branches last met.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit_id: Option<String>,
+    /// When the branch was created, as Unix epoch microseconds recorded to
+    /// the second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1714000000000000i64)]
+    pub created_at: Option<i64>,
+    /// When the head last moved, as Unix epoch microseconds: the time of the
+    /// branch's newest commit, or `created_at` while it has written none.
+    #[schema(example = 1714000000000000i64)]
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2629,6 +2678,30 @@ pub fn diff_output(page: &omnigraph::changes::GraphDiffPage) -> DiffOutput {
         base_commit_id: page.base_commit_id.clone(),
         changes: page.changes.iter().map(entity_change_output).collect(),
         next_page_token: page.next_page_token.clone(),
+    }
+}
+
+/// A detailed branch listing (`detailed=true`): names and details, each in
+/// byte order.
+pub fn branch_list_output(listing: &omnigraph::db::BranchListing) -> BranchListOutput {
+    let mut branches = listing.branches.clone();
+    branches.sort();
+    let mut details: Vec<_> = listing.details.iter().map(branch_detail_output).collect();
+    details.sort_by(|left, right| left.name.cmp(&right.name));
+    BranchListOutput {
+        branches,
+        details: Some(details),
+    }
+}
+
+pub fn branch_detail_output(detail: &omnigraph::db::BranchDetail) -> BranchDetailOutput {
+    BranchDetailOutput {
+        name: detail.name.clone(),
+        head: commit_output(&detail.head),
+        from: detail.from.clone(),
+        from_commit_id: detail.from_commit_id.clone(),
+        created_at: detail.created_at,
+        updated_at: detail.updated_at,
     }
 }
 

@@ -309,6 +309,13 @@ fn parity_branch_list() {
     let p = parity();
     let (l, r) = p.run(&["branch", "list", "--json"]);
     assert_parity("branch list", &l, &r);
+    let (l, r) = p.run(&["branch", "list", "--detailed", "--json"]);
+    assert_parity("branch list --detailed", &l, &r);
+    assert!(
+        parse_stdout_json(&l)["details"][0]["head"]["graph_commit_id"].is_string(),
+        "{}",
+        String::from_utf8_lossy(&l.stdout)
+    );
 }
 
 #[test]

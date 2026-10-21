@@ -2913,6 +2913,7 @@ pub(crate) async fn server_load_ndjson(
     path = "/branches",
     tag = "branches",
     operation_id = "listBranches",
+    params(api::BranchListQuery),
     responses(
         (status = 200, description = "List of branches", body = BranchListOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
@@ -2924,12 +2925,54 @@ pub(crate) async fn server_load_ndjson(
 ///
 /// Returns branch names sorted by name in byte order. Read-only. The GQ statement
 /// `branch list` on `POST /query` runs the same body.
+///
+/// `detailed=true` adds `details`: for each branch the caller may `read`, its
+/// head commit, the branch and commit it started from, when it was created,
+/// and when it last moved. Each listed branch costs a read of its latest
+/// version, and of the version it was created from once it has written a
+/// commit; no commit history is read.
 pub(crate) async fn server_branch_list(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
+    Query(query): Query<api::BranchListQuery>,
 ) -> std::result::Result<Json<BranchListOutput>, ApiError> {
-    let branches = branch_list_body(&handle, actor.as_ref().map(|Extension(actor)| actor)).await?;
-    Ok(Json(BranchListOutput { branches }))
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    if !query.detailed {
+        let branches = branch_list_body(&handle, actor).await?;
+        return Ok(Json(BranchListOutput {
+            branches,
+            details: None,
+        }));
+    }
+    authorize_scope_free_read(&handle, actor)?;
+    let policy = handle.policy.as_deref();
+    // A policy failure (a missing bearer, an evaluation error) is not a
+    // denial: it stops the listing, and its own error answers.
+    let mut failure = None;
+    let mut can_read = |branch: &str| {
+        let request = PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some(branch.to_string()),
+            target_branch: None,
+        };
+        match authorize(actor, policy, request) {
+            Ok(Authz::Allowed) => true,
+            Ok(Authz::Denied(_)) => false,
+            Err(error) => {
+                failure.get_or_insert(error);
+                false
+            }
+        }
+    };
+    let listing = handle
+        .engine
+        .branch_list_detailed(&mut can_read)
+        .await
+        .map_err(ApiError::from_omni)?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(Json(api::branch_list_output(&listing)))
 }
 
 /// The scope-free `read` decision shared by `GET /branches`, `branch list`,
