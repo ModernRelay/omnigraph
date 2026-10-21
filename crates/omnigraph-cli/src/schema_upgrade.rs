@@ -263,11 +263,36 @@ mod tests {
 
     #[test]
     fn system_column_upgrade_rejects_retired_addressing() {
-        for flag in ["--server", "--cluster", "--store", "--profile"] {
+        for flag in ["--server", "--cluster", "--store", "--connection"] {
             assert!(
                 Cli::try_parse_from(["omnigraph", flag, "x", "schema", "upgrade-system-columns",])
                     .is_err(),
                 "{flag} must be refused"
+            );
+        }
+        for args in [
+            [
+                "omnigraph",
+                "--profile",
+                "work",
+                "schema",
+                "upgrade-system-columns",
+            ],
+            [
+                "omnigraph",
+                "schema",
+                "upgrade-system-columns",
+                "--profile",
+                "work",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.profile.as_deref(), Some("work"));
+            assert_eq!(
+                crate::planes::guard_addressing(&cli)
+                    .unwrap_err()
+                    .to_string(),
+                "schema upgrade-system-columns does not accept --profile"
             );
         }
         assert!(

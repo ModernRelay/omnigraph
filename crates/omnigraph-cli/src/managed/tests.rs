@@ -442,7 +442,7 @@ fn retired_managed_selectors_refuse_and_targets_do_not_add_selector_commands() {
     }
     for verb in ["login", "logout"] {
         assert!(Cli::try_parse_from(["omnigraph", verb, "--target", "account"]).is_ok());
-        assert!(Cli::try_parse_from(["omnigraph", verb, "--connection", "work"]).is_ok());
+        assert!(Cli::try_parse_from(["omnigraph", verb, "--profile", "work"]).is_ok());
     }
     for args in [
         vec!["login", "--api", "https://control.example"],

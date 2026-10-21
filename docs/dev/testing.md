@@ -218,7 +218,8 @@ filtering and wrong-plane refusal before configuration or HTTP access. The exist
 these CLI changes require no additional query-semantic GQT cases.
 
 Operator schema/routing owners cover whole-document validity, independent
-connection/target defaults, owner-local profile selection and immutable bindings.
+profile/target defaults, single-identity managed profiles, standalone auth
+selection and immutable target-to-profile bindings.
 Credential-source owners cover bounded stdin/env/file/exec acquisition, absence
 of fallback, helper failures and secret redaction. Target/application tests own
 static set/remove, no-network/no-helper/noninteractive status and pipe-only export

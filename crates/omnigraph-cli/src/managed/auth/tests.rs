@@ -17,19 +17,12 @@ fn status_reports_unknown_without_requesting_keychain_custody() {
 async fn selected_control_token_matches_the_canonical_prefixed_route() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("token"), "declared-token\n").unwrap();
-    std::fs::write(directory.path().join("config.yaml"), "version: 1\nconnections:\n  work:\n    api: https://api.example/prefix/\n    organization_id: org_test\n    auth: {machine: {provider: token, source: {file: ./token}}}\n").unwrap();
+    std::fs::write(directory.path().join("config.yaml"), "version: 1\nprofiles:\n  work:\n    api: https://api.example/prefix/\n    organization_id: org_test\n    auth: {provider: token, source: {file: ./token}}\n").unwrap();
     let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
-    let cli = crate::invocation::parse_from([
-        "omnigraph",
-        "credentials",
-        "status",
-        "--connection",
-        "work",
-        "--auth",
-        "machine",
-    ])
-    .unwrap()
-    .cli;
+    let cli =
+        crate::invocation::parse_from(["omnigraph", "credentials", "status", "--profile", "work"])
+            .unwrap()
+            .cli;
     let target = crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
         .unwrap()
         .unwrap();
@@ -101,7 +94,7 @@ async fn derived_index_survives_generations_route_changes_and_interrupted_cleanu
     let root = tempfile::tempdir().unwrap();
     let input = crate::operator::InvocationConfig::at(Some(root.path().to_owned()), None);
     let binding = |profile, route| {
-        crate::operator_routing::registration_auth(&input, "work", profile, route).unwrap()
+        crate::operator_routing::registration_auth(&input, profile, route).unwrap()
     };
     let first = binding("human", "https://first.example");
     let other = binding("other", "https://first.example");

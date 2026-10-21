@@ -210,7 +210,7 @@ mod tests {
             let config = input.get(&mut std::io::sink()).unwrap();
             let schema = config.schema.as_ref().unwrap();
             assert_eq!(schema.version, 1);
-            assert!(schema.connections.is_empty());
+            assert!(schema.profiles.is_empty());
             assert!(schema.targets.is_empty());
         }
         let explicit = InvocationConfig::at(Some(directory.path().to_owned()), None)

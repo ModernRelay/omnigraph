@@ -8,11 +8,11 @@ administration, and the organization must already be activated by its operator.
 Sign in to the selected organization:
 
 ```sh
-omnigraph login --connection work
+omnigraph login --profile work
 ```
 
-Every command below uses `--connection work`, a managed connection with an
-explicit API, organization ID and owner-local authentication profiles. See
+Every command below uses `--profile work`, a managed profile with an
+explicit API, organization ID and one authentication provider for one identity. See
 [operator registration](targets.md#login-and-registration). `org` aliases
 `organization`. The caller needs the exact organization control grant
 `{cluster: null, verb: members_manage}`; a provider role alone does not imply it.
@@ -20,15 +20,15 @@ The service operator's enrollment procedure grants the initial administrator.
 
 These commands never use folder context or change the target. A cluster target
 cannot administer its organization implicitly. The organization in a member
-patch must equal the connection before any credential or request is used.
+patch must equal the profile before any credential or request is used.
 `--json` emits the validated API envelope.
 
 ## Invite and find people
 
 ```sh
-omnigraph organization --connection work invitations send avery@example.com \
+omnigraph organization --profile work invitations send avery@example.com \
   --idempotency-key invite-avery-20261015
-omnigraph organization --connection work invitations list --json
+omnigraph organization --profile work invitations list --json
 ```
 
 The invitation email lets the recipient join the organization. Wait for
@@ -37,7 +37,7 @@ or graph permissions. List the organization directory to find the exact user ID,
 provider membership status and current local grant version:
 
 ```sh
-omnigraph organization members list --connection work --json
+omnigraph organization members list --profile work --json
 ```
 
 This complete directory includes active, pending and inactive provider members,
@@ -51,9 +51,9 @@ as `--after CURSOR` to fetch the next page. A null cursor means the last page.
 To resend or cancel an invitation, use its exact ID:
 
 ```sh
-omnigraph org invitations resend invitation_example --connection work \
+omnigraph org invitations resend invitation_example --profile work \
   --idempotency-key resend-avery-20261015
-omnigraph org invitations revoke invitation_example --connection work \
+omnigraph org invitations revoke invitation_example --profile work \
   --idempotency-key revoke-avery-20261015
 ```
 
@@ -80,7 +80,7 @@ add:
 ```
 
 ```sh
-omnigraph organization members apply member.yaml --connection work \
+omnigraph organization members apply member.yaml --profile work \
   --idempotency-key enroll-avery-20261015 --json > member-receipt.json
 ```
 
@@ -105,13 +105,13 @@ appropriate Cedar policy through the normal [source and deployment
 workflow](managed-lifecycle.md#prepare-and-apply-configuration). Grant only the
 intended graph and configuration permissions, retaining another manager.
 
-The teammate registers their own connection, discovers the cluster and registers
+The teammate registers their own profile, discovers the cluster and registers
 its service-attested resource identity:
 
 ```sh
-omnigraph login --register work --auth me
-omnigraph cluster list --connection work
-omnigraph target add production --connection work --cluster CLUSTER_ID
+omnigraph login --register work
+omnigraph cluster list --profile work
+omnigraph target add production --profile work --cluster CLUSTER_ID
 omnigraph target inspect production --resolved
 ```
 
@@ -128,8 +128,8 @@ configuration manager.
 Then read the current grant version and offboard the exact user:
 
 ```sh
-omnigraph organization members list --connection work --json
-omnigraph organization members offboard user_avery --connection work \
+omnigraph organization members list --profile work --json
+omnigraph organization members offboard user_avery --profile work \
   --expected-version 4 --idempotency-key offboard-avery-20261015 --json
 ```
 

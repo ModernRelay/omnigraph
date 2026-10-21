@@ -32,7 +32,7 @@ fn schema_id_grammars_and_scope_references_match_execution_issue_1115() {
         json!([{"$ref": "#/$defs/graphId"}, {"const": "og_catalog"}])
     );
     for (record, field, definition) in [
-        ("connection", "organization_id", "organizationId"),
+        ("profile", "organization_id", "organizationId"),
         ("managedTarget", "cluster_id", "managedId"),
         ("managedTarget", "cluster_incarnation", "managedId"),
         ("managedTarget", "default_graph", "servedGraphId"),
@@ -92,15 +92,15 @@ fn record<T: DeserializeOwned + Serialize>(name: &str, value: Value) {
 fn checked_in_schema_fields_and_required_lists_match_serde_records() {
     record::<OperatorConfig>(
         "document",
-        json!({"version":1,"connections":{},"targets":{},"aliases":{},"defaults":{}}),
+        json!({"version":1,"profiles":{},"targets":{},"aliases":{},"defaults":{}}),
     );
-    record::<Connection>(
-        "connection",
-        json!({"api":"https://example.com","organization_id":"id","auth":{},"default_auth":"me","transport":{}}),
+    record::<Profile>(
+        "profile",
+        json!({"api":"https://example.com","organization_id":"id","auth":{"provider":"omnigraph"},"transport":{}}),
     );
     record::<Target>(
         "managedTarget",
-        json!({"kind":"managed","connection":"service","cluster_id":"id","cluster_incarnation":"generation","endpoint":"https://example.com","transport":{},"default_graph":"graph"}),
+        json!({"kind":"managed","profile":"service","cluster_id":"id","cluster_incarnation":"generation","endpoint":"https://example.com","transport":{},"default_graph":"graph"}),
     );
     record::<Target>(
         "serverTarget",
@@ -135,7 +135,7 @@ fn checked_in_schema_fields_and_required_lists_match_serde_records() {
     record::<Proxy>("urlProxy", json!({"mode":"url","url":"http://proxy"}));
     record::<Defaults>(
         "defaults",
-        json!({"connection":"service","target":"target","output":"table"}),
+        json!({"profile":"service","target":"target","output":"table"}),
     );
     record::<ReadAlias>(
         "alias",
@@ -153,6 +153,16 @@ fn schema_discriminators_defaults_and_owner_variants_match_contract() {
             .unwrap()
             .contains(&MAX_CONFIG_BYTES.to_string())
     );
+    assert_eq!(
+        defs["profile"]["properties"]["auth"],
+        json!({"$ref": "#/$defs/profileAuth"})
+    );
+    assert!(defs["profile"]["properties"].get("default_auth").is_none());
+    assert!(schema["properties"].get("connections").is_none());
+    assert_eq!(
+        defs["serverTarget"]["properties"]["auth"]["additionalProperties"],
+        json!({"$ref": "#/$defs/serverAuth"})
+    );
     for (name, expected) in [
         (
             "target",
@@ -164,7 +174,7 @@ fn schema_discriminators_defaults_and_owner_variants_match_contract() {
             ],
         ),
         (
-            "connectionAuth",
+            "profileAuth",
             vec!["omnigraphAuth", "tokenAuth", "execAuth"],
         ),
         ("serverAuth", vec!["anonymousAuth", "tokenAuth", "execAuth"]),

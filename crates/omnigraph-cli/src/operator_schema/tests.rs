@@ -2,31 +2,41 @@ use super::*;
 
 const COMPLETE: &str = r#"
 version: 1
-connections:
+profiles:
   service:
     api: HTTPS://Platform.Example:443/Control/V1
     organization_id: org_issued-123
-    default_auth: human
-    auth:
-      human: {provider: omnigraph}
-      stored: {provider: token, source: {store: {}}}
-      environment: {provider: token, source: {env: _OG_TOKEN}}
-      mounted: {provider: token, source: {file: secrets/token}}
-      helper: {provider: exec, command: [/missing/helper, get, ""]}
+    auth: {provider: omnigraph}
     transport:
       tls: {ca: {mode: append, file: ca.pem}}
       proxy: {mode: url, url: HTTP://Proxy.Example:80}
+  stored:
+    api: https://platform.example
+    organization_id: org_stored
+    auth: {provider: token, source: {store: {}}}
+  environment:
+    api: https://platform.example
+    organization_id: org_environment
+    auth: {provider: token, source: {env: _OG_TOKEN}}
+  mounted:
+    api: https://platform.example
+    organization_id: org_mounted
+    auth: {provider: token, source: {file: secrets/token}}
+  helper:
+    api: https://platform.example
+    organization_id: org_helper
+    auth: {provider: exec, command: [/missing/helper, get, ""]}
 targets:
   cluster:
     kind: managed
-    connection: service
+    profile: service
     cluster_id: 123-issued-id
     cluster_incarnation: 456-issued-incarnation
     endpoint: https://Private.Example/Data/V1
     default_graph: 123-exact-graph
   control:
     kind: managed
-    connection: service
+    profile: service
     cluster_id: other
     cluster_incarnation: other-generation
   server:
@@ -60,7 +70,7 @@ aliases:
     target: root
     graph: pinned-graph
     query: read_query
-defaults: {connection: service, target: cluster, output: jsonl}
+defaults: {profile: service, target: cluster, output: jsonl}
 "#;
 
 fn decode(text: &str) -> Result<OperatorConfig, ConfigError> {
@@ -194,11 +204,27 @@ fn graph_id_boundaries_and_catalogue_scope_match_execution_issue_1115() {
 #[test]
 fn complete_document_resolves_paths_and_normalizes_routes_without_io() {
     let config = decode(COMPLETE).unwrap();
-    let connection = &config.connections["service"];
-    assert_eq!(connection.api, "https://platform.example/Control/V1/");
-    assert_eq!(connection.organization_id, "org_issued-123");
+    let profile = &config.profiles["service"];
+    assert_eq!(profile.api, "https://platform.example/Control/V1/");
+    assert_eq!(profile.organization_id, "org_issued-123");
+    assert_eq!(config.profiles.len(), 5);
+    assert_eq!(profile.auth, AuthProfile::Omnigraph);
     assert_eq!(
-        connection.auth["mounted"],
+        config.profiles["stored"].auth,
+        AuthProfile::Token {
+            source: TokenSource::Store { store: Empty {} },
+        }
+    );
+    assert_eq!(
+        config.profiles["environment"].auth,
+        AuthProfile::Token {
+            source: TokenSource::Env {
+                env: "_OG_TOKEN".into()
+            },
+        }
+    );
+    assert_eq!(
+        config.profiles["mounted"].auth,
         AuthProfile::Token {
             source: TokenSource::File {
                 file: PathBuf::from("/operator/secrets/token")
@@ -206,13 +232,13 @@ fn complete_document_resolves_paths_and_normalizes_routes_without_io() {
         }
     );
     assert_eq!(
-        connection.auth["helper"],
+        config.profiles["helper"].auth,
         AuthProfile::Exec {
             command: vec!["/missing/helper".into(), "get".into(), "".into()],
             timeout: "30s".into(),
         }
     );
-    let transport = connection.transport.as_ref().unwrap();
+    let transport = profile.transport.as_ref().unwrap();
     assert_eq!(
         transport.tls.as_ref().unwrap().ca.as_ref().unwrap().file,
         Path::new("/operator/ca.pem")
@@ -251,9 +277,10 @@ fn complete_document_resolves_paths_and_normalizes_routes_without_io() {
 fn minimal_document_and_output_defaults() {
     let config = decode("version: 1").unwrap();
     assert!(config.targets.is_empty());
-    assert!(config.connections.is_empty());
+    assert!(config.profiles.is_empty());
     assert_eq!(config.defaults.output, OutputFormat::Table);
     assert!(config.defaults.target.is_none());
+    assert!(config.defaults.profile.is_none());
     for output in ["table", "json", "jsonl", "csv", "kv"] {
         assert!(decode(&format!("version: 1\ndefaults: {{output: {output}}}")).is_ok());
     }
@@ -281,7 +308,10 @@ fn document_grammar_is_strict() {
         "version: 1\ntarget_config_version: 1",
         "target_config_version: 1",
         "version: 1\nservices: {}",
-        "version: 1\nconnections: null",
+        "version: 1\nprofiles: null",
+        "version: 1\nconnections: {}",
+        "version: 1\ndefaults: {connection: service}",
+        "version: 1\ndefaults: {profile: null}",
         "version: 1\ntargets: null",
         "version: 1\naliases: null",
         "version: 1\ndefaults: null",
@@ -305,12 +335,16 @@ fn document_grammar_is_strict() {
 fn duplicates_are_rejected_at_every_mapping_depth() {
     for (needle, replacement) in [
         (
-            "default_auth: human",
-            "default_auth: human\n    default_auth: human",
+            "organization_id: org_issued-123",
+            "organization_id: org_issued-123\n    organization_id: org_issued-123",
         ),
         (
-            "human: {provider: omnigraph}",
-            "human: {provider: omnigraph}\n      human: {provider: omnigraph}",
+            "auth: {provider: omnigraph}",
+            "auth: {provider: omnigraph}\n    auth: {provider: omnigraph}",
+        ),
+        (
+            "public: {provider: anonymous}",
+            "public: {provider: anonymous}\n      public: {provider: anonymous}",
         ),
         (
             "{provider: omnigraph}",
@@ -345,15 +379,18 @@ fn names_and_references_are_validated_document_wide() {
         reject(&COMPLETE.replacen("  service:", &format!("  {bad}:"), 1));
         reject(&COMPLETE.replacen("  local:", &format!("  {bad}:"), 1));
         reject(&COMPLETE.replacen("  graph-query:", &format!("  {bad}:"), 1));
-        reject(&COMPLETE.replacen("      human:", &format!("      {bad}:"), 1));
+        reject(&COMPLETE.replacen("      public:", &format!("      {bad}:"), 1));
     }
     for (needle, replacement) in [
-        ("connection: service", "connection: missing"),
-        ("default_auth: human", "default_auth: Human"),
+        ("profile: service", "profile: missing"),
+        (
+            "endpoint: https://server.example/prefix",
+            "endpoint: https://server.example/prefix\n    default_auth: missing",
+        ),
         ("target: local", "target: missing"),
         (
-            "connection: service, target: cluster",
-            "connection: missing, target: cluster",
+            "profile: service, target: cluster",
+            "profile: missing, target: cluster",
         ),
         (
             "target: cluster, output: jsonl",
@@ -377,7 +414,8 @@ fn required_fields_and_variant_boundaries_are_enforced() {
     for field in [
         "    api: HTTPS://Platform.Example:443/Control/V1\n",
         "    organization_id: org_issued-123\n",
-        "    connection: service\n",
+        "    auth: {provider: omnigraph}\n",
+        "    profile: service\n",
         "    cluster_id: other\n",
         "    cluster_incarnation: other-generation\n",
         "    endpoint: https://server.example/prefix\n",
@@ -400,7 +438,7 @@ fn required_fields_and_variant_boundaries_are_enforced() {
         ));
     }
     for extra in [
-        "connection: service",
+        "profile: service",
         "cluster_id: id",
         "scope: graph",
         "storage: {}",
@@ -433,6 +471,20 @@ fn required_fields_and_variant_boundaries_are_enforced() {
 
 #[test]
 fn auth_provider_and_source_variants_are_exact() {
+    for auth in [
+        "null",
+        "{human: {provider: omnigraph}}",
+        "{human: {provider: omnigraph}, machine: {provider: token, source: {store: {}}}}",
+        "{provider: omnigraph, default_auth: human}",
+    ] {
+        reject(&COMPLETE.replacen("auth: {provider: omnigraph}", &format!("auth: {auth}"), 1));
+    }
+    reject(&COMPLETE.replacen(
+        "auth: {provider: omnigraph}",
+        "auth: {provider: omnigraph}\n    default_auth: human",
+        1,
+    ));
+    reject(&COMPLETE.replacen("profile: service", "connection: service", 1));
     for profile in [
         "{}",
         "{provider: workload}",
@@ -473,16 +525,13 @@ fn auth_provider_and_source_variants_are_exact() {
             "{profile}"
         );
     }
+    reject(&COMPLETE.replace("auth: {provider: omnigraph}", "auth: {provider: anonymous}"));
     reject(&COMPLETE.replace(
-        "human: {provider: omnigraph}",
-        "human: {provider: anonymous}",
-    ));
-    reject(&COMPLETE.replace(
-        "human: {provider: omnigraph}",
-        "human: {provider: omnigraph, issuer: https://example.com}",
+        "auth: {provider: omnigraph}",
+        "auth: {provider: omnigraph, issuer: https://example.com}",
     ));
     reject(
-        "version: 1\nconnections: {c: {api: 'https://example.com', organization_id: id, auth: {}}}",
+        "version: 1\nprofiles: {c: {api: 'https://example.com', organization_id: id, auth: {}}}",
     );
     reject("version: 1\ntargets: {s: {kind: server, endpoint: 'https://example.com', auth: {}}}");
 }
@@ -788,14 +837,14 @@ fn custom_destination_ca_refuses_explicit_https_proxy_document_wide() {
                     .to_string()
                     .contains("targets.control.transport")
             );
-            let connection = format!(
-                "version: 1\nconnections:\n  unused:\n    api: https://example.com\n    organization_id: org\n    auth: {{human: {{provider: omnigraph}}}}\n    transport: {transport}\n"
+            let profile = format!(
+                "version: 1\nprofiles:\n  unused:\n    api: https://example.com\n    organization_id: org\n    auth: {{provider: omnigraph}}\n    transport: {transport}\n"
             );
             assert!(
-                decode(&connection)
+                decode(&profile)
                     .unwrap_err()
                     .to_string()
-                    .contains("connections.unused.transport")
+                    .contains("profiles.unused.transport")
             );
         }
         for proxy in [

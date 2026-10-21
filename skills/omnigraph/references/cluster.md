@@ -136,22 +136,22 @@ backup restoration; apply does not adopt or recreate them.
 
 ## Managed clusters
 
-A connection pins API, organization and owner-local auth profiles. A managed
+A profile pins API, organization and one auth provider for one identity. A managed
 target references it and pins cluster ID/incarnation plus an optional endpoint.
 Graph work needs that endpoint and an explicit/default graph. See
 [registration](../../../docs/user/cli/targets.md#login-and-registration).
 
 ```bash
-omnigraph login --connection work
-omnigraph cluster list --connection work --json
-omnigraph cluster create demo --connection work --no-wait --json
-omnigraph target add production --connection work --cluster CLUSTER_ID
+omnigraph login --profile work
+omnigraph cluster list --profile work --json
+omnigraph cluster create demo --profile work --no-wait --json
+omnigraph target add production --profile work --cluster CLUSTER_ID
 omnigraph cluster pull --target production --out source --json
 omnigraph cluster push --target production --config source --expected-revision REV --message 'Update schema'
 omnigraph cluster plan --target production --rev NEW_REV --json
 omnigraph cluster apply --target production --plan PREVIEW_ID --json
 omnigraph cluster status DELIVERY_ID --target production --json
-omnigraph cluster operation OPERATION_ID --connection work --wait --json
+omnigraph cluster operation OPERATION_ID --profile work --wait --json
 ```
 
 Managed plan/apply use pushed source revisions/previews and reject local
@@ -165,7 +165,7 @@ Lifecycle pending and accepted identities live under the operator home's
 with the same principal, exact arguments and key. Accepted history is bounded;
 full custody refuses instead of evicting evidence. Preserve old journals and
 preserve matching legacy folder evidence explicitly with `config recover-operations
---source DIR --connection work --auth me`. This does not convert configuration or
+--source DIR --profile work`. This does not convert configuration or
 submit operations; resume with the original verified principal and original key.
 
 Managed graph commands acquire missing identity credentials without replaying

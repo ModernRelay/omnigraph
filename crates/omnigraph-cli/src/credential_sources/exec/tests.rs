@@ -23,7 +23,7 @@ fn request() -> CredentialRequest {
 #[test]
 fn request_contains_only_captured_constraints_and_noninteractive_mode() {
     let owner = OwnerBinding::new(
-        OwnerKind::Connection,
+        OwnerKind::Profile,
         "owner-id".into(),
         "profile-id".into(),
         "https://control.invalid/api/".into(),

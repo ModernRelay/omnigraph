@@ -3,8 +3,8 @@
 These commands use your managed service identity and permissions. They do not
 open graph storage or require cloud credentials. The service must support
 cluster creation and lifecycle operations; an older service returns a refusal.
-Account commands select a connection and resource commands select a target.
-Configure `work` as a managed connection and `production` as its target; see
+Account commands select a profile and resource commands select a target.
+Configure `work` as a managed profile and `production` as its target; see
 [managed target configuration](reference.md#managed-cluster-commands).
 
 ## Find a cluster and recover its configuration
@@ -12,9 +12,9 @@ Configure `work` as a managed connection and `production` as its target; see
 After signing in, list the clusters visible to your selected organization:
 
 ```sh
-omnigraph login --connection work
-omnigraph cluster list --connection work --json
-omnigraph target add production --connection work --cluster CLUSTER_ID
+omnigraph login --profile work
+omnigraph cluster list --profile work --json
+omnigraph target add production --profile work --cluster CLUSTER_ID
 omnigraph cluster pull --target production --out customer-config --json
 ```
 
@@ -61,17 +61,17 @@ enroll and remove people through the same cached CLI login.
 
 ## Create an empty cluster
 
-Use a complete connection:
+Use a complete profile:
 
 ```sh
-omnigraph login --connection work
-omnigraph cluster create customer-demo --connection work --no-wait --json
+omnigraph login --profile work
+omnigraph cluster create customer-demo --profile work --no-wait --json
 ```
 
 The service reserves a cluster and operation. Creation returns its identity;
 it never creates configuration files, binds a directory or changes the selected
 target. Keep `data.canonical_root`, `data.incarnation` and `data.operation_id`,
-then register it with `target add production --connection work --cluster CLUSTER_ID`. Without `--no-wait`, the
+then register it with `target add production --profile work --cluster CLUSTER_ID`. Without `--no-wait`, the
 command waits for initial bootstrap and serving readiness. `data.state` is the
 operation outcome; `data.lifecycle.phase` reports provisioning progress.
 
@@ -80,8 +80,8 @@ sets a local 1–3600-second deadline; the default is 300. A timeout does not
 cancel creation. Follow the saved operation explicitly:
 
 ```sh
-omnigraph cluster operation OPERATION_ID --connection work --json
-omnigraph cluster operation OPERATION_ID --connection work --wait --timeout 600 --json
+omnigraph cluster operation OPERATION_ID --profile work --json
+omnigraph cluster operation OPERATION_ID --profile work --wait --timeout 600 --json
 ```
 
 Connections can observe creation before a cluster target exists. A cluster

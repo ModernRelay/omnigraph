@@ -24,34 +24,38 @@ fn auth_selection_never_infers_a_sole_profile() {
 #[test]
 fn explicit_rename_and_principal_replacement_commands_parse_without_legacy_selectors() {
     for args in [
-        vec!["config", "rename-connection", "old", "new"],
+        vec!["config", "rename-profile", "old", "new"],
         vec!["config", "rename-target", "old", "new"],
-        vec!["config", "rename-auth", "connection", "work", "old", "new"],
         vec!["config", "rename-auth", "server", "served", "old", "new"],
         vec!["config", "recover-rename"],
         vec![
             "login",
-            "--connection",
+            "--profile",
             "work",
-            "--auth",
-            "me",
             "--replace-principal",
             "principal_new",
         ],
     ] {
         assert!(crate::invocation::parse_from(std::iter::once("omnigraph").chain(args)).is_ok());
     }
-    assert!(
-        crate::invocation::parse_from([
-            "omnigraph",
-            "login",
-            "--connection",
-            "work",
-            "--replace-principal",
-            "principal_new"
-        ])
-        .is_err()
-    );
+    for args in [
+        vec!["config", "rename-connection", "old", "new"],
+        vec!["config", "rename-auth", "connection", "work", "old", "new"],
+        vec!["config", "rename-auth", "profile", "work", "old", "new"],
+        vec!["login", "--connection", "work"],
+    ] {
+        assert!(crate::invocation::parse_from(std::iter::once("omnigraph").chain(args)).is_err());
+    }
+    for args in [
+        vec!["login", "--profile", "work", "--auth", "me"],
+        vec!["logout", "--profile", "work", "--auth", "me"],
+        vec!["login", "--auth", "me"],
+        vec!["login", "--replace-principal", "principal_new"],
+    ] {
+        let parsed =
+            crate::invocation::parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
+        assert!(crate::planes::guard_addressing(&parsed.cli).is_err());
+    }
 }
 
 #[test]
@@ -91,7 +95,6 @@ fn standalone_server_and_auth_renames_preserve_the_secret_store_binding() {
     crate::operator_routing::rename(
         &input,
         crate::operator_routing::Rename::Auth {
-            server: true,
             owner: "new".into(),
         },
         "first",
@@ -153,27 +156,25 @@ async fn supported_owner_and_profile_renames_preserve_custody_and_references() {
     use crate::operator_routing::{Rename, registration_auth, rename};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
-    std::fs::write(&path, "version: 1\nconnections:\n  work:\n    api: https://api.example/prefix\n    organization_id: org_test\n    auth: {me: {provider: omnigraph}}\n    default_auth: me\ntargets:\n  cloud:\n    kind: managed\n    connection: work\n    cluster_id: cluster_one\n    cluster_incarnation: incarnation_one\naliases:\n  search: {target: cloud, graph: knowledge, query: search}\ndefaults: {connection: work, target: cloud}\n").unwrap();
+    std::fs::write(&path, "version: 1\nprofiles:\n  work:\n    api: https://api.example/prefix\n    organization_id: org_test\n    auth: {provider: omnigraph}\ntargets:\n  cloud:\n    kind: managed\n    profile: work\n    cluster_id: cluster_one\n    cluster_incarnation: incarnation_one\naliases:\n  search: {target: cloud, graph: knowledge, query: search}\ndefaults: {profile: work, target: cloud}\n").unwrap();
     let input = InvocationConfig::at(Some(directory.path().to_owned()), None);
-    let before = registration_auth(&input, "work", "me", "https://api.example/prefix").unwrap();
-    rename(
-        &input,
-        Rename::Auth {
-            server: false,
-            owner: "work".into(),
-        },
-        "me",
-        "human",
-    )
-    .unwrap();
-    let input = InvocationConfig::at(Some(directory.path().to_owned()), None);
-    rename(&input, Rename::Connection, "work", "renamed").unwrap();
+    let before = registration_auth(&input, "work", "https://api.example/prefix").unwrap();
+    assert_eq!(before.name, "auth");
+    rename(&input, Rename::Profile, "work", "renamed").unwrap();
     let input = InvocationConfig::at(Some(directory.path().to_owned()), None);
     rename(&input, Rename::Target, "cloud", "production").unwrap();
     let input = InvocationConfig::at(Some(directory.path().to_owned()), None);
-    let after =
-        registration_auth(&input, "renamed", "human", "https://api.example/prefix").unwrap();
+    let after = registration_auth(&input, "renamed", "https://api.example/prefix").unwrap();
     assert_eq!(before.owner, after.owner);
+    assert_eq!(after.name, "auth");
+    let bindings: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.path().join("config.yaml.bindings.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(bindings.get("profile:work").is_none());
+    let auth_bindings = bindings["profile:renamed"]["profiles"].as_object().unwrap();
+    assert_eq!(auth_bindings.len(), 1);
+    assert!(auth_bindings.contains_key("auth"));
     let old_namespace = crate::operator_routing::AUTH
         .scope(Some(before), async {
             crate::operator_routing::namespace("session")
@@ -186,15 +187,15 @@ async fn supported_owner_and_profile_renames_preserve_custody_and_references() {
         .await;
     assert_eq!(old_namespace, new_namespace);
     let config = input.get(&mut Vec::new()).unwrap().schema.as_ref().unwrap();
-    assert_eq!(config.defaults.connection.as_deref(), Some("renamed"));
+    assert_eq!(config.defaults.profile.as_deref(), Some("renamed"));
     assert_eq!(config.defaults.target.as_deref(), Some("production"));
     assert_eq!(
-        config.connections["renamed"].default_auth.as_deref(),
-        Some("human")
+        config.profiles["renamed"].auth,
+        crate::operator_schema::AuthProfile::Omnigraph
     );
     assert_eq!(config.aliases["search"].target, "production");
     assert!(
-        matches!(&config.targets["production"], crate::operator_schema::Target::Managed { connection, .. } if connection == "renamed")
+        matches!(&config.targets["production"], crate::operator_schema::Target::Managed { profile, .. } if profile == "renamed")
     );
 }
 

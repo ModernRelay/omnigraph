@@ -5,8 +5,8 @@ Use `omnigraph --help` or `omnigraph <command> --help` for exact installed flags
 ## Addressing a graph
 
 Resource commands resolve one target from `--target NAME|LOCAL_PATH` or
-`defaults.target`. Account commands use `--connection NAME` or
-`defaults.connection`; see [selection rules](targets.md#selection-and-defaults). An unknown, incomplete or unsupported
+`defaults.target`. Account commands use `--profile NAME` or
+`defaults.profile`; see [selection rules](targets.md#selection-and-defaults). An unknown, incomplete or unsupported
 target refuses; it never falls back to another backend. Folder context and
 source configuration do not select destinations. Every backend invocation prints
 its resolved target to stderr, including its kind, scope and selection source.
@@ -64,18 +64,18 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `queries list` | List stored queries: a cluster root's registry (`--graph` narrows it to one graph), or one served graph's catalog, whose `--json` is the body of `GET /graphs/{id}/queries` | cluster or served |
 | `queries validate` | Type-check a cluster's applied query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate self-hosted declarative state; [deployment/recovery flags](../clusters/index.md) | config, server, explicit root |
-| `cluster create/list/members/pull/push/delete/undo-delete/token/operation/history/cancel` | Operate a managed cluster | connection or managed target |
+| `cluster create/list/members/pull/push/delete/undo-delete/token/operation/history/cancel` | Operate a managed cluster | profile or managed target |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
-| `login`, `logout` | Register a connection or manage an `omnigraph` profile session | managed connection |
+| `login`, `logout` | Register a profile or manage an `omnigraph` profile session | managed profile |
 | `target list/inspect/add/refresh/remove` (`register` aliases `add`) | Inspect/edit targets; managed add/refresh uses discovery | local or managed API |
-| `credentials set/status/remove/export` | Manage static custody or export access to a pipe; explicit owner and auth required | connection or server; managed target for export |
+| `credentials set/status/remove/export` | Manage static custody or export access to a pipe; explicit profile or standalone target/auth required | profile or server; managed target for export |
 | `config validate` | Validate the whole operator file offline | local |
-| `config rename-connection/rename-target/rename-auth/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
-| `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | connection, local evidence |
+| `config rename-profile/rename-target/rename-auth/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
+| `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
 | `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or served |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
-| `organization members/invitations` | Administer organization membership and invitations | connection |
+| `organization members/invitations` | Administer organization membership and invitations | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
 | `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`target`, `credential`, `access`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
@@ -194,13 +194,13 @@ There is no backward compatibility or `target import`. No secrets belong in YAML
 
 ## Managed cluster commands
 
-Account operations use a connection. Resource operations use a managed target
+Account operations use a profile. Resource operations use a managed target
 referencing it; see [registration](targets.md#login-and-registration).
 
 ```bash
-omnigraph login --register work --auth me
-omnigraph cluster list --connection work --json
-omnigraph target add production --connection work --cluster CLUSTER_ID
+omnigraph login --register work
+omnigraph cluster list --profile work --json
+omnigraph target add production --profile work --cluster CLUSTER_ID
 ```
 
 The target pins cluster ID/incarnation and an optional service-attested endpoint.
@@ -209,8 +209,8 @@ retarget an invocation.
 
 | Managed command | Target and behavior |
 |---|---|
-| `login` / `logout` | Selected `omnigraph` connection profile (also via a managed target) |
-| `cluster create NAME`, `cluster list` | Connection; create returns identity without binding a folder |
+| `login` / `logout` | Selected `omnigraph` profile (also via a managed target) |
+| `cluster create NAME`, `cluster list` | Profile; create returns identity without binding a folder |
 | `cluster members list` | Cluster target; list explicit enrollment |
 | `cluster pull --out NEW_DIR [--rev REVISION]` | Download configuration into a new directory |
 | `cluster push --config DIR --expected-revision REVISION --message TEXT` | Upload source using an exact revision |
@@ -219,9 +219,9 @@ retarget an invocation.
 | `cluster status [DEPLOYMENT_ID] [--wait]` | Observe the cluster or one exact delivery |
 | `cluster history`, `cluster cancel DEPLOYMENT_ID` | Observe or cancel managed deliveries |
 | `cluster delete --incarnation ID`, `cluster undo-delete --incarnation ID --deletion-id ID` | Assert the target incarnation before lifecycle submission |
-| `cluster operation OPERATION_ID [--wait]` | Observe a lifecycle operation using its matching connection or managed target |
+| `cluster operation OPERATION_ID [--wait]` | Observe a lifecycle operation using its matching profile or managed target |
 
-Pass `--connection NAME` for account operations and `--target NAME` for resource
+Pass `--profile NAME` for account operations and `--target NAME` for resource
 operations, or set the corresponding independent default.
 `--config DIR` names source files only: managed push accepts it, while managed
 plan/apply read pushed source and refuse it. Managed operations never fall back

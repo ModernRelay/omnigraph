@@ -460,14 +460,14 @@ fn attested_endpoint(row: &Value) -> Result<Option<String>> {
 
 pub(crate) async fn register_target(
     binding: &Binding,
-    connection: &str,
+    profile: &str,
     cluster: &str,
 ) -> color_eyre::Result<crate::operator_schema::Target> {
     let result = async {
         identifier(cluster)?;
         let api = binding.client().await?;
         let body = api.request(Method::GET, "/v1/clusters", None, None).await?;
-        target_from_listing(binding, connection, cluster, &body)
+        target_from_listing(binding, profile, cluster, &body)
     }
     .await;
     result.map_err(|failure: Failure| color_eyre::eyre::eyre!("{}", failure.body))
@@ -475,7 +475,7 @@ pub(crate) async fn register_target(
 
 fn target_from_listing(
     binding: &Binding,
-    connection: &str,
+    profile: &str,
     cluster: &str,
     body: &Value,
 ) -> Result<crate::operator_schema::Target> {
@@ -507,7 +507,7 @@ fn target_from_listing(
     }
     let endpoint = attested_endpoint(row)?;
     Ok(crate::operator_schema::Target::Managed {
-        connection: connection.into(),
+        profile: profile.into(),
         cluster_id: cluster.into(),
         cluster_incarnation: incarnation.into(),
         endpoint,

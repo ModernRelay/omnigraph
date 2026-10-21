@@ -13,7 +13,7 @@ omnigraph query find_person --target production --graph knowledge --params '{"na
 omnigraph mutate add_person --target production --graph knowledge --params '{"name":"Alice"}' --json
 ```
 
-The target references a connection for API, organization and auth profiles, and
+The target references a profile for API, organization and one auth provider, and
 pins cluster ID, incarnation and data endpoint. See [operator configuration](targets.md). A graph operation requires `--graph` or that target's
 `default_graph`. Discovery lists graph IDs; it never selects one.
 
@@ -65,7 +65,7 @@ credential, refuses without falling back to another inventory.
 
 ## Cached access and routing
 
-Data credentials belong to the selected connection/profile and resource binding,
+Data credentials belong to the selected profile and resource binding,
 including endpoint and incarnation. They remain separate from control sessions;
 there is no plaintext cache or control-token fallback at the graph endpoint.
 Use [credential export](targets.md#manage-credentials) to explicitly release a
@@ -129,7 +129,7 @@ See Apple's [code identity requirements](https://developer.apple.com/documentati
 `cluster token --target production --clear` forgets that cluster's persistent local data
 entry independently of its control session. Do not combine `--clear` with
 `--graph` or `--ttl`. Clearing is not server revocation: copies remain usable
-until expiry or signing-key retirement. `logout --connection work --auth me` clears the
+until expiry or signing-key retirement. `logout --profile work` clears the
 selected local session and its derived data cache, then requests provider-session revocation;
 `provider_revocation_confirmed` reports its outcome. Copies of issued data
 credentials can remain valid remotely until expiry or signing-key retirement.

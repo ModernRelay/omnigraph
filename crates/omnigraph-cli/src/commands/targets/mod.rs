@@ -38,43 +38,42 @@ fn edit(
 pub(crate) async fn onboard(
     input: &InvocationConfig,
     name: &str,
-    profile: &str,
     api: &str,
     organization: Option<&str>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    if !targets::valid_name(name) || !targets::valid_name(profile) {
-        bail!("connection and profile names must start with an ASCII letter");
+    if !targets::valid_name(name) {
+        bail!("profile names must start with an ASCII letter");
     }
     let configured = input.get(stderr)?;
     if configured
         .schema
         .as_ref()
-        .is_some_and(|s| s.connections.contains_key(name))
+        .is_some_and(|s| s.profiles.contains_key(name))
     {
-        bail!("connection already exists; use login --connection");
+        bail!("profile already exists; use login --profile");
     }
-    let candidate = serde_json::json!({"version":1,"connections":{name:{"api":api,"organization_id":"org_pending","auth":{profile:{"provider":"omnigraph"}},"default_auth":profile}}});
+    let candidate = serde_json::json!({"version":1,"profiles":{name:{"api":api,"organization_id":"org_pending","auth":{"provider":"omnigraph"}}}});
     let validated =
         crate::operator_schema::parse(&serde_json::to_string(&candidate)?, &configured.base_dir)?;
-    let mut connection = validated.connections[name].clone();
-    let route = connection.api.trim_end_matches('/').to_owned();
-    connection.api = route.clone();
-    let auth = crate::operator_routing::registration_auth(input, name, profile, &route)?;
+    let mut profile = validated.profiles[name].clone();
+    let route = profile.api.trim_end_matches('/').to_owned();
+    profile.api = route.clone();
+    let auth = crate::operator_routing::registration_auth(input, name, &route)?;
     crate::operator_routing::AUTH.scope(Some(auth), async {
             let receipt = crate::managed::register_login(route.clone(), organization, stderr).await?;
         let organization = receipt["data"]["account_id"].as_str().ok_or_else(|| eyre!("verified login response has no organization"))?;
-        connection.organization_id = organization.to_owned();
+        profile.organization_id = organization.to_owned();
         if let Err(error) = edit(input, |config| {
-            if config.connections.contains_key(name) { bail!("connection was registered concurrently"); }
-            config.connections.insert(name.into(), connection);
+            if config.profiles.contains_key(name) { bail!("profile was registered concurrently"); }
+            config.profiles.insert(name.into(), profile);
             Ok(())
         }) {
             let cleanup = crate::managed::discard_registration(route, organization).await;
-            bail!("connection could not be saved: {error}; session cleanup completed: {}", cleanup.is_ok());
+            bail!("profile could not be saved: {error}; session cleanup completed: {}", cleanup.is_ok());
         }
-        crate::output::write_json(&serde_json::json!({"registered":name,"profile":profile,"organization_id":organization}), stdout)
+        crate::output::write_json(&serde_json::json!({"registered":name,"profile":name,"organization_id":organization}), stdout)
     }).await
 }
 
@@ -92,14 +91,14 @@ pub(crate) fn run_config(
     }
     input.get(stderr)?;
     match command {
-        ConfigCommand::RenameConnection { from, to } => {
+        ConfigCommand::RenameProfile { from, to } => {
             crate::operator_routing::rename(
                 input,
-                crate::operator_routing::Rename::Connection,
+                crate::operator_routing::Rename::Profile,
                 &from,
                 &to,
             )?;
-            writeln!(stdout, "connection renamed; profile custody preserved")?;
+            writeln!(stdout, "profile renamed; profile custody preserved")?;
             Ok(())
         }
         ConfigCommand::RenameTarget { from, to } => {
@@ -113,17 +112,14 @@ pub(crate) fn run_config(
             Ok(())
         }
         ConfigCommand::RenameAuth {
-            kind,
+            kind: args::RenameOwner::Server,
             owner,
             from,
             to,
         } => {
             crate::operator_routing::rename(
                 input,
-                crate::operator_routing::Rename::Auth {
-                    server: matches!(kind, args::RenameOwner::Server),
-                    owner,
-                },
+                crate::operator_routing::Rename::Auth { owner },
                 &from,
                 &to,
             )?;
@@ -133,10 +129,10 @@ pub(crate) fn run_config(
         ConfigCommand::RecoverRename => unreachable!(),
         ConfigCommand::RecoverOperations { source, json } => {
             let TargetBinding::Managed(binding) = &selected
-                .ok_or_else(|| eyre!("select --connection NAME"))?
+                .ok_or_else(|| eyre!("select --profile NAME"))?
                 .binding
             else {
-                bail!("operation recovery requires a connection");
+                bail!("operation recovery requires a profile");
             };
             let home = input
                 .directory()
@@ -174,7 +170,7 @@ pub(crate) async fn run_target(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    let (connection, auth_override) = selection;
+    let (profile, auth_override) = selection;
     match command {
         TargetCommand::List { json } => {
             let config = input.get(stderr)?;
@@ -214,9 +210,12 @@ pub(crate) async fn run_target(
             let mut output = serde_json::json!({"name":name,"target":target});
             if resolved {
                 let profiles = match target {
-                    Target::Managed { connection, .. } => {
-                        let owner = &source.connections[connection];
-                        Some((&owner.auth, owner.default_auth.as_deref()))
+                    Target::Managed { profile, .. } => {
+                        if auth_override.is_some() {
+                            bail!("managed targets do not accept --auth");
+                        }
+                        output["profile"] = serde_json::to_value(&source.profiles[profile])?;
+                        None
                     }
                     Target::Server {
                         auth, default_auth, ..
@@ -229,9 +228,6 @@ pub(crate) async fn run_target(
                     output["auth_profile"] = serde_json::json!({"name":name,"source":if auth_override.is_some() { "explicit" } else { "owner default" }});
                 } else if auth_override.is_some() {
                     bail!("direct targets do not accept --auth");
-                }
-                if let Target::Managed { connection, .. } = target {
-                    output["connection"] = serde_json::to_value(&source.connections[connection])?;
                 }
                 output["identity"] =
                     serde_json::json!({"status":"unknown","source":"offline inspection"});
@@ -257,25 +253,25 @@ pub(crate) async fn run_target(
             if frozen.targets.contains_key(&name) {
                 bail!("target already exists");
             }
-            let expected_connection = connection.and_then(|name| {
+            let expected_profile = profile.and_then(|name| {
                 frozen
                     .schema
                     .as_ref()
-                    .and_then(|source| source.connections.get(name))
+                    .and_then(|source| source.profiles.get(name))
             });
             let entry = if let Some(cluster) = cluster {
-                let connection = connection
-                    .ok_or_else(|| eyre!("managed registration requires --connection NAME"))?;
+                let profile =
+                    profile.ok_or_else(|| eyre!("managed registration requires --profile NAME"))?;
                 let TargetBinding::Managed(binding) = &selected
-                    .ok_or_else(|| eyre!("no selected connection"))?
+                    .ok_or_else(|| eyre!("no selected profile"))?
                     .binding
                 else {
-                    bail!("managed registration requires a connection");
+                    bail!("managed registration requires a profile");
                 };
-                crate::managed::register_target(binding, connection, &cluster).await?
+                crate::managed::register_target(binding, profile, &cluster).await?
             } else {
-                if connection.is_some() {
-                    bail!("--connection requires --cluster");
+                if profile.is_some() {
+                    bail!("--profile requires --cluster");
                 }
                 let mut bytes = Vec::new();
                 stdin.take(65537).read_to_end(&mut bytes)?;
@@ -285,9 +281,9 @@ pub(crate) async fn run_target(
                 serde_json::from_slice::<Target>(&bytes)?
             };
             edit(input, |config| {
-                if let Some(connection) = connection {
-                    if config.connections.get(connection) != expected_connection {
-                        bail!("connection changed during registration");
+                if let Some(profile) = profile {
+                    if config.profiles.get(profile) != expected_profile {
+                        bail!("profile changed during registration");
                     }
                 }
                 if config.targets.contains_key(&name) {
@@ -314,7 +310,7 @@ pub(crate) async fn run_target(
                 .get(&name)
                 .ok_or_else(|| eyre!("unknown target"))?;
             let Target::Managed {
-                connection,
+                profile,
                 cluster_id,
                 cluster_incarnation,
                 ..
@@ -327,7 +323,7 @@ pub(crate) async fn run_target(
             else {
                 bail!("refresh requires a managed target");
             };
-            let fresh = crate::managed::register_target(binding, connection, cluster_id).await?;
+            let fresh = crate::managed::register_target(binding, profile, cluster_id).await?;
             let Target::Managed {
                 cluster_incarnation: incarnation,
                 endpoint,
@@ -346,8 +342,8 @@ pub(crate) async fn run_target(
             let endpoint_available = endpoint.is_some();
             let endpoint = endpoint.or_else(|| previous.clone());
             edit(input, |current| {
-                if current.connections.get(connection) != source.connections.get(connection) {
-                    bail!("connection changed during refresh");
+                if current.profiles.get(profile) != source.profiles.get(profile) {
+                    bail!("profile changed during refresh");
                 }
                 let entry = current
                     .targets
@@ -426,7 +422,7 @@ pub(crate) async fn run_credential(
     if matches!(&target.binding, TargetBinding::Managed(binding) if binding.cluster.is_some())
         && !matches!(command, CredentialCommand::Export)
     {
-        bail!("set/status/remove select the managed connection with --connection");
+        bail!("set/status/remove select the managed profile with --profile");
     }
     let auth = crate::operator_routing::AUTH.with(Clone::clone);
     if auth.is_none() && matches!(command, CredentialCommand::Status { .. }) {
@@ -505,7 +501,7 @@ pub(crate) async fn run_credential(
                 AuthProfile::Omnigraph => "unknown",
                 AuthProfile::Anonymous => "anonymous",
             };
-            let mut result = serde_json::json!({"owner":auth.owner,"profile":auth.name,"availability":availability,"identity":"unknown","server_validity":"unverified","observed_at":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?,"verified_at":null});
+            let mut result = serde_json::json!({"owner":auth.owner,"profile":profile_name,"availability":availability,"identity":"unknown","server_validity":"unverified","observed_at":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?,"verified_at":null});
             if matches!(auth.profile, AuthProfile::Omnigraph) {
                 if let TargetBinding::Managed(binding) = &target.binding {
                     result["session"] = crate::managed::credential_status(binding);

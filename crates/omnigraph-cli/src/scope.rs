@@ -21,41 +21,41 @@ pub(crate) fn resolve(
         return Ok(None);
     }
     let config = input.get(stderr)?;
-    let connection_class = matches!(need, Requirement::ManagedAccount)
+    let profile_class = matches!(need, Requirement::ManagedAccount)
         || (need == Requirement::Authentication && cli.target.is_none())
-        || (cli.connection.is_some()
+        || (cli.profile.is_some()
             && matches!(
                 need,
                 Requirement::Authentication
                     | Requirement::Credential
                     | Requirement::ManagedOperation
             ));
-    if connection_class {
+    if profile_class {
         let source = config
             .schema
             .as_ref()
             .ok_or_else(|| color_eyre::eyre::eyre!("operator configuration requires version: 1"))?;
         let name = cli
-            .connection
+            .profile
             .as_deref()
-            .or(source.defaults.connection.as_deref())
+            .or(source.defaults.profile.as_deref())
             .ok_or_else(|| {
                 targets::refusal(
-                    "connection_required",
-                    "select --connection NAME or configure defaults.connection",
+                    "profile_required",
+                    "select --profile NAME or configure defaults.profile",
                 )
             })?;
-        let connection = source.connections.get(name).ok_or_else(|| {
-            targets::refusal("connection_unknown", format!("unknown connection '{name}'"))
+        let profile = source.profiles.get(name).ok_or_else(|| {
+            targets::refusal("profile_unknown", format!("unknown profile '{name}'"))
         })?;
         let target = ResolvedTarget::new(
             TargetBinding::Managed(crate::managed::Binding {
-                api: connection.api.trim_end_matches('/').to_owned(),
-                organization_id: Some(connection.organization_id.clone()),
+                api: profile.api.trim_end_matches('/').to_owned(),
+                organization_id: Some(profile.organization_id.clone()),
                 cluster: None,
                 control_auth: crate::managed::ControlAuth::HumanDevice,
             }),
-            if cli.connection.is_some() {
+            if cli.profile.is_some() {
                 TargetProvenance::Explicit { name: name.into() }
             } else {
                 TargetProvenance::Default { name: name.into() }
@@ -352,7 +352,7 @@ pub(crate) fn report(
     };
     let selection_kind = if matches!(&target.binding, TargetBinding::Managed(binding) if binding.cluster.is_none())
     {
-        "connection"
+        "profile"
     } else {
         "target"
     };
@@ -381,7 +381,7 @@ mod tests {
     use crate::invocation::parse_from;
 
     #[test]
-    fn connection_report_does_not_present_an_account_as_a_resource_target() {
+    fn profile_report_does_not_present_an_account_as_a_resource_target() {
         let input = InvocationConfig::at(None, None);
         let selected = ResolvedTarget::new(
             TargetBinding::Managed(crate::managed::Binding {
@@ -398,7 +398,7 @@ mod tests {
         report(&input, &selected, None, None, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.starts_with(
-            "connection work (explicit): api https://control.example; organization=org_one"
+            "profile work (explicit): api https://control.example; organization=org_one"
         ));
         assert!(!output.contains("cluster="));
         assert!(!output.contains("target work"));
@@ -407,16 +407,16 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, InvocationConfig) {
         let dir = tempfile::tempdir().unwrap();
         let source = r#"version: 1
-connections:
+profiles:
   work:
     api: https://control.example/prefix
     organization_id: org_one
-    auth: {me: {provider: omnigraph}}
+    auth: {provider: omnigraph}
 targets:
   local: {kind: direct, scope: graph, uri: 'file:///tmp/graph'}
   cluster:
     kind: managed
-    connection: work
+    profile: work
     cluster_id: cluster-one
     cluster_incarnation: inc-one
     endpoint: https://data.example/
@@ -426,7 +426,7 @@ targets:
     endpoint: https://example.test/
     auth: {public: {provider: anonymous}}
     default_graph: knowledge
-defaults: {target: local, connection: work}
+defaults: {target: local, profile: work}
 "#;
         std::fs::write(dir.path().join("config.yaml"), source).unwrap();
         let input = InvocationConfig::at(Some(dir.path().to_owned()), None);
@@ -449,8 +449,62 @@ defaults: {target: local, connection: work}
     }
 
     #[test]
-    fn connection_and_resource_defaults_are_independent() {
+    fn profile_and_resource_defaults_are_independent() {
         let (dir, input) = fixture();
+        for args in [
+            vec!["credentials", "status", "--profile", "work"],
+            vec!["credentials", "export", "--target", "cluster"],
+            vec![
+                "credentials",
+                "status",
+                "--target",
+                "server",
+                "--auth",
+                "public",
+            ],
+            vec![
+                "login",
+                "--profile",
+                "work",
+                "--replace-principal",
+                "user-one",
+            ],
+            vec![
+                "login",
+                "--target",
+                "cluster",
+                "--replace-principal",
+                "user-one",
+            ],
+        ] {
+            assert!(selected(&args, &input, dir.path()).is_ok(), "{args:?}");
+        }
+        for args in [
+            vec!["credentials", "status"],
+            vec!["credentials", "status", "--target", "server"],
+            vec!["credentials", "status", "--target", "cluster"],
+            vec!["credentials", "status", "--profile", "work", "--auth", "me"],
+            vec![
+                "credentials",
+                "export",
+                "--target",
+                "cluster",
+                "--auth",
+                "me",
+            ],
+            vec!["login", "--profile", "work", "--auth", "me"],
+            vec!["login", "--replace-principal", "user-one"],
+            vec![
+                "login",
+                "--target",
+                "server",
+                "--replace-principal",
+                "user-one",
+            ],
+            vec!["config", "recover-operations", "--source", "/tmp/evidence"],
+        ] {
+            assert!(selected(&args, &input, dir.path()).is_err(), "{args:?}");
+        }
         let resource = selected(&["query", "-e", "q"], &input, dir.path())
             .unwrap()
             .unwrap();
@@ -474,7 +528,7 @@ defaults: {target: local, connection: work}
         );
         assert!(
             selected(
-                &["query", "-e", "q", "--connection", "work"],
+                &["query", "-e", "q", "--profile", "work"],
                 &input,
                 dir.path()
             )

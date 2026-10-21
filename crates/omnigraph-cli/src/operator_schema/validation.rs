@@ -43,41 +43,31 @@ pub(super) fn validate(config: &mut OperatorConfig, base: &Path) -> Result<(), C
     if !base.is_absolute() {
         return Err(invalid("base_dir", "must be absolute"));
     }
-    for (key, connection) in &mut config.connections {
-        let path = format!("connections.{key}");
+    for (key, profile) in &mut config.profiles {
+        let path = format!("profiles.{key}");
         name(key, &path)?;
         managed_identifier(
-            &connection.organization_id,
+            &profile.organization_id,
             128,
             &format!("{path}.organization_id"),
         )?;
-        connection.api = endpoint(&connection.api, false, &format!("{path}.api"))?;
-        auth(
-            &mut connection.auth,
-            &connection.default_auth,
-            true,
-            base,
-            &path,
-        )?;
-        transport(&mut connection.transport, base, &path)?;
+        profile.api = endpoint(&profile.api, false, &format!("{path}.api"))?;
+        auth_provider(&mut profile.auth, true, base, &format!("{path}.auth"))?;
+        transport(&mut profile.transport, base, &path)?;
     }
     for (key, target) in &mut config.targets {
         let path = format!("targets.{key}");
         name(key, &path)?;
         match target {
             Target::Managed {
-                connection,
+                profile,
                 cluster_id,
                 cluster_incarnation,
                 endpoint: route,
                 transport: network,
                 default_graph,
             } => {
-                reference(
-                    connection,
-                    &config.connections,
-                    &format!("{path}.connection"),
-                )?;
+                reference(profile, &config.profiles, &format!("{path}.profile"))?;
                 managed_identifier(cluster_id, 256, &format!("{path}.cluster_id"))?;
                 managed_identifier(
                     cluster_incarnation,
@@ -147,8 +137,8 @@ pub(super) fn validate(config: &mut OperatorConfig, base: &Path) -> Result<(), C
             nonempty(key, &format!("{path}.params"))?;
         }
     }
-    if let Some(value) = &config.defaults.connection {
-        reference(value, &config.connections, "defaults.connection")?;
+    if let Some(value) = &config.defaults.profile {
+        reference(value, &config.profiles, "defaults.profile")?;
     }
     if let Some(value) = &config.defaults.target {
         reference(value, &config.targets, "defaults.target")?;
@@ -201,53 +191,62 @@ fn auth(
     for (key, profile) in profiles {
         let path = format!("{path}.auth.{key}");
         name(key, &path)?;
-        match profile {
-            AuthProfile::Omnigraph if !managed => {
-                return Err(invalid(&path, "omnigraph requires a managed connection"));
-            }
-            AuthProfile::Anonymous if managed => {
-                return Err(invalid(&path, "anonymous requires a standalone server"));
-            }
-            AuthProfile::Token { source } => match source {
-                TokenSource::Store { .. } => {}
-                TokenSource::Env { env } => {
-                    let mut bytes = env.bytes();
-                    if !bytes
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
-                        || !bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
-                    {
-                        return Err(invalid(&path, "env must match [A-Za-z_][A-Za-z0-9_]*"));
-                    }
-                }
-                TokenSource::File { file } => filesystem_path(file, base, &path)?,
-            },
-            AuthProfile::Exec { command, timeout } => {
-                let Some(executable) = command.first() else {
-                    return Err(invalid(&path, "command must be a nonempty argv array"));
-                };
-                nonempty(executable, &path)?;
-                if !Path::new(executable).is_absolute()
-                    || command.iter().any(|arg| arg.contains('\0'))
-                {
-                    return Err(invalid(
-                        &path,
-                        "command requires an absolute executable and NUL-free arguments",
-                    ));
-                }
-                let seconds = timeout
-                    .strip_suffix('s')
-                    .filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
-                    .and_then(|s| s.parse::<u32>().ok());
-                if !seconds.is_some_and(|s| (1..=120).contains(&s)) {
-                    return Err(invalid(
-                        &path,
-                        "timeout must be integer seconds from 1s through 120s",
-                    ));
-                }
-            }
-            AuthProfile::Omnigraph | AuthProfile::Anonymous => {}
+        auth_provider(profile, managed, base, &path)?;
+    }
+    Ok(())
+}
+
+fn auth_provider(
+    profile: &mut AuthProfile,
+    managed: bool,
+    base: &Path,
+    path: &str,
+) -> Result<(), ConfigError> {
+    match profile {
+        AuthProfile::Omnigraph if !managed => {
+            return Err(invalid(path, "omnigraph requires a managed profile"));
         }
+        AuthProfile::Anonymous if managed => {
+            return Err(invalid(path, "anonymous requires a standalone server"));
+        }
+        AuthProfile::Token { source } => match source {
+            TokenSource::Store { .. } => {}
+            TokenSource::Env { env } => {
+                let mut bytes = env.bytes();
+                if !bytes
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+                    || !bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                {
+                    return Err(invalid(path, "env must match [A-Za-z_][A-Za-z0-9_]*"));
+                }
+            }
+            TokenSource::File { file } => filesystem_path(file, base, path)?,
+        },
+        AuthProfile::Exec { command, timeout } => {
+            let Some(executable) = command.first() else {
+                return Err(invalid(path, "command must be a nonempty argv array"));
+            };
+            nonempty(executable, path)?;
+            if !Path::new(executable).is_absolute() || command.iter().any(|arg| arg.contains('\0'))
+            {
+                return Err(invalid(
+                    path,
+                    "command requires an absolute executable and NUL-free arguments",
+                ));
+            }
+            let seconds = timeout
+                .strip_suffix('s')
+                .filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+                .and_then(|s| s.parse::<u32>().ok());
+            if !seconds.is_some_and(|s| (1..=120).contains(&s)) {
+                return Err(invalid(
+                    path,
+                    "timeout must be integer seconds from 1s through 120s",
+                ));
+            }
+        }
+        AuthProfile::Omnigraph | AuthProfile::Anonymous => {}
     }
     Ok(())
 }

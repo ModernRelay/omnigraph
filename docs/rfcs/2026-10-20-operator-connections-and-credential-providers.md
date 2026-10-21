@@ -1,20 +1,20 @@
 ---
 rfc: "2026-10-20-operator-connections-and-credential-providers"
-title: "Operator connections and credential providers"
+title: "Operator profiles and credential providers"
 track: maintainer
 status: draft
 implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-20
-updated: 2026-10-20
+updated: 2026-10-21
 discussion: null
 supersedes: []
 superseded_by: []
 blocked_on: []
 ---
 
-# RFC: Operator connections and credential providers
+# RFC: Operator profiles and credential providers
 
 No backward-compatibility requirement. This is the clean-slate operator contract.
 
@@ -22,13 +22,22 @@ MUST, MUST NOT, SHOULD and MAY express requirements of the proposed implementati
 
 ## Recommendation
 
-Use two main configuration sections: `connections` for managed service and organization access, and `targets` for concrete resource access. Keep named authentication profiles within the object that owns their audience. Resolve all references into one immutable invocation binding before sending credentials or performing an operation.
+Use two main configuration sections: `profiles` for managed service and organization access, and `targets` for concrete resource access. Each managed profile owns exactly one auth provider and one identity. Only standalone servers retain named auth maps. Resolve all references into one immutable invocation binding before sending credentials or performing an operation.
 
-A managed connection is first-class operator configuration, not a cluster target. BYOC is deployment placement, not a new client access kind. Direct storage and standalone servers remain independent of managed connections.
+A managed profile is first-class operator configuration, not a cluster target. BYOC is deployment placement, not a new client access kind. Direct storage and standalone servers remain independent of managed profiles.
 
 The common experience MUST be login, register a resource, then operate on it. Users SHOULD NOT need to hand-author authentication internals. Advanced providers add capability without making a simple managed login verbose. Authentication configuration selects credential acquisition; it never grants authorization.
 
 ## Design precedents
+
+This revision replaces `connections` with `profiles`, managed target `connection`
+with `profile`, `defaults.connection` with `defaults.profile`, and `--connection`
+with `--profile`. Old fields and selectors are rejected, with no importer or
+compatibility aliases. Each former managed auth identity becomes a separate
+profile containing one provider object; managed `default_auth` is removed.
+`config rename-profile FROM TO` replaces `rename-connection` and preserves
+credential custody while updating target references and the profile default.
+`config rename-auth server TARGET FROM TO` remains standalone-only.
 
 These are design inputs, not claims that another product implements this specification.
 
@@ -36,7 +45,7 @@ These are design inputs, not claims that another product implements this specifi
 | --- | --- | --- |
 | [Modal configuration](https://modal.com/docs/sdk/py/latest/config) | Named profiles, explicit override precedence, mutually exclusive complete authentication methods | Small generated configuration and strict provider variants; do not copy inline token storage |
 | [Modal environments](https://modal.com/docs/guide/environments) | Resource environments are distinct from authentication profiles | Do not overload auth profiles with graph or deployment selection |
-| [Supabase CLI](https://supabase.com/docs/reference/cli/supabase-login) | Login and project linking are separate operations | Connection login does not implicitly select or create a cluster |
+| [Supabase CLI](https://supabase.com/docs/reference/cli/supabase-login) | Login and project linking are separate operations | Profile login does not implicitly select or create a cluster |
 | [Fly access tokens](https://docs.fly.io/security/tokens) | Automation tokens can be scoped to an app or organization | Workload credentials require actual server-side qualification and least privilege |
 | [Wrangler authentication](https://developers.cloudflare.com/workers/wrangler/commands/general/) | Browser login and named authentication profiles | Multiple identities are supported independently from resource configuration |
 | [AWS SSO](https://docs.aws.amazon.com/sdkref/latest/guide/feature-sso-credentials.html) | Sessions are distinct from account/role profiles | Service, tenant, principal and destination are separate concepts |
@@ -83,19 +92,17 @@ The names and fields below define a new contract. `version: 1` identifies this p
 ```yaml
 version: 1
 
-connections:
+profiles:
   modernrelay:
     api: https://platform.omnigraph.dev
     organization_id: org_example
-    default_auth: developer
     auth:
-      developer:
-        provider: omnigraph
+      provider: omnigraph
 
 targets:
   mr-managed:
     kind: managed
-    connection: modernrelay
+    profile: modernrelay
     cluster_id: cluster_example
     cluster_incarnation: incarnation_example
     endpoint: https://cluster.example.com
@@ -119,9 +126,9 @@ defaults:
   output: table
 ```
 
-`connections` identifies a service and tenant. It owns the profiles that can authenticate to that service/tenant. It does not select a cluster, graph, actor permission or source directory.
+`profiles` identifies a service, tenant and identity. Each entry owns one `auth` provider object. It does not select a cluster, graph, actor permission or source directory.
 
-`targets` identifies a resource access path. Managed targets reference a connection and pin cluster ID/incarnation. Server targets own their endpoint and authentication configuration. Direct targets own their storage URI, graph/root scope and any required provider destination settings. A local target need not invent an organization or remote credential.
+`targets` identifies a resource access path. Managed targets reference a profile and pin cluster ID/incarnation. Server targets own their endpoint and authentication configuration. Direct targets own their storage URI, graph/root scope and any required provider destination settings. A local target need not invent an organization or remote credential.
 
 Keep `scope` only for direct graph versus root distinctions where it changes addressing. Do not require `scope: cluster` under managed targets: the managed variant already denotes a cluster. No managed account target remains.
 
@@ -129,26 +136,26 @@ No separate `services`, `organizations`, `regions`, `cells`, `accounts`, or `env
 
 ## Configuration grammar
 
-The operator document is one YAML mapping with the following public fields. Unless stated optional, variant fields are required. Connection, target, alias and auth-profile names MUST match `[A-Za-z][A-Za-z0-9_.-]*` and are case-sensitive. Names are local labels, not service identities; `default`, `admin` and `production` have no implicit behavior. These lexical rules do not apply to service-issued IDs or stored-query identifiers.
+The operator document is one YAML mapping with the following public fields. Unless stated optional, variant fields are required. Profile, target, alias and auth-profile names MUST match `[A-Za-z][A-Za-z0-9_.-]*` and are case-sensitive. Names are local labels, not service identities; `default`, `admin` and `production` have no implicit behavior. These lexical rules do not apply to service-issued IDs or stored-query identifiers.
 
 | Object | Fields |
 | --- | --- |
-| Document | `version: 1`; optional `connections`, `targets`, `aliases`, `defaults` |
-| Connection | `api`, `organization_id`, `auth`; optional `default_auth`, `transport` |
-| Managed target | `kind: managed`, `connection`, `cluster_id`, `cluster_incarnation`; optional `endpoint`, `transport`, `default_graph` |
+| Document | `version: 1`; optional `profiles`, `targets`, `aliases`, `defaults` |
+| Profile | `api`, `organization_id`, one `auth` provider object; optional `transport` |
+| Managed target | `kind: managed`, `profile`, `cluster_id`, `cluster_incarnation`; optional `endpoint`, `transport`, `default_graph` |
 | Server target | `kind: server`, `endpoint`, `auth`; optional `default_auth`, `transport`, `default_graph` |
 | Direct graph target | `kind: direct`, `scope: graph`, `uri` |
 | Direct root target | `kind: direct`, `scope: root`, `uri`; optional `default_graph` |
-| Defaults | Optional `connection`, `target`, `output`; no default identity or credential |
+| Defaults | Optional `profile`, `target`, `output`; no standalone auth default |
 | Read alias | `target`, `query`; conditional `graph`; optional `params` mapping |
 
 `kind` has exactly three values: `managed`, `server`, `direct`. They describe access mechanisms. A catalogue is a read-only resource view, not a fourth access mechanism. The previously proposed catalogue target wrapper is withdrawn; version 1 rejects `kind: catalogue` and the magic `--target og_catalog` selector.
 
-The explicit local `catalogue` command exposes the existing engine `CatalogueScope` independently of operator configuration. It requires exactly one inline `-e` or `--query` source and optionally accepts `--json`. It reads only the binary's registries and explicit source file; it MUST NOT read operator configuration (including an explicit config path), acquire credentials or open graph storage. Target, connection, auth, actor, graph, branch and snapshot selectors are rejected. Presentation uses in-memory defaults. Existing catalogue query restrictions apply, including refusal of mutations and graph-state operations. Served catalogue queries remain ordinary reads through a named target with `--graph og_catalog`; they do not use this local command.
+The explicit local `catalogue` command exposes the existing engine `CatalogueScope` independently of operator configuration. It requires exactly one inline `-e` or `--query` source and optionally accepts `--json`. It reads only the binary's registries and explicit source file; it MUST NOT read operator configuration (including an explicit config path), acquire credentials or open graph storage. Target, profile, auth, actor, graph, branch and snapshot selectors are rejected. Presentation uses in-memory defaults. Existing catalogue query restrictions apply, including refusal of mutations and graph-state operations. Served catalogue queries remain ordinary reads through a named target with `--graph og_catalog`; they do not use this local command.
 
 `version` MUST be the integer 1. Unknown versions, duplicate YAML keys, unknown fields, invalid enum values, YAML tags, anchors, aliases and merge keys MUST be rejected. YAML is a serialization format, not a programming language: no interpolation, includes, inheritance or executable expressions. References are literal local names. Empty strings do not mean absent; null MUST NOT be used as an implicit reset/default.
 
-The parser MUST validate required fields, types, variants, local references and cross-field constraints across the entire document without acquiring credentials. Any invalid entry invalidates the document; incomplete drafts do not belong in the active file. Missing credentials, unavailable helper executables/CA files, remote authorization, reachability and runtime capabilities are checked only for the selected operation, not unrelated entries. `config validate` performs the same complete offline schema/reference validation without reading secrets, executing helpers or contacting services. A saved connection MUST include its organization; first-login discovery is transient state, not an incompletely persisted connection.
+The parser MUST validate required fields, types, variants, local references and cross-field constraints across the entire document without acquiring credentials. Any invalid entry invalidates the document; incomplete drafts do not belong in the active file. Missing credentials, unavailable helper executables/CA files, remote authorization, reachability and runtime capabilities are checked only for the selected operation, not unrelated entries. `config validate` performs the same complete offline schema/reference validation without reading secrets, executing helpers or contacting services. A saved profile MUST include its organization; first-login discovery is transient state, not an incompletely persisted profile.
 
 An explicit operator file replaces, rather than merges with, the default operator file. Relative filesystem paths resolve against that file's directory. Authentication helpers are permitted only from operator-trusted configuration, never from an automatically discovered repository file. Selecting an explicit file authorizes its declared helpers only when executing an operation that needs them; inspection and validation never execute helpers.
 
@@ -156,7 +163,7 @@ Graph selection is `--graph` followed by the selected target's `default_graph`; 
 
 `default_graph`, alias `graph` and `--graph` contain the exact graph identifier accepted by the graph API, not a display-name lookup. If a backend uses name-like identifiers, the CLI MUST preserve those semantics rather than claim a stronger immutable identity. Per-graph recreation protection requires a backend generation/identity contract and is not provided by pinning the cluster incarnation alone. Direct version-1 URIs are absolute local `file://` URIs without query, fragment or remote authority; cloud URI variants remain deferred until their schemas are specified.
 
-Aliases bind a stored read-query identifier (`query`, not a file path or inline program) to an explicit target. `graph` is required for multi-graph targets and forbidden for direct-graph targets, whose URI supplies it. Aliases never inherit `default_graph`. An alias MUST NOT change auth configuration or routing; caller target/graph overrides are rejected. `--auth` may select an existing profile on the bound owner. Normal credential acquisition can invoke that owner's helper, but the alias cannot define a helper. `params` is a mapping of query parameter names to JSON-compatible values, including null where the query type allows it. Caller parameters shallowly replace same-name defaults; values are passed as typed parameters, never interpolated. Aliases MUST NOT invoke mutations and use the ordinary resolver and authorization checks.
+Aliases bind a stored read-query identifier (`query`, not a file path or inline program) to an explicit target. `graph` is required for multi-graph targets and forbidden for direct-graph targets, whose URI supplies it. Aliases never inherit `default_graph`. An alias MUST NOT change auth configuration or routing; caller target/graph overrides are rejected. `--auth` selects a named entry only on a bound standalone server; managed aliases retain their target's pinned profile. Normal credential acquisition can invoke that owner's helper, but the alias cannot define a helper. `params` is a mapping of query parameter names to JSON-compatible values, including null where the query type allows it. Caller parameters shallowly replace same-name defaults; values are passed as typed parameters, never interpolated. Aliases MUST NOT invoke mutations and use the ordinary resolver and authorization checks.
 
 `defaults.output` has exactly `table | json | jsonl | csv | kv` and applies only to tabular/read-result commands supporting `--format`. Selection is explicit `--format`, then `defaults.output`, then `table`. A selected format unsupported by that read command fails before execution; it never silently substitutes another format. Action commands, durable receipts and errors use their own documented human/structured output contracts and ignore this read-result default. Raw credential export always ignores it. Machine stdout MUST NOT contain destination notices or diagnostics.
 
@@ -166,16 +173,20 @@ There are no general destination environment-variable overrides in version 1. En
 
 ### Exact proposed syntax
 
-An authentication owner (a managed connection or standalone server target) declares `auth` as a map of profile names to tagged objects. `provider` is the discriminator. Unknown fields and irrelevant provider fields are errors; there is no untyped options bag. Transport configuration is separate. Do not add `protocol: oauth | bearer`: OAuth is an acquisition/authorization framework and can issue bearer credentials, so those are not mutually exclusive protocols.
+A managed profile declares `auth` as one tagged provider object. Standalone servers retain a named `auth` map and optional `default_auth`. `provider` is the discriminator. Unknown fields and irrelevant provider fields are errors; there is no untyped options bag. Transport configuration is separate. Do not add `protocol: oauth | bearer`: OAuth is an acquisition/authorization framework and can issue bearer credentials, so those are not mutually exclusive protocols.
+
+For a managed profile:
 
 ```yaml
-default_auth: me
 auth:
-  me:
-    provider: omnigraph
+  provider: omnigraph
+```
 
-  administrator:
-    provider: omnigraph
+For a standalone server, named provider alternatives remain available:
+
+```yaml
+default_auth: stored-token
+auth:
 
   stored-token:
     provider: token
@@ -201,7 +212,7 @@ auth:
     provider: anonymous
 ```
 
-This is a catalogue of alternatives, not a valid set for every owner. Managed connections reject anonymous authentication. `omnigraph` is initially available only on managed connections. `token` and `exec` do not imply that the managed service accepts the resulting credential or recognizes a workload; the verified service contract must permit the credential class. Standalone servers may use only providers supported by that deployment. Direct storage uses native provider credentials separately; these HTTP providers do not replace AWS/Azure credential providers.
+This is a catalogue of alternatives, not a valid set for every owner. Managed profiles reject anonymous authentication. `omnigraph` is initially available only on managed profiles. `token` and `exec` do not imply that the managed service accepts the resulting credential or recognizes a workload; the verified service contract must permit the credential class. Standalone servers may use only providers supported by that deployment. Direct storage uses native provider credentials separately; these HTTP providers do not replace AWS/Azure credential providers.
 
 `omnigraph` has only `provider` in the initial schema. It owns interactive login, refresh and logout for a qualified platform adapter. The initial adapter uses the supported device flow; the public config does not encode its incidental token format. Public provider configuration comes from authenticated service discovery and an explicitly trusted adapter contract; application client IDs, issuer and login URLs are validated/pinned rather than guessed or accepted from an arbitrary redirect. The profile's verified principal and secret session are private local state, not YAML. `administrator` is merely a nickname and grants no administrator rights. Headless resource commands MUST NOT start an interactive login; they fail with an actionable login-required error.
 
@@ -215,9 +226,9 @@ A file source is an explicit externally managed secret, not a plaintext fallback
 
 `anonymous` has only `provider`; it sends no credential. It is allowed only on standalone server targets and must be explicitly selected/configured. It cannot be an error fallback.
 
-The auth selector is `--auth NAME`, resolved within the selected owner. Explicit selection wins over that owner's `default_auth`; when neither exists, the command refuses even if only one profile is configured. A target cannot override its managed connection's auth fields, and there is no global default auth. Connection selection, auth profile selection, verified principal, and authorization remain distinct.
+Managed operations use the selected profile's single provider and reject `--auth`. Managed targets always use their pinned profile; neither `defaults.profile` nor a global `--profile` can override it. Managed profiles reject `default_auth` and nested named auth maps.
 
-Every credentialed owner has named `auth` profiles and an explicit `default_auth`, or requires `--auth` when no default is configured. Even a single configured profile does not become an ambient last-used identity. `--auth` selects only from the already selected connection or standalone target. It cannot override service, tenant, cluster, issuer or transport fields.
+Only standalone servers have named `auth` entries. `--auth NAME` overrides the server's `default_auth`; without either, selection refuses even with one entry.
 
 A profile describes credential acquisition; it does not assert a verified principal. On successful login, bind the profile to the server-verified identity in private local state. Two profiles in one organization may hold two independent human identities. Replacing a profile's principal requires an explicit account-replacement operation, and never retargets an already running command.
 
@@ -233,7 +244,7 @@ A qualified adapter's credential refresh may renew the same verified identity. I
 
 ### Managed credential exchange
 
-A managed connection's auth provider obtains a control-plane credential. The managed adapter uses the qualified control-plane exchange to acquire a data credential bound to the selected organization, cluster, incarnation, route and audience. It MUST NOT forward the control credential or login refresh token to the graph endpoint. The target does not configure a second independent data-auth profile: data credentials belong to the selected connection/profile and resource binding. Direct cluster-token access without this exchange is a standalone `server` access path, not an implicit managed-mode fallback.
+A managed profile's auth provider obtains a control-plane credential. The managed adapter uses the qualified control-plane exchange to acquire a data credential bound to the selected organization, cluster, incarnation, route and audience. It MUST NOT forward the control credential or login refresh token to the graph endpoint. The target does not configure a second independent data-auth profile: data credentials belong to the selected profile and resource binding. Direct cluster-token access without this exchange is a standalone `server` access path, not an implicit managed-mode fallback.
 
 ### Provider interface and helper protocol
 
@@ -275,11 +286,11 @@ Profile binding identifiers are local metadata independent of nicknames. Support
 omnigraph credentials set --target production --auth operator --stdin
 omnigraph credentials status --target production --auth operator
 omnigraph credentials remove --target production --auth operator
-omnigraph credentials set --connection work --auth ci --stdin
+omnigraph credentials set --profile work --stdin
 omnigraph credentials export --target production --auth operator
 ```
 
-These commands require exactly one explicit `--connection` or `--target`, plus explicit `--auth`; none uses routing or auth defaults. For set/status/remove, the selector names an owner: a connection or standalone server target. Managed targets MUST use their connection selector for those operations to avoid confusing control credentials with derived data tokens. Direct targets have no HTTP credential owner and reject this command family.
+These commands require exactly one explicit owner selector. Managed credentials use `--profile NAME` without `--auth`; standalone credentials use `--target NAME --auth PROFILE`. Managed-target export uses its pinned profile without `--auth`. Defaults do not apply. For set/status/remove, the selector names an owner: a profile or standalone server target. Managed targets MUST use their profile selector for those operations to avoid confusing control credentials with derived data tokens. Direct targets have no HTTP credential owner and reject this command family.
 
 | Provider/source | Set/remove | Status | Export |
 | --- | --- | --- | --- |
@@ -293,22 +304,22 @@ These commands require exactly one explicit `--connection` or `--target`, plus e
 
 `status` is non-networking and never refreshes sessions, starts login or runs helpers. It reports selected owner/profile, configured source, availability, and locally known expiry/verified identity with provenance and timestamp. Unknown metadata stays unknown. Environment availability can be checked without printing values; file availability checks do not read contents. Availability is not proof of acceptance. Secure-store access must be noninteractive; if unavailable, report unavailable/unknown rather than trigger a login prompt. Output and errors MUST NOT expose tokens or raw credential payloads.
 
-`export` explicitly releases an access credential to another local process. It requires stdout to be a pipe and refuses terminal or regular-file output; there is no force-to-terminal option. On success stdout contains only the bearer token followed by a newline, regardless of output defaults. Diagnostics go to stderr with secrets redacted. All validation/issuance completes before any secret bytes are written. `--connection` exports only a qualified control-plane access credential; `--target` exports a standalone server credential or, for a managed target, a qualified cluster-bound data credential. Managed export never substitutes a control token. The operation may refresh the selected provider or run its helper, but may not initiate interactive login. Unsupported export, anonymous access or missing/expired credentials fail explicitly. Refresh tokens are never exportable.
+`export` explicitly releases an access credential to another local process. It requires stdout to be a pipe and refuses terminal or regular-file output; there is no force-to-terminal option. On success stdout contains only the bearer token followed by a newline, regardless of output defaults. Diagnostics go to stderr with secrets redacted. All validation/issuance completes before any secret bytes are written. `--profile` exports only a qualified control-plane access credential; `--target` exports a standalone server credential or, for a managed target, a qualified cluster-bound data credential. Managed export never substitutes a control token. The operation may refresh the selected provider or run its helper, but may not initiate interactive login. Unsupported export, anonymous access or missing/expired credentials fail explicitly. Refresh tokens are never exportable.
 
 Export is not a sandbox: the receiving process can copy or disclose the secret. The pipe restriction prevents accidental terminal/file output, not malicious consumers. Export does not broaden the credential's existing server-enforced privileges. A future structured credential export needs a separately specified format; version 1 exports bearer access credentials only.
 
 ### Onboarding and resource selection
 
 ```sh
-omnigraph login --register modernrelay --auth me
-omnigraph login --api https://control.example.com --register private --auth me
+omnigraph login --register modernrelay
+omnigraph login --api https://control.example.com --register private
 
-omnigraph login --connection modernrelay --auth developer
-omnigraph organization members list --connection modernrelay
-omnigraph cluster list --connection modernrelay
-omnigraph cluster create demo --connection modernrelay
+omnigraph login --profile modernrelay
+omnigraph organization members list --profile modernrelay
+omnigraph cluster list --profile modernrelay
+omnigraph cluster create demo --profile modernrelay
 
-omnigraph target add mr-managed --connection modernrelay --cluster CLUSTER_ID
+omnigraph target add mr-managed --profile modernrelay --cluster CLUSTER_ID
 omnigraph graphs list --target mr-managed
 omnigraph query ... --target mr-managed --graph spike
 omnigraph cluster plan --target mr-managed --rev REVISION
@@ -319,17 +330,17 @@ omnigraph target refresh mr-managed
 omnigraph config validate
 ```
 
-For a new connection, `login --register NAME --auth PROFILE` creates an `omnigraph` profile, performs verified login and organization selection, then atomically saves the connection with `default_auth: PROFILE`. `--auth` defaults to `me` only during new-connection onboarding. An existing registration is never overwritten by this command. Bare `login` is the interactive onboarding wizard: it uses the hosted API default, asks for a connection name and organization where needed, and makes the same explicit registration. In noninteractive mode, incomplete onboarding fails. None of these operations changes `defaults.target` or `defaults.connection` without an explicit configuration command.
+For a new profile, `login --register NAME` creates `auth: {provider: omnigraph}`, performs verified login and organization selection, then atomically saves the profile. Login rejects `--auth`; `login --profile NAME` selects an existing profile. An existing registration is never overwritten by this command. Bare `login` is the interactive onboarding wizard: it uses the hosted API default, proposes the profile name `omnigraph` and asks for an organization where needed, and makes the same explicit registration. In noninteractive mode, incomplete onboarding fails. None of these operations changes `defaults.target` or `defaults.profile` without an explicit configuration command.
 
-Account-level operations select a connection. Resource operations select a target. These selectors are mutually exclusive. Login/logout accept a connection or resolve a managed target to its connection, and operate only on an `omnigraph` profile. Standalone server profiles use `credentials` or external source management instead; they do not have a platform-login session in version 1.
+Account-level operations select a profile. Resource operations select a target. These selectors are mutually exclusive. Login/logout accept a profile or resolve a managed target to its profile, and operate only on an `omnigraph` profile. Standalone server profiles use `credentials` or external source management instead; they do not have a platform-login session in version 1.
 
-Optional `defaults.connection` and `defaults.target` apply only to their respective command classes. Neither is inferred from the other. No mutable current organization, current cluster or last-used identity exists outside the declarative configuration. `--config` continues to mean deployment source; use a distinct `--operator-config` for an explicit operator file. No automatic upward directory search or merging of personal and project operator files.
+Optional `defaults.profile` and `defaults.target` apply only to their respective command classes. Neither is inferred from the other. No mutable current organization, current cluster or last-used identity exists outside the declarative configuration. `--config` continues to mean deployment source; use a distinct `--operator-config` for an explicit operator file. No automatic upward directory search or merging of personal and project operator files.
 
-First login accepts `--api URL` without a registered connection. It performs supported device discovery and returns the verified principal/organization. An explicit registration option saves that result as a named connection; it does not select a cluster or alter defaults. Several organizations require an explicit choice. Automation refuses ambiguous or incomplete selection rather than prompting.
+First login accepts `--api URL` without a registered profile. It performs supported device discovery and returns the verified principal/organization. An explicit registration option saves that result as a named profile; it does not select a cluster or alter defaults. Several organizations require an explicit choice. Automation refuses ambiguous or incomplete selection rather than prompting.
 
-The agreed hosted default is `https://platform.omnigraph.dev`. Zero-argument login and new-connection creation use it when no API is supplied. Saved/generated connections contain that explicit canonical API value; an incomplete hand-written connection does not borrow an ambient destination. Private services override it with `--api`. Resource commands still require a selected connection or target, and never infer an organization or cluster from the hosted default. This is proposed product behavior; the default is absent from the installed CLI today.
+The agreed hosted default is `https://platform.omnigraph.dev`. Zero-argument login and new-profile creation use it when no API is supplied. Saved/generated profiles contain that explicit canonical API value; an incomplete hand-written profile does not borrow an ambient destination. Private services override it with `--api`. Resource commands still require a selected profile or target, and never infer an organization or cluster from the hosted default. This is proposed product behavior; the default is absent from the installed CLI today.
 
-`target add --connection --cluster` reads authorized service discovery, verifies the response, and saves the selected cluster's exact identity and endpoint. It changes local registration only. Creating a remote cluster is a separate command. Names are display/lookup conveniences; once selected, operations bind immutable IDs and incarnation.
+`target add --profile --cluster` reads authorized service discovery, verifies the response, and saves the selected cluster's exact identity and endpoint. It changes local registration only. Creating a remote cluster is a separate command. Names are display/lookup conveniences; once selected, operations bind immutable IDs and incarnation.
 
 `target inspect --resolved` shows the expanded service, tenant, resource, graph selection, auth profile/verified principal if available, transport and their selection sources. It redacts secret material and does not refresh credentials by default.
 
@@ -341,7 +352,7 @@ A control-only cluster registration may omit the data endpoint. Data operations 
 
 Populate endpoint pins from authenticated discovery at registration. An explicit refresh may update a changed route after verifying the same resource identity and showing the change. It must refuse a changed incarnation; replacement/rebinding is a separate explicit operation. Normal requests never follow redirects or silently adopt a newly issued credential's different endpoint.
 
-Control and data transports are independent. Optional transport settings belong beside the corresponding API or endpoint: CA trust, proxy choice and supported network connection settings. Default to system trust; custom CA changes, when supported, have explicit append/replace semantics. Do not use `insecure` as a private-CA workaround. Proxy or tunnel support must preserve TLS authority, server-name validation and credential audience. Native Unix sockets retain socket identity rather than treating their synthetic HTTP origin as the destination.
+Control and data transports are independent. Optional transport settings belong beside the corresponding API or endpoint: CA trust, proxy choice and supported network profile settings. Default to system trust; custom CA changes, when supported, have explicit append/replace semantics. Do not use `insecure` as a private-CA workaround. Proxy or tunnel support must preserve TLS authority, server-name validation and credential audience. Native Unix sockets retain socket identity rather than treating their synthetic HTTP origin as the destination.
 
 The initial optional `transport` schema is deliberately bounded:
 
@@ -356,7 +367,7 @@ transport:
     url: http://proxy.example.com:8080
 ```
 
-`tls.ca` is optional; if present both `mode: append | replace` and `file` are required. Without it use system CA roots. The file is a PEM CA bundle, not a private key, and relative paths resolve against the operator file. Certificate verification and hostname verification are always enabled. `proxy` is optional and defaults to `mode: direct`. Its variants are `mode: direct` with no other fields, `mode: url` with a required URL, or `mode: environment` with no other fields. Explicit proxy URLs accept only `http` or `https`, a host and optional port, with no userinfo, query, fragment or non-root path. SOCKS and authenticated proxies are deferred. For HTTPS destinations, HTTP proxies use CONNECT and never receive origin Authorization headers outside the TLS tunnel. HTTPS proxy TLS uses system roots in this version; destination CA overrides do not override proxy trust. No connection transport is inherited by a managed target's data transport or by an identity-provider adapter.
+`tls.ca` is optional; if present both `mode: append | replace` and `file` are required. Without it use system CA roots. The file is a PEM CA bundle, not a private key, and relative paths resolve against the operator file. Certificate verification and hostname verification are always enabled. `proxy` is optional and defaults to `mode: direct`. Its variants are `mode: direct` with no other fields, `mode: url` with a required URL, or `mode: environment` with no other fields. Explicit proxy URLs accept only `http` or `https`, a host and optional port, with no userinfo, query, fragment or non-root path. SOCKS and authenticated proxies are deferred. For HTTPS destinations, HTTP proxies use CONNECT and never receive origin Authorization headers outside the TLS tunnel. HTTPS proxy TLS uses system roots in this version; destination CA overrides do not override proxy trust. No profile transport is inherited by a managed target's data transport or by an identity-provider adapter.
 
 Only `mode: environment` consults proxy variables. Capture the environment once per invocation. For HTTPS destinations use `https_proxy` or `HTTPS_PROXY`; for the loopback HTTP exception use lowercase `http_proxy` only (never uppercase `HTTP_PROXY`). `no_proxy`/`NO_PROXY` may bypass the chosen proxy. If both supported spellings of a variable exist with different values, fail instead of choosing implicitly. Empty proxy values mean direct; `ALL_PROXY` is not supported. Proxy URLs obey the same URL restrictions as explicit mode. Bypass lists are comma-separated `*`, exact hosts/IPs, or leading-dot DNS suffixes, optionally qualified by a port; suffix matching respects DNS label boundaries. IPv6 literals use brackets. Whitespace around entries is ignored; CIDR and other unsupported patterns fail. Resolve bypass matching from the destination's host and effective port, not reverse DNS. Inspection reports the resolved route and source without exposing environment contents. No other mode consults these variables.
 
@@ -389,15 +400,15 @@ Air-gapped operation must work with local storage or a locally authenticated ser
 ## One invocation, one resolved binding
 
 1. Parse a single operator config snapshot with strict version and duplicate-key validation.
-2. Select a connection or target by command class and explicit/default selector.
+2. Select a profile or target by command class and explicit/default selector.
 3. Resolve only its declared references. Validate selected variant fields, graph selection, endpoint, transport and auth profile. Local source-only commands need no destination.
 4. Capture immutable destination and authentication configuration before any credential helper or network request. Relative paths resolve against the explicit config file, not the later working directory.
 5. Acquire or refresh credentials and verify principal, tenant, issuer and audience where the qualified protocol supplies evidence. Managed exchange must verify its full binding. Opaque standalone credentials without introspection retain an unknown principal locally; freeze their source/destination without inventing verification. Complete the invocation binding once; identity-sensitive recovery requires the corresponding evidence.
 6. Execute against that binding. Record operation identity and provenance where the operation is durable or may have uncertain outcomes.
 
-Unknown references, missing required fields and unsupported fields refuse across the document. There is no dictionary merge across targets, connection chaining, credential fallback or runtime configuration reload. Unrelated runtime unavailability does not block a structurally valid selected target.
+Unknown references, missing required fields and unsupported fields refuse across the document. There is no dictionary merge across targets, profile chaining, credential fallback or runtime configuration reload. Unrelated runtime unavailability does not block a structurally valid selected target.
 
-Durable retries bind canonical destination, verified principal where available, credential-owner binding, exact input and original operation identity. When principal verification is unavailable, the journal records that limitation and identity-sensitive recovery refuses rather than infer continuity from a token nickname. A renamed target, changed default, new login or altered connection must not cause replay against another destination. Credential caches never become the source of routing, and deleting a target never deletes unresolved operation evidence.
+Durable retries bind canonical destination, verified principal where available, credential-owner binding, exact input and original operation identity. When principal verification is unavailable, the journal records that limitation and identity-sensitive recovery refuses rather than infer continuity from a token nickname. A renamed target, changed default, new login or altered profile must not cause replay against another destination. Credential caches never become the source of routing, and deleting a target never deletes unresolved operation evidence.
 
 Use one resource-client dispatch after resolution. A managed credential adapter should produce an authenticated graph client usable by every supported served graph command, rather than maintain a second per-command allowlist. Current managed wrappers only cover a subset of graph operations; that is an implementation limitation to remove. Capability and protocol checks must still reject genuinely unsupported operations, and storage-only maintenance must not silently acquire direct storage access.
 
@@ -408,8 +419,8 @@ These are acceptance scenarios for the proposed implementation, not tests alread
 | Scenario | Required result |
 | --- | --- |
 | Fresh user, no organization ID | Verified hosted login returns organization; registration stores it explicitly |
-| Several organizations on one API | Each connection stays tenant-bound; no last-login switching |
-| Two humans in one organization | Independent auth profiles/sessions; refresh/logout affects the selected profile; session collisions refuse |
+| Several organizations on one API | Each profile stays tenant-bound; no last-login switching |
+| Two humans in one organization | Independent managed profiles/sessions; refresh/logout affects the selected profile; session collisions refuse |
 | Human and workload access | Same resource can be selected; verified principal class and authorization remain distinct; unsupported workloads refuse |
 | Config changed while a command runs | Existing invocation retains its captured binding |
 | BYOC private data endpoint, public control API | Independent routing/trust; no customer storage credential leaves its execution domain |
@@ -458,7 +469,7 @@ Keeping account entries in `targets` preserves one selector but forces control-p
 
 A single global active account is insufficient for multiple organizations, services, CI and concurrent operations. Deriving destination from the most recent credential is unsafe.
 
-A fully generic graph of services, accounts, identities, environments, transports and resources is excessive before those reuse cases exist. Restrict composition to target-to-connection and owner-local authentication profiles. Transport settings can initially remain inline.
+A fully generic graph of services, accounts, identities, environments, transports and resources is excessive before those reuse cases exist. Restrict composition to target-to-profile references with one identity each and server-local auth maps. Transport settings can initially remain inline.
 
 `kind: byoc` confuses deployment ownership with the client's access protocol. Automatically discovered endpoints on every request complicate offline access and destination stability. Endpoint pinning with explicit refresh is the smaller, more auditable initial contract.
 
@@ -476,7 +487,7 @@ Adopt the configuration model independently of shipping every future adapter. Ex
 
 ### Delivery gates
 
-1. Publish the machine-readable strict configuration schema and resolver conformance tests. Implement generated onboarding, owner-local profiles, server/managed targeting, credential management and local direct storage. Qualify read-alias bindings; catalogue view semantics remain a separate design gate, not another target kind.
+1. Publish the machine-readable strict configuration schema and resolver conformance tests. Implement generated onboarding, single-identity managed profiles, server-local auth maps, server/managed targeting, credential management and local direct storage. Qualify read-alias bindings; catalogue view semantics remain a separate design gate, not another target kind.
 2. Qualify platform login/session isolation, token sources, secret custody and the common served-resource client against real CLI and control-plane contracts. Generated config and diagnostics must use the same parser/resolver as execution.
 3. Qualify the exec adapter and private CA/proxy transports with adversarial tests. If an adapter is unavailable, reject it with an unsupported-capability error before acquiring credentials; do not silently ignore its fields.
 4. Specify and qualify cloud-direct provider schemas, workload federation, private/BYOC endpoint attestation and additional transports independently. None is implied by completion of the basic config rewrite.

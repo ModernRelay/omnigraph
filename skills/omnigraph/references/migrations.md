@@ -223,9 +223,13 @@ entity, property, graph-manifest, and published-dataset terms plus
 ## Operator configuration rewrite
 
 `version: 1` replaces the old target format without backward compatibility.
-Replace account targets with connections, select owner-local auth profiles, and
+Replace account targets and connections with profiles, flatten each managed
+`auth` to one provider object, and split multiple identities into separate profiles.
+Change managed target `connection` to `profile` and `defaults.connection` to
+`defaults.profile`; remove managed `default_auth` and `--auth`. Standalone servers
+retain named auth entries and `--auth`. Use `--profile` instead of `--connection` and
 install static credentials with `credentials set --stdin`. There is no config
-importer. `config recover-operations --source DIR --connection NAME --auth PROFILE`
+importer. `config recover-operations --source DIR --profile NAME`
 preserves matching legacy folder lifecycle evidence separately; retain old operator
 homes and reconcile unresolved operations under the original identity and key. See the primary
 [operator reference](../../../docs/user/cli/targets.md#upgrade-from-the-old-format).
@@ -247,7 +251,7 @@ targets, output defaults and aliases into the versioned operator file.
 
 | Before | Current |
 |---|---|
-| `--server`, `--store`, `--cluster`, `--profile` | `--target NAME\|LOCAL_PATH` for resources, `--connection NAME` for account operations; rebuild configuration without an importer |
+| `--server`, `--store`, `--cluster`, old resource `--profile` | `--target NAME\|LOCAL_PATH` for resources, `--profile NAME` for account operations; rebuild configuration without an importer |
 | positional backend URL or URI | `--target NAME\|ADDRESS` (only `init` retains its positional creation address) |
 | `--cluster-graph <id>` | `--target ROOT --graph ID` |
 | query `--name <q>` | positional query name plus `--query`/`-e` for ad-hoc source |

@@ -5,7 +5,7 @@ use super::{CredentialError, Result};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OwnerKind {
-    Connection,
+    Profile,
     Server,
 }
 
@@ -32,7 +32,7 @@ impl OwnerBinding {
             || organization_id
                 .as_deref()
                 .is_some_and(|value| !valid_field(value))
-            || (kind == OwnerKind::Connection) != organization_id.is_some()
+            || (kind == OwnerKind::Profile) != organization_id.is_some()
         {
             return Err(CredentialError::InvalidBinding);
         }
@@ -90,10 +90,10 @@ impl CredentialRequest {
                 !valid_field(&value.cluster_id) || !valid_field(&value.cluster_incarnation)
             })
             || match (owner.kind, purpose) {
-                (OwnerKind::Connection, Purpose::Control) => {
+                (OwnerKind::Profile, Purpose::Control) => {
                     canonical_endpoint != owner.route || resource.is_some()
                 }
-                (OwnerKind::Connection, Purpose::Data) => resource.is_none(),
+                (OwnerKind::Profile, Purpose::Data) => resource.is_none(),
                 (OwnerKind::Server, Purpose::Data) => {
                     canonical_endpoint != owner.route || resource.is_some()
                 }

@@ -379,16 +379,10 @@ async fn logout_deletes_local_custody_before_a_frozen_transport_failure() {
                             "derived-credential",
                         )
                         .unwrap();
-                    let cli = crate::invocation::parse_from([
-                        "omnigraph",
-                        "logout",
-                        "--connection",
-                        "work",
-                        "--auth",
-                        "me",
-                    ])
-                    .unwrap()
-                    .cli;
+                    let cli =
+                        crate::invocation::parse_from(["omnigraph", "logout", "--profile", "work"])
+                            .unwrap()
+                            .cli;
                     let target = crate::targets::ResolvedTarget::new(
                         crate::targets::TargetBinding::Managed(crate::managed::Binding {
                             api: api.origin.clone(),
@@ -590,10 +584,8 @@ async fn two_profiles_for_the_same_human_keep_independent_refresh_custody() {
         let directory = tempfile::tempdir().unwrap();
         let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
         let origin = "https://api.example";
-        let first =
-            crate::operator_routing::registration_auth(&input, "work", "first", origin).unwrap();
-        let second =
-            crate::operator_routing::registration_auth(&input, "work", "second", origin).unwrap();
+        let first = crate::operator_routing::registration_auth(&input, "first", origin).unwrap();
+        let second = crate::operator_routing::registration_auth(&input, "second", origin).unwrap();
         let store = BoundStore(MemoryStore::default());
         crate::operator_routing::AUTH
             .scope(Some(first.clone()), async {

@@ -34,7 +34,7 @@ no branch, no snapshot, no graph commit in the answer, and `--branch` or
 `--query <file>` and optional `--json`. It does not read operator configuration,
 including an explicit `--operator-config`, or access credentials or storage.
 It uses the binary's default table presentation unless `--json` is supplied.
-It accepts no target, connection, authentication profile, actor, graph, branch
+It accepts no target, profile, authentication profile, actor, graph, branch
 or snapshot selector. Operator version 1 has no catalogue target kind or magic
 `--target og_catalog` selector. Local `./og_catalog` and `file://` paths remain
 ordinary store addresses. The prefix

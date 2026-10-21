@@ -194,15 +194,41 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     {
         bail!("target refresh already names its target; remove --target");
     }
-    if let Command::Credential { command } = &cli.command {
-        if cli.auth.is_none() || (cli.target.is_some() == cli.connection.is_some()) {
-            bail!(
-                "credentials requires exactly one explicit --connection or --target and explicit --auth"
-            );
-        }
-        let _ = command;
+    if matches!(cli.command, Command::Credential { .. })
+        && (cli.target.is_some() == cli.profile.is_some())
+    {
+        bail!("credentials requires exactly one explicit --profile or --target");
     }
-    if cli.connection.is_some()
+    if cli.auth.is_some()
+        && (cli.profile.is_some()
+            || matches!(
+                need,
+                Requirement::ManagedAccount | Requirement::Authentication
+            ))
+    {
+        bail!("managed operations do not accept --auth; select a profile or managed target");
+    }
+    if matches!(
+        cli.command,
+        Command::Config {
+            command: crate::commands::targets::ConfigCommand::RecoverOperations { .. }
+        }
+    ) && cli.profile.is_none()
+    {
+        bail!("operation recovery requires explicit --profile");
+    }
+    if matches!(
+        cli.command,
+        Command::Login {
+            replace_principal: Some(_),
+            ..
+        }
+    ) && cli.profile.is_none()
+        && cli.target.is_none()
+    {
+        bail!("principal replacement requires an explicit existing --profile or managed --target");
+    }
+    if cli.profile.is_some()
         && !matches!(
             need,
             Requirement::ManagedAccount
@@ -211,13 +237,10 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
                 | Requirement::ManagedOperation
         )
     {
-        bail!(
-            "{} does not accept --connection",
-            command_label(&cli.command)
-        );
+        bail!("{} does not accept --profile", command_label(&cli.command));
     }
     if matches!(need, Requirement::ManagedAccount) && cli.target.is_some() {
-        bail!("this operation selects --connection, not --target");
+        bail!("this operation selects --profile, not --target");
     }
     if matches!(need, Requirement::Local)
         && cli.auth.is_some()
@@ -387,6 +410,22 @@ pub(crate) fn validate_target(
             command_label(&cli.command)
         );
     }
+    if matches!(target.binding, Managed(_)) && cli.auth.is_some() {
+        bail!("managed targets do not accept --auth");
+    }
+    if let Command::Credential { command } = &cli.command {
+        match &target.binding {
+            Server { .. } if cli.target.is_none() || cli.auth.is_none() => {
+                bail!("standalone credentials require explicit --target and --auth");
+            }
+            Managed(binding)
+                if binding.cluster.is_some() && !matches!(command, CredentialCommand::Export) =>
+            {
+                bail!("managed credentials set/status/remove require explicit --profile");
+            }
+            _ => {}
+        }
+    }
     let invocation = match &cli.command {
         Command::Query(args) => Some((
             args.name.as_deref(),
@@ -422,7 +461,7 @@ pub(crate) fn validate_target(
         && !matches!(target.binding, Managed(_))
     {
         bail!(
-            "login/logout require a managed connection with provider: omnigraph; use credentials for static tokens"
+            "login/logout require a managed profile with provider: omnigraph; use credentials for static tokens"
         );
     }
     if let Command::Cluster { command } = &cli.command {
@@ -594,7 +633,13 @@ mod tests {
                     !matches!(
                         argument.get_long(),
                         Some(
-                            "server" | "store" | "profile" | "managed" | "direct" | "quiet" | "uri"
+                            "server"
+                                | "store"
+                                | "connection"
+                                | "managed"
+                                | "direct"
+                                | "quiet"
+                                | "uri"
                         )
                     ),
                     "retired flag in {}: {:?}",
@@ -608,6 +653,22 @@ mod tests {
         }
         let command = crate::cli::Cli::command();
         walk(&command);
+        for selector in ["target", "profile"] {
+            assert!(command.get_arguments().any(|argument| {
+                argument.get_long() == Some(selector) && argument.is_global_set()
+            }));
+        }
+        let conflict = crate::invocation::parse_from([
+            "omnigraph",
+            "cluster",
+            "list",
+            "--profile",
+            "work",
+            "--target",
+            "cluster",
+        ])
+        .unwrap_err();
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
         assert!(
             !command
                 .get_subcommands()
@@ -742,7 +803,7 @@ mod tests {
             "--server",
             "--store",
             "--cluster",
-            "--profile",
+            "--connection",
             "--managed",
             "--direct",
             "--quiet",
@@ -756,6 +817,19 @@ mod tests {
         }
         for command in ["use", "profile"] {
             assert!(crate::invocation::parse_from(["omnigraph", command]).is_err());
+        }
+        for args in [
+            ["omnigraph", "--profile", "work", "query", "q"],
+            ["omnigraph", "query", "q", "--profile", "work"],
+        ] {
+            let parsed = crate::invocation::parse_from(args).unwrap();
+            assert_eq!(parsed.cli.profile.as_deref(), Some("work"));
+            assert_eq!(
+                super::guard_addressing(&parsed.cli)
+                    .unwrap_err()
+                    .to_string(),
+                "query does not accept --profile"
+            );
         }
     }
 }

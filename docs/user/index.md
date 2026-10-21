@@ -31,7 +31,7 @@ deployment.
 
 - [CLI guide](cli/index.md)
 - [CLI reference](cli/reference.md)
-- [Operator connections, targets and credentials](cli/targets.md)
+- [Operator profiles, targets and credentials](cli/targets.md)
 - [Managed data credentials and queries](cli/managed-data.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [Managed organization members and invitations](cli/managed-team.md)

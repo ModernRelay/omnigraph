@@ -182,7 +182,7 @@ mod tests {
     fn global_selectors_are_singletons_across_command_levels() {
         for flag in [
             "--target",
-            "--connection",
+            "--profile",
             "--auth",
             "--operator-config",
             "--graph",

@@ -51,7 +51,7 @@ pub(crate) enum TargetCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConfigCommand {
-    RenameConnection {
+    RenameProfile {
         from: String,
         to: String,
     },
@@ -81,7 +81,6 @@ pub(crate) enum ConfigCommand {
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub(crate) enum RenameOwner {
-    Connection,
     Server,
 }
 

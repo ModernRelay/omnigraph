@@ -345,10 +345,9 @@ fn help_groups_commands_by_capability() {
     assert!(
         stdout.contains("--target <NAME|ADDRESS>")
             && stdout.contains("defaults.target")
-            && stdout.contains(
-                "Select resources with --target and account operations with --connection"
-            )
-            && stdout.contains("Select an owner-local profile with --auth")
+            && stdout
+                .contains("Select resources with --target and account operations with --profile")
+            && stdout.contains("--auth")
             && stdout.contains("--operator-config selects one operator file")
             && stdout.contains("--config supplies deployment sources"),
         "target/capability guidance missing from --help:\n{stdout}"
@@ -1088,7 +1087,7 @@ fn init_rejects_two_explicit_destinations() {
 }
 
 #[test]
-fn init_rejects_retired_profile_selection() {
+fn init_rejects_managed_profile_selection() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     let output = output_failure(
@@ -1098,7 +1097,12 @@ fn init_rejects_retired_profile_selection() {
             .args(["--profile", "localdev"])
             .arg(&graph),
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--profile'"));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("init does not accept --profile"),
+        "{output:?}"
+    );
     assert!(!graph.exists());
 }
 
@@ -1178,24 +1182,26 @@ fn operator_config_selection_validation_and_inspection_are_offline() {
         &config,
         format!(
             r#"version: 1
-connections:
+profiles:
   account:
     api: {}
     organization_id: account-one
-    default_auth: automation
     auth:
-      automation:
-        provider: token
-        source: {{env: CLI_TEST_ABSENT_TOKEN}}
+      provider: token
+      source: {{env: CLI_TEST_ABSENT_TOKEN}}
+  other:
+    api: https://other.example.test
+    organization_id: account-two
+    auth: {{provider: omnigraph}}
 targets:
   cluster:
     kind: managed
-    connection: account
+    profile: account
     cluster_id: cluster-one
     cluster_incarnation: inc-one
     default_graph: knowledge
 defaults:
-  connection: account
+  profile: other
   target: cluster
 "#,
             trap.origin
@@ -1224,27 +1230,77 @@ defaults:
         "--resolved",
         "--json",
     ])));
-    assert_eq!(inspected["target"]["connection"], "account");
-    assert_eq!(inspected["connection"]["organization_id"], "account-one");
+    assert_eq!(inspected["target"]["profile"], "account");
+    assert_eq!(inspected["profile"]["organization_id"], "account-one");
     assert_eq!(inspected["identity"]["status"], "unknown");
+    let credential = parse_stdout_json(&output_success(&mut invoke(&[
+        "credentials",
+        "status",
+        "--profile",
+        "account",
+        "--json",
+    ])));
+    assert_eq!(credential["availability"], "absent");
+    assert_eq!(credential["profile"], "account");
+    assert_eq!(credential["owner"]["kind"], "profile");
     for args in [
         vec!["cluster", "list", "--target", "cluster"],
-        vec!["branch", "list", "--connection", "account"],
+        vec!["branch", "list", "--profile", "account"],
         vec![
             "cluster",
             "list",
-            "--connection",
+            "--profile",
             "account",
             "--target",
             "cluster",
         ],
         vec!["config", "validate", "--auth", "automation"],
-        vec!["credentials", "status", "--connection", "account"],
+        vec![
+            "credentials",
+            "status",
+            "--profile",
+            "account",
+            "--auth",
+            "automation",
+        ],
         vec!["credentials", "status", "--auth", "automation"],
+        vec![
+            "branch",
+            "list",
+            "--target",
+            "cluster",
+            "--profile",
+            "other",
+        ],
+        vec![
+            "branch",
+            "list",
+            "--target",
+            "cluster",
+            "--auth",
+            "automation",
+        ],
+        vec![
+            "cluster",
+            "status",
+            "--target",
+            "cluster",
+            "--profile",
+            "other",
+        ],
+        vec!["login", "--profile", "account", "--auth", "automation"],
+        vec![
+            "config",
+            "rename-auth",
+            "automation",
+            "renamed",
+            "--profile",
+            "account",
+        ],
     ] {
         output_failure(&mut invoke(&args));
     }
-    for selector in ["--connection", "--auth", "--operator-config", "--target"] {
+    for selector in ["--profile", "--auth", "--operator-config", "--target"] {
         let output = output_failure(
             cli()
                 .env("OMNIGRAPH_HOME", home.path())
@@ -1254,6 +1310,14 @@ defaults:
             String::from_utf8_lossy(&output.stderr).contains("cannot be used multiple times"),
             "{output:?}"
         );
+    }
+    for args in [
+        vec!["cluster", "list", "--connection", "account"],
+        vec!["config", "rename-connection", "account", "renamed"],
+    ] {
+        let output = output_failure(&mut invoke(&args));
+        assert_eq!(output.status.code(), Some(64), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
     }
     assert_eq!(fs::read(&config).unwrap(), before);
     assert!(trap.requests().is_empty());
@@ -1265,6 +1329,12 @@ fn operator_config_clean_slate_refuses_legacy_and_ambiguous_documents() {
     let home = tempfile::tempdir().unwrap();
     let config = home.path().join("operator.yaml");
     for source in [
+        "version: 1\nconnections: {}\n",
+        "version: 1\ndefaults: {connection: old}\n",
+        "version: 1\nprofiles:\n  old: {api: https://example.test, organization_id: org, auth: {human: {provider: omnigraph}}}\n",
+        "version: 1\nprofiles:\n  old: {api: https://example.test, organization_id: org, default_auth: human, auth: {provider: omnigraph}}\n",
+        "version: 1\nprofiles:\n  account: {api: https://example.test, organization_id: org, auth: {provider: omnigraph}}\ntargets:\n  old: {kind: managed, connection: account, cluster_id: cluster, cluster_incarnation: one}\n",
+        "version: 1\nprofiles:\n  account: {api: https://example.test, organization_id: org, auth: {provider: omnigraph}}\ntargets:\n  old: {kind: managed, profile: account, auth: human, cluster_id: cluster, cluster_incarnation: one}\n",
         "target_config_version: 1\ntargets: {}\n",
         "version: 2\n",
         "version: 1\nversion: 1\n",

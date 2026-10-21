@@ -234,8 +234,17 @@ fn core_remote_retired_selectors_refuse_before_operator_or_backend_access() {
             &api.origin,
             "--json",
         ]));
-        assert_eq!(output.status.code(), Some(64));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+        let (exit, diagnostic) = if selector == "--profile" {
+            (1, "cluster does not accept --profile")
+        } else {
+            (64, "unexpected argument")
+        };
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{output:?}"
+        );
     }
     assert!(api.requests().is_empty());
     assert_no_core_effects(home.path());
@@ -1215,7 +1224,7 @@ fn managed_cluster_members_requires_cluster_target_and_rejects_duplicate_selecto
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("cluster does not accept --connection"),
+        String::from_utf8_lossy(&output.stderr).contains("cluster does not accept --profile"),
         "{output:?}"
     );
     for args in [
@@ -1868,8 +1877,22 @@ fn managed_status_and_history_verify_selected_target_identity() {
         .collect();
     let api = lifecycle_fixture(replies);
     write_managed_target(temp.path(), &api.origin);
+    let config_path = managed_home(temp.path()).join("config.yaml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "{}\ndefaults:\n  profile: other\n",
+            config.replace(
+                "profiles:\n",
+                "profiles:\n  other:\n    api: https://other.example.test\n    organization_id: account-two\n    auth: {provider: token, source: {env: CLI_TEST_OTHER_TOKEN}}\n",
+            )
+        ),
+    )
+    .unwrap();
     for (index, (args, path, response, refused)) in reads.into_iter().enumerate() {
         let output = managed_cli(temp.path(), &api.origin)
+            .env_remove("CLI_TEST_OTHER_TOKEN")
             .args(args)
             .arg("--json")
             .output()
@@ -2351,7 +2374,7 @@ fn managed_redirect_and_oversized_reply_fail_without_following_or_core_effects()
 }
 
 #[test]
-fn managed_unknown_auth_and_api_down_never_open_core() {
+fn managed_auth_selector_and_api_down_never_open_core() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     let api = lifecycle_fixture(vec![]);
@@ -2361,13 +2384,17 @@ fn managed_unknown_auth_and_api_down_never_open_core() {
         .args(["apply", "--plan", "saved-plan", "--json"])
         .output()
         .unwrap();
-    assert_eq!(mismatch.status.code(), Some(1));
-    assert!(mismatch.stdout.is_empty());
+    assert_eq!(mismatch.status.code(), Some(2), "{mismatch:?}");
+    let problem = parse_stdout_json(&mismatch);
+    assert_eq!(problem["code"], "target_incompatible");
     assert!(
-        String::from_utf8_lossy(&mismatch.stderr)
-            .contains("unknown auth profile 'unknown-profile'"),
+        problem["error"]
+            .as_str()
+            .unwrap()
+            .contains("managed targets do not accept --auth"),
         "{mismatch:?}"
     );
+    assert!(mismatch.stderr.is_empty(), "{mismatch:?}");
     assert!(api.requests().is_empty());
     assert_no_core_effects(temp.path());
     let origin = api.origin.clone();
@@ -3906,7 +3933,7 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
         let (exit, diagnostic) = if argument == "--direct" {
             (64, "unexpected argument '--direct'")
         } else {
-            (1, "this operation selects --connection, not --target")
+            (1, "this operation selects --profile, not --target")
         };
         assert_eq!(output.status.code(), Some(exit), "{output:?}");
         assert!(output.stdout.is_empty());
@@ -4030,7 +4057,7 @@ fn managed_organization_requires_an_account_target_and_write_keys() {
     let api = lifecycle_fixture(vec![]);
     write_managed_target(temp.path(), &api.origin);
     let missing = output_failure(cli().args(["organization", "members", "list"]));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("connection_required"));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("profile_required"));
     for arguments in [
         vec!["invitations", "send", "member@example.com"],
         vec!["invitations", "resend", "inv_one"],

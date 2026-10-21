@@ -150,7 +150,7 @@ fn directory_at(
             Ok(_) => {
                 return Err(Failure::refused(
                     "legacy_lifecycle_custody",
-                    "legacy lifecycle evidence requires config recover-operations --connection NAME --source DIR before another lifecycle submission; preserve the project .omnigraph directory",
+                    "legacy lifecycle evidence requires config recover-operations --profile NAME --source DIR before another lifecycle submission; preserve the project .omnigraph directory",
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -179,7 +179,7 @@ fn verify_retired_custody(source: &Path, home: &Path) -> Result<()> {
     let missing = || {
         Failure::refused(
             "legacy_lifecycle_custody",
-            "retired lifecycle evidence has not been preserved in this operator home; run config recover-operations --connection NAME --source DIR before another lifecycle submission",
+            "retired lifecycle evidence has not been preserved in this operator home; run config recover-operations --profile NAME --source DIR before another lifecycle submission",
         )
     };
     if let Some(pending) = evidence.pending {

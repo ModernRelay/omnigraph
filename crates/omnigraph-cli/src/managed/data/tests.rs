@@ -159,19 +159,12 @@ async fn stored_token_cache_survives_control_outage_but_not_expiry_or_generation
     });
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("config.yaml"), format!(
-        "version: 1\nconnections:\n  work:\n    api: {}\n    organization_id: org_test\n    auth:\n      machine:\n        provider: token\n        source: {{store: {{}}}}\n", cp.origin
+        "version: 1\nprofiles:\n  work:\n    api: {}\n    organization_id: org_test\n    auth:\n      provider: token\n      source: {{store: {{}}}}\n", cp.origin
     )).unwrap();
-    let cli = crate::invocation::parse_from([
-        "omnigraph",
-        "credentials",
-        "status",
-        "--connection",
-        "work",
-        "--auth",
-        "machine",
-    ])
-    .unwrap()
-    .cli;
+    let cli =
+        crate::invocation::parse_from(["omnigraph", "credentials", "status", "--profile", "work"])
+            .unwrap()
+            .cli;
     let binding = || {
         let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
         let target =

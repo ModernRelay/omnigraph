@@ -20,7 +20,7 @@ pub(crate) const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub(crate) struct OperatorConfig {
     pub(crate) version: u32,
     #[serde(default)]
-    pub(crate) connections: BTreeMap<String, Connection>,
+    pub(crate) profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub(crate) targets: BTreeMap<String, Target>,
     #[serde(default)]
@@ -31,12 +31,10 @@ pub(crate) struct OperatorConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Connection {
+pub(crate) struct Profile {
     pub(crate) api: String,
     pub(crate) organization_id: String,
-    pub(crate) auth: BTreeMap<String, AuthProfile>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) default_auth: Option<String>,
+    pub(crate) auth: AuthProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) transport: Option<Transport>,
 }
@@ -45,7 +43,7 @@ pub(crate) struct Connection {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Target {
     Managed {
-        connection: String,
+        profile: String,
         cluster_id: String,
         cluster_incarnation: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,7 +201,7 @@ impl From<StrictProxy> for Proxy {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Defaults {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) connection: Option<String>,
+    pub(crate) profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target: Option<String>,
     #[serde(default)]

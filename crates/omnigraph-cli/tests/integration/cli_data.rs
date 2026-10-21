@@ -1134,8 +1134,15 @@ fn retired_address_flags_refuse_before_resolving_a_target() {
         let output =
             output_failure(cli().args(["query", flag, "./graph.omni", "-e", "branch list"]));
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let (exit, diagnostic) = if flag == "--profile" {
+            (1, "query does not accept --profile")
+        } else {
+            (64, "unexpected argument")
+        };
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
         assert!(
-            stderr.contains("unexpected argument") && stderr.contains(flag),
+            stderr.contains(diagnostic) && stderr.contains(flag),
             "{stderr}"
         );
     }
@@ -5634,10 +5641,10 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
         format!(
             "{server_config}    default_graph: knowledge\n  \
              local:\n    kind: direct\n    scope: graph\n    uri: '{}'\n  \
-             cloud:\n    kind: managed\n    connection: service\n    \
+             cloud:\n    kind: managed\n    profile: service\n    \
              cluster_id: cluster\n    cluster_incarnation: one\n    default_graph: knowledge\n\
-             connections:\n  service:\n    api: https://api.example.com\n    organization_id: org\n    \
-             default_auth: human\n    auth:\n      human: {{provider: omnigraph}}\n",
+             profiles:\n  service:\n    api: https://api.example.com\n    organization_id: org\n    \
+             auth: {{provider: omnigraph}}\n",
             url::Url::from_file_path(&graph).unwrap()
         ),
     )
@@ -5956,7 +5963,7 @@ fn catalogue_scope_reads_the_binary_registries_without_a_store() {
             }
         }
     }
-    for flag in ["--target", "--connection", "--auth", "--graph", "--as"] {
+    for flag in ["--target", "--profile", "--auth", "--graph", "--as"] {
         let output = output_failure(
             cli()
                 .env("OMNIGRAPH_HOME", home.path())

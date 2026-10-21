@@ -329,7 +329,7 @@ fn validate_token(token: &str) -> Result<()> {
 fn login_required() -> Failure {
     Failure::refused(
         "login_required",
-        "sign in with login --connection NAME --auth PROFILE before continuing",
+        "sign in with login --profile NAME before continuing",
     )
 }
 
@@ -420,10 +420,7 @@ async fn configured_token(origin: &str) -> Result<Option<String>> {
         .ok()
         .flatten()
         .ok_or_else(|| {
-            Failure::refused(
-                "credential_binding_required",
-                "select a configured connection auth profile",
-            )
+            Failure::refused("credential_binding_required", "select a configured profile")
         })?;
     if canonical_origin(auth.owner.route())? != canonical_origin(origin)? {
         return Err(Failure::refused(

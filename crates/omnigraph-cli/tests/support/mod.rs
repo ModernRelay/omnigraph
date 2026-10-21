@@ -130,7 +130,7 @@ pub fn write_managed_target(config: &Path, origin: &str) {
     let home = managed_home(config);
     fs::create_dir_all(&home).unwrap();
     fs::write(home.join("config.yaml"), format!(
-        "version: 1\nconnections:\n  managed-account:\n    api: {origin}\n    organization_id: account-one\n    default_auth: automation\n    auth:\n      automation:\n        provider: token\n        source: {{env: OMNIGRAPH_CONTROL_TOKEN}}\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\ntargets:\n  managed-test:\n    kind: managed\n    connection: managed-account\n    cluster_id: managed-test\n    cluster_incarnation: inc-one\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n", tls_gateway::ca_path().display(), tls_gateway::ca_path().display()
+        "version: 1\nprofiles:\n  managed-account:\n    api: {origin}\n    organization_id: account-one\n    auth:\n      provider: token\n      source: {{env: OMNIGRAPH_CONTROL_TOKEN}}\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\ntargets:\n  managed-test:\n    kind: managed\n    profile: managed-account\n    cluster_id: managed-test\n    cluster_incarnation: inc-one\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n", tls_gateway::ca_path().display(), tls_gateway::ca_path().display()
     )).unwrap();
 }
 
@@ -144,7 +144,7 @@ pub fn managed_command(config: &Path, origin: &str, target: &str) -> Command {
         .current_dir(config)
         .args([
             if target == "managed-account" {
-                "--connection"
+                "--profile"
             } else {
                 "--target"
             },
@@ -259,7 +259,7 @@ pub fn stdout_string(output: &Output) -> String {
 pub fn only_target_report(output: &Output) -> bool {
     String::from_utf8_lossy(&output.stderr)
         .lines()
-        .all(|line| line.starts_with("target ") || line.starts_with("connection "))
+        .all(|line| line.starts_with("target ") || line.starts_with("profile "))
 }
 
 pub fn parse_stdout_json(output: &Output) -> Value {

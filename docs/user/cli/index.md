@@ -1,7 +1,7 @@
 # CLI guide
 
 Select resources with `--target NAME|LOCAL_PATH`, or `defaults.target` when
-omitted. Account operations use `--connection NAME` or `defaults.connection`.
+omitted. Account operations use `--profile NAME` or `defaults.profile`.
 These selectors are mutually exclusive. Source files select what to run; they
 never choose where to run it.
 
@@ -30,7 +30,7 @@ credentials and discovery responses cannot change the destination.
 
 Run `omnigraph <command> --help` for available flags. The
 [CLI reference](reference.md) covers the complete command surface, and
-[operator configuration](targets.md) is the primary reference for connections,
+[operator configuration](targets.md) is the primary reference for profiles,
 targets, authentication providers and the breaking format change.
 
 ## Create, load, and query a graph
@@ -189,13 +189,13 @@ Reusing an existing ID only observes its original invocation. It never executes
 it again. Recovery that needs proof of stopped writers additionally requires
 `--writers-stopped` and an explicit target.
 
-For managed operations, register a connection and then a target using
+For managed operations, register a profile and then a target using
 service-attested cluster identity:
 
 ```bash
-omnigraph login --register work --auth me
-omnigraph cluster list --connection work --json
-omnigraph target add cloud --connection work --cluster CLUSTER_ID
+omnigraph login --register work
+omnigraph cluster list --profile work --json
+omnigraph target add cloud --profile work --cluster CLUSTER_ID
 omnigraph cluster plan --target cloud --json > plan.json
 omnigraph cluster apply --target cloud --plan "$(jq -r .data.preview_id plan.json)" --json
 omnigraph cluster status --target cloud --json

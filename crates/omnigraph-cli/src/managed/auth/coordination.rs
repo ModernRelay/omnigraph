@@ -178,20 +178,12 @@ mod tests {
     async fn cache_index_lock_is_profile_wide_across_clusters_and_generations() {
         let root = tempfile::tempdir().unwrap();
         let input = crate::operator::InvocationConfig::at(Some(root.path().to_owned()), None);
-        let first = crate::operator_routing::registration_auth(
-            &input,
-            "work",
-            "first",
-            "https://api.example",
-        )
-        .unwrap();
-        let other = crate::operator_routing::registration_auth(
-            &input,
-            "work",
-            "other",
-            "https://api.example",
-        )
-        .unwrap();
+        let first =
+            crate::operator_routing::registration_auth(&input, "first", "https://api.example")
+                .unwrap();
+        let other =
+            crate::operator_routing::registration_auth(&input, "other", "https://api.example")
+                .unwrap();
         let directory = root.path().join("locks");
         let held = crate::operator_routing::AUTH
             .scope(Some(first.clone()), async {
@@ -203,7 +195,6 @@ mod tests {
         first.invalidate().unwrap();
         let renewed = crate::operator_routing::registration_auth(
             &input,
-            "work",
             "first",
             "https://replacement.example",
         )

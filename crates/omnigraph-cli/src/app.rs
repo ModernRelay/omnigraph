@@ -428,7 +428,7 @@ async fn run(
         ..
     } = &cli.command
     {
-        if register.is_some() || (cli.target.is_none() && cli.connection.is_none()) {
+        if register.is_some() || (cli.target.is_none() && cli.profile.is_none()) {
             if matches!(
                 &cli.command,
                 Command::Login {
@@ -437,7 +437,7 @@ async fn run(
                 }
             ) {
                 color_eyre::eyre::bail!(
-                    "principal replacement requires an explicit existing --connection or --target"
+                    "principal replacement requires an explicit existing --profile or --target"
                 );
             }
             let name = if let Some(name) = register {
@@ -446,7 +446,7 @@ async fn run(
                 if !stdin_is_terminal {
                     color_eyre::eyre::bail!("noninteractive onboarding requires --register NAME");
                 }
-                write!(stderr, "Connection name: ")?;
+                write!(stderr, "Profile name [omnigraph]: ")?;
                 stderr.flush()?;
                 let mut bytes = Vec::new();
                 let mut byte = [0u8; 1];
@@ -459,12 +459,16 @@ async fn run(
                         Err(error) => return Err(error.into()),
                     }
                 }
-                String::from_utf8(bytes)?.trim().to_owned()
+                let name = String::from_utf8(bytes)?.trim().to_owned();
+                if name.is_empty() {
+                    "omnigraph".to_owned()
+                } else {
+                    name
+                }
             };
             commands::targets::onboard(
                 &operator,
                 &name,
-                cli.auth.as_deref().unwrap_or("me"),
                 api.as_deref().unwrap_or("https://platform.omnigraph.dev"),
                 organization.as_deref(),
                 stdout,
@@ -475,7 +479,7 @@ async fn run(
         }
         if api.is_some() || organization.is_some() {
             color_eyre::eyre::bail!(
-                "--api and --organization are only available during new connection registration"
+                "--api and --organization are only available during new profile registration"
             );
         }
     }
@@ -582,13 +586,13 @@ async fn run_bound(
     };
     match cli.command {
         Command::Login { .. } | Command::Logout { .. } => {
-            color_eyre::eyre::bail!("login/logout require a managed connection")
+            color_eyre::eyre::bail!("login/logout require a managed profile")
         }
         Command::Target { command } => {
             commands::targets::run_target(
                 &operator,
                 target.as_ref(),
-                (cli.connection.as_deref(), cli.auth.as_deref()),
+                (cli.profile.as_deref(), cli.auth.as_deref()),
                 command,
                 input.reader,
                 stdout,
@@ -603,7 +607,10 @@ async fn run_bound(
             commands::targets::run_credential(
                 required_target(),
                 command,
-                cli.auth.as_deref().expect("explicit credential profile"),
+                cli.auth
+                    .as_deref()
+                    .or(cli.profile.as_deref())
+                    .unwrap_or_else(|| required_target().label()),
                 input.is_terminal,
                 input.reader,
                 stdout,

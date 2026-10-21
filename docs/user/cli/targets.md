@@ -1,6 +1,6 @@
 # Operator configuration
 
-Use connections for service/organization access and targets for resource access.
+Use profiles for service/organization access and targets for resource access.
 The operator file is `~/.omnigraph/config.yaml`, or `config.yaml` under
 `OMNIGRAPH_HOME`. `--operator-config FILE` replaces it for one invocation;
 files are never merged or discovered by searching parent directories.
@@ -10,18 +10,16 @@ files are never merged or discovered by searching parent directories.
 
 ```yaml
 version: 1
-connections:
+profiles:
   work:
     api: https://platform.omnigraph.dev
     organization_id: org_example
-    default_auth: me
     auth:
-      me:
-        provider: omnigraph
+      provider: omnigraph
 targets:
   production:
     kind: managed
-    connection: work
+    profile: work
     cluster_id: cluster_example
     cluster_incarnation: incarnation_example
     endpoint: https://cluster.example.com
@@ -43,13 +41,13 @@ defaults:
   output: table
 ```
 
-A connection requires `api`, `organization_id` and `auth`. A managed target
-references that connection and pins `cluster_id` and `cluster_incarnation`.
-Its optional `endpoint` is required for data operations; without it the
-registration is control-only. Server targets own `endpoint` and `auth` directly.
-Direct targets have `scope: graph` or `scope: root` and an absolute local
-`file://` URI without remote authority, query or fragment. A root may declare
-`default_graph`; a direct graph may not.
+A profile requires `api`, `organization_id` and one `auth` provider object. Each profile represents one
+identity; use separate profiles for different people or automation identities, even within the same
+organization. A managed target references that profile and pins `cluster_id` and `cluster_incarnation`. Its
+optional `endpoint` is required for data operations; without it the registration is control-only. Server
+targets own `endpoint` and `auth` directly. Direct targets have `scope: graph` or `scope: root` and an
+absolute local `file://` URI without remote authority, query or fragment. A root may declare `default_graph`;
+a direct graph may not.
 
 Names match `[A-Za-z][A-Za-z0-9_.-]*` and are case-sensitive. The
 [JSON Schema](operator-config.schema.json) describes the fields;
@@ -71,17 +69,18 @@ Credential, helper and CA availability are checked only for selected operations.
 
 | Selection | Precedence and boundary |
 |---|---|
-| Account operations | `--connection NAME`, then `defaults.connection` |
+| Account operations | `--profile NAME`, then `defaults.profile` |
 | Resource operations | `--target NAME`, then `defaults.target` |
-| Authentication | `--auth PROFILE`, then owner's `default_auth`; otherwise refuse, even with one profile |
+| Managed authentication | The selected profile's single `auth` provider; `--auth` is rejected |
+| Standalone authentication | `--auth PROFILE`, then server's `default_auth`; otherwise refuse, even with one entry |
 | Graph | `--graph ID`, then target `default_graph`; otherwise graph-scoped operations refuse |
 | Read output | Explicit `--format`, then `defaults.output`, then `table`; `--json` selects JSON where offered |
 
-Connection and target selectors are mutually exclusive; their defaults never
-infer each other. Auth profiles belong to the connection or standalone server;
-there is no global auth default or last-used identity or implicit single-profile selection. A direct graph rejects a
-separate graph selector. Discovery never selects the first graph. Graph IDs are
-exact API identifiers, not display-name lookups; cluster incarnation pinning
+Profile and target selectors are mutually exclusive; their defaults never infer each other. Managed targets
+always use their pinned `profile`; neither `defaults.profile` nor a global `--profile` can override that
+binding. Only standalone servers own named auth entries and `default_auth`. There is no last-used identity or
+implicit single-profile selection. A direct graph rejects a separate graph selector. Discovery never selects
+the first graph. Graph IDs are exact API identifiers, not display-name lookups; cluster incarnation pinning
 does not protect against recreation of a graph with the same ID.
 
 Inline targets are local paths or `file://` URIs only, such as
@@ -96,11 +95,11 @@ contracts. Unsupported formats refuse. Diagnostics go to stderr, results to stdo
 
 ## Authentication providers
 
-Each `auth` entry is one of these profiles:
+Managed profiles contain one provider object, such as `auth: {provider: omnigraph}`.
+Standalone servers retain a named `auth` map with these alternatives:
 
 ```yaml
 auth:
-  me: {provider: omnigraph}
   saved: {provider: token, source: {store: {}}}
   injected: {provider: token, source: {env: OG_SERVICE_TOKEN}}
   mounted: {provider: token, source: {file: /var/run/omnigraph/token}}
@@ -112,7 +111,7 @@ auth:
 ```
 
 These are alternatives, not a valid set for every owner. `omnigraph` is a
-managed-connection device-login provider. `anonymous` is standalone-server only
+managed-profile device-login provider. `anonymous` is standalone-server only
 and must be selected explicitly or by `default_auth`. Profile names grant no
 privileges. Token/exec sources do not qualify arbitrary workload federation.
 
@@ -144,7 +143,7 @@ refuse it rather than launch a helper without bounded cancellation.
 Never put tokens, refresh tokens or private keys in YAML. Persistent login fails
 if secure custody is unavailable; there is no plaintext fallback. Resource
 commands never start interactive login. Managed access exchanges the selected
-connection credential for a cluster-bound data credential; control and refresh
+profile credential for a cluster-bound data credential; control and refresh
 tokens never go to the graph endpoint. Service and graph policy still authorize
 operations independently of credential acquisition.
 
@@ -157,22 +156,22 @@ secure-store requirements.
 ## Login and registration
 
 ```bash
-omnigraph login --register work --auth me
-omnigraph login --api https://control.example.com --register private --auth me
-omnigraph login --connection work --auth me
-omnigraph cluster list --connection work --json
-omnigraph target add production --connection work --cluster CLUSTER_ID
+omnigraph login --register work
+omnigraph login --api https://control.example.com --register private
+omnigraph login --profile work
+omnigraph cluster list --profile work --json
+omnigraph target add production --profile work --cluster CLUSTER_ID
 omnigraph target inspect production --resolved --json
 omnigraph target refresh production
 ```
 
-New registration defaults to `https://platform.omnigraph.dev` and profile `me`.
-Bare `login` is interactive onboarding; noninteractive onboarding requires
-`--register NAME`. Use onboarding `--organization ID` to select an organization
-explicitly when needed. Verified organization selection precedes saving a complete
-connection. Registration refuses existing names and does not change routing
-defaults. Existing login/logout use an `omnigraph` profile selected through a
-connection or a managed target's connection. Static tokens use `credentials`.
+Bare `login` is interactive onboarding, proposing name `omnigraph` and API
+`https://platform.omnigraph.dev`. Noninteractive onboarding requires `--register NAME`;
+`--organization ID` explicitly selects an organization. Verified selection precedes
+saving. Registration refuses existing names and does not change routing defaults.
+`login --profile NAME` signs in to an existing profile; login rejects `--auth`.
+Login/logout require `provider: omnigraph`, directly or via a managed target's pinned
+profile. Static tokens use `credentials`.
 
 Target registration uses authenticated discovery to save exact cluster identity
 and its service-attested endpoint, if available. It creates no remote cluster.
@@ -186,7 +185,7 @@ complete target JSON object from stdin (64 KiB limit). `target remove NAME`
 preserves credentials and journals; references must remain valid. Add/remove
 never switch defaults. `target register` is an alias for `target add`.
 Discovery-backed add and refresh contact the service. Resolved inspection expands
-the connection and selected auth profile but reports identity as unknown; it does
+the profile and its provider but reports identity as unknown; it does
 not verify the principal or probe runtime transport availability.
 
 Logout clears the selected profile's local session and derived credentials and
@@ -197,10 +196,10 @@ operation evidence across logout and configuration changes.
 To deliberately replace a profile's principal, confirm the **new** principal ID:
 
 ```bash
-omnigraph login --connection work --auth me --replace-principal PRINCIPAL_ID
+omnigraph login --profile work --replace-principal PRINCIPAL_ID
 ```
 
-This requires explicit `--auth` and an existing connection or managed target;
+This requires an existing profile or managed target;
 `--register`, `--api` and `--organization` cannot be combined with it. The newly
 verified principal must match the supplied ID. A different principal without
 confirmation refuses. Replacement invalidates the profile's credential generation
@@ -223,23 +222,21 @@ JSON includes `protocol: 1`, `actor`, `graph_wide` and `actions`; see [access se
 ## Rename registrations and profiles
 
 ```bash
-omnigraph config rename-connection work company
+omnigraph config rename-profile work company
 omnigraph config rename-target production live
-omnigraph config rename-auth connection company me developer
 omnigraph config rename-auth server standalone operator administrator
 # After an interrupted rename, select the same operator file:
 omnigraph config recover-rename --operator-config /path/to/config.yaml
 ```
 
-These local commands preserve credential binding IDs. Connection renames update
-managed references and the connection default; target renames update aliases and
-the target default; auth renames update the owner's auth default. Destination-name
-or retained-custody collisions refuse. Use these commands instead of manually
-renaming YAML keys, which does not move custody.
+These local commands preserve credential binding IDs. Profile renames update managed references and the
+profile default; target renames update aliases and the target default; auth renames apply only to servers and
+update their auth default. Destination-name or retained-custody collisions refuse. Use these commands instead
+of manually renaming YAML keys, which does not move custody.
 
-An interrupted rename blocks normal config use until `config recover-rename`
-finishes it. Conflicting subsequent edits refuse recovery and preserve the journal
-for review. Renames and rename recovery have human output only, with no `--json`.
+An interrupted rename blocks normal config use until `config recover-rename` finishes it. Conflicting
+subsequent edits refuse recovery and preserve the journal for review. Renames and rename recovery have human
+output only, with no `--json`.
 
 ## Manage credentials
 
@@ -251,22 +248,28 @@ omnigraph credentials remove --target standalone --auth operator
 omnigraph credentials export --target standalone --auth operator | consumer
 ```
 
-Every credentials command requires exactly one explicit owner selector and
-explicit `--auth`; defaults do not apply. Set/status/remove use `--connection`
-for managed credentials or `--target` for standalone servers. Direct targets
-have no HTTP credentials. Set/remove accept only `token` with `source: {store:
-{}}`; set requires `--stdin` and existing entries require `--replace`. Neither
-edits YAML. Remove is local and idempotent, not remote revocation.
+Credentials require one explicit owner selector; defaults do not apply.
+Managed credentials use `--profile NAME` without `--auth`:
 
-Status performs no network request, refresh, login or helper execution. It
-reports source availability and locally known metadata, never values. Secure-store
-availability and identity are reported as unknown without prompting or reading
-secrets. File status does not read contents. Availability is not validity.
+```bash
+omnigraph credentials status --profile work --json
+printf '%s\n' "$CONTROL_TOKEN" | omnigraph credentials set --profile automation --stdin
+```
+
+Standalone credentials use `--target NAME --auth PROFILE`; managed-target export
+uses its pinned profile without `--auth`. Managed set/status/remove require `--profile`.
+Direct targets have no HTTP credentials. Set/remove require `token` with
+`source: {store: {}}`; set requires `--stdin`, plus `--replace` for existing entries.
+Neither edits YAML. Remove is local and idempotent, not remote revocation.
+
+Status performs no network request, refresh, login or helper execution. It reports source availability and
+locally known metadata, never values. Secure-store availability and identity are reported as unknown without
+prompting or reading secrets. File status does not read contents. Availability is not validity.
 
 Export currently requires a Unix FIFO pipe, refusing other platforms, terminals and regular files before
 acquisition. Success writes only a bearer access token and newline, ignoring
 output defaults. It may refresh or invoke the selected helper but never starts
-interactive login. `--connection` exports control access; a managed `--target`
+interactive login. `--profile` exports control access; a managed `--target`
 exports only exchanged cluster data access. Anonymous and refresh credentials
 cannot be exported. The receiving process can copy or disclose the token.
 
@@ -274,7 +277,7 @@ cannot be exported. The receiving process can copy or disclose the token.
 
 Remote endpoints require HTTPS. The only HTTP exception is an explicitly
 anonymous loopback standalone server. Optional `transport` belongs independently
-to a connection's API or target's data endpoint; it is not inherited.
+to a profile's API or target's data endpoint; it is not inherited.
 API/endpoint URLs may include a base-path prefix, which stays inside the
 credential scope. Userinfo, queries, fragments, traversal and ambiguous encoded
 separators refuse. TLS verifies certificates and hostnames with system roots by default.
@@ -315,28 +318,30 @@ An alias has `target`, `query`, optional `params`, and required explicit `graph`
 for multi-graph targets. A direct-graph alias must omit `graph`, but execution
 still refuses because the stored-query registry is served-only. Aliases never
 inherit `default_graph`, contain source code or mutate data. Caller target/graph
-overrides refuse; `--auth` may select a profile on the bound owner. `--params`
+overrides refuse; `--auth` may select a named auth entry only on a bound standalone
+server. Managed aliases keep the target's pinned profile. `--params`
 and `--params-file` must contain a JSON object. Its fields shallowly replace
 defaults as typed values, never source interpolation. Arrays, scalars and null
 are refused. Alias `args` and `format` fields and positional arguments are unsupported.
 
 ## Upgrade from the old format
 
-There is no backward compatibility or configuration importer. `version: 1` is a new
-format, not the previous target-only format. Replace account targets with connections,
-cluster auth fields with connection references, and credential nicknames/static
-login with owner-local providers and `credentials set --stdin`. Recreate aliases
-without `args`/`format`, use `--as` for direct actor selection, and register remote
-endpoints. Never copy old plaintext credentials into YAML. Preserve old operator
-homes and unresolved journals. Config replacement changes no graph data.
+There is no backward compatibility or importer. Replace `connections` with `profiles`, flatten managed `auth`
+to one provider object and remove managed `default_auth`. Change target `connection` to `profile` and
+`defaults.connection` to `defaults.profile`. Split identities into separate profiles and pin each target to
+its intended profile. Old fields, `--connection`, managed `--auth` and login `--auth` are rejected. For the
+older target-only format, replace account targets with profiles and static login with `credentials set
+--stdin`. Remove alias `args`/`format`, use `--as` for direct actors, and register remote endpoints. Never put
+plaintext credentials in YAML. Preserve old operator homes and unresolved journals; config replacement changes
+no graph data.
 
 Legacy folder lifecycle evidence has a separate, explicit recovery command:
 
 ```bash
-omnigraph config recover-operations --source /path/to/old-workspace --connection work --auth me --json
+omnigraph config recover-operations --source /path/to/old-workspace --profile work --json
 ```
 
-It checks the selected connection's API and organization against evidence in the
+It checks the selected profile's API and organization against evidence in the
 source's `.omnigraph` directory, durably copies matching pending/accepted records
 to the operator home, then retires the originals. Conflicts refuse; preserve both
 copies. This is local evidence preservation, not config conversion or operation

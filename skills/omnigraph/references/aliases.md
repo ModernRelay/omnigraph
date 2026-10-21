@@ -18,12 +18,14 @@ aliases:
 
 ```bash
 omnigraph alias triage --params '{"since":"2026-06-01"}' --format jsonl
-omnigraph alias triage --auth me --params '{"limit":5}' --json
+omnigraph alias triage --params '{"limit":5}' --json
 ```
 
 Aliases require an explicit target and, for multi-graph targets, an explicit
 graph. They never inherit `default_graph` and reject target/graph overrides.
-`--auth` may select an existing profile on the bound owner. `query` is a stored
+Managed aliases retain their target's pinned profile and reject `--auth`.
+Only standalone aliases allow `--auth` to select a named server auth entry.
+`query` is a stored
 identifier, never a filename or inline program. Values in `params` are typed
 JSON-compatible defaults; explicit parameters shallowly replace matching names.
 There is no positional `args` binding or per-alias `format` field.

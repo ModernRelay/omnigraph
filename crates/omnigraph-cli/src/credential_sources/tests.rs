@@ -321,14 +321,14 @@ fn store_keys_bind_every_owner_constraint_without_ambiguous_concatenation() {
             None,
         ),
         make(
-            OwnerKind::Connection,
+            OwnerKind::Profile,
             "a:b",
             "c",
             "https://example.invalid/one/",
             Some("org-1"),
         ),
         make(
-            OwnerKind::Connection,
+            OwnerKind::Profile,
             "a:b",
             "c",
             "https://example.invalid/one/",
@@ -396,7 +396,7 @@ fn result_rejects_a_different_request_and_expiry_at_the_boundary() {
 fn binding_refuses_incomplete_owners_and_wrong_planes() {
     assert!(
         OwnerBinding::new(
-            OwnerKind::Connection,
+            OwnerKind::Profile,
             "o".into(),
             "p".into(),
             "https://example.invalid/".into(),
@@ -445,15 +445,16 @@ fn binding_refuses_incomplete_owners_and_wrong_planes() {
 }
 
 #[test]
-fn connection_store_never_substitutes_a_control_token_for_data() {
+fn profile_store_never_substitutes_a_control_token_for_data() {
     let owner = OwnerBinding::new(
-        OwnerKind::Connection,
+        OwnerKind::Profile,
         "o".into(),
         "p".into(),
         "https://control.invalid/api/".into(),
         Some("org".into()),
     )
     .unwrap();
+    assert_eq!(serde_json::to_value(&owner).unwrap()["kind"], "profile");
     let data = CredentialRequest::new(
         owner.clone(),
         Purpose::Data,

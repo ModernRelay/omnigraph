@@ -60,14 +60,14 @@ pub(crate) fn parse(text: &str, base: &Path) -> Result<crate::operator::Operator
                 }
             }
             Target::Managed {
-                connection,
+                profile,
                 cluster_id,
                 cluster_incarnation,
                 endpoint,
                 default_graph,
                 ..
             } => {
-                let owner = &source.connections[connection];
+                let owner = &source.profiles[profile];
                 entry.kind = TargetKind::Managed;
                 entry.scope = Some(TargetScope::Cluster);
                 entry.api = Some(owner.api.trim_end_matches('/').to_owned());
@@ -409,7 +409,7 @@ impl Transports {
             if let Some(source) = &config.schema {
                 if matches!(&target.binding, crate::targets::TargetBinding::Managed(binding) if binding.cluster.is_none())
                 {
-                    if let Some(owner) = source.connections.get(target.label()) {
+                    if let Some(owner) = source.profiles.get(target.label()) {
                         routes.insert(
                             (true, owner.api.trim_end_matches('/').to_owned()),
                             (owner.transport.clone(), Default::default()),
@@ -433,12 +433,12 @@ impl Transports {
                         );
                     }
                     Some(Target::Managed {
-                        connection,
+                        profile,
                         endpoint,
                         transport,
                         ..
                     }) => {
-                        let owner = &source.connections[connection];
+                        let owner = &source.profiles[profile];
                         routes.insert(
                             (true, owner.api.trim_end_matches('/').to_owned()),
                             (owner.transport.clone(), Default::default()),
@@ -451,7 +451,7 @@ impl Transports {
                         }
                     }
                     _ => {
-                        if let Some(owner) = source.connections.get(target.label()) {
+                        if let Some(owner) = source.profiles.get(target.label()) {
                             routes.insert(
                                 (true, owner.api.trim_end_matches('/').to_owned()),
                                 (owner.transport.clone(), Default::default()),
@@ -658,30 +658,40 @@ pub(crate) fn authentication(
         .schema
         .as_ref()
         .ok_or_else(|| eyre!("operator configuration requires version: 1"))?;
-    let (kind, name, route, org, profiles, default) = match &target.binding {
+    let (kind, name, route, org, auth_name, profile) = match &target.binding {
         crate::targets::TargetBinding::Managed(binding) => {
-            let name = cli
-                .connection
-                .as_deref()
-                .or_else(|| {
-                    if binding.cluster.is_none() {
-                        source.defaults.connection.as_deref()
-                    } else {
-                        match source.targets.get(target.label()) {
-                            Some(Target::Managed { connection, .. }) => Some(connection.as_str()),
-                            _ => source.defaults.connection.as_deref(),
-                        }
-                    }
-                })
-                .ok_or_else(|| eyre!("select --connection NAME"))?;
-            let owner = &source.connections[name];
+            if cli.auth.is_some() {
+                bail!(
+                    "managed profiles own one authentication configuration; select --profile instead of --auth"
+                );
+            }
+            let name = if binding.cluster.is_none() {
+                cli.profile
+                    .as_deref()
+                    .or(source.defaults.profile.as_deref())
+            } else {
+                if cli.profile.is_some() {
+                    bail!(
+                        "a managed target uses its configured profile; --profile cannot override it"
+                    );
+                }
+                match source.targets.get(target.label()) {
+                    Some(Target::Managed { profile, .. }) => Some(profile.as_str()),
+                    _ => None,
+                }
+            }
+            .ok_or_else(|| eyre!("select --profile NAME"))?;
+            let owner = source
+                .profiles
+                .get(name)
+                .ok_or_else(|| eyre!("unknown profile '{name}'"))?;
             (
-                OwnerKind::Connection,
+                OwnerKind::Profile,
                 name,
                 &owner.api,
                 Some(owner.organization_id.clone()),
+                "auth",
                 &owner.auth,
-                owner.default_auth.as_deref(),
             )
         }
         crate::targets::TargetBinding::Server { .. } => match source.targets.get(target.label()) {
@@ -690,14 +700,18 @@ pub(crate) fn authentication(
                 auth,
                 default_auth,
                 ..
-            }) => (
-                OwnerKind::Server,
-                target.label(),
-                endpoint,
-                None,
-                auth,
-                default_auth.as_deref(),
-            ),
+            }) => {
+                let (auth_name, profile) =
+                    choose(auth, default_auth.as_deref(), cli.auth.as_deref())?;
+                (
+                    OwnerKind::Server,
+                    target.label(),
+                    endpoint,
+                    None,
+                    auth_name,
+                    profile,
+                )
+            }
             _ => bail!("served access requires a configured server target"),
         },
         _ => {
@@ -707,16 +721,15 @@ pub(crate) fn authentication(
             return Ok(None);
         }
     };
-    let (profile_name, profile) = choose(profiles, default, cli.auth.as_deref())?;
     if matches!(profile, AuthProfile::Anonymous) {
         return Ok(None);
     }
-    let route = if kind == OwnerKind::Connection {
+    let route = if kind == OwnerKind::Profile {
         route.trim_end_matches('/').to_owned()
     } else {
         route.clone()
     };
-    let ids = owner_ids(input, kind, name, profile_name)?;
+    let ids = owner_ids(input, kind, name, auth_name)?;
     let custody = custody(&ids.owner, &ids.profile, &route, profile)?;
     let owner = OwnerBinding::new(
         kind,
@@ -727,7 +740,7 @@ pub(crate) fn authentication(
     )?;
     let request = CredentialRequest::new(
         owner.clone(),
-        if kind == OwnerKind::Connection {
+        if kind == OwnerKind::Profile {
             Purpose::Control
         } else {
             Purpose::Data
@@ -739,7 +752,7 @@ pub(crate) fn authentication(
     Ok(Some(std::sync::Arc::new(Authentication {
         owner,
         profile: profile.clone(),
-        name: profile_name.to_owned(),
+        name: auth_name.to_owned(),
         request,
         derived_credentials: Default::default(),
         custody,
@@ -768,13 +781,12 @@ fn custody(
 pub(crate) fn registration_auth(
     input: &crate::operator::InvocationConfig,
     name: &str,
-    profile: &str,
     route: &str,
 ) -> Result<std::sync::Arc<Authentication>> {
-    let ids = owner_ids(input, OwnerKind::Connection, name, profile)?;
+    let ids = owner_ids(input, OwnerKind::Profile, name, "auth")?;
     let custody = custody(&ids.owner, &ids.profile, route, &AuthProfile::Omnigraph)?;
     let owner = OwnerBinding::new(
-        OwnerKind::Connection,
+        OwnerKind::Profile,
         ids.owner.clone(),
         ids.profile.clone(),
         route.into(),
@@ -785,7 +797,7 @@ pub(crate) fn registration_auth(
     Ok(std::sync::Arc::new(Authentication {
         owner,
         request,
-        name: profile.into(),
+        name: "auth".into(),
         derived_credentials: Default::default(),
         profile: AuthProfile::Omnigraph,
         custody,
@@ -857,8 +869,8 @@ fn owner_ids(
     };
     let key = format!(
         "{}:{name}",
-        if kind == OwnerKind::Connection {
-            "connection"
+        if kind == OwnerKind::Profile {
+            "profile"
         } else {
             "server"
         }
@@ -894,9 +906,9 @@ fn owner_ids(
 }
 
 pub(crate) enum Rename {
-    Connection,
+    Profile,
     Target,
-    Auth { server: bool, owner: String },
+    Auth { owner: String },
 }
 
 fn adjacent(path: &Path, suffix: &str) -> std::path::PathBuf {
@@ -969,17 +981,17 @@ pub(crate) fn rename(
         .transpose()?
         .unwrap_or_default();
     let owner_move = match kind {
-        Rename::Connection => {
-            move_entry(&mut config.connections, from, to)?;
-            rename_default(&mut config.defaults.connection, from, to);
+        Rename::Profile => {
+            move_entry(&mut config.profiles, from, to)?;
+            rename_default(&mut config.defaults.profile, from, to);
             for target in config.targets.values_mut() {
-                if let Target::Managed { connection, .. } = target {
-                    if connection == from {
-                        *connection = to.into();
+                if let Target::Managed { profile, .. } = target {
+                    if profile == from {
+                        *profile = to.into();
                     }
                 }
             }
-            Some((format!("connection:{from}"), format!("connection:{to}")))
+            Some((format!("profile:{from}"), format!("profile:{to}")))
         }
         Rename::Target => {
             let server = matches!(config.targets.get(from), Some(Target::Server { .. }));
@@ -992,24 +1004,16 @@ pub(crate) fn rename(
             }
             server.then(|| (format!("server:{from}"), format!("server:{to}")))
         }
-        Rename::Auth { server, owner } => {
-            let (profiles, default) = if server {
-                match config.targets.get_mut(&owner) {
-                    Some(Target::Server {
-                        auth, default_auth, ..
-                    }) => (auth, default_auth),
-                    _ => bail!("auth rename requires a standalone server owner"),
-                }
-            } else {
-                let owner = config
-                    .connections
-                    .get_mut(&owner)
-                    .ok_or_else(|| eyre!("unknown connection"))?;
-                (&mut owner.auth, &mut owner.default_auth)
+        Rename::Auth { owner } => {
+            let (profiles, default) = match config.targets.get_mut(&owner) {
+                Some(Target::Server {
+                    auth, default_auth, ..
+                }) => (auth, default_auth),
+                _ => bail!("auth rename requires a standalone server owner"),
             };
             move_entry(profiles, from, to)?;
             rename_default(default, from, to);
-            let key = format!("{}:{owner}", if server { "server" } else { "connection" });
+            let key = format!("server:{owner}");
             if let Some(record) = records.get_mut(&key) {
                 if record.profiles.contains_key(to) {
                     bail!("destination profile has retained custody; choose another name");
@@ -1121,15 +1125,13 @@ mod tests {
         use credentials::SecretStore;
         for remove in [false, true] {
             let directory = tempfile::tempdir().unwrap();
-            std::fs::write(directory.path().join("config.yaml"), "version: 1\nconnections:\n  work:\n    api: https://control.example\n    organization_id: org_test\n    auth: {machine: {provider: token, source: {store: {}}}}\n").unwrap();
+            std::fs::write(directory.path().join("config.yaml"), "version: 1\nprofiles:\n  work:\n    api: https://control.example\n    organization_id: org_test\n    auth: {provider: token, source: {store: {}}}\n").unwrap();
             let cli = crate::invocation::parse_from([
                 "omnigraph",
                 "credentials",
                 "status",
-                "--connection",
+                "--profile",
                 "work",
-                "--auth",
-                "machine",
             ])
             .unwrap()
             .cli;

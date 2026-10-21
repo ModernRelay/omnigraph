@@ -173,7 +173,7 @@ backend. `--config DIR` is source input only.
 - Direct graph: `--target ./graph.omni` or a registered `kind: direct, scope: graph` entry.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
 - Server: `--target production --graph knowledge`; the registered target owns endpoint and named auth profiles.
-- Managed: `--connection work` for account operations; a managed target references that connection and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
+- Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
 - Direct targets support local files only. Cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
 Bare target names resolve from the operator file; use `./` for relative inline
@@ -197,10 +197,10 @@ destination line. Legacy `--server`, `--store`, `--cluster`, `--profile`,
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
 | Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
-| Managed account | `cluster create/list`, `organization members/invitations`; `--connection NAME` |
+| Managed account | `cluster create/list`, `organization members/invitations`; `--profile NAME` |
 | Managed cluster | `cluster members/pull/push/plan/apply/status/history/cancel/token/delete/undo-delete`; complete cluster target |
-| Local configuration | `config validate/rename-connection/rename-target/rename-auth/recover-rename/recover-operations`, `target list/inspect/add/refresh/remove` (`register` aliases `add`), `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
-| Authentication | `login --register NAME`, `login --connection NAME --auth PROFILE`, or `logout --connection NAME --auth PROFILE` for platform sessions; `credentials set/status/remove/export` requires explicit owner and auth |
+| Local configuration | `config validate/rename-profile/rename-target/rename-auth/recover-rename/recover-operations`, `target list/inspect/add/refresh/remove` (`register` aliases `add`), `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
+| Authentication | `login --register NAME`, `login --profile NAME`, or `logout --profile NAME` for platform sessions; `credentials set/status/remove/export` requires explicit profile or standalone target/auth |
 | Access | `access [--branch B [--target-branch T]]`; the actor and the actions the graph's policy grants it, from a server's access route or, for a direct graph or root target, the installed policy; catalogue and managed targets refuse |
 
 `query` and `mutate` invoke stored queries by positional name, or accept
@@ -214,7 +214,7 @@ then `cluster plan --rev REV`, then `cluster apply --plan PREVIEW_ID`, all with
 the same cluster target. Managed plan/apply reject local `--config`. Creation
 returns identity; it does not select a new target or bind a folder. Providers never
 fall back to each other. Preserve unresolved lifecycle evidence and reconcile it
-through explicit `config recover-operations --source DIR --connection NAME`
+through explicit `config recover-operations --source DIR --profile NAME`
 for legacy folder evidence; there is no configuration importer or automatic migration.
 
 For direct recovery, `cluster apply --target ROOT --deployment-id ID
@@ -299,42 +299,44 @@ selects one replacement file without merging. `--config DIR` is deployment sourc
 The primary [operator reference](../../docs/user/cli/targets.md) owns the complete
 schema, providers, transport, defaults and upgrade procedure.
 
-Connections pin API/organization and own named auth profiles. Managed targets
-reference a connection and pin cluster ID/incarnation; standalone server targets
+Profiles pin API/organization and own one auth provider for one identity. Managed targets
+reference a profile and pin cluster ID/incarnation; standalone server targets
 own endpoint/auth. Direct graph/root targets use absolute local `file://` URIs.
-`--auth` overrides owner `default_auth`; without either, selection refuses even
-with one profile. `defaults.connection` and `defaults.target` apply only to their command
+On standalone servers, `--auth` overrides `default_auth`; without either,
+selection refuses even with one entry. Managed `--auth` is rejected. Managed
+targets use their pinned profile; default/global profiles cannot override it. `defaults.profile` and `defaults.target` apply only to their command
 classes. A graph selector overrides target `default_graph`; direct graphs reject
 it. Read output defaults to `table`. Whole-document validation is offline.
 
 ```bash
 omnigraph config validate
-omnigraph login --register work --auth me
-omnigraph cluster list --connection work --json
-omnigraph target add production --connection work --cluster CLUSTER_ID
+omnigraph login --register work
+omnigraph cluster list --profile work --json
+omnigraph target add production --profile work --cluster CLUSTER_ID
 omnigraph target inspect production --resolved --json
-omnigraph credentials status --connection work --auth me --json
+omnigraph credentials status --profile work --json
 ```
 
 Never put secrets in configuration. Providers are `omnigraph` (managed device
 login), `token` (exactly one `store`, `env` or `file` source), `exec` (absolute
 argv, bounded JSON protocol), and standalone-only `anonymous`. No fallback is
 allowed. Static installation uses `credentials set --stdin`, not login; existing
-entries require `--replace`. All credentials commands require explicit owner and
-`--auth`. Status never uses network/helpers or prompts; secure-store availability
+entries require `--replace`. Managed credentials require `--profile NAME` without `--auth`; standalone
+credentials require `--target NAME --auth PROFILE`. Status never uses network/helpers or prompts; secure-store availability
 and identity remain unknown without reading secrets. Export is raw bearer-plus-newline to a pipe
-only, never terminal/file output; managed export releases data access, never a
-control/refresh token. Read the reference before using credential commands.
+only, never terminal/file output; managed-target export releases data access; `--profile` exports control access.
+Neither exports refresh tokens. Read the reference before using credential commands.
 
-Use `config rename-connection FROM TO`, `config rename-target FROM TO`, or
-`config rename-auth connection|server OWNER FROM TO` to preserve custody and update
+Use `config rename-profile FROM TO`, `config rename-target FROM TO`, or
+`config rename-auth server OWNER FROM TO` to preserve custody and update
 references/defaults. An interrupted rename needs `config recover-rename` against
 the same operator file; conflicting edits refuse. These commands have no `--json`.
-Changing a profile's principal requires `login --connection NAME --auth PROFILE
+Changing a profile's principal requires `login --profile NAME
 --replace-principal NEW_PRINCIPAL_ID`, matching the verified new identity and
 invalidating old derived credentials. See the primary operator reference.
 
-New registration defaults to `https://platform.omnigraph.dev` and profile `me`;
+Bare login proposes profile name `omnigraph`; registration defaults to
+`https://platform.omnigraph.dev` and rejects `--auth`;
 this does not create routing defaults. Existing sessions need the selected profile.
 Transport defaults to verified system TLS and direct routing, ignoring proxy
 variables unless opted in. Custom CA plus HTTPS proxy is refused. This model

@@ -24,7 +24,7 @@ existing configuration-owned root selection.
 
 ## Managed CLI sessions
 
-A connection owns API, organization and named authentication profiles. A managed
+A profile owns API, organization and one auth provider for one identity. A managed
 target references it and pins cluster identity/incarnation plus an optional data
 endpoint. Whole-document structural validation precedes selected credential and
 runtime capability checks. Registration consumes authenticated endpoint attestation;
@@ -35,7 +35,7 @@ and [decision](../rfcs/2026-10-20-operator-connections-and-credential-providers.
 Pending/accepted lifecycle evidence remains separate from configuration and
 credential custody. Preserve it across removal, logout and upgrade. Retiring the
 old grammar does not authorize discarding unresolved work or replaying it under
-a new identity. `config recover-operations --source DIR --connection NAME`
+a new identity. `config recover-operations --source DIR --profile NAME`
 preserves matching legacy folder evidence without accepting old configuration
 or submitting remote operations; `managed/lifecycle/pending` owns that copy/retire
 protocol.

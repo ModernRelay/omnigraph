@@ -55,7 +55,7 @@ or the HTTP API; the server hosts multiple graphs from one applied cluster
 revision.
 
 The CLI's [scope resolver](../../crates/omnigraph-cli/src/scope.rs) selects one
-connection for account operations or target for resource operations. Explicit
+profile for account operations or target for resource operations. Explicit
 selectors override their respective declarative defaults. `InvocationConfig`
 captures one complete operator file; repository/folder state never selects it. Applicability is checked before credentials and backend access.
 The resolved destination is retained through storage and HTTP execution.
@@ -128,7 +128,7 @@ at its first consumer. Every consumer shares that result, including a failed
 load. [`operator_schema`](../../crates/omnigraph-cli/src/operator_schema.rs) owns
 strict `version: 1` grammar and whole-document validation; its published JSON
 Schema is a related contract, not a substitute for cross-reference validation.
-[`scope`](../../crates/omnigraph-cli/src/scope.rs) selects connection or resource
+[`scope`](../../crates/omnigraph-cli/src/scope.rs) selects profile or resource
 by command class. [`operator_routing`](../../crates/omnigraph-cli/src/operator_routing.rs)
 resolves owner-local auth and transport into the invocation; source files never
 route execution. [`planes`](../../crates/omnigraph-cli/src/planes.rs) rejects
