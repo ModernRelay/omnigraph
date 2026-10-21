@@ -166,7 +166,7 @@ fn finish(
                 color_eyre::eyre::eyre!(refusal.to_string()),
                 evidence,
             );
-            body["command_outcome"] = serde_json::to_value(failure.command_outcome)?;
+            body["disposition"] = serde_json::to_value(failure.disposition())?;
         }
         match machine {
             Some(format) => {
@@ -205,8 +205,8 @@ fn finish(
                     }
                     writeln!(
                         stderr,
-                        "command_outcome: {}",
-                        serde_json::to_string(&failure.command_outcome)?
+                        "disposition: {}",
+                        serde_json::to_string(&failure.disposition())?
                     )?;
                     stderr.flush()?;
                 }
@@ -215,7 +215,7 @@ fn finish(
         })();
         if let Err(delivery) = delivered {
             // stdout may be closed or contain a partial result. Retain the
-            // complete outcome in the returned error, which main reports on
+            // complete disposition in the returned error, which main reports on
             // stderr, rather than losing it to the output error.
             return Err(UndeliveredFailure { failure, delivery }.into());
         }
@@ -346,10 +346,7 @@ async fn run(
         let graph = if let Command::Alias(args) = &cli.command {
             let alias = &operator.get(stderr)?.aliases[&args.name];
             scope::graph_selection(target, alias.graph.as_deref())?
-        } else if matches!(
-            planes::requirement(&cli.command),
-            planes::Requirement::Graph { .. }
-        ) {
+        } else if planes::selects_graph(&cli.command, target) {
             scope::graph_selection(target, cli.graph.as_deref())?
         } else {
             cli.graph.as_deref()

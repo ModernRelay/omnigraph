@@ -310,9 +310,9 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
         "--json fails closed too: {refusal}"
     );
     assert_eq!(
-        refusal["command_outcome"],
+        refusal["disposition"],
         serde_json::json!({
-            "execution":"not_started", "effects":"none", "action":"refresh"
+            "effects":"none", "action":"refresh"
         })
     );
     assert!(refusal.get("http_status").is_none());
@@ -592,14 +592,14 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
         if verb == "mutate" {
             assert_eq!(actual["http_status"], 400);
             assert_eq!(
-                actual["command_outcome"],
+                actual["disposition"],
                 serde_json::json!({
-                    "execution":"unknown", "effects":"unknown", "action":"reconcile"
+                    "effects":"unknown", "action":"reconcile"
                 })
             );
             let fields = actual.as_object_mut().unwrap();
             fields.remove("http_status");
-            fields.remove("command_outcome");
+            fields.remove("disposition");
         }
         assert_eq!(
             actual, refusal,
@@ -1118,7 +1118,6 @@ fn queries_list_with_as_flag_errors() {
 fn queries_and_policy_refuse_server_targets_before_network() {
     let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
     for args in [
-        vec!["queries", "list"],
         vec!["queries", "validate"],
         vec!["policy", "validate"],
         vec!["policy", "test", "--tests", "missing-tests.yaml"],
@@ -1133,7 +1132,105 @@ fn queries_and_policy_refuse_server_targets_before_network() {
         assert!(output.stdout.is_empty());
         assert!(server.requests().is_empty());
     }
+    // A server lists one graph's queries, so `queries list` without `--graph`
+    // or a `default_graph` refuses before any request.
+    let output = output_failure(cli().args(["--target", &server.origin, "queries", "list"]));
+    let stderr = stderr_string(&output);
+    assert!(stderr.contains("graph_required"), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(server.requests().is_empty());
     server.assert_complete();
+}
+
+/// On a server target `queries list` reads `GET /graphs/{id}/queries`, and
+/// `--json` prints that body exactly. The direct root form keeps its own
+/// shape (`mcp_expose`, GQ type names, the whole cluster without `--graph`),
+/// so the two agree on the declarations they share, not byte for byte.
+#[test]
+fn queries_list_on_a_server_target_prints_the_route_body() {
+    let cluster = converged_cluster_with_query(
+        "stored.gq",
+        &format!(
+            "query described($name: String) \
+                @description(\"Find a person by exact name.\") \
+                @instruction(\"Use for exact lookups.\") \
+                {{ match {{ $p: Person {{ name: $name }} }} return {{ $p.age }} }}\n{SET_AGE}\n"
+        ),
+        "      - ./stored.gq\n",
+    );
+    let server = spawn_server_with_cluster(cluster.path());
+    let route: Value = graph_http_client()
+        .get(format!("{}/graphs/knowledge/queries", server.base_url))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(route["queries"].as_array().unwrap().len(), 2, "{route}");
+
+    let served = output_success(cli().args([
+        "queries",
+        "list",
+        "--target",
+        &server.base_url,
+        "--graph",
+        "knowledge",
+        "--json",
+    ]));
+    assert_eq!(parse_stdout_json(&served), route);
+
+    // A named server target supplies its `default_graph`.
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "target_config_version: 1\ntargets:\n  srv:\n    kind: server\n    endpoint: '{}'\n    auth: anonymous\n    default_graph: knowledge\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let human = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["queries", "list", "--target", "srv"]),
+    );
+    assert!(stderr_string(&human).contains("graph=knowledge"));
+    assert_eq!(
+        stdout_string(&human),
+        concat!(
+            "read  described($name: string)\n",
+            "    description: Find a person by exact name.\n",
+            "    instruction: Use for exact lookups.\n",
+            "mutation  set_age($name: string, $age: int)\n",
+        )
+    );
+
+    let direct = parse_stdout_json(&output_success(
+        cli()
+            .args(["queries", "list", "--target"])
+            .arg(cluster.path())
+            .args(["--graph", "knowledge", "--json"]),
+    ));
+    let shared = |body: &Value| -> Vec<Value> {
+        body["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| {
+                serde_json::json!({
+                    "name": q["name"],
+                    "mutation": q["mutation"],
+                    "description": q.get("description"),
+                    "instruction": q.get("instruction"),
+                    "params": q["params"].as_array().unwrap().iter()
+                        .map(|p| serde_json::json!([p["name"], p["nullable"]]))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    };
+    assert_eq!(shared(&direct), shared(&route));
 }
 
 // RFC-011: `queries validate`/`list` source the registry + schemas from a

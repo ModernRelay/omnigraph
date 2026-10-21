@@ -15,12 +15,12 @@ use omnigraph_api_types::{
     ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOpOutput, ChangeOutput,
     ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, DiffOutput,
     EntityKindOutput, ExportRequest, GraphBatchLoadOutput, GraphDiscoveryResponse,
-    GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryRequest, ReadOutput,
-    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
-    branch_read_output, change_baseline_output, change_feed_output, change_scope,
-    commit_changes_output, commit_output, diff_output, graph_batch_load_receipt_output,
-    load_executed_output, merge_base_output, read_output, schema_apply_output, show_read_output,
-    snapshot_payload,
+    GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput,
+    branch_list_read_output, branch_read_output, change_baseline_output, change_feed_output,
+    change_scope, commit_changes_output, commit_output, diff_output,
+    graph_batch_load_receipt_output, load_executed_output, merge_base_output, read_output,
+    schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
@@ -629,6 +629,33 @@ impl GraphClient {
                     catalogue_source: Some(scope.schema_source()),
                 })
             }
+        }
+    }
+
+    /// A served graph's stored-query catalog, the body of `GET …/queries`.
+    /// A direct root reads its registry from the applied cluster state
+    /// instead, so only a server target reaches this.
+    pub(crate) async fn list_queries(&self) -> Result<QueriesCatalogOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                ..
+            } => {
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["queries"], &[])?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => {
+                bail!("a direct graph has no stored queries; list them from its cluster root")
+            }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("queries list")),
         }
     }
 
@@ -2682,7 +2709,8 @@ fn verified_blob_precondition(error: color_eyre::eyre::Report) -> color_eyre::ey
         Ok(remote)
             if remote.status == StatusCode::PRECONDITION_FAILED
                 && remote.output.blob_precondition_failure.is_some()
-                && remote.output.code == Some(omnigraph_api_types::ErrorCode::Conflict)
+                && remote.output.code
+                    == Some(omnigraph_api_types::ErrorCode::PreconditionFailed)
                 && crate::command_outcome::single_request()
                 && {
                     let mut rest = remote.output.clone();
@@ -3242,17 +3270,17 @@ mod tests {
         assert_eq!(compound.exit, 1);
         assert_eq!(single.exit, 75);
         assert_eq!(
-            serde_json::to_value(compound).unwrap()["command_outcome"],
+            serde_json::to_value(compound).unwrap()["disposition"],
             json!({
-                "execution":"unknown", "effects":"unknown", "action":"reconcile"
+                "effects":"unknown", "action":"reconcile"
             })
         );
         let single = serde_json::to_value(single).unwrap();
         assert_eq!(single["retry_after"], "Wed, 21 Oct 2026 07:28:00 GMT");
         assert_eq!(
-            single["command_outcome"],
+            single["disposition"],
             json!({
-                "execution":"not_started", "effects":"none", "action":"retry"
+                "effects":"none", "action":"retry"
             })
         );
         // A later read's typed refusal cannot erase an earlier successful
@@ -3267,21 +3295,21 @@ mod tests {
             let compound = attempt(true, read_refusal, kind).await;
             assert_eq!(compound.exit, 1);
             assert_eq!(
-                serde_json::to_value(compound).unwrap()["command_outcome"]["effects"],
+                serde_json::to_value(compound).unwrap()["disposition"]["effects"],
                 "unknown"
             );
         }
         let conditional = attempt(false, false, Refusal::Condition).await;
         assert_eq!(conditional.exit, 4);
         assert_eq!(
-            serde_json::to_value(conditional).unwrap()["command_outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"})
+            serde_json::to_value(conditional).unwrap()["disposition"],
+            json!({"effects":"none","action":"refresh"})
         );
         let denied = attempt(false, false, Refusal::Denied).await;
         assert_eq!(denied.exit, 1);
         assert_eq!(
-            serde_json::to_value(denied).unwrap()["command_outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"})
+            serde_json::to_value(denied).unwrap()["disposition"],
+            json!({"effects":"none","action":"refresh"})
         );
     }
 

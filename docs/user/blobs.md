@@ -97,7 +97,7 @@ HTTP an `If-Match` field, embedded a `BlobPrecondition`. A list of entity tags
 (`BlobPrecondition::Tags`) holds when the current ETag is one of them; weak tags
 never match. `*` (`BlobPrecondition::AnyExisting`) holds when the cell is not
 null. When it fails, the write changes nothing and returns
-`BlobWritePreconditionFailed`, over HTTP a `412` whose
+`BlobWritePreconditionFailed`, over HTTP a `412` `precondition_failed` whose
 `blob_precondition_failure.current_etag` and `ETag` header carry the cell's
 current ETag when it holds a managed value. A malformed `If-Match` is a `400`. A commit that
 lands while the write is in flight makes it start again from the new head and

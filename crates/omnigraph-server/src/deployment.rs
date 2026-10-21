@@ -6,11 +6,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::{Arc, Mutex as SyncMutex, PoisonError};
 
-use axum::{
-    Extension, Json,
-    extract::{Path, State},
-    http::StatusCode,
-};
+use axum::{Extension, Json, extract::State, http::StatusCode};
+
+/// The request's resolved actor. A server without authentication resolves
+/// none, and its handlers refuse instead of failing on a missing extension.
+type Actor = Option<Extension<AuthenticatedActor>>;
 use omnigraph_cluster::{
     CapturedDeployment, DeploymentCaller, DeploymentLookup, DeploymentStatus,
     GraphDeploymentResult, IdentityAuthorization,
@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 use tokio::time::{Duration, Instant};
 use utoipa::ToSchema;
 
+use crate::extract::{ApiJson, ApiPath};
 use crate::operations::{OperationRuntime, OwnedResponse, OwnedResult};
 use crate::workload::IngressLease;
 use crate::{
@@ -151,6 +152,17 @@ pub(crate) struct DeploymentStatusResponse {
     in_progress: bool,
 }
 
+/// The authenticated actor a deployment route acts for. A server that resolves
+/// none, as one run without authentication does, has no identity to record
+/// or to authorize, so the route is refused before any effect.
+fn authenticated(actor: Actor) -> Result<AuthenticatedActor, ApiError> {
+    actor.map(|Extension(actor)| actor).ok_or_else(|| {
+        ApiError::forbidden(
+            "deployment routes require an authenticated actor; this server resolves none",
+        )
+    })
+}
+
 fn caller(state: &AppState, actor: &AuthenticatedActor) -> Result<DeploymentCaller, ApiError> {
     crate::handlers::authorize_request(
         Some(actor),
@@ -190,12 +202,10 @@ fn refusal(error: omnigraph_cluster::Diagnostic) -> ApiError {
 }
 
 fn observation_changed() -> ApiError {
-    let mut error = ApiError::conflict(
+    ApiError::new(
+        crate::api::ErrorCode::ServiceUnavailable,
         "deployment ownership changed during observation; repeat this status request",
-    );
-    error.status = StatusCode::SERVICE_UNAVAILABLE;
-    error.code = None;
-    error
+    )
 }
 
 fn uncertain(message: impl Into<String>) -> ApiError {
@@ -316,8 +326,9 @@ fn active_result(
 )]
 pub(crate) async fn status(
     State(state): State<AppState>,
-    Extension(actor): Extension<AuthenticatedActor>,
+    actor: Actor,
 ) -> Result<Json<DeploymentStatusResponse>, ApiError> {
+    let actor = authenticated(actor)?;
     lookup_status(&state, &actor, None).await.map(Json)
 }
 
@@ -330,9 +341,10 @@ pub(crate) async fn status(
 )]
 pub(crate) async fn lookup(
     State(state): State<AppState>,
-    Extension(actor): Extension<AuthenticatedActor>,
-    Path(id): Path<String>,
+    actor: Actor,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<Json<DeploymentResponse>, ApiError> {
+    let actor = authenticated(actor)?;
     let owner = admission(&state)?;
     let identity = IdentityAuthorization::authenticated(actor.actor_id_str()).map_err(refusal)?;
     let ((deployment, revision), in_progress) = state
@@ -378,16 +390,17 @@ async fn lookup_status(
     request_body = PlanRequest,
     responses((status = 200, body = Object), (status = 400, body = crate::api::ErrorOutput),
         (status = 403, body = crate::api::ErrorOutput), (status = 409, body = crate::api::ErrorOutput),
-        (status = 413, body = crate::api::ErrorOutput)),
+        (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn plan(
     State(state): State<AppState>,
-    Extension(actor): Extension<AuthenticatedActor>,
-    request: Result<Json<PlanRequest>, axum::extract::rejection::JsonRejection>,
+    actor: Actor,
+    request: Result<ApiJson<PlanRequest>, ApiError>,
 ) -> Result<Json<omnigraph_cluster::PlanOutput>, ApiError> {
-    let caller = caller(&state, &actor)?;
-    let Json(request) = request.map_err(|error| ApiError::bad_request(error.body_text()))?;
+    // Authorization precedes the body's own refusals, which keep their status.
+    let caller = caller(&state, &authenticated(actor)?)?;
+    let ApiJson(request) = request?;
     let owner = admission(&state)?;
     let _gate = state.deployments.gate.try_lock().map_err(|_| {
         ApiError::conflict("deployment planning or apply is already running; observe submitted work by its original identity")
@@ -415,17 +428,20 @@ pub(crate) async fn plan(
     request_body = DeploymentRequest,
     responses((status = 200, body = DeploymentResponse), (status = 202, description = "Durably accepted; poll the exact receipt until in_progress is false and inspect active", body = DeploymentResponse), (status = 400, body = crate::api::ErrorOutput),
         (status = 403, body = crate::api::ErrorOutput), (status = 409, body = crate::api::ErrorOutput),
-        (status = 413, body = crate::api::ErrorOutput), (status = 503, body = crate::api::ErrorOutput)),
+        (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput),
+        (status = 503, body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn apply(
     State(state): State<AppState>,
-    Extension(actor): Extension<AuthenticatedActor>,
+    actor: Actor,
     Extension(ingress): Extension<IngressLease>,
-    request: Result<Json<DeploymentRequest>, axum::extract::rejection::JsonRejection>,
+    request: Result<ApiJson<DeploymentRequest>, ApiError>,
 ) -> Result<(StatusCode, Json<DeploymentResponse>), ApiError> {
+    // Authorization precedes the body's own refusals, which keep their status.
+    let actor = authenticated(actor)?;
     let caller = caller(&state, &actor)?;
-    let Json(request) = request.map_err(|error| ApiError::bad_request(error.body_text()))?;
+    let ApiJson(request) = request?;
     let owner = admission(&state)?.clone();
     if owner.canonical_root() != request.deployment.canonical_root() {
         return Err(ApiError::conflict(
@@ -1023,6 +1039,11 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("repeat this status request")
+            );
+            assert_eq!(body["code"], "service_unavailable");
+            assert_eq!(
+                body["disposition"],
+                serde_json::json!({"effects": "none", "action": "retry"})
             );
             assert!(body.get("deployment").is_none());
             assert!(body.get("active").is_none());
