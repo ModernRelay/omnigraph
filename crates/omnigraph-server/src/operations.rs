@@ -15,7 +15,8 @@ use crate::ApiError;
 tokio::task_local! {
     /// Whether the request being served has submitted an owned write. An
     /// error it returns afterwards, from the write or from anything the
-    /// handler does after it, may follow effects.
+    /// handler does after it, may follow effects. The owned write itself runs
+    /// with it set.
     static SUBMITTED_WRITE: std::cell::Cell<bool>;
 }
 
@@ -276,7 +277,14 @@ impl OperationRuntime {
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(
             async move {
-                let result = match AssertUnwindSafe(operation).catch_unwind().await {
+                // The write runs as its request's submitted write: an error it
+                // translates follows it, as its waiter judges it, and logs the
+                // status it answers with.
+                let operation = SUBMITTED_WRITE.scope(
+                    std::cell::Cell::new(true),
+                    AssertUnwindSafe(operation).catch_unwind(),
+                );
+                let OwnedResult { result, uncertain } = match operation.await {
                     Ok(result) => result,
                     Err(_) => OwnedResult {
                         result: Err(ApiError::internal(
@@ -285,37 +293,34 @@ impl OperationRuntime {
                         uncertain: true,
                     },
                 };
+                // Mark the error as its waiter receives it, so the log below
+                // records the status its response sends.
+                let result = result.map_err(ApiError::after_owned_write);
                 // A known result carries its reservation through pending delivery.
                 // Consumption releases admission before the handler can respond;
                 // abandonment destroys the output before releasing its ownership.
                 // Uncertainty closes admission before its result is observable.
-                // The failure's class was logged in this request's span
-                // when the engine error was mapped.
-                if let Err(error) = &result.result
+                // An owned write whose outcome is unknown is logged once,
+                // whether or not it contains the process. The failure's class
+                // was logged in this request's span when the engine error was
+                // mapped.
+                if let Err(error) = &result
                     && error.completion_uncertain()
                 {
                     tracing::error!(
                         status = %error.status(),
-                        contained = result.uncertain,
+                        contained = uncertain,
                         "owned write ended without a definite outcome"
                     );
                 }
-                let owner = if result.uncertain {
-                    // The failure's class was logged in this request's span
-                    // when the engine error was mapped.
-                    if let Err(error) = &result.result {
-                        tracing::error!(
-                            status = %error.status(),
-                            "owned write ended without a definite outcome"
-                        );
-                    }
+                let owner = if uncertain {
                     owner.finish(true);
                     None
                 } else {
                     Some(owner)
                 };
                 let _ = sender.send(WriteDelivery {
-                    result: Some(result.result),
+                    result: Some(result),
                     owner,
                 });
             }
@@ -360,14 +365,15 @@ impl Default for OperationRuntime {
 pub(crate) struct OwnedResponse<T>(oneshot::Receiver<WriteDelivery<T>>);
 
 impl<T> OwnedResponse<T> {
+    /// The write's result; an error is one the owned write returned.
     pub(crate) async fn result(self) -> Result<T, ApiError> {
         match self.0.await {
             Ok(delivery) => delivery.into_result(),
             Err(_) => Err(ApiError::internal(
                 "owned write result was lost; effects are unknown and require reconciliation",
-            )),
+            )
+            .after_owned_write()),
         }
-        .map_err(ApiError::after_owned_write)
     }
 }
 

@@ -10,6 +10,7 @@ use crate::app::Completion;
 use crate::client::GraphClient;
 use crate::helpers::graph_resource_id_for_selection;
 use crate::operator;
+use crate::targets::TargetBinding;
 
 mod args;
 mod output;
@@ -31,8 +32,19 @@ pub(crate) async fn run_queries(
     command: QueriesCommand,
     scope: ControlScope<'_>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<Completion> {
+    // A server answers for one graph: `--json` prints the route's body.
+    if let (QueriesCommand::List { json }, TargetBinding::Server { .. }) =
+        (&command, &scope.target.binding)
+    {
+        let client =
+            GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                .await?;
+        let catalog = client.list_queries().await?;
+        output::write_queries_catalog(&catalog, *json, stdout)?;
+        return Ok(Completion::success());
+    }
     crate::scope::direct_root_uri(scope.target)?;
     let binding = crate::scope::capture_storage_binding(scope.target)?;
     match command {
@@ -133,18 +145,26 @@ pub(crate) async fn run_graphs(
 async fn read_serving_snapshot_or_report(
     binding: &omnigraph::storage::CapturedStorageBinding,
 ) -> Result<omnigraph_cluster::ServingSnapshot> {
-    let diagnostic_cluster = omnigraph::storage::redacted_storage_uri(binding.uri());
-    let snapshot = omnigraph_cluster::read_serving_snapshot_with_binding(binding).await;
-    snapshot.map_err(|diagnostics| {
-        color_eyre::eyre::eyre!(
-            "cluster `{diagnostic_cluster}` is not servable:\n  {}",
-            diagnostics
-                .iter()
-                .map(|d| d.message.clone())
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        )
-    })
+    omnigraph_cluster::read_serving_snapshot_with_binding(binding)
+        .await
+        .map_err(|diagnostics| not_servable(binding, &diagnostics))
+}
+
+/// The one loud error for a cluster the serving snapshot reader refused:
+/// every readiness diagnostic, under the redacted root.
+pub(crate) fn not_servable(
+    binding: &omnigraph::storage::CapturedStorageBinding,
+    diagnostics: &[omnigraph_cluster::Diagnostic],
+) -> color_eyre::Report {
+    color_eyre::eyre::eyre!(
+        "cluster `{}` is not servable:\n  {}",
+        omnigraph::storage::redacted_storage_uri(binding.uri()),
+        diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    )
 }
 
 /// Resolve the Cedar policy bundle(s) for a direct-root policy target
@@ -322,8 +342,8 @@ pub(crate) async fn execute_queries_validate(
     Ok(Completion::success())
 }
 
-/// `queries list --target NAME`: list the catalog's stored queries.
-/// With `--graph`, scope to one graph.
+/// `queries list --target ROOT`: list the catalog's stored queries.
+/// With `--graph`, scope to one graph. A server target never reaches this.
 pub(crate) async fn execute_queries_list(
     binding: &omnigraph::storage::CapturedStorageBinding,
     graph: Option<&str>,

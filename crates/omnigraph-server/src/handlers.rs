@@ -865,7 +865,6 @@ pub(crate) fn access_body(
     actor: Option<&AuthenticatedActor>,
     query: api::AccessQuery,
 ) -> std::result::Result<api::AccessOutput, ApiError> {
-    use api::AccessAction as A;
     if query.target_branch.is_some() && query.branch.is_none() {
         return Err(ApiError::bad_request(
             "target_branch needs branch: it names where branch_create and branch_merge from branch would land",
@@ -873,86 +872,20 @@ pub(crate) fn access_body(
     }
     require_canonical_branches([query.branch.as_deref(), query.target_branch.as_deref()])?;
     let policy = handle.policy.as_deref();
-    let allowed = |access: A,
-                   branch: Option<&str>,
-                   target_branch: Option<&str>|
-     -> std::result::Result<bool, ApiError> {
-        let request = PolicyRequest {
-            action: access_policy_action(access),
-            branch: branch.map(str::to_string),
-            target_branch: target_branch.map(str::to_string),
-        };
-        Ok(matches!(authorize(actor, policy, request)?, Authz::Allowed))
-    };
-
-    let mut graph_wide = Vec::new();
-    for access in [
-        A::Read,
-        A::Export,
-        A::Change,
-        A::SchemaApply,
-        A::BranchCreate,
-        A::BranchDelete,
-        A::BranchMerge,
-        A::CommitPublish,
-        A::CommitDrop,
-        A::InvokeQuery,
-    ] {
-        if allowed(access, None, None)? {
-            graph_wide.push(access);
-        }
-    }
-
-    let mut actions = Vec::new();
-    if let Some(branch) = query.branch.as_deref() {
-        for access in [A::Read, A::Export, A::Change] {
-            if allowed(access, Some(branch), None)? {
-                actions.push(access);
-            }
-        }
-        for access in [
-            A::SchemaApply,
-            A::BranchDelete,
-            A::CommitPublish,
-            A::CommitDrop,
-        ] {
-            if allowed(access, None, Some(branch))? {
-                actions.push(access);
-            }
-        }
-        if let Some(target) = query.target_branch.as_deref() {
-            for access in [A::BranchCreate, A::BranchMerge] {
-                if allowed(access, Some(branch), Some(target))? {
-                    actions.push(access);
-                }
-            }
-        }
-    }
-
-    Ok(api::AccessOutput {
-        actor: actor.map(|actor| actor.actor_id.to_string()),
-        graph_id: handle.key.graph_id.to_string(),
-        graph_wide,
-        branch: query.branch,
-        target_branch: query.target_branch,
-        actions,
-    })
-}
-
-fn access_policy_action(access: api::AccessAction) -> PolicyAction {
-    use api::AccessAction as A;
-    match access {
-        A::Read => PolicyAction::Read,
-        A::Export => PolicyAction::Export,
-        A::Change => PolicyAction::Change,
-        A::SchemaApply => PolicyAction::SchemaApply,
-        A::BranchCreate => PolicyAction::BranchCreate,
-        A::BranchDelete => PolicyAction::BranchDelete,
-        A::BranchMerge => PolicyAction::BranchMerge,
-        A::CommitPublish => PolicyAction::CommitPublish,
-        A::CommitDrop => PolicyAction::CommitDrop,
-        A::InvokeQuery => PolicyAction::InvokeQuery,
-    }
+    api::AccessOutput::evaluate(
+        actor.map(|actor| actor.actor_id.to_string()),
+        handle.key.graph_id.to_string(),
+        query.branch,
+        query.target_branch,
+        |access, branch, target_branch| {
+            let request = PolicyRequest {
+                action: access.into(),
+                branch: branch.map(str::to_string),
+                target_branch: target_branch.map(str::to_string),
+            };
+            Ok(matches!(authorize(actor, policy, request)?, Authz::Allowed))
+        },
+    )
 }
 
 #[utoipa::path(

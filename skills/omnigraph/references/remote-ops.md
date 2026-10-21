@@ -118,10 +118,11 @@ route.
   do not replay.
 
 The effect-free conflict details are distinct from a lost response or a recovery
-requirement. Neither HTTP `409`/`503` nor the CLI's generic failure exit `1` is
-a universal retry signal; conditional precondition failure has its own exit `4`
-on data-plane commands (managed `cluster plan`/`apply` use exit `4` for
-recovery required instead).
+requirement. Neither HTTP `409`/`503` nor a CLI failure exit is a universal retry
+signal. On data-plane commands, exit `1` means nothing started, exit `2` that the
+effects are unknown, exit `4` a failed condition such as a precondition, and exit
+`75` a busy refusal that may be retried after `Retry-After` (managed
+`cluster plan`/`apply` use exit `4` for recovery required instead).
 
 ## Read large output safely
 
