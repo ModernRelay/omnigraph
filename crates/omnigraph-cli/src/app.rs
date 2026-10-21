@@ -43,7 +43,8 @@ pub(crate) fn sync_dir(_dir: &std::path::Path) -> io::Result<()> {
 }
 
 /// Invoke the CLI without installing process hooks or terminating the caller.
-/// Clap keeps its original output stream and exit status for help and refusals.
+/// Clap keeps its original output stream for help and refusals; a refused
+/// command line exits 64.
 pub async fn run_from<I, T>(args: I) -> Result<Completion>
 where
     I: IntoIterator<Item = T>,
@@ -52,9 +53,14 @@ where
     let parsed = match invocation::parse_from(args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            // Match Clap's exit contract even when its selected stream is closed.
+            // Help and version succeed; every refused command line is a
+            // usage error, even when Clap's selected stream is closed.
             let _ = error.print();
-            return Ok(Completion::exit(error.exit_code()));
+            return Ok(Completion::exit(if error.exit_code() == 0 {
+                0
+            } else {
+                crate::EXIT_USAGE
+            }));
         }
     };
     let mut stdin = io::stdin();
@@ -83,12 +89,17 @@ async fn execute(
         mut machine,
         explicit_config,
     } = parsed;
-    let classify = command_outcome::applies(&cli);
-    let observe = command_outcome::observes(&cli);
+    let kind = command_outcome::kind(&cli);
+    // A served cluster command reports its own failures; its requests are
+    // observed only so that a refused `--as` assertion exits as a condition.
+    let observe = kind.or_else(|| {
+        command_outcome::observed_unclassified(&cli).then_some(command_outcome::CommandKind::Write)
+    });
     // Rendering runs inside observation. The completion path retains that
     // same evidence when flushing, including after a dispatched write.
     // The dispatch future contains every command variant. Keep that
     // large state off reusable callers' stacks (including libtest threads).
+    let mut stdout = StartedOutput::new(stdout);
     let invocation = Box::pin(run(
         cli,
         explicit_config,
@@ -96,21 +107,58 @@ async fn execute(
         &mut machine,
         stdin,
         stdin_is_terminal,
-        stdout,
+        &mut stdout,
         stderr,
     ));
-    let (result, evidence) = if observe {
-        let (result, evidence) = admission::scope(command_outcome::observe(invocation)).await;
+    let (result, evidence) = if let Some(kind) = observe {
+        let (result, evidence) = admission::scope(command_outcome::observe(kind, invocation)).await;
         (result, Some(evidence))
     } else {
         (admission::scope(invocation).await, None)
     };
-    let (evidence, observed) = if classify {
+    let (evidence, observed) = if kind.is_some() {
         (evidence, None)
     } else {
         (None, evidence)
     };
-    finish(result, evidence, observed, machine, stdout, stderr)
+    let result_started = stdout.started;
+    finish(
+        result,
+        evidence,
+        observed,
+        machine,
+        result_started,
+        &mut stdout,
+        stderr,
+    )
+}
+
+/// A command's stdout, noting whether any of its result reached it. A failure
+/// after part of a result goes to stderr, so stdout keeps a single result.
+struct StartedOutput<'a> {
+    inner: &'a mut dyn Write,
+    started: bool,
+}
+
+impl<'a> StartedOutput<'a> {
+    fn new(inner: &'a mut dyn Write) -> Self {
+        Self {
+            inner,
+            started: false,
+        }
+    }
+}
+
+impl Write for StartedOutput<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.started |= written > 0;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// `evidence` classifies a data command's failure; `observed` only decides
@@ -120,6 +168,7 @@ fn finish(
     evidence: Option<command_outcome::Evidence>,
     observed: Option<command_outcome::Evidence>,
     machine: Option<MachineErrors>,
+    result_started: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
@@ -161,12 +210,21 @@ fn finish(
             .is_none_or(command_outcome::Evidence::has_no_effects)
     {
         let mut body = serde_json::json!({"error": refusal.to_string(), "code": refusal.code});
+        // A target refusal keeps its own exit on the target commands; on a
+        // classified command it exits as its disposition says, and it asks the
+        // caller to fix the destination the command named.
+        let mut exit = 2;
         if let Some(evidence) = evidence {
             let failure = command_outcome::Failure::classify(
                 color_eyre::eyre::eyre!(refusal.to_string()),
                 evidence,
             );
-            body["disposition"] = serde_json::to_value(failure.disposition())?;
+            let mut disposition = failure.disposition();
+            if disposition.effects == omnigraph_api_types::DispositionEffects::None {
+                disposition.action = omnigraph_api_types::DispositionAction::Fix;
+            }
+            body["disposition"] = serde_json::to_value(disposition)?;
+            exit = failure.exit;
         }
         match machine {
             Some(format) => {
@@ -178,12 +236,18 @@ fn finish(
                 stderr.flush()?;
             }
         }
-        return Ok(Completion::exit(2));
+        return Ok(Completion::exit(exit));
     }
     if let Some(evidence) = evidence {
         let failure = command_outcome::Failure::classify(error, evidence);
         let delivered = (|| -> Result<()> {
             match machine {
+                // Part of the result already reached stdout, so the failure
+                // envelope goes to stderr and stdout keeps one result.
+                Some(format) if result_started => {
+                    write_machine(&failure, format, stderr)?;
+                    stderr.flush()?;
+                }
                 Some(format) => {
                     write_machine(&failure, format, stdout)?;
                     stdout.flush()?;
@@ -278,6 +342,15 @@ fn write_machine<T: Serialize>(
             Ok(())
         }
     }
+}
+
+/// The exit for an error `run_from` returns: a classified failure that could
+/// not be delivered keeps the exit its outcome chose, since a write may have
+/// committed; every other error exits 1.
+pub fn exit_code(error: &color_eyre::Report) -> i32 {
+    error
+        .downcast_ref::<UndeliveredFailure>()
+        .map_or(1, |undelivered| undelivered.failure.exit)
 }
 
 #[derive(Debug)]

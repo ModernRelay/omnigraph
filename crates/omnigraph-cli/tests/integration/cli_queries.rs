@@ -589,18 +589,22 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
                 .arg("--json"),
         );
         let mut actual = parse_stdout_json(&output);
-        if verb == "mutate" {
-            assert_eq!(actual["http_status"], 400);
-            assert_eq!(
-                actual["disposition"],
+        // A read changes nothing; an untyped refusal of a write leaves its
+        // effects unknown.
+        assert_eq!(actual["http_status"], 400);
+        assert_eq!(
+            actual["disposition"],
+            if verb == "mutate" {
                 serde_json::json!({
                     "effects":"unknown", "action":"reconcile"
                 })
-            );
-            let fields = actual.as_object_mut().unwrap();
-            fields.remove("http_status");
-            fields.remove("disposition");
-        }
+            } else {
+                serde_json::json!({"effects":"none", "action":"fix"})
+            }
+        );
+        let fields = actual.as_object_mut().unwrap();
+        fields.remove("http_status");
+        fields.remove("disposition");
         assert_eq!(
             actual, refusal,
             "{verb} must preserve every original server field"
@@ -1026,7 +1030,23 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
                     "{output:?}"
                 );
             } else {
-                assert_eq!(parse_stdout_json(&output), refusal, "{output:?}");
+                // An alias is a read: its refusal reports the disposition a
+                // `query` does, with no effects.
+                let mut reported = parse_stdout_json(&output);
+                assert_eq!(
+                    reported["disposition"],
+                    serde_json::json!({"effects":"none","action":"refresh"}),
+                    "{output:?}"
+                );
+                assert_eq!(reported["http_status"], 403, "{output:?}");
+                let reported = reported.as_object_mut().unwrap();
+                reported.remove("disposition");
+                reported.remove("http_status");
+                assert_eq!(
+                    serde_json::Value::Object(reported.clone()),
+                    refusal,
+                    "{output:?}"
+                );
                 assert!(
                     !stderr_string(&output).contains("captured alias denied"),
                     "{output:?}"

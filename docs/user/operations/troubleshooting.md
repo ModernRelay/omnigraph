@@ -75,7 +75,7 @@ the same way. See [Diagnostics](../queries/diagnostics.md).
 
 ## Failed data-write commands
 
-Every server error body, and every CLI data-write failure, carries a
+Every server error body, and every CLI data-write and read failure, carries a
 `disposition`: `effects` is `none`, `partial` or `unknown`, and `action` is
 `fix`, `refresh`, `retry`, `recover` or `reconcile`. The server decides it for
 the request it answered by the first row that matches:
@@ -100,9 +100,13 @@ could not settle answers `500`.
 
 The CLI reports the server's disposition when that request was the command's
 only effectful one, and otherwise its own account of the whole command, so a
-lost response is `unknown` with `reconcile`. JSON mode writes the failure to
-stdout; human mode prints the `disposition` line on stderr. HTTP failures also
-retain `http_status` and, when present, the original `retry_after` string.
+lost response is `unknown` with `reconcile`. A read command changes nothing, so
+its failure always has `effects: none`. JSON mode writes the failure to stdout,
+or to stderr when part of the result, such as a streamed page, already reached
+stdout, so stdout holds one document. Human mode prints the `disposition` line
+on stderr. A target refusal on these commands exits 1 with `action: fix`. HTTP
+failures also retain `http_status` and, when present, the original
+`retry_after` string.
 
 This includes `commit publish` and `commit drop`, as well as their `mutate`
 statement forms. If a response or result output is lost, inspect the commit's
@@ -110,14 +114,26 @@ current state before another attempt; an output failure does not undo the write.
 The same applies to `load`, `blob put`, `blob clear` and `schema apply`: a closed
 output pipe or failed result flush can follow a successful write. The CLI exits with a failure
 and does not repeat the operation. If stdout cannot carry a JSON failure, stderr
-reports the undelivered diagnostic and its disposition.
+reports the undelivered diagnostic and its disposition, and the exit still
+follows it.
+
+For the data commands the CLI classifies (queries, reads, `load`, `mutate`,
+branch, commit, schema and Blob commands, and aliases), the
+exit follows from the disposition:
 
 | CLI exit | What to do |
 |---:|---|
 | 0 | The operation succeeded or was a no-op. A merge can separately report a source-deletion failure without losing its successful result. |
-| 4 | The server verified the requested write precondition failed with no earlier command effects. Re-read the branch and choose a new precondition deliberately. |
-| 75 | The server's typed admission refusal proves this whole command did not start. Honor `Retry-After` and bound any caller retry. |
-| 1 | Inspect the action and details. A conflict, resource limit, unavailable server, incomplete response or lost connection does not by itself permit repeating the write. |
+| 1 | `effects: none`: the command changed nothing. Inspect the action and details, correct the cause and run it again. |
+| 2 | `effects: unknown` or `partial`: the command may have had effects, or an earlier step of it did. Read the target, and reconcile or recover as `action` says, before another attempt; a conflict, resource limit, incomplete response or lost connection does not by itself permit repeating the write. |
+| 4 | A condition you set did not hold, with no earlier command effects: a verified write precondition or an `--as` assertion. Re-read the branch and choose a new precondition deliberately. |
+| 75 | `effects: none` with `retry`: the server refused before starting, as when the actor is busy. Honor `Retry-After` and bound any caller retry. |
+| 64 | The argument parser refused the command line before anything ran (`EX_USAGE`); an addressing refusal inside a command, such as two scope flags, exits 1. |
+
+Maintenance commands (`init`, `upgrade`, `optimize`, `rebuild-full-text-indexes`,
+`repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy`,
+`target`, `credential` and the managed commands keep their own exits for now:
+their exit 1 does not by itself say that nothing changed, so read their report.
 
 A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
 `api_contract_mismatch` exits 1 with `effects: none`, and `action: refresh` for
@@ -141,9 +157,15 @@ deciding. `recover` means finish the reported recovery obligation.
 attempt. Only `retry` with exit 75 grants the bounded retry described above; the
 CLI performs no automatic retry.
 
-The disposition covers the entire command. A later refused subrequest cannot undo
-an earlier branch creation, load or publication. Embedded load conflicts and
-conditional mismatches remain exit 1: writable open can complete earlier work.
+The disposition covers the entire command. A later refused subrequest cannot
+undo an earlier branch creation, load or publication. An embedded write's own
+refusal says what the engine did, projected as a server would project it: a
+policy refusal precedes every publication, a `load --from` fork included, so it
+has `effects: none` on both planes. The engine marks an error that follows a
+fork which did publish: a typed refusal then has `effects: partial` on both
+planes, and an error the engine cannot prove wrote nothing has `unknown`. A
+`load --from` onto a branch that already exists forks nothing. Any later
+failure, such as rendering a committed receipt, stays `unknown`.
 Disconnecting an admitted HTTP write does not cancel it: the server keeps
 running the original operation, and a lost response can leave the caller's
 outcome unknown. There is no durable request-result lookup in this release.

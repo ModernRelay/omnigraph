@@ -107,9 +107,9 @@ merged-parent ids, optional `actor_id`, and `created_at` in Unix microseconds. A
 that changes no entities returns `"commit": null`. On every target `load --json` prints the body of
 `POST /graphs/{id}/load/ndjson`, with the write's `actor_id` and a `base_branch` that is `null` without `--from`.
 
-`--json` and read `--format json` preserve structured errors on stdout. Data-write failures
-report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands).
-Verified HTTP conditional mismatches exit 4; embedded mismatches exit 1 because writable open can complete earlier work.
+`--json` and read `--format json` preserve structured errors on stdout. Data-write and read failures
+report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands); a refused command line exits 64.
+Verified conditional mismatches exit 4, embedded or served, when nothing else in the command ran.
 
 ### Conditional mutations
 
@@ -122,7 +122,7 @@ omnigraph mutate update_person --query queries.gq --target ./graph.omni \
 `--if-commit` runs the mutation only while the target branch is still at that
 commit. Any intervening commit on the branch invalidates the condition, even
 when it changed unrelated data. A mismatch has no effect and exits with code
-4 against a server, 1 on an embedded `--target` run; JSON output includes `precondition_failure` with `expected` and optional
+4, against a server or embedded; JSON output includes `precondition_failure` with `expected` and optional
 `actual` commit ids. Re-read and decide again instead of retrying blindly.
 
 ## Storage upgrade
