@@ -46,7 +46,7 @@ prints the exact flags of the installed binary.
 | `repair` | — | Report foreign Lance history without adopting it |
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
-| `queries` | `validate` `list` | Check or list a cluster's stored queries |
+| `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
 | `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a managed account target; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
@@ -339,10 +339,14 @@ deletion and `optimize` leave this reclamation to `cleanup`.
 ```bash
 omnigraph queries validate --target .              # type-check every applied registry
 omnigraph queries list --target . --graph knowledge # list names and typed params
+omnigraph queries list --target prod --graph knowledge --json # a server's catalog
 ```
 
-`queries` operates on applied cluster state, not a graph URI. `validate`
-checks every registry against its applied schema; `list` may select one graph.
+`validate` operates on applied cluster state, not a graph URI, and checks every
+registry against its applied schema. `list` reads a direct cluster root, where
+`--graph` may select one graph, or one served graph, which a server target
+selects with `--graph` or its `default_graph`; there `--json` prints the body of
+`GET /graphs/{id}/queries`.
 Distinct from `lint`, which validates authoring source. See
 [`stored-queries.md`](stored-queries.md).
 
