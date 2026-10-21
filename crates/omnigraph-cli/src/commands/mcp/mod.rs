@@ -39,6 +39,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::io::Write;
+use std::rc::Rc;
 use std::time::Duration;
 
 use color_eyre::Result;
@@ -190,11 +191,11 @@ pub(crate) async fn run(
                             break ended;
                         }
                     }
-                    Dispatch::Request { id, tool, future } => {
+                    Dispatch::Request { id, class, future } => {
                         read += 1;
                         let seq = read;
                         let (abort, registration) = AbortHandle::new_pair();
-                        pending.insert(seq, Pending { id, tool, abort });
+                        pending.insert(seq, Pending { id, class, abort });
                         in_flight.push(
                             async move { (seq, Abortable::new(future, registration).await) }
                                 .boxed_local(),
@@ -219,29 +220,19 @@ pub(crate) async fn run(
     };
     let mut unanswered: Vec<(u64, Pending)> = pending.into_iter().collect();
     unanswered.sort_by_key(|(seq, _)| *seq);
-    let mut unanswered: Vec<(Value, Option<String>)> = unanswered
+    // Judged by the class each call took when it was sent: one not sent yet
+    // had no effects.
+    let mut unanswered: Vec<(Value, bool)> = unanswered
         .into_iter()
-        .map(|(_, request)| (request.id, request.tool))
+        .map(|(_, request)| (request.id, request.class.get() == Some(Effect::MayWrite)))
         .collect();
     // The handshake relayed in order calls no tool.
     if let Some((Some(id), _)) = ordered.take() {
-        unanswered.push((id, None));
+        unanswered.push((id, false));
     }
     // Dropping the relays drops their exchanges.
     drop(ordered);
     drop(in_flight);
-    // Judged against the tools as the server last listed them: a call the
-    // bridge admitted was listed by then, and one it has not seen listed may
-    // write.
-    let unanswered: Vec<(Value, bool)> = unanswered
-        .into_iter()
-        .map(|(id, tool)| {
-            let may_write = tool
-                .as_deref()
-                .is_some_and(|tool| relay.tool_may_write(tool));
-            (id, may_write)
-        })
-        .collect();
     let mut ended = ended;
     if !matches!(ended, Ended::Failed(_)) {
         let answers: Vec<String> = unanswered
@@ -270,10 +261,25 @@ pub(crate) async fn run(
 /// A request relayed concurrently, by the order it was read in.
 struct Pending {
     id: Value,
-    /// The tool a `tools/call` names.
-    tool: Option<String>,
+    /// The effect class it was sent with, once sent.
+    class: SentClass,
     abort: AbortHandle,
 }
+
+/// What a request could do once sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Effect {
+    /// A call the server annotates read-only, or any other request.
+    None,
+    /// A call that may write: a tool not annotated read-only, or one not yet
+    /// listed, on a bridge started with `--write`.
+    MayWrite,
+}
+
+/// A request's effect class, recorded when it is sent and read when its
+/// answer is lost or the bridge stops. Taken then, it cannot change when a
+/// later lost answer clears the tools the bridge knows.
+type SentClass = Rc<Cell<Option<Effect>>>;
 
 /// The answer to a call that may have written and whose outcome the bridge
 /// cannot know: the agent reads the target and reconciles before replaying.
@@ -408,8 +414,8 @@ enum Dispatch<'r> {
     /// Relay a request beside the others in flight.
     Request {
         id: Value,
-        /// The tool a `tools/call` names.
-        tool: Option<String>,
+        /// Its effect class, recorded when it is sent.
+        class: SentClass,
         future: LocalBoxFuture<'r, Answer>,
     },
     /// Relay a message before reading the next line.
@@ -466,16 +472,18 @@ impl Relay<'_, '_> {
         match kind {
             Inbound::Request { id, method } if method == "initialize" => Dispatch::Ordered {
                 id: Some(id.clone()),
-                future: self.request(id, method, message, raw).boxed_local(),
+                future: self
+                    .request(id, method, message, raw, SentClass::default())
+                    .boxed_local(),
             },
-            Inbound::Request { id, method } => Dispatch::Request {
-                id: id.clone(),
-                tool: (method == "tools/call")
-                    .then(|| message.pointer("/params/name").and_then(Value::as_str))
-                    .flatten()
-                    .map(str::to_string),
-                future: self.request(id, method, message, raw).boxed_local(),
-            },
+            Inbound::Request { id, method } => {
+                let class = SentClass::default();
+                Dispatch::Request {
+                    id: id.clone(),
+                    class: Rc::clone(&class),
+                    future: self.request(id, method, message, raw, class).boxed_local(),
+                }
+            }
             Inbound::Notification { method } => Dispatch::Ordered {
                 id: None,
                 future: self.forward(Some(method), message, raw).boxed_local(),
@@ -504,7 +512,14 @@ impl Relay<'_, '_> {
 
     /// Relay a request once, and answer it with the server's answer or the
     /// reason there is none.
-    async fn request(&self, id: Value, method: String, message: Value, raw: Vec<u8>) -> Answer {
+    async fn request(
+        &self,
+        id: Value,
+        method: String,
+        message: Value,
+        raw: Vec<u8>,
+        class: SentClass,
+    ) -> Answer {
         let mut admitted = self.binding.borrow().admit(&method, &message);
         if admitted == Admit::ListTools {
             admitted = match self.list_tools(&message).await {
@@ -541,10 +556,12 @@ impl Relay<'_, '_> {
             None => raw,
         };
         let routing = self.routing(Some(&method), sent);
+        let effect = self.effect(&method, sent);
+        class.set(Some(effect));
         let delivery = self.upstream.post(body, &routing).await;
         let messages = match delivery {
             Delivery::Messages(messages) => messages,
-            other => return vec![self.unanswered(&id, &method, sent, other).to_string()],
+            other => return vec![self.unanswered(&id, &method, effect, other).to_string()],
         };
         let mut lines = Vec::new();
         let mut responded = false;
@@ -590,26 +607,26 @@ impl Relay<'_, '_> {
         lines
     }
 
-    /// Whether `message` is a call that may have effects once sent: a tool
-    /// the server does not annotate read-only, or one not yet listed, on a
-    /// bridge started with `--write`. Without it no such call is ever sent.
-    fn may_write(&self, method: &str, message: &Value) -> bool {
-        method == "tools/call"
+    /// The effect class of `message` as it is sent. Without `--write` no
+    /// call that may write is ever sent.
+    fn effect(&self, method: &str, message: &Value) -> Effect {
+        let binding = self.binding.borrow();
+        let may_write = method == "tools/call"
+            && binding.admits_writes()
             && message
                 .pointer("/params/name")
                 .and_then(Value::as_str)
-                .is_some_and(|tool| self.tool_may_write(tool))
-    }
-
-    /// Whether a call to `tool` may have had effects: see [`Self::may_write`].
-    fn tool_may_write(&self, tool: &str) -> bool {
-        let binding = self.binding.borrow();
-        binding.admits_writes() && binding.may_write(tool)
+                .is_some_and(|tool| binding.may_write(tool));
+        if may_write {
+            Effect::MayWrite
+        } else {
+            Effect::None
+        }
     }
 
     /// The JSON-RPC error a request is answered with when the server sent no
     /// JSON-RPC answer to it. Nothing is ever sent again.
-    fn unanswered(&self, id: &Value, method: &str, sent: &Value, delivery: Delivery) -> Value {
+    fn unanswered(&self, id: &Value, method: &str, effect: Effect, delivery: Delivery) -> Value {
         let message = self.describe(&delivery);
         self.log.line(format_args!("`{method}` failed: {message}"));
         // The server's own error body beside its status, as its MCP refusals
@@ -629,9 +646,8 @@ impl Relay<'_, '_> {
                 data
             }
             Delivery::Lost(lost) => {
-                let may_write = self.may_write(method, sent);
                 self.binding.borrow_mut().forget();
-                if may_write {
+                if effect == Effect::MayWrite {
                     return outcome_unknown(id.clone(), &message);
                 }
                 wire::refusal_data(lost.code(), DispositionEffects::None, &message)
@@ -748,7 +764,7 @@ impl Relay<'_, '_> {
                 .await;
             let Delivery::Messages(messages) = delivery else {
                 let message = self.describe(&delivery);
-                let answered = self.unanswered(&id, "tools/list", &request, delivery);
+                let answered = self.unanswered(&id, "tools/list", Effect::None, delivery);
                 return Err((message, answered["error"]["data"].clone()));
             };
             let Some(answer) = messages

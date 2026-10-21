@@ -1186,6 +1186,17 @@ fn mcp_reports_unreachable_servers_and_lost_answers_without_resending() {
     assert_eq!(endpoint.received(2).len(), 1);
     assert_eq!(endpoint.received(3).len(), 1);
 
+    // Each call keeps the class it was sent with: the first lost answer
+    // clears the tools the bridge knows, and the second read is still a read.
+    bridge.send(&tool_call(20, "drop_read", json!({})));
+    bridge.send(&tool_call(21, "drop_read", json!({})));
+    for _ in 0..2 {
+        let lost = bridge.answer();
+        let body = &lost["error"]["data"]["error"];
+        assert_eq!(body["code"], "service_unavailable", "{lost}");
+        assert_eq!(body["disposition"]["effects"], "none", "{lost}");
+    }
+
     #[cfg(not(unix))]
     bridge.finish().assert_success();
     // Stopped while a write and a read are in flight, the bridge answers
@@ -1201,6 +1212,13 @@ fn stopped_with_calls_in_flight(mut bridge: Bridge, endpoint: &McpEndpoint) {
     bridge.send(&tool_call(4, "slow_write", json!({})));
     bridge.send(&tool_call(5, "slow", json!({})));
     endpoint.await_slow(2);
+    // A lost answer meanwhile clears the tools the bridge knows; the calls
+    // in flight keep the classes they were sent with.
+    let lost = bridge.tool(6, "drop_read", json!({}));
+    assert_eq!(
+        lost["error"]["data"]["error"]["code"], "service_unavailable",
+        "{lost}"
+    );
     let pid = i32::try_from(bridge.child.id()).unwrap();
     // SAFETY: `kill` takes a process id and a signal number, and the child
     // is this test's own process.

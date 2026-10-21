@@ -98,7 +98,8 @@ refusals stay the server's.
 The bridge relays up to 16 requests at once, the server's own limit, and
 answers them as they complete. It applies `notifications/cancelled` itself: the
 cancelled request's exchange is dropped and it gets no answer, unless its answer
-was already written. It never sends a request again:
+was already written. A cancelled write may still have landed: read the target
+before running it again. It never sends a request again:
 
 | Failure | JSON-RPC error `data` |
 |---|---|
