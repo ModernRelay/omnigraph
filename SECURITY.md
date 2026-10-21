@@ -43,7 +43,8 @@ releases are welcome, but the fix ships in a new release, not a backport.
 
 In scope: the code in this repository and the release artifacts built from it,
 namely the `omnigraph` and `omnigraph-server` binaries, the
-`ghcr.io/modernrelay/omnigraph-server` container image and the install script.
+`modernrelay/omnigraph-server` container images on Docker Hub and GHCR, and
+the install script.
 
 Out of scope: the configuration of the services a deployment relies on, such
 as storage bucket policies and encryption, the identity provider, the
