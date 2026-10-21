@@ -98,7 +98,7 @@ revision. Retained roots, trust and storage format stay fixed. Removing a graph
 from desired configuration deletes its exact managed root, including all branches,
 retained history and managed Blob bytes. It does not follow external Blob
 references or delete peer roots. Adoption, missing-root recreation and catalog
-repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.13.
+repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.14.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
@@ -234,8 +234,17 @@ Late fresh files remain unreachable and a conditional create cannot replace
 an existing publication. Such requests settle at the physical scope after
 an error or cancellation, including multipart uploads. This does not prove
 that a graph publication failed: the catalogue still owns the outcome of an
-unacknowledged numbered-manifest publication, and its uncertainty reaches the
-logical operation owner independently of the storage scope.
+unacknowledged numbered-manifest publication. The commit handler every
+dataset uses re-issues an ambiguous manifest request until the store answers
+it and records whether a request was sent; the publisher marks a failure with
+no request sent, or one the store refused, `Unpublished`, and only an outcome
+its read-back cannot settle reaches the logical operation owner as uncertain.
+Lance deletes an attempt's transaction file only when the handler calls a
+missing version definitive, and only the commit's own request record may say
+so: the catalog's per-commit handler answers from its probe, and a dataset's
+shared handler never does. A manifest that lands late therefore finds its
+transaction file on every open path; the transaction-delete hold below is the
+served process's second line.
 
 Refs, version hints, cluster control objects, unknown paths, if-match
 replacements and recursive deletes remain conservative. A cancelled or
@@ -352,7 +361,7 @@ revision alone. Old-ID submission validates immutable input and returns the
 original record before graph closure; it cannot reinstall an old view. Boot
 digests remain boot facts. Explicit OIDC public-admission refresh is separate below.
 
-Protected graph and registry HTTP calls require the v0.13 contract header after
+Protected graph and registry HTTP calls require the v0.14 contract header after
 authentication and before graph resolution. CLI discovery and response validation
 are specified by [wire compatibility](versioning.md#wire-compatibility); the
 managed control-plane API and standard MCP/OAuth protocols are separate surfaces.
@@ -433,7 +442,9 @@ a failure it proves left the graph unchanged, before any effect or after
 detached effects no manifest names (`BeforeEffect`, `Unpublished`), is
 not itself a reason for logical containment, whatever status it maps to,
 including a 500. Mutation, load, Blob write and merge mark opaque errors (storage, I/O, DataFusion, internal) at their pre-publication
-steps, alongside the table store's staged-write and detached-commit sites.
+steps, alongside the table store's staged-write and detached-commit sites,
+and the publisher marks every failure whose manifest request cannot land.
+A contained write logs the failure's redacted class before admission closes.
 A typed refusal keeps its shape. Other opaque schema and maintenance
 preparation errors without completion evidence still fail closed as uncertain. Proven publication followed by
 `RecoveryRequired`, and uncertain publication itself, are never downgraded.

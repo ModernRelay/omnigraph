@@ -18,6 +18,9 @@ pub(crate) enum Requirement {
     Standalone,
     Registry,
     Root,
+    /// A whole direct root, optionally filtered by `--graph`, or one served
+    /// graph: the server answers per graph, so a server target selects one.
+    RootOrServedGraph,
     Deployment,
     ManagedAccount,
     ManagedCluster,
@@ -104,7 +107,13 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
             }
         }
         Command::Graphs { .. } => Registry,
-        Command::Queries { .. } | Command::Policy { .. } => Root,
+        Command::Queries {
+            command: QueriesCommand::List { .. },
+        } => RootOrServedGraph,
+        Command::Queries {
+            command: QueriesCommand::Validate { .. },
+        }
+        | Command::Policy { .. } => Root,
         Command::Cluster { command } => match command {
             ClusterCommand::Validate { .. } => Local,
             ClusterCommand::Plan { .. }
@@ -138,8 +147,18 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
 pub(crate) fn root_input(command: &Command) -> bool {
     matches!(
         requirement(command),
-        Requirement::Root | Requirement::Deployment
+        Requirement::Root | Requirement::RootOrServedGraph | Requirement::Deployment
     )
+}
+
+/// Whether the operation addresses one graph of `target`, so `--graph` or the
+/// target's `default_graph` must select it before any I/O.
+pub(crate) fn selects_graph(command: &Command, target: &ResolvedTarget) -> bool {
+    match requirement(command) {
+        Requirement::Graph { .. } => true,
+        Requirement::RootOrServedGraph => matches!(target.binding, TargetBinding::Server { .. }),
+        _ => false,
+    }
 }
 
 /// Flag applicability does not acquire configuration or a credential.
@@ -148,7 +167,12 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     if matches!(need, Requirement::Local | Requirement::Alias) && cli.target.is_some() {
         bail!("{} does not accept --target", command_label(&cli.command));
     }
-    if cli.graph.is_some() && !matches!(need, Requirement::Graph { .. } | Requirement::Root) {
+    if cli.graph.is_some()
+        && !matches!(
+            need,
+            Requirement::Graph { .. } | Requirement::Root | Requirement::RootOrServedGraph
+        )
+    {
         bail!("{} does not accept --graph", command_label(&cli.command));
     }
     if cli.graph.is_some() && matches!(&cli.command, Command::Cluster { .. }) {
@@ -162,7 +186,8 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 
 /// An explicit actor applies only to an actor-consuming operation. Match mixed
 /// families exhaustively so new leaves need a decision; read-only families
-/// refuse as a whole. Served targets still derive identity from credentials.
+/// refuse as a whole. A served target still derives identity from its
+/// credential and carries `--as` as the `Omnigraph-If-Actor` assertion.
 fn accepts_actor(command: &Command) -> bool {
     match command {
         Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => true,
@@ -192,7 +217,8 @@ fn accepts_actor(command: &Command) -> bool {
         },
         Command::Cluster { command } => match command {
             // Plan checks the intended actor; apply and upgrade attribute it.
-            // validate_target separately refuses --as on served/managed targets.
+            // A served plan or apply asserts it; validate_target refuses
+            // --as on managed targets.
             ClusterCommand::Plan { .. }
             | ClusterCommand::Apply { .. }
             | ClusterCommand::UpgradeLedger { .. } => true,
@@ -249,7 +275,9 @@ pub(crate) fn validate_target(
     let need = requirement(&cli.command);
     let allowed = match (&need, &target.binding) {
         (Graph { .. } | Standalone, DirectGraph { .. }) => true,
-        (Graph { root: true, .. } | Root | Deployment, DirectRoot { .. }) => true,
+        (Graph { root: true, .. } | Root | RootOrServedGraph | Deployment, DirectRoot { .. }) => {
+            true
+        }
         (
             Graph {
                 catalogue: true, ..
@@ -261,6 +289,7 @@ pub(crate) fn validate_target(
                 direct_only: false, ..
             }
             | Registry
+            | RootOrServedGraph
             | Deployment
             | Authentication
             | Credential
@@ -305,9 +334,11 @@ pub(crate) fn validate_target(
     if cli.graph.is_some() && matches!(target.binding, DirectGraph { .. } | DirectCatalogue) {
         bail!("a direct graph or catalogue target already identifies its graph; remove --graph");
     }
-    if cli.as_actor.is_some() && matches!(target.binding, Server { .. } | Managed(_)) {
+    // A served target derives identity from its credential and sends `--as`
+    // as an assertion the server checks; a managed target asserts nothing.
+    if cli.as_actor.is_some() && matches!(target.binding, Managed(_)) {
         bail!(
-            "--as is only available for direct operations; a served target derives identity from its credential"
+            "--as is not available for a managed target; it derives identity from its credential"
         );
     }
     if matches!(

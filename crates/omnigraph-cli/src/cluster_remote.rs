@@ -151,11 +151,18 @@ struct RemoteCluster {
 }
 
 impl RemoteCluster {
-    fn new(input: &crate::operator::InvocationConfig, target: &ResolvedTarget) -> Result<Self> {
+    /// `expected_actor` is the actor `--as` asserts: every request carries
+    /// it, and the server refuses one whose credential resolves to another.
+    fn new(
+        input: &crate::operator::InvocationConfig,
+        target: &ResolvedTarget,
+        expected_actor: Option<&str>,
+    ) -> Result<Self> {
         let TargetBinding::Server { endpoint, auth, .. } = &target.binding else {
             bail!("remote cluster operations require a server target");
         };
-        let client = GraphHttpClient::server_target(input, target)?;
+        let client =
+            GraphHttpClient::server_target(input, target)?.with_expected_actor(expected_actor);
         let token = crate::targets::resolve_server_token(input, auth, endpoint)?;
         Ok(Self {
             root: endpoint.clone(),
@@ -471,6 +478,7 @@ pub(crate) async fn run(
     input: &crate::operator::InvocationConfig,
     command: &ClusterCommand,
     target: &ResolvedTarget,
+    expected_actor: Option<&str>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
@@ -497,7 +505,7 @@ pub(crate) async fn run(
     ) {
         bail!("this cluster operation is not supported by a server target");
     }
-    let remote = RemoteCluster::new(input, target)?;
+    let remote = RemoteCluster::new(input, target, expected_actor)?;
     match command {
         ClusterCommand::Plan { config, json, .. } => {
             remote
@@ -674,7 +682,7 @@ mod tests {
             };
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let error = run(&input, &command, &target, &mut out, &mut err)
+            let error = run(&input, &command, &target, None, &mut out, &mut err)
                 .await
                 .unwrap_err();
             assert!(

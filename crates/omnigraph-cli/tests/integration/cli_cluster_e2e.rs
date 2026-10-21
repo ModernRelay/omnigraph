@@ -524,7 +524,7 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
             "missing.json",
             "--json",
         ]));
-        assert_eq!(refused.status.code(), Some(2));
+        assert_eq!(refused.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&refused.stderr).contains("unexpected argument"));
         for args in [
             vec!["cluster", "upgrade-ledger", "--writers-stopped"],
@@ -613,7 +613,7 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
         assert!(status["lock_id"].is_null());
         assert_eq!(status["next_sequence"], 3);
         let conflict = output_failure(&mut rooted(&["status", "--config", "."]));
-        assert_eq!(conflict.status.code(), Some(2));
+        assert_eq!(conflict.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&conflict.stderr).contains("unexpected argument"));
     }
 }
@@ -849,7 +849,7 @@ fn cluster_e2e_removed_v1_commands_are_not_executable() {
                 .args(["cluster", command, "--config"])
                 .arg(temp.path()),
         );
-        assert_eq!(refused.status.code(), Some(2));
+        assert_eq!(refused.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&refused.stderr).contains("unrecognized subcommand"));
         assert!(!temp.path().join("__cluster").exists());
     }

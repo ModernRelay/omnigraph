@@ -38,10 +38,11 @@ pub(crate) struct Cli {
     pub(crate) target: Option<String>,
 
     /// Actor id for direct-engine writes and actor-bound cluster operations;
-    /// overrides `operator.actor`. Served targets reject this option and
-    /// resolve the actor from the credential. With a policy configured
-    /// but no actor set, the operation is denied — see
-    /// docs/user/operations/policy.md.
+    /// overrides `operator.actor`. On a served write it is an assertion: the
+    /// request carries `omnigraph-if-actor`, and the server refuses it
+    /// before anything runs when the bearer token resolves to another actor.
+    /// With a policy configured but no actor set, a direct operation is
+    /// denied — see docs/user/operations/policy.md.
     #[arg(long = "as", global = true, value_name = "ACTOR", value_parser = crate::invocation::single_selector("--as"))]
     pub(crate) as_actor: Option<String>,
 

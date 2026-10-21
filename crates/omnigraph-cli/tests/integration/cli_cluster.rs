@@ -89,6 +89,53 @@ fn lifecycle_fixture(replies: Vec<IntentReply>) -> IntentApiFixture {
     IntentApiFixture::with_session(replies, lifecycle_session("principal-one", "account-one"))
 }
 
+/// `--as` on a served cluster command asserts the actor; the server refuses
+/// another one before any effect, so the command exits 4 having sent nothing
+/// that could change the cluster, with and without `--json`.
+#[test]
+fn as_on_a_served_cluster_command_exits_4_on_another_actor() {
+    let refusal = serde_json::json!({
+        "error": "the credential resolves to actor 'act-real', not the expected 'act-nope'",
+        "code": "actor_mismatch"
+    });
+    let root = tempdir().unwrap();
+    write_cluster_config_fixture(root.path());
+    for command in ["plan", "apply"] {
+        for json in [true, false] {
+            let api = IntentApiFixture::graph(vec![IntentReply::json(412, refusal.clone())]);
+            let mut cmd = cli();
+            cmd.args(["cluster", command, "--target", &api.origin])
+                .args(["--as", "act-nope", "--config"])
+                .arg(root.path());
+            if json {
+                cmd.arg("--json");
+            }
+            let output = cmd.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(4),
+                "{command} json={json}: {output:?}"
+            );
+            if json {
+                assert_eq!(parse_stdout_json(&output)["code"], "actor_mismatch");
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("act-nope"),
+                    "{command}: {output:?}"
+                );
+            }
+            let requests = api.workflow_requests();
+            assert_eq!(requests.len(), 1, "{command}: {requests:?}");
+            assert_eq!(requests[0].method, "GET", "{command}: {requests:?}");
+            assert_eq!(
+                requests[0].headers["omnigraph-if-actor"], "act-nope",
+                "{command}: {requests:?}"
+            );
+            api.assert_complete();
+        }
+    }
+}
+
 #[test]
 fn core_remote_status_uses_only_the_selected_target_credential() {
     let status = serde_json::json!({"status":{"canonical_root":"file:///server-only-storage","ledger_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","state_revision":1,"result_revision":0,"next_sequence":1,"lock_id":"server-owner","outstanding_id":null,"lookup":null},"active":false,"in_progress":false});
@@ -170,7 +217,7 @@ fn core_remote_retired_selectors_refuse_before_operator_or_backend_access() {
             &api.origin,
             "--json",
         ]));
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
     assert!(api.requests().is_empty());
@@ -1197,7 +1244,7 @@ fn managed_cluster_members_requires_cluster_target_and_rejects_duplicate_selecto
                 .args(["members", "list", "--json"])
                 .args(args),
         );
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
     }
     assert!(api.requests().is_empty());
     assert_no_core_effects(temp.path());
@@ -1513,7 +1560,7 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
             .arg("--json")
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
     assert!(api.workflow_requests().is_empty());
@@ -1607,7 +1654,7 @@ fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain
                 "--json",
             ],
             "target_incompatible",
-            "--as is only available for direct operations",
+            "--as is not available for a managed target",
         ),
         (
             vec![
@@ -1628,7 +1675,10 @@ fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain
             .args(&args)
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        // A data command's target refusal exits by its disposition; the
+        // cluster commands keep the target refusal's own exit.
+        let exit = if args[0] == "cluster" { 2 } else { 1 };
+        assert_eq!(output.status.code(), Some(exit), "{args:?}: {output:?}");
         let problem = parse_stdout_json(&output);
         assert_eq!(problem["code"], code, "{args:?}: {problem}");
         assert!(
@@ -3456,7 +3506,7 @@ fn managed_operation_rejects_retired_organization_override_before_authentication
         "foreign",
         "--json",
     ]));
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(64));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     assert!(api.requests().is_empty());
 }
@@ -3856,7 +3906,7 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
             command.arg("https://other.example");
         }
         let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
     }
     let output = organization_cli(temp.path(), &api.origin)
         .args(["members", "list", "--organization", "foreign", "--json"])

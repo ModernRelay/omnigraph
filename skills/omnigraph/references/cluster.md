@@ -90,7 +90,9 @@ omnigraph query find_person --target production --params '{"name":"Alice"}' --js
 A named server target sends only its endpoint-bound credential. Inline HTTP or
 Unix addresses use the deepest matching configured endpoint credential, or none.
 The server derives the actor from authentication;
-`--as` is direct-only. The applied policy must grant `config_manage`, plus graph
+`--as` on a server `plan` or `apply` only asserts it, and another actor is
+refused with `actor_mismatch` and exit 4 before anything is submitted. The
+applied policy must grant `config_manage`, plus graph
 permissions required by schema changes or deletion. Proposed permissions cannot
 authorize their own installation.
 

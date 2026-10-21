@@ -89,7 +89,7 @@ exits `4`; HTTP returns `412` with `precondition_failure: {expected, actual?}`.
 Re-read and decide again. Fetching a head id after the read does not close the
 race.
 
-Over HTTP, beside the `Omnigraph-Http-Api: 0.13` header every graph request
+Over HTTP, beside the `Omnigraph-Http-Api: 0.14` header every graph request
 needs, send the raw id in the `Omnigraph-If-Graph-Commit` header to
 `POST /graphs/{id}/mutate/if-graph-commit` or
 `POST /graphs/{id}/queries/{name}/if-graph-commit`. The plain routes reject that
@@ -99,7 +99,7 @@ route.
 ## Typed failures and recovery
 
 - `429 Too Many Requests`: the write did not start. Honor `Retry-After`, then
-  retry. The CLI marks this case with exit `75` and a `command_outcome` whose
+  retry. The CLI marks this case with exit `75` and a `disposition` whose
   `action` is `retry`, only when no earlier step of the command took effect.
 - Structured `read_set_conflict` means an input changed before publication.
   Refresh and reconsider the operation, including schema/table identity changes;
@@ -118,10 +118,11 @@ route.
   do not replay.
 
 The effect-free conflict details are distinct from a lost response or a recovery
-requirement. Neither HTTP `409`/`503` nor the CLI's generic failure exit `1` is
-a universal retry signal; conditional precondition failure has its own exit `4`
-on data-plane commands (managed `cluster plan`/`apply` use exit `4` for
-recovery required instead).
+requirement. Neither HTTP `409`/`503` nor a CLI failure exit is a universal retry
+signal. On data-plane commands, exit `1` means nothing started, exit `2` that the
+effects are unknown, exit `4` a failed condition such as a precondition, and exit
+`75` a busy refusal that may be retried after `Retry-After` (managed
+`cluster plan`/`apply` use exit `4` for recovery required instead).
 
 ## Read large output safely
 

@@ -133,7 +133,7 @@ Write tools follow one contract:
 - **A lost response is an unknown outcome.** A write runs to completion even when
   the caller stops waiting. A write still running after 30 seconds, or one whose
   completion the server cannot confirm, returns `isError` with
-  `"outcome_unknown": true`. A write the client cancelled, timed out or lost the
+  `code: outcome_unknown`. A write the client cancelled, timed out or lost the
   connection for returns nothing, and means the same. Before replaying it, read
   the target with `read` or `snapshot` and compare `graph_commit_id`, or list the
   branch with `commits_list`; replay a `mutate` with `if_graph_commit`, so a write
@@ -160,8 +160,8 @@ The best-practices references are the `omnigraph` agent skill's own files,
 compiled into the server, so they always match its version.
 
 A resource read runs the same handler and policy action as its tool. A refusal
-is a JSON-RPC error whose `data` carries the HTTP `status` and `error` body; an
-unknown resource or graph is error `-32002`.
+is a JSON-RPC error whose `data` carries the refused tool call's content below;
+an unknown resource or graph is error `-32002`.
 
 ## Results and errors
 
@@ -169,15 +169,16 @@ A successful call returns the route's JSON response body as structured content,
 plus a text copy for older clients. `health`, `graphs`, `schema`, `queries`,
 `access` and `branches_list` declare an output schema.
 
-A refused call returns `isError: true` with one of two shapes:
-
-- `{"status": <HTTP status>, "error": <the route's error body>}` when the route
-  refused it, for example 403 for a policy denial, 404 for an unknown or hidden
-  graph, 503 for a graph that is not available;
-- `{"code": "...", "message": "..."}` when the MCP layer refused it:
-  `capacity_exceeded`, `cancelled`, `deadline_exceeded` or `result_too_large`.
-
-A write adds `"outcome_unknown": true` to either shape when it may have happened.
+A refused call returns `isError: true` with
+`{"status": <HTTP status>, "error": <error body>}`: the error body every HTTP
+route answers, with its `code`, `disposition` and details, and the status the
+same failure answers over HTTP, for example 403 for a policy denial, 404 for an
+unknown or hidden graph, 503 for a graph that is not available. The MCP layer's
+own refusals use the same body: `unauthorized` without a verified credential,
+`too_many_requests` beyond the concurrent limit, and `cancelled`,
+`deadline_exceeded` or `result_too_large`, which only MCP sends and which carry
+no `status`. A write that may have happened, one whose call was cancelled or
+passed its wait included, answers `outcome_unknown` with `effects: unknown`.
 
 ## Limits
 

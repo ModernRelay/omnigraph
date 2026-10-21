@@ -2496,7 +2496,8 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server_issue_1022() {
     assert!(refusal.get("http_status").is_none(), "{refusal}");
     assert!(refusal.get("missing_credential").is_none(), "{refusal}");
     assert_eq!(refusal["code"], "credential_missing", "{refusal}");
-    assert_eq!(output.status.code(), Some(2));
+    // A read's target refusal exits by its disposition: nothing ran.
+    assert_eq!(output.status.code(), Some(1));
 
     // login with a WRONG token (via stdin, the documented pipe flow).
     let output = cli()

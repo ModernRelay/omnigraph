@@ -298,11 +298,8 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
             .arg("--json"),
     );
     let refusal = parse_stdout_json(&output);
-    assert_eq!(
-        refusal["command_outcome"]["execution"], "not_started",
-        "{refusal}"
-    );
-    assert_eq!(refusal["command_outcome"]["effects"], "none", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
     assert!(refusal.get("http_status").is_none(), "{refusal}");
     assert!(
         refusal["error"]
@@ -675,7 +672,8 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
             "{statement}/{fault:?}: lost delivery must not report success"
         );
         if !matches!(fault, MergeDeliveryFault::CallerWait) {
-            assert_eq!(output.status.code(), Some(1), "{statement}/{fault:?}");
+            // A lost delivery leaves effects unknown.
+            assert_eq!(output.status.code(), Some(2), "{statement}/{fault:?}");
         }
         if !output.stdout.is_empty() {
             let error = parse_stdout_json(&output);
@@ -687,9 +685,12 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
                 error.get("commit").is_none(),
                 "lost delivery is not success"
             );
-            assert!(
-                error.get("outcome").is_none(),
-                "lost delivery is not success"
+            // A merge's success body names its merge `outcome`; a failure's
+            // `disposition` is the whole command's, and a lost delivery's
+            // effects are unknown.
+            assert_eq!(
+                error["disposition"]["effects"], "unknown",
+                "lost delivery is not success: {error}"
             );
         }
 
@@ -870,15 +871,16 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
             };
             assert!(!output.status.success(), "{operation}/{fault:?}");
             if !matches!(fault, MergeDeliveryFault::CallerWait) {
-                assert_eq!(output.status.code(), Some(1), "{operation}/{fault:?}");
+                // A lost delivery leaves effects unknown.
+                assert_eq!(output.status.code(), Some(2), "{operation}/{fault:?}");
                 let error = parse_stdout_json(&output);
                 assert!(
                     error.get("error").is_some(),
                     "{operation}/{fault:?}: {error}"
                 );
                 assert_eq!(
-                    error["command_outcome"],
-                    json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"}),
+                    error["disposition"],
+                    json!({"effects":"unknown", "action":"reconcile"}),
                     "{operation}/{fault:?}"
                 );
                 assert!(
@@ -1095,7 +1097,8 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
                 "{put}/{fault:?}: lost delivery must not report success"
             );
             if !matches!(fault, MergeDeliveryFault::CallerWait) {
-                assert_eq!(output.status.code(), Some(1), "{put}/{fault:?}");
+                // A lost delivery leaves effects unknown.
+                assert_eq!(output.status.code(), Some(2), "{put}/{fault:?}");
             }
             if !output.stdout.is_empty() {
                 let error = parse_stdout_json(&output);
@@ -1890,14 +1893,16 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(snapshot["graph_branch"], "main");
 
     // Authentication and policy refuse before admission or staging, so the CLI
-    // reports a write that never started and leaves no reconciliation to do.
+    // reports a write that never started and leaves no reconciliation to do: a
+    // credential to fix, or a policy to read again.
     let refused_before_effects = |output: &std::process::Output, status: u16| {
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         let body = parse_stdout_json(output);
         assert_eq!(body["http_status"], status, "{body}");
+        let action = if status == 401 { "fix" } else { "refresh" };
         assert_eq!(
-            body["command_outcome"],
-            serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
+            body["disposition"],
+            serde_json::json!({"effects":"none","action":action}),
             "{body}"
         );
         body
@@ -2280,8 +2285,8 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     assert_eq!(body["precondition_failure"]["expected"], json!(stale_id));
     assert_eq!(body["http_status"], 412);
     assert_eq!(
-        body["command_outcome"],
-        json!({"execution":"not_started","effects":"none","action":"refresh"})
+        body["disposition"],
+        json!({"effects":"none","action":"refresh"})
     );
 
     // An id from a fresh read passes with exit 0.

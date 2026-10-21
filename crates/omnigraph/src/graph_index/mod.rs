@@ -274,13 +274,12 @@ impl GraphIndex {
     /// Load the persisted adjacency artifact when one matches this snapshot's
     /// physical identity; fall back to the in-memory scan build. The load path
     /// is fail-open — a rejected artifact logs and builds, never errors.
-    /// `adapter` is the owning db's storage adapter when one exists (so
-    /// instrumented/injected adapters observe the artifact GET); `None` lets
-    /// the loader derive one from the store root.
+    /// `adapter` is the owning db's storage adapter, so instrumented, injected
+    /// and bound adapters observe the artifact GET.
     pub async fn load_or_build(
         snapshot: &Snapshot,
         edge_types: &HashMap<String, (String, String)>,
-        adapter: Option<&dyn crate::storage::StorageAdapter>,
+        adapter: &dyn crate::storage::StorageAdapter,
         system_columns: SystemColumns,
     ) -> Result<Self> {
         if let Some((index, _)) = persist::load(snapshot, edge_types, adapter).await {
@@ -297,7 +296,7 @@ impl GraphIndex {
     pub(crate) async fn load_persisted(
         snapshot: &Snapshot,
         edge_types: &HashMap<String, (String, String)>,
-        adapter: Option<&dyn crate::storage::StorageAdapter>,
+        adapter: &dyn crate::storage::StorageAdapter,
     ) -> Option<(Self, Vec<persist::TableStamp>)> {
         persist::load(snapshot, edge_types, adapter).await
     }

@@ -504,7 +504,9 @@ impl GraphCoordinator {
         // it in two physical phases (shallow clone, then BranchContents); the
         // manifest coordinator classifies/reclaims a clone-only zombie before
         // a bounded retry. No graph-lineage branch is created or rolled back.
-        self.manifest.create_branch(&branch).await?;
+        self.manifest
+            .create_branch(&branch, self.storage.binding().as_ref())
+            .await?;
         Ok(self.manifest.head().graph_commit_id.clone())
     }
 
@@ -523,6 +525,7 @@ impl GraphCoordinator {
                 &branch,
                 record.commit.graph_manifest_version,
                 &record.commit.graph_commit_id,
+                self.storage.binding().as_ref(),
             )
             .await
     }
@@ -678,7 +681,7 @@ impl GraphCoordinator {
                     candidate.require_readable()?;
                     return Ok(CommitState {
                         commit: candidate.graph_commit(),
-                        snapshot: Snapshot::wrap(candidate.snapshot(self.root_uri())?),
+                        snapshot: Snapshot::wrap(candidate.snapshot(self.root_uri(), &session)?),
                     });
                 }
                 match self.unattached_commit(id).await? {
@@ -686,7 +689,9 @@ impl GraphCoordinator {
                         candidate.require_readable()?;
                         Ok(CommitState {
                             commit: candidate.graph_commit(),
-                            snapshot: Snapshot::wrap(candidate.snapshot(self.root_uri())?),
+                            snapshot: Snapshot::wrap(
+                                candidate.snapshot(self.root_uri(), &session)?,
+                            ),
                         })
                     }
                     None => Err(commit_not_found(snapshot_id)),
@@ -1087,7 +1092,7 @@ async fn settled_commit_state(
     record: HistoryRecord,
 ) -> Result<CommitState> {
     ManifestCoordinator::ensure_incarnation_live(root_uri, control_session, &record.commit).await?;
-    let snapshot = Snapshot::wrap(record.snapshot(root_uri)?);
+    let snapshot = Snapshot::wrap(record.snapshot(root_uri, control_session)?);
     Ok(CommitState {
         commit: graph_commit_from_manifest_row(record.commit),
         snapshot,

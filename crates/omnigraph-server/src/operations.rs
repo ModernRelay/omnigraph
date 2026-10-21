@@ -12,6 +12,28 @@ use tracing::Instrument;
 
 use crate::ApiError;
 
+tokio::task_local! {
+    /// Whether the request being served has submitted an owned write. An
+    /// error it returns afterwards, from the write or from anything the
+    /// handler does after it, may follow effects.
+    static SUBMITTED_WRITE: std::cell::Cell<bool>;
+}
+
+/// Serve one request with its own record of whether it submitted a write.
+pub(crate) async fn scope_request<F: Future>(request: F) -> F::Output {
+    SUBMITTED_WRITE
+        .scope(std::cell::Cell::new(false), request)
+        .await
+}
+
+/// Whether the request being served has submitted an owned write; false
+/// outside a served request.
+pub(crate) fn request_submitted_write() -> bool {
+    SUBMITTED_WRITE
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+}
+
 pub const DEFAULT_READ_OBSERVERS: usize = 128;
 pub const DEFAULT_WRITE_OBSERVERS: usize = 64;
 
@@ -239,6 +261,7 @@ impl OperationRuntime {
             }
             state.active_writes += 1;
         }
+        let _ = SUBMITTED_WRITE.try_with(|submitted| submitted.set(true));
         let owner = WriteOwner {
             inner: Arc::clone(&self.inner),
             reservation: Some(Box::new(reservation)),
@@ -260,6 +283,14 @@ impl OperationRuntime {
                 // abandonment destroys the output before releasing its ownership.
                 // Uncertainty closes admission before its result is observable.
                 let owner = if result.uncertain {
+                    // The failure's class was logged in this request's span
+                    // when the engine error was mapped.
+                    if let Err(error) = &result.result {
+                        tracing::error!(
+                            status = %error.status(),
+                            "owned write ended without a definite outcome"
+                        );
+                    }
                     owner.finish(true);
                     None
                 } else {
@@ -318,6 +349,7 @@ impl<T> OwnedResponse<T> {
                 "owned write result was lost; effects are unknown and require reconciliation",
             )),
         }
+        .map_err(ApiError::after_owned_write)
     }
 }
 
@@ -411,6 +443,10 @@ impl ReadObserver {
     /// Descendants of this observer may finish after admission closes; no new
     /// observer or queue entry is acquired here. Native tails outside the
     /// engine future remain outside this logical ownership boundary.
+    ///
+    /// The task serves a request, or a part of one such as an MCP tool call,
+    /// so it keeps its own record of the writes that request submits, and an
+    /// error leaving it carries that record to the waiter.
     pub(crate) fn spawn_read<T, R, F>(self, reservation: R, operation: F) -> OwnedReadResponse<T>
     where
         T: Send + 'static,
@@ -423,11 +459,16 @@ impl ReadObserver {
             async move {
                 let _observer = self;
                 let _reservation = reservation;
-                #[allow(clippy::redundant_async_block)] // Catch completed future Drop panics too.
-                let result = AssertUnwindSafe(async move { operation.await })
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
+                let result = scope_request(async move {
+                    // Catch completed future Drop panics too.
+                    #[allow(clippy::redundant_async_block)]
+                    let result = AssertUnwindSafe(async move { operation.await })
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
+                    result.map_err(ApiError::with_request_facts)
+                })
+                .await;
                 // No result history: an absent waiter drops the result here.
                 let _ = sender.send(result);
             }
@@ -938,7 +979,7 @@ mod tests {
         let first = runtime.try_observe().unwrap();
         let producer = first.clone();
         assert_eq!(
-            runtime.try_observe().err().unwrap().status,
+            runtime.try_observe().err().unwrap().status(),
             StatusCode::TOO_MANY_REQUESTS
         );
         drop(first);

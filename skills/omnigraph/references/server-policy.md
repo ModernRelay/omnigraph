@@ -47,7 +47,7 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `GET /graphs/{id}/access` | The caller's actor and allowed actions (`?branch=`, `&target_branch=`); check before a write instead of learning from a 403 |
 
 Every request to a graph, registry or deployment route must carry exactly one
-`Omnigraph-Http-Api: 0.13` header; a missing, repeated or other value is
+`Omnigraph-Http-Api: 0.14` header; a missing, repeated or other value is
 refused with `400 api_contract_mismatch` before graph access. Responses carry
 the same header. `/healthz`, `/readyz` and `/openapi.json` need none. Upgrade
 the CLI, server and HTTP clients together.

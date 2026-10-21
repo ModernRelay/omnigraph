@@ -98,7 +98,7 @@ pub(crate) async fn execute_load(
     if json {
         write_json(&payload, stdout)?;
     } else {
-        write_load_human(&payload, stdout)?;
+        write_load_human(client.uri(), &payload, stdout)?;
     }
     Ok(())
 }
