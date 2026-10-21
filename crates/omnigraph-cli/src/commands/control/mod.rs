@@ -10,6 +10,7 @@ use crate::app::Completion;
 use crate::client::GraphClient;
 use crate::helpers::graph_resource_id_for_selection;
 use crate::operator;
+use crate::targets::TargetBinding;
 
 mod args;
 mod output;
@@ -31,8 +32,19 @@ pub(crate) async fn run_queries(
     command: QueriesCommand,
     scope: ControlScope<'_>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<Completion> {
+    // A server answers for one graph: `--json` prints the route's body.
+    if let (QueriesCommand::List { json }, TargetBinding::Server { .. }) =
+        (&command, &scope.target.binding)
+    {
+        let client =
+            GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                .await?;
+        let catalog = client.list_queries().await?;
+        output::write_queries_catalog(&catalog, *json, stdout)?;
+        return Ok(Completion::success());
+    }
     crate::scope::direct_root_uri(scope.target)?;
     let binding = crate::scope::capture_storage_binding(scope.target)?;
     match command {
@@ -317,8 +329,8 @@ pub(crate) async fn execute_queries_validate(
     Ok(Completion::success())
 }
 
-/// `queries list --target NAME`: list the catalog's stored queries.
-/// With `--graph`, scope to one graph.
+/// `queries list --target ROOT`: list the catalog's stored queries.
+/// With `--graph`, scope to one graph. A server target never reaches this.
 pub(crate) async fn execute_queries_list(
     binding: &omnigraph::storage::CapturedStorageBinding,
     graph: Option<&str>,

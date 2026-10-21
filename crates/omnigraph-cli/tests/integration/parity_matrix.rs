@@ -227,12 +227,24 @@ fn assert_blob_stat_parity(
     local_json
 }
 
-fn normalized_blob_error(output: &std::process::Output) -> &str {
+/// A failure's message: the `error` of its JSON envelope on stdout, or the
+/// first line of its human report, before its status lines.
+fn normalized_blob_error(output: &std::process::Output) -> String {
+    if !output.stdout.is_empty() {
+        let failure = parse_stdout_json(output);
+        return failure["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Blob failure omitted its error: {failure}"))
+            .to_string();
+    }
     let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    // The resolved destination line differs between the arms by design.
     stderr
         .lines()
-        .find_map(|line| line.trim().strip_prefix("0: "))
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("target "))
         .unwrap_or_else(|| panic!("Blob failure omitted its primary diagnostic: {stderr}"))
+        .to_string()
 }
 
 #[test]
@@ -795,6 +807,20 @@ fn parity_load() {
         "--json",
     ]);
     assert_write_parity("load", &l, &r);
+    // Both arms print the load route's body: the write's actor, an explicit
+    // null base branch without `--from`, and no field the route lacks.
+    for (arm, output) in [("local", &l), ("remote", &r)] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["actor_id"], PARITY_ACTOR, "{arm}");
+        assert_eq!(
+            payload.get("base_branch"),
+            Some(&serde_json::Value::Null),
+            "{arm}"
+        );
+        let body: omnigraph_api_types::GraphBatchLoadOutput =
+            serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&body).unwrap(), payload, "{arm}");
+    }
 
     // Canonical load is strict graph-batch syntax, but Overwrite uses Lance's
     // replacement transaction rather than RFC-023's keyed Append/Merge adapter.
@@ -846,11 +872,10 @@ fn parity_load() {
         "--json",
     ]);
     for (arm, output) in [("local", &l), ("remote", &r)] {
-        assert_eq!(output.status.code(), Some(1), "{arm}: {output:?}");
+        assert_eq!(output.status.code(), Some(2), "{arm}: {output:?}");
         let output = parse_stdout_json(output);
-        assert_eq!(output["command_outcome"]["execution"], "unknown", "{arm}");
-        assert_eq!(output["command_outcome"]["effects"], "unknown", "{arm}");
-        assert_ne!(output["command_outcome"]["action"], "retry", "{arm}");
+        assert_eq!(output["disposition"]["effects"], "unknown", "{arm}");
+        assert_ne!(output["disposition"]["action"], "retry", "{arm}");
     }
     let (l, r) = p.run(&["branch", "list", "--json"]);
     assert_parity("compound load retained the created branch", &l, &r);
@@ -1408,19 +1433,19 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
     }
 
     // A stale validator: the same Blob precondition detail on both arms. As
-    // for a graph-commit precondition, the served arm's verified 412 exits 4
-    // and the embedded arm, which opened storage for writing, exits 1.
+    // for a graph-commit precondition, both arms exit 4: the served arm's
+    // verified 412 and the embedded engine's own refusal both precede effects.
     let (local, remote) = p.run(&with(
         "put",
         &["--file", payload, "--if-match", "\"stale\""],
     ));
     assert_eq!(
         (local.status.code(), remote.status.code()),
-        (Some(1), Some(4))
+        (Some(4), Some(4))
     );
     let (local, remote) = (parse_stdout_json(&local), parse_stdout_json(&remote));
     for (arm, refused) in [("local", &local), ("remote", &remote)] {
-        assert_eq!(refused["code"], "conflict", "{arm}: {refused}");
+        assert_eq!(refused["code"], "precondition_failed", "{arm}: {refused}");
         assert!(
             refused.get("precondition_failure").is_none(),
             "{arm}: {refused}"
@@ -1430,7 +1455,7 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
             serde_json::json!({}),
             "{arm}: a null cell has no validator"
         );
-        assert_eq!(refused["command_outcome"]["action"], "refresh", "{arm}");
+        assert_eq!(refused["disposition"]["action"], "refresh", "{arm}");
     }
     assert_eq!(local["error"], remote["error"]);
 
@@ -1443,10 +1468,7 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
     let (local, remote) = p.run(&with("put", &["--file", oversized.to_str().unwrap()]));
     assert_eq!(local.status.code(), remote.status.code());
     assert_eq!(parse_stdout_json(&local), parse_stdout_json(&remote));
-    assert_eq!(
-        parse_stdout_json(&local)["command_outcome"]["execution"],
-        "not_started"
-    );
+    assert_eq!(parse_stdout_json(&local)["disposition"]["effects"], "none");
 }
 
 // ---- error parity: exit codes must match for shared failure cases ----

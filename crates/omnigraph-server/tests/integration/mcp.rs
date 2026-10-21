@@ -1338,10 +1338,19 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
         stale["result"]["structuredContent"]["status"], 412,
         "{stale}"
     );
-    assert!(
-        stale["result"]["structuredContent"]
-            .get("outcome_unknown")
-            .is_none()
+    // The refusal is the route's own error body: its code and a
+    // disposition that says nothing was written.
+    let refusal = &stale["result"]["structuredContent"];
+    assert_eq!(refusal["error"]["code"], "precondition_failed", "{stale}");
+    assert_eq!(
+        refusal["error"]["disposition"],
+        json!({"effects": "none", "action": "refresh"}),
+        "{stale}"
+    );
+    assert_eq!(
+        refusal.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["error", "status"],
+        "{stale}"
     );
     assert_eq!(
         manifest_dataset_version(&graph_path(temp.path())).await,
@@ -1403,6 +1412,31 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
     )
     .await;
     assert_eq!(missing["result"]["structuredContent"]["status"], 404);
+
+    // A load that forks its branch publishes the fork before its rows, so a
+    // typed refusal of the rows follows effects. The tool's task boundary
+    // must not lose that: the body says so, and the branch is there.
+    let refused = call(
+        &app,
+        "secret",
+        "load",
+        json!({"graph":"default","branch":"forked","from":"main","mode":"append","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":31}}"}),
+    )
+    .await;
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    let refusal = &refused["result"]["structuredContent"];
+    assert_eq!(refusal["status"], 409, "{refused}");
+    assert!(refusal["error"]["key_conflict"].is_object(), "{refused}");
+    assert_eq!(
+        refusal["error"]["disposition"],
+        json!({"effects": "partial", "action": "refresh"}),
+        "{refused}"
+    );
+    let branches = call(&app, "secret", "branches_list", json!({"graph":"default"})).await;
+    assert_eq!(
+        branches["result"]["structuredContent"]["branches"],
+        json!(["forked", "main"])
+    );
 
     // Each write keeps its route's policy action: `change` without
     // `branch_create` refuses branch creation.

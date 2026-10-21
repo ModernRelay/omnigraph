@@ -340,11 +340,11 @@ resume cursor ([Changes, Diffs and Change Feeds](../branching/changes.md)).
 
 ## Errors and retries
 
-Application errors preserve structured details. Admission limits use `429` with
-`Retry-After`; size limits use `413`, and blocked graphs or closed admission use
-`503`. Admitted writes continue after disconnect. Only the
-CLI's qualified whole-command admission refusal permits exit 75 and caller retry;
-generic 409/503 and lost responses do not. See [failure outcomes](troubleshooting.md#failed-data-write-commands).
+Every error body, an unknown route's and a malformed request's included, carries
+a `code`, its details and a `disposition` (`effects`, `action`; see
+[failed writes](troubleshooting.md#failed-data-write-commands)); a write the
+server could not settle is `outcome_unknown`, with `500`. Admission limits use `429`, size limits `413`, blocked graphs or closed admission `503`, each refusal
+that asks for a retry with `Retry-After`. Admitted writes continue after disconnect.
 
 For TLS, secrets, storage credentials, container examples and Azure admission,
 see [Deployment](../deployment.md).

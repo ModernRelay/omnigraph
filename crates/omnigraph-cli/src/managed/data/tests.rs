@@ -1517,35 +1517,38 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
     let mut completed = 0;
     for (status, _) in cases {
         for operation in operations {
-            let (error, evidence) = crate::command_outcome::observe(async {
-                match operation {
-                    "load" => client
-                        .load(
-                            "main",
-                            None,
-                            batch.path().to_str().unwrap(),
-                            crate::cli::CliLoadMode::Append,
-                            &[],
-                            &mut Vec::new(),
-                        )
-                        .await
-                        .unwrap_err(),
-                    "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
-                    "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
-                    _ => client
-                        .mutate(
-                            Some("main"),
-                            "mutation m() {}",
-                            Some("m"),
-                            None,
-                            Some("head-a"),
-                            &[],
-                            &mut Vec::new(),
-                        )
-                        .await
-                        .unwrap_err(),
-                }
-            })
+            let (error, evidence) = crate::command_outcome::observe(
+                crate::command_outcome::CommandKind::Write,
+                async {
+                    match operation {
+                        "load" => client
+                            .load(
+                                "main",
+                                None,
+                                batch.path().to_str().unwrap(),
+                                crate::cli::CliLoadMode::Append,
+                                &[],
+                                &mut Vec::new(),
+                            )
+                            .await
+                            .unwrap_err(),
+                        "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
+                        "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+                        _ => client
+                            .mutate(
+                                Some("main"),
+                                "mutation m() {}",
+                                Some("m"),
+                                None,
+                                Some("head-a"),
+                                &[],
+                                &mut Vec::new(),
+                            )
+                            .await
+                            .unwrap_err(),
+                    }
+                },
+            )
             .await;
             assert!(
                 error

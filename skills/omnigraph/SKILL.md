@@ -193,7 +193,7 @@ destination line. Legacy `--server`, `--store`, `--cluster`, `--profile`,
 | Direct schema | `schema plan`; `schema apply` and `schema upgrade-system-columns` require standalone graph targets |
 | Direct maintenance | `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes`; `upgrade --target ADDRESS` is standalone and offline |
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
-| Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets |
+| Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
 | Managed account | `cluster create/list`, `organization members/invitations`; `--connection NAME` |
 | Managed cluster | `cluster members/pull/push/plan/apply/status/history/cancel/token/delete/undo-delete`; complete cluster target |

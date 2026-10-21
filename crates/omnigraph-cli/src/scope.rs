@@ -163,7 +163,7 @@ pub(crate) fn resolve(
     };
     planes::validate_target(cli, &target, explicit_config)
         .map_err(|e| targets::refusal("target_incompatible", e.to_string()))?;
-    if matches!(need, Requirement::Graph { .. }) {
+    if planes::selects_graph(&cli.command, &target) {
         graph_selection(&target, cli.graph.as_deref())
             .map_err(|error| targets::refusal("target_incompatible", error.to_string()))?;
     }
