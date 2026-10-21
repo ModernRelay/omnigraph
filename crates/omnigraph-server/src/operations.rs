@@ -288,7 +288,7 @@ impl OperationRuntime {
                     && error.completion_uncertain()
                 {
                     tracing::error!(
-                        status = %error.status,
+                        status = %error.status(),
                         contained = result.uncertain,
                         "owned write ended without a definite outcome"
                     );
