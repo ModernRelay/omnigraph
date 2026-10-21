@@ -734,7 +734,7 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
         stat_etag(readme).as_str()
     );
     assert!(refused.get("precondition_failure").is_none(), "{refused}");
-    assert_eq!(refused["command_outcome"]["action"], "refresh");
+    assert_eq!(refused["disposition"]["action"], "refresh");
 
     let cleared = parse_stdout_json(&output_success(
         blob("clear", readme)
@@ -805,7 +805,7 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             "actual": 32 * 1024 * 1024 + 1,
         })
     );
-    assert_eq!(refused["command_outcome"]["execution"], "not_started");
+    assert_eq!(refused["disposition"]["effects"], "none");
     assert!(!absent.exists(), "neither arm opened the store");
 
     // If-Match precedes reading the input; a missing input in turn precedes
@@ -834,8 +834,8 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             "{validator}: {refused}"
         );
         assert_eq!(
-            refused["command_outcome"],
-            json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+            refused["disposition"],
+            json!({"effects":"none", "action":"refresh"})
         );
         assert!(server.requests().is_empty());
         server.assert_complete();
@@ -2502,8 +2502,8 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
         Value::String(stale_head)
     );
     assert_eq!(
-        body["command_outcome"],
-        serde_json::json!({"execution":"unknown","effects":"unknown","action":"refresh"})
+        body["disposition"],
+        serde_json::json!({"effects":"unknown","action":"refresh"})
     );
 
     let verify = output_success(
@@ -2564,9 +2564,9 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
         assert_eq!(error["http_status"], status);
         assert_eq!(error["request_dispatched"], false);
         assert_eq!(
-            error["command_outcome"],
+            error["disposition"],
             serde_json::json!({
-                "execution":"not_started", "effects":"none", "action":"refresh"
+                "effects":"none", "action":"fix"
             })
         );
         let requests = server.requests();
@@ -2840,24 +2840,20 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             });
             if arguments[0] == "mutate" {
                 // A verified precondition and a typed policy denial both refuse
-                // before effects; every other row leaves the outcome unknown.
-                let (execution, effects) = if exit == 4 || body["code"] == "forbidden" {
-                    ("not_started", "none")
+                // before effects; every other row leaves the effects unknown.
+                let effects = if exit == 4 || body["code"] == "forbidden" {
+                    "none"
                 } else {
-                    ("unknown", "unknown")
+                    "unknown"
                 };
                 assert_eq!(actual["http_status"], status);
                 assert_eq!(
-                    actual["command_outcome"]["execution"], execution,
-                    "{arguments:?}: {actual}"
-                );
-                assert_eq!(
-                    actual["command_outcome"]["effects"], effects,
+                    actual["disposition"]["effects"], effects,
                     "{arguments:?}: {actual}"
                 );
                 let fields = actual.as_object_mut().unwrap();
                 fields.remove("http_status");
-                fields.remove("command_outcome");
+                fields.remove("disposition");
             }
             assert_eq!(
                 actual, body,
@@ -2902,8 +2898,8 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         ],
         vec!["blob", "clear", "node", "Document", "readme", "content"],
     ];
-    let not_started = |action: &str| serde_json::json!({"execution":"not_started","effects":"none","action":action});
-    let unknown = |action: &str| serde_json::json!({"execution":"unknown","effects":"unknown","action":action});
+    let not_started = |action: &str| serde_json::json!({"effects":"none","action":action});
+    let unknown = |action: &str| serde_json::json!({"effects":"unknown","action":action});
     let cases = [
         (
             429,
@@ -2973,7 +2969,7 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             401,
             serde_json::json!({"error":"invalid bearer token","code":"unauthorized"}),
             1,
-            not_started("refresh"),
+            not_started("fix"),
         ),
         (
             403,
@@ -2985,7 +2981,7 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             400,
             serde_json::json!({"error":"exactly one contract header is required","code":"api_contract_mismatch"}),
             1,
-            not_started("refresh"),
+            not_started("fix"),
         ),
         // Only the code under its own status proves the refusal; contradictory
         // effect evidence outranks it.
@@ -3015,7 +3011,7 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
     for_each_concurrently(
         matrix,
         CASE_WORKERS,
-        |(arguments, (status, body, exit, outcome))| {
+        |(arguments, (status, body, exit, disposition))| {
             let mut reply = IntentReply::json(*status, body.clone());
             reply.headers.push(("Retry-After".into(), "17".into()));
             let server = IntentApiFixture::graph(vec![reply]);
@@ -3034,11 +3030,11 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             assert_eq!(actual["http_status"], *status);
             assert_eq!(actual["retry_after"], "17");
             assert_eq!(
-                &actual["command_outcome"], outcome,
+                &actual["disposition"], disposition,
                 "{arguments:?} HTTP {status} {body}"
             );
             let fields = actual.as_object_mut().unwrap();
-            fields.remove("command_outcome");
+            fields.remove("disposition");
             fields.remove("http_status");
             fields.remove("retry_after");
             // No credential is bound to the fixture's URL, so a 401 also says
@@ -3093,8 +3089,8 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         assert_eq!(output.status.code(), Some(1));
         let actual = parse_stdout_json(&output);
         assert_eq!(
-            actual["command_outcome"],
-            serde_json::json!({"execution":"unknown","effects":"unknown","action":"reconcile"})
+            actual["disposition"],
+            serde_json::json!({"effects":"unknown","action":"reconcile"})
         );
         assert_eq!(actual["http_status"], 200);
         assert_eq!(server.requests().len(), 2);
@@ -3709,8 +3705,8 @@ fn as_on_a_served_write_asserts_the_actor() {
         let error = parse_stdout_json(&output);
         assert_eq!(error["code"], "actor_mismatch", "{write:?}: {error}");
         assert_eq!(
-            error["command_outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"}),
+            error["disposition"],
+            json!({"effects":"none","action":"fix"}),
             "{write:?}: {error}"
         );
         let requests = server.requests();
@@ -4137,7 +4133,7 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
     let output = parse_stdout_json(&output);
     let error = output["error"].as_str().unwrap();
     assert!(error.contains("refusing destructive `branch delete`") && error.contains("--yes"));
-    assert_eq!(output["command_outcome"]["effects"], "none");
+    assert_eq!(output["disposition"]["effects"], "none");
 
     // Both commit-drop spellings use the same consent gate before submission.
     for arguments in [
@@ -4161,8 +4157,8 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
             "{arguments:?}: {error}"
         );
         assert_eq!(
-            error["command_outcome"],
-            serde_json::json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
+            error["disposition"],
+            serde_json::json!({"effects":"none", "action":"refresh"}),
             "{arguments:?}"
         );
         let requests = server.requests();
@@ -4268,7 +4264,7 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
             .unwrap()
             .contains("refusing destructive `load --mode overwrite`")
     );
-    assert_eq!(output["command_outcome"]["effects"], "none");
+    assert_eq!(output["disposition"]["effects"], "none");
 
     let temp = tempdir().unwrap();
     let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
@@ -4287,8 +4283,8 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
         "consent must precede reading --data: {refused}"
     );
     assert_eq!(
-        refused["command_outcome"],
-        json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+        refused["disposition"],
+        json!({"effects":"none", "action":"refresh"})
     );
     assert!(
         server.requests().is_empty(),
@@ -5139,8 +5135,8 @@ fn cli_fails_for_missing_schema_or_data_file() {
         "{refused}"
     );
     assert_eq!(
-        refused["command_outcome"],
-        json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"}),
+        refused["disposition"],
+        json!({"effects":"unknown", "action":"reconcile"}),
         "embedded load opens writable storage before reading --data"
     );
     let after = parse_stdout_json(&output_success(
@@ -5174,8 +5170,8 @@ fn cli_fails_for_missing_schema_or_data_file() {
             "{settings:?}: {refused}"
         );
         assert_eq!(
-            refused["command_outcome"],
-            json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
+            refused["disposition"],
+            json!({"effects":"none", "action":"refresh"}),
             "served load validates settings and reads --data before HTTP"
         );
         assert!(server.requests().is_empty());

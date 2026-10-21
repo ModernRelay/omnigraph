@@ -1612,7 +1612,7 @@ impl Omnigraph {
                 effective_graph_head.as_deref().unwrap_or("<absent>"),
             )));
         }
-        let snapshot = Snapshot::wrap(base.snapshot(self.uri())?);
+        let snapshot = Snapshot::wrap(base.snapshot(self.uri(), &self.control_session())?);
         let (catalog, identity) = self.accepted_catalog_for_snapshot(&snapshot).await?;
         let (_, live_identity) = self.accepted_catalog_for_snapshot(&live).await?;
         if live_identity != identity {
@@ -2178,15 +2178,28 @@ impl Omnigraph {
     /// `resolve_target` additionally assembles the lineage projection the OCC
     /// read never consults. Skipping that work is a pure read-cost reduction,
     /// not a freshness change.
+    ///
+    /// The re-read goes through this handle's control session, so it observes
+    /// the destination the handle is bound to rather than one the ambient
+    /// provider configuration selects.
     pub(crate) async fn fresh_snapshot_for_branch_unchecked(
         &self,
         branch: Option<&str>,
     ) -> Result<Snapshot> {
+        let session = self.control_session();
         let manifest = match branch {
             Some(branch) => {
-                crate::db::manifest::ManifestCoordinator::open_at_branch(self.uri(), branch).await?
+                crate::db::manifest::ManifestCoordinator::open_at_branch_with_session(
+                    self.uri(),
+                    branch,
+                    &session,
+                )
+                .await?
             }
-            None => crate::db::manifest::ManifestCoordinator::open(self.uri()).await?,
+            None => {
+                crate::db::manifest::ManifestCoordinator::open_with_session(self.uri(), &session)
+                    .await?
+            }
         };
         Ok(Snapshot::wrap(manifest.snapshot()))
     }
@@ -3972,7 +3985,7 @@ impl Omnigraph {
                 source.version()
             )));
         }
-        let snapshot = Snapshot::wrap(record.snapshot(self.root_uri())?);
+        let snapshot = Snapshot::wrap(record.snapshot(self.root_uri(), &self.control_session())?);
         // Every record carries the contract its commit was written under:
         // the storage upgrade gives each converted commit one too. A commit
         // from before the upgrade is refused where its `__manifest` version

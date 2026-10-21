@@ -183,14 +183,31 @@ pub async fn write_params(
     Ok(params)
 }
 
+/// Create `branch` of `source` at `source_version`. `binding` is the captured
+/// destination of the handle that opened `source`, if any: Lance's
+/// `create_branch` probes the new branch location through a client of its own,
+/// built on a default session from the store parameters it is given, so a
+/// bound handle passes its captured options there or the probe reaches the
+/// ambient provider configuration.
 pub async fn create_branch(
     source: &mut Dataset,
     branch: &str,
     source_version: u64,
+    binding: Option<&crate::storage::CapturedStorageBinding>,
 ) -> Result<Dataset> {
+    let store_params = binding.map(|binding| {
+        let mut params = source.store_params().cloned().unwrap_or_default();
+        params.storage_options_accessor = Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_static_options(binding.lance_options()),
+        ));
+        params
+    });
     let context = CloneContext::capture(source, source_version)?;
     CLONE_CONTEXT
-        .scope(context, source.create_branch(branch, source_version, None))
+        .scope(
+            context,
+            source.create_branch(branch, source_version, store_params),
+        )
         .await
 }
 
@@ -956,9 +973,13 @@ mod tests {
             .await
             .unwrap();
         let version = source.version().version;
-        let mut first = create_branch(&mut source, "first", version).await.unwrap();
+        let mut first = create_branch(&mut source, "first", version, None)
+            .await
+            .unwrap();
         let version = first.version().version;
-        let second = create_branch(&mut first, "second", version).await.unwrap();
+        let second = create_branch(&mut first, "second", version, None)
+            .await
+            .unwrap();
         for dataset in [&source, &first, &second] {
             let store = dataset.object_store(None).await.unwrap();
             let handler =
@@ -1072,7 +1093,7 @@ mod tests {
         let uri = dir.path().join("versioned.lance");
         let mut source = fresh_dataset(uri.to_str().unwrap()).await;
         let version = source.version().version;
-        let error = create_branch(&mut source, "refused", version + 1)
+        let error = create_branch(&mut source, "refused", version + 1, None)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
@@ -1091,10 +1112,14 @@ mod tests {
             let mut source = fresh_dataset(&uri).await;
             append_guard_row(&mut source, &uri, 3).await;
             let version = source.version().version;
-            let mut first = create_branch(&mut source, "first", version).await.unwrap();
+            let mut first = create_branch(&mut source, "first", version, None)
+                .await
+                .unwrap();
             tokio::task::yield_now().await;
             let version = first.version().version;
-            let second = create_branch(&mut first, "second", version).await.unwrap();
+            let second = create_branch(&mut first, "second", version, None)
+                .await
+                .unwrap();
             assert!(CLONE_CONTEXT.try_with(|_| ()).is_err());
             let mut scan = second.scan();
             scan.filter("value = 3").unwrap();
@@ -1179,7 +1204,7 @@ mod tests {
             .unwrap();
         let raw_clone_cost = raw_store.io_stats_incremental();
         let version = engine.version().version;
-        let engine_child = create_branch(&mut engine, "read_cost", version)
+        let engine_child = create_branch(&mut engine, "read_cost", version, None)
             .await
             .unwrap();
         let engine_clone_cost = engine_store.io_stats_incremental();
@@ -1230,7 +1255,7 @@ mod tests {
         }
         let store = source.object_store(None).await.unwrap();
         store.inner.delete(&original.path).await.unwrap();
-        let error = create_branch(&mut source, "missing_source", version)
+        let error = create_branch(&mut source, "missing_source", version, None)
             .await
             .unwrap_err();
         assert!(error.is_not_found(), "{error:?}");
