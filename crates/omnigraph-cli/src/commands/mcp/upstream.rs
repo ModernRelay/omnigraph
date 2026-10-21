@@ -14,7 +14,7 @@ use std::time::Duration;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use omnigraph_api_types::{DispositionEffects, ErrorCode};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, WWW_AUTHENTICATE};
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
@@ -41,8 +41,13 @@ pub(super) enum Delivery {
     Accepted,
     /// An HTTP answer that carries no JSON-RPC message, with its body.
     Refused { status: u16, body: Value },
-    /// The server refused the credential (HTTP 401) before running anything.
-    Unauthorized { body: Value, reread: Reread },
+    /// The server refused the credential (HTTP 401) before running anything,
+    /// with its `WWW-Authenticate` challenge as sent.
+    Unauthorized {
+        body: Value,
+        challenge: Option<String>,
+        reread: Reread,
+    },
     /// Nothing was sent: the server could not be reached or speaks another
     /// contract. `data` is the JSON-RPC error data the agent is answered with.
     NotSent { message: String, data: Value },
@@ -239,12 +244,14 @@ impl Upstream {
             Err(error) => return self.failed(&error),
         };
         if response.status() == StatusCode::UNAUTHORIZED {
+            let challenge = challenge(response.headers());
             let body = match read_body(response).await {
                 Ok(body) => error_body(&body),
                 Err(_) => Value::Null,
             };
             return Delivery::Unauthorized {
                 body,
+                challenge,
                 reread: self.reread(reads).await,
             };
         }
@@ -325,6 +332,18 @@ fn not_sent(code: ErrorCode, message: String) -> Delivery {
     }
 }
 
+/// The `WWW-Authenticate` challenge of a response, verbatim: its header
+/// fields joined with ", " as one field holds a list, or none when it has no
+/// such field or one that is not UTF-8.
+fn challenge(headers: &HeaderMap) -> Option<String> {
+    let fields = headers
+        .get_all(WWW_AUTHENTICATE)
+        .iter()
+        .map(|field| std::str::from_utf8(field.as_bytes()).ok())
+        .collect::<Option<Vec<&str>>>()?;
+    (!fields.is_empty()).then(|| fields.join(", "))
+}
+
 /// A response body, bounded.
 async fn read_body(mut response: reqwest::Response) -> std::result::Result<Vec<u8>, Lost> {
     let mut body = Vec::new();
@@ -402,6 +421,30 @@ async fn read_answer(response: reqwest::Response) -> Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_challenge_is_every_www_authenticate_field_unchanged() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(challenge(&headers), None);
+        headers.append(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+        );
+        assert_eq!(
+            challenge(&headers).as_deref(),
+            Some(r#"Bearer error="invalid_token""#)
+        );
+        headers.append(WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=x"));
+        assert_eq!(
+            challenge(&headers).as_deref(),
+            Some(r#"Bearer error="invalid_token", Basic realm=x"#)
+        );
+        headers.append(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_bytes(b"Bearer realm=\xff").unwrap(),
+        );
+        assert_eq!(challenge(&headers), None);
+    }
 
     #[test]
     fn a_body_that_is_not_json_rpc_is_an_error_body() {

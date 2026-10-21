@@ -750,8 +750,9 @@ const HELD_REST: Duration = Duration::from_millis(1500);
 
 /// A stand-in MCP server for timing, credentials and lost answers, reached
 /// through a TLS gateway. It answers discovery with the HTTP contract,
-/// refuses any bearer but the one it accepts with a 401, and records every
-/// message with the bearer it carried.
+/// refuses any bearer but the one it accepts with a 401, carrying the
+/// `WWW-Authenticate` challenge it is given if any, and records every message
+/// with the bearer it carried.
 /// `slow` and `slow_write` answer after [`SLOW`] and `fast` at once; `held` answers once
 /// [`HELD`] calls of it have arrived, the one marked `first` before the
 /// others; `drop_read` and `drop_write` hang up without answering. Every
@@ -768,6 +769,8 @@ struct McpEndpoint {
 struct EndpointState {
     /// The bearer the endpoint accepts.
     accepts: Mutex<String>,
+    /// The `WWW-Authenticate` challenge its 401 carries.
+    challenge: Mutex<Option<String>>,
     /// Every JSON-RPC message posted, with the bearer it carried.
     received: Mutex<Vec<(Value, String)>>,
     slow: AtomicUsize,
@@ -809,6 +812,10 @@ impl McpEndpoint {
 
     fn accept(&self, token: &str) {
         *self.state.accepts.lock().unwrap() = token.to_string();
+    }
+
+    fn challenge(&self, challenge: &str) {
+        *self.state.challenge.lock().unwrap() = Some(challenge.to_string());
     }
 
     /// The bearers the request with `id` was received with, in order.
@@ -904,11 +911,17 @@ fn answer_one(mut stream: TcpStream, state: &EndpointState) {
         .unwrap()
         .push((message.clone(), bearer.clone()));
     if bearer != *state.accepts.lock().unwrap() {
-        return reply(
-            &mut stream,
-            "401 Unauthorized",
-            r#"{"error":"A verified bearer credential is required.","code":"unauthorized","disposition":{"effects":"none","action":"fix"}}"#,
+        let challenge = state.challenge.lock().unwrap().clone();
+        let challenge = challenge.map_or_else(String::new, |value| {
+            format!("www-authenticate: {value}\r\n")
+        });
+        let body = r#"{"error":"A verified bearer credential is required.","code":"unauthorized","disposition":{"effects":"none","action":"fix"}}"#;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\n{challenge}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
         );
+        return;
     }
     let Some(id) = message
         .get("id")
@@ -1171,6 +1184,35 @@ fn mcp_reads_a_refused_credential_again_for_later_requests_without_resending() {
         assert_eq!(endpoint.received(id), [""]);
         bridge.finish().assert_success();
     }
+}
+
+/// The server's `WWW-Authenticate` challenge on a 401 is relayed verbatim
+/// beside its status and body, and a 401 without one relays no challenge.
+#[test]
+fn mcp_relays_the_servers_authentication_challenge_with_a_401() {
+    const CHALLENGE: &str = "Bearer error=\"invalid_token\", \
+         resource_metadata=\"https://graphs.example/.well-known/oauth-protected-resource\"";
+    let endpoint = McpEndpoint::start("accepted-token-31");
+    let home = Home::server(&endpoint.url);
+    let mut bridge = home.bridge(
+        &["--target", "staging"],
+        &[("OMNIGRAPH_TOKEN_STAGING", "refused-token-32")],
+    );
+    let refused = bridge.call(tools_list(1));
+    let data = &refused["error"]["data"];
+    assert_eq!(data["status"], 401, "{refused}");
+    assert_eq!(data["error"]["code"], "unauthorized", "{refused}");
+    assert!(data.get("www_authenticate").is_none(), "{refused}");
+
+    endpoint.challenge(CHALLENGE);
+    let refused = bridge.call(tools_list(2));
+    let data = &refused["error"]["data"];
+    assert_eq!(data["status"], 401, "{refused}");
+    assert_eq!(data["error"]["code"], "unauthorized", "{refused}");
+    assert_eq!(data["www_authenticate"], CHALLENGE, "{refused}");
+    let finished = bridge.finish();
+    finished.assert_success();
+    finished.assert_never_shows(&["refused-token-32"]);
 }
 
 /// An unreachable server fails each request with a typed error saying

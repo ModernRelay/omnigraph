@@ -640,7 +640,16 @@ impl Relay<'_> {
         };
         let data = match delivery {
             Delivery::Refused { status, body } => refused(status, body),
-            Delivery::Unauthorized { body, .. } => refused(401, body),
+            Delivery::Unauthorized {
+                body, challenge, ..
+            } => {
+                let mut data = refused(401, body);
+                // The server's challenge, which names how to authenticate.
+                if let Some(challenge) = challenge {
+                    data["www_authenticate"] = Value::String(challenge);
+                }
+                data
+            }
             Delivery::NotSent { data, .. } => {
                 self.binding.borrow_mut().forget();
                 data

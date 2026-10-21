@@ -103,7 +103,7 @@ before running it again. It never sends a request again:
 
 | Failure | JSON-RPC error `data` |
 |---|---|
-| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error` |
+| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error`. A 401 also carries the server's `WWW-Authenticate` challenge, verbatim, as `www_authenticate` when it sends one |
 | Nothing was sent: the server could not be reached, or speaks another HTTP contract | `error.code` `service_unavailable`, or `api_contract_mismatch`, with `effects: none` |
 | The answer was lost, or took longer than 45 seconds | `outcome_unknown` with `effects: unknown` for a call to a tool that may write; otherwise `service_unavailable`, `deadline_exceeded` or `result_too_large` with `effects: none` |
 
