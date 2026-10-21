@@ -385,13 +385,16 @@ object.
   A later phase adds `disposition.check`, what a later read needs to settle an
   unknown write: its branch and its publication id (a graph commit id, or a
   control fact's attempt id), with the branch's head before the write. The
-  outcome is final once the branch moves past the attempted version. It arrives with the attempt identity of
-  [cross-process writes](#cross-process-writes). Until then a caller settles a
-  row publication from the branch it sent and that branch's head, and a
-  control fact from the registration, tombstone or drop record it names, since
-  a control fact does not move the head. Retrying one is safe: a create refuses
-  with `branch_exists`, and a delete or a drop converges. The body below is that later
-  phase's:
+  outcome is final once the branch moves past the attempted version. It
+  arrives with the attempt identity of [cross-process
+  writes](#cross-process-writes). Under an actor view that hides the commit
+  listing, the check answers for the caller's own publication id and returns
+  only the caller's own receipt. Until then a caller settles a row publication
+  from the branch it sent and that branch's head, and a control fact from the
+  registration, tombstone or drop record it names, since a control fact does
+  not move the head. Retrying one is safe: a create refuses with
+  `branch_exists`, and a delete or a drop converges. The body below is that
+  later phase's:
 
   ```json
   {"error":"the write may have published","code":"outcome_unknown",
@@ -467,8 +470,10 @@ targets. `omnigraph access --target NAME [--graph G] [--branch B]
   graph's installed policy for the declared actor; without a policy every
   action is allowed, as it is for direct writes.
 - It reports Cedar operations, not actor views, whose per-securable roles can
-  still refuse a permitted `change`; a `view` field is reserved, and the actor
-  views RFC should list the route among its surfaces.
+  still refuse a permitted `change`. [Actor views and subgraph
+  sharing](https://github.com/ModernRelay/omnigraph/pull/951) lists the route
+  and the command among its surfaces and fills the reserved `view` field with
+  facts about the caller's own view only.
 
 Clients show the actions `access` allows instead of learning them from a 403.
 Studio's spec 012 lists this as E15.
@@ -1504,3 +1509,8 @@ proposal.
   pending-branch `service_unavailable` row is gone. Read-back follows #1092's
   split, a not-ready branch's absent fields are named, and the access evidence
   uses RFC 0059's target kinds.
+- 2026-10-20: Aligned with actor views and subgraph sharing (#951): it fills
+  the access output's reserved `view` field with the caller's own view facts,
+  its refusals join the one registry with `effects: none` and `action: fix`,
+  and under a view that hides commit listings `disposition.check` answers only
+  for the caller's own publication and receipt.
