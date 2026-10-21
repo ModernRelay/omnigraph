@@ -27,6 +27,8 @@
 
 Omnigraph is engineered for the new workload introduced by long-horizon agents: multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. Agents and UIs can become thin stateless consumers of durable state.
 
+Omnigraph Cloud, a hosted deployment of the same engine, is in private preview. [Join the waitlist](https://www.omnigraph.dev/cloud).
+
 ## Capabilities
 
 | Capability | What it gives you |
@@ -61,8 +63,6 @@ published release binaries. Or with Homebrew:
 brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
-
-Omnigraph Cloud, a hosted deployment of the same engine, is in private preview. [Join the waitlist](https://www.omnigraph.dev/cloud).
 
 ## Set it up with an AI agent
 
