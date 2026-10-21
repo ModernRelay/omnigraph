@@ -834,7 +834,7 @@ mod tests {
         let main_data = main.data_dir();
         let main_version = main.version().version;
         let mut parent =
-            crate::lance_clone::create_branch(&mut main, "parent/data/topic", main_version)
+            crate::lance_clone::create_branch(&mut main, "parent/data/topic", main_version, None)
                 .await
                 .unwrap();
         parent
@@ -843,10 +843,14 @@ mod tests {
             .unwrap();
         let parent_data = parent.data_dir();
         let parent_version = parent.version().version;
-        let mut child =
-            crate::lance_clone::create_branch(&mut parent, "child/_indices/topic", parent_version)
-                .await
-                .unwrap();
+        let mut child = crate::lance_clone::create_branch(
+            &mut parent,
+            "child/_indices/topic",
+            parent_version,
+            None,
+        )
+        .await
+        .unwrap();
         child
             .append(row(3), Some(params(WriteMode::Append)))
             .await

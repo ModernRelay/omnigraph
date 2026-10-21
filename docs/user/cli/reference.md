@@ -45,7 +45,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
-| `commit list/show/changes/publish/drop` | Inspect history (`list --limit`/`--page-token` for one page of it, `list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other and paging) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it); `publish` and `drop` take `--as` on a direct graph, the reads refuse it | direct or served |
+| `commit list/show/changes/publish/drop` | Inspect history (`list --limit`/`--page-token` for one page of it, `list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other and paging) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it); `publish` and `drop` take `--as`, the reads refuse it | direct or served |
 | `diff` | Net entity changes between two points: branches or commit ids (`--from`, `--to`) | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
@@ -179,7 +179,7 @@ omnigraph blob get|stat|put|clear <node|edge> <TYPE> <ID> <PROPERTY> --target NA
 `get` accepts `--branch` or `--snapshot`, `--offset`, `--length`, and
 `--out <PATH>`. `stat` accepts `--branch` or `--snapshot` and `--json`. `put`
 reads `--file <PATH>` or stdin; `put` and `clear` accept `--branch`,
-`--if-match <TAG>`, `--json` and, on direct storage targets, `--as`. See [Blob values](../blobs.md).
+`--if-match <TAG>`, `--json` and `--as` (on a served target, an assertion). See [Blob values](../blobs.md).
 
 ## Operator configuration
 

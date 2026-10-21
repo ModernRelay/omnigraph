@@ -147,12 +147,12 @@ edge Knows: Person -> Person {}
     .unwrap()
     .unwrap();
     assert!(
-        crate::graph_index::persist::load(&left.snapshot, &scope, Some(reader.storage_adapter()))
+        crate::graph_index::persist::load(&left.snapshot, &scope, reader.storage_adapter())
             .await
             .is_some()
     );
     assert!(
-        crate::graph_index::persist::load(&right.snapshot, &scope, Some(reader.storage_adapter()))
+        crate::graph_index::persist::load(&right.snapshot, &scope, reader.storage_adapter())
             .await
             .is_none(),
         "a cold artifact must reject another detached pin at the same counter"
@@ -647,7 +647,7 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
     let catalog = build_test_catalog();
 
     let mut main_mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    main_mc.create_branch("feature").await.unwrap();
+    main_mc.create_branch("feature", None).await.unwrap();
 
     // Fork Person onto `feature` at version Vf (owner = feature).
     let snap = main_mc.snapshot();
@@ -687,7 +687,7 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
     let mut feature_mc = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
-    feature_mc.create_branch("experiment").await.unwrap();
+    feature_mc.create_branch("experiment", None).await.unwrap();
     feature_ds
         .create_branch("experiment", feature_version, None)
         .await
