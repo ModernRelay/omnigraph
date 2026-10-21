@@ -18,6 +18,9 @@ pub(crate) enum Requirement {
     Standalone,
     Registry,
     Root,
+    /// A whole direct root, optionally filtered by `--graph`, or one served
+    /// graph: the server answers per graph, so a server target selects one.
+    RootOrServedGraph,
     Deployment,
     ManagedAccount,
     ManagedCluster,
@@ -104,7 +107,13 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
             }
         }
         Command::Graphs { .. } => Registry,
-        Command::Queries { .. } | Command::Policy { .. } => Root,
+        Command::Queries {
+            command: QueriesCommand::List { .. },
+        } => RootOrServedGraph,
+        Command::Queries {
+            command: QueriesCommand::Validate { .. },
+        }
+        | Command::Policy { .. } => Root,
         Command::Cluster { command } => match command {
             ClusterCommand::Validate { .. } => Local,
             ClusterCommand::Plan { .. }
@@ -127,6 +136,15 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         Command::Organization { .. } => ManagedAccount,
         Command::Alias(_) => Alias,
         Command::Login { .. } | Command::Logout { .. } => Authentication,
+        // A served graph's access route, or a direct graph's or root graph's
+        // installed policy. Managed data qualifies each wrapper separately,
+        // and the catalogue carries no policy.
+        Command::Access(_) => Graph {
+            direct_only: false,
+            root: true,
+            managed: false,
+            catalogue: false,
+        },
         Command::Credential { .. } => Credential,
         Command::Target { .. }
         | Command::Embed(_)
@@ -138,8 +156,18 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
 pub(crate) fn root_input(command: &Command) -> bool {
     matches!(
         requirement(command),
-        Requirement::Root | Requirement::Deployment
+        Requirement::Root | Requirement::RootOrServedGraph | Requirement::Deployment
     )
+}
+
+/// Whether the operation addresses one graph of `target`, so `--graph` or the
+/// target's `default_graph` must select it before any I/O.
+pub(crate) fn selects_graph(command: &Command, target: &ResolvedTarget) -> bool {
+    match requirement(command) {
+        Requirement::Graph { .. } => true,
+        Requirement::RootOrServedGraph => matches!(target.binding, TargetBinding::Server { .. }),
+        _ => false,
+    }
 }
 
 /// Flag applicability does not acquire configuration or a credential.
@@ -148,7 +176,12 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     if matches!(need, Requirement::Local | Requirement::Alias) && cli.target.is_some() {
         bail!("{} does not accept --target", command_label(&cli.command));
     }
-    if cli.graph.is_some() && !matches!(need, Requirement::Graph { .. } | Requirement::Root) {
+    if cli.graph.is_some()
+        && !matches!(
+            need,
+            Requirement::Graph { .. } | Requirement::Root | Requirement::RootOrServedGraph
+        )
+    {
         bail!("{} does not accept --graph", command_label(&cli.command));
     }
     if cli.graph.is_some() && matches!(&cli.command, Command::Cluster { .. }) {
@@ -167,6 +200,8 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 fn accepts_actor(command: &Command) -> bool {
     match command {
         Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => true,
+        // The actor a direct target's policy decides for.
+        Command::Access(_) => true,
         Command::Branch { command } => match command {
             BranchCommand::Create { .. }
             | BranchCommand::Delete { .. }
@@ -251,7 +286,9 @@ pub(crate) fn validate_target(
     let need = requirement(&cli.command);
     let allowed = match (&need, &target.binding) {
         (Graph { .. } | Standalone, DirectGraph { .. }) => true,
-        (Graph { root: true, .. } | Root | Deployment, DirectRoot { .. }) => true,
+        (Graph { root: true, .. } | Root | RootOrServedGraph | Deployment, DirectRoot { .. }) => {
+            true
+        }
         (
             Graph {
                 catalogue: true, ..
@@ -263,6 +300,7 @@ pub(crate) fn validate_target(
                 direct_only: false, ..
             }
             | Registry
+            | RootOrServedGraph
             | Deployment
             | Authentication
             | Credential
@@ -414,6 +452,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Logout { .. } => "logout",
         Command::Target { .. } => "target",
         Command::Credential { .. } => "credential",
+        Command::Access(_) => "access",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",
@@ -525,6 +564,7 @@ mod tests {
             (&["mutate", "-e", "q"], true),
             (&["load", "--data", "d.jsonl", "--mode", "append"], true),
             (&["rebuild-full-text-indexes"], true),
+            (&["access"], true),
             (&["branch", "create", "b"], true),
             (&["branch", "delete", "b"], true),
             (&["branch", "merge", "b"], true),

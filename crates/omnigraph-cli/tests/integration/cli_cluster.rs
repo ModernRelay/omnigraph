@@ -217,7 +217,7 @@ fn core_remote_retired_selectors_refuse_before_operator_or_backend_access() {
             &api.origin,
             "--json",
         ]));
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
     assert!(api.requests().is_empty());
@@ -1244,7 +1244,7 @@ fn managed_cluster_members_requires_cluster_target_and_rejects_duplicate_selecto
                 .args(["members", "list", "--json"])
                 .args(args),
         );
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
     }
     assert!(api.requests().is_empty());
     assert_no_core_effects(temp.path());
@@ -1560,7 +1560,7 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
             .arg("--json")
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
     assert!(api.workflow_requests().is_empty());
@@ -1675,7 +1675,10 @@ fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain
             .args(&args)
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        // A data command's target refusal exits by its disposition; the
+        // cluster commands keep the target refusal's own exit.
+        let exit = if args[0] == "cluster" { 2 } else { 1 };
+        assert_eq!(output.status.code(), Some(exit), "{args:?}: {output:?}");
         let problem = parse_stdout_json(&output);
         assert_eq!(problem["code"], code, "{args:?}: {problem}");
         assert!(
@@ -3503,7 +3506,7 @@ fn managed_operation_rejects_retired_organization_override_before_authentication
         "foreign",
         "--json",
     ]));
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(64));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     assert!(api.requests().is_empty());
 }
@@ -3903,7 +3906,7 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
             command.arg("https://other.example");
         }
         let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
     }
     let output = organization_cli(temp.path(), &api.origin)
         .args(["members", "list", "--organization", "foreign", "--json"])

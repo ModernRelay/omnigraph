@@ -250,3 +250,4 @@ then dated RFCs by date.
 | [2026-10-11](2026-10-11-unattached-graph-branches.md) | Unattached graph branches | maintainer | draft | not-started |
 | [2026-10-15](2026-10-15-bulk-load-as-a-query-plan.md) | Bulk load as a query plan | maintainer | draft | partial |
 | [2026-10-16](2026-10-16-engine-catalogue.md) | Engine catalogue | maintainer | draft | in-progress |
+| [2026-10-16](2026-10-16-graph-access-serving-and-cross-process-writes.md) | Graph access and cross-process writes | maintainer | accepted | in-progress |

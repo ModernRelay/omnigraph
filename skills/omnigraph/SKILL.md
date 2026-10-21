@@ -178,7 +178,8 @@ backend. `--config DIR` is source input only.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
-address convenience. `--as ACTOR` attributes supported direct operations;
+address convenience. `--as ACTOR` attributes supported direct operations and
+names the actor `access` reports for direct storage;
 served targets derive their actor from credentials and send `--as` as the
 `Omnigraph-If-Actor` assertion, refusing a mismatch with `actor_mismatch` and
 exit 4; managed targets refuse it. `--yes` supplies explicit
@@ -193,12 +194,13 @@ destination line. Legacy `--server`, `--store`, `--cluster`, `--profile`,
 | Direct schema | `schema plan`; `schema apply` and `schema upgrade-system-columns` require standalone graph targets |
 | Direct maintenance | `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes`; `upgrade --target ADDRESS` is standalone and offline |
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
-| Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets |
+| Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
 | Managed account | `cluster create/list`, `organization members/invitations`; account target |
 | Managed cluster | `cluster members/pull/push/plan/apply/status/history/cancel/token/delete/undo-delete`; complete cluster target |
 | Local configuration | `target list/show/add/remove/import`, `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
 | Authentication | `login --target NAME` / `logout --target NAME`; server static credentials or managed human-device session. `credential get --target NAME` exports a server token to a pipe |
+| Access | `access [--branch B [--target-branch T]]`; the actor and the actions the graph's policy grants it, from a server's access route or, for a direct graph or root target, the installed policy; catalogue and managed targets refuse |
 
 `query` and `mutate` invoke stored queries by positional name, or accept
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate

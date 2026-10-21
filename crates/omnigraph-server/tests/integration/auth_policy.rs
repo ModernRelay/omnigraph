@@ -641,9 +641,8 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         "params": {"name": "contract-write", "age": 27}
     })
     .to_string();
-    let expected_message = format!(
-        "exactly one {HTTP_API_CONTRACT_HEADER} header with value {HTTP_API_CONTRACT} is required"
-    );
+    let expected_message =
+        format!("exactly one Omnigraph-Http-Api header with value {HTTP_API_CONTRACT} is required");
     let cases = [
         Vec::new(),
         vec![HeaderValue::from_static("0.11")],
@@ -787,6 +786,210 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
             HTTP_API_CONTRACT
         );
     }
+}
+
+/// A request refused before any handler runs, because no route or method
+/// matches or its body, query string or path parameter does not decode,
+/// answers the error body every other refusal does.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_and_unrouted_requests_answer_the_error_body() {
+    use omnigraph_server::api::{
+        DispositionAction, DispositionEffects, DispositionOutput, ErrorCode,
+    };
+
+    let (temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let graph = graph_path(temp.path());
+    let before = manifest_dataset_version(&graph).await;
+    let request = |method: Method, path: &str, body: &'static str| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer demo-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let cases = [
+        // A body that is not JSON, and JSON of the wrong shape.
+        (
+            request(Method::POST, &g("/load"), "{"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/load"), r#"{"data":5}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/branches"), r#"{"name":5}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/changes/baseline"), "{"),
+            StatusCode::BAD_REQUEST,
+        ),
+        // Query strings that do not decode.
+        (
+            request(Method::GET, &g("/snapshot?branch=a&branch=b"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/load/ndjson?mode=sideways"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits?limit=many"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        // Path parameters that are not UTF-8.
+        (
+            request(Method::DELETE, &g("/branches/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::DELETE, &g("/commits/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/commits/%FF/publish"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits/%FF/changes"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, "/cluster/deployments/%FF", ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        // No route, inside and outside a graph, and a method a route does
+        // not serve.
+        (
+            Request::get("/no-such-route").body(Body::empty()).unwrap(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            request(Method::GET, &g("/no-such-route"), ""),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            request(Method::PUT, &g("/snapshot"), ""),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ];
+    for (request, status) in cases {
+        let what = format!("{} {}", request.method(), request.uri());
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status, "{what}");
+        assert_eq!(
+            response.headers()[HTTP_API_CONTRACT_HEADER],
+            HTTP_API_CONTRACT,
+            "{what}"
+        );
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            assert_eq!(response.headers()["allow"], "GET,HEAD", "{what}");
+        }
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("{what}: {}", String::from_utf8_lossy(&body)));
+        let code = match status {
+            StatusCode::NOT_FOUND => ErrorCode::NotFound,
+            StatusCode::METHOD_NOT_ALLOWED => ErrorCode::MethodNotAllowed,
+            _ => ErrorCode::BadRequest,
+        };
+        assert_eq!(error.code, Some(code), "{what}: {}", error.error);
+        assert_eq!(
+            error.disposition,
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action: DispositionAction::Fix,
+            }),
+            "{what}"
+        );
+    }
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+}
+
+/// A method a protected route does not serve is answered by the same guards
+/// as one it serves: authentication, the contract and the actor assertion
+/// refuse first, and only a request they admit learns which methods the path
+/// serves. One route of each protected router; MCP serves its own methods
+/// behind its own guards.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unserved_method_on_a_protected_route_answers_after_every_guard() {
+    use omnigraph_server::api::{
+        DispositionAction, DispositionEffects, DispositionOutput, ErrorCode,
+    };
+
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let routes = [
+        (Method::PUT, g("/snapshot"), "GET,HEAD"),
+        (Method::PUT, g("/branches/feature"), "DELETE"),
+        (Method::PUT, "/graphs".to_string(), "GET,HEAD"),
+        (Method::PUT, "/cluster/plan".to_string(), "POST"),
+        (Method::GET, "/graphs/og_catalog/query".to_string(), "POST"),
+    ];
+    for (method, path, allow) in routes {
+        let what = format!("{method} {path}");
+
+        let (status, body) =
+            json_response(&app, expecting(method.clone(), &path, None, &[], None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}: {body}");
+        assert_code(body, ErrorCode::Unauthorized, &what);
+
+        let mut request = expecting(method.clone(), &path, Some("demo-token"), &[], None);
+        request
+            .headers_mut()
+            .insert(HTTP_API_CONTRACT_HEADER, HeaderValue::from_static("0.11"));
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+        assert_code(body, ErrorCode::ApiContractMismatch, &what);
+
+        let (status, body) = json_response(
+            &app,
+            expecting(
+                method.clone(),
+                &path,
+                Some("demo-token"),
+                &["act-someone-else"],
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{what}: {body}");
+        assert_code(body, ErrorCode::ActorMismatch, &what);
+
+        let response = app
+            .clone()
+            .oneshot(expecting(method, &path, Some("demo-token"), &[], None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{what}");
+        assert_eq!(response.headers()["allow"], allow, "{what}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("{what}: {}", String::from_utf8_lossy(&body)));
+        assert_eq!(error.code, Some(ErrorCode::MethodNotAllowed), "{what}");
+        assert_eq!(
+            error.disposition,
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action: DispositionAction::Fix,
+            }),
+            "{what}"
+        );
+    }
+
+    let response = app
+        .clone()
+        .oneshot(expecting(Method::PUT, "/mcp", None, &[], None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "PUT /mcp");
 }
 
 #[tokio::test(flavor = "multi_thread")]

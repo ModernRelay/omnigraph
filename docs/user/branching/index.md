@@ -172,7 +172,8 @@ branch was forked off in `from`, for a commit start the branch that wrote the
 commit, and the commit it starts at in `from_commit_id`. Every receipt carries
 `from_commit_id`: for a start from a branch it is that branch's head when the
 branch was created. A branch starts only at a commit whose whole snapshot is
-still there under the graph's current schema; otherwise nothing is created:
+still there under the graph's current schema; otherwise nothing is created,
+and the error's `code` is `branch_start_refusal`, with `action: fix`:
 
 | `from_commit` names | Answer | `branch_start_refusal.reason` |
 |---|---|---|

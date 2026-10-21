@@ -594,10 +594,16 @@ fn blob_stat_fails_loudly_for_null_missing_and_non_blob_cells() {
                 .arg("--target")
                 .arg(&graph),
         );
-        assert!(
-            output.stdout.is_empty(),
-            "{case}: failure must not masquerade as Blob metadata"
+        // The failure is the failure envelope, never Blob metadata.
+        let failure = parse_stdout_json(&output);
+        assert!(failure["error"].is_string(), "{case}: {failure}");
+        assert_eq!(
+            failure["disposition"]["effects"], "none",
+            "{case}: {failure}"
         );
+        for metadata in ["kind", "size", "etag"] {
+            assert!(failure.get(metadata).is_none(), "{case}: {failure}");
+        }
     }
 }
 
@@ -727,14 +733,15 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             .arg(&original)
             .arg("--json"),
     );
-    assert_eq!(stale.status.code(), Some(1), "an embedded mismatch exits 1");
+    // The engine refused the write before it published, as a server does.
+    assert_eq!(stale.status.code(), Some(4), "an embedded mismatch exits 4");
     let refused = parse_stdout_json(&stale);
     assert_eq!(
         refused["blob_precondition_failure"]["current_etag"],
         stat_etag(readme).as_str()
     );
     assert!(refused.get("precondition_failure").is_none(), "{refused}");
-    assert_eq!(refused["command_outcome"]["action"], "refresh");
+    assert_eq!(refused["disposition"]["action"], "refresh");
 
     let cleared = parse_stdout_json(&output_success(
         blob("clear", readme)
@@ -805,7 +812,7 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             "actual": 32 * 1024 * 1024 + 1,
         })
     );
-    assert_eq!(refused["command_outcome"]["execution"], "not_started");
+    assert_eq!(refused["disposition"]["effects"], "none");
     assert!(!absent.exists(), "neither arm opened the store");
 
     // If-Match precedes reading the input; a missing input in turn precedes
@@ -834,8 +841,8 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             "{validator}: {refused}"
         );
         assert_eq!(
-            refused["command_outcome"],
-            json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+            refused["disposition"],
+            json!({"effects":"none", "action":"refresh"})
         );
         assert!(server.requests().is_empty());
         server.assert_complete();
@@ -1290,7 +1297,7 @@ fn repair_reports_foreign_drift_and_refuses_removed_flags() {
     assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
     for flag in ["--confirm", "--force"] {
         let refused = output_failure(cli().arg("repair").arg(flag).arg("--target").arg(&graph));
-        assert_eq!(refused.status.code(), Some(2));
+        assert_eq!(refused.status.code(), Some(64));
         assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
     }
 }
@@ -1447,7 +1454,7 @@ fn removed_cli_spellings_refuse_and_canonical_commands_remain_available() {
         vec!["export", "--jsonl"],
     ] {
         let output = output_failure(cli().args(&args));
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert_eq!(output.status.code(), Some(64), "{args:?}: {output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
@@ -1755,6 +1762,15 @@ fn load_json_outputs_summary_for_main_branch() {
     );
     assert!(payload["commit"]["graph_commit_id"].is_string());
     assert!(payload["commit"]["graph_manifest_version"].is_number());
+    // The load route's body, field for field: no address, the write's actor
+    // (none is configured here) and a null base branch without `--from`.
+    assert!(payload.get("uri").is_none(), "{payload}");
+    assert_eq!(payload.get("base_branch"), Some(&Value::Null));
+    assert_eq!(payload.get("actor_id"), Some(&Value::Null));
+    assert_eq!(payload["actor_id"], payload["commit"]["actor_id"]);
+    let body: omnigraph_api_types::GraphBatchLoadOutput =
+        serde_json::from_value(payload.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&body).unwrap(), payload);
 
     let commits = parse_stdout_json(&output_success(
         cli()
@@ -2491,8 +2507,8 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
         .unwrap();
     assert_eq!(
         lost.status.code(),
-        Some(1),
-        "embedded writable open prevents whole-command no-effect proof; stderr: {}",
+        Some(4),
+        "the engine refused before it published, as a server does; stderr: {}",
         String::from_utf8_lossy(&lost.stderr)
     );
     let body: Value = serde_json::from_slice(&lost.stdout)
@@ -2502,8 +2518,8 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
         Value::String(stale_head)
     );
     assert_eq!(
-        body["command_outcome"],
-        serde_json::json!({"execution":"unknown","effects":"unknown","action":"refresh"})
+        body["disposition"],
+        serde_json::json!({"effects":"none","action":"refresh"})
     );
 
     let verify = output_success(
@@ -2564,9 +2580,9 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
         assert_eq!(error["http_status"], status);
         assert_eq!(error["request_dispatched"], false);
         assert_eq!(
-            error["command_outcome"],
+            error["disposition"],
             serde_json::json!({
-                "execution":"not_started", "effects":"none", "action":"refresh"
+                "effects":"none", "action":"fix"
             })
         );
         let requests = server.requests();
@@ -2761,7 +2777,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"request exceeds the write budget",
                 "resource_limit":{"resource":"entities","limit":100,"actual":101}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted", "--if-commit", "head-before"],
@@ -2779,7 +2795,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"wrong status cannot establish a conditional refusal",
                 "precondition_failure":{"expected":"head-before","actual":"head-after"}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted", "--if-commit", "head-before"],
@@ -2788,7 +2804,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"wrong condition cannot establish this request's refusal",
                 "precondition_failure":{"expected":"another-condition","actual":"head-after"}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted"],
@@ -2797,7 +2813,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"unsolicited condition cannot establish a refusal",
                 "precondition_failure":{"expected":"head-before","actual":"head-after"}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted", "--if-commit", "head-before"],
@@ -2807,7 +2823,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "precondition_failure":{"expected":"head-before","actual":"head-after"},
                 "recovery_required":{"operation_id":"published"}
             }),
-            1,
+            2,
         ),
     ] {
         let formats: &[&[&str]] = if arguments[0] == "query" {
@@ -2838,27 +2854,22 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             let mut actual = serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
                 panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
             });
-            if arguments[0] == "mutate" {
-                // A verified precondition and a typed policy denial both refuse
-                // before effects; every other row leaves the outcome unknown.
-                let (execution, effects) = if exit == 4 || body["code"] == "forbidden" {
-                    ("not_started", "none")
-                } else {
-                    ("unknown", "unknown")
-                };
-                assert_eq!(actual["http_status"], status);
-                assert_eq!(
-                    actual["command_outcome"]["execution"], execution,
-                    "{arguments:?}: {actual}"
-                );
-                assert_eq!(
-                    actual["command_outcome"]["effects"], effects,
-                    "{arguments:?}: {actual}"
-                );
-                let fields = actual.as_object_mut().unwrap();
-                fields.remove("http_status");
-                fields.remove("command_outcome");
-            }
+            // A read changes nothing, and a verified precondition and a typed
+            // policy denial both refuse before effects; every other row
+            // leaves the effects unknown.
+            let effects = if arguments[0] != "mutate" || exit == 4 || body["code"] == "forbidden" {
+                "none"
+            } else {
+                "unknown"
+            };
+            assert_eq!(actual["http_status"], status);
+            assert_eq!(
+                actual["disposition"]["effects"], effects,
+                "{arguments:?}: {actual}"
+            );
+            let fields = actual.as_object_mut().unwrap();
+            fields.remove("http_status");
+            fields.remove("disposition");
             assert_eq!(
                 actual, body,
                 "{arguments:?} {format:?} must preserve the server's complete error contract"
@@ -2870,6 +2881,143 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             server.assert_complete();
         },
     );
+}
+
+/// A served load its policy refuses ran nothing, so it exits 1 with
+/// `not_started` whether or not `--from` would have forked its branch: the
+/// server authorizes the load, the fork included, before its write. An
+/// embedded write carries no cluster policy; `command_outcome`'s tests own
+/// the embedded projection of an engine policy refusal.
+#[test]
+fn a_policy_refused_served_load_reports_not_started() {
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
+    let rows = cluster.path().join("rows.jsonl");
+    fs::write(
+        &rows,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Refused\",\"age\":1}}\n",
+    )
+    .unwrap();
+    // act-bruno may change an unprotected branch but neither create a branch
+    // nor change `main`.
+    let load = |branch: &str| {
+        vec![
+            "load".to_string(),
+            "--mode".into(),
+            "append".into(),
+            "--data".into(),
+            rows.to_string_lossy().into_owned(),
+            "--branch".into(),
+            branch.into(),
+            "--from".into(),
+            "main".into(),
+            "--json".into(),
+        ]
+    };
+    let assert_refused = |arm: &str, output: &std::process::Output| {
+        assert_eq!(output.status.code(), Some(1), "{arm}: {output:?}");
+        let body = parse_stdout_json(output);
+        assert_eq!(body["code"], "forbidden", "{arm}: {body}");
+        assert_eq!(
+            body["disposition"],
+            json!({"effects":"none","action":"refresh"}),
+            "{arm}: {body}"
+        );
+    };
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-bruno":"bruno-token"}"#,
+        )],
+    );
+    let operator = KeyedServer::new(&server.base_url);
+    for branch in ["fresh", "main"] {
+        let output = cli()
+            .envs(operator.env("bruno-token"))
+            .args(load(branch))
+            .args(["--target", &server.base_url, "--graph", "knowledge"])
+            .output()
+            .unwrap();
+        assert_refused(&format!("served {branch}"), &output);
+    }
+    // The refused fork left no branch.
+    let branches = parse_stdout_json(&output_success(
+        cli()
+            .envs(operator.env("bruno-token"))
+            .args(["branch", "list", "--json"])
+            .args(["--target", &server.base_url, "--graph", "knowledge"]),
+    ));
+    assert!(
+        !branches["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "fresh"),
+        "{branches}"
+    );
+}
+
+/// An embedded load reports what the engine did rather than a prediction.
+/// Onto a branch that exists, `--from` forks nothing, so a refused payload ran
+/// nothing. Onto a missing branch the fork publishes before the payload is
+/// read, so the same refusal follows that publication and the branch stays.
+#[test]
+fn an_embedded_load_reports_its_fork_from_the_engine() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph = temp.path().join("graph.omni");
+    init_graph(&graph);
+    load_fixture(&graph);
+    output_success(
+        cli()
+            .args(["branch", "create", "feature", "--target"])
+            .arg(&graph),
+    );
+    let rows = temp.path().join("rows.jsonl");
+    fs::write(&rows, "not valid graph NDJSON\n").unwrap();
+    let load = |branch: &str| {
+        cli()
+            .args(["load", "--mode", "append", "--data"])
+            .arg(&rows)
+            .args(["--branch", branch, "--from", "main", "--json", "--target"])
+            .arg(&graph)
+            .output()
+            .unwrap()
+    };
+    let branches = || {
+        parse_stdout_json(&output_success(
+            cli()
+                .args(["branch", "list", "--json", "--target"])
+                .arg(&graph),
+        ))["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before = branches();
+
+    let existing = load("feature");
+    assert_eq!(existing.status.code(), Some(1), "{existing:?}");
+    assert_eq!(
+        parse_stdout_json(&existing)["disposition"],
+        json!({"effects":"none","action":"fix"}),
+        "{existing:?}"
+    );
+    assert_eq!(branches(), before, "no fork onto an existing branch");
+
+    let forked = load("fresh");
+    assert_eq!(forked.status.code(), Some(2), "{forked:?}");
+    let body = parse_stdout_json(&forked);
+    // The fork published, and the engine marks the load's later error as
+    // following it without proving that the failing step wrote nothing, so
+    // the whole command's effects are unknown.
+    assert_eq!(
+        body["disposition"],
+        json!({"effects":"unknown","action":"reconcile"}),
+        "{body}"
+    );
+    assert!(branches().contains("fresh"), "the fork published");
 }
 
 /// Whole-command outcome classification needs real CLI processes and a wire
@@ -2902,8 +3050,8 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         ],
         vec!["blob", "clear", "node", "Document", "readme", "content"],
     ];
-    let not_started = |action: &str| serde_json::json!({"execution":"not_started","effects":"none","action":action});
-    let unknown = |action: &str| serde_json::json!({"execution":"unknown","effects":"unknown","action":action});
+    let not_started = |action: &str| serde_json::json!({"effects":"none","action":action});
+    let unknown = |action: &str| serde_json::json!({"effects":"unknown","action":action});
     let cases = [
         (
             429,
@@ -2914,31 +3062,31 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         (
             429,
             serde_json::json!({"error":"unqualified proxy throttle"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             409,
             serde_json::json!({"error":"conflict","code":"conflict"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             503,
             serde_json::json!({"error":"unavailable"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             409,
             serde_json::json!({"error":"authority changed","read_set_conflict":{"member":"graph_head","expected":"before","actual":"after"}}),
-            1,
+            2,
             unknown("refresh"),
         ),
         (
             409,
             serde_json::json!({"error":"input too large","resource_limit":{"resource":"entities","limit":10,"actual":11}}),
-            1,
+            2,
             unknown("refresh"),
         ),
         // Admission probes an external Blob source before any effect; the
@@ -2946,25 +3094,25 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         (
             424,
             serde_json::json!({"error":"source unavailable","external_blob_source":{"uri":"s3://bucket/object","reason":"not found"}}),
-            1,
+            2,
             unknown("refresh"),
         ),
         (
             424,
             serde_json::json!({"error":"source unavailable"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             503,
             serde_json::json!({"error":"schema completion required","recovery_required":{"operation_id":"published-commit"}}),
-            1,
+            2,
             unknown("recover"),
         ),
         (
             429,
             serde_json::json!({"error":"contradictory refusal","code":"too_many_requests","recovery_required":{"operation_id":"published-commit"}}),
-            1,
+            2,
             unknown("recover"),
         ),
         // The server answers these before admission: bearer authentication,
@@ -2973,7 +3121,7 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             401,
             serde_json::json!({"error":"invalid bearer token","code":"unauthorized"}),
             1,
-            not_started("refresh"),
+            not_started("fix"),
         ),
         (
             403,
@@ -2985,26 +3133,26 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             400,
             serde_json::json!({"error":"exactly one contract header is required","code":"api_contract_mismatch"}),
             1,
-            not_started("refresh"),
+            not_started("fix"),
         ),
         // Only the code under its own status proves the refusal; contradictory
         // effect evidence outranks it.
         (
             403,
             serde_json::json!({"error":"denied by an intermediary"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             400,
             serde_json::json!({"error":"misplaced denial","code":"forbidden"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             403,
             serde_json::json!({"error":"contradictory denial","code":"forbidden","recovery_required":{"operation_id":"published-commit"}}),
-            1,
+            2,
             unknown("recover"),
         ),
     ];
@@ -3015,7 +3163,7 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
     for_each_concurrently(
         matrix,
         CASE_WORKERS,
-        |(arguments, (status, body, exit, outcome))| {
+        |(arguments, (status, body, exit, disposition))| {
             let mut reply = IntentReply::json(*status, body.clone());
             reply.headers.push(("Retry-After".into(), "17".into()));
             let server = IntentApiFixture::graph(vec![reply]);
@@ -3034,11 +3182,11 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             assert_eq!(actual["http_status"], *status);
             assert_eq!(actual["retry_after"], "17");
             assert_eq!(
-                &actual["command_outcome"], outcome,
+                &actual["disposition"], disposition,
                 "{arguments:?} HTTP {status} {body}"
             );
             let fields = actual.as_object_mut().unwrap();
-            fields.remove("command_outcome");
+            fields.remove("disposition");
             fields.remove("http_status");
             fields.remove("retry_after");
             // No credential is bound to the fixture's URL, so a 401 also says
@@ -3090,11 +3238,11 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             ])
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(2));
         let actual = parse_stdout_json(&output);
         assert_eq!(
-            actual["command_outcome"],
-            serde_json::json!({"execution":"unknown","effects":"unknown","action":"reconcile"})
+            actual["disposition"],
+            serde_json::json!({"effects":"unknown","action":"reconcile"})
         );
         assert_eq!(actual["http_status"], 200);
         assert_eq!(server.requests().len(), 2);
@@ -3149,10 +3297,17 @@ fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
             .args(["--target", &server.origin, "--graph", "knowledge"])
             .args(&arguments);
         let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        // A write's response lost its contract, so its effects are unknown;
+        // a read has none.
+        let write = arguments[0] == "mutate";
+        assert_eq!(output.status.code(), Some(if write { 2 } else { 1 }));
         if arguments.len() > 2 {
             let error = parse_stdout_json(&output);
             assert_eq!(error["code"], "api_contract_mismatch");
+            assert_eq!(
+                error["disposition"]["effects"],
+                if write { "unknown" } else { "none" }
+            );
             assert_eq!(error["http_status"], status);
             assert_eq!(error["request_dispatched"], true);
             assert!(
@@ -3225,11 +3380,31 @@ fn remote_human_and_invalid_json_errors_remain_diagnostics() {
         }
         let output = command.output().unwrap();
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty(), "{output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(expected),
-            "{output:?}"
-        );
+        if json {
+            // An untrusted body is never structure: its status and text
+            // become the CLI's own failure, which a read cannot leave with
+            // effects.
+            let failure = parse_stdout_json(&output);
+            assert!(
+                failure["error"].as_str().unwrap().contains(expected),
+                "{failure}"
+            );
+            assert_eq!(failure["http_status"], 403);
+            assert_eq!(failure["disposition"]["effects"], "none");
+            // Only the resolved destination precedes it, on stderr.
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .all(|line| line.starts_with("target ")),
+                "{output:?}"
+            );
+        } else {
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected),
+                "{output:?}"
+            );
+        }
         server.assert_complete();
     }
 }
@@ -3709,8 +3884,8 @@ fn as_on_a_served_write_asserts_the_actor() {
         let error = parse_stdout_json(&output);
         assert_eq!(error["code"], "actor_mismatch", "{write:?}: {error}");
         assert_eq!(
-            error["command_outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"}),
+            error["disposition"],
+            json!({"effects":"none","action":"fix"}),
             "{write:?}: {error}"
         );
         let requests = server.requests();
@@ -4137,7 +4312,7 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
     let output = parse_stdout_json(&output);
     let error = output["error"].as_str().unwrap();
     assert!(error.contains("refusing destructive `branch delete`") && error.contains("--yes"));
-    assert_eq!(output["command_outcome"]["effects"], "none");
+    assert_eq!(output["disposition"]["effects"], "none");
 
     // Both commit-drop spellings use the same consent gate before submission.
     for arguments in [
@@ -4161,8 +4336,8 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
             "{arguments:?}: {error}"
         );
         assert_eq!(
-            error["command_outcome"],
-            serde_json::json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
+            error["disposition"],
+            serde_json::json!({"effects":"none", "action":"refresh"}),
             "{arguments:?}"
         );
         let requests = server.requests();
@@ -4268,7 +4443,7 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
             .unwrap()
             .contains("refusing destructive `load --mode overwrite`")
     );
-    assert_eq!(output["command_outcome"]["effects"], "none");
+    assert_eq!(output["disposition"]["effects"], "none");
 
     let temp = tempdir().unwrap();
     let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
@@ -4287,8 +4462,8 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
         "consent must precede reading --data: {refused}"
     );
     assert_eq!(
-        refused["command_outcome"],
-        json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+        refused["disposition"],
+        json!({"effects":"none", "action":"refresh"})
     );
     assert!(
         server.requests().is_empty(),
@@ -4633,7 +4808,8 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             let output = command.output().unwrap();
             assert_eq!(
                 output.status.code(),
-                Some(if valid { 0 } else { 1 }),
+                // A receipt that contradicts the request leaves effects unknown.
+                Some(if valid { 0 } else { 2 }),
                 "{body}: {output:?}"
             );
             if valid {
@@ -4719,7 +4895,8 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
                 .unwrap();
             assert_eq!(
                 output.status.code(),
-                Some(if valid { 0 } else { 1 }),
+                // A receipt that contradicts the request leaves effects unknown.
+                Some(if valid { 0 } else { 2 }),
                 "{body}: {output:?}"
             );
             if valid {
@@ -5139,9 +5316,9 @@ fn cli_fails_for_missing_schema_or_data_file() {
         "{refused}"
     );
     assert_eq!(
-        refused["command_outcome"],
-        json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"}),
-        "embedded load opens writable storage before reading --data"
+        refused["disposition"],
+        json!({"effects":"none", "action":"refresh"}),
+        "embedded load reads --data before it opens storage"
     );
     let after = parse_stdout_json(&output_success(
         cli()
@@ -5174,8 +5351,8 @@ fn cli_fails_for_missing_schema_or_data_file() {
             "{settings:?}: {refused}"
         );
         assert_eq!(
-            refused["command_outcome"],
-            json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
+            refused["disposition"],
+            json!({"effects":"none", "action":"refresh"}),
             "served load validates settings and reads --data before HTTP"
         );
         assert!(server.requests().is_empty());
@@ -5276,6 +5453,310 @@ fn target_list_and_show_have_the_same_versioned_binding() {
             .args(["target", "show", "missing"]),
     );
     assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown target"));
+}
+
+/// `access` says what the caller may do at a target. A cluster graph's
+/// applied policy decides for the declared actor, whether a root target with
+/// `--graph` or the graph's own store is addressed; a standalone graph
+/// without a policy allows everything once it opens; a store that holds no
+/// graph refuses, a damaged one keeps its own failure; a server target
+/// answers through its access route with the target's token, `--as` riding
+/// as the actor assertion; and a catalogue or managed target refuses before
+/// any I/O.
+#[test]
+fn access_reports_what_the_caller_may_do_at_a_target() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
+    let actions = |report: &Value, key: &str| -> Vec<String> {
+        report[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key}: {report}"))
+            .iter()
+            .map(|action| action.as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // A cluster graph through a root target: its applied policy decides for
+    // the declared actor.
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
+    let decide = |actor: Option<&str>, branch: &str| -> Value {
+        let mut command = cli();
+        command
+            .arg("access")
+            .arg("--target")
+            .arg(cluster.path())
+            .args(["--graph", "knowledge", "--branch", branch, "--json"]);
+        if let Some(actor) = actor {
+            command.args(["--as", actor]);
+        }
+        parse_stdout_json(&output_success(&mut command))
+    };
+    let feature = decide(Some("act-bruno"), "feature");
+    assert_eq!(feature["protocol"], 1, "{feature}");
+    assert_eq!(feature["source"], "direct", "{feature}");
+    assert_eq!(feature["graph_id"], "knowledge");
+    assert_eq!(feature["actor"], "act-bruno");
+    assert!(
+        actions(&feature, "actions").contains(&"change".to_string()),
+        "{feature}"
+    );
+    let main = decide(Some("act-bruno"), "main");
+    assert!(
+        actions(&main, "actions").contains(&"read".to_string()),
+        "{main}"
+    );
+    assert!(
+        !actions(&main, "actions").contains(&"change".to_string()),
+        "{main}"
+    );
+    let nobody = decide(None, "feature");
+    assert!(actions(&nobody, "graph_wide").is_empty(), "{nobody}");
+    assert!(actions(&nobody, "actions").is_empty(), "{nobody}");
+    // A graph the cluster does not apply has no policy to read, so access
+    // refuses rather than report every action allowed.
+    let unknown = output_failure(
+        cli()
+            .arg("access")
+            .arg("--target")
+            .arg(cluster.path())
+            .args(["--graph", "missing", "--json"]),
+    );
+    assert_eq!(unknown.status.code(), Some(1), "{unknown:?}");
+    let refusal = parse_stdout_json(&unknown);
+    assert_eq!(refusal["code"], "not_found", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+    assert!(
+        refusal["error"].as_str().unwrap().contains("knowledge"),
+        "{refusal}"
+    );
+    // The same graph addressed by its store answers from the cluster's
+    // applied ledger, exactly as the root target does, and an unapplied
+    // `storage:` in the cluster's configuration moves neither answer.
+    let store = cluster.path().join("graphs").join("knowledge.omni");
+    let by_store = || {
+        parse_stdout_json(&output_success(
+            cli().arg("access").arg("--target").arg(&store).args([
+                "--as",
+                "act-bruno",
+                "--branch",
+                "main",
+                "--json",
+            ]),
+        ))
+    };
+    let mut expected = main.clone();
+    expected["target"] = json!(store.to_string_lossy());
+    assert_eq!(by_store(), expected);
+    let config = cluster.path().join("cluster.yaml");
+    let applied = fs::read_to_string(&config).unwrap();
+    let elsewhere = tempdir().unwrap();
+    fs::write(
+        &config,
+        format!("storage: {}\n{applied}", elsewhere.path().display()),
+    )
+    .unwrap();
+    assert_eq!(by_store(), expected);
+    assert_eq!(decide(Some("act-bruno"), "main"), main);
+    fs::write(&config, applied).unwrap();
+    // Legacy recovery evidence quarantines the cluster's only graph, so the
+    // loader serves nothing; the graph is unavailable, not the cluster
+    // broken, through either address.
+    let recoveries = cluster.path().join("__cluster").join("recoveries");
+    fs::create_dir_all(&recoveries).unwrap();
+    fs::write(
+        recoveries.join("op-pending.json"),
+        json!({
+            "schema_version": 1,
+            "operation_id": "op-pending",
+            "started_at": "1970-01-01T00:00:00Z",
+            "kind": "schema_apply",
+            "graph_id": "knowledge",
+            "graph_uri": store.to_string_lossy(),
+            "desired_schema_digest": "pending",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for target in [cluster.path().to_path_buf(), store.clone()] {
+        let mut command = cli();
+        command.arg("access").arg("--target").arg(&target);
+        if target == cluster.path() {
+            command.args(["--graph", "knowledge"]);
+        }
+        let quarantined = output_failure(command.args(["--branch", "main", "--json"]));
+        // The code's own action and exit, as a server answers it.
+        assert_eq!(quarantined.status.code(), Some(75), "{quarantined:?}");
+        let refusal = parse_stdout_json(&quarantined);
+        assert_eq!(refusal["code"], "graph_unavailable", "{refusal}");
+        assert_eq!(
+            refusal["disposition"],
+            json!({"effects": "none", "action": "retry"}),
+            "{refusal}"
+        );
+        assert!(
+            refusal["error"]
+                .as_str()
+                .unwrap()
+                .contains("awaits recovery"),
+            "{refusal}"
+        );
+    }
+
+    // A store that holds no graph has no policy to report.
+    let temp = tempdir().unwrap();
+    let missing = output_failure(
+        cli()
+            .arg("access")
+            .arg("--target")
+            .arg(temp.path().join("absent.omni"))
+            .args(["--branch", "main", "--json"]),
+    );
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+    let refusal = parse_stdout_json(&missing);
+    assert_eq!(refusal["code"], "not_found", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+    // A graph whose manifest names a missing object is damaged, not absent:
+    // the open's own failure stands.
+    let damaged = temp.path().join("damaged.omni");
+    init_graph(&damaged);
+    fs::remove_dir_all(damaged.join("__manifest").join("data")).unwrap();
+    let failure = output_failure(
+        cli()
+            .arg("access")
+            .arg("--target")
+            .arg(&damaged)
+            .args(["--branch", "main", "--json"]),
+    );
+    let failure = parse_stdout_json(&failure);
+    assert_eq!(failure["code"], "internal", "{failure}");
+    assert_eq!(failure["disposition"]["effects"], "none", "{failure}");
+
+    // A standalone graph without a policy allows every action.
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let home = tempdir().unwrap();
+    let rows = IntentReply::json(
+        200,
+        json!({
+            "actor":"act-me", "graph_id":"knowledge", "graph_wide":["read"],
+            "branch":"main", "target_branch":null, "actions":["read","change"]
+        }),
+    );
+    let served = IntentApiFixture::graph(vec![rows]);
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "target_config_version: 1\ntargets:\n  \
+             local:\n    kind: direct\n    scope: graph\n    uri: '{}'\n  \
+             served:\n    kind: server\n    endpoint: '{}'\n    credential: served\n    default_graph: knowledge\n  \
+             cloud:\n    kind: managed\n    scope: cluster\n    api: https://api.example.com\n    \
+             organization_id: org\n    cluster_id: cluster\n    cluster_incarnation: one\n    \
+             control_auth: human-device\n    default_graph: knowledge\n",
+            graph.to_string_lossy(),
+            served.origin
+        ),
+    )
+    .unwrap();
+    let local = parse_stdout_json(&output_success(
+        cli().env("OMNIGRAPH_HOME", home.path()).args([
+            "access",
+            "--target",
+            "local",
+            "--branch",
+            "main",
+            "--target-branch",
+            "feature",
+            "--json",
+        ]),
+    ));
+    assert_eq!(local["target"], "local");
+    assert_eq!(local["source"], "direct");
+    assert_eq!(local["graph_id"], "default", "{local}");
+    assert_eq!(local["target_branch"], "feature", "{local}");
+    for action in [
+        "read",
+        "change",
+        "branch_create",
+        "branch_merge",
+        "commit_publish",
+    ] {
+        assert!(
+            actions(&local, "actions").contains(&action.to_string()),
+            "{action}: {local}"
+        );
+    }
+    // The text names the target branch for the actions decided into it.
+    let text = output_success(cli().env("OMNIGRAPH_HOME", home.path()).args([
+        "access",
+        "--target",
+        "local",
+        "--branch",
+        "main",
+        "--target-branch",
+        "feature",
+    ]));
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        text.contains("\nfrom main into feature: branch_create, branch_merge\n"),
+        "{text}"
+    );
+    let on_main = text
+        .lines()
+        .find(|line| line.starts_with("on main: "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        on_main.contains("change") && !on_main.contains("branch_create"),
+        "{text}"
+    );
+
+    // A server target asks its access route, with the target's token, and
+    // `--as` rides as the actor assertion.
+    let report = parse_stdout_json(&output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_TOKEN_SERVED", "served-token")
+            .args([
+                "access", "--target", "served", "--as", "act-me", "--branch", "main", "--json",
+            ]),
+    ));
+    assert_eq!(report["source"], "server", "{report}");
+    assert_eq!(report["target"], "served");
+    assert_eq!(actions(&report, "actions"), ["read", "change"]);
+    let requests = served.workflow_requests();
+    let request = requests.last().unwrap();
+    assert_eq!(request.method, "GET");
+    assert!(
+        request.path.starts_with("/graphs/knowledge/access"),
+        "{}",
+        request.path
+    );
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer served-token")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get("omnigraph-if-actor")
+            .map(String::as_str),
+        Some("act-me")
+    );
+    served.assert_complete();
+
+    // The catalogue carries no policy and managed data qualifies each
+    // operation separately: both refuse before any I/O.
+    for target in ["og_catalog", "cloud"] {
+        let refused = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["access", "--target", target, "--json"]),
+        );
+        let refusal = parse_stdout_json(&refused);
+        assert_eq!(
+            refusal["code"], "target_incompatible",
+            "{target}: {refusal}"
+        );
+    }
 }
 
 #[test]

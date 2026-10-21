@@ -45,7 +45,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
-| `commit list/show/changes/publish/drop` | Inspect history (`list --limit`/`--page-token` for one page of it, `list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other and paging) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it); `publish` and `drop` take `--as` on a direct graph, the reads refuse it | direct or served |
+| `commit list/show/changes/publish/drop` | Inspect history (`list --limit`/`--page-token` for one page of it, `list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other and paging) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it); `publish` and `drop` take `--as`, the reads refuse it | direct or served |
 | `diff` | Net entity changes between two points: branches or commit ids (`--from`, `--to`) | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
@@ -60,7 +60,8 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |
-| `queries list/validate` | Inspect or validate a cluster query registry | cluster |
+| `queries list` | List stored queries: a cluster root's registry (`--graph` narrows it to one graph), or one served graph's catalog, whose `--json` is the body of `GET /graphs/{id}/queries` | cluster or served |
+| `queries validate` | Type-check a cluster's applied query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate self-hosted declarative state; [deployment/recovery flags](../clusters/index.md) | config, server, explicit root |
 | `cluster create/list/members/pull/push/delete/undo-delete/token/operation/history/cancel` | Operate a managed cluster | managed account or cluster target |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
@@ -68,10 +69,11 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
 | `target list/show/add/remove/import` | Inspect, edit or import complete target entries | local |
 | `credential get` | Export a server target’s static token to a pipe | registered server target |
+| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or served |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
 | `organization members/invitations` | Administer organization membership and invitations | managed account target |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
-| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`target`, `credential`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
+| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`target`, `credential`, `access`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 ## Query inputs and output
 
@@ -96,19 +98,18 @@ envelope pretty and the `rows` array compact; a refusal follows [Diagnostics](..
 
 ### Machine-readable read and write positions
 
-`query --json` returns `graph_commit_id` when its read snapshot has a graph
-head. The id and rows share one pinned snapshot; use that id for a later
-conditional mutation.
+`query --json` returns `graph_commit_id` when its read snapshot has a graph head. The id and
+rows share one pinned snapshot; use that id for a later conditional mutation.
 
 Successful `mutate --json` and `load --json` responses include `commit`, the exact commit published by
-that attempt. It contains `graph_commit_id`, optional `graph_branch`,
-`graph_manifest_version`, optional parent and merged-parent ids, optional
-`actor_id`, and `created_at` in Unix microseconds. A successful mutation
-that changes no entities returns `"commit": null`.
+that attempt: `graph_commit_id`, optional `graph_branch`, `graph_manifest_version`, optional parent and
+merged-parent ids, optional `actor_id`, and `created_at` in Unix microseconds. A successful mutation
+that changes no entities returns `"commit": null`. On every target `load --json` prints the body of
+`POST /graphs/{id}/load/ndjson`, with the write's `actor_id` and a `base_branch` that is `null` without `--from`.
 
-`--json` and read `--format json` preserve structured errors on stdout. Data-write failures
-report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands).
-Verified HTTP conditional mismatches exit 4; embedded mismatches exit 1 because writable open can complete earlier work.
+`--json` and read `--format json` preserve structured errors on stdout. Data-write and read failures
+report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands); a refused command line exits 64.
+Verified conditional mismatches exit 4, embedded or served, when nothing else in the command ran.
 
 ### Conditional mutations
 
@@ -121,7 +122,7 @@ omnigraph mutate update_person --query queries.gq --target ./graph.omni \
 `--if-commit` runs the mutation only while the target branch is still at that
 commit. Any intervening commit on the branch invalidates the condition, even
 when it changed unrelated data. A mismatch has no effect and exits with code
-4 against a server, 1 on an embedded `--target` run; JSON output includes `precondition_failure` with `expected` and optional
+4, against a server or embedded; JSON output includes `precondition_failure` with `expected` and optional
 `actual` commit ids. Re-read and decide again instead of retrying blindly.
 
 ## Storage upgrade
@@ -178,7 +179,7 @@ omnigraph blob get|stat|put|clear <node|edge> <TYPE> <ID> <PROPERTY> --target NA
 `get` accepts `--branch` or `--snapshot`, `--offset`, `--length`, and
 `--out <PATH>`. `stat` accepts `--branch` or `--snapshot` and `--json`. `put`
 reads `--file <PATH>` or stdin; `put` and `clear` accept `--branch`,
-`--if-match <TAG>`, `--json` and, on direct storage targets, `--as`. See [Blob values](../blobs.md).
+`--if-match <TAG>`, `--json` and `--as` (on a served target, an assertion). See [Blob values](../blobs.md).
 
 ## Operator configuration
 

@@ -15,11 +15,12 @@ use omnigraph_api_types::{
     ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOpOutput, ChangeOutput,
     ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, DiffOutput,
     EntityKindOutput, ExportRequest, GraphBatchLoadOutput, GraphDiscoveryResponse,
-    GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryRequest, ReadOutput,
-    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
-    branch_read_output, change_baseline_output, change_feed_output, change_scope,
-    commit_changes_output, commit_output, diff_output, load_executed_output, merge_base_output,
-    read_output, schema_apply_output, show_read_output, snapshot_payload,
+    GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput,
+    branch_list_read_output, branch_read_output, change_baseline_output, change_feed_output,
+    change_scope, commit_changes_output, commit_output, diff_output,
+    graph_batch_load_receipt_output, load_executed_output, merge_base_output, read_output,
+    schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
@@ -34,6 +35,7 @@ use crate::blob_cli::{
     remote_blob_error, whole_external_uri,
 };
 use crate::cli::CliLoadMode;
+use crate::command_outcome::{EngineWrite as _, EngineWriteError};
 #[cfg(test)]
 use crate::graph_http::ApiContractError;
 use crate::graph_http::GraphHttpClient;
@@ -44,7 +46,6 @@ use crate::helpers::{
     remote_response_json_bounded, remote_url, resolve_actor_with_config, select_named_query,
 };
 use crate::operator::InvocationConfig;
-use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 use crate::targets::{ResolvedTarget, TargetBinding};
 
 const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
@@ -632,6 +633,33 @@ impl GraphClient {
         }
     }
 
+    /// A served graph's stored-query catalog, the body of `GET …/queries`.
+    /// A direct root reads its registry from the applied cluster state
+    /// instead, so only a server target reaches this.
+    pub(crate) async fn list_queries(&self) -> Result<QueriesCatalogOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                ..
+            } => {
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["queries"], &[])?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => {
+                bail!("a direct graph has no stored queries; list them from its cluster root")
+            }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("queries list")),
+        }
+    }
+
     pub(crate) async fn list_commits(&self, branch: Option<&str>) -> Result<CommitListOutput> {
         match self {
             GraphClient::Remote {
@@ -1078,9 +1106,10 @@ impl GraphClient {
     }
 
     /// `load` — bulk-load `data` (a file path) onto `branch`, forking from
-    /// `from` if missing. Returns the CLI `LoadOutput`; each arm keeps its
-    /// own mapping (remote uses the logical graph-batch result, embedded reads
-    /// the engine `LoadResult` directly).
+    /// `from` if missing. Both arms return the load route's body: the remote
+    /// arm as the server sent it, the embedded arm built from the engine
+    /// receipt by the constructor the route uses, attributed to this
+    /// process's actor.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn load(
         &self,
@@ -1090,7 +1119,7 @@ impl GraphClient {
         mode: CliLoadMode,
         settings: &[(SettingId, SettingValue)],
         stderr: &mut dyn Write,
-    ) -> Result<LoadOutput> {
+    ) -> Result<GraphBatchLoadOutput> {
         match self {
             GraphClient::Remote {
                 http,
@@ -1125,22 +1154,18 @@ impl GraphClient {
                 // One attempt only. A lost response may follow a committed
                 // load or a created branch; neither can be replayed blindly.
                 let response = http.send(request).await?;
-                let output: GraphBatchLoadOutput =
-                    remote_response_json_bounded(response, token.as_deref(), *response_limit)
-                        .await?;
-                Ok(load_output_from_graph_batch(
-                    base_url,
-                    mode.as_str(),
-                    &output,
-                ))
+                remote_response_json_bounded(response, token.as_deref(), *response_limit).await
             }
             GraphClient::Embedded {
                 uri,
                 actor,
                 binding,
             } => {
-                let session = Self::open_write_session(uri, binding, settings, stderr).await?;
+                refuse_noncanonical_branches([Some(branch), from])?;
                 let data = std::fs::read_to_string(data)?;
+                let session = Self::open_write_session(uri, binding, settings, stderr).await?;
+                // A missing branch is forked first, which publishes on its
+                // own; the engine marks a later refusal as following it.
                 let receipt = session
                     .load_graph_batch_as_with_receipt(
                         branch,
@@ -1149,13 +1174,13 @@ impl GraphClient {
                         mode.into(),
                         actor.as_deref(),
                     )
-                    .await?;
-                Ok(load_output_from_receipt(
-                    uri,
-                    branch,
-                    mode.as_str(),
+                    .await
+                    .engine_write()?;
+                Ok(graph_batch_load_receipt_output(
                     &receipt,
                     &session.catalog(),
+                    mode.into(),
+                    actor.clone(),
                 ))
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("load")),
@@ -1222,6 +1247,7 @@ impl GraphClient {
                 let (selected_name, query_params) =
                     select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
+                refuse_noncanonical_branches([branch])?;
                 let session = Self::open_write_session(uri, binding, settings, stderr).await?;
                 let actor = actor.as_deref();
                 let receipt = session
@@ -1242,7 +1268,7 @@ impl GraphClient {
                                 expected,
                                 actual,
                             } => precondition_failed_cli(message, expected, actual).into(),
-                            other => color_eyre::eyre::Report::from(other),
+                            other => color_eyre::eyre::Report::from(EngineWriteError(other)),
                         }
                     })?;
                 Ok(ChangeOutput {
@@ -1381,7 +1407,8 @@ impl GraphClient {
                                 actor.as_deref(),
                                 as_commit,
                             )
-                            .await?;
+                            .await
+                            .engine_write()?;
                         let commit = result.commit.as_ref().map(commit_output);
                         (
                             target.clone(),
@@ -1473,14 +1500,16 @@ impl GraphClient {
                 Self::apply_prefix(&mut session, query_source)?;
                 let target = session
                     .get_commit(write.graph_commit_id())
-                    .await?
+                    .await
+                    .engine_write()?
                     .graph_branch
                     .unwrap_or_else(|| "main".to_string());
                 let (commit, outcome) = match write {
                     CommitWrite::Publish { graph_commit_id } => {
                         let published = session
                             .publish_commit_as(&graph_commit_id, actor.as_deref())
-                            .await?;
+                            .await
+                            .engine_write()?;
                         (
                             Some(commit_output(&published)),
                             BranchOutcomeOutput::Published,
@@ -1489,7 +1518,8 @@ impl GraphClient {
                     CommitWrite::Drop { graph_commit_id } => {
                         session
                             .drop_commit_as(&graph_commit_id, actor.as_deref())
-                            .await?;
+                            .await
+                            .engine_write()?;
                         (None, BranchOutcomeOutput::Dropped { graph_commit_id })
                     }
                 };
@@ -1562,7 +1592,8 @@ impl GraphClient {
                 Self::apply_prefix(&mut session, query_source)?;
                 let receipt = session
                     .load_csv_as_with_receipt(branch.unwrap_or("main"), &request, actor.as_deref())
-                    .await?;
+                    .await
+                    .engine_write()?;
                 let executed = receipt.executed_plan().map(load_executed_output);
                 Ok(ChangeOutput {
                     branch: receipt.result.branch,
@@ -1611,7 +1642,8 @@ impl GraphClient {
                 commit_output(
                     &session
                         .publish_commit_as(commit_id, actor.as_deref())
-                        .await?,
+                        .await
+                        .engine_write()?,
                 )
             }
             GraphClient::Catalogue => return Err(catalogue_scope_refusal("commit publish")),
@@ -1650,7 +1682,7 @@ impl GraphClient {
                 session
                     .drop_commit_as(commit_id, actor.as_deref())
                     .await
-                    .map_err(Into::into)
+                    .engine_write()
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("commit drop")),
         }
@@ -1989,7 +2021,10 @@ impl GraphClient {
             } => {
                 let db = Self::open_write(uri, binding, stderr).await?;
                 let actor = actor.as_deref();
-                let created = db.branch_create_from_as(start, name, actor).await?;
+                let created = db
+                    .branch_create_from_as(start, name, actor)
+                    .await
+                    .engine_write()?;
                 Ok(BranchCreateOutput {
                     uri: uri.clone(),
                     from: created.from,
@@ -2030,7 +2065,7 @@ impl GraphClient {
             } => {
                 let db = Self::open_write(uri, binding, stderr).await?;
                 let actor = actor.as_deref();
-                db.branch_delete_as(name, actor).await?;
+                db.branch_delete_as(name, actor).await.engine_write()?;
                 Ok(BranchDeleteOutput {
                     uri: uri.clone(),
                     name: name.to_string(),
@@ -2055,9 +2090,7 @@ impl GraphClient {
         // Dispatch, receipt validation and optional deletion all use the names
         // as given, so refuse one the engine and the server would refuse before
         // any storage or HTTP work: none can then fail after publication.
-        for name in [source, into] {
-            omnigraph_policy::ensure_canonical_branch_name(name)?;
-        }
+        refuse_noncanonical_branches([Some(source), Some(into)])?;
         let output = match self {
             GraphClient::Remote {
                 http,
@@ -2109,7 +2142,8 @@ impl GraphClient {
                 let actor = actor.as_deref();
                 let result = session
                     .branch_merge_as_with_options(source, into, actor, as_commit)
-                    .await?;
+                    .await
+                    .engine_write()?;
                 // Composed exactly like the server handler: the merge is
                 // durable, so a deletion refusal/failure is reported in the
                 // payload, never as an error (parity_matrix pins the two
@@ -2275,7 +2309,8 @@ impl GraphClient {
                 let db = Self::open_write(uri, binding, stderr).await?;
                 let result = db
                     .apply_schema_as_with_catalog_check(schema_source, actor.as_deref(), validate)
-                    .await?;
+                    .await
+                    .engine_write()?;
                 Ok(schema_apply_output(uri, result))
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("apply schema")),
@@ -2542,7 +2577,7 @@ impl GraphClient {
                         }
                         .into()
                     }
-                    other => color_eyre::eyre::Report::from(other),
+                    other => color_eyre::eyre::Report::from(EngineWriteError(other)),
                 })?;
                 Ok(omnigraph_api_types::blob_write_output(
                     query.into(),
@@ -2689,7 +2724,8 @@ fn verified_blob_precondition(error: color_eyre::eyre::Report) -> color_eyre::ey
         Ok(remote)
             if remote.status == StatusCode::PRECONDITION_FAILED
                 && remote.output.blob_precondition_failure.is_some()
-                && remote.output.code == Some(omnigraph_api_types::ErrorCode::Conflict)
+                && remote.output.code
+                    == Some(omnigraph_api_types::ErrorCode::PreconditionFailed)
                 && crate::command_outcome::single_request()
                 && {
                     let mut rest = remote.output.clone();
@@ -2755,6 +2791,19 @@ fn parse_change_feed_start(start: &str) -> Result<omnigraph::changes::ChangeFeed
             })
             .ok_or_else(|| eyre!("start must be now | beginning | after:<commit_id>")),
     }
+}
+
+/// Refuse a branch name the engine refuses, with the engine's own error,
+/// before any storage open or request: the refusal then proves that nothing
+/// ran.
+fn refuse_noncanonical_branches<'a>(
+    names: impl IntoIterator<Item = Option<&'a str>>,
+) -> Result<()> {
+    for name in names.into_iter().flatten() {
+        omnigraph_policy::ensure_canonical_branch_name(name)
+            .map_err(|error| omnigraph::error::OmniError::manifest(error.to_string()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3206,33 +3255,36 @@ mod tests {
             };
             let server = IntentApiFixture::graph(replies);
             let http = GraphHttpClient::new(&server.origin).unwrap();
-            let (error, evidence) = crate::command_outcome::observe(async {
-                if earlier_request {
-                    remote_json::<Value>(
+            let (error, evidence) = crate::command_outcome::observe(
+                crate::command_outcome::CommandKind::Write,
+                async {
+                    if earlier_request {
+                        remote_json::<Value>(
+                            &http,
+                            Method::POST,
+                            format!("{}/graphs/knowledge/branches", server.origin),
+                            Some(json!({"name":"review"})),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    remote_json_with_graph_commit_precondition::<Value>(
                         &http,
-                        Method::POST,
-                        format!("{}/graphs/knowledge/branches", server.origin),
-                        Some(json!({"name":"review"})),
+                        if read_refusal {
+                            Method::GET
+                        } else {
+                            Method::POST
+                        },
+                        format!("{}/graphs/knowledge/mutate", server.origin),
+                        Some(json!({"query":"mutation m() {}"})),
                         None,
+                        conditional.then_some("head-a"),
                     )
                     .await
-                    .unwrap();
-                }
-                remote_json_with_graph_commit_precondition::<Value>(
-                    &http,
-                    if read_refusal {
-                        Method::GET
-                    } else {
-                        Method::POST
-                    },
-                    format!("{}/graphs/knowledge/mutate", server.origin),
-                    Some(json!({"query":"mutation m() {}"})),
-                    None,
-                    conditional.then_some("head-a"),
-                )
-                .await
-                .unwrap_err()
-            })
+                    .unwrap_err()
+                },
+            )
             .await;
             assert_eq!(
                 server.workflow_requests().len(),
@@ -3246,20 +3298,20 @@ mod tests {
             attempt(true, false, Refusal::Busy),
             attempt(false, false, Refusal::Busy)
         );
-        assert_eq!(compound.exit, 1);
+        assert_eq!(compound.exit, 2);
         assert_eq!(single.exit, 75);
         assert_eq!(
-            serde_json::to_value(compound).unwrap()["command_outcome"],
+            serde_json::to_value(compound).unwrap()["disposition"],
             json!({
-                "execution":"unknown", "effects":"unknown", "action":"reconcile"
+                "effects":"unknown", "action":"reconcile"
             })
         );
         let single = serde_json::to_value(single).unwrap();
         assert_eq!(single["retry_after"], "Wed, 21 Oct 2026 07:28:00 GMT");
         assert_eq!(
-            single["command_outcome"],
+            single["disposition"],
             json!({
-                "execution":"not_started", "effects":"none", "action":"retry"
+                "effects":"none", "action":"retry"
             })
         );
         // A later read's typed refusal cannot erase an earlier successful
@@ -3272,23 +3324,23 @@ mod tests {
             (false, Refusal::Denied),
         ] {
             let compound = attempt(true, read_refusal, kind).await;
-            assert_eq!(compound.exit, 1);
+            assert_eq!(compound.exit, 2);
             assert_eq!(
-                serde_json::to_value(compound).unwrap()["command_outcome"]["effects"],
+                serde_json::to_value(compound).unwrap()["disposition"]["effects"],
                 "unknown"
             );
         }
         let conditional = attempt(false, false, Refusal::Condition).await;
         assert_eq!(conditional.exit, 4);
         assert_eq!(
-            serde_json::to_value(conditional).unwrap()["command_outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"})
+            serde_json::to_value(conditional).unwrap()["disposition"],
+            json!({"effects":"none","action":"refresh"})
         );
         let denied = attempt(false, false, Refusal::Denied).await;
         assert_eq!(denied.exit, 1);
         assert_eq!(
-            serde_json::to_value(denied).unwrap()["command_outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"})
+            serde_json::to_value(denied).unwrap()["disposition"],
+            json!({"effects":"none","action":"refresh"})
         );
     }
 

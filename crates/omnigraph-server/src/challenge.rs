@@ -140,7 +140,7 @@ mod tests {
             headers.append(AUTHORIZATION, HeaderValue::from_bytes(value).unwrap());
         }
         bearer_token(&headers).map(str::to_owned).map_err(|error| {
-            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
             let Some(crate::ApiErrorDetails::Unauthenticated(reason)) = error.details.as_deref()
             else {
                 panic!("a 401 without its reason: {error:?}");
