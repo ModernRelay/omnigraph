@@ -177,9 +177,9 @@ with the same error, byte for byte, as a query naming something never declared.
 
 ### What is not promised
 
-- **Storage holders, direct and local access.** Lance files contain every row.
-  Anyone who can read the graph's objects sees everything, and direct access and
-  a local server you run for yourself are storage-holder access
+- **Storage holders and direct access.** Lance files contain every row.
+  Anyone who can read the graph's objects sees everything, and direct CLI and
+  embedded access are storage-holder access
   ([Direct and served access](#direct-and-served-access)). A recipient who needs
   storage-level access gets a materialized share with its own storage.
 - **Timing.** Execution time can depend on hidden rows. Timing channels are out
@@ -527,23 +527,23 @@ mentions any, follow the canonical branch-name rule.
 
 ### Direct and served access
 
-How the actor's view applies follows the access path, in the terms of the draft
+How the actor's view applies follows the access path, in the terms of the
 graph access RFC
-([ModernRelay/omnigraph#1017](https://github.com/ModernRelay/omnigraph/pull/1017)):
+([ModernRelay/omnigraph#1017](https://github.com/ModernRelay/omnigraph/pull/1017)),
+which has one serving model, the cluster-backed `omnigraph-server`, on any host
+including localhost:
 
 | Path | Actor | View |
 |---|---|---|
-| Served to others (a cluster deployment, `serve --listen`) | Resolved from the credential; `--as` becomes an assertion the server checks | The actor's view |
-| A local server you run for yourself | Declared with `--as` | Bypass: you already hold the storage credentials |
-| Direct access from the CLI or an embedding | Declared | Bypass, unless the embedding installs a policy, in which case the engine applies the declared actor's view as a convenience, not as confidentiality |
+| Served (the cluster-backed server) | Resolved from the credential; `--as` sends `Omnigraph-If-Actor`, an assertion the server checks | The actor's view |
+| Direct access from the CLI or an embedding | Declared with `--as`, else `operator.actor` | Storage holder. Where the engine enforces the graph's policy for the declared actor, it applies that actor's view too, as a convenience, not as confidentiality |
 
-A graph with `actor-views` declarations is served to others only by a cluster,
-whose version-2 policy defines `internal` and `bypass`. The server refuses to
-serve such a graph in unauthenticated mode, which today allows every graph
+The server activates a graph with `actor-views` declarations only under a
+version-2 cluster policy, which defines `internal` and `bypass`. It refuses to
+serve such a graph without authentication, which today allows every graph
 action, and with static tokens but no policy, which today allows every read
-(`handlers.rs`, the no-policy branch of the authorization check). A local server
-that serves an `actor-views` graph read-write applies the bypass view and records
-the declared actor, as the graph access draft specifies.
+(`handlers.rs`, the no-policy branch of the authorization check). Cluster apply
+reports the refusal before activation.
 
 ### Reading under a view
 
@@ -655,8 +655,7 @@ covers each listed securable, and each securable that inherits from a covered
 one when every one of its `@requires` targets is covered too. A summary that
 also derives from a source outside the caveat therefore stays outside it.
 
-The `omnigraph-expect-actor` assertion of the graph access draft names the
-actor. Cedar evaluates each action for both the subject and the actor, and both
+The `Omnigraph-If-Actor` assertion of the graph access RFC names the actor. Cedar evaluates each action for both the subject and the actor, and both
 must be allowed. Commit receipts record both. `omnigraph access` reports the
 effective view.
 
@@ -726,7 +725,7 @@ the dual-placement rule to branches.
 ### Surfaces
 
 Each operation has one name, request and result across CLI, HTTP and MCP, as the
-graph access draft requires. Under a restricted view:
+graph access RFC requires. Under a restricted view:
 
 | Operation (CLI, HTTP, MCP tool or resource) | Under a restricted view |
 |---|---|
@@ -745,7 +744,7 @@ graph access draft requires. Under a restricted view:
 | `blob get`, `blob stat` | Only for a visible row; a hidden row answers exactly as a missing one. |
 | `access` (`GET /graphs/{id}/access`) | Reports the caller's effective view ([Operator tools](#operator-tools)). |
 | Replay of a saved plan | Refused for another actor's plan or a changed view; refusals are redacted ([Plan acceptance](#plan-acceptance)). |
-| Error and denial messages | Carry no other row's ids, values, counts, ETags or versions, and no schema hash; the error code and outcome object stay as defined. |
+| Error and denial messages | Carry no other row's ids, values, counts, ETags or versions, and no schema hash; the error code and `disposition` object stay as defined. |
 
 ### Sharing
 
@@ -809,7 +808,7 @@ root and one set of credentials today
 
 ### Operator tools
 
-The graph access draft's `omnigraph access` command and
+The graph access RFC's `omnigraph access` command and
 `GET /graphs/{graph_id}/access` route report the caller's own effective access.
 This RFC fills their `view` field with facts about the caller's own view only,
 none of which changes with hidden rows: whether the view is restricted or
@@ -1287,32 +1286,35 @@ applies the view, or refuses with `view_restricted`.
   `.pg` text instead of serving the stored source. OIDC tokens are bound to their
   audience and organization, signed data tokens to the cluster; no tool forwards
   a credential.
-- **Errors.** Every new refusal is a code in the graph access draft's shared
-  error registry, with its HTTP status and outcome:
+- **Errors.** Every new refusal is a code in the graph access RFC's one
+  registry (`ErrorCode`), with its HTTP status and `disposition`. Each is a
+  refusal met before the write started, so its effects are `none`:
 
-  | Code | HTTP | Outcome |
-  |---|---|---|
-  | `view_restricted` | 403 | not started, no effects |
-  | `view_write_denied` | 403 | not started, no effects |
-  | `placement_required` | 400 | not started, no effects |
-  | `delete_blocked` | 409 | not started, no effects |
-  | `identity_binding_denied` | 403 | not started, no effects |
-  | `view_limit_exceeded` | 422 | not started, no effects |
+  | Code | HTTP | `effects` | `action` |
+  |---|---|---|---|
+  | `view_restricted` | 403 | `none` | `fix` |
+  | `view_write_denied` | 403 | `none` | `fix` |
+  | `placement_required` | 400 | `none` | `fix` |
+  | `delete_blocked` | 409 | `none` | `fix` |
+  | `identity_binding_denied` | 403 | `none` | `fix` |
+  | `view_limit_exceeded` | 422 | `none` | `fix` |
 
   `key_conflict` becomes a code too, and a restricted actor's response omits its
-  entity id. Stripping foreign facts never changes the code or the outcome
-  object, and a hidden name produces the same error, outcome included, as an
-  undeclared one.
+  entity id. Stripping foreign facts never changes the code or the
+  `disposition`, and a hidden name produces the same error, disposition
+  included, as an undeclared one.
 - **Settling uncertain writes.** Today a client settles an unknown outcome by
   comparing the branch head and listing commits, then replays with
   `if-graph-commit`. Branch heads stay visible under a view, but commit listings
-  are refused in the first scope. A restricted writer therefore settles with the
-  `outcome.check` of the graph access draft (branch, head before the write,
-  attempt id): the server answers whether that attempt published and returns
-  that actor's own commit receipt, never the commit's other effects, and a
-  conditional replay works as today.
-- **Serving modes** follow [Direct and served access](#direct-and-served-access):
-  `serve --listen` refuses an `actor-views` graph without a version-2 cluster
+  are refused in the first scope. A restricted writer therefore settles through
+  the `disposition.check` that a later phase of the graph access RFC adds
+  (branch, publication id, head before the write): the server answers whether
+  that publication landed and returns that actor's own commit receipt, never
+  the commit's other effects, and a conditional replay works as today. Until
+  that phase ships, a restricted writer settles by head comparison and a
+  conditional replay alone.
+- **Serving** follows [Direct and served access](#direct-and-served-access): the
+  server refuses to activate an `actor-views` graph without a version-2 cluster
   policy, and cluster apply reports the refusal before activation.
 
 ### Polymorphic types
@@ -1638,7 +1640,7 @@ the same contract ([Phase 8](#rollout)).
    any future search cache are derived state keyed by immutable versions. Missing
    or stale derived state is rebuilt or refuses; it never widens a view. Index
    coverage never changes a restricted search result.
-8. **Loud integrity.** Every refusal is a typed code with an outcome. A view or a
+8. **Loud integrity.** Every refusal is a typed code with a disposition. A view or a
    search is never truncated silently. A fixed placement naming a missing
    securable is refused, not hidden.
 9. **Typed semantics.** The view is a typed IR leaf with its own eligibility,
@@ -2040,6 +2042,9 @@ placement.
   - The polymorphic types draft adopted view statistics on 2026-10-18 and
     records the same plan split; multi-member `bm25` stays refused for every
     actor until its scanner option ships.
+  - Aligned with the graph access RFC as revised on 2026-10-20: one serving
+    model, the cluster-backed server on any host; the `Omnigraph-If-Actor`
+    assertion; the `disposition` object, whose `check` a later phase adds.
 
 ## Appendix A: validated assumptions
 
