@@ -86,6 +86,12 @@ impl ClusterAdmission {
         self.owner().guard.lock_id()
     }
 
+    /// A watch on this admission's lease. It holds no reference to the
+    /// admission, so a holder can wait on it without delaying release.
+    pub fn lease_fence(&self) -> crate::lease::LeaseFence {
+        crate::lease::LeaseFence(self.owner().guard.lease_fenced())
+    }
+
     /// Explicit storage lifetime acquired before the first native lock request.
     pub fn io_scope(&self) -> Option<omnigraph_storage::StorageIoScope> {
         self.owner().store.io_scope()
@@ -216,7 +222,7 @@ impl ClusterAdmission {
     /// never a reason to delete or retry against a newer version. Operators
     /// must still exclude concurrent administrative force-unlock.
     pub async fn release_after_settlement(mut self) -> Result<(), Diagnostic> {
-        let owner = match Arc::try_unwrap(self.0.take().expect("admission not consumed")) {
+        let mut owner = match Arc::try_unwrap(self.0.take().expect("admission not consumed")) {
             Ok(owner) => owner,
             Err(owner) => {
                 let error = Diagnostic::error(
@@ -231,6 +237,11 @@ impl ClusterAdmission {
                 return Err(error);
             }
         };
+        // Renewal stops and its beats go first: if the release then fails,
+        // the lock is a silent leased lock a successor takes over.
+        if let Some(dir) = owner.guard.stop_lease().await {
+            owner.store.remove_lease_dir(&dir).await;
+        }
         owner.store.release_settled(owner.guard.lock_id()).await
     }
 

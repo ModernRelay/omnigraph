@@ -662,36 +662,39 @@ mod tests {
             },
         ] {
             let api = IntentApiFixture::graph(vec![]);
-            let target = ResolvedTarget::new(
-                TargetBinding::Server {
-                    endpoint: api.origin.clone(),
-                    auth: crate::targets::ServerAuth::Token {
-                        owner: "fixture".into(),
+            crate::operator_routing::test_transport_scope(&[&api.origin], async {
+                let target = ResolvedTarget::new(
+                    TargetBinding::Server {
+                        endpoint: api.origin.clone(),
+                        auth: crate::targets::ServerAuth::Token {
+                            owner: "fixture".into(),
+                        },
+                        default_graph: None,
                     },
-                    default_graph: None,
-                },
-                provenance,
-            );
-            let command = ClusterCommand::Apply {
-                config: None,
-                json: true,
-                deployment_id: Some(id.into()),
-                writers_stopped: false,
-                plan: None,
-                run: crate::commands::cluster::ClusterRunArgs::default(),
-            };
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            let error = run(&input, &command, &target, None, &mut out, &mut err)
-                .await
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("requires explicit --config"),
-                "{error:?}"
-            );
-            assert!(out.is_empty() && err.is_empty());
-            assert!(api.workflow_requests().is_empty());
-            api.assert_complete();
+                    provenance,
+                );
+                let command = ClusterCommand::Apply {
+                    config: None,
+                    json: true,
+                    deployment_id: Some(id.into()),
+                    writers_stopped: false,
+                    plan: None,
+                    run: crate::commands::cluster::ClusterRunArgs::default(),
+                };
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let error = run(&input, &command, &target, None, &mut out, &mut err)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("requires explicit --config"),
+                    "{error:?}"
+                );
+                assert!(out.is_empty() && err.is_empty());
+                assert!(api.workflow_requests().is_empty());
+                api.assert_complete();
+            })
+            .await;
         }
         let digest = omnigraph_cluster::capture_deployment_for_server(source.path(), root)
             .unwrap()
@@ -714,65 +717,68 @@ mod tests {
                     replies.push(IntentReply::json(202, accepted.clone()));
                 }
                 let api = IntentApiFixture::graph(replies);
-                // Supplied routing avoids ambient operator configuration in this
-                // output-boundary test; the fixture still owns actual HTTP.
-                let remote = RemoteCluster {
-                    root: api.origin.clone(),
-                    token: Some("fixture-secret".into()),
-                    client: GraphHttpClient::new(&api.origin).unwrap(),
-                };
-                let mut stdout = Output::new((!fail_identity).then_some(fault));
-                let mut stderr = Output::new(fail_identity.then_some(fault));
-                let error = remote
-                    .apply(
-                        source.path(),
-                        Some(id),
-                        true,
-                        true,
-                        Some(10),
-                        &mut stdout,
-                        &mut stderr,
-                    )
-                    .await
-                    .unwrap_err();
-                assert_eq!(
-                    error.downcast_ref::<io::Error>().unwrap().kind(),
-                    io::ErrorKind::BrokenPipe
-                );
-                assert!(error.to_string().contains(id), "{error:?}");
-                assert!(!error.is::<WaitTimeout>());
-                assert!(!retry_observation(&error));
-                let requests = api.workflow_requests();
-                assert_eq!(requests.len(), if fail_identity { 1 } else { 2 });
-                assert_eq!(
-                    (&*requests[0].method, &*requests[0].path),
-                    ("GET", "/cluster/deployments")
-                );
-                if fail_identity {
-                    assert!(stdout.bytes.is_empty());
-                    assert!(error.to_string().contains("no deployment was sent"));
-                } else {
+                crate::operator_routing::test_transport_scope(&[&api.origin], async {
+                    // Supplied routing avoids ambient operator configuration in this
+                    // output-boundary test; the fixture still owns actual HTTP.
+                    let remote = RemoteCluster {
+                        root: api.origin.clone(),
+                        token: Some("fixture-secret".into()),
+                        client: GraphHttpClient::new(&api.origin).unwrap(),
+                    };
+                    let mut stdout = Output::new((!fail_identity).then_some(fault));
+                    let mut stderr = Output::new(fail_identity.then_some(fault));
+                    let error = remote
+                        .apply(
+                            source.path(),
+                            Some(id),
+                            true,
+                            true,
+                            Some(10),
+                            &mut stdout,
+                            &mut stderr,
+                        )
+                        .await
+                        .unwrap_err();
                     assert_eq!(
-                        (&*requests[1].method, &*requests[1].path),
-                        ("POST", "/cluster/deployments")
+                        error.downcast_ref::<io::Error>().unwrap().kind(),
+                        io::ErrorKind::BrokenPipe
                     );
-                    assert_eq!(requests[1].body["deployment_id"], id);
-                    assert_eq!(stderr.bytes, format!("Deployment-ID: {id}\n").as_bytes());
-                    assert_eq!(stderr.flushes, 1, "identity delivered before submission");
-                    assert!(error.to_string().contains("never replay unknown work"));
-                    if matches!(fault, OutputFault::Flush) {
+                    assert!(error.to_string().contains(id), "{error:?}");
+                    assert!(!error.is::<WaitTimeout>());
+                    assert!(!retry_observation(&error));
+                    let requests = api.workflow_requests();
+                    assert_eq!(requests.len(), if fail_identity { 1 } else { 2 });
+                    assert_eq!(
+                        (&*requests[0].method, &*requests[0].path),
+                        ("GET", "/cluster/deployments")
+                    );
+                    if fail_identity {
+                        assert!(stdout.bytes.is_empty());
+                        assert!(error.to_string().contains("no deployment was sent"));
+                    } else {
                         assert_eq!(
-                            serde_json::from_slice::<Value>(&stdout.bytes).unwrap(),
-                            accepted
+                            (&*requests[1].method, &*requests[1].path),
+                            ("POST", "/cluster/deployments")
                         );
+                        assert_eq!(requests[1].body["deployment_id"], id);
+                        assert_eq!(stderr.bytes, format!("Deployment-ID: {id}\n").as_bytes());
+                        assert_eq!(stderr.flushes, 1, "identity delivered before submission");
+                        assert!(error.to_string().contains("never replay unknown work"));
+                        if matches!(fault, OutputFault::Flush) {
+                            assert_eq!(
+                                serde_json::from_slice::<Value>(&stdout.bytes).unwrap(),
+                                accepted
+                            );
+                        }
                     }
-                }
-                for request in requests {
-                    assert_eq!(request.headers["authorization"], "Bearer fixture-secret");
-                }
-                assert!(!source.path().join("__cluster").exists());
-                assert!(!source.path().join("graphs").exists());
-                api.assert_complete();
+                    for request in requests {
+                        assert_eq!(request.headers["authorization"], "Bearer fixture-secret");
+                    }
+                    assert!(!source.path().join("__cluster").exists());
+                    assert!(!source.path().join("graphs").exists());
+                    api.assert_complete();
+                })
+                .await;
             }
         }
 
@@ -797,77 +803,81 @@ mod tests {
                     }
                     replies.push(IntentReply::json(refusal_status.as_u16(), refusal.clone()));
                     let api = IntentApiFixture::graph(replies);
-                    let remote = RemoteCluster {
-                        root: api.origin.clone(),
-                        token: Some("fixture-secret".into()),
-                        client: GraphHttpClient::new(&api.origin).unwrap(),
-                    };
-                    let mut stdout = Output::new(None);
-                    let mut stderr = Output::after_flushes(fault, 1);
-                    let error = remote
-                        .apply(
-                            source.path(),
-                            Some(id),
-                            true,
-                            !during_observation,
-                            Some(10),
-                            &mut stdout,
-                            &mut stderr,
-                        )
-                        .await
-                        .unwrap_err();
-                    let remote_error = error
-                        .downcast_ref::<RemoteErrorCli>()
-                        .expect("hint failure must preserve the typed server refusal");
-                    assert_eq!(remote_error.status, refusal_status);
-                    assert_eq!(serde_json::to_value(&remote_error.output).unwrap(), refusal);
-                    assert_eq!(
-                        serde_json::to_value(crate::app::error_output_of(&error).unwrap()).unwrap(),
-                        refusal,
-                        "application JSON rendering must retain the server body"
-                    );
-                    assert!(!retry_observation(&error));
-                    assert!(!error.is::<WaitTimeout>());
-                    assert!(stdout.bytes.is_empty());
-                    if fault.is_some() {
-                        let context = error.to_string();
-                        assert!(context.contains("stderr"), "{error:?}");
-                        assert!(context.contains("output closed"), "{error:?}");
-                        assert!(context.contains(id), "{error:?}");
-                        assert!(context.contains(if during_observation {
-                            "observation failure"
+                    crate::operator_routing::test_transport_scope(&[&api.origin], async {
+                        let remote = RemoteCluster {
+                            root: api.origin.clone(),
+                            token: Some("fixture-secret".into()),
+                            client: GraphHttpClient::new(&api.origin).unwrap(),
+                        };
+                        let mut stdout = Output::new(None);
+                        let mut stderr = Output::after_flushes(fault, 1);
+                        let error = remote
+                            .apply(
+                                source.path(),
+                                Some(id),
+                                true,
+                                !during_observation,
+                                Some(10),
+                                &mut stdout,
+                                &mut stderr,
+                            )
+                            .await
+                            .unwrap_err();
+                        let remote_error = error
+                            .downcast_ref::<RemoteErrorCli>()
+                            .expect("hint failure must preserve the typed server refusal");
+                        assert_eq!(remote_error.status, refusal_status);
+                        assert_eq!(serde_json::to_value(&remote_error.output).unwrap(), refusal);
+                        assert_eq!(
+                            serde_json::to_value(crate::app::error_output_of(&error).unwrap())
+                                .unwrap(),
+                            refusal,
+                            "application JSON rendering must retain the server body"
+                        );
+                        assert!(!retry_observation(&error));
+                        assert!(!error.is::<WaitTimeout>());
+                        assert!(stdout.bytes.is_empty());
+                        if fault.is_some() {
+                            let context = error.to_string();
+                            assert!(context.contains("stderr"), "{error:?}");
+                            assert!(context.contains("output closed"), "{error:?}");
+                            assert!(context.contains(id), "{error:?}");
+                            assert!(context.contains(if during_observation {
+                                "observation failure"
+                            } else {
+                                "submission failure"
+                            }));
                         } else {
-                            "submission failure"
-                        }));
-                    } else {
-                        assert_eq!(error.to_string(), refusal["error"].as_str().unwrap());
-                    }
-                    assert_eq!(
-                        stderr.flushes,
-                        if matches!(fault, Some(OutputFault::AfterPrefix)) {
-                            1
-                        } else {
-                            2
+                            assert_eq!(error.to_string(), refusal["error"].as_str().unwrap());
                         }
-                    );
-                    let requests = api.workflow_requests();
-                    assert_eq!(requests.len(), if during_observation { 3 } else { 2 });
-                    assert_eq!(
-                        requests
-                            .iter()
-                            .filter(|request| request.method == "POST")
-                            .count(),
-                        1,
-                        "a failed refusal hint never authorizes resubmission"
-                    );
-                    assert_eq!(requests[1].body["deployment_id"], id);
-                    if during_observation {
-                        assert_eq!(requests[2].method, "GET");
-                        assert_eq!(requests[2].path, format!("/cluster/deployments/{id}"));
-                    }
-                    assert!(!source.path().join("__cluster").exists());
-                    assert!(!source.path().join("graphs").exists());
-                    api.assert_complete();
+                        assert_eq!(
+                            stderr.flushes,
+                            if matches!(fault, Some(OutputFault::AfterPrefix)) {
+                                1
+                            } else {
+                                2
+                            }
+                        );
+                        let requests = api.workflow_requests();
+                        assert_eq!(requests.len(), if during_observation { 3 } else { 2 });
+                        assert_eq!(
+                            requests
+                                .iter()
+                                .filter(|request| request.method == "POST")
+                                .count(),
+                            1,
+                            "a failed refusal hint never authorizes resubmission"
+                        );
+                        assert_eq!(requests[1].body["deployment_id"], id);
+                        if during_observation {
+                            assert_eq!(requests[2].method, "GET");
+                            assert_eq!(requests[2].path, format!("/cluster/deployments/{id}"));
+                        }
+                        assert!(!source.path().join("__cluster").exists());
+                        assert!(!source.path().join("graphs").exists());
+                        api.assert_complete();
+                    })
+                    .await;
                 }
             }
         }

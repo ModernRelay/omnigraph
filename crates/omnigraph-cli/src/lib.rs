@@ -19,9 +19,16 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+mod credential_sources;
 mod embed;
+#[cfg(target_os = "macos")]
+mod macos_secure_store;
 mod operator;
+mod operator_routing;
+mod operator_schema;
+mod operator_transport;
 mod read_format;
+mod secure_store_error;
 
 mod admission;
 mod blob_cli;
@@ -45,6 +52,9 @@ mod schema_upgrade;
 mod scope;
 mod skill;
 mod targets;
+#[cfg(test)]
+#[path = "../tests/support/tls_gateway.rs"]
+mod tls_gateway;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/unix_gateway.rs"]
 mod unix_gateway_fixture;

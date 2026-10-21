@@ -8,7 +8,11 @@ use std::time::Duration;
 /// A bounded HTTP fixture for actual CLI processes. It records every request,
 /// including unexpected follow-up calls, without requiring a managed service.
 pub struct IntentApiFixture {
+    _tls: super::tls_gateway::TlsGateway,
     pub origin: String,
+    /// Backing HTTP listener for non-CLI mock storage/embedding dependencies.
+    /// CLI control and graph requests must use the HTTPS origin and a target.
+    pub http_origin: String,
     requests: std::sync::Arc<std::sync::Mutex<Vec<IntentRequest>>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -128,7 +132,10 @@ impl IntentApiFixture {
             None,
             Duration::ZERO,
             true,
-            Some(Forwarding::Merge(upstream.to_owned(), fault)),
+            Some(Forwarding::Merge(
+                super::tls_gateway::http_upstream(upstream),
+                fault,
+            )),
             None,
         )
     }
@@ -145,7 +152,10 @@ impl IntentApiFixture {
             None,
             Duration::ZERO,
             true,
-            Some(Forwarding::Deployment(upstream.to_owned(), fault)),
+            Some(Forwarding::Deployment(
+                super::tls_gateway::http_upstream(upstream),
+                fault,
+            )),
             None,
         )
     }
@@ -178,7 +188,9 @@ impl IntentApiFixture {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let http_origin = format!("http://{}", listener.local_addr().unwrap());
+        let tls = super::tls_gateway::TlsGateway::new(&http_origin);
+        let origin = tls.origin.clone();
         let replies = replies(&origin);
         let reply_count = match &forwarding {
             Some(Forwarding::Merge(..)) => Some(1),
@@ -489,7 +501,9 @@ impl IntentApiFixture {
             }
         });
         Self {
+            _tls: tls,
             origin,
+            http_origin,
             requests,
             stop,
             thread: Some(thread),

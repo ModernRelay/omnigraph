@@ -222,8 +222,9 @@ graph/action grants. Version-1 restricted credentials are not accepted.
 For direct CLI writes, actor resolution is:
 
 1. `--as <ACTOR>`;
-2. `operator.actor` in `~/.omnigraph/config.yaml`;
-3. no actor.
+2. no actor.
+
+The version-1 operator document has no actor field.
 
 When a policy is installed, a missing actor is denied. Only the server
 resolves a served write's actor; there `--as` is an assertion the server checks

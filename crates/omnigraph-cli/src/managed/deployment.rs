@@ -423,8 +423,7 @@ pub(super) async fn dispatch(
             }
         }
         ClusterCommand::History { limit, since, .. } => {
-            let mut url = Url::parse(&format!("{}{base}/history", context.api))
-                .map_err(|_| Failure::protocol())?;
+            let mut url = api.url(&format!("{base}/history"))?;
             url.query_pairs_mut()
                 .append_pair("limit", &limit.to_string());
             if let Some(since) = since {
@@ -435,7 +434,12 @@ pub(super) async fn dispatch(
                 url.query_pairs_mut().append_pair("since", since);
             }
             let body = api
-                .request(Method::GET, &url[url::Position::BeforePath..], None, None)
+                .request(
+                    Method::GET,
+                    &format!("{base}/history?{}", url.query().unwrap_or_default()),
+                    None,
+                    None,
+                )
                 .await?;
             cluster_matches(&body, &context.cluster)?;
             for delivery in body["data"]["deployments"]

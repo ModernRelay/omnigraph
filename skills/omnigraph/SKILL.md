@@ -133,7 +133,7 @@ omnigraph load --data delta.jsonl --from main --branch review --mode merge --tar
 ### Dispatching
 
 ```bash
-omnigraph alias  signal sig-foo                  # operator alias → its bound stored read query
+omnigraph alias  signal --params '{"slug":"sig-foo"}'                  # operator alias → its bound stored read query
 omnigraph query  get_signal --params '{"slug":"sig-foo"}'   # served stored query by name (verb asserts read vs write)
 omnigraph query  -e 'query q() { match { $s: Signal } return { $s.slug } limit 5 }'   # ad-hoc/inline (or: --query f.gq <name>)
 omnigraph mutate add_signal --query mutations.gq --params '{"slug":"sig-foo","name":"Foo","brief":"Example","createdAt":"2026-04-14T00:00:00Z"}'   # name positional; ad-hoc file source
@@ -172,9 +172,9 @@ backend. `--config DIR` is source input only.
 
 - Direct graph: `--target ./graph.omni` or a registered `kind: direct, scope: graph` entry.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
-- Server: `--target production --graph knowledge` or an explicit HTTP/Unix address. A registered server target binds its endpoint and credential owner or `auth: anonymous`.
-- Managed: a registered account or cluster target pins API, organization, authentication mechanism and, for clusters, ID and incarnation. Data access additionally requires its endpoint. `--graph` or `default_graph` is required for graph commands.
-- Catalogue: `--target og_catalog` for `query` and `schema show`.
+- Server: `--target production --graph knowledge`; the registered target owns endpoint and named auth profiles.
+- Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
+- Direct targets support local files only. Cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
@@ -189,17 +189,18 @@ destination line. Legacy `--server`, `--store`, `--cluster`, `--profile`,
 
 | Family | Operations and applicability |
 |---|---|
-| Data | `query`, `mutate`, `load --mode overwrite\|append\|merge`, `branch`, `commit`, `snapshot`, `export`, `blob`, `diff`, `changes`; direct or server targets |
-| Managed data | `query`, `mutate`, `load`, `commit list/show`, `graphs list`; other wrappers do not acquire managed credentials |
+| Engine inventory | `catalogue -e '<gq>'` or `catalogue --query file.gq`, optionally `--json`; local, without operator configuration, credentials or storage |
+| Data | `query`, `mutate`, `load --mode overwrite\|append\|merge`, `branch`, `commit`, `snapshot`, `export`, `blob`, `diff`, `changes`; direct or served targets |
+| Managed data | `graphs list` and common served graph commands, subject to endpoint capabilities and policy; no direct maintenance fallback |
 | Direct schema | `schema plan`; `schema apply` and `schema upgrade-system-columns` require standalone graph targets |
 | Direct maintenance | `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes`; `upgrade --target ADDRESS` is standalone and offline |
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
 | Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
-| Managed account | `cluster create/list`, `organization members/invitations`; account target |
+| Managed account | `cluster create/list`, `organization members/invitations`; `--profile NAME` |
 | Managed cluster | `cluster members/pull/push/plan/apply/status/history/cancel/token/delete/undo-delete`; complete cluster target |
-| Local configuration | `target list/show/add/remove/import`, `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
-| Authentication | `login --target NAME` / `logout --target NAME`; server static credentials or managed human-device session. `credential get --target NAME` exports a server token to a pipe |
+| Local configuration | `config validate/rename-profile/rename-target/rename-auth/recover-rename/recover-operations`, `target list/inspect/add/refresh/remove` (`register` aliases `add`), `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
+| Authentication | `login --register NAME`, `login --profile NAME`, or `logout --profile NAME` for platform sessions; `credentials set/status/remove/export` requires explicit profile or standalone target/auth |
 | Access | `access [--branch B [--target-branch T]]`; the actor and the actions the graph's policy grants it, from a server's access route or, for a direct graph or root target, the installed policy; catalogue and managed targets refuse |
 
 `query` and `mutate` invoke stored queries by positional name, or accept
@@ -211,10 +212,10 @@ values into query source. Reads support `--format table|json|jsonl|csv|kv`;
 Managed source changes use `cluster push --config DIR --expected-revision REV`,
 then `cluster plan --rev REV`, then `cluster apply --plan PREVIEW_ID`, all with
 the same cluster target. Managed plan/apply reject local `--config`. Creation
-returns identity; it does not select a new target or bind a folder. Human-device
-and automation-env authentication never fall back to each other. Preserve
-operator-home lifecycle recovery records; `target import` validates and migrates
-legacy folder evidence before new lifecycle submissions.
+returns identity; it does not select a new target or bind a folder. Providers never
+fall back to each other. Preserve unresolved lifecycle evidence and reconcile it
+through explicit `config recover-operations --source DIR --profile NAME`
+for legacy folder evidence; there is no configuration importer or automatic migration.
 
 For direct recovery, `cluster apply --target ROOT --deployment-id ID
 --writers-stopped` has no `--config`: it reconciles an existing attempt. A fresh
@@ -286,49 +287,65 @@ Direct `init`/`load` and **`cluster apply`** write storage without an HTTP serve
   changes with `cluster apply --target <name|url>`.
   See `references/cluster.md`.
 - **Direct / embedded access — no server.** Address a graph's storage directly
-  with `--target <file://|s3://|az:// uri>`; `init` also accepts its creation URI positionally.
+  with a local path or `--target file:///absolute/path/graph.omni`; `init` also accepts its creation URI positionally.
   There is **no single-graph server mode** — the server is cluster-only.
 
 ### The two config surfaces
 
-The team owns `cluster.yaml` and referenced schemas, stored queries and policies.
-The operator owns complete destinations, identity, presentation and personal
-aliases in `~/.omnigraph/config.yaml` (`OMNIGRAPH_HOME` changes that directory).
-Source configuration declares desired state; targets select where it applies.
+The team owns `cluster.yaml` and referenced schemas, queries and policies.
+The operator owns the `version: 1` document at `~/.omnigraph/config.yaml`.
+`OMNIGRAPH_HOME` changes the operator directory; `--operator-config FILE`
+selects one replacement file without merging. `--config DIR` is deployment source.
+The primary [operator reference](../../docs/user/cli/targets.md) owns the complete
+schema, providers, transport, defaults and upgrade procedure.
 
-```yaml
-target_config_version: 1
-operator:
-  actor: act-andrew
-defaults:
-  output: table
-  target: intel-dev
-targets:
-  intel-dev:
-    kind: server
-    endpoint: https://graph.example.com
-    credential: intel-dev
-    default_graph: spike
-aliases:
-  triage:
-    target: intel-dev
-    graph: spike
-    query: weekly_triage
-    args: [since]
+Profiles pin API/organization and own one auth provider for one identity. Managed targets
+reference a profile and pin cluster ID/incarnation; standalone server targets
+own endpoint/auth. Direct graph/root targets use absolute local `file://` URIs.
+On standalone servers, `--auth` overrides `default_auth`; without either,
+selection refuses even with one entry. Managed `--auth` is rejected. Managed
+targets use their pinned profile; default/global profiles cannot override it. `defaults.profile` and `defaults.target` apply only to their command
+classes. A graph selector overrides target `default_graph`; direct graphs reject
+it. Read output defaults to `table`. Whole-document validation is offline.
+
+```bash
+omnigraph config validate
+omnigraph login --register work
+omnigraph cluster list --profile work --json
+omnigraph target add production --profile work --cluster CLUSTER_ID
+omnigraph target inspect production --resolved --json
+omnigraph credentials status --profile work --json
 ```
 
-Secrets stay outside configuration. `echo "$TOKEN" | omnigraph login --target
-intel-dev` stores an endpoint-bound static token with mode `0600`;
-`OMNIGRAPH_TOKEN_INTEL_DEV` overrides it. Managed sessions and data credentials
-use separate OS-keychain entries. Named cloud targets pin provider destination
-settings while standard provider chains supply storage credentials. Stored
-relative paths resolve beside the operator file, whereas explicit inline paths
-resolve from the working directory. Source/query paths are independent inputs.
+Never put secrets in configuration. Providers are `omnigraph` (managed device
+login), `token` (exactly one `store`, `env` or `file` source), `exec` (absolute
+argv, bounded JSON protocol), and standalone-only `anonymous`. No fallback is
+allowed. Static installation uses `credentials set --stdin`, not login; existing
+entries require `--replace`. Managed credentials require `--profile NAME` without `--auth`; standalone
+credentials require `--target NAME --auth PROFILE`. Status never uses network/helpers or prompts; secure-store availability
+and identity remain unknown without reading secrets. Export is raw bearer-plus-newline to a pipe
+only, never terminal/file output; managed-target export releases data access; `--profile` exports control access.
+Neither exports refresh tokens. Read the reference before using credential commands.
 
-Use `target import` for old operator files and matching lifecycle evidence.
-It preserves the original file and refuses ambiguous bindings. Neither
-`OMNIGRAPH_PROFILE` nor `.omnigraph/context` supplies a target. A target name
-never falls back to a filesystem path, credential cache or discovered graph.
+Use `config rename-profile FROM TO`, `config rename-target FROM TO`, or
+`config rename-auth server OWNER FROM TO` to preserve custody and update
+references/defaults. An interrupted rename needs `config recover-rename` against
+the same operator file; conflicting edits refuse. These commands have no `--json`.
+Changing a profile's principal requires `login --profile NAME
+--replace-principal NEW_PRINCIPAL_ID`, matching the verified new identity and
+invalidating old derived credentials. See the primary operator reference.
+
+Bare login proposes profile name `omnigraph`; registration defaults to
+`https://platform.omnigraph.dev` and rejects `--auth`;
+this does not create routing defaults. Existing sessions need the selected profile.
+Transport defaults to verified system TLS and direct routing, ignoring proxy
+variables unless opted in. Custom CA plus HTTPS proxy is refused. This model
+qualifies neither BYOC private routing nor workload federation. Direct aliases
+cannot execute the server-owned stored-query registry.
+
+No backward compatibility or `target import` exists. Rebuild old configuration,
+retain old operator homes and reconcile outstanding operations with compatible
+tooling. Credentials and discovery never supply a missing destination.
 
 ### What to commit
 
@@ -382,9 +399,9 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Using `data.id` for identity on a new graph | `unknown input field 'id': move data.id to the top-level 'id' field` | Put identity in top-level JSONL `id`; `data` contains user properties |
 | Re-running a `--mode merge` load with unkeyed edges | duplicate edges | Supply stable top-level edge `id`s, or declare `@key(@src, @dst)` when creating the edge type |
 | Assuming every JSON result cell has a key | absent keys for null values | Query/export JSON omits null cells; change images retain explicit nulls |
-| `--format arrow` or `defaults.output: arrow` | `has no text rendering` after the query runs | 0.12.0 has no Arrow output; use `json` or `jsonl` |
+| `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv` or `kv` |
 | `..` or a symlink in a `cluster.yaml` relative path | `config_path_escape` / `config_path_symlink` | Keep referenced files inside the config directory with plain relative paths |
-| Legacy folder/profile routing | `legacy_routing` | Import preserved configuration/custody, then choose an explicit complete target |
+| Old operator format | configuration refusal | Replace it with `version: 1`; preserve journals and reconcile unresolved work before retiring old tooling |
 | Policy commands with both a graph and a `cluster` bundle applied | `matches 2 policy bundles` | Known 0.12.0 limitation of `policy validate/test/explain --graph`; inspect each bundle file directly |
 
 ## Deep Dives
