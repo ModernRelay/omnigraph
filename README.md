@@ -62,7 +62,7 @@ brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
-Prefer not to run it yourself? [Omnigraph Cloud](https://www.omnigraph.dev/cloud) runs dedicated clusters on the same MIT engine and is in private preview; join the waitlist there.
+Omnigraph Cloud, a hosted deployment of the same engine, is in private preview. [Join the waitlist](https://www.omnigraph.dev/cloud).
 
 ## Set it up with an AI agent
 
