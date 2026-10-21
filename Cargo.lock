@@ -5707,6 +5707,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "ulid",
  "yaml_serde",
 ]
@@ -5783,8 +5784,10 @@ dependencies = [
  "lance-core",
  "lance-io",
  "object_store 0.14.2",
+ "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-storage",
  "rand 0.9.4",
  "serde_json",
  "serial_test",

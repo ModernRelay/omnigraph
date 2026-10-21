@@ -32,13 +32,16 @@ time = { workspace = true }
 # StateLockGuard::drop on object-store backends (cluster commands always
 # run inside the caller's tokio runtime).
 tokio = { workspace = true }
+# The lease's fence and takeover records: lock ids and timing, never paths.
+tracing = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 serial_test = "3"
 tempfile = { workspace = true }
-tokio = { workspace = true }
+# Paused time for the lease tests, so the crate's own test build runs them.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
