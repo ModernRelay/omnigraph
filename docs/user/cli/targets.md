@@ -173,7 +173,10 @@ other. `target` is the target's name or the address given inline.
   `storage:` in `cluster.yaml` moves neither. With a bundle, nothing is
   allowed without an actor; with none, every action is allowed. A graph the
   cluster does not apply refuses with `not_found`, and one it quarantined, or
-  that two bundles bind, with `graph_unavailable`, as a server refuses them.
+  that two bundles bind, with `graph_unavailable`, as a server refuses them:
+  `action: retry` and exit 75. The answer comes from the ledger and does not
+  open the graph's store, so an allowed action is authorization, not proof
+  that the store opens.
 - A standalone graph carries no policy, so once its store opens every action
   is allowed, as direct writes do; its `graph_id` is `default`. A store that
   holds no graph refuses with `not_found`. A graph that fails to open for

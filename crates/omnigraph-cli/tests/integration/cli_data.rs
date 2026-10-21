@@ -5575,10 +5575,15 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
             command.args(["--graph", "knowledge"]);
         }
         let quarantined = output_failure(command.args(["--branch", "main", "--json"]));
-        assert_eq!(quarantined.status.code(), Some(1), "{quarantined:?}");
+        // The code's own action and exit, as a server answers it.
+        assert_eq!(quarantined.status.code(), Some(75), "{quarantined:?}");
         let refusal = parse_stdout_json(&quarantined);
         assert_eq!(refusal["code"], "graph_unavailable", "{refusal}");
-        assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+        assert_eq!(
+            refusal["disposition"],
+            json!({"effects": "none", "action": "retry"}),
+            "{refusal}"
+        );
         assert!(
             refusal["error"]
                 .as_str()

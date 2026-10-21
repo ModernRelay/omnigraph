@@ -375,10 +375,12 @@ impl Failure {
             || output.diagnostic.is_some()
             || output.branch_start_refusal.is_some()
         {
-            // A refusal of the request itself is fixed; any other is read
-            // again first.
+            // A refusal keeps its code's action when that action is to fix
+            // the request or, when nothing ran, to repeat it, as a server's
+            // own disposition does; any other is read again first.
             match output.code.map(ErrorCode::action) {
                 Some(Action::Fix) => Action::Fix,
+                Some(Action::Retry) if not_started => Action::Retry,
                 _ => Action::Refresh,
             }
         } else {
@@ -556,5 +558,31 @@ mod tests {
         assert_ne!(failure.output.code, Some(ErrorCode::OutcomeUnknown));
         assert_eq!(disposition(&failure)["effects"], "none");
         assert_eq!(failure.exit, 1);
+    }
+
+    /// A refusal the CLI decides itself takes its code's action, as the same
+    /// code relayed from a server does: one code, one action and one exit.
+    #[test]
+    fn a_local_refusal_keeps_its_code_action() {
+        for (code, action, exit) in [
+            (ErrorCode::GraphUnavailable, "retry", crate::EXIT_RETRY),
+            (ErrorCode::NotFound, "fix", 1),
+            (ErrorCode::Internal, "refresh", 1),
+        ] {
+            let failure = Failure::classify(
+                crate::helpers::CodedRefusal::report(code, "refused"),
+                Evidence {
+                    kind: CommandKind::Read,
+                    ..Evidence::default()
+                },
+            );
+            assert_eq!(failure.output.code, Some(code));
+            assert_eq!(
+                disposition(&failure),
+                serde_json::json!({"effects": "none", "action": action}),
+                "{code:?}"
+            );
+            assert_eq!(failure.exit, exit, "{code:?}");
+        }
     }
 }
