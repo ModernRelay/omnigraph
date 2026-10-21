@@ -8,7 +8,7 @@ authors:
   - ragnorc
   - azimafroozeh
 created: 2026-10-07
-updated: 2026-10-18
+updated: 2026-10-20
 discussion: null
 supersedes: []
 superseded_by: []
@@ -799,8 +799,11 @@ Per-type and per-row visibility is defined by
   predicate, placed during per-arm resolution. A traversal never reaches a
   node the actor cannot see, so a hidden endpoint is never rendered as a
   dangling reference.
-- An interface-wide mutation checks every arm against the actor's view before
-  staging and is never partly applied.
+- An interface-wide mutation checks every arm against the actor's view in
+  attempt validation, over the staged rows, and again in the commit
+  revalidation, where Actor views checks every write; a check before staging
+  could not see staged placement values. A refusal leaves every staged arm
+  detached, so the mutation is never partly applied.
 - When the view removed a member or filtered rows of any type the plan read,
   the response's `view.restricted` is `true`. It is computed from the view and
   the plan, never from data, and carries no counts. A view that must be
@@ -1302,3 +1305,7 @@ the compiler (issue #1079), with or directly after the identity RFC's
 `NodeRef`. The prototype's first draft chose between two identity rules per
 site and got four of them wrong (P1, P2, P4, P6), so plans and rows should not
 use different vocabularies.
+
+2026-10-20: an interface-wide mutation is checked against the actor's view
+where Actor views checks every write, in attempt validation and the commit
+revalidation, not before staging, which could not see staged placement values.
