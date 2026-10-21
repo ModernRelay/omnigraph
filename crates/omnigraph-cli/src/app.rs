@@ -346,10 +346,7 @@ async fn run(
         let graph = if let Command::Alias(args) = &cli.command {
             let alias = &operator.get(stderr)?.aliases[&args.name];
             scope::graph_selection(target, alias.graph.as_deref())?
-        } else if matches!(
-            planes::requirement(&cli.command),
-            planes::Requirement::Graph { .. }
-        ) {
+        } else if planes::selects_graph(&cli.command, target) {
             scope::graph_selection(target, cli.graph.as_deref())?
         } else {
             cli.graph.as_deref()
