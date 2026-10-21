@@ -834,7 +834,8 @@ mod tests {
                 true,
             ),
             (
-                OmniError::manifest_publish_in_doubt("uncertain publication").before_effect(),
+                OmniError::manifest_publish_in_doubt("01JCOMMIT", "uncertain publication")
+                    .before_effect(),
                 true,
             ),
             (
@@ -859,7 +860,10 @@ mod tests {
             ),
             (OmniError::manifest_internal("internal failure"), true),
             (
-                OmniError::manifest_publish_in_doubt("publication acknowledgement unavailable"),
+                OmniError::manifest_publish_in_doubt(
+                    "01JCOMMIT",
+                    "publication acknowledgement unavailable",
+                ),
                 true,
             ),
             (OmniError::manifest("invalid request"), false),
@@ -912,8 +916,11 @@ mod tests {
                 true,
             ),
             (
-                OmniError::manifest_publish_in_doubt("manifest publish outcome is in doubt")
-                    .unpublished(),
+                OmniError::manifest_publish_in_doubt(
+                    "01JCOMMIT",
+                    "manifest publish outcome is in doubt",
+                )
+                .unpublished(),
                 true,
             ),
         ] {

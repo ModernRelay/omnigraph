@@ -1153,11 +1153,14 @@ fn publish_outcome_in_doubt(
     graph_commit_id: &str,
     cause: impl std::fmt::Display,
 ) -> OmniError {
-    OmniError::manifest_publish_in_doubt(format!(
-        "manifest publish outcome is in doubt: graph commit {graph_commit_id} may be durable but \
-         it could not be confirmed ({cause}); reopen the graph and look that commit up before \
-         retrying a non-idempotent write. original error: {original}"
-    ))
+    OmniError::manifest_publish_in_doubt(
+        graph_commit_id,
+        format!(
+            "manifest publish outcome is in doubt: graph commit {graph_commit_id} may be durable \
+             but it could not be confirmed ({cause}); reopen the graph and look that commit up \
+             before retrying a non-idempotent write. original error: {original}"
+        ),
+    )
 }
 
 /// Where a publication attempt failed, relative to the store's
@@ -1297,19 +1300,25 @@ async fn create_candidate_tag(
         // ambiguous one still can, and would address the candidate.
         Err(LanceError::RefNotFound { .. }) => match classify_failed_request(&error) {
             FailedRequest::Refused => Err(OmniError::storage(error).unpublished()),
-            FailedRequest::Ambiguous => Err(OmniError::manifest_publish_in_doubt(format!(
-                "the {} of {} '{graph_commit_id}' may still appear: its creation failed \
-                 ({error}) and the tag is not there yet",
+            FailedRequest::Ambiguous => Err(OmniError::manifest_publish_in_doubt(
+                graph_commit_id,
+                format!(
+                    "the {} of {} '{graph_commit_id}' may still appear: its creation failed \
+                     ({error}) and the tag is not there yet",
+                    kind.tag_noun(),
+                    kind.noun()
+                ),
+            )),
+        },
+        Err(readback) => Err(OmniError::manifest_publish_in_doubt(
+            graph_commit_id,
+            format!(
+                "the {} of {} '{graph_commit_id}' may exist: its creation failed ({error}) and \
+                 the readback failed ({readback})",
                 kind.tag_noun(),
                 kind.noun()
-            ))),
-        },
-        Err(readback) => Err(OmniError::manifest_publish_in_doubt(format!(
-            "the {} of {} '{graph_commit_id}' may exist: its creation failed ({error}) and the \
-             readback failed ({readback})",
-            kind.tag_noun(),
-            kind.noun()
-        ))),
+            ),
+        )),
     }
 }
 
@@ -1326,11 +1335,14 @@ fn candidate_probe_failed_after_release(
     if error.is_read_set_changed() || matches!(&error, OmniError::BranchNotFound { .. }) {
         return error;
     }
-    OmniError::manifest_publish_in_doubt(format!(
-        "{} '{graph_commit_id}' may remain addressable: its authority probe failed ({error}); \
-         deleting its tag cannot rule out a delayed create",
-        kind.noun()
-    ))
+    OmniError::manifest_publish_in_doubt(
+        graph_commit_id,
+        format!(
+            "{} '{graph_commit_id}' may remain addressable: its authority probe failed \
+             ({error}); deleting its tag cannot rule out a delayed create",
+            kind.noun()
+        ),
+    )
 }
 
 impl GraphNamespacePublisher {
@@ -1442,11 +1454,14 @@ impl GraphNamespacePublisher {
                             CandidateKind::Unpublished,
                             &graph_commit_id,
                         ),
-                        Err(release) => OmniError::manifest_publish_in_doubt(format!(
-                            "unpublished commit '{graph_commit_id}' may remain addressable: its \
-                             authority probe failed ({error}) and the tag release failed \
-                             ({release})"
-                        )),
+                        Err(release) => OmniError::manifest_publish_in_doubt(
+                            &graph_commit_id,
+                            format!(
+                                "unpublished commit '{graph_commit_id}' may remain addressable: \
+                                 its authority probe failed ({error}) and the tag release \
+                                 failed ({release})"
+                            ),
+                        ),
                     },
                 );
             }
@@ -2033,11 +2048,15 @@ impl GraphNamespacePublisher {
                     CandidateKind::Unattached,
                     &property.graph_commit_id,
                 ),
-                Err(release) => OmniError::manifest_publish_in_doubt(format!(
-                    "unattached branch '{}' may remain addressable: its authority revalidation \
-                     refused it ({refusal}) and the tag release failed ({release})",
-                    property.graph_commit_id
-                )),
+                Err(release) => OmniError::manifest_publish_in_doubt(
+                    &property.graph_commit_id,
+                    format!(
+                        "unattached branch '{}' may remain addressable: its authority \
+                         revalidation refused it ({refusal}) and the tag release failed \
+                         ({release})",
+                        property.graph_commit_id
+                    ),
+                ),
             });
         }
         Ok(UnattachedOutcome {

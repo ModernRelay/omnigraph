@@ -85,6 +85,10 @@ pub struct ManifestError {
     /// readback. Retention guards must remain until authority proves it cannot
     /// still publish; the external error category remains `Internal`.
     pub publication_in_doubt: bool,
+    /// The graph commit an in-doubt publication carries. It is an engine
+    /// identifier, never a storage path, so a log may name it where it names
+    /// no message.
+    pub publication_id: Option<String>,
 }
 
 impl ManifestError {
@@ -94,6 +98,7 @@ impl ManifestError {
             message: message.into(),
             details: None,
             publication_in_doubt: false,
+            publication_id: None,
         }
     }
 
@@ -1017,11 +1022,30 @@ impl OmniError {
         Self::Manifest(ManifestError::new(ManifestErrorKind::Internal, message))
     }
 
-    pub fn manifest_publish_in_doubt(message: impl Into<String>) -> Self {
+    /// A publication of graph commit `graph_commit_id` whose outcome is
+    /// unknown: it may be durable, now or later.
+    pub fn manifest_publish_in_doubt(
+        graph_commit_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::Manifest(ManifestError {
             publication_in_doubt: true,
+            publication_id: Some(graph_commit_id.into()),
             ..ManifestError::new(ManifestErrorKind::Internal, message)
         })
+    }
+
+    /// The graph commit of a publication whose outcome is unknown, through
+    /// any completion evidence wrapped around it.
+    pub fn publication_id(&self) -> Option<&str> {
+        match self.without_evidence() {
+            Self::Manifest(ManifestError {
+                publication_in_doubt: true,
+                publication_id,
+                ..
+            }) => publication_id.as_deref(),
+            _ => None,
+        }
     }
 
     /// Whether a manifest publication lacks a definitive durable outcome.
@@ -1426,7 +1450,7 @@ mod tests {
         );
 
         let explicit = [
-            OmniError::manifest_publish_in_doubt("publish acknowledgement lost"),
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "publish acknowledgement lost"),
             OmniError::recovery_required("commit", "contract pending"),
             OmniError::InitializationCommitted {
                 uri: "memory://graph".to_string(),
@@ -1557,7 +1581,7 @@ mod tests {
         }
 
         for uncertain in [
-            OmniError::manifest_publish_in_doubt("publish acknowledgement lost"),
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "publish acknowledgement lost"),
             OmniError::recovery_required("commit", "contract pending"),
             OmniError::manifest("returned after effects")
                 .with_completion_evidence(CompletionEvidence::Uncertain),
@@ -1657,7 +1681,7 @@ mod tests {
         assert!(matches!(cause, OmniError::KeyConflict { .. }));
 
         for uncertain in [
-            OmniError::manifest_publish_in_doubt("rows publish in doubt")
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "rows publish in doubt")
                 .after_earlier_publication(),
             refused()
                 .with_completion_evidence(CompletionEvidence::Uncertain)
@@ -1736,7 +1760,8 @@ mod tests {
                 Some("commit-before".to_string()),
                 Some("commit-after".to_string()),
             ),
-            OmniError::manifest_publish_in_doubt("exact in-doubt outcome").with_context("merge"),
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "exact in-doubt outcome")
+                .with_context("merge"),
             OmniError::ResourceLimitExceeded {
                 resource: "blob materialization bytes".to_string(),
                 limit: 10,
@@ -1769,6 +1794,7 @@ mod tests {
                 assert_eq!(actual.message, expected.message);
                 assert_eq!(actual.details, expected.details);
                 assert_eq!(actual.publication_in_doubt, expected.publication_in_doubt);
+                assert_eq!(actual.publication_id, expected.publication_id);
             }
             (
                 OmniError::ResourceLimitExceeded {
@@ -2208,6 +2234,24 @@ mod tests {
                 ..
             }) if message == "carried engine invariant"
         ));
+    }
+
+    /// An in-doubt publication names its graph commit, through context,
+    /// completion evidence and the DataFusion stream carrier, so a log can
+    /// name it without the message. Nothing else names one.
+    #[test]
+    fn an_in_doubt_publication_names_its_commit_issue_1067() {
+        let in_doubt = OmniError::manifest_publish_in_doubt("01JCOMMIT", "acknowledgement lost")
+            .with_context("merge");
+        assert_eq!(in_doubt.publication_id(), Some("01JCOMMIT"));
+        let wrapped = in_doubt.with_completion_evidence(CompletionEvidence::Uncertain);
+        assert_eq!(wrapped.publication_id(), Some("01JCOMMIT"));
+        let carried = OmniError::datafusion(wrapped.into_datafusion_external());
+        assert_eq!(carried.publication_id(), Some("01JCOMMIT"));
+        assert_eq!(
+            OmniError::manifest_internal("not a publication").publication_id(),
+            None
+        );
     }
 
     #[test]

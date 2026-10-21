@@ -42,6 +42,8 @@ candidate is proven expired.
 A contained write logs `owned write ended without a definite outcome` with
 its status, and the engine failure behind it logs
 `engine failure without definite completion evidence` with the failure's
-class. Neither line carries the error's message, which can name storage
-paths. Each re-issued manifest request logs a warning, and one that no
+class. When the failure is a publication whose outcome is unknown, that line
+also names the graph commit in its `publication` field, so you can look the
+commit up later and see whether it landed. Neither line carries the error's
+message, which can name storage paths. Each re-issued manifest request logs a warning, and one that no
 re-issue settles logs `manifest request outcome unknown after every re-issue`.
