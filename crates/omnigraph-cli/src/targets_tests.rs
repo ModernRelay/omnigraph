@@ -308,6 +308,20 @@ async fn owner_profiles_capture_one_credential_and_never_fall_back() {
     assert_eq!(first.token().await.unwrap().as_deref(), Some("first-token"));
     std::fs::write(dir.path().join("first"), "rotated-token\n").unwrap();
     assert_eq!(first.token().await.unwrap().as_deref(), Some("first-token"));
+    // A long-lived client reads the rotated source again for its endpoint
+    // only, and the invocation's own credential is unchanged.
+    let route = first.owner.route().to_owned();
+    assert_eq!(
+        first.reacquire(&route).await.unwrap().as_deref(),
+        Some("rotated-token")
+    );
+    assert!(
+        first
+            .reacquire("https://example.test/sibling/")
+            .await
+            .is_err()
+    );
+    assert_eq!(first.token().await.unwrap().as_deref(), Some("first-token"));
     assert!(second.token().await.is_err());
     let next = resolve("first");
     assert_eq!(next.owner, first.owner);

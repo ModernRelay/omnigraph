@@ -1,7 +1,8 @@
 //! `omnigraph mcp`: an agent's MCP over stdio, relayed to an existing server
-//! target's `/mcp` with the target's stored credential. The bridge only
-//! connects: a target it cannot relay to refuses before any request, and an
-//! unreachable server fails each request without anything being started.
+//! target's `/mcp` with the token of the target's selected auth profile. The
+//! bridge only connects: a target it cannot relay to refuses before any
+//! request, and an unreachable server fails each request without anything
+//! being started.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
+use crate::support::tls_gateway::{self, TlsGateway};
 use crate::support::*;
 
 /// How long one answer may take; a hang fails here instead of stalling the
@@ -39,24 +41,31 @@ struct Home {
 }
 
 impl Home {
-    fn new(targets: &str) -> Self {
+    /// A home whose `version: 1` operator document continues with `document`.
+    fn new(document: &str) -> Self {
         let temp = tempdir().unwrap();
         let path = temp.path().join("home");
         std::fs::create_dir(&path).unwrap();
-        std::fs::write(
-            path.join("config.yaml"),
-            format!("target_config_version: 1\ntargets:\n{targets}"),
-        )
-        .unwrap();
+        std::fs::write(path.join("config.yaml"), format!("version: 1\n{document}")).unwrap();
         Self { _temp: temp, path }
     }
 
-    /// A home whose target `staging` is the server at `endpoint`, keyed to
-    /// credential owner `staging`, serving `knowledge` by default.
+    /// A home whose target `staging` is the TLS fixture server at
+    /// `endpoint`, serving `knowledge` by default. Its default auth profile
+    /// `fixture` reads its token from `OMNIGRAPH_TOKEN_STAGING`.
     fn server(endpoint: &str) -> Self {
+        Self::with_source(endpoint, "{env: OMNIGRAPH_TOKEN_STAGING}")
+    }
+
+    /// [`Self::server`], with `fixture` reading its token from `source`, and
+    /// an anonymous auth profile `public` beside it.
+    fn with_source(endpoint: &str, source: &str) -> Self {
         Self::new(&format!(
-            "  staging:\n    kind: server\n    endpoint: '{endpoint}'\n    credential: staging\n    \
-             default_graph: knowledge\n"
+            "targets:\n  staging:\n    kind: server\n    endpoint: '{endpoint}'\n    \
+             default_graph: knowledge\n    default_auth: fixture\n    auth:\n      \
+             fixture: {{provider: token, source: {source}}}\n      \
+             public: {{provider: anonymous}}\n{}",
+            fixture_transport()
         ))
     }
 
@@ -78,16 +87,21 @@ impl Home {
         Bridge::start(command)
     }
 
-    /// Store `token` for target `staging` as `omnigraph login` does.
-    fn login(&self, token: &str) {
-        let mut command = cli();
-        command
-            .env("OMNIGRAPH_HOME", &self.path)
-            .env_remove("OMNIGRAPH_TOKEN_STAGING")
-            .args(["login", "--target", "staging"])
-            .write_stdin(format!("{token}\n"));
-        output_success(&mut command);
+    /// Replace the token file `token` beside the operator document, as a
+    /// mounted secret rotates.
+    fn write_token(&self, token: &str) {
+        let staged = self.path.join("token.next");
+        std::fs::write(&staged, format!("{token}\n")).unwrap();
+        std::fs::rename(staged, self.path.join("token")).unwrap();
     }
+}
+
+/// The `transport` of a target whose endpoint is a TLS fixture.
+fn fixture_transport() -> String {
+    format!(
+        "    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n",
+        tls_gateway::ca_path().display()
+    )
 }
 
 /// A running `omnigraph mcp`, spoken to as an agent speaks to it.
@@ -365,9 +379,12 @@ impl Served {
     }
 
     /// The server's own answer to `message` at `/mcp`, sent as the agent's
-    /// token with the negotiated protocol version.
+    /// token with the negotiated protocol version, through its TLS gateway.
     fn rpc(&self, message: &Value) -> Value {
-        reqwest::blocking::Client::new()
+        reqwest::blocking::Client::builder()
+            .add_root_certificate(tls_gateway::certificate())
+            .build()
+            .unwrap()
             .post(format!("{}/mcp", self.url()))
             .bearer_auth(AGENT_TOKEN)
             .header("content-type", "application/json")
@@ -396,7 +413,8 @@ impl Served {
     }
 }
 
-/// A TCP port that counts the connections made to it, and answers none.
+/// A TCP port that records whether anything connected to it, and answers
+/// nothing; it is addressed as an `https` endpoint.
 struct Probe {
     listener: TcpListener,
 }
@@ -409,7 +427,7 @@ impl Probe {
     }
 
     fn url(&self) -> String {
-        format!("http://{}", self.listener.local_addr().unwrap())
+        format!("https://{}", self.listener.local_addr().unwrap())
     }
 
     fn connected(&self) -> bool {
@@ -427,16 +445,25 @@ fn mcp_refuses_what_it_cannot_relay_to_before_any_request() {
     let endpoint = probe.url();
     let temp = tempdir().unwrap();
     let absent = temp.path().join("absent");
+    let token = |owner: &str| {
+        format!(
+            "    default_auth: fixture\n    auth:\n      fixture: {{provider: token, source: \
+             {{env: OMNIGRAPH_TOKEN_{owner}}}}}\n"
+        )
+    };
     let home = Home::new(&format!(
-        "  local:\n    kind: direct\n    scope: graph\n    uri: '{graph}'\n  root:\n    kind: direct\n    \
-         scope: root\n    uri: '{root}'\n    default_graph: knowledge\n  managed:\n    kind: managed\n    \
-         scope: cluster\n    api: {endpoint}\n    organization_id: org\n    cluster_id: c\n    \
-         cluster_incarnation: i\n    endpoint: {endpoint}/data\n    default_graph: knowledge\n    \
-         control_auth: automation-env\n  nograph:\n    kind: server\n    endpoint: '{endpoint}/a'\n    \
-         credential: nograph\n  keyed:\n    kind: server\n    endpoint: '{endpoint}/b'\n    \
-         credential: keyed\n    default_graph: knowledge\n",
+        "profiles:\n  work:\n    api: '{endpoint}'\n    organization_id: org\n    \
+         auth: {{provider: omnigraph}}\ntargets:\n  local:\n    kind: direct\n    scope: graph\n    \
+         uri: 'file://{graph}'\n  root:\n    kind: direct\n    scope: root\n    uri: 'file://{root}'\n    \
+         default_graph: knowledge\n  managed:\n    kind: managed\n    profile: work\n    \
+         cluster_id: c\n    cluster_incarnation: i\n    endpoint: '{endpoint}/data'\n    \
+         default_graph: knowledge\n  nograph:\n    kind: server\n    endpoint: '{endpoint}/a'\n\
+         {nograph}  keyed:\n    kind: server\n    endpoint: '{endpoint}/b'\n    \
+         default_graph: knowledge\n{keyed}",
         graph = absent.join("graph.omni").display(),
         root = absent.join("root").display(),
+        nograph = token("NOGRAPH"),
+        keyed = token("KEYED"),
     ));
     let inline = absent.join("inline.omni");
     let undeclared = format!("{endpoint}/c");
@@ -447,14 +474,18 @@ fn mcp_refuses_what_it_cannot_relay_to_before_any_request() {
             vec!["--target", inline.to_str().unwrap()],
             "target_kind_unsupported",
         ),
-        (vec!["--target", "og_catalog"], "target_kind_unsupported"),
         (vec!["--target", "managed"], "target_kind_unsupported"),
         (vec!["--target", "nograph"], "graph_required"),
-        (vec!["--target", "keyed"], "credential_missing"),
-        // An address no target declares never falls back to anonymous access.
+        // The selected auth profile's source has no token.
+        (
+            vec!["--target", "keyed"],
+            "selected credential environment variable is missing",
+        ),
+        // An address no target declares is never reached, with or without a
+        // credential.
         (
             vec!["--target", undeclared.as_str(), "--graph", "knowledge"],
-            "credential_missing",
+            "inline access supports local storage only",
         ),
         (vec![], "target_required"),
     ] {
@@ -563,9 +594,10 @@ fn mcp_lists_and_admits_tools_under_the_server_ceiling_and_the_agents_consent() 
 
 /// The bridge is bound to one graph: it fills `graph` where a call omits it,
 /// refuses a call or resource naming another graph, and narrows the graph
-/// listing to its own. Everything else is the server's answer unchanged,
-/// over TCP and over a Unix socket alike. `--as` is asserted on every
-/// request, and the token never reaches the agent.
+/// listing to its own. Everything else is the server's answer unchanged.
+/// `--as` is asserted on every request, and the token never reaches the
+/// agent. A Unix-socket endpoint, which an operator document does not accept,
+/// refuses before anything connects.
 #[test]
 fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
     let served = Served::start(false);
@@ -684,19 +716,25 @@ fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
     finished.assert_success();
     finished.assert_never_shows(&[AGENT_TOKEN]);
 
-    // A server on a Unix socket is reached through the same transport.
     #[cfg(unix)]
     {
         use crate::support::unix_gateway::UnixGateway;
         let gateway = UnixGateway::new(served.url());
-        let socket = Home::server(&gateway.url());
-        let mut bridge = socket.bridge(&["--target", "staging"], &token);
-        let read = bridge.tool(1, "read", json!({"query": PEOPLE}));
-        assert_eq!(read, expected);
-        assert!(gateway.connections() > 0);
-        let finished = bridge.finish();
-        finished.assert_success();
-        finished.assert_never_shows(&[AGENT_TOKEN]);
+        // An escaped socket path, so the refusal is the transport rule's.
+        let socket = Home::server(&gateway.url().replace(' ', "%20"));
+        let output = socket
+            .command()
+            .args(["mcp", "--target", "staging"])
+            .env("OMNIGRAPH_TOKEN_STAGING", AGENT_TOKEN)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("HTTPS"), "{stderr}");
+        assert!(!stderr.contains(AGENT_TOKEN), "{stderr}");
+        assert_eq!(gateway.connections(), 0);
     }
 }
 
@@ -710,17 +748,20 @@ const HELD: usize = 16;
 const HELD_FIRST: Duration = Duration::from_millis(200);
 const HELD_REST: Duration = Duration::from_millis(1500);
 
-/// A stand-in MCP server for timing, credentials and lost answers. It answers
-/// discovery with the HTTP contract, refuses any bearer but the one it
-/// accepts with a 401, and records every message with the bearer it carried.
+/// A stand-in MCP server for timing, credentials and lost answers, reached
+/// through a TLS gateway. It answers discovery with the HTTP contract,
+/// refuses any bearer but the one it accepts with a 401, and records every
+/// message with the bearer it carried.
 /// `slow` and `slow_write` answer after [`SLOW`] and `fast` at once; `held` answers once
 /// [`HELD`] calls of it have arrived, the one marked `first` before the
 /// others; `drop_read` and `drop_write` hang up without answering. Every
 /// answer closes its connection.
 struct McpEndpoint {
+    /// The gateway's `https` origin.
     url: String,
     stop: Arc<AtomicBool>,
     state: Arc<EndpointState>,
+    _gateway: TlsGateway,
 }
 
 #[derive(Default)]
@@ -740,10 +781,12 @@ impl McpEndpoint {
         listener.set_nonblocking(true).unwrap();
         let state = Arc::new(EndpointState::default());
         *state.accepts.lock().unwrap() = accepts.to_string();
+        let gateway = TlsGateway::new(&format!("http://{}", listener.local_addr().unwrap()));
         let endpoint = Self {
-            url: format!("http://{}", listener.local_addr().unwrap()),
+            url: gateway.origin.clone(),
             stop: Arc::new(AtomicBool::new(false)),
             state,
+            _gateway: gateway,
         };
         let stop = Arc::clone(&endpoint.stop);
         let state = Arc::clone(&endpoint.state);
@@ -1044,24 +1087,24 @@ fn mcp_answers_requests_as_they_complete_and_drops_cancelled_ones() {
     assert_eq!(endpoint.state.hung_up.load(Ordering::SeqCst), 1);
 }
 
-/// A 401 has the credential read again once, for later requests: the refused
-/// call is answered with the server's refusal and never sent again, and the
-/// next call carries the token `omnigraph login` stored meanwhile. A token
-/// that is still refused is a typed failure each time, and the bridge keeps
-/// answering.
+/// A 401 has the credential read from its source again once, for later
+/// requests: the refused call is answered with the server's refusal and never
+/// sent again, and the next call carries the token the target's token file
+/// was rotated to meanwhile. A token that is still refused is a typed failure
+/// each time, saying how to replace it, and the bridge keeps answering.
 #[test]
 fn mcp_reads_a_refused_credential_again_for_later_requests_without_resending() {
     let endpoint = McpEndpoint::start("first-token-71");
-    let home = Home::server(&endpoint.url);
-    home.login("first-token-71");
+    let home = Home::with_source(&endpoint.url, "{file: ./token}");
+    home.write_token("first-token-71");
     let mut bridge = home.bridge(&["--target", "staging"], &[]);
     bridge.initialize();
     bridge.call(tools_list(1));
 
-    // The token is rotated: the server accepts only the new one, which
-    // `omnigraph login` stores.
+    // The token is rotated: the server accepts only the new one, which the
+    // mounted token file now holds.
     endpoint.accept("second-token-72");
-    home.login("second-token-72");
+    home.write_token("second-token-72");
     let refused = bridge.tool(2, "fast", json!({}));
     assert_eq!(refused["error"]["code"], -32000, "{refused}");
     assert_eq!(refused["error"]["data"]["status"], 401, "{refused}");
@@ -1082,15 +1125,16 @@ fn mcp_reads_a_refused_credential_again_for_later_requests_without_resending() {
     );
     assert_eq!(endpoint.received(3), ["second-token-72"]);
 
-    // A token the server keeps refusing is reported each time, and nothing
-    // is ever resent.
+    // A token the server keeps refusing is read again and reported each
+    // time, and nothing is ever resent.
     endpoint.accept("unknown-token");
     for id in [4, 5] {
         let refused = bridge.tool(id, "fast", json!({}));
         assert_eq!(refused["error"]["data"]["status"], 401, "{refused}");
         let message = refused["error"]["message"].as_str().unwrap();
         assert!(
-            message.contains("omnigraph login --target staging"),
+            message.contains("it is unchanged; write a token the server accepts to `")
+                && message.contains("token`, which a later refused request reads again"),
             "{message}"
         );
         assert_eq!(endpoint.received(id), ["second-token-72"]);
@@ -1099,24 +1143,34 @@ fn mcp_reads_a_refused_credential_again_for_later_requests_without_resending() {
     finished.assert_success();
     finished.assert_never_shows(&["first-token-71", "second-token-72"]);
 
-    // A target that selects anonymous access sends no credential at all.
+    // An anonymous auth profile sends no credential at all, whether the
+    // target selects it by default or `--auth` selects it.
     let open = Home::new(&format!(
-        "  open:\n    kind: server\n    endpoint: '{}'\n    auth: anonymous\n    \
-         default_graph: knowledge\n",
-        endpoint.url
+        "targets:\n  open:\n    kind: server\n    endpoint: '{}'\n    default_graph: knowledge\n    \
+         default_auth: public\n    auth:\n      public: {{provider: anonymous}}\n{}",
+        endpoint.url,
+        fixture_transport()
     ));
-    let mut bridge = open.bridge(&["--target", "open"], &[]);
-    let refused = bridge.call(tools_list(9));
-    assert_eq!(refused["error"]["data"]["status"], 401, "{refused}");
-    assert!(
-        refused["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("uses anonymous access"),
-        "{refused}"
-    );
-    assert_eq!(endpoint.received(9), [""]);
-    bridge.finish().assert_success();
+    for (id, home, args) in [
+        (9, &open, ["--target", "open"].as_slice()),
+        (
+            10,
+            &home,
+            ["--target", "staging", "--auth", "public"].as_slice(),
+        ),
+    ] {
+        let mut bridge = home.bridge(args, &[]);
+        let refused = bridge.call(tools_list(id));
+        assert_eq!(refused["error"]["data"]["status"], 401, "{refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("requires a credential")
+                && message.contains("uses anonymous authentication"),
+            "{refused}"
+        );
+        assert_eq!(endpoint.received(id), [""]);
+        bridge.finish().assert_success();
+    }
 }
 
 /// An unreachable server fails each request with a typed error saying
@@ -1129,7 +1183,7 @@ fn mcp_reports_unreachable_servers_and_lost_answers_without_resending() {
     let closed = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = closed.local_addr().unwrap();
     drop(closed);
-    let home = Home::server(&format!("http://{address}"));
+    let home = Home::server(&format!("https://{address}"));
     let mut bridge = home.bridge(
         &["--target", "staging"],
         &[("OMNIGRAPH_TOKEN_STAGING", AGENT_TOKEN)],

@@ -73,7 +73,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `config rename-profile/rename-target/rename-auth/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
 | `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
 | `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or served |
-| `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its stored token, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server |
+| `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its auth profile's token, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
 | `organization members/invitations` | Administer organization membership and invitations | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |

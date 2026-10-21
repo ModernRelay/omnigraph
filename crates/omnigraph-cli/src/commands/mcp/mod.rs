@@ -19,8 +19,8 @@
 //! bound as well, where no further line is relayed; an answer written before
 //! the cancellation was read stays sent.
 //!
-//! A server's 401 has the credential read again once for later requests; the
-//! refused request is answered, never sent again. A request whose answer was
+//! A server's 401 has the credential read from its source again once for
+//! later requests; the refused request is answered, never sent again. A request whose answer was
 //! lost is never sent again either: a write's outcome is then unknown.
 //!
 //! The bridge is bound to one graph, and without `--write` lists and admits
@@ -430,11 +430,11 @@ enum Dispatch<'r> {
 
 /// The state every relay shares. The relays run on the bridge's one task,
 /// so each borrows a cell only between its awaits.
-struct Relay<'a, 'w> {
+struct Relay<'w> {
     log: Log<'w>,
     /// The target as the invocation named it.
     target: String,
-    upstream: Upstream<'a>,
+    upstream: Upstream,
     binding: RefCell<Binding>,
     /// The protocol version `initialize` negotiated, sent with every later
     /// message that names none in its `_meta`.
@@ -443,7 +443,7 @@ struct Relay<'a, 'w> {
     requests: Cell<u64>,
 }
 
-impl Relay<'_, '_> {
+impl Relay<'_> {
     fn dispatch(&self, line: Line) -> Dispatch<'_> {
         let raw = match line {
             Line::TooLong => {
@@ -683,29 +683,30 @@ impl Relay<'_, '_> {
             },
             Delivery::Unauthorized { reread, .. } => {
                 let target = &self.target;
-                let next = if self.upstream.anonymous() {
-                    format!(
-                        "target '{target}' uses anonymous access; give it a `credential` owner \
-                         and run `omnigraph login --target {target}`"
-                    )
-                } else {
-                    match reread {
-                        Reread::Renewed => {
-                            "the bridge read the credential again and sends the new one with \
-                             later requests"
-                                .to_string()
-                        }
-                        Reread::Already => {
-                            "the bridge already read the credential again for later requests"
-                                .to_string()
-                        }
-                        Reread::Unchanged => format!(
-                            "the stored credential is unchanged; run `omnigraph login --target \
-                             {target}`"
-                        ),
-                        Reread::Failed(cause) => {
-                            format!("reading the credential again failed: {cause}")
-                        }
+                if self.upstream.anonymous() {
+                    // The guidance every served command gives a 401 to a
+                    // request that carried no credential.
+                    let missing =
+                        crate::helpers::MissingCredential::AnonymousTarget(target.clone());
+                    return format!(
+                        "the server requires a credential (HTTP 401); {missing}; this request \
+                         was not sent again"
+                    );
+                }
+                let next = match reread {
+                    Reread::Renewed => "the bridge read the credential again and sends the new \
+                                        one with later requests"
+                        .to_string(),
+                    Reread::Already => {
+                        "the bridge already read the credential again for later requests"
+                            .to_string()
+                    }
+                    Reread::Unchanged => format!(
+                        "the bridge read the credential again and it is unchanged; {}",
+                        self.upstream.replacement(target)
+                    ),
+                    Reread::Failed(cause) => {
+                        format!("reading the credential again failed: {cause}")
                     }
                 };
                 format!(

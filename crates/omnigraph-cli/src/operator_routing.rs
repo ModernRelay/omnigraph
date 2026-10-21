@@ -203,6 +203,34 @@ impl Authentication {
             .ok_or_else(|| eyre!("credential generation exhausted"))?;
         crate::targets::replace_file(&self.ids.path, &serde_json::to_string(&records)?)
     }
+    /// The selected source's credential, read from it now.
+    async fn acquire(&self) -> Result<credentials::AcquiredCredential> {
+        Ok(match &self.profile {
+            AuthProfile::Token {
+                source: TokenSource::Env { env },
+            } => credentials::acquire_environment(&self.request, env)?,
+            AuthProfile::Token {
+                source: TokenSource::File { file },
+            } => credentials::acquire_file(&self.request, file)?,
+            AuthProfile::Token {
+                source: TokenSource::Store { .. },
+            } => {
+                self.acquire_stored_with(
+                    &credentials::OsSecretStore,
+                    crate::managed::credential_lock(),
+                )
+                .await?
+            }
+            AuthProfile::Exec { command, timeout } => {
+                credentials::acquire_exec(
+                    &self.request,
+                    &credentials::ExecSource::new(command.clone(), timeout)?,
+                )
+                .await?
+            }
+            _ => bail!("selected provider does not supply a static bearer"),
+        })
+    }
     pub(crate) async fn token(&self) -> Result<Option<String>> {
         if matches!(
             self.profile,
@@ -210,38 +238,31 @@ impl Authentication {
         ) {
             return Ok(None);
         }
-        let credential = self
-            .credential
-            .get_or_try_init(|| async {
-                Ok::<_, color_eyre::Report>(match &self.profile {
-                    AuthProfile::Token {
-                        source: TokenSource::Env { env },
-                    } => credentials::acquire_environment(&self.request, env)?,
-                    AuthProfile::Token {
-                        source: TokenSource::File { file },
-                    } => credentials::acquire_file(&self.request, file)?,
-                    AuthProfile::Token {
-                        source: TokenSource::Store { .. },
-                    } => {
-                        self.acquire_stored_with(
-                            &credentials::OsSecretStore,
-                            crate::managed::credential_lock(),
-                        )
-                        .await?
-                    }
-                    AuthProfile::Exec { command, timeout } => {
-                        credentials::acquire_exec(
-                            &self.request,
-                            &credentials::ExecSource::new(command.clone(), timeout)?,
-                        )
-                        .await?
-                    }
-                    _ => bail!("selected provider does not supply a static bearer"),
-                })
-            })
-            .await?;
+        let credential = self.credential.get_or_try_init(|| self.acquire()).await?;
         Ok(Some(
             credential
+                .bearer_for(&self.request, time::OffsetDateTime::now_utc())?
+                .expose()
+                .to_owned(),
+        ))
+    }
+    /// The selected credential read from its source again, for a long-lived
+    /// client whose server refused the one it holds. The credential this
+    /// invocation acquired is unchanged. A stored credential replaced since
+    /// the invocation began is of another generation, and refuses.
+    pub(crate) async fn reacquire(&self, endpoint: &str) -> Result<Option<String>> {
+        if endpoint != self.owner.route() {
+            bail!("credential destination differs from the frozen owner");
+        }
+        if matches!(
+            self.profile,
+            AuthProfile::Anonymous | AuthProfile::Omnigraph
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.acquire()
+                .await?
                 .bearer_for(&self.request, time::OffsetDateTime::now_utc())?
                 .expose()
                 .to_owned(),

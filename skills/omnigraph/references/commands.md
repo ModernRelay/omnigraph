@@ -418,7 +418,7 @@ onboarding `--register`, `--api` and `--organization`.
 
 `omnigraph mcp` speaks MCP on stdio for an agent that starts its tools as a
 child process, relaying every message to an existing server target's `/mcp`
-with the target's stored token, which the agent never sees. It is bound to one
+with the token of the target's auth profile, which the agent never sees. It is bound to one
 graph (`--graph` or `default_graph`): calls that omit `graph` get it, and calls
 or resource URIs naming another graph are refused. Without `--write` only tools
 the server annotates read-only are listed and admitted; the server lists write

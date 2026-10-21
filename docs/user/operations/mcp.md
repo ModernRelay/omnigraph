@@ -76,12 +76,12 @@ on stdin to the server target's `/mcp`, one `POST` each, and writes each answer
 as one line on stdout; diagnostics go to stderr. Tools, their logic and their
 refusals stay the server's.
 
-- **Credential.** Requests carry the target's stored token, resolved as every
-  served command resolves it ([`omnigraph login`](../cli/reference.md#operator-configuration)
-  or `OMNIGRAPH_TOKEN_<OWNER>`); it never appears in the agent's configuration
-  or output. A target with `auth: anonymous` sends none. A `unix://` endpoint is
-  reached over its socket. `--as ACTOR` sends `Omnigraph-If-Actor` with every
-  request, so another actor's token is refused with `412 actor_mismatch`.
+- **Credential.** Requests carry the token of the target's selected auth
+  profile (`--auth PROFILE`, else its `default_auth`), acquired as every served
+  command acquires it ([authentication providers](../cli/targets.md#authentication-providers));
+  it never appears in the agent's configuration or output. A profile with
+  `provider: anonymous` sends none. `--as ACTOR` sends `Omnigraph-If-Actor` with
+  every request, so another actor's token is refused with `412 actor_mismatch`.
 - **One graph.** `--graph`, else the target's `default_graph`; without either the
   command refuses before any request. A tool call that omits `graph` gets it, a
   call or resource URI naming another graph is refused with a JSON-RPC error, and
@@ -109,9 +109,13 @@ before running it again. It never sends a request again:
 
 These errors carry code `-32000`; refusals by the graph binding or write consent
 carry `-32602`, with a `bad_request` body. After a 401 the bridge reads the
-credential again once, so a token rotated with `omnigraph login` reaches later
-requests without a restart. A server that stays unreachable fails each request;
-the bridge keeps running until stdin closes.
+credential from its source again once, for later requests: a token rewritten
+in a `file` source, or returned anew by an `exec` helper, reaches them without
+a restart. An `env` source is fixed when the bridge starts, and a token
+replaced with `omnigraph credentials set` belongs to a new credential
+generation, so both take a restart; the error says how to replace the token. A
+server that stays unreachable fails each request; the bridge keeps running
+until stdin closes.
 
 ## Settings
 

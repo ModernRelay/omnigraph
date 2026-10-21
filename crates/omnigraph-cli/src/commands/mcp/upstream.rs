@@ -2,10 +2,11 @@
 //! credential its requests carry.
 //!
 //! Requests go through the transport every served command uses: the
-//! target's captured credential scope, its TCP or Unix-socket connection, the
-//! `--as` assertion, and a fresh discovery probe before each request. The
-//! token is resolved as every served command resolves it, read again once
-//! after the server refuses it, and never written anywhere.
+//! target's captured credential scope and transport settings, the `--as`
+//! assertion, and a fresh discovery probe before each request. The token is
+//! the one every served command acquires from the selected auth profile, read
+//! from its source again once after the server refuses it, and never written
+//! anywhere.
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -18,9 +19,10 @@ use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
 use super::wire;
-use crate::graph_http::{ApiContractError, GraphHttpClient, RequestTarget};
+use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::operator::InvocationConfig;
-use crate::targets::{CredentialOwner, ResolvedTarget, ServerAuth, TargetBinding};
+use crate::operator_schema::{AuthProfile, TokenSource};
+use crate::targets::{ResolvedTarget, ServerAuth, TargetBinding};
 
 /// How long one relayed request may take. The server bounds a read, and its
 /// wait for a write, at 30 seconds, so its answer arrives within this; it
@@ -100,9 +102,11 @@ pub(super) struct Routing<'a> {
     pub(super) protocol_version: Option<String>,
 }
 
-pub(super) struct Upstream<'a> {
-    input: &'a InvocationConfig,
+pub(super) struct Upstream {
     auth: ServerAuth,
+    /// The selected auth profile's name and provider, which say how to
+    /// replace a refused token.
+    profile: Option<(String, AuthProfile)>,
     endpoint: String,
     /// The endpoint's `/mcp`.
     url: String,
@@ -117,11 +121,12 @@ struct Credential {
     reads: u64,
 }
 
-impl<'a> Upstream<'a> {
-    /// The server target's `/mcp`, with its credential owner's token. Fails
-    /// before any request when the token cannot be resolved.
+impl Upstream {
+    /// The server target's `/mcp`, with the token the invocation acquired
+    /// from the selected auth profile. Fails before any request when it has
+    /// none to send.
     pub(super) fn open(
-        input: &'a InvocationConfig,
+        input: &InvocationConfig,
         target: &ResolvedTarget,
         actor: Option<&str>,
     ) -> Result<Self> {
@@ -129,31 +134,21 @@ impl<'a> Upstream<'a> {
             bail!("the MCP bridge relays only to a server target");
         };
         let url = crate::helpers::remote_url(endpoint, &["mcp"], &[])?;
-        // Anonymous access is a registered target's explicit choice, never
-        // the fallback for an address no target declares.
-        if matches!(auth, ServerAuth::Anonymous)
-            && !matches!(
-                input
-                    .get(&mut std::io::sink())?
-                    .credential_owner_for(&RequestTarget::of(endpoint, &url)?),
-                Some(CredentialOwner::Anonymous { .. })
-            )
-        {
-            return Err(crate::targets::refusal(
-                "credential_missing",
-                format!(
-                    "no registered server target declares {endpoint}, so it has neither a \
-                     credential owner nor `auth: anonymous`; add one with `omnigraph target add`"
-                ),
-            ));
-        }
         let http = GraphHttpClient::server_target(input, target)?.with_expected_actor(actor);
         // The captured credential scope admits the route before any token is read.
         let _ = http.request(Method::POST, url.clone())?;
         let token = crate::targets::resolve_server_token_for(input, auth, endpoint, &url)?;
+        let profile = crate::operator_routing::AUTH
+            .try_with(|selected| {
+                selected
+                    .as_ref()
+                    .map(|selected| (selected.name.clone(), selected.profile.clone()))
+            })
+            .ok()
+            .flatten();
         Ok(Self {
-            input,
             auth: auth.clone(),
+            profile,
             endpoint: endpoint.clone(),
             url,
             http,
@@ -165,8 +160,47 @@ impl<'a> Upstream<'a> {
         &self.url
     }
 
+    /// The selected auth profile is `provider: anonymous`.
     pub(super) fn anonymous(&self) -> bool {
         matches!(self.auth, ServerAuth::Anonymous)
+    }
+
+    /// How to replace a token the server still refuses after it was read
+    /// again, by where the selected auth profile reads it.
+    pub(super) fn replacement(&self, target: &str) -> String {
+        match &self.profile {
+            Some((
+                name,
+                AuthProfile::Token {
+                    source: TokenSource::Store { .. },
+                },
+            )) => format!(
+                "replace it with `omnigraph credentials set --target {target} --auth {name} \
+                 --stdin --replace` and start `omnigraph mcp` again"
+            ),
+            Some((
+                _,
+                AuthProfile::Token {
+                    source: TokenSource::Env { env },
+                },
+            )) => format!(
+                "start `omnigraph mcp` again with `{env}` set to a token the server accepts"
+            ),
+            Some((
+                _,
+                AuthProfile::Token {
+                    source: TokenSource::File { file },
+                },
+            )) => format!(
+                "write a token the server accepts to `{}`, which a later refused request reads \
+                 again",
+                file.display()
+            ),
+            Some((name, AuthProfile::Exec { .. })) => {
+                format!("a later refused request runs the helper of auth profile `{name}` again")
+            }
+            _ => "replace the token its auth profile supplies".to_string(),
+        }
     }
 
     /// POST one message and read its answer. Dropping the future drops the
@@ -211,7 +245,7 @@ impl<'a> Upstream<'a> {
             };
             return Delivery::Unauthorized {
                 body,
-                reread: self.reread(reads),
+                reread: self.reread(reads).await,
             };
         }
         read_answer(response).await
@@ -257,20 +291,23 @@ impl<'a> Upstream<'a> {
         }
     }
 
-    /// Read the credential again after a request sent with read `refused`
-    /// was refused, once for every request that read refused.
-    fn reread(&self, refused: u64) -> Reread {
-        let mut credential = self.credential.borrow_mut();
-        if credential.reads != refused {
-            return Reread::Already;
+    /// Read the credential from its source again after a request sent with
+    /// read `refused` was refused, once for every request that read refused.
+    /// A request sent while it is read carries the token it had.
+    async fn reread(&self, refused: u64) -> Reread {
+        {
+            let mut credential = self.credential.borrow_mut();
+            if credential.reads != refused {
+                return Reread::Already;
+            }
+            credential.reads += 1;
         }
-        credential.reads += 1;
-        match crate::targets::resolve_server_token_for(
-            self.input,
-            &self.auth,
-            &self.endpoint,
-            &self.url,
-        ) {
+        // No borrow is held across the read, which may run a helper: the
+        // other relays keep sending meanwhile.
+        let read =
+            crate::targets::reread_server_token_for(&self.auth, &self.endpoint, &self.url).await;
+        let mut credential = self.credential.borrow_mut();
+        match read {
             Ok(token) if token == credential.token => Reread::Unchanged,
             Ok(token) => {
                 credential.token = token;
