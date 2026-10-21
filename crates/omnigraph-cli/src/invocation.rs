@@ -133,6 +133,15 @@ mod tests {
             (vec!["query", "q", "--format", "table"], None),
             (vec!["query", "q", "--format", "arrow"], None),
             (vec!["query", "q", "--json"], Some(MachineErrors::Json)),
+            (vec!["catalogue", "-e", "query q() {}"], None),
+            (
+                vec!["catalogue", "-e", "query q() {}", "--json"],
+                Some(MachineErrors::Json),
+            ),
+            (
+                vec!["catalogue", "--query", "catalogue.gq", "--json"],
+                Some(MachineErrors::Json),
+            ),
             (
                 vec!["query", "q", "--format", "json"],
                 Some(MachineErrors::Json),
@@ -154,6 +163,18 @@ mod tests {
         ] {
             let parsed = parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
             assert_eq!(parsed.machine, expected);
+        }
+    }
+
+    #[test]
+    fn catalogue_requires_one_source_and_has_no_graph_state_options() {
+        for args in [
+            vec!["catalogue"],
+            vec!["catalogue", "-e", "q", "--query", "q.gq"],
+            vec!["catalogue", "-e", "q", "--branch", "main"],
+            vec!["catalogue", "-e", "q", "--snapshot", "snapshot"],
+        ] {
+            assert!(parse_from(std::iter::once("omnigraph").chain(args)).is_err());
         }
     }
 

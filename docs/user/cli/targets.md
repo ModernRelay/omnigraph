@@ -55,7 +55,14 @@ Names match `[A-Za-z][A-Za-z0-9_.-]*` and are case-sensitive. The
 [JSON Schema](operator-config.schema.json) describes the fields;
 `omnigraph config validate` also checks references and cross-field constraints.
 The whole document must be valid, including unselected entries. Unknown fields,
-versions, duplicate keys, YAML tags, merge keys and implicit null defaults refuse.
+versions, duplicate keys, YAML tags, anchors, aliases, merge keys and implicit null defaults refuse.
+
+Organization IDs contain 1–128 ASCII letters, digits, underscores or hyphens;
+cluster IDs and incarnations use the same characters with a 256-character limit.
+Graph IDs use the server's rule: 1–64 ASCII letters, digits or hyphens, excluding
+`policies`, `healthz`, `openapi` and `graphs`. Served targets additionally accept
+the system scope `og_catalog`; direct-root targets do not. Validation checks these
+rules for defaults and alias graph selectors before any network or credential access.
 There is no interpolation, include or inheritance. The input limit is 1 MiB.
 Relative token and CA paths resolve beside the selected operator file.
 Credential, helper and CA availability are checked only for selected operations.
@@ -295,8 +302,9 @@ for multi-graph targets. A direct-graph alias must omit `graph`, but execution
 still refuses because the stored-query registry is served-only. Aliases never
 inherit `default_graph`, contain source code or mutate data. Caller target/graph
 overrides refuse; `--auth` may select a profile on the bound owner. `--params`
-shallowly replaces defaults as typed values, never source interpolation.
-Alias `args` and `format` fields are unsupported.
+and `--params-file` must contain a JSON object. Its fields shallowly replace
+defaults as typed values, never source interpolation. Arrays, scalars and null
+are refused. Alias `args` and `format` fields and positional arguments are unsupported.
 
 ## Upgrade from the old format
 

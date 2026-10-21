@@ -3,7 +3,7 @@ use yaml_serde::Value;
 use super::ConfigError;
 
 pub(super) fn parse(text: &str) -> Result<Value, ConfigError> {
-    reject_explicit_tags(text)?;
+    reject_yaml_extensions(text)?;
     let value: Value = yaml_serde::from_str(text)
         .map_err(|error| ConfigError(format!("invalid operator YAML: {error}")))?;
     if !value.is_mapping() {
@@ -13,10 +13,7 @@ pub(super) fn parse(text: &str) -> Result<Value, ConfigError> {
     Ok(value)
 }
 
-fn reject_explicit_tags(text: &str) -> Result<(), ConfigError> {
-    if !text.contains('!') {
-        return Ok(());
-    }
+fn reject_yaml_extensions(text: &str) -> Result<(), ConfigError> {
     use std::mem::MaybeUninit;
 
     use libyaml_rs as sys;
@@ -38,6 +35,9 @@ fn reject_explicit_tags(text: &str) -> Result<(), ConfigError> {
             match kind {
                 sys::YAML_TAG_TOKEN | sys::YAML_TAG_DIRECTIVE_TOKEN => {
                     break Err(ConfigError("YAML tags are forbidden".into()));
+                }
+                sys::YAML_ANCHOR_TOKEN | sys::YAML_ALIAS_TOKEN => {
+                    break Err(ConfigError("YAML anchors and aliases are forbidden".into()));
                 }
                 sys::YAML_STREAM_END_TOKEN => break Ok(()),
                 _ => {}
@@ -82,4 +82,32 @@ fn validate(value: &Value, path: &mut Vec<String>, parameter: bool) -> Result<()
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn anchors_and_aliases_are_rejected_without_rejecting_literal_text() {
+        for text in [
+            "version: 1\ndefaults: &defaults {}",
+            "version: 1\ndefaults: &defaults {}\ntargets: *defaults",
+            "version: 1\ndefaults: &defaults {}\ntargets: {<<: *defaults}",
+        ] {
+            assert!(super::parse(text).is_err(), "{text}");
+        }
+        assert!(super::parse("version: 1\ntext: '&anchor *alias !tag' # &comment").is_ok());
+    }
+
+    #[test]
+    fn legacy_document_error_names_the_upgrade_guide() {
+        let error = crate::operator_schema::parse(
+            "target_config_version: 1\n",
+            std::path::Path::new("/operator"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("target_config_version"));
+        assert!(error.contains("docs/user/cli/targets.md#upgrade-from-the-old-format"));
+        assert!(error.contains("no automatic importer"));
+    }
 }

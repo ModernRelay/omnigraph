@@ -1102,6 +1102,52 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
 }
 
 #[test]
+fn alias_rejects_non_object_parameters_and_positional_arguments_without_requests() {
+    let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "version: 1\ntargets:\n  srv:\n    kind: server\n    endpoint: '{}'\n    default_auth: public\n    auth:\n      public: {{provider: anonymous}}\naliases:\n  lookup:\n    target: srv\n    graph: knowledge\n    query: lookup\n    params: {{name: default}}\n",
+            server.origin
+        ),
+    ).unwrap();
+    let params_file = home.path().join("params.json");
+    for params in ["[1]", "\"name\"", "7", "true", "null"] {
+        fs::write(&params_file, params).unwrap();
+        for file in [false, true] {
+            let mut command = cli();
+            command
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["alias", "lookup", "--json"]);
+            if file {
+                command.arg("--params-file").arg(&params_file);
+            } else {
+                command.args(["--params", params]);
+            }
+            let output = output_failure(&mut command);
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                parse_stdout_json(&output)["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("must contain a JSON object")
+            );
+            assert!(server.requests().is_empty());
+        }
+    }
+    let output = output_failure(cli().env("OMNIGRAPH_HOME", home.path()).args([
+        "alias",
+        "lookup",
+        "positional",
+    ]));
+    assert_eq!(output.status.code(), Some(64));
+    assert!(stderr_string(&output).contains("unexpected argument"));
+    assert!(server.requests().is_empty());
+    server.assert_complete();
+}
+
+#[test]
 fn alias_rejects_global_scope_flags_that_the_binding_owns() {
     for (flag, value) in [
         ("--target", "dev"),

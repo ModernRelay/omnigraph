@@ -41,8 +41,6 @@ pub(crate) struct OperatorAlias {
     pub(crate) graph: Option<String>,
     pub(crate) query: String,
     #[serde(default)]
-    pub(crate) args: Vec<String>,
-    #[serde(default)]
     pub(crate) params: yaml_serde::Mapping,
     pub(crate) format: Option<ReadOutputFormat>,
 }

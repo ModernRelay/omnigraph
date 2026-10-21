@@ -211,17 +211,22 @@ pub(crate) fn with_missing_credential(
 
 /// A graph identifier is one unambiguous URL/storage path segment.
 pub(crate) fn require_graph_segment(graph: &str) -> Result<()> {
-    if graph.is_empty()
-        || !graph
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        color_eyre::eyre::bail!(
-            "invalid graph `{graph}`: a graph name is one path segment of ASCII letters, \
-             digits, `-` or `_`"
-        );
+    if graph != "og_catalog" {
+        omnigraph_server::GraphId::try_from(graph).map_err(|error| {
+            color_eyre::eyre::eyre!(
+                "invalid graph `{graph}`: a graph name is one path segment; {error}"
+            )
+        })?;
     }
     Ok(())
+}
+
+pub(crate) fn valid_managed_identifier(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 pub(crate) fn apply_bearer_token(

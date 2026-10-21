@@ -881,11 +881,15 @@ fn token_arguments_bound_lifetime_and_refuse_removed_actions() {
         "policies",
         "graphs",
         "κnowledge",
-        "1graph",
-        "-graph",
+        "healthz",
+        "openapi",
     ] {
         assert!(graph_id(bad).is_err());
     }
+    for valid in ["1graph", "-graph", "og_catalog", &"a".repeat(64)] {
+        assert!(graph_id(valid).is_ok(), "{valid}");
+    }
+    assert!(graph_id(&"a".repeat(65)).is_err());
     assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--clear"]).is_ok());
     assert!(Cli::try_parse_from(["omnigraph", "cluster", "token"]).is_ok());
     assert!(Cli::try_parse_from(["omnigraph", "query", "q", "--direct"]).is_err());

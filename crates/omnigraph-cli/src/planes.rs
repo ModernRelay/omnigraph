@@ -32,6 +32,7 @@ pub(crate) enum Requirement {
 pub(crate) fn requirement(command: &Command) -> Requirement {
     use Requirement::*;
     match command {
+        Command::Catalogue(_) => Local,
         Command::Query(_) => Graph {
             direct_only: false,
             root: true,
@@ -295,7 +296,8 @@ fn accepts_actor(command: &Command) -> bool {
             | ClusterCommand::History { .. }
             | ClusterCommand::Cancel { .. } => false,
         },
-        Command::Query(_)
+        Command::Catalogue(_)
+        | Command::Query(_)
         | Command::Snapshot(_)
         | Command::Export(_)
         | Command::Diff(_)
@@ -553,6 +555,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             ChangesCommand::Baseline { .. } => "changes baseline",
         },
         Command::Query(_) => "query",
+        Command::Catalogue(_) => "catalogue",
         Command::Mutate(_) => "mutate",
         Command::Alias(_) => "alias",
         Command::Policy { .. } => "policy",

@@ -25,8 +25,50 @@ use crate::output::{write_change_human, write_json};
 use crate::presentation::ReadPresentation;
 
 use args::ParamsArgs;
-pub(crate) use args::{AliasArgs, MutateArgs, QueryArgs};
+pub(crate) use args::{AliasArgs, CatalogueArgs, MutateArgs, QueryArgs};
 use prepare::{Envelope, MutationOperation, QueryInput, ReadOperation};
+
+pub(crate) async fn run_catalogue(
+    args: CatalogueArgs,
+    operator: &InvocationConfig,
+    machine: &mut Option<MachineErrors>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    let target = crate::targets::ResolvedTarget::new(
+        crate::targets::TargetBinding::DirectCatalogue,
+        crate::targets::TargetProvenance::Explicit {
+            name: "catalogue".into(),
+        },
+    );
+    run_query(
+        QueryArgs {
+            name: None,
+            query: args.query,
+            query_string: args.query_string,
+            params: ParamsArgs {
+                params: None,
+                params_file: None,
+            },
+            branch: None,
+            snapshot: None,
+            settings: Vec::new(),
+            format: None,
+            json: args.json,
+        },
+        GraphScope {
+            operator,
+            target: &target,
+            graph: None,
+            actor: None,
+            yes: false,
+        },
+        machine,
+        stdout,
+        stderr,
+    )
+    .await
+}
 
 /// Only the global arguments this command family consumes.
 pub(crate) struct GraphScope<'a> {
@@ -57,7 +99,15 @@ pub(crate) async fn run_query(
         json,
     } = args;
     let settings = parse_set_flags(&settings)?;
-    let operator = scope.operator.get(stderr)?;
+    let catalogue_defaults = crate::operator::OperatorConfig::default();
+    let operator = if matches!(
+        scope.target.binding,
+        crate::targets::TargetBinding::DirectCatalogue
+    ) {
+        &catalogue_defaults
+    } else {
+        scope.operator.get(stderr)?
+    };
     let presentation = ReadPresentation::capture(operator, format, json, None);
     *machine = presentation.machine_errors();
     let client =
@@ -278,7 +328,6 @@ pub(crate) async fn run_alias(
 ) -> Result<()> {
     let AliasArgs {
         name,
-        args,
         params,
         format,
         json,
@@ -293,7 +342,6 @@ pub(crate) async fn run_alias(
         target,
         &name,
         operator_alias,
-        &args,
         load_params_json(&params)?,
         stderr,
     )
@@ -343,13 +391,12 @@ async fn execute_operator_alias(
     target: &crate::targets::ResolvedTarget,
     alias_name: &str,
     alias: &OperatorAlias,
-    alias_args: &[String],
     explicit_params: Option<Value>,
     stderr: &mut dyn Write,
 ) -> Result<ReadOutput> {
+    let params = prepare::alias_params(alias_name, alias, explicit_params)?;
     let client =
         GraphClient::from_target(input, target, alias.graph.as_deref(), None, stderr).await?;
-    let params = prepare::alias_params(alias_name, alias, alias_args, explicit_params)?;
     client
         .invoke_named(
             &alias.query,

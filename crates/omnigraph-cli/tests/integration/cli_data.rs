@@ -5579,11 +5579,6 @@ fn changes_baseline_failure_preserves_existing_out_file() {
 
 #[test]
 fn catalogue_scope_reads_the_binary_registries_without_a_store() {
-    // Retain the historical owner name, but pin the deliberate clean-slate
-    // removal: revision 3 defers catalogue command/view semantics entirely.
-    // Neither the former magic selector nor a fourth target kind is supported.
-    // Registry content remains covered in engine/catalogue.rs and
-    // omnigraph-gqt/cases/catalogue, independently of CLI target selection.
     let operators = "query operators() { match { $o: @Operator } return { $o.name, $o.inputs } }";
     let reset_one = format!("reset query_memory_bytes; {operators}");
     let reset_all = format!("reset all; {operators}");
@@ -5607,6 +5602,76 @@ fn catalogue_scope_reads_the_binary_registries_without_a_store() {
     let home = tempdir().unwrap();
     let work = tempdir().unwrap();
     let config = home.path().join("config.yaml");
+    let poison = "version: [invalid operator configuration";
+    fs::write(&config, poison).unwrap();
+    let query_file = home.path().join("catalogue.gq");
+    fs::write(&query_file, operators).unwrap();
+    let missing_config = home.path().join("missing.yaml");
+    for explicit_config in [None, Some(&config), Some(&missing_config)] {
+        for from_file in [false, true] {
+            for machine in [false, true] {
+                let mut invocation = cli();
+                invocation
+                    .env("OMNIGRAPH_HOME", home.path())
+                    .current_dir(work.path())
+                    .arg("catalogue");
+                if let Some(path) = explicit_config {
+                    invocation.arg("--operator-config").arg(path);
+                }
+                if from_file {
+                    invocation.arg("--query").arg(&query_file);
+                } else {
+                    invocation.args(["-e", operators]);
+                }
+                if machine {
+                    invocation.arg("--json");
+                }
+                let output = output_success(&mut invocation);
+                assert!(output.stderr.is_empty(), "{output:?}");
+                if machine {
+                    let result = parse_stdout_json(&output);
+                    assert!(!result["rows"].as_array().unwrap().is_empty(), "{result}");
+                    assert!(result["target"]["branch"].is_null(), "{result}");
+                    assert!(result["target"]["snapshot"].is_null(), "{result}");
+                    assert!(result["graph_commit_id"].is_null(), "{result}");
+                } else {
+                    assert!(!output.stdout.is_empty());
+                }
+                assert_eq!(fs::read_to_string(&config).unwrap(), poison);
+                assert_eq!(fs::read_dir(work.path()).unwrap().count(), 0);
+                assert_eq!(fs::read_dir(home.path()).unwrap().count(), 2);
+            }
+        }
+    }
+    for flag in ["--target", "--connection", "--auth", "--graph", "--as"] {
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .current_dir(work.path())
+                .args(["catalogue", "-e", operators, flag, "unavailable", "--json"]),
+        );
+        let error = parse_stdout_json(&output);
+        assert!(error["error"].as_str().unwrap().contains(flag), "{error}");
+        assert_eq!(error["disposition"]["effects"], "none", "{error}");
+        assert_ne!(error["code"], "target_config_invalid", "{error}");
+    }
+    for source in [
+        "query add() { insert @Operator { name: \"Teleport\" } }",
+        "branch list",
+        "query missing() { match { $n: Missing } return { $n } }",
+    ] {
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .current_dir(work.path())
+                .args(["catalogue", "-e", source, "--json"]),
+        );
+        let error = parse_stdout_json(&output);
+        assert_eq!(error["disposition"]["effects"], "none", "{error}");
+        assert_ne!(error["code"], "target_config_invalid", "{error}");
+        assert!(error.get("rows").is_none(), "{error}");
+        assert_eq!(fs::read_dir(work.path()).unwrap().count(), 0);
+    }
     for (source, code, message) in [
         (
             "version: 1\n",

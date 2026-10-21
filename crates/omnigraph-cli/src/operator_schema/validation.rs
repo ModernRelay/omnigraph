@@ -46,8 +46,9 @@ pub(super) fn validate(config: &mut OperatorConfig, base: &Path) -> Result<(), C
     for (key, connection) in &mut config.connections {
         let path = format!("connections.{key}");
         name(key, &path)?;
-        nonempty(
+        managed_identifier(
             &connection.organization_id,
+            128,
             &format!("{path}.organization_id"),
         )?;
         connection.api = endpoint(&connection.api, false, &format!("{path}.api"))?;
@@ -77,13 +78,17 @@ pub(super) fn validate(config: &mut OperatorConfig, base: &Path) -> Result<(), C
                     &config.connections,
                     &format!("{path}.connection"),
                 )?;
-                nonempty(cluster_id, &format!("{path}.cluster_id"))?;
-                nonempty(cluster_incarnation, &format!("{path}.cluster_incarnation"))?;
+                managed_identifier(cluster_id, 256, &format!("{path}.cluster_id"))?;
+                managed_identifier(
+                    cluster_incarnation,
+                    256,
+                    &format!("{path}.cluster_incarnation"),
+                )?;
                 if let Some(route) = route {
                     *route = endpoint(route, false, &format!("{path}.endpoint"))?;
                 }
                 transport(network, base, &path)?;
-                graph(default_graph, &path)?;
+                graph(default_graph, true, &path)?;
             }
             Target::Server {
                 endpoint: route,
@@ -98,7 +103,7 @@ pub(super) fn validate(config: &mut OperatorConfig, base: &Path) -> Result<(), C
                     .all(|p| matches!(p, AuthProfile::Anonymous));
                 *route = endpoint(route, anonymous, &format!("{path}.endpoint"))?;
                 transport(network, base, &path)?;
-                graph(default_graph, &path)?;
+                graph(default_graph, true, &path)?;
             }
             Target::Direct {
                 scope,
@@ -109,7 +114,7 @@ pub(super) fn validate(config: &mut OperatorConfig, base: &Path) -> Result<(), C
                     return Err(invalid(&path, "direct graph targets forbid default_graph"));
                 }
                 *uri = local_uri(uri, &format!("{path}.uri"))?;
-                graph(default_graph, &path)?;
+                graph(default_graph, false, &path)?;
             }
         }
     }
@@ -128,7 +133,14 @@ pub(super) fn validate(config: &mut OperatorConfig, base: &Path) -> Result<(), C
         match (&alias.graph, direct_graph) {
             (Some(_), true) => return Err(invalid(&path, "direct graph aliases forbid graph")),
             (None, false) => return Err(invalid(&path, "multi-graph aliases require graph")),
-            (Some(value), false) => nonempty(value, &format!("{path}.graph"))?,
+            (Some(value), false) => graph_id(
+                value,
+                !matches!(
+                    config.targets.get(&alias.target),
+                    Some(Target::Direct { .. })
+                ),
+                &format!("{path}.graph"),
+            )?,
             (None, true) => {}
         }
         for key in alias.params.keys() {
@@ -144,9 +156,28 @@ pub(super) fn validate(config: &mut OperatorConfig, base: &Path) -> Result<(), C
     Ok(())
 }
 
-fn graph(value: &Option<String>, path: &str) -> Result<(), ConfigError> {
+fn managed_identifier(value: &str, max_len: usize, path: &str) -> Result<(), ConfigError> {
+    if !crate::helpers::valid_managed_identifier(value, max_len) {
+        return Err(invalid(
+            path,
+            &format!("must contain 1–{max_len} ASCII letters, digits, underscores, or hyphens"),
+        ));
+    }
+    Ok(())
+}
+
+fn graph_id(value: &str, served: bool, path: &str) -> Result<(), ConfigError> {
+    let result = if served {
+        crate::helpers::require_graph_segment(value)
+    } else {
+        omnigraph_server::GraphId::try_from(value).map(|_| ())
+    };
+    result.map_err(|error| invalid(path, &error.to_string()))
+}
+
+fn graph(value: &Option<String>, served: bool, path: &str) -> Result<(), ConfigError> {
     if let Some(value) = value {
-        nonempty(value, &format!("{path}.default_graph"))?;
+        graph_id(value, served, &format!("{path}.default_graph"))?;
     }
     Ok(())
 }

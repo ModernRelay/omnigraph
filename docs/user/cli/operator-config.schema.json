@@ -49,6 +49,26 @@
       "type": "string",
       "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$(?![\\s\\S])"
     },
+    "organizationId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,128}$(?![\\s\\S])"
+    },
+    "managedId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,256}$(?![\\s\\S])"
+    },
+    "graphId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9-]{1,64}$(?![\\s\\S])",
+      "not": {"enum": ["policies", "healthz", "openapi", "graphs"]}
+    },
+    "servedGraphId": {
+      "oneOf": [
+        {"$ref": "#/$defs/graphId"},
+        {"const": "og_catalog"}
+      ],
+      "description": "A real graph ID or the served virtual catalogue scope og_catalog."
+    },
     "text": {
       "type": "string",
       "minLength": 1,
@@ -245,7 +265,7 @@
           "$ref": "#/$defs/httpsUrl"
         },
         "organization_id": {
-          "$ref": "#/$defs/text"
+          "$ref": "#/$defs/organizationId"
         },
         "auth": {
           "type": "object",
@@ -281,10 +301,10 @@
           "$ref": "#/$defs/name"
         },
         "cluster_id": {
-          "$ref": "#/$defs/text"
+          "$ref": "#/$defs/managedId"
         },
         "cluster_incarnation": {
-          "$ref": "#/$defs/text"
+          "$ref": "#/$defs/managedId"
         },
         "endpoint": {
           "$ref": "#/$defs/httpsUrl"
@@ -293,7 +313,7 @@
           "$ref": "#/$defs/transport"
         },
         "default_graph": {
-          "$ref": "#/$defs/text"
+          "$ref": "#/$defs/servedGraphId"
         }
       },
       "required": [
@@ -330,7 +350,7 @@
           "$ref": "#/$defs/transport"
         },
         "default_graph": {
-          "$ref": "#/$defs/text"
+          "$ref": "#/$defs/servedGraphId"
         }
       },
       "required": [
@@ -401,7 +421,7 @@
           "$ref": "#/$defs/localUri"
         },
         "default_graph": {
-          "$ref": "#/$defs/text"
+          "$ref": "#/$defs/graphId"
         }
       },
       "required": [
@@ -587,7 +607,8 @@
           "$ref": "#/$defs/text"
         },
         "graph": {
-          "$ref": "#/$defs/text"
+          "$ref": "#/$defs/servedGraphId",
+          "description": "og_catalog is supported only when target references a managed or server target; direct-root aliases require a real graph ID. The CLI enforces this cross-reference constraint."
         },
         "params": {
           "type": "object",

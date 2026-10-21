@@ -777,6 +777,9 @@ async fn run_bound(
             )
             .await?;
         }
+        Command::Catalogue(args) => {
+            commands::query::run_catalogue(args, &operator, machine, stdout, stderr).await?;
+        }
         Command::Query(args) => {
             commands::query::run_query(
                 args,

@@ -16,7 +16,7 @@ use crate::commands::history::{DiffArgs, SnapshotArgs};
 use crate::commands::maintenance::{
     CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
 };
-use crate::commands::query::{AliasArgs, MutateArgs, QueryArgs};
+use crate::commands::query::{AliasArgs, CatalogueArgs, MutateArgs, QueryArgs};
 pub(crate) use crate::commands::schema::SchemaCommand;
 use crate::commands::schema::{InitArgs, LintArgs};
 pub(crate) use crate::commands::transfer::{BlobCommand, CliLoadMode};
@@ -82,6 +82,8 @@ pub(crate) enum Command {
     ///
     /// Run a read query.
     Query(QueryArgs),
+    /// Query this binary's engine catalogue without storage, configuration or credentials.
+    Catalogue(CatalogueArgs),
     /// Execute a mutation, or one `branch create`/`delete`/`merge` statement.
     ///
     /// Run a mutation.
@@ -90,7 +92,7 @@ pub(crate) enum Command {
     ///
     /// An alias is a personal binding under `aliases:` in
     /// ~/.omnigraph/config.yaml — name → (target, graph, stored-query name,
-    /// default params). `omnigraph alias <name> [args]` invokes the bound
+    /// default params). `omnigraph alias <name> --params '{"key":"value"}'` invokes the bound
     /// stored query on its server. Living in its own namespace, an alias can
     /// never shadow or be shadowed by a built-in verb. Replaces the removed
     /// `--alias` flag on `query`/`mutate`.

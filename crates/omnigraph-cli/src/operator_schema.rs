@@ -250,6 +250,13 @@ pub(crate) fn parse(text: &str, base_dir: &Path) -> Result<OperatorConfig, Confi
         ));
     }
     let value = yaml::parse(text)?;
+    if value.as_mapping().is_some_and(|mapping| {
+        mapping.contains_key(yaml_serde::Value::String("target_config_version".into()))
+    }) {
+        return Err(ConfigError(
+            "legacy target_config_version is unsupported; write a version: 1 operator document using docs/user/cli/targets.md#upgrade-from-the-old-format; there is no automatic importer".into(),
+        ));
+    }
     let mut config: OperatorConfig = yaml_serde::from_value(value)
         .map_err(|error| ConfigError(format!("invalid operator configuration: {error}")))?;
     validation::validate(&mut config, base_dir)?;

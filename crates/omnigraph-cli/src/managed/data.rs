@@ -183,15 +183,7 @@ fn invalid() -> Failure {
 }
 
 fn graph_id(graph: &str) -> Result<()> {
-    // The server's graph selector is a single path segment, never path syntax.
-    if graph.is_empty()
-        || graph.len() > 64
-        || !graph.as_bytes()[0].is_ascii_alphabetic()
-        || !graph
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-        || matches!(graph, "policies" | "healthz" | "openapi" | "graphs")
-    {
+    if crate::helpers::require_graph_segment(graph).is_err() {
         return Err(Failure::refused(
             "graph_invalid",
             "--graph must select one valid graph id",

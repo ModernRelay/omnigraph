@@ -56,6 +56,7 @@ rules:
         &server_binary,
         &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", &tokens)],
     );
+    assert!(server.base_url.starts_with("https://"));
     let artifacts = tempfile::tempdir().unwrap();
     let mut command = assert_cmd::Command::new(&gqt);
     command
@@ -73,6 +74,22 @@ rules:
         ])
         .arg(artifacts.path())
         .timeout(Duration::from_secs(30));
+    let untrusted = command
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("server request failed:"))
+        .stderr(predicates::str::contains(format!(
+            "{}/graphs/smoke/schema",
+            server.base_url
+        )));
+    let untrusted_output = untrusted.get_output();
+    let untrusted_stdout = String::from_utf8_lossy(&untrusted_output.stdout);
+    let untrusted_report_path = untrusted_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("GQT report: "))
+        .expect("failed command must retain its invocation report");
+    let untrusted_report_text = fs::read_to_string(untrusted_report_path).unwrap();
+    command.env("SSL_CERT_FILE", support::tls_gateway::ca_path());
     let assertion = command.assert().success();
     let output = assertion.get_output();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -85,10 +102,13 @@ rules:
         stdout.as_ref(),
         String::from_utf8_lossy(&output.stderr).as_ref(),
         &report_text,
+        untrusted_stdout.as_ref(),
+        String::from_utf8_lossy(&untrusted_output.stderr).as_ref(),
+        &untrusted_report_text,
     ] {
         assert!(
             !text.contains(token),
-            "bearer token retained in command output"
+            "bearer token retained in command output or invocation report"
         );
     }
     let report: Value = serde_json::from_str(&report_text).unwrap();

@@ -60,7 +60,8 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
     match &cli.command {
         // An alias invokes a stored query as a read; the server refuses a
         // mutation behind one before it runs.
-        Command::Query(_)
+        Command::Catalogue(_)
+        | Command::Query(_)
         | Command::Alias(_)
         | Command::Snapshot(_)
         | Command::Export(_)

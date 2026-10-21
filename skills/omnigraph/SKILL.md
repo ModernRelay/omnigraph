@@ -188,6 +188,7 @@ destination line. Legacy `--server`, `--store`, `--cluster`, `--profile`,
 
 | Family | Operations and applicability |
 |---|---|
+| Engine inventory | `catalogue -e '<gq>'` or `catalogue --query file.gq`, optionally `--json`; local, without operator configuration, credentials or storage |
 | Data | `query`, `mutate`, `load --mode overwrite\|append\|merge`, `branch`, `commit`, `snapshot`, `export`, `blob`, `diff`, `changes`; direct or served targets |
 | Managed data | `graphs list` and common served graph commands, subject to endpoint capabilities and policy; no direct maintenance fallback |
 | Direct schema | `schema plan`; `schema apply` and `schema upgrade-system-columns` require standalone graph targets |

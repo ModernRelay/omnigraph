@@ -9,6 +9,45 @@ fn schema() -> Value {
     serde_json::from_str(SCHEMA).unwrap()
 }
 
+#[test]
+fn schema_id_grammars_and_scope_references_match_execution_issue_1115() {
+    let schema = schema();
+    let defs = &schema["$defs"];
+    for (name, pattern) in [
+        ("organizationId", r"^[A-Za-z0-9_-]{1,128}$(?![\s\S])"),
+        ("managedId", r"^[A-Za-z0-9_-]{1,256}$(?![\s\S])"),
+    ] {
+        assert_eq!(defs[name], json!({"type": "string", "pattern": pattern}));
+    }
+    assert_eq!(
+        defs["graphId"],
+        json!({
+            "type": "string",
+            "pattern": r"^[A-Za-z0-9-]{1,64}$(?![\s\S])",
+            "not": {"enum": ["policies", "healthz", "openapi", "graphs"]}
+        })
+    );
+    assert_eq!(
+        defs["servedGraphId"]["oneOf"],
+        json!([{"$ref": "#/$defs/graphId"}, {"const": "og_catalog"}])
+    );
+    for (record, field, definition) in [
+        ("connection", "organization_id", "organizationId"),
+        ("managedTarget", "cluster_id", "managedId"),
+        ("managedTarget", "cluster_incarnation", "managedId"),
+        ("managedTarget", "default_graph", "servedGraphId"),
+        ("serverTarget", "default_graph", "servedGraphId"),
+        ("directRootTarget", "default_graph", "graphId"),
+        ("alias", "graph", "servedGraphId"),
+    ] {
+        assert_eq!(
+            defs[record]["properties"][field]["$ref"],
+            format!("#/$defs/{definition}"),
+            "{record}.{field}"
+        );
+    }
+}
+
 fn record<T: DeserializeOwned + Serialize>(name: &str, value: Value) {
     let schema = schema();
     let declaration = if name == "document" {

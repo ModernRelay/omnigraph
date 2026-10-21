@@ -568,12 +568,7 @@ fn canonical_origin(input: &str) -> Result<String> {
 }
 
 fn identifier(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > 256
-        || !value
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    {
+    if !crate::helpers::valid_managed_identifier(value, 256) {
         return Err(Failure::refused(
             "identifier_invalid",
             "cluster and operation ids contain 1–256 ASCII letters, digits, hyphens, or underscores",
@@ -583,12 +578,7 @@ fn identifier(value: &str) -> Result<()> {
 }
 
 fn organization_id(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
+    if !crate::helpers::valid_managed_identifier(value, 128) {
         return Err(Failure::refused(
             "organization_invalid",
             "organization IDs contain 1–128 ASCII letters, digits, underscores, or hyphens",

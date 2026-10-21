@@ -26,6 +26,7 @@ prints the exact flags of the installed binary.
 
 | Command | Subcommands | Use |
 |---|---|---|
+| `catalogue` | — | Query this binary's engine registries with `-e` or `--query`, optionally `--json`; no store, operator config or credentials |
 | `query` | — | Run a read query: a served stored query by name, or ad-hoc `--query`/`-e` source; also the `branch list` and `explain` statements |
 | `mutate` | — | Run a mutation, or a `branch create`/`delete`/`merge` or `commit publish`/`drop` statement |
 | `alias` | — | Invoke an operator alias's stored read query |
@@ -424,6 +425,7 @@ For params:
 
 1. **Explicit `--params '{...}'`** wins on key conflict
 2. Alias `params` supplies defaults; no positional alias binding exists
+3. Alias `--params` and `--params-file` require a JSON object; arrays, scalars and null refuse before query execution
 
 ## Output Formats and Positions
 

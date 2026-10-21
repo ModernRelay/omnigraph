@@ -91,7 +91,6 @@ pub(crate) fn parse(text: &str, base: &Path) -> Result<crate::operator::Operator
                     target: alias.target.clone(),
                     graph: alias.graph.clone(),
                     query: alias.query.clone(),
-                    args: Vec::new(),
                     params: yaml_serde::to_value(&alias.params)?
                         .as_mapping()
                         .cloned()

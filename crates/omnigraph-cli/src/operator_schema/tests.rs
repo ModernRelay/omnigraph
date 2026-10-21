@@ -5,7 +5,7 @@ version: 1
 connections:
   service:
     api: HTTPS://Platform.Example:443/Control/V1
-    organization_id: org:issued/123
+    organization_id: org_issued-123
     default_auth: human
     auth:
       human: {provider: omnigraph}
@@ -23,7 +23,7 @@ targets:
     cluster_id: 123-issued-id
     cluster_incarnation: 456-issued-incarnation
     endpoint: https://Private.Example/Data/V1
-    default_graph: exact/graph:id
+    default_graph: 123-exact-graph
   control:
     kind: managed
     connection: service
@@ -78,11 +78,125 @@ fn server(endpoint: &str, profile: &str) -> String {
 }
 
 #[test]
+fn managed_id_boundaries_match_execution_issue_1115() {
+    for (field, original, max_len) in [
+        ("organization_id", "org_issued-123", 128),
+        ("cluster_id", "123-issued-id", 256),
+        ("cluster_incarnation", "456-issued-incarnation", 256),
+    ] {
+        for (value, accepted) in [
+            ("A".to_owned(), true),
+            ("0_-aZ".to_owned(), true),
+            ("_".to_owned(), true),
+            ("-".to_owned(), true),
+            ("a".repeat(max_len), true),
+            ("a".repeat(max_len + 1), false),
+            (String::new(), false),
+            ("org:issued/123".to_owned(), false),
+            ("a.b".to_owned(), false),
+            ("a/b".to_owned(), false),
+            ("a\\b".to_owned(), false),
+            ("a b".to_owned(), false),
+            ("a\n".to_owned(), false),
+            ("é".to_owned(), false),
+        ] {
+            let text = COMPLETE.replace(
+                &format!("{field}: {original}"),
+                &format!("{field}: {}", serde_json::to_string(&value).unwrap()),
+            );
+            let result = decode(&text);
+            assert_eq!(result.is_ok(), accepted, "{field}={value:?}: {result:?}");
+            assert_eq!(
+                crate::helpers::valid_managed_identifier(&value, max_len),
+                accepted,
+                "{field}={value:?}"
+            );
+            if let Err(error) = result {
+                assert!(error.to_string().contains(field), "{error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn graph_id_boundaries_and_catalogue_scope_match_execution_issue_1115() {
+    for value in [
+        "a".to_owned(),
+        "1graph".to_owned(),
+        "-graph".to_owned(),
+        "-".to_owned(),
+        "Graphs".to_owned(),
+        "a".repeat(64),
+        "a".repeat(65),
+        String::new(),
+        "exact/graph:id".to_owned(),
+        "graph_bad".to_owned(),
+        "../graph".to_owned(),
+        "a.b".to_owned(),
+        "a\\b".to_owned(),
+        "a b".to_owned(),
+        "a\n".to_owned(),
+        "é".to_owned(),
+        "policies".to_owned(),
+        "healthz".to_owned(),
+        "openapi".to_owned(),
+        "graphs".to_owned(),
+        "og_catalog".to_owned(),
+    ] {
+        let real_graph = omnigraph_server::GraphId::try_from(value.as_str()).is_ok();
+        let served_graph = real_graph || value == "og_catalog";
+        assert_eq!(
+            crate::helpers::require_graph_segment(&value).is_ok(),
+            served_graph,
+            "{value:?}"
+        );
+        let encoded = serde_json::to_string(&value).unwrap();
+        for (original, replacement, accepted) in [
+            (
+                "default_graph: 123-exact-graph",
+                format!("default_graph: {encoded}"),
+                served_graph,
+            ),
+            (
+                "endpoint: https://server.example/prefix",
+                format!("endpoint: https://server.example/prefix\n    default_graph: {encoded}"),
+                served_graph,
+            ),
+            (
+                "default_graph: stored-graph",
+                format!("default_graph: {encoded}"),
+                real_graph,
+            ),
+            (
+                "graph: alias-graph",
+                format!("graph: {encoded}"),
+                served_graph,
+            ),
+            (
+                "graph: pinned-graph",
+                format!("graph: {encoded}"),
+                real_graph,
+            ),
+        ] {
+            let result = decode(&COMPLETE.replace(original, &replacement));
+            assert_eq!(result.is_ok(), accepted, "{original}={value:?}: {result:?}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("graph"), "{error}");
+            }
+        }
+        let server_alias = COMPLETE
+            .replace("target: cluster\n    graph:", "target: server\n    graph:")
+            .replace("graph: alias-graph", &format!("graph: {encoded}"));
+        assert_eq!(decode(&server_alias).is_ok(), served_graph, "{value:?}");
+    }
+}
+
+#[test]
 fn complete_document_resolves_paths_and_normalizes_routes_without_io() {
     let config = decode(COMPLETE).unwrap();
     let connection = &config.connections["service"];
     assert_eq!(connection.api, "https://platform.example/Control/V1/");
-    assert_eq!(connection.organization_id, "org:issued/123");
+    assert_eq!(connection.organization_id, "org_issued-123");
     assert_eq!(
         connection.auth["mounted"],
         AuthProfile::Token {
@@ -245,7 +359,7 @@ fn names_and_references_are_validated_document_wide() {
             "target: cluster, output: jsonl",
             "target: missing, output: jsonl",
         ),
-        ("organization_id: org:issued/123", "organization_id: ''"),
+        ("organization_id: org_issued-123", "organization_id: ''"),
         ("cluster_id: other", "cluster_id: ''"),
         (
             "cluster_incarnation: other-generation",
@@ -262,7 +376,7 @@ fn names_and_references_are_validated_document_wide() {
 fn required_fields_and_variant_boundaries_are_enforced() {
     for field in [
         "    api: HTTPS://Platform.Example:443/Control/V1\n",
-        "    organization_id: org:issued/123\n",
+        "    organization_id: org_issued-123\n",
         "    connection: service\n",
         "    cluster_id: other\n",
         "    cluster_incarnation: other-generation\n",
