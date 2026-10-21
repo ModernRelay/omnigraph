@@ -1425,7 +1425,9 @@ fn human_report_lines(
 
 #[test]
 fn current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end() {
-    use crate::support::{parse_stdout_json, resolved_snapshot_id, spawn_server_with_cluster};
+    use crate::support::{
+        FixtureTarget, parse_stdout_json, resolved_snapshot_id, spawn_server_with_cluster,
+    };
     use serde_json::json;
     use std::fs;
 
@@ -1682,25 +1684,26 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
 
     assert_rebuilt_v10_graph(&rebuilt);
 
-    let query_command = |target: &[&str], branch: &str, name: &str, params: &str| {
+    let target_command = |target: &[&str]| {
         let mut command = cli();
-        command.args([
-            "query", name, "--query", query_path, "--branch", branch, "--params", params, "--json",
-        ]);
         if target
             .get(1)
             .is_some_and(|value| value.starts_with("https://"))
         {
             command
-                .env(
-                    "OMNIGRAPH_HOME",
-                    support::tls_gateway::anonymous_home(target[1]),
-                )
-                .args(["--target", support::KEYED_SERVER_NAME])
+                .arg("--target")
+                .fixture_target(target[1])
                 .args(&target[2..]);
         } else {
             command.args(target);
         }
+        command
+    };
+    let query_command = |target: &[&str], branch: &str, name: &str, params: &str| {
+        let mut command = target_command(target);
+        command.args([
+            "query", name, "--query", query_path, "--branch", branch, "--params", params, "--json",
+        ]);
         command
     };
     let direct = ["--target", rebuilt_uri];
@@ -1763,46 +1766,36 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             }
         }
         for target in [&direct[..], &remote[..]] {
-            let blob = output_success(
-                cli()
-                    .args([
-                        "blob",
-                        "get",
-                        "node",
-                        "BinaryAsset",
-                        "blob-sentinel",
-                        "payload",
-                        "--branch",
-                        branch,
-                    ])
-                    .args(target),
-            );
+            let blob = output_success(target_command(target).args([
+                "blob",
+                "get",
+                "node",
+                "BinaryAsset",
+                "blob-sentinel",
+                "payload",
+                "--branch",
+                branch,
+            ]));
             assert_eq!(blob.stdout, [0, 1, 2, 3, 255]);
         }
     }
 
     let before = resolved_snapshot_id(&rebuilt, "review");
-    let change = parse_stdout_json(&output_success(
-        cli()
-            .args([
-                "mutate",
-                "revise",
-                "--query",
-                query_path,
-                "--branch",
-                "review",
-                "--params",
-                r#"{"body":"verified after rebuild"}"#,
-                "--json",
-            ])
-            .args(remote),
-    ));
+    let change = parse_stdout_json(&output_success(target_command(&remote).args([
+        "mutate",
+        "revise",
+        "--query",
+        query_path,
+        "--branch",
+        "review",
+        "--params",
+        r#"{"body":"verified after rebuild"}"#,
+        "--json",
+    ])));
     assert_eq!(change["affected_nodes"], 1);
     assert_ne!(resolved_snapshot_id(&rebuilt, "review"), before);
     output_success(
-        cli()
-            .args(["branch", "merge", "review", "--into", "main", "--json"])
-            .args(remote),
+        target_command(&remote).args(["branch", "merge", "review", "--into", "main", "--json"]),
     );
     let expected = parse_stdout_json(&output_success(&mut query_command(
         &remote, "main", "docs", "{}",
