@@ -81,14 +81,14 @@ pub struct ManifestError {
     pub kind: ManifestErrorKind,
     pub message: String,
     pub details: Option<ManifestConflictDetails>,
-    /// Publication may be durable despite an unavailable acknowledgement or
-    /// readback. Retention guards must remain until authority proves it cannot
-    /// still publish; the external error category remains `Internal`.
-    pub publication_in_doubt: bool,
-    /// The graph commit an in-doubt publication carries. It is an engine
-    /// identifier, never a storage path, so a log may name it where it names
-    /// no message.
-    pub publication_id: Option<String>,
+    /// The graph commit of a publication that may be durable despite an
+    /// unavailable acknowledgement or readback; `None` when no publication is
+    /// in doubt. Retention guards must remain until authority proves it cannot
+    /// still publish; the external error category remains `Internal`. The id
+    /// is an engine identifier, never a storage path, so a log may name it
+    /// where it names no message. A thin box keeps the field one word, so
+    /// every `Result<_, OmniError>` stays under the large-error bound.
+    pub publication_in_doubt: Option<Box<String>>,
 }
 
 impl ManifestError {
@@ -97,8 +97,7 @@ impl ManifestError {
             kind,
             message: message.into(),
             details: None,
-            publication_in_doubt: false,
-            publication_id: None,
+            publication_in_doubt: None,
         }
     }
 
@@ -779,7 +778,7 @@ impl OmniError {
                 | Self::InitializationCommitted { .. }
                 | Self::InitializationIndeterminate { .. }
                 | Self::Manifest(ManifestError {
-                    publication_in_doubt: true,
+                    publication_in_doubt: Some(_),
                     ..
                 })
         ) {
@@ -1029,8 +1028,7 @@ impl OmniError {
         message: impl Into<String>,
     ) -> Self {
         Self::Manifest(ManifestError {
-            publication_in_doubt: true,
-            publication_id: Some(graph_commit_id.into()),
+            publication_in_doubt: Some(Box::new(graph_commit_id.into())),
             ..ManifestError::new(ManifestErrorKind::Internal, message)
         })
     }
@@ -1040,10 +1038,9 @@ impl OmniError {
     pub fn publication_id(&self) -> Option<&str> {
         match self.without_evidence() {
             Self::Manifest(ManifestError {
-                publication_in_doubt: true,
-                publication_id,
+                publication_in_doubt: Some(graph_commit_id),
                 ..
-            }) => publication_id.as_deref(),
+            }) => Some(graph_commit_id.as_str()),
             _ => None,
         }
     }
@@ -1054,7 +1051,7 @@ impl OmniError {
         matches!(
             self.without_evidence(),
             Self::Manifest(ManifestError {
-                publication_in_doubt: true,
+                publication_in_doubt: Some(_),
                 ..
             })
         )
@@ -1794,7 +1791,6 @@ mod tests {
                 assert_eq!(actual.message, expected.message);
                 assert_eq!(actual.details, expected.details);
                 assert_eq!(actual.publication_in_doubt, expected.publication_in_doubt);
-                assert_eq!(actual.publication_id, expected.publication_id);
             }
             (
                 OmniError::ResourceLimitExceeded {

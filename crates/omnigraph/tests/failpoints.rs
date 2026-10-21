@@ -3117,7 +3117,7 @@ async fn merge_refuses_a_target_recreated_by_another_process_issue_643() {
         matches!(
             &error,
             OmniError::Manifest(manifest)
-                if !manifest.publication_in_doubt
+                if manifest.publication_in_doubt.is_none()
                     && matches!(
                         &manifest.details,
                         Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged { member, .. })

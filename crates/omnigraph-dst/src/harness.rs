@@ -5893,7 +5893,7 @@ impl UniverseScenario<RustResources> for Scenario {
                         matches!(&error, OmniError::Manifest(detail)
                             if detail.kind == omnigraph::error::ManifestErrorKind::BadRequest
                                 && detail.details.is_none()
-                                && !detail.publication_in_doubt
+                                && detail.publication_in_doubt.is_none()
                                 && detail.message == format!("injected failpoint triggered: {window}")),
                         "counted effect fired but an unrelated error escaped: {error}"
                     );
