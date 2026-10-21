@@ -24,7 +24,7 @@ Load and mutation input use one String representation:
 ```
 
 New external references are denied by default. A cluster-served graph must list
-allowed URI bases in its graph configuration. Direct `--store` CLI access has no
+allowed URI bases in its graph configuration. Direct `--target` CLI access has no
 external-source allowlist, so it accepts managed `base64:` input but rejects new
 external references. Credentials must not appear in stored URIs. An allowed
 base must lie outside the cluster's storage root and every graph root; see
@@ -72,7 +72,7 @@ cell:
 
 ```http
 PUT /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.13
+Omnigraph-Http-Api: 0.14
 Content-Type: application/octet-stream
 If-Match: "<current ETag>"
 
@@ -97,7 +97,7 @@ HTTP an `If-Match` field, embedded a `BlobPrecondition`. A list of entity tags
 (`BlobPrecondition::Tags`) holds when the current ETag is one of them; weak tags
 never match. `*` (`BlobPrecondition::AnyExisting`) holds when the cell is not
 null. When it fails, the write changes nothing and returns
-`BlobWritePreconditionFailed`, over HTTP a `412` whose
+`BlobWritePreconditionFailed`, over HTTP a `412` `precondition_failed` whose
 `blob_precondition_failure.current_etag` and `ETag` header carry the cell's
 current ETag when it holds a managed value. A malformed `If-Match` is a `400`. A commit that
 lands while the write is in flight makes it start again from the new head and
@@ -135,16 +135,16 @@ receipt the server returns:
 
 ```bash
 omnigraph blob put node Document manual content --file manual.pdf \
-  --if-match '"<current ETag>"' --store graph.omni
-omnigraph blob clear node Document manual content --server prod --graph knowledge
+  --if-match '"<current ETag>"' --target ./graph.omni
+omnigraph blob clear node Document manual content --target prod --graph knowledge
 ```
 
 The CLI refuses input over 32 MiB and a malformed `--if-match` before it
 addresses the graph. The value must also fit `write_max_bytes`: the process's
-`OMNIGRAPH_WRITE_MAX_BYTES` for a `--store` write, the server's for a served
-one. `--as` names the actor of a `--store` write; a served
-write takes its actor from the bearer token. A served Blob `412` exits 4, as a
-graph-commit precondition does; an embedded one exits 1. Each write is sent
+`OMNIGRAPH_WRITE_MAX_BYTES` for a `--target` write, the server's for a served
+one. `--as` names the actor of a `--target` write; a served
+write takes its actor from the bearer token, and `--as` there only asserts it. A Blob precondition failure exits 4,
+embedded or served, as a graph-commit precondition does. Each write is sent
 once: after an unknown outcome, read the cell before writing again.
 
 ## Query behavior
@@ -161,17 +161,16 @@ commit.
 ## CLI reads
 
 The selector is `ENTITY TYPE ID PROPERTY`, where `ENTITY` is `node` or `edge`.
-Blob commands address the graph with `--store`, `--server`, or a matching
-profile; they do not take a positional graph URI.
+Blob commands address the graph with `--target NAME|ADDRESS`; they do not take a positional graph URI.
 
 ```bash
 # Stream managed bytes to a file.
 omnigraph blob get node Document manual content \
-  --out manual.bin --store graph.omni
+  --out manual.bin --target ./graph.omni
 
 # Inspect the value without reading payload bytes.
 omnigraph blob stat node Document manual content \
-  --json --store graph.omni
+  --json --target ./graph.omni
 ```
 
 Reads default to `main`. `--branch <name>` and `--snapshot <commit-id>` are
@@ -205,7 +204,7 @@ Servers expose the same logical selector with GET and HEAD:
 
 ```http
 GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.13
+Omnigraph-Http-Api: 0.14
 ```
 
 Both methods follow the [HTTP contract](operations/server.md#http-contract),

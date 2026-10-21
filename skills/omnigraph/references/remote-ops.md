@@ -7,17 +7,30 @@ than the transport status alone.
 
 ## Address the graph
 
-Register a named server and keep the token outside project configuration:
+Register a complete server target in the operator file and keep its token
+outside project configuration:
+
+```yaml
+target_config_version: 1
+targets:
+  production:
+    kind: server
+    endpoint: https://graph.example.com
+    credential: production
+```
 
 ```bash
-echo "$TOKEN" | omnigraph login production
-omnigraph query get_person --server production --graph knowledge \
+echo "$TOKEN" | omnigraph login --target production
+omnigraph query get_person --target production --graph knowledge \
   --params '{"email":"ada@example.com"}' --json
 ```
 
-`--server <name>` resolves the URL from `~/.omnigraph/config.yaml`; `--graph`
-selects a graph served by that cluster. Do not use the cluster control-plane
-`--config` flag on data-plane commands.
+`--target NAME` selects one binding from `~/.omnigraph/config.yaml`; omitting it
+uses only `defaults.target`. `--graph` or the target's `default_graph` selects the
+graph. Inline HTTP/Unix targets use the deepest matching configured endpoint
+credential, otherwise none. A required missing credential refuses. Do not use the cluster
+source `--config` flag on data commands. Folder metadata never changes routing.
+The resolved target is printed on stderr before backend execution.
 
 ## Successful write receipts
 
@@ -46,9 +59,9 @@ not prove success or failure:
 Use server addressing for the checks too:
 
 ```bash
-omnigraph commit list --server production --graph knowledge \
+omnigraph commit list --target production --graph knowledge \
   --branch main --json
-omnigraph export --server production --graph knowledge \
+omnigraph export --target production --graph knowledge \
   --branch main --type Person > /tmp/people.jsonl
 ```
 
@@ -66,8 +79,8 @@ When a mutation is derived from returned rows, protect it with the commit pinned
 to those rows:
 
 ```bash
-omnigraph query find_person --server production --graph knowledge --json
-omnigraph mutate update_person --server production --graph knowledge \
+omnigraph query find_person --target production --graph knowledge --json
+omnigraph mutate update_person --target production --graph knowledge \
   --params '{"name":"Ada"}' --if-commit <graph_commit_id> --json
 ```
 
@@ -76,7 +89,7 @@ exits `4`; HTTP returns `412` with `precondition_failure: {expected, actual?}`.
 Re-read and decide again. Fetching a head id after the read does not close the
 race.
 
-Over HTTP, beside the `Omnigraph-Http-Api: 0.13` header every graph request
+Over HTTP, beside the `Omnigraph-Http-Api: 0.14` header every graph request
 needs, send the raw id in the `Omnigraph-If-Graph-Commit` header to
 `POST /graphs/{id}/mutate/if-graph-commit` or
 `POST /graphs/{id}/queries/{name}/if-graph-commit`. The plain routes reject that
@@ -86,7 +99,7 @@ route.
 ## Typed failures and recovery
 
 - `429 Too Many Requests`: the write did not start. Honor `Retry-After`, then
-  retry. The CLI marks this case with exit `75` and a `command_outcome` whose
+  retry. The CLI marks this case with exit `75` and a `disposition` whose
   `action` is `retry`, only when no earlier step of the command took effect.
 - Structured `read_set_conflict` means an input changed before publication.
   Refresh and reconsider the operation, including schema/table identity changes;
@@ -105,10 +118,11 @@ route.
   do not replay.
 
 The effect-free conflict details are distinct from a lost response or a recovery
-requirement. Neither HTTP `409`/`503` nor the CLI's generic failure exit `1` is
-a universal retry signal; conditional precondition failure has its own exit `4`
-on data-plane commands (managed `cluster plan`/`apply` use exit `4` for
-recovery required instead).
+requirement. Neither HTTP `409`/`503` nor a CLI failure exit is a universal retry
+signal. On data-plane commands, exit `1` means nothing started, exit `2` that the
+effects are unknown, exit `4` a failed condition such as a precondition, and exit
+`75` a busy refusal that may be retried after `Retry-After` (managed
+`cluster plan`/`apply` use exit `4` for recovery required instead).
 
 ## Read large output safely
 
@@ -116,7 +130,7 @@ Redirect large schemas and exports to a file before inspecting them so an agent
 or terminal output cap cannot silently truncate the result:
 
 ```bash
-omnigraph schema show --server production --graph knowledge > /tmp/schema.pg
+omnigraph schema show --target production --graph knowledge > /tmp/schema.pg
 wc -l /tmp/schema.pg
 ```
 

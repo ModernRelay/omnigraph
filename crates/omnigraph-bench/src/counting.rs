@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance::io::WrappingObjectStore;
+use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -93,6 +94,34 @@ impl WrappingObjectStore for LogicalCallCounter {
             target,
             counter: self.clone(),
         })
+    }
+
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        target: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        Some(Arc::new(CountingPaginatedStore {
+            target,
+            counter: self.clone(),
+        }))
+    }
+}
+
+struct CountingPaginatedStore {
+    target: Arc<dyn PaginatedListStore>,
+    counter: LogicalCallCounter,
+}
+
+#[async_trait]
+impl PaginatedListStore for CountingPaginatedStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: PaginatedListOptions,
+    ) -> StoreResult<PaginatedListResult> {
+        self.counter.0.list.fetch_add(1, Ordering::Relaxed);
+        self.target.list_paginated(prefix, options).await
     }
 }
 
@@ -227,12 +256,14 @@ mod tests {
     use super::*;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
+    use std::sync::Mutex;
 
     #[derive(Debug)]
     struct RangeSpyStore {
         target: Arc<dyn ObjectStore>,
         get_opts: AtomicU64,
         get_ranges: AtomicU64,
+        pages: Mutex<Vec<(Option<String>, PaginatedListOptions)>>,
     }
 
     impl fmt::Display for RangeSpyStore {
@@ -294,6 +325,35 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl PaginatedListStore for RangeSpyStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: PaginatedListOptions,
+        ) -> StoreResult<PaginatedListResult> {
+            let count = {
+                let mut pages = self.pages.lock().unwrap();
+                pages.push((prefix.map(str::to_string), options));
+                pages.len()
+            };
+            if count > 1 {
+                return Err(object_store::Error::Generic {
+                    store: "pagination spy",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "page response lost",
+                    )),
+                });
+            }
+            let prefix = prefix.map(Path::from);
+            Ok(PaginatedListResult {
+                result: self.target.list_with_delimiter(prefix.as_ref()).await?,
+                page_token: Some("opaque/next?+=token".to_string()),
+            })
+        }
+    }
+
     #[test]
     fn take_resets_every_tally() {
         let counter = LogicalCallCounter::default();
@@ -333,6 +393,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pagination_counts_each_delegated_page_and_preserves_request_context() {
+        let target = Arc::new(InMemory::new());
+        let location = Path::from("prefix/item");
+        target
+            .put(&location, PutPayload::from_static(b"page item"))
+            .await
+            .unwrap();
+        let spy = Arc::new(RangeSpyStore {
+            target,
+            get_opts: AtomicU64::new(0),
+            get_ranges: AtomicU64::new(0),
+            pages: Mutex::new(Vec::new()),
+        });
+        let counter = LogicalCallCounter::default();
+        let store = counter.wrap_paginated("test", spy.clone()).unwrap();
+        let context = Arc::new(42_u64);
+        let mut options = PaginatedListOptions {
+            offset: Some("prefix/before".to_string()),
+            delimiter: Some("/".into()),
+            max_keys: Some(7),
+            page_token: Some("opaque/first?+=token".to_string()),
+            ..Default::default()
+        };
+        options.extensions.insert(Arc::clone(&context));
+        let page = store
+            .list_paginated(Some("prefix/"), options)
+            .await
+            .unwrap();
+        assert_eq!(page.result.objects.len(), 1);
+        assert_eq!(page.result.objects[0].location, location);
+        assert!(page.result.common_prefixes.is_empty());
+        assert_eq!(page.page_token.as_deref(), Some("opaque/next?+=token"));
+        let one_list = LogicalCallCounts {
+            list: 1,
+            ..Default::default()
+        };
+        assert_eq!(counter.take(), one_list);
+
+        let mut next = PaginatedListOptions {
+            page_token: page.page_token,
+            ..Default::default()
+        };
+        next.extensions.insert(Arc::clone(&context));
+        let error = store.list_paginated(None, next).await.unwrap_err();
+        let object_store::Error::Generic { store, source } = error else {
+            panic!("the backend error must be preserved");
+        };
+        assert_eq!(store, "pagination spy");
+        assert_eq!(source.to_string(), "page response lost");
+        assert_eq!(
+            source.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(counter.take(), one_list);
+        assert_eq!(counter.take(), LogicalCallCounts::default());
+
+        let pages = spy.pages.lock().unwrap();
+        assert_eq!(pages.len(), 2);
+        for (index, (prefix, options)) in pages.iter().enumerate() {
+            assert_eq!(prefix.as_deref(), (index == 0).then_some("prefix/"));
+            assert_eq!(
+                options.offset.as_deref(),
+                (index == 0).then_some("prefix/before")
+            );
+            assert_eq!(options.delimiter.as_deref(), (index == 0).then_some("/"));
+            assert_eq!(options.max_keys, (index == 0).then_some(7));
+            assert_eq!(
+                options.page_token.as_deref(),
+                Some(if index == 0 {
+                    "opaque/first?+=token"
+                } else {
+                    "opaque/next?+=token"
+                })
+            );
+            assert_eq!(options.extensions.len(), 1);
+            assert!(Arc::ptr_eq(
+                options.extensions.get::<Arc<u64>>().unwrap(),
+                &context
+            ));
+        }
+        assert_eq!(spy.get_opts.load(Ordering::Relaxed), 0);
+        assert_eq!(spy.get_ranges.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn get_ranges_remains_one_delegated_logical_call() {
         let location = Path::from("ranges");
         let target = Arc::new(InMemory::new());
@@ -344,6 +489,7 @@ mod tests {
             target,
             get_opts: AtomicU64::new(0),
             get_ranges: AtomicU64::new(0),
+            pages: Mutex::new(Vec::new()),
         });
         let counter = LogicalCallCounter::default();
         let store = counter.wrap("test", spy.clone());

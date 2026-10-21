@@ -168,6 +168,7 @@ async fn explicit_automation_resolves_its_own_principal_before_data_cache_reuse(
         Some("org_test"),
         Some("automation-access".into()),
         Some(api.origin.clone()),
+        super::super::ControlAuth::AutomationEnv,
     )
     .await
     .unwrap();
@@ -315,7 +316,7 @@ async fn cached_login_does_not_restart_provider_authorization() {
         &api.origin,
         config(),
         &provider.provider(),
-        None,
+        Some("org_test"),
         &mut Vec::new(),
     )
     .await
@@ -466,41 +467,55 @@ async fn failed_login_custody_attempts_to_revoke_the_new_provider_session() {
 }
 
 #[tokio::test]
-async fn signing_into_another_organization_starts_its_own_device_flow() {
-    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
-    let (saved, _) = renewal::accept(
-        &api.origin,
-        config(),
-        serde_json::from_value(tokens(120, "user_one")).unwrap(),
-        None,
-    )
-    .await
-    .unwrap();
-    let store = MemoryStore::default();
-    renewal::save(&store, &saved).unwrap();
-    let before = store.0.borrow().clone();
-    let transport = MockTransport::with(vec![(
-        200,
-        json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":1,"interval":5}),
-    )]);
-    let error = login_with(
-        &store,
-        &api.origin,
-        config(),
-        &transport.provider(),
-        Some("org_other"),
-        &mut Vec::new(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.body["type"], "device_expired");
-    assert_eq!(*store.0.borrow(), before);
-    let requests = transport.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].url, config().device_authorization_endpoint);
-    let body: Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
-    assert_eq!(body, json!({"client_id":"client_test"}));
-    api.assert_complete();
+async fn organization_discovery_starts_fresh_with_zero_one_or_multiple_cached_organizations() {
+    for count in [0, 1, 2] {
+        let organizations = ["org_test", "org_other"];
+        let api = IntentApiFixture::new(
+            organizations
+                .iter()
+                .take(count)
+                .map(|org| metadata_for(120, "principal_one", org))
+                .collect(),
+        );
+        let store = MemoryStore::default();
+        for org in organizations.iter().take(count) {
+            let mut supplied = tokens(120, "user_one");
+            supplied["organization_id"] = json!(org);
+            rewrite_claim(&mut supplied, "org_id", json!(org));
+            let (saved, _) = renewal::accept(
+                &api.origin,
+                config(),
+                serde_json::from_value(supplied).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+            renewal::save(&store, &saved).unwrap();
+        }
+        let before = store.0.borrow().clone();
+        let transport = MockTransport::with(vec![(
+            200,
+            json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":1,"interval":5}),
+        )]);
+        let error = login_with(
+            &store,
+            &api.origin,
+            config(),
+            &transport.provider(),
+            None,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.body["type"], "device_expired");
+        assert_eq!(*store.0.borrow(), before);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, config().device_authorization_endpoint);
+        let body: Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(body, json!({"client_id":"client_test"}));
+        api.assert_complete();
+    }
 }
 
 #[tokio::test]
@@ -512,6 +527,7 @@ async fn explicit_organization_must_match_the_verified_automation_account() {
         Some("org_other"),
         Some("automation".into()),
         Some(api.origin.clone()),
+        super::super::ControlAuth::AutomationEnv,
     )
     .await;
     assert_eq!(result.err().unwrap().body["type"], "organization_mismatch");
@@ -904,4 +920,48 @@ async fn selected_device_custody_failure_revokes_only_the_new_verified_session()
         format!("Bearer {}", selected["access_token"].as_str().unwrap())
     );
     api.assert_complete();
+}
+
+#[tokio::test]
+async fn target_mechanism_never_falls_back_to_another_credential_class() {
+    let store = MemoryStore::default();
+    let origin = "https://control.example";
+    // A human target ignores even invalid or foreign automation input.
+    let human = select_with(
+        &store,
+        origin,
+        Some("org_one"),
+        Some("invalid secret".into()),
+        Some("https://foreign.example".into()),
+        super::super::ControlAuth::HumanDevice,
+    )
+    .await
+    .unwrap();
+    assert!(human.is_none());
+    store.put(origin, "unreadable-human-session").unwrap();
+    let error = select_with(
+        &store,
+        origin,
+        Some("org_one"),
+        None,
+        None,
+        super::super::ControlAuth::AutomationEnv,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.body["type"], "automation_credential_required");
+    assert_eq!(
+        selected_principal_with(
+            &store,
+            origin,
+            Some("org_one"),
+            None,
+            None,
+            super::super::ControlAuth::AutomationEnv
+        )
+        .await
+        .unwrap(),
+        None
+    );
 }

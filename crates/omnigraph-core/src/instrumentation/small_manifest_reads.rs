@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
-use lance_table::format::{RowDatasetVersionMeta, RowIdMeta};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
@@ -67,15 +66,7 @@ fn small_files(dataset: &Dataset) -> Option<HashMap<String, u64>> {
     for fragment in dataset.manifest().fragments.iter() {
         if !fragment.overlays.is_empty()
             || fragment.deletion_file.is_some()
-            || matches!(fragment.row_id_meta, Some(RowIdMeta::External(_)))
-            || matches!(
-                fragment.last_updated_at_version_meta,
-                Some(RowDatasetVersionMeta::External(_))
-            )
-            || matches!(
-                fragment.created_at_version_meta,
-                Some(RowDatasetVersionMeta::External(_))
-            )
+            || fragment.has_spilled_row_lineage()
         {
             return None;
         }
@@ -130,7 +121,7 @@ impl ObjectStore for BoundedManifestStore {
             return self.inner.get_opts(path, options).await;
         }
         options.range = Some(GetRange::Bounded(0..size));
-        let result = self.inner.get_opts(path, options).await?;
+        let mut result = self.inner.get_opts(path, options).await?;
         if result.meta.size != size || result.range != (0..size) {
             return Err(invalid_data(
                 "manifest data size differs from its captured metadata",
@@ -138,6 +129,7 @@ impl ObjectStore for BoundedManifestStore {
         }
         let meta = result.meta.clone();
         let attributes = result.attributes.clone();
+        let extensions = std::mem::take(&mut result.extensions);
         let stream = futures::stream::try_unfold(
             (result.into_stream(), size),
             |(mut stream, remaining)| async move {
@@ -161,6 +153,7 @@ impl ObjectStore for BoundedManifestStore {
             meta,
             range: 0..size,
             attributes,
+            extensions,
         })
     }
 
@@ -209,6 +202,28 @@ mod tests {
     use object_store::ObjectStoreExt;
 
     #[tokio::test]
+    async fn spilled_row_lineage_keeps_the_dataset_reader() {
+        use lance_table::format::{RowDatasetVersionMeta, RowIdMeta};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("table.lance");
+        let dataset = crate::lance_clone::fresh_dataset(uri.to_str().unwrap()).await;
+        assert!(small_files(&dataset).is_some());
+        for field in 0..3 {
+            let mut indirect = dataset.clone();
+            let manifest = Arc::make_mut(&mut indirect.manifest);
+            let fragment = &mut Arc::make_mut(&mut manifest.fragments)[0];
+            match field {
+                0 => fragment.row_id_meta = Some(RowIdMeta::Column),
+                1 => fragment.created_at_version_meta = Some(RowDatasetVersionMeta::Column),
+                _ => fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Column),
+            }
+            assert!(small_files(&indirect).is_none(), "lineage field {field}");
+        }
+        assert!(small_files(&dataset).is_some());
+    }
+
+    #[tokio::test]
     async fn bounded_manifest_reads_validate_object_size_and_keep_other_paths_readable() {
         let inner = Arc::new(object_store::memory::InMemory::new());
         let path = Path::from("main/data/file.lance");
@@ -250,7 +265,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum BodyCase {
         Exact,
         Short,
@@ -282,6 +297,7 @@ mod tests {
             self.requests.fetch_add(1, Ordering::SeqCst);
             assert_eq!(options.range, Some(GetRange::Bounded(0..6)));
             let mut result = self.inner.get_opts(path, options).await?;
+            result.extensions.insert(self.case);
             let mut chunks = vec![Ok(Bytes::from_static(b"ab"))];
             match self.case {
                 BodyCase::Exact => chunks.push(Ok(Bytes::from_static(b"cdef"))),
@@ -386,6 +402,7 @@ mod tests {
             );
             assert_eq!(result.meta.size, 6);
             assert_eq!(result.range, 0..6);
+            assert_eq!(result.extensions.get::<BodyCase>(), Some(&case));
             let bytes = result.bytes().await;
             match case {
                 BodyCase::Exact => assert_eq!(bytes.unwrap(), Bytes::from_static(b"abcdef")),

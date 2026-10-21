@@ -235,94 +235,6 @@ pub(crate) fn write_cleanup(
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct LoadOutput {
-    pub(crate) uri: String,
-    pub(crate) branch: String,
-    pub(crate) mode: &'static str,
-    /// Present only when `--from` was given; echoes the requested base.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) base_branch: Option<String>,
-    pub(crate) branch_created: bool,
-    pub(crate) nodes: Vec<GraphBatchDeclarationOutput>,
-    pub(crate) edges: Vec<GraphBatchDeclarationOutput>,
-    pub(crate) total_entities: usize,
-    pub(crate) embedding_generation: Option<omnigraph_api_types::LoadEmbeddingGeneration>,
-    pub(crate) commit: Option<CommitOutput>,
-}
-
-pub(crate) fn load_output_from_graph_batch(
-    uri: &str,
-    mode: &'static str,
-    output: &GraphBatchLoadOutput,
-) -> LoadOutput {
-    LoadOutput {
-        uri: uri.to_string(),
-        branch: output.branch.clone(),
-        mode,
-        base_branch: output.base_branch.clone(),
-        branch_created: output.branch_created,
-        nodes: output.nodes.clone(),
-        edges: output.edges.clone(),
-        total_entities: output.total_entities,
-        embedding_generation: output.embedding_generation,
-        commit: output.commit.clone(),
-    }
-}
-
-/// The local arm's twin of `load_output_from_graph_batch`: build the same
-/// `LoadOutput` from the engine `LoadResult` directly (the remote arm has the
-/// logical graph-batch DTO; the local arm has the full result). Both load
-/// mappings live here, next to the struct — RFC-009
-/// Phase 2's "one place" for the `-> LoadOutput` mapping that used to fork
-/// between this file and main.rs's inline construction.
-pub(crate) fn load_output_from_receipt(
-    uri: &str,
-    branch: &str,
-    mode: &'static str,
-    receipt: &omnigraph::loader::LoadReceipt,
-    catalog: &omnigraph_compiler::catalog::Catalog,
-) -> LoadOutput {
-    let result = &receipt.result;
-    let mut nodes = result
-        .nodes_loaded
-        .iter()
-        .map(|(name, entities_loaded)| GraphBatchDeclarationOutput {
-            name: name.clone(),
-            entities_loaded: *entities_loaded,
-        })
-        .collect::<Vec<_>>();
-    nodes.sort_by(|left, right| left.name.cmp(&right.name));
-    let mut edges = result
-        .edges_loaded
-        .iter()
-        .map(|(name, entities_loaded)| GraphBatchDeclarationOutput {
-            name: name.clone(),
-            entities_loaded: *entities_loaded,
-        })
-        .collect::<Vec<_>>();
-    edges.sort_by(|left, right| left.name.cmp(&right.name));
-    let total_entities = nodes
-        .iter()
-        .chain(&edges)
-        .map(|entry| entry.entities_loaded)
-        .sum();
-    LoadOutput {
-        uri: uri.to_string(),
-        branch: branch.to_string(),
-        mode,
-        base_branch: result.base_branch.clone(),
-        branch_created: result.branch_created,
-        nodes,
-        edges,
-        total_entities,
-        embedding_generation: omnigraph_api_types::LoadEmbeddingGeneration::for_load(
-            catalog, result,
-        ),
-        commit: Some(omnigraph_api_types::commit_output(&receipt.commit)),
-    }
-}
-
-#[derive(Debug, Serialize)]
 pub(crate) struct SchemaPlanOutput<'a> {
     pub(crate) uri: &'a str,
     pub(crate) supported: bool,
@@ -514,35 +426,6 @@ pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Wri
     write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn write_cluster_status_human(
-    output: &StatusOutput,
-    stdout: &mut dyn Write,
-) -> Result<()> {
-    if output.ok {
-        let state = &output.state_observations;
-        if state.state_found {
-            writeln!(
-                stdout,
-                "cluster state: revision {}, {} resource(s)",
-                state.state_revision, state.resource_count
-            )?;
-            if let Some(digest) = state.applied_config_digest.as_deref() {
-                writeln!(stdout, "  applied config: {digest}")?;
-            }
-            if state.locked {
-                writeln!(stdout, "  lock: held{}", cluster_lock_summary(state))?;
-            } else {
-                writeln!(stdout, "  lock: not held")?;
-            }
-        } else {
-            writeln!(stdout, "cluster state missing")?;
-        }
-    } else {
-        writeln!(stdout, "cluster status failed")?;
-    }
-    write_cluster_diagnostics(&output.diagnostics, stdout)
-}
-
 pub(crate) fn write_cluster_state_sync_human(
     output: &StateSyncOutput,
     stdout: &mut dyn Write,
@@ -585,33 +468,6 @@ pub(crate) fn write_cluster_state_sync_human(
         }
     } else {
         writeln!(stdout, "cluster {operation} failed")?;
-    }
-    write_cluster_diagnostics(&output.diagnostics, stdout)
-}
-
-pub(crate) fn write_cluster_force_unlock_human(
-    output: &ForceUnlockOutput,
-    stdout: &mut dyn Write,
-) -> Result<()> {
-    if output.ok {
-        if output.lock_removed {
-            writeln!(
-                stdout,
-                "cluster force-unlock: removed lock{}",
-                cluster_lock_summary(&output.state_observations)
-            )?;
-        } else {
-            writeln!(stdout, "cluster force-unlock: no lock removed")?;
-        }
-    } else {
-        writeln!(stdout, "cluster force-unlock failed")?;
-        if output.state_observations.locked {
-            writeln!(
-                stdout,
-                "  lock: held{}",
-                cluster_lock_summary(&output.state_observations)
-            )?;
-        }
     }
     write_cluster_diagnostics(&output.diagnostics, stdout)
 }
@@ -715,23 +571,6 @@ pub(crate) fn finish_cluster_plan(
     Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_status(
-    output: &StatusOutput,
-    json: bool,
-    stdout: &mut dyn Write,
-) -> Result<Completion> {
-    if json {
-        write_json(output, stdout)?;
-    } else {
-        write_cluster_status_human(output, stdout)?;
-    }
-    if !output.ok {
-        stdout.flush()?;
-        return Ok(Completion::exit(1));
-    }
-    Ok(Completion::success())
-}
-
 pub(crate) fn finish_cluster_state_sync(
     output: &StateSyncOutput,
     json: bool,
@@ -749,30 +588,18 @@ pub(crate) fn finish_cluster_state_sync(
     Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_force_unlock(
-    output: &ForceUnlockOutput,
-    json: bool,
-    stdout: &mut dyn Write,
-) -> Result<Completion> {
-    if json {
-        write_json(output, stdout)?;
-    } else {
-        write_cluster_force_unlock_human(output, stdout)?;
-    }
-    if !output.ok {
-        stdout.flush()?;
-        return Ok(Completion::exit(1));
-    }
-    Ok(Completion::success())
-}
-
-pub(crate) fn write_load_human(payload: &LoadOutput, writer: &mut dyn Write) -> Result<()> {
+/// The load route's body carries no address, so the caller names the graph.
+pub(crate) fn write_load_human(
+    uri: &str,
+    payload: &GraphBatchLoadOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
     writeln!(
         writer,
         "loaded {} on branch {} with {}: {} entities across {} node types and {} edge types",
-        payload.uri,
+        uri,
         payload.branch,
-        payload.mode,
+        payload.mode.as_str(),
         payload.total_entities,
         payload.nodes.len(),
         payload.edges.len()
@@ -1104,8 +931,15 @@ pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Wr
 /// prints; a mutation's prints the affected counts.
 pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) -> Result<()> {
     match &output.outcome {
-        Some(BranchOutcomeOutput::Created { from, name }) => {
-            writeln!(writer, "created branch {name} from {from}")?;
+        Some(BranchOutcomeOutput::Created {
+            from,
+            name,
+            from_commit_id,
+        }) => {
+            writeln!(
+                writer,
+                "created branch {name} from {from} at {from_commit_id}"
+            )?;
         }
         Some(BranchOutcomeOutput::Deleted { name }) => writeln!(writer, "deleted branch {name}")?,
         Some(BranchOutcomeOutput::Merged {
@@ -2447,12 +2281,11 @@ mod tests {
 
     #[test]
     fn load_human_preserves_branch_and_embedding_diagnostics() {
-        let mut output = super::LoadOutput {
-            uri: "graph".to_string(),
+        let mut output = omnigraph_api_types::GraphBatchLoadOutput {
             branch: "work".to_string(),
-            mode: "append",
             base_branch: Some("main".to_string()),
             branch_created: true,
+            mode: omnigraph::loader::LoadMode::Append,
             nodes: vec![omnigraph_api_types::GraphBatchDeclarationOutput {
                 name: "Doc".to_string(),
                 entities_loaded: 2,
@@ -2460,19 +2293,20 @@ mod tests {
             edges: Vec::new(),
             total_entities: 2,
             embedding_generation: Some(omnigraph_api_types::LoadEmbeddingGeneration::Unsupported),
+            actor_id: None,
             commit: None,
         };
         assert_human_format(
             "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n\
              branch work created from main\n\
              Loads do not generate embeddings. Supplied vectors are preserved; omitted vectors follow schema nullability. Supply vectors in the input or prepare them with omnigraph embed.\n",
-            |writer| super::write_load_human(&output, writer),
+            |writer| super::write_load_human("graph", &output, writer),
         );
         output.branch_created = false;
         output.embedding_generation = None;
         assert_human_format(
             "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n",
-            |writer| super::write_load_human(&output, writer),
+            |writer| super::write_load_human("graph", &output, writer),
         );
     }
 

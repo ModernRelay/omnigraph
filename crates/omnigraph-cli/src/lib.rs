@@ -3,13 +3,9 @@
 use color_eyre::eyre::{Result, bail};
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
-    CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput,
-    SchemaApplyOutput, SnapshotDatasetOutput,
+    CommitOutput, ErrorOutput, GraphBatchLoadOutput, SchemaApplyOutput, SnapshotDatasetOutput,
 };
-use omnigraph_cluster::{
-    DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
-    ValidateOutput,
-};
+use omnigraph_cluster::{DiagnosticSeverity, PlanOutput, StateSyncOutput, ValidateOutput};
 use omnigraph_compiler::{
     JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSeverity,
     QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, json_params_to_param_map,
@@ -48,6 +44,7 @@ mod presentation;
 mod schema_upgrade;
 mod scope;
 mod skill;
+mod targets;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/unix_gateway.rs"]
 mod unix_gateway_fixture;
@@ -67,3 +64,11 @@ mod tests;
 /// Exit code for a verified remote `--if-commit` refusal (HTTP 412) with
 /// no earlier whole-command effects. Scripts must refresh before retrying.
 const EXIT_PRECONDITION_FAILED: i32 = 4;
+/// Exit code for a failure whose effects are unknown: reconcile or recover
+/// before trying again.
+const EXIT_OUTCOME_UNKNOWN: i32 = 2;
+/// Exit code for a command that did not start and may be retried after
+/// `Retry-After` (`EX_TEMPFAIL`).
+const EXIT_RETRY: i32 = 75;
+/// Exit code for a command line the parser refused (`EX_USAGE`).
+const EXIT_USAGE: i32 = 64;

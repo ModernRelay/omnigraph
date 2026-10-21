@@ -247,8 +247,8 @@ macro_rules! write_surfaces {
 
 write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options", "init_with_storage"],
-    "db/omnigraph/prepared_create.rs" => WriteProtocol::Bootstrap => ["apply_prepared_graph_create", "apply_prepared_graph_create_with_io_scope"],
-    "db/omnigraph/prepared_create.rs" => WriteProtocol::Exact("quiesced birth settlement: exact init claim, bounded original empty tables, no published manifest or refs") => ["settle_prepared_graph_create_after_quiescence"],
+    "db/omnigraph/prepared_create.rs" => WriteProtocol::Bootstrap => ["apply_prepared_graph_create", "apply_prepared_graph_create_with_io_scope", "apply_prepared_graph_create_with_storage"],
+    "db/omnigraph/prepared_create.rs" => WriteProtocol::Exact("quiesced birth settlement: exact init claim, bounded original empty tables, no published manifest or refs") => ["settle_prepared_graph_create_after_quiescence", "settle_prepared_graph_create_after_quiescence_with_storage"],
     "db/omnigraph.rs" => WriteProtocol::Composed("read-write admission + owned local-root create-if-absent capability probe") => ["open", "open_with_storage", "open_with_io_scope"],
     "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_with_receipt", "mutate_as", "mutate_as_with_receipt", "mutate_as_with_expected_head", "mutate_as_with_expected_head_receipt", "mutate_as_with_optional_branch_receipt"],
     "exec/blob_write.rs" => MUTATION_V9 => ["put_blob_at_as", "clear_blob_at_as"],
@@ -283,7 +283,15 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph/prepared_create.rs", "prepare_graph_create"),
     (
         "db/omnigraph/prepared_create.rs",
+        "prepare_graph_create_with_storage",
+    ),
+    (
+        "db/omnigraph/prepared_create.rs",
         "reconcile_prepared_graph_create",
+    ),
+    (
+        "db/omnigraph/prepared_create.rs",
+        "reconcile_prepared_graph_create_with_storage",
     ),
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "refresh"),
@@ -292,6 +300,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "cleanup_plan_path_snapshot"),
     ("db/omnigraph.rs", "open_read_only_with_storage"),
     ("db/omnigraph.rs", "ensure_no_pending_recovery"),
+    ("db/omnigraph.rs", "ensure_no_pending_recovery_with_storage"),
     ("db/omnigraph.rs", "manifest_has_external_base_paths"),
     ("db/omnigraph/export.rs", "capture_served_export_cut"),
     (
@@ -382,11 +391,6 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
-        "read_schema_contract_at",
-    ),
-    (
-        "omnigraph-catalog/lib.rs",
-        "ManifestCoordinator",
         "read_schema_contract_for_snapshot",
     ),
     (
@@ -469,6 +473,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "published_record",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "capture_change_cut",
     ),
     (
@@ -506,16 +515,10 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "ManifestCoordinator",
         "open_exact_genesis",
     ),
-    ("omnigraph-catalog/lib.rs", "ManifestCoordinator", "open"),
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "open_with_session",
-    ),
-    (
-        "omnigraph-catalog/lib.rs",
-        "ManifestCoordinator",
-        "open_at_branch",
     ),
     (
         "omnigraph-catalog/lib.rs",
@@ -525,22 +528,22 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
-        "snapshot_at",
+        "snapshot_at_with_session",
     ),
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
-        "snapshot_at_in",
+        "snapshot_at_in_with_session",
     ),
     (
         "omnigraph-catalog/retention.rs",
         "ManifestCoordinator",
-        "pinned_graph_commit",
+        "pinned_graph_commit_with_session",
     ),
     (
         "omnigraph-catalog/retention.rs",
         "ManifestCoordinator",
-        "retired_commit_graphs",
+        "retired_commit_graphs_with_session",
     ),
     (
         "omnigraph-catalog/lib.rs",
@@ -641,6 +644,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "branch_create_at",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "branch_delete_captured",
         WriteProtocol::NativeRefControl,
     ),
@@ -672,6 +681,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "create_branch",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "create_branch_at",
         WriteProtocol::NativeRefControl,
     ),
     (
@@ -810,7 +825,7 @@ gateway_surfaces! {
         "manifest_scan_dataset",
     ],
     "omnigraph-core/storage.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
-        "io_scope", "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
+        "binding", "io_scope", "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
         "read_bytes_if_exists_bounded", "exists",
         "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
@@ -868,7 +883,7 @@ gateway_surfaces! {
         "commit_full_text_declarations",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
-        "validate_initial_empty_table",
+        "session", "validate_initial_empty_table",
         "transaction_identity",
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
         "open_at_entry_verified", "open_dataset_head", "list_native_branches",
@@ -2863,6 +2878,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
     let coordinator_methods = [
         "init_commit_with_session",
         "branch_create",
+        "branch_create_at",
         "branch_delete_captured",
         "commit_updates_with_actor",
         "commit_updates_with_actor_with_expected",
@@ -2906,6 +2922,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         "init_commit",
         "commit_changes_with_lineage_and_precondition",
         "create_branch",
+        "create_branch_at",
         "delete_branch",
         "delete_branch_with_expected",
     ] {
@@ -2941,6 +2958,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         "commit_changes_with_lineage",
         "commit_changes_with_lineage_and_precondition",
         "create_branch",
+        "create_branch_at",
         "delete_branch",
         "delete_branch_with_expected",
     ];
@@ -3024,6 +3042,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "db/manifest.rs: omnigraph_catalog::INTERNAL_MANIFEST_SCHEMA_VERSION",
     "db/manifest.rs: omnigraph_catalog::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION",
     "db/manifest.rs: omnigraph_catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE",
+    "error.rs: omnigraph_core::error::BranchStartRefusal",
     "error.rs: omnigraph_core::error::CompletionEvidence",
     "error.rs: omnigraph_core::error::ManifestConflictDetails",
     "error.rs: omnigraph_core::error::ManifestError",
@@ -3087,16 +3106,20 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "seams.rs: omnigraph_core::seams::store::StoreAction",
     "seams.rs: omnigraph_core::seams::store::Subject",
     "seams.rs: omnigraph_core::seams::store::SUBJECT_MAX_BYTES",
+    "storage.rs: omnigraph_core::storage::CapturedStorageBinding",
     "storage.rs: omnigraph_core::storage::DecorateStorage",
     "storage.rs: omnigraph_core::storage::ListDirBounds",
     "storage.rs: omnigraph_core::storage::ObjectStorageAdapter",
     "storage.rs: omnigraph_core::storage::STORAGE",
     "storage.rs: omnigraph_core::storage::StorageAdapter",
+    "storage.rs: omnigraph_core::storage::StorageDestination",
     "storage.rs: omnigraph_core::storage::StorageIoScope",
     "storage.rs: omnigraph_core::storage::StorageKind",
     "storage.rs: omnigraph_core::storage::join_uri",
     "storage.rs: omnigraph_core::storage::normalize_root_uri",
     "storage.rs: omnigraph_core::storage::redacted_storage_uri",
+    "storage.rs: omnigraph_core::storage::storage_for_binding",
+    "storage.rs: omnigraph_core::storage::storage_for_binding_scoped",
     "storage.rs: omnigraph_core::storage::storage_for_uri",
     "storage.rs: omnigraph_core::storage::storage_for_uri_scoped",
     "storage.rs: omnigraph_core::storage::storage_kind_for_uri",

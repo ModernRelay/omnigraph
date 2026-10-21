@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-10-06
+updated: 2026-10-20
 discussion: https://github.com/ModernRelay/omnigraph/pull/633
 supersedes: []
 superseded_by: []
@@ -15,6 +15,15 @@ blocked_on: []
 ---
 
 # RFC 0053: Offline data-token verification
+
+> **RFC 0059 disposition:** [RFC 0059](0059-config-cli-coherency.md) replaces
+> routing in Managed CLI data access. Historical: implicit folder selection,
+> legacy selectors and graph-selection rules, and the issuer-selected data
+> endpoint. Managed targets supply the binding and configured endpoint assertion.
+> Current: offline credential verification, cluster/incarnation/principal checks,
+> applied-policy authority, independent credential lifetime and local clearing,
+> and bounded acquisition and requests. This accepts the replacement design;
+> RFC 0059 continues to track implementation and qualification.
 
 > The [identity and applied-policy extension](2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
 > defines identity-only credentials, automatic acquisition and an offline OAuth

@@ -8,7 +8,6 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::Write;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAX_CREDENTIAL: usize = 64 * 1024;
@@ -58,7 +57,7 @@ fn key(context: &Context) -> String {
 fn invalid() -> Failure {
     Failure::refused(
         "data_credential_invalid",
-        "the cached data credential is invalid; run cluster token --managed",
+        "the cached data credential is invalid; run cluster token --target NAME",
     )
 }
 
@@ -121,6 +120,7 @@ impl Credential {
             || claims.account_id != context.organization_id
             || claims.cluster_id != self.cluster_id
             || self.cluster_incarnation.as_deref() != Some(claims.cluster_incarnation.as_str())
+            || claims.cluster_incarnation != context.incarnation
             || claims.aud != format!("urn:omnigraph:data:{}", self.cluster_id)
             || self.actor != format!("principal:{}", claims.sub)
             || i64::try_from(claims.exp).ok() != Some(expires.unix_timestamp())
@@ -138,10 +138,22 @@ impl Credential {
         {
             return Err(invalid());
         }
+        if context
+            .endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint != &self.endpoint)
+        {
+            let mut failure = Failure::refused(
+                "data_endpoint_mismatch",
+                "the issued data endpoint differs from the selected target; update the target explicitly before acquiring a replacement credential",
+            );
+            failure.body["endpoint"] = json!(self.endpoint);
+            return Err(failure);
+        }
         if expires <= now {
             return Err(Failure::refused(
                 "data_credential_expired",
-                "the data credential has expired; run cluster token --managed",
+                "the data credential has expired; run cluster token --target NAME",
             ));
         }
         Ok(())
@@ -173,15 +185,10 @@ pub(crate) fn parse_ttl(input: &str) -> std::result::Result<u64, String> {
 }
 
 fn scope(cli: &Cli) -> Result<()> {
-    if cli.server.is_some()
-        || cli.profile.is_some()
-        || cli.store.is_some()
-        || cli.cluster.is_some()
-        || cli.as_actor.is_some()
-    {
+    if cli.as_actor.is_some() {
         return Err(Failure::refused(
             "managed_scope_conflict",
-            "this managed operation uses its selected context; ordinary target selectors and an explicit --as are not applicable",
+            "managed data identity is derived from its credential; --as does not apply",
         ));
     }
     Ok(())
@@ -208,7 +215,7 @@ async fn mint_for_principal(
             None,
         )
         .await?;
-    super::cluster_matches(&body, &context.cluster)?;
+    context.verify(&body)?;
     let data = &body["data"];
     if data["version"] != 2
         || ["grants", "roles", "actions", "groups", "policy"]
@@ -276,7 +283,7 @@ pub(super) fn token_scope(cli: &Cli, ttl: Option<u64>, clear: bool) -> Result<()
     }
     if cli.graph.is_some() {
         return Err(Failure::refused(
-            "token_profile_conflict",
+            "token_graph_conflict",
             "identity credentials do not select a graph; use --graph on the graph operation",
         ));
     }
@@ -293,7 +300,7 @@ pub(super) async fn token(
     if clear {
         return self::clear(&auth::DATA_STORE, context);
     }
-    let api = Api::authenticated(context.api.clone(), Some(&context.organization_id)).await?;
+    let api = context.client().await?;
     mint(&auth::DATA_STORE, context, &api, ttl.unwrap_or(3600)).await
 }
 
@@ -301,7 +308,7 @@ fn load_credential(store: &impl Store, context: &Context) -> Result<Credential> 
     let raw = store.get(&key(context))?.ok_or_else(|| {
         Failure::refused(
             "data_credential_required",
-            "no data credential is cached for this cluster; run cluster token --managed",
+            "no data credential is cached for this cluster; run cluster token --target NAME",
         )
     })?;
     if raw.len() > MAX_CREDENTIAL {
@@ -313,8 +320,14 @@ fn load_credential(store: &impl Store, context: &Context) -> Result<Credential> 
 }
 
 fn load(store: &impl Store, context: &Context, graph: &str) -> Result<GraphClient> {
+    let endpoint = context.endpoint.as_deref().ok_or_else(|| {
+        Failure::refused(
+            "data_endpoint_required",
+            "complete the managed target endpoint before data operations",
+        )
+    })?;
     let credential = load_credential(store, context)?;
-    GraphClient::managed(&credential.endpoint, graph, credential.token).map_err(|_| {
+    GraphClient::managed(endpoint, graph, credential.token).map_err(|_| {
         Failure::new(
             "transport_failed",
             "could not initialize the managed data client",
@@ -323,81 +336,32 @@ fn load(store: &impl Store, context: &Context, graph: &str) -> Result<GraphClien
     })
 }
 
-fn skips_context(cli: &Cli) -> bool {
-    cli.direct
-        || !matches!(
-            cli.command,
-            Command::Query(_)
-                | Command::Mutate(_)
-                | Command::Graphs {
-                    command: GraphsCommand::List { .. }
-                }
-                | Command::Load(LoadArgs { uri: None, .. })
-                | Command::Commit {
-                    command: CommitCommand::List { uri: None, .. }
-                        | CommitCommand::Show { uri: None, .. }
-                }
-        )
-        || cli.server.is_some()
-        || cli.profile.is_some()
-        || cli.store.is_some()
-        || cli.cluster.is_some()
+/// Qualified data operations only; adding a wrapper needs its own protocol proof.
+fn supports(cli: &Cli) -> bool {
+    matches!(
+        cli.command,
+        Command::Query(_)
+            | Command::Mutate(_)
+            | Command::Graphs {
+                command: GraphsCommand::List { .. }
+            }
+            | Command::Load(LoadArgs { .. })
+            | Command::Commit {
+                command: CommitCommand::List { .. } | CommitCommand::Show { .. }
+            }
+    )
 }
 
-/// This check never resolves a competing target or consults credentials. Even
-/// an unknown profile or matching-looking server URL is ambiguous beside a
-/// managed binding. Call it only after selecting a valid exact-directory
-/// context, so ordinary commands retain their own operator-config behavior.
-fn has_ambient_target(
-    input: &crate::operator::InvocationConfig,
-    stderr: &mut dyn Write,
-) -> Result<bool> {
-    if input.has_profile() {
-        return Ok(true);
-    }
-    let operator = input.get(stderr).map_err(|error| {
-        if error.downcast_ref::<std::io::Error>().is_some() {
-            Failure::output_delivery()
-        } else {
-            Failure::refused(
-                "operator_config_invalid",
-                "cannot read valid operator configuration to exclude a competing data target",
-            )
-        }
-    })?;
-    Ok(operator.default_server().is_some() || operator.default_store().is_some())
-}
-
-#[cfg(test)]
-fn resolve(
-    cli: &Cli,
-    config: &std::path::Path,
-    store: &impl Store,
-    ambient_target: impl FnOnce() -> Result<bool>,
-) -> Result<Option<GraphClient>> {
-    if skips_context(cli) {
-        return Ok(None);
-    }
-    let Some(context) = super::read_context(config)? else {
-        return Ok(None);
-    };
-    resolve_context(cli, &context, store, ambient_target)
-}
-
-fn resolve_context(
-    cli: &Cli,
-    context: &Context,
-    store: &impl Store,
-    ambient_target: impl FnOnce() -> Result<bool>,
-) -> Result<Option<GraphClient>> {
-    if ambient_target()? {
+fn resolve_context(cli: &Cli, context: &Context, store: &impl Store) -> Result<GraphClient> {
+    if !supports(cli) {
         return Err(Failure::refused(
-            "managed_target_ambiguous",
-            "folder context competes with OMNIGRAPH_PROFILE or an operator default target; select the intended ordinary target explicitly, use --direct for ordinary ambient resolution, or clear the competing ambient target to use this managed folder",
+            "managed_operation_unsupported",
+            "this operation is not supported on managed targets",
         ));
     }
+    scope(cli)?;
+    let endpoint = context.endpoint.as_deref().ok_or_else(|| Failure::refused("data_endpoint_required", "complete the managed target's endpoint before data operations; cluster token reports the issuer endpoint"))?;
     if matches!(cli.command, Command::Graphs { .. }) {
-        scope(cli)?;
         if cli.graph.is_some() {
             return Err(Failure::refused(
                 "graph_scope_conflict",
@@ -405,47 +369,42 @@ fn resolve_context(
             ));
         }
         let credential = load_credential(store, context)?;
-        return GraphClient::managed_registry(&credential.endpoint, credential.token)
-            .map(Some)
-            .map_err(|_| {
-                Failure::new(
-                    "transport_failed",
-                    "could not initialize the managed discovery client",
-                    1,
-                )
-            });
+        return GraphClient::managed_registry(endpoint, credential.token).map_err(|_| {
+            Failure::new(
+                "transport_failed",
+                "could not initialize the managed discovery client",
+                1,
+            )
+        });
     }
-    scope(cli)?;
     let graph = cli
         .graph
         .as_deref()
-        .ok_or_else(|| Failure::refused("graph_required", "managed data requires --graph"))?;
+        .or(context.default_graph.as_deref())
+        .ok_or_else(|| {
+            Failure::refused(
+                "graph_required",
+                "managed data requires --graph or a target default_graph",
+            )
+        })?;
     graph_id(graph)?;
-    load(store, context, graph).map(Some)
+    load(store, context, graph)
 }
 
 /// Acquire authority before constructing the operation request. Unsupported
 /// or malformed caches refuse before contacting the issuer.
 async fn resolve_with_acquisition(
     cli: &Cli,
-    cwd: &std::path::Path,
+    context: &Context,
     store: &impl Store,
-    mut ambient: impl FnMut() -> Result<bool>,
     identity: impl AsyncFn(&Context) -> Result<Option<String>>,
     api: impl AsyncFn(&Context) -> Result<Api>,
-) -> Result<Option<GraphClient>> {
-    if skips_context(cli) {
-        return Ok(None);
-    }
-    let Some(context) = super::read_context(cwd)? else {
-        return Ok(None);
-    };
-    // One folder/account binding owns the whole invocation, including renewal.
-    let mut resolved = resolve_context(cli, &context, store, &mut ambient);
-    let expected = if matches!(&resolved, Ok(Some(_))) {
-        let expected = identity(&context).await?;
+) -> Result<GraphClient> {
+    let mut resolved = resolve_context(cli, context, store);
+    let expected = if resolved.is_ok() {
+        let expected = identity(context).await?;
         if expected.as_ref().is_some_and(|id| {
-            load_credential(store, &context)
+            load_credential(store, context)
                 .is_ok_and(|saved| saved.actor != format!("principal:{id}"))
         }) {
             resolved = Err(Failure::refused(
@@ -471,51 +430,47 @@ async fn resolve_with_acquisition(
         {
             let expected = match expected {
                 Some(id) => Some(id),
-                None => identity(&context).await?,
+                None => identity(context).await?,
             };
             // A cluster cache lock serializes independent CLI invocations. The
             // control credential lock is acquired only inside this one.
-            let _lock = auth::cache_lock(&format!("data:{}", key(&context))).await?;
-            if let Some(raw) = store.get(&key(&context))? {
+            let _lock = auth::cache_lock(&format!("data:{}", key(context))).await?;
+            if let Some(raw) = store.get(&key(context))? {
                 if raw.len() > MAX_CREDENTIAL {
                     return Err(invalid());
                 }
                 let saved: Credential = serde_json::from_str(&raw).map_err(|_| invalid())?;
-                match saved.validate(&context) {
+                match saved.validate(context) {
                     Ok(()) => {
                         if expected
                             .as_ref()
                             .is_none_or(|id| saved.actor == format!("principal:{id}"))
                         {
-                            return resolve_context(cli, &context, store, ambient);
+                            return resolve_context(cli, context, store);
                         }
                     }
                     Err(error) if error.body["type"] == "data_credential_expired" => {}
                     Err(error) => return Err(error),
                 }
             }
-            let api = api(&context).await?;
+            let api = api(context).await?;
             if let (Some(selected), Some(expected)) = (&api.selection, &expected) {
                 api.matches_principal(expected, &context.organization_id)?;
                 if selected.account_id != context.organization_id {
                     return Err(Failure::protocol());
                 }
             }
-            mint_for_principal(store, &context, &api, 3600, expected.as_deref()).await?;
-            resolve_context(cli, &context, store, ambient)
+            mint_for_principal(store, context, &api, 3600, expected.as_deref()).await?;
+            resolve_context(cli, context, store)
         }
         Err(failure) => Err(failure),
     }
 }
 
 pub(crate) async fn client(
-    input: &crate::operator::InvocationConfig,
     cli: &Cli,
-    stderr: &mut dyn Write,
-) -> std::result::Result<Option<GraphClient>, Output> {
-    if skips_context(cli) {
-        return Ok(None);
-    }
+    binding: &super::Binding,
+) -> std::result::Result<GraphClient, Output> {
     let json = match &cli.command {
         Command::Query(args) => {
             args.json
@@ -535,18 +490,20 @@ pub(crate) async fn client(
         _ => false,
     };
     let result = async {
-        let cwd = std::env::current_dir().map_err(|_| {
-            Failure::refused("context_invalid", "cannot resolve the current directory")
-        })?;
+        let context = binding.context()?;
         resolve_with_acquisition(
             cli,
-            &cwd,
+            &context,
             &auth::DATA_STORE,
-            || has_ambient_target(input, stderr),
-            async |context| auth::selected_principal(&context.api, &context.organization_id).await,
             async |context| {
-                Api::authenticated(context.api.clone(), Some(&context.organization_id)).await
+                auth::selected_principal(
+                    &context.api,
+                    &context.organization_id,
+                    context.control_auth,
+                )
+                .await
             },
+            async |context| context.client().await,
         )
         .await
     }

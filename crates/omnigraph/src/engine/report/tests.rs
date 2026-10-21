@@ -444,6 +444,70 @@ fn counter(metrics: &[QueryExecutionMetrics], operator: &str, name: &str) -> Vec
         .collect()
 }
 
+#[test]
+fn ann_diagnostics_join_attempts_without_changing_search_decisions() {
+    use crate::engine::search::{AnnAttemptMetrics, ProbeAttempt, ScanReport};
+
+    let mut report = ExecutionReport::default();
+    report.record_probes(4, 0, &ScanReport::default());
+    assert_eq!(
+        serde_json::to_value(&report).unwrap(),
+        serde_json::json!({"rows": []})
+    );
+
+    let mut scan = ScanReport {
+        probes: vec![
+            ProbeAttempt {
+                maximum_nprobes: Some(1),
+                flat: false,
+                rows: 0,
+            },
+            ProbeAttempt {
+                maximum_nprobes: None,
+                flat: true,
+                rows: 3,
+            },
+        ],
+        ann_metrics: vec![AnnAttemptMetrics {
+            attempt: 1,
+            counts: [("prefilter_row_ids", 3)].into(),
+            cumulative_times_ns: [("prefilter_load_time", 37)].into(),
+        }],
+        ..Default::default()
+    };
+    report.record_probes(4, 0, &scan);
+    let first = serde_json::to_value(&report).unwrap();
+    scan.ann_metrics[0]
+        .cumulative_times_ns
+        .insert("prefilter_load_time", 99);
+    let mut replay = ExecutionReport::default();
+    replay.record_probes(4, 0, &scan);
+    let replay = serde_json::to_value(&replay).unwrap();
+    assert_eq!(
+        first["search"], replay["search"],
+        "diagnostics are not replay decisions"
+    );
+    assert_ne!(first["ann_metrics"], replay["ann_metrics"]);
+
+    report.record_probes(4, 3, &scan);
+    let report = serde_json::to_value(&report).unwrap();
+    let metrics = report["ann_metrics"].as_array().unwrap();
+    assert_eq!(
+        metrics.len(),
+        2,
+        "one diagnostic per measured attempt, not per handoff"
+    );
+    for (metric, rung) in metrics.iter().zip([0, 3]) {
+        assert_eq!(metric["id"], 4);
+        assert_eq!(metric["rung"], rung);
+        assert_eq!(
+            metric["attempt"], 1,
+            "missing metrics never shift probe positions"
+        );
+        assert_eq!(metric["counts"]["prefilter_row_ids"], 3);
+    }
+}
+
 /// The scan of binding `binding` and the join (`CrossJoin` or
 /// `ContainsJoin`) whose right side it is.
 fn right_scan_of_the_join(run: &Captured, binding: &str) -> (NodeId, NodeId) {

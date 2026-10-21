@@ -1,0 +1,40 @@
+# issue: none
+# notes: A budgeted multi-hop traversal (an edge alternation with a hop range) streams: the engine builds its Expand as a streaming operator and the planner's shape agrees, so explain prints the Expand inside the scan's pipeline, flowing into the destination lookup, where a costed named multi-hop traversal (explain_pipelines_cut_at_breakers) ends the scan's pipeline at the Expand.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person
+edge Likes: Person -> Person
+
+--- seed
+{"type":"Person","data":{"slug":"p1","name":"alice"}}
+{"type":"Person","data":{"slug":"p2","name":"bob"}}
+{"type":"Person","data":{"slug":"p4","name":"dave"}}
+{"edge":"Knows","from":"p1","to":"p2"}
+{"edge":"Likes","from":"p2","to":"p4"}
+
+--- query
+set engine = v2;
+query budgeted_two_hops() {
+    match {
+        $p: Person { name: "alice" }
+        $p (knows | likes){1,2} $q
+    }
+    return { $q.name }
+}
+--- expect unordered
+{"q.name":"bob"}
+{"q.name":"dave"}
+--- expect shape
+q.name: String
+--- expect plan
+pipeline 0: Scan -> Expand -> Scan(input_ids) -> Projection => consumer

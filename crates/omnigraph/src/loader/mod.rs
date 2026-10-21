@@ -66,12 +66,46 @@ pub struct LoadReceipt {
     pub executed: LoadExecuted,
 }
 
+impl LoadReceipt {
+    /// The measurement of a plan the engine ran: `Some` for a `load csv`
+    /// overwrite, whose operators recorded their rows; `None` for an append
+    /// or merge, which the keyed adapters run with no plan executed, and for
+    /// a JSONL load.
+    pub fn executed_plan(&self) -> Option<&LoadExecuted> {
+        (self.plan.is_some() && !self.executed.operators.is_empty()).then_some(&self.executed)
+    }
+}
+
 /// What an executed load measured beside its plan.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadExecuted {
     pub partitions: u32,
     pub rows: u64,
     pub source_bytes: u64,
+    /// One entry per node of the executed plan in post-order, the source
+    /// first, read from the node's operator after the plan ran; empty for a
+    /// load the engine did not run (append and merge).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operators: Vec<LoadOperatorExecuted>,
+}
+
+/// What one operator of an executed load plan did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadOperatorExecuted {
+    /// The plan node's `id`, as the explain document numbers it.
+    pub id: u64,
+    /// The plan node's kind: `CsvSource`, `Validate`, `FragmentWrite`.
+    pub node: String,
+    /// The operator the node built.
+    pub operator: String,
+    /// The rows the operator emitted; the sink counts the rows it staged.
+    pub rows: u64,
+    /// Nanoseconds the operator was computing: the polls of its stream and of
+    /// its workers, never the time it waited for its input or for storage.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds from the operator's first poll to its end: the phase's
+    /// wall time, waits included; `0` where no end was recorded.
+    pub wall_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,7 +518,8 @@ impl Omnigraph {
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
-                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)?;
+                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)
+                    .map_err(OmniError::after_earlier_publication)?;
             }
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
@@ -504,8 +539,10 @@ impl Omnigraph {
             )
             .await
             .map_err(|error| {
+                // The fork published on its own, so every failure of the rows
+                // follows it.
                 if branch_created {
-                    error.without_pre_effect_evidence()
+                    error.after_earlier_publication()
                 } else {
                     error
                 }
@@ -1268,7 +1305,9 @@ async fn load_csv_overwrite_plan(
         graph_index: Arc::new(GraphIndexHandle::none()),
         load: Some(&facts),
     };
-    let rows = crate::engine::execute_load(&bound, &context, memory).await?;
+    let run = crate::engine::execute_load(&bound, &context, memory).await?;
+    let rows = run.rows;
+    executed.operators = run.operators;
     let staged = staged
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

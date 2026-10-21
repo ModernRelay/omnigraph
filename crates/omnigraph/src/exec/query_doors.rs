@@ -374,6 +374,7 @@ impl Session {
                 catalog.system_columns,
             ),
             (IndexSource::Direct, true) => engine::GraphIndexHandle::direct(
+                Arc::clone(&**self),
                 snapshot.clone(),
                 engine::referenced_edge_types(&ir.pipeline, catalog),
                 catalog.system_columns,

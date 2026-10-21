@@ -1,7 +1,7 @@
 //! Graph-batch loading. Source reads and backend-specific limits stay in GraphClient.
 use super::{CliLoadMode, LoadArgs, TransferScope};
 use crate::client::{self, GraphClient};
-use crate::helpers::{confirm_destructive, resolve_branch, write_target};
+use crate::helpers::{confirm_destructive, resolve_branch};
 use crate::output::{write_json, write_load_human};
 use color_eyre::eyre::Result;
 use omnigraph::settings::{SettingId, SettingValue};
@@ -27,7 +27,6 @@ pub(crate) async fn run_load(
     stderr: &mut dyn Write,
 ) -> Result<()> {
     let LoadArgs {
-        uri,
         data,
         branch,
         from,
@@ -39,15 +38,11 @@ pub(crate) async fn run_load(
     let client = match managed_client {
         Some(client) => client,
         None => {
-            GraphClient::resolve_with_policy(
+            GraphClient::from_target(
                 scope.operator,
-                scope.capability,
-                scope.server,
+                scope.target,
                 scope.graph,
-                uri,
                 scope.actor,
-                scope.profile,
-                scope.store,
                 stderr,
             )
             .await?
@@ -61,23 +56,13 @@ pub(crate) async fn run_load(
         settings,
         json,
     };
-    execute_load(
-        &client,
-        operation,
-        scope.yes,
-        scope.quiet,
-        input,
-        stdout,
-        stderr,
-    )
-    .await
+    execute_load(&client, operation, scope.yes, input, stdout, stderr).await
 }
 
 pub(crate) async fn execute_load(
     client: &GraphClient,
     operation: LoadOperation,
     yes: bool,
-    quiet: bool,
     input: &mut crate::input::Input<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -100,7 +85,6 @@ pub(crate) async fn execute_load(
             stderr,
         )?;
     }
-    write_target(quiet, "load", client.uri(), client.is_remote(), stderr)?;
     let payload = client
         .load(
             &branch,
@@ -114,7 +98,7 @@ pub(crate) async fn execute_load(
     if json {
         write_json(&payload, stdout)?;
     } else {
-        write_load_human(&payload, stdout)?;
+        write_load_human(client.uri(), &payload, stdout)?;
     }
     Ok(())
 }

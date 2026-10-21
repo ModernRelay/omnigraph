@@ -101,6 +101,15 @@ pub(crate) struct SearchDecision {
     pub(crate) taken: Taken,
 }
 
+/// Diagnostics for one native nearest attempt, independent of search decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AnnMetrics {
+    id: NodeId,
+    rung: usize,
+    #[serde(flatten)]
+    metrics: super::search::AnnAttemptMetrics,
+}
+
 /// What a [`SearchDecision`] took.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
@@ -150,6 +159,9 @@ pub struct ExecutionReport {
     /// The adaptive search decisions of the run, in the order taken.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     search: Vec<SearchDecision>,
+    /// Optional native measurements. Timings vary between equivalent replays.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ann_metrics: Vec<AnnMetrics>,
 }
 
 impl ExecutionReport {
@@ -166,6 +178,31 @@ impl ExecutionReport {
     /// Record one adaptive search decision.
     pub(super) fn decide(&mut self, id: NodeId, rung: usize, taken: Taken) {
         self.search.push(SearchDecision { id, rung, taken });
+    }
+
+    /// Keep a scan's deterministic probe decisions and its optional diagnostics
+    /// in separate report surfaces, joined by node, rung and attempt position.
+    pub(super) fn record_probes(
+        &mut self,
+        id: NodeId,
+        rung: usize,
+        scan: &super::search::ScanReport,
+    ) {
+        if !scan.probes.is_empty() {
+            self.decide(
+                id,
+                rung,
+                Taken::Probes {
+                    attempts: scan.probes.clone(),
+                },
+            );
+        }
+        self.ann_metrics
+            .extend(scan.ann_metrics.iter().cloned().map(|metrics| AnnMetrics {
+                id,
+                rung,
+                metrics,
+            }));
     }
 
     /// Fold one pass in: a node met before gains the pass's attempt, and is
@@ -186,8 +223,8 @@ impl ExecutionReport {
 }
 
 /// What executing a bound plan alone produced: its rows, the plan, and what
-/// each node of the plan did. Serialized, `report` is `{"rows": [{id,
-/// operator, status, attempts}]}`.
+/// each node of the plan did. The serialized report carries operator `rows`,
+/// adaptive `search` decisions and optional native `ann_metrics` diagnostics.
 pub struct PlanRun {
     pub result: omnigraph_compiler::result::QueryResult,
     pub plan: BoundPlan,
@@ -226,8 +263,8 @@ impl Executed {
     /// The report as actuals rows in the explain row schema: `tree`
     /// `profile`, no `depth`, `node` the plan node's kind, `detail` the row's
     /// own fields (`id`, `operator`, `status`, `attempts`), then one row per
-    /// search decision (`node` `gate` or `probes`). The third public surface
-    /// beside the rows and explain.
+    /// search decision (`node` `gate` or `probes`) and measured nearest attempt
+    /// (`node` `ann_metrics`). The third public surface beside rows and explain.
     pub fn profile(&self) -> Result<omnigraph_compiler::result::QueryResult> {
         let mut rows = ExplainRows::default();
         for row in &self.report.rows {
@@ -256,6 +293,15 @@ impl Executed {
                 Taken::Probes { .. } => "probes",
             };
             rows.push(PROFILE_TREE, None, node, detail.to_string());
+        }
+        for metrics in &self.report.ann_metrics {
+            let detail = serde_json::to_value(metrics).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "ANN metrics of node {} cannot serialize: {error}",
+                    metrics.id
+                ))
+            })?;
+            rows.push(PROFILE_TREE, None, "ann_metrics", detail.to_string());
         }
         rows.into_result()
     }
