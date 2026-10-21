@@ -4,7 +4,7 @@
 pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
 pub(crate) use crate::commands::local::SkillCommand;
-pub(crate) use crate::commands::targets::{CredentialCommand, TargetCommand};
+pub(crate) use crate::commands::targets::{AccessArgs, CredentialCommand, TargetCommand};
 pub(crate) use crate::managed::args::{
     OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
     OrganizationMembersCommand,
@@ -200,6 +200,9 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: TargetCommand,
     },
+    /// Say who you are at a target and what you may do there: the actions
+    /// the graph's policy grants, graph-wide and on a branch.
+    Access(AccessArgs),
     /// Manage an explicitly selected owner/profile credential or export access through a pipe.
     #[command(name = "credentials")]
     Credential {

@@ -178,7 +178,8 @@ backend. `--config DIR` is source input only.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
-address convenience. `--as ACTOR` attributes supported direct operations;
+address convenience. `--as ACTOR` attributes supported direct operations and
+names the actor `access` reports for direct storage;
 served targets derive their actor from credentials and send `--as` as the
 `Omnigraph-If-Actor` assertion, refusing a mismatch with `actor_mismatch` and
 exit 4; managed targets refuse it. `--yes` supplies explicit
@@ -200,6 +201,7 @@ destination line. Legacy `--server`, `--store`, `--cluster`, `--profile`,
 | Managed cluster | `cluster members/pull/push/plan/apply/status/history/cancel/token/delete/undo-delete`; complete cluster target |
 | Local configuration | `config validate/rename-connection/rename-target/rename-auth/recover-rename/recover-operations`, `target list/inspect/add/refresh/remove` (`register` aliases `add`), `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
 | Authentication | `login --register NAME`, `login --connection NAME --auth PROFILE`, or `logout --connection NAME --auth PROFILE` for platform sessions; `credentials set/status/remove/export` requires explicit owner and auth |
+| Access | `access [--branch B [--target-branch T]]`; the actor and the actions the graph's policy grants it, from a server's access route or, for a direct graph or root target, the installed policy; catalogue and managed targets refuse |
 
 `query` and `mutate` invoke stored queries by positional name, or accept
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate

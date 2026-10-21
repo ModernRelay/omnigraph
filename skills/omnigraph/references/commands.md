@@ -57,6 +57,7 @@ prints the exact flags of the installed binary.
 | `target` | `list` `inspect` `add` `refresh` `remove` | Manage resource bindings |
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
 | `config` | `validate` `rename-connection` `rename-target` `rename-auth` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
+| `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -367,7 +368,13 @@ omnigraph credentials export --target production --auth operator | consumer
 omnigraph target list --json
 omnigraph target inspect production --resolved --json
 omnigraph config validate --json
+omnigraph access --target production --auth operator --branch main --json
 ```
+
+`access` reports the server-resolved actor and allowed graph actions; it is the
+identity check, with no separate `whoami` command. Direct targets use `--as`
+or no actor. Managed targets refuse `access`. See
+[access scope and policy semantics](../../../docs/user/cli/targets.md#what-you-may-do-at-a-target).
 
 Set/remove require `token`/`store`; an existing entry needs `--replace`.
 Status never calls network/helpers or prompts; secure-store availability and

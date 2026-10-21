@@ -137,6 +137,14 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         Command::Organization { .. } => ManagedAccount,
         Command::Alias(_) => Alias,
         Command::Login { .. } | Command::Logout { .. } => Authentication,
+        // A served graph's access route, or a direct graph's or root graph's
+        // installed policy. Managed data qualifies each wrapper separately,
+        // and the catalogue carries no policy.
+        Command::Access(_) => Graph {
+            direct_only: false,
+            root: true,
+            catalogue: false,
+        },
         Command::Credential { .. } => Credential,
         Command::Target {
             command: TargetCommand::Add {
@@ -249,6 +257,8 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 fn accepts_actor(command: &Command) -> bool {
     match command {
         Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => true,
+        // The actor a direct target's policy decides for.
+        Command::Access(_) => true,
         Command::Branch { command } => match command {
             BranchCommand::Create { .. }
             | BranchCommand::Delete { .. }
@@ -366,7 +376,7 @@ pub(crate) fn validate_target(
             | ManagedCluster
             | Alias,
             Managed(binding),
-        ) => binding.cluster.is_some(),
+        ) => binding.cluster.is_some() && !matches!(cli.command, Command::Access(_)),
         (ManagedAccount, Managed(binding)) => binding.cluster.is_none(),
         (ManagedOperation | Authentication | Credential, Managed(_)) => true,
         _ => false,
@@ -508,6 +518,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Target { .. } => "target",
         Command::Config { .. } => "config",
         Command::Credential { .. } => "credential",
+        Command::Access(_) => "access",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",
@@ -611,6 +622,7 @@ mod tests {
             (&["mutate", "-e", "q"], true),
             (&["load", "--data", "d.jsonl", "--mode", "append"], true),
             (&["rebuild-full-text-indexes"], true),
+            (&["access"], true),
             (&["branch", "create", "b"], true),
             (&["branch", "delete", "b"], true),
             (&["branch", "merge", "b"], true),

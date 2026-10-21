@@ -1,9 +1,15 @@
+//! The `target` and `credential` command groups and `access`: the operator
+//! configuration's named targets, a server target's static token for another
+//! program, and what the caller may do at a target.
+
+mod access;
 mod args;
 use crate::credential_sources::{self as credentials, SecretStore};
 use crate::operator::InvocationConfig;
 use crate::operator_schema::{AuthProfile, Target, TokenSource};
 use crate::targets::{self, ResolvedTarget, TargetBinding};
-pub(crate) use args::{ConfigCommand, CredentialCommand, TargetCommand};
+pub(crate) use access::run_access;
+pub(crate) use args::{AccessArgs, ConfigCommand, CredentialCommand, TargetCommand};
 use color_eyre::eyre::{Result, bail, eyre};
 use std::io::{Read, Write};
 

@@ -205,7 +205,8 @@ never the rules behind them, and reveals nothing about other actors. A static
 token on a graph without a policy gets `read` alone, and a signed data
 credential without one nothing, as those routes decide; a server without
 authentication allows every graph action and reports no `actor`. The MCP
-`access` tool returns the same body.
+`access` tool returns the same body, and `omnigraph access` prints it for a
+server target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 
 It reports policy actions, not actor views, so a view can still refuse a
 `change` the policy allows.

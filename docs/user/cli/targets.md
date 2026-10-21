@@ -206,6 +206,20 @@ verified principal must match the supplied ID. A different principal without
 confirmation refuses. Replacement invalidates the profile's credential generation
 and clears its derived data cache; it does not reroute existing operations.
 
+## What you may do at a target
+
+```bash
+omnigraph access --target standalone --auth operator --branch main --json
+```
+
+`access` reports your actor and permissions; there is no separate `whoami` command.
+Offline inspection and credential status do not verify identity. Servers use the
+selected auth profile and `--graph` or `default_graph`; `--as` asserts the actor.
+Direct targets use `--as` or no actor; v1 config has no actor field. Without policy,
+direct graphs allow all actions; standalone graphs must open. Managed/catalogue targets refuse.
+Use `--branch` for branch permissions, plus `--target-branch` for create/merge permissions.
+JSON includes `protocol: 1`, `actor`, `graph_wide` and `actions`; see [access semantics](../operations/policy.md#learn-your-access). Authorization guarantees neither operation support nor storage health.
+
 ## Rename registrations and profiles
 
 ```bash
@@ -309,7 +323,7 @@ are refused. Alias `args` and `format` fields and positional arguments are unsup
 ## Upgrade from the old format
 
 There is no backward compatibility or configuration importer. `version: 1` is a new
-format, not `target_config_version: 1`. Replace account targets with connections,
+format, not the previous target-only format. Replace account targets with connections,
 cluster auth fields with connection references, and credential nicknames/static
 login with owner-local providers and `credentials set --stdin`. Recreate aliases
 without `args`/`format`, use `--as` for direct actor selection, and register remote
