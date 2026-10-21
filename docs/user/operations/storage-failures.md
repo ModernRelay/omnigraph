@@ -29,7 +29,7 @@ The outcome stays unknown if no re-issue settles the request or the committed
 version cannot be read back reliably. A local filesystem error can also occur
 after a write has taken effect, so an error alone does not prove that nothing
 was published. When the outcome remains unknown, the write answers 500
-(`outcome_unknown` on MCP), and the server contains itself as described under [Deployment](../deployment.md#binary). Do
+`outcome_unknown` on HTTP and MCP alike, and the server contains itself as described under [Deployment](../deployment.md#binary). Do
 not retry such a write blindly; read the branch's commits first.
 
 The same rule applies when creating a proposal or an unattached snapshot: if
@@ -40,10 +40,11 @@ candidate is proven expired.
 ## Logs
 
 A contained write logs `owned write ended without a definite outcome` with
-its status, and the engine failure behind it logs
-`engine failure without definite completion evidence` with the failure's
-class. When the failure is a publication whose outcome is unknown, that line
-also names the graph commit in its `publication` field, so you can look the
-commit up later and see whether it landed. Neither line carries the error's
-message, which can name storage paths. Each re-issued manifest request logs a warning, and one that no
-re-issue settles logs `manifest request outcome unknown after every re-issue`.
+the status its response sends, 500 for `outcome_unknown`, and the engine
+failure behind it logs `engine failure without definite completion evidence`
+with the failure's class and the same status. When the failure is a
+publication whose outcome is unknown, that line also names the graph commit in
+its `publication` field, so you can look the commit up later and see whether it
+landed. Neither line carries the error's message, which can name storage paths.
+Each re-issued manifest request logs a warning, and one that no re-issue
+settles logs `manifest request outcome unknown after every re-issue`.
