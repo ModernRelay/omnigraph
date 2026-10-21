@@ -16,6 +16,9 @@ pub(crate) enum Requirement {
         catalogue: bool,
     },
     Standalone,
+    /// One graph of an existing server, reached only over HTTP: a client of
+    /// the server, never of its storage.
+    ServedGraph,
     Registry,
     Root,
     /// A whole direct root, optionally filtered by `--graph`, or one served
@@ -107,6 +110,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
             }
         }
         Command::Graphs { .. } => Registry,
+        Command::Mcp(_) => ServedGraph,
         Command::Queries {
             command: QueriesCommand::List { .. },
         } => RootOrServedGraph,
@@ -155,7 +159,7 @@ pub(crate) fn root_input(command: &Command) -> bool {
 /// target's `default_graph` must select it before any I/O.
 pub(crate) fn selects_graph(command: &Command, target: &ResolvedTarget) -> bool {
     match requirement(command) {
-        Requirement::Graph { .. } => true,
+        Requirement::Graph { .. } | Requirement::ServedGraph => true,
         Requirement::RootOrServedGraph => matches!(target.binding, TargetBinding::Server { .. }),
         _ => false,
     }
@@ -170,7 +174,10 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     if cli.graph.is_some()
         && !matches!(
             need,
-            Requirement::Graph { .. } | Requirement::Root | Requirement::RootOrServedGraph
+            Requirement::Graph { .. }
+                | Requirement::Root
+                | Requirement::RootOrServedGraph
+                | Requirement::ServedGraph
         )
     {
         bail!("{} does not accept --graph", command_label(&cli.command));
@@ -190,7 +197,11 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 /// credential and carries `--as` as the `Omnigraph-If-Actor` assertion.
 fn accepts_actor(command: &Command) -> bool {
     match command {
-        Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => true,
+        // The bridge asserts the actor on every request it relays.
+        Command::Mutate(_)
+        | Command::Load(_)
+        | Command::RebuildFullTextIndexes(_)
+        | Command::Mcp(_) => true,
         Command::Branch { command } => match command {
             BranchCommand::Create { .. }
             | BranchCommand::Delete { .. }
@@ -273,6 +284,20 @@ pub(crate) fn validate_target(
     use Requirement::*;
     use TargetBinding::*;
     let need = requirement(&cli.command);
+    if need == ServedGraph && !matches!(target.binding, Server { .. }) {
+        let label = command_label(&cli.command);
+        let why = match &target.binding {
+            Managed(_) => format!(
+                "{label} does not relay to a managed target; it connects to a server target"
+            ),
+            _ => format!(
+                "{label} connects to an existing server, and target '{}' is direct storage; \
+                 select a server target for a server that serves the graph",
+                target.label()
+            ),
+        };
+        return Err(crate::targets::refusal("target_kind_unsupported", why));
+    }
     let allowed = match (&need, &target.binding) {
         (Graph { .. } | Standalone, DirectGraph { .. }) => true,
         (Graph { root: true, .. } | Root | RootOrServedGraph | Deployment, DirectRoot { .. }) => {
@@ -288,6 +313,7 @@ pub(crate) fn validate_target(
             Graph {
                 direct_only: false, ..
             }
+            | ServedGraph
             | Registry
             | RootOrServedGraph
             | Deployment
@@ -441,6 +467,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Logout { .. } => "logout",
         Command::Target { .. } => "target",
         Command::Credential { .. } => "credential",
+        Command::Mcp(_) => "mcp",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",
@@ -629,6 +656,8 @@ mod tests {
             (&["changes", "baseline", "--out", "out"], false),
             (&["optimize"], false),
             (&["cleanup"], false),
+            (&["mcp"], true),
+            (&["mcp", "--write"], true),
         ];
         for &(args, accepts_actor) in cases {
             let argv = ["omnigraph"]

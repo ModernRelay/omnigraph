@@ -12,6 +12,7 @@
 - Maintenance (optimize, full-text rebuild, cleanup)
 - Stored queries
 - Operator config & credentials
+- MCP for agents (mcp)
 - Addressing a graph
 - Output formats and positions · health check
 - Organization administration (members and invitations)
@@ -55,6 +56,7 @@ prints the exact flags of the installed binary.
 | `logout` | — | Remove a stored token or a managed session |
 | `target` | `list` `show` `add` `remove` `import` | Manage complete target bindings |
 | `credential` | `get` | Export a server target token to a pipe |
+| `mcp` | — | Relay an agent's stdio MCP to an existing server target's `/mcp`, bound to one graph; read-only tools unless `--write` |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -367,6 +369,23 @@ sessions and data credentials use separate OS-keychain entries. Managed
 A composed route that crosses a more specific endpoint's authentication boundary
 refuses before discovery; credentials never switch within an invocation.
 Never print credential values while inspecting configuration.
+
+## MCP for Agents
+
+```json
+{"command": "omnigraph", "args": ["mcp", "--target", "staging", "--graph", "knowledge"]}
+```
+
+`omnigraph mcp` speaks MCP on stdio for an agent that starts its tools as a
+child process, relaying every message to an existing server target's `/mcp`
+with the target's stored token, which the agent never sees. It is bound to one
+graph (`--graph` or `default_graph`): calls that omit `graph` get it, and calls
+or resource URIs naming another graph are refused. Without `--write` only tools
+the server annotates read-only are listed and admitted; the server lists write
+tools only with `--mcp-allow-writes`. `--as` asserts the actor on every
+request. Direct and managed targets refuse with `target_kind_unsupported`; the
+bridge never starts a server. A lost answer is never resent: an
+`outcome_unknown` error means read the target and reconcile before replaying.
 
 ## Addressing a Graph
 

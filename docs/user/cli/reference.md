@@ -25,8 +25,7 @@ server requires `--graph` or its own `default_graph` for graph operations. No
 request discovers a graph to select automatically. Inline addresses can use
 `file://`, `s3://`, `az://`, `http://`, `https://`, or `unix://`. Use `./name` for a
 relative filesystem address; a bare name selects a registered target.
-`init --schema graph.pg ./graph.omni` remains a creation convenience; it cannot
-be combined with `--target`.
+`init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
 
 `--as ACTOR` attributes supported direct operations. A served target derives its
 actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
@@ -69,6 +68,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
 | `target list/show/add/remove/import` | Inspect, edit or import complete target entries | local |
 | `credential get` | Export a server target’s static token to a pipe | registered server target |
+| `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its stored token, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
 | `organization members/invitations` | Administer organization membership and invitations | managed account target |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |

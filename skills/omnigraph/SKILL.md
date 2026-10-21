@@ -199,6 +199,7 @@ destination line. Legacy `--server`, `--store`, `--cluster`, `--profile`,
 | Managed cluster | `cluster members/pull/push/plan/apply/status/history/cancel/token/delete/undo-delete`; complete cluster target |
 | Local configuration | `target list/show/add/remove/import`, `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
 | Authentication | `login --target NAME` / `logout --target NAME`; server static credentials or managed human-device session. `credential get --target NAME` exports a server token to a pipe |
+| Agent MCP | `mcp --target NAME [--graph G] [--write]` relays an agent's stdio MCP to an existing server target's `/mcp`, bound to one graph, read-only tools unless `--write`; direct and managed targets refuse |
 
 `query` and `mutate` invoke stored queries by positional name, or accept
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate
@@ -286,6 +287,10 @@ Direct `init`/`load` and **`cluster apply`** write storage without an HTTP serve
 - **Direct / embedded access — no server.** Address a graph's storage directly
   with `--target <file://|s3://|az:// uri>`; `init` also accepts its creation URI positionally.
   There is **no single-graph server mode** — the server is cluster-only.
+- **Agents — one path per place.** In a terminal, an agent runs CLI commands
+  with `--target`, or connects its MCP client to an existing server target with
+  `omnigraph mcp --target NAME` (see `references/commands.md`, MCP for agents);
+  in Studio's agent panel it uses Studio's gateway. No path starts a server.
 
 ### The two config surfaces
 

@@ -480,6 +480,20 @@ async fn run(
             stdout,
             stderr,
         )?,
+        Command::Mcp(args) => {
+            return commands::mcp::run(
+                args,
+                commands::mcp::McpScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                },
+                stdout,
+                stderr,
+            )
+            .await;
+        }
         Command::Skill { command } => commands::local::run_skill(command, stdout)?,
         Command::Version { json } => commands::local::run_version(json, stdout)?,
         Command::Embed(args) => commands::local::run_embed(args, stdout).await?,

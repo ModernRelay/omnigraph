@@ -120,7 +120,7 @@ before admission), and before graph lookup or any effect, a match changes nothin
 is `412 actor_mismatch` with nothing run; a server without authentication resolves no actor. A
 repeated, padded or empty header is `400 bad_request`. The header never supplies the actor, and a
 server before contract `0.14` refuses the contract first. The CLI sends it for `--as` on served
-writes and on served `cluster plan` and `cluster apply`.
+writes, served `cluster plan` and `apply`, and every [`mcp`](mcp.md#connect-a-stdio-agent) request.
 
 ### Signed data credentials
 

@@ -5,6 +5,7 @@
 mod cli_cluster;
 mod cli_cluster_e2e;
 mod cli_data;
+mod cli_mcp;
 mod cli_queries;
 mod cli_schema_config;
 mod crossversion_upgrade;
