@@ -771,6 +771,33 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
     }
 
+    /// Whether a graph exists at `uri`: `false` only when Lance finds no
+    /// `__manifest` dataset at the root. Every other failure is the error, so
+    /// a manifest that names a missing object or a missing ref never reads as
+    /// an absent graph, although an open reports both with the same storage
+    /// kind. Opens the latest `__manifest` version and drops it; it reads no
+    /// graph state and writes nothing.
+    ///
+    /// This is a point-in-time observation: a graph created or removed
+    /// afterwards changes what a later open finds.
+    pub async fn exists(uri: &str) -> Result<bool> {
+        Self::exists_with_storage(uri, storage_for_uri(uri)?).await
+    }
+
+    /// [`Self::exists`] through the caller's explicit storage binding, the
+    /// binding a following [`Self::open_read_only_with_storage`] uses.
+    pub async fn exists_with_storage(uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<bool> {
+        let lance_access = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
+        let root = normalize_root_uri(uri)?;
+        let manifest = crate::instrumentation::open_dataset_if_present(
+            &crate::db::manifest::manifest_uri(&root),
+            Some(&lance_access.control_session()),
+            crate::instrumentation::manifest_wrapper(),
+        )
+        .await?;
+        Ok(manifest.is_some())
+    }
+
     /// Observe that no legacy recovery sidecar is present.
     /// Performs no graph open, recovery, cleanup, or object-body reads. Any
     /// pending JSON, including malformed or unsupported sidecars, refuses.
