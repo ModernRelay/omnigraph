@@ -168,6 +168,15 @@ impl std::fmt::Display for ScalarType {
     }
 }
 
+/// The index a one-column `@index` or `@key` declaration builds on a node
+/// property: a scalar BTREE, a full-text inverted index or a vector index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropIndexKind {
+    Btree,
+    FullText,
+    Vector,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PropType {
     pub scalar: ScalarType,
@@ -221,6 +230,34 @@ impl PropType {
 
     pub fn is_enum(&self) -> bool {
         self.enum_values.is_some()
+    }
+
+    /// The index a one-column `@index`/`@key` declaration on a node property
+    /// of this type builds, `None` when the type is not indexable (a list or a
+    /// `Blob`). Enums are physically `String` but filtered by equality, so
+    /// they take a scalar BTREE, not a full-text index (Lance never consults
+    /// an inverted index for `=` or a range); free-text Strings take the
+    /// full-text index `search`, `fuzzy`, `match_text` and `bm25` read. The
+    /// one rule the type checker (`T27`) and index maintenance share.
+    pub fn index_kind(&self) -> Option<PropIndexKind> {
+        if self.list {
+            return None;
+        }
+        match self.scalar {
+            ScalarType::String if !self.is_enum() => Some(PropIndexKind::FullText),
+            ScalarType::Vector(_) => Some(PropIndexKind::Vector),
+            ScalarType::String
+            | ScalarType::DateTime
+            | ScalarType::Date
+            | ScalarType::I32
+            | ScalarType::I64
+            | ScalarType::U32
+            | ScalarType::U64
+            | ScalarType::F32
+            | ScalarType::F64
+            | ScalarType::Bool => Some(PropIndexKind::Btree),
+            ScalarType::Blob => None,
+        }
     }
 
     pub fn to_arrow(&self) -> DataType {

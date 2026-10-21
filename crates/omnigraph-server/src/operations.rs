@@ -260,6 +260,14 @@ impl OperationRuntime {
                 // abandonment destroys the output before releasing its ownership.
                 // Uncertainty closes admission before its result is observable.
                 let owner = if result.uncertain {
+                    // The failure's class was logged in this request's span
+                    // when the engine error was mapped.
+                    if let Err(error) = &result.result {
+                        tracing::error!(
+                            status = %error.status,
+                            "owned write ended without a definite outcome"
+                        );
+                    }
                     owner.finish(true);
                     None
                 } else {
@@ -845,6 +853,65 @@ mod tests {
             assert_eq!(runtime.snapshot().closed, uncertain);
             assert_eq!(runtime.snapshot().uncertain_writes, usize::from(uncertain));
             assert_eq!(releases.load(Ordering::SeqCst), usize::from(!uncertain));
+        }
+    }
+
+    /// A storage failure the engine proves left the graph unchanged (its
+    /// effects are detached versions no manifest names) is a 500 the caller
+    /// can act on, not an unknown outcome: admission stays open, the
+    /// reservation is released and nothing contains the process. The same
+    /// error without that evidence still fails closed.
+    #[tokio::test]
+    async fn definite_unpublished_storage_failure_keeps_admission_open_issue_1067() {
+        use omnigraph::error::{CompletionEvidence, OmniError};
+        for (error, uncertain) in [
+            (
+                OmniError::Io(std::io::Error::other("detached manifest put failed")).unpublished(),
+                false,
+            ),
+            (
+                OmniError::manifest_internal("table reached commit without a staged transaction")
+                    .unpublished(),
+                false,
+            ),
+            (
+                OmniError::Io(std::io::Error::other("detached manifest put failed")),
+                true,
+            ),
+            (
+                OmniError::manifest_publish_in_doubt("manifest publish outcome is in doubt")
+                    .unpublished(),
+                true,
+            ),
+        ] {
+            let message = error.to_string();
+            let evidence = error.completion_evidence();
+            let api = ApiError::from_omni(error);
+            assert_eq!(api.status(), StatusCode::INTERNAL_SERVER_ERROR, "{message}");
+            assert_eq!(api.completion_uncertain(), uncertain, "{message}");
+            if !uncertain {
+                assert_eq!(evidence, Some(CompletionEvidence::Unpublished));
+            }
+            let runtime = OperationRuntime::new();
+            let releases = Arc::new(AtomicUsize::new(0));
+            let response = runtime
+                .submit(Reservation(Arc::clone(&releases)), async move {
+                    OwnedResult::from(Err::<(), _>(api))
+                })
+                .unwrap();
+            assert!(response.result().await.is_err());
+            assert_eq!(runtime.wait_logical_owners().await, !uncertain, "{message}");
+            assert_eq!(runtime.snapshot().closed, uncertain, "{message}");
+            assert_eq!(
+                runtime.snapshot().uncertain_writes,
+                usize::from(uncertain),
+                "{message}"
+            );
+            assert_eq!(
+                releases.load(Ordering::SeqCst),
+                usize::from(!uncertain),
+                "{message}"
+            );
         }
     }
 

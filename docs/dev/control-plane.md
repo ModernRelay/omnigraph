@@ -14,19 +14,21 @@ The desired bundle is input, not runtime authority. A server reads the applied r
 its achieved result in the same process; direct apply requires a subsequent
 server start.
 
-Direct storage resolution defaults to the configuration directory and may instead
-use a local path, `file://`, `s3://`, or `az://` root. Remote capture reads the selected
-server's authenticated canonical root: omitted storage binds to it, while an
-explicit absolute root must match lexically without client storage access. The
-server independently validates canonical identity under its admission. Graph
-roots are derived as `graphs/<graph_id>.omni` beneath that root.
+The CLI selects the storage root from its captured target. `--config` supplies
+source only; an optional source `storage:` is an equality assertion against that
+root. Relative assertions resolve against the source directory. Server capture
+checks its authenticated canonical root, and the server independently validates
+canonical identity under its admission. Graph roots are derived as
+`graphs/<graph_id>.omni` beneath that root. Embedded/server callers retain their
+existing configuration-owned root selection.
 
 ## Managed CLI sessions
 
-Cluster control selects the service only with explicit `--managed`; folder
-context supplies identity after selection and never redirects direct/server
-deployment. The CLI rejects conflicting targets and wrong-mode flags before
-context, credentials, HTTP, or storage access. Data-command context is separate.
+A managed target supplies API, organization, authentication mechanism and optional
+cluster identity. Folder context cannot select a destination. The CLI validates
+operation applicability before credentials, HTTP or storage access. Legacy
+lifecycle evidence has a separate preservation guard: an explicit target cannot
+bypass pending/accepted custody migration.
 
 The CLI's managed HTTP adapter obtains current access before each new request,
 including status polls. A rotating credential pair lives only in the OS
@@ -96,7 +98,7 @@ revision. Retained roots, trust and storage format stay fixed. Removing a graph
 from desired configuration deletes its exact managed root, including all branches,
 retained history and managed Blob bytes. It does not follow external Blob
 references or delete peer roots. Adoption, missing-root recreation and catalog
-repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.13.
+repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.14.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
@@ -223,12 +225,50 @@ release and acquisition, so an older bootstrap create cannot recreate its owner.
 Clean native shutdown closes logical admission, drains its existing operation
 owners, then closes and drains an explicit `StorageIoScope` shared by control
 adapters and graph Lance sessions. The wrappers count actual mutating requests
-and multipart lifetimes; cancellation and ambiguous errors stick even if a
-higher layer consumes the error. Single-attempt conditional conflicts remain
-settled refusals. Scoped clients disable both transport and Lance AIMD retries,
-and local Lance uses its object-store file provider so direct file writes cannot
-bypass the scope. Embedded defaults and Azure serving clients are unchanged;
-the automatic scoped shutdown path applies only to local and S3 roots.
+and multipart lifetimes. Physical settlement depends on the operation and the
+key it names. The wrapper recognizes Lance 13's fresh `data/*.lance` files,
+their `data/<file-key>/*.blob` sidecars, `_transactions/*.txn`,
+`_deletions/*.arrow|*.bin`, flat files in `_indices/<uuid>/`, detached
+`_versions/d*.manifest`, and numbered manifests created only if absent.
+Late fresh files remain unreachable and a conditional create cannot replace
+an existing publication. Such requests settle at the physical scope after
+an error or cancellation, including multipart uploads. This does not prove
+that a graph publication failed: the catalogue still owns the outcome of an
+unacknowledged numbered-manifest publication. The commit handler every
+dataset uses re-issues an ambiguous manifest request until the store answers
+it and records whether a request was sent; the publisher marks a failure with
+no request sent, or one the store refused, `Unpublished`, and only an outcome
+its read-back cannot settle reaches the logical operation owner as uncertain.
+Lance deletes an attempt's transaction file only when the handler calls a
+missing version definitive, and only the commit's own request record may say
+so: the catalog's per-commit handler answers from its probe, and a dataset's
+shared handler never does. A manifest that lands late therefore finds its
+transaction file on every open path; the transaction-delete hold below is the
+served process's second line.
+
+Refs, version hints, cluster control objects, unknown paths, if-match
+replacements and recursive deletes remain conservative. A cancelled or
+ambiguous request sticks even if a higher layer consumes the error, and the
+scope logs its key and error. Rename also accounts for removal of its source.
+Single-attempt conditional conflicts and a delete answered "not found" are
+settled refusals.
+
+An unacknowledged manifest write may land after Lance reads it back as absent
+and attempts to delete its transaction file. One sticky flag therefore
+refuses transaction-file deletion throughout that scope, including rename
+source deletion and recursive removal. This intentionally retains other
+datasets' transaction files too, bounding the accounting state. Normal data
+serving can continue, while transaction cleanup can be deferred until a
+replacement scope. The collector must still establish its normal
+reachability, authority and age predicates before reclaiming retained files;
+replacing the scope is not permission to delete them. Definite conditional
+conflicts do not set the hold. A successful multipart abort does not clear a
+hold from an earlier unacknowledged completion.
+
+Scoped clients disable both transport and Lance AIMD retries, and local Lance
+uses its object-store file provider so direct file writes cannot bypass the
+scope. Embedded defaults and Azure serving clients are unchanged; the
+automatic scoped shutdown path applies only to local and S3 roots.
 
 Only unique admission, successful startup and unpoisoned settlement permit final
 release. Original adapters remain permanently closed; a private single-attempt
@@ -321,7 +361,7 @@ revision alone. Old-ID submission validates immutable input and returns the
 original record before graph closure; it cannot reinstall an old view. Boot
 digests remain boot facts. Explicit OIDC public-admission refresh is separate below.
 
-Protected graph and registry HTTP calls require the v0.13 contract header after
+Protected graph and registry HTTP calls require the v0.14 contract header after
 authentication and before graph resolution. CLI discovery and response validation
 are specified by [wire compatibility](versioning.md#wire-compatibility); the
 managed control-plane API and standard MCP/OAuth protocols are separate surfaces.
@@ -359,8 +399,8 @@ authorization still applies to ready graphs.
 
 The CLI's versioned keychain cache verifies endpoint and identity bindings before
 replacement. Unsupported caches refuse without automatic replacement. The provider-native client acquires missing/expired identity
-credentials before an operation and selects discovery in a managed folder.
-Explicit server addressing keeps the
+credentials before an operation using the selected managed target.
+A server target keeps the
 existing catalog unless `graphs list --discovery` is requested; the CLI never
 infers routing from an arbitrary bearer token's unverified shape.
 
@@ -397,9 +437,19 @@ before releasing ownership. A read
 error or panic does not trigger write uncertainty. A write panic or explicitly
 indeterminate owned completion closes admission for every graph and signals the
 same bounded process shutdown, retaining
-unresolved reservations until exit. Proven engine pre-effect refusals remain
-nonfatal. Read/write body and response lanes have independent capacity; bodyless
-reads consume only read observers. Once HTTP connections and the remaining known
+unresolved reservations until exit. The engine's completion evidence decides:
+a failure it proves left the graph unchanged, before any effect or after
+detached effects no manifest names (`BeforeEffect`, `Unpublished`), is
+not itself a reason for logical containment, whatever status it maps to,
+including a 500. Mutation, load, Blob write and merge mark opaque errors (storage, I/O, DataFusion, internal) at their pre-publication
+steps, alongside the table store's staged-write and detached-commit sites,
+and the publisher marks every failure whose manifest request cannot land.
+A contained write logs the failure's redacted class before admission closes.
+A typed refusal keeps its shape. Other opaque schema and maintenance
+preparation errors without completion evidence still fail closed as uncertain. Proven publication followed by
+`RecoveryRequired`, and uncertain publication itself, are never downgraded.
+Read/write body and response lanes have independent capacity; bodyless reads
+consume only read observers. Once HTTP connections and the remaining known
 logical owners finish, uncertain completion exits 2 immediately, with the original
 watchdog as the upper bound. This does not establish native-I/O settlement.
 

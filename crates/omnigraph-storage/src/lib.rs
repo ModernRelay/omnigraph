@@ -17,8 +17,11 @@ use url::Url;
 
 use thiserror::Error;
 
+mod binding;
+pub use binding::{CapturedStorageBinding, StorageDestination, storage_handle_for_binding};
+
 mod scoped;
-pub use scoped::StorageIoScope;
+pub use scoped::{OWNED_STORE_NAME, StorageIoScope};
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
@@ -1357,6 +1360,9 @@ impl ObjectStorageAdapter {
         // CanonicalAzureRoot captured the backend selection.
         let mut builder = MicrosoftAzureBuilder::new();
         for (key, value) in &root.azure_options {
+            if matches!(key.as_str(), "client_max_retries" | "client_retry_timeout") {
+                continue;
+            }
             let key = AzureConfigKey::from_str(key).map_err(|_| {
                 StorageError::backend(
                     StorageFailureKind::Configuration,
@@ -1372,6 +1378,15 @@ impl ObjectStorageAdapter {
             .with_use_emulator(false);
         if scope.is_some() {
             builder = builder.with_retry(single_attempt_retry_config());
+        } else if root.azure_options.contains_key("client_max_retries") {
+            builder = builder.with_retry(binding::captured_retry_config(
+                root.azure_options
+                    .get("client_max_retries")
+                    .map(String::as_str),
+                root.azure_options
+                    .get("client_retry_timeout")
+                    .map(String::as_str),
+            )?);
         }
         let store = builder.build().map_err(|_| {
             StorageError::backend(
@@ -2244,10 +2259,15 @@ impl StorageAdapter for ObjectStorageAdapter {
         // still-present. remove_dir_all reclaims them in one call.
         if self.codec == UriCodec::Local {
             let path = absolutize_lexically(local_path_from_uri(prefix_uri)?)?;
+            let request = scoped::Request::new(
+                "delete_prefix",
+                &object_store::path::Path::from(path.to_string_lossy().as_ref()),
+                false,
+            );
             let mutation = self
                 .scope
                 .as_ref()
-                .map(StorageIoScope::begin)
+                .map(|scope| scope.begin(request))
                 .transpose()
                 .map_err(|error| storage_backend_error("delete_prefix", prefix_uri, error))?;
             let result = match tokio::fs::remove_dir_all(&path).await {

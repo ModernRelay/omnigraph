@@ -309,6 +309,10 @@ pub enum Unrouted {
     /// A load mode the executor's keyed adapters still own: the plan is
     /// built and explained, the executor runs the statement.
     ModeOnExecutor { mode: &'static str },
+    /// A full-text call reads a declared index with no segment at the
+    /// pinned snapshot (`PlanError::FullTextIndexRequired`): a conflict the
+    /// engine returns with its typed detail.
+    FullTextIndexRequired { index: String },
 }
 
 impl Unrouted {
@@ -318,6 +322,7 @@ impl Unrouted {
         match error {
             PlanError::Unsupported(diagnostic) => Self::UnsupportedQuery { diagnostic },
             PlanError::Source { detail } => Self::SourceError { message: detail },
+            PlanError::FullTextIndexRequired { index } => Self::FullTextIndexRequired { index },
             other => Self::PlannerError {
                 message: other.to_string(),
             },
@@ -336,6 +341,7 @@ impl Unrouted {
             Self::ValidationExhausted { .. } => "validation_exhausted",
             Self::SourceError { .. } => "source_error",
             Self::ModeOnExecutor { .. } => "mode_on_executor",
+            Self::FullTextIndexRequired { .. } => "full_text_index_required",
         }
     }
 
@@ -360,6 +366,9 @@ impl Unrouted {
                 json!({ "kind": self.kind(), "limit": limit, "value": value })
             }
             Self::ModeOnExecutor { mode } => json!({ "kind": self.kind(), "mode": mode }),
+            Self::FullTextIndexRequired { index } => {
+                json!({ "kind": self.kind(), "index": index })
+            }
         }
     }
 }
@@ -420,7 +429,7 @@ impl Decision {
                 logical,
             ),
             Ok(_) => {
-                let mut explain = LogicalView::of(&logical)
+                let explain = LogicalView::of(&logical)
                     .explain(
                         operation,
                         override_,
@@ -430,7 +439,6 @@ impl Decision {
                         Some(&initial),
                     )
                     .engine();
-                explain.pipelines = None;
                 Self::Engine {
                     plan: optimized.physical,
                     logical,
@@ -594,7 +602,6 @@ async fn plan_and_accept(
     let accepted = validate::accept(optimized.physical, input, derivation)
         .map_err(ValidationError::into_unrouted)?;
     let rendered = rendered.map(|mut explain| {
-        explain.pipelines = None;
         explain.validation = Some(accepted.summary());
         explain
     });
@@ -696,7 +703,7 @@ fn route_decision(
                 optimized
                     .physical
                     .set_assumptions(recorded.assumptions(bounds));
-                let mut explain = logical.explain(
+                let explain = logical.explain(
                     operation,
                     override_,
                     None,
@@ -704,7 +711,6 @@ fn route_decision(
                     &fired,
                     Some(&initial),
                 );
-                explain.pipelines = None;
                 match ir.mode {
                     LoadStmtMode::Overwrite => Decision::Engine {
                         plan: optimized.physical,

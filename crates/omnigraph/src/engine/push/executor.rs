@@ -394,10 +394,18 @@ pub async fn build(plan: &PhysicalPlan, ctx: &ExecContext) -> Result<Pipeline> {
     };
     let mut drained = HashMap::new();
     for spec in &specs {
-        let PipelineSink::Node(sink) = spec.sink else {
-            return Err(ExecError::internal(
-                "only the last pipeline feeds the consumer".to_string(),
-            ));
+        let sink = match spec.sink {
+            PipelineSink::Node(sink) => sink,
+            PipelineSink::Consumer => {
+                return Err(ExecError::internal(
+                    "only the last pipeline feeds the consumer".to_string(),
+                ));
+            }
+            PipelineSink::Breaker(id) => {
+                return Err(ExecError::internal(format!(
+                    "physical node {id} holds its whole input; the push executor drains only build sides"
+                )));
+            }
         };
         let spec_source = source(plan, ctx, &spec.source, &mut drained).await?;
         let schema = spec_source.schema();

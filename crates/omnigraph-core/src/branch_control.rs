@@ -831,6 +831,7 @@ pub async fn create_branch_recoverably(
     source: &mut Dataset,
     branch: &str,
     source_version: u64,
+    binding: Option<&crate::storage::CapturedStorageBinding>,
 ) -> Result<BranchCreateOutcome> {
     // Lance validates inside phase 2 today. Validate before phase 1 so an
     // invalid name cannot leave a clone-only zombie. This validation and the
@@ -891,16 +892,17 @@ pub async fn create_branch_recoverably(
     fail(&BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE)?;
 
     for attempt in 0..2 {
-        let native_error = match crate::lance_clone::create_branch(source, branch, source_version)
-            .await
-            .map_err(OmniError::storage)
-        {
-            Ok(_) => match fail(&BRANCH_CREATE_POST_NATIVE) {
-                Ok(()) => return Ok(BranchCreateOutcome::Created),
+        let native_error =
+            match crate::lance_clone::create_branch(source, branch, source_version, binding)
+                .await
+                .map_err(OmniError::storage)
+            {
+                Ok(_) => match fail(&BRANCH_CREATE_POST_NATIVE) {
+                    Ok(()) => return Ok(BranchCreateOutcome::Created),
+                    Err(error) => error,
+                },
                 Err(error) => error,
-            },
-            Err(error) => error,
-        };
+            };
 
         let observed = branch_contents(source, branch).await.map_err(|classifier_error| {
             OmniError::manifest_internal(format!(
@@ -1066,6 +1068,15 @@ mod tests {
                 target,
                 fault: self.clone(),
             })
+        }
+
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            // Listings must pass through the fault store and its accounting.
+            None
         }
     }
 
@@ -1669,7 +1680,9 @@ mod tests {
             .await
             .unwrap();
 
-        let error = match create_branch_recoverably(&mut dataset, "feature/child", version).await {
+        let error = match create_branch_recoverably(&mut dataset, "feature/child", version, None)
+            .await
+        {
             Ok(_) => panic!("the lower branch-control surface must enforce prefix disjointness"),
             Err(error) => error,
         };
@@ -1711,7 +1724,7 @@ mod tests {
             .identifier
             .clone();
 
-        let outcome = create_branch_recoverably(&mut dataset, "feature", version)
+        let outcome = create_branch_recoverably(&mut dataset, "feature", version, None)
             .await
             .unwrap();
         assert!(matches!(outcome, BranchCreateOutcome::RefAlreadyExists));

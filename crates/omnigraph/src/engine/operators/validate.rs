@@ -18,13 +18,13 @@ use omnigraph_compiler::catalog::Catalog;
 use omnigraph_planner::ValidateSpec;
 
 use super::memory::WorkMemory;
-use super::producer::producer_stream;
-use super::{breaker_properties, drain, external, polled};
+use super::shape::{Breaker, work};
+use super::{drain, external};
 use crate::db::{Omnigraph, Snapshot};
 use crate::loader::LoadMode;
 use crate::loader::read_reuse::LoadReadReuse;
 use crate::storage_layer::{DeletedIdBudget, WriteBudget};
-use crate::validate::load::{LoadAdmission, LoadPhase, judge_load};
+use crate::validate::load::{LoadAdmission, LoadPhase, int_keyed, judge_load};
 use omnigraph_compiler::ir::ValidateCheck;
 
 /// The `validated_rows` metric: the delta rows the operator judged.
@@ -45,7 +45,7 @@ pub(crate) struct LoadJudge {
 pub(crate) struct ValidateExec {
     input: Arc<dyn ExecutionPlan>,
     judge: Arc<LoadJudge>,
-    properties: Arc<PlanProperties>,
+    shape: Breaker,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -55,7 +55,7 @@ impl ValidateExec {
         Self {
             input,
             judge: Arc::new(judge),
-            properties: breaker_properties(schema),
+            shape: Breaker::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -97,7 +97,7 @@ impl ExecutionPlan for ValidateExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -109,10 +109,11 @@ impl ExecutionPlan for ValidateExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1, "ValidateExec has one child");
+        let input = children.remove(0);
         Ok(Arc::new(Self {
-            input: children.remove(0),
+            shape: Breaker::new(input.schema()),
+            input,
             judge: Arc::clone(&self.judge),
-            properties: Arc::clone(&self.properties),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
@@ -123,18 +124,15 @@ impl ExecutionPlan for ValidateExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "ValidateExec has one partition");
-        let schema = self.schema();
         let input = self.input.execute(0, Arc::clone(&ctx))?;
-        let mut work = WorkMemory::new(ctx, "ValidateExec")?;
-        work.set_metrics(self.metrics.clone());
-        work.metric("input_rows", 0);
-        work.metric(VALIDATED_ROWS, 0);
+        let memory = work(ctx, "ValidateExec", &self.metrics)?;
+        memory.metric("input_rows", 0);
+        memory.metric(VALIDATED_ROWS, 0);
         let judge = Arc::clone(&self.judge);
-        let stream = producer_stream(
-            schema,
-            Arc::new(work),
-            Some(&self.metrics),
-            move |memory, sender| async move {
+        Ok(self.shape.held(
+            memory,
+            &self.metrics,
+            move |memory| async move {
                 let batches = drain(input, &memory).await?;
                 let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
                 {
@@ -153,6 +151,15 @@ impl ExecutionPlan for ValidateExec {
                             reserve.map_err(|error| memory.error(error))?;
                             Ok(Box::new(phase_memory))
                         };
+                    let mut admit_bytes = |bytes: usize| -> crate::error::Result<Box<dyn Send>> {
+                        let allocation = memory
+                            .child("load integer endpoint keys")
+                            .map_err(|error| memory.error(error))?;
+                        allocation
+                            .grow(bytes)
+                            .map_err(|error| memory.error(error))?;
+                        Ok(Box::new(allocation))
+                    };
                     let mut admit_reuse = || {
                         memory.admit_read_reuse().and_then(|admitted| {
                             LoadReadReuse::new(&judge.db, &judge.snapshot, admitted)
@@ -186,6 +193,7 @@ impl ExecutionPlan for ValidateExec {
                         &batches,
                         &mut LoadAdmission {
                             phase: Some(&mut admit_phase),
+                            bytes: Some(&mut admit_bytes),
                             reuse: Some(&mut admit_reuse),
                             removed: &mut admit_removed,
                             retained: &mut admit_retained,
@@ -195,13 +203,15 @@ impl ExecutionPlan for ValidateExec {
                     .map_err(external)?;
                 }
                 memory.metric(VALIDATED_ROWS, rows);
+                Ok(batches)
+            },
+            move |batches, memory, sender| async move {
                 for batch in batches {
                     sender.send(batch, Arc::clone(&memory)).await?;
                 }
                 Ok(())
             },
-        );
-        Ok(polled(&self.metrics, stream))
+        ))
     }
 }
 
@@ -304,11 +314,9 @@ fn admit_validation(
                 }
             }
         }
-        if judge
-            .checks
-            .iter()
-            .any(|spec| matches!(spec.check, ValidateCheck::EdgeRi { .. }))
-        {
+        if judge.checks.iter().any(|spec| {
+            matches!(&spec.check, ValidateCheck::EdgeRi { node_type, .. } if !int_keyed(&judge.catalog, node_type))
+        }) {
             let src_bytes = string_payload_bytes(column(sc.src)?);
             let dst_bytes = string_payload_bytes(column(sc.dst)?);
             memory.entries::<(String, String, String)>(rows)?;

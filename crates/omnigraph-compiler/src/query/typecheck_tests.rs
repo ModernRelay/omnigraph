@@ -114,7 +114,7 @@ fn setup() -> Catalog {
     let schema = parse_schema(
         r#"
 node Person {
-name: String
+name: String @index
 age: I32?
 }
 node Company {
@@ -154,7 +154,7 @@ fn setup_vector() -> Catalog {
     let schema = parse_schema(
         r#"
 node Doc {
-id_str: String
+id_str: String @index
 embedding: Vector(3)
 }
 "#,
@@ -776,6 +776,106 @@ limit 3
     assert!(ctx.scope.bindings.contains_key("d"));
 }
 
+/// T27: a full-text call needs a one-column full-text index on its node
+/// property, read from the schema alone. `@key` declares one, a composite
+/// `@index` does not, an enum takes none, and a field that is not a String
+/// keeps its operand error.
+#[test]
+fn full_text_calls_need_a_declared_full_text_index() {
+    let catalog = build_catalog(
+        &parse_schema(
+            r#"
+node Doc {
+slug: String @key
+title: String @index
+body: String?
+summary: String
+kind: enum(note, essay)
+pages: I32?
+@index(summary, body)
+}
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let check = |call: &str| {
+        let source = format!(
+            "query q($q: String) {{ match {{ $d: Doc }} return {{ $d.slug }} {call} limit 3 }}"
+        );
+        typecheck_query(&catalog, parse_query(&source).unwrap().single_decl())
+    };
+    for accepted in [
+        "order { bm25($d.title, $q) }",
+        "order { bm25($d.slug, $q) }",
+    ] {
+        check(accepted).unwrap_or_else(|error| panic!("{accepted}: {error}"));
+    }
+    let accepted = typecheck_query(
+        &catalog,
+        parse_query(
+            "query q($q: String) { match { $d: Doc search($d.title, $q) } return { $d.slug } }",
+        )
+        .unwrap()
+        .single_decl(),
+    );
+    accepted.unwrap();
+    for (call, property) in [
+        ("search($d.body, $q)", "body"),
+        ("fuzzy($d.body, $q)", "body"),
+        ("match_text($d.summary, $q)", "summary"),
+    ] {
+        let source =
+            format!("query q($q: String) {{ match {{ $d: Doc {call} }} return {{ $d.slug }} }}");
+        let error =
+            typecheck_query(&catalog, parse_query(&source).unwrap().single_decl()).unwrap_err();
+        let diagnostic = error.diagnostic().expect("T27 carries a diagnostic");
+        assert_eq!(diagnostic.code.as_str(), "T27", "{call}: {error}");
+        assert_eq!(
+            diagnostic
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.expression.as_deref()),
+            Some(format!("$d.{property}").as_str())
+        );
+        assert!(
+            diagnostic
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains(&format!("{property}: String @index"))),
+            "{call}: {diagnostic:?}"
+        );
+    }
+    let error = check("order { bm25($d.body, $q) }").unwrap_err();
+    assert_eq!(error.diagnostic().unwrap().code.as_str(), "T27", "{error}");
+    let error = typecheck_query(
+        &catalog,
+        parse_query("query q() { match { $d: Doc search($d.kind, \"note\") } return { $d.slug } }")
+            .unwrap()
+            .single_decl(),
+    )
+    .unwrap_err();
+    let diagnostic = error.diagnostic().unwrap();
+    assert_eq!(diagnostic.code.as_str(), "T27", "{error}");
+    assert!(
+        diagnostic
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("$d.kind = ")),
+        "{diagnostic:?}"
+    );
+    let error = typecheck_query(
+        &catalog,
+        parse_query(
+            "query q($q: String) { match { $d: Doc search($d.pages, $q) } return { $d.slug } }",
+        )
+        .unwrap()
+        .single_decl(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("T19"), "{error}");
+}
+
 #[test]
 fn test_search_string_param_ok() {
     let catalog = setup();
@@ -952,6 +1052,64 @@ limit 5
 "#,
     );
     assert!(parse.is_err());
+}
+
+/// T59: the ranked binding roots its component's scan, so `rrf()` arms that
+/// rank two bindings one traversal connects, directly or over several hops,
+/// are refused; arms on one binding, or on bindings no top-level traversal
+/// joins (an anonymous endpoint and a negation join nothing), are admitted.
+#[test]
+fn rrf_arms_on_two_bindings_one_traversal_connects_issue_789() {
+    let catalog = build_catalog(
+        &parse_schema(
+            "node Doc { text: String @index  embedding: Vector(2) @index }\nedge Cites: Doc -> Doc",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let check = |pattern: &str, first: &str, second: &str| {
+        let parsed = parse_query(&format!(
+            "query q($q: String, $v: Vector(2)) {{ match {{ {pattern} }} return {{ ${first}.text }} order {{ rrf(nearest(${first}.embedding, $v), bm25(${second}.text, $q)) }} limit 5 }}"
+        ))
+        .unwrap();
+        typecheck_query(&catalog, parsed.single_decl())
+    };
+    for pattern in [
+        "$a: Doc  $a cites $b",
+        "$b: Doc  $a cites $b",
+        "$a: Doc  $a cites $x  $x cites $b",
+        "$a: Doc  $b cites{1,3} $a",
+    ] {
+        let err = check(pattern, "a", "b").unwrap_err();
+        let diagnostic = err.diagnostic().expect("a typecheck diagnostic");
+        assert_eq!(diagnostic.code.as_str(), "T59", "{pattern}: {err}");
+        assert!(
+            diagnostic
+                .message
+                .contains("`rrf()` ranks `$a` and `$b`, which one traversal connects"),
+            "{pattern}: {err}"
+        );
+        assert_eq!(
+            diagnostic
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.expression.as_deref()),
+            Some("rrf(nearest($a.embedding, $v), bm25($b.text, $q))"),
+            "{pattern}"
+        );
+        assert_eq!(
+            diagnostic.fix, None,
+            "{pattern}: no pattern serves both arms"
+        );
+    }
+    for (pattern, first, second) in [
+        ("$a: Doc  $a cites $b", "b", "b"),
+        ("$a: Doc  $b: Doc", "a", "b"),
+        ("$a: Doc  $b: Doc  $a cites $_  $_ cites $b", "a", "b"),
+        ("$a: Doc  $b: Doc  not { $a cites $b }", "a", "b"),
+    ] {
+        check(pattern, first, second).unwrap_or_else(|err| panic!("{pattern}: {err}"));
+    }
 }
 
 #[test]
@@ -2194,8 +2352,8 @@ fn setup_expressions() -> Catalog {
     let schema = parse_schema(
         r#"
 node Person {
-name: String
-email: String?
+name: String @index
+email: String? @index
 age: I32?
 active: Bool
 tags: [String]?
@@ -2983,7 +3141,7 @@ fn expected_visits_of(expr: &Expr, out: &mut Vec<Visit>) {
 fn checked_tree_retains_every_source_field() {
     let catalog = build_catalog(
         &parse_schema(
-            "node Doc { text: String  score: I32?  embedding: Vector(2) }\nedge Cites: Doc -> Doc",
+            "node Doc { text: String @index  score: I32?  embedding: Vector(2) }\nedge Cites: Doc -> Doc",
         )
         .unwrap(),
     )

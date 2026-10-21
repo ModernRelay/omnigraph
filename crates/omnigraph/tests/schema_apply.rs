@@ -1432,9 +1432,10 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 //   and `DropProperty`; see the cleanup tests below.
 //
 // Every other destructive shape (narrow type, add required without
-// backfill, remove constraint) still returns an `UnsupportedChange` step that
-// surfaces as an error from `apply_schema`. These tests pin the current
-// contract so a regression in the planner can't silently change behavior.
+// backfill, remove a constraint from a property that stays) still returns an
+// `UnsupportedChange` step that surfaces as an error from `apply_schema`.
+// These tests pin the current contract so a regression in the planner can't
+// silently change behavior.
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
@@ -1733,7 +1734,7 @@ node Document {
 /// publishes it, and keyed writes, queries and optimize work afterwards.
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn apply_schema_column_changes_keep_data_files_ids_and_index_coverage() {
+async fn apply_schema_column_changes_keep_data_files_ids_and_index_coverage_issue_1014() {
     use lance::index::DatasetIndexExt;
 
     const MARKER: &str = "omnigraph.stable_property_id";
@@ -1793,14 +1794,14 @@ async fn apply_schema_column_changes_keep_data_files_ids_and_index_coverage() {
 node Document {
     title: String @key
     rank: I32? @index
-    note: String?
+    note: String? @index
     content: Blob?
 }
 
 node Tag {
     name: String @key
     weight: I32? @index
-    color: String?
+    color: I32? @index
 }
 "#;
     let db = helpers::session(Omnigraph::init(uri, initial).await.unwrap());
@@ -1812,8 +1813,8 @@ node Tag {
         serde_json::json!({"type": "Document", "data": {"title": "dedicated", "rank": 3, "note": "n3", "content": format!("base64:{dedicated}")}}),
         serde_json::json!({"type": "Document", "data": {"title": "empty", "rank": 4, "note": "n4", "content": "base64:"}}),
         serde_json::json!({"type": "Document", "data": {"title": "null", "rank": 5, "note": "n5", "content": null}}),
-        serde_json::json!({"type": "Tag", "data": {"name": "red", "weight": 7, "color": "crimson"}}),
-        serde_json::json!({"type": "Tag", "data": {"name": "blue", "weight": 9, "color": "navy"}}),
+        serde_json::json!({"type": "Tag", "data": {"name": "red", "weight": 7, "color": 1}}),
+        serde_json::json!({"type": "Tag", "data": {"name": "blue", "weight": 9, "color": 2}}),
     ]
     .iter()
     .map(|row| row.to_string())
@@ -1828,7 +1829,7 @@ node Tag {
     for table in ["node:Document", "node:Tag"] {
         let coverage_before = coverage(&db, table).await;
         assert!(
-            coverage_before.len() >= 2,
+            coverage_before.len() >= 3,
             "{table} needs its id and property indexes: {coverage_before:?}"
         );
         before_state.insert(
@@ -1884,6 +1885,7 @@ node Tag {
         );
     }
 
+    let mut dropped_ids = Vec::new();
     for (table, renamed, from, dropped) in [
         ("node:Document", "score", "rank", "note"),
         ("node:Tag", "strength", "weight", "color"),
@@ -1913,10 +1915,36 @@ node Tag {
                 );
             }
         }
+        // A dropped property takes its own index with it (the drop's
+        // Project removes it); every other index keeps its coverage.
+        let (_, dropped_id, _) = field(fields_before, dropped);
+        let surviving = coverage_before
+            .iter()
+            .filter(|(fields, _)| fields != &[*dropped_id])
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
-            &coverage(&db, table).await,
-            coverage_before,
-            "{table}: every index keeps its field and fragment coverage"
+            surviving.len(),
+            coverage_before.len() - 1,
+            "{table}: the dropped column was indexed before the apply"
+        );
+        assert_eq!(
+            coverage(&db, table).await,
+            surviving,
+            "{table}: every surviving index keeps its field and fragment coverage"
+        );
+        dropped_ids.push((table, *dropped_id));
+    }
+    // Reconciliation builds from the desired declarations, so nothing indexes
+    // a dropped column again.
+    db.ensure_indices().await.unwrap();
+    for (table, dropped_id) in dropped_ids {
+        assert!(
+            coverage(&db, table)
+                .await
+                .iter()
+                .all(|(fields, _)| fields != &[dropped_id]),
+            "{table}: ensure_indices leaves the dropped column unindexed"
         );
     }
     for table in ["node:Document", "node:Tag"] {

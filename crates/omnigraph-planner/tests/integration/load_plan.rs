@@ -167,7 +167,7 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
         ]
     );
     let document = explain.to_value();
-    assert_eq!(document["explain_version"], 6);
+    assert_eq!(document["explain_version"], 7);
     assert!(document["logical_plan_initial"].is_object());
     assert_eq!(document["route"], "engine");
     assert_eq!(document["operation"]["kind"], "load");
@@ -194,7 +194,25 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
     let leaf = &validation["inputs"][0];
     assert_eq!(leaf["node"], "CsvSource");
     assert_eq!(leaf["source"], "s3://bucket/people.csv");
-    assert!(document["pipelines"].is_null());
+    let pipelines = document["pipelines"]
+        .as_array()
+        .expect("a load plan has pipelines");
+    assert_eq!(
+        pipelines.len(),
+        2,
+        "the whole-input validation cuts the load in two"
+    );
+    assert_eq!(pipelines[0]["source"]["node"], "CsvSource");
+    assert_eq!(pipelines[0]["operators"], serde_json::json!([]));
+    assert_eq!(pipelines[0]["sink"]["name"], "Validate");
+    assert_eq!(pipelines[1]["source"]["node"], "Validate");
+    assert_eq!(
+        pipelines[1]["source"]["id"], pipelines[0]["sink"]["id"],
+        "the breaker is the sink of the first pipeline and the source of the second"
+    );
+    assert_eq!(pipelines[1]["operators"][0]["name"], "FragmentWrite");
+    assert_eq!(pipelines[1]["sink"]["name"], "consumer");
+    assert_eq!(pipelines[1]["depends_on"], serde_json::json!([0]));
 }
 
 #[test]
@@ -320,10 +338,16 @@ fn endpoint_access_costs_the_consulted_table_and_index_coverage() {
     for (rows, coverage, usable, expected) in [
         (Some(100_000_000), Some((1, 1)), true, ValidateAccess::Probe),
         (Some(1_000), Some((1, 1)), true, ValidateAccess::Scan),
-        (Some(1_000), Some((0, 1)), true, ValidateAccess::Probe),
-        (Some(1_000), Some((1, 2)), true, ValidateAccess::Probe),
-        (Some(1_000), None, true, ValidateAccess::Probe),
-        (Some(1_000), Some((1, 1)), false, ValidateAccess::Probe),
+        (Some(1_000), Some((0, 1)), true, ValidateAccess::Scan),
+        (Some(1_000), Some((1, 2)), true, ValidateAccess::Scan),
+        (
+            Some(100_000_000),
+            Some((25, 26)),
+            true,
+            ValidateAccess::Probe,
+        ),
+        (Some(1_000), None, true, ValidateAccess::Scan),
+        (Some(1_000), Some((1, 1)), false, ValidateAccess::Scan),
         (None, Some((1, 1)), true, ValidateAccess::Probe),
     ] {
         let schema = parse_schema("node Person { id: String @key }").unwrap();
@@ -378,5 +402,22 @@ fn endpoint_access_costs_the_consulted_table_and_index_coverage() {
         assert!(document.contains("consulted_rows"), "{document}");
         assert!(document.contains("index_full_coverage"), "{document}");
         assert!(document.contains("probe_calls"), "{document}");
+        if usable && coverage.is_none_or(|(covered, total)| covered > 0 && covered < total) {
+            let stats: Vec<_> = explain
+                .statistics
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|stat| stat.statistic == "validate_access(edge_ri)")
+                .collect();
+            assert_eq!(stats.len(), 2);
+            for stat in stats {
+                let origin: serde_json::Value = serde_json::from_str(&stat.origin).unwrap();
+                assert_eq!(origin["index_coverage"], "partial");
+                assert_eq!(origin["index_full_coverage"], false);
+                assert_eq!(origin["probe_cost"], 90_000u64);
+                assert_eq!(origin["scan_cost"], rows.unwrap() + input_rows);
+            }
+        }
     }
 }

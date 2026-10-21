@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - OmniGraph maintainers
 created: 2026-09-29
-updated: 2026-10-08
+updated: 2026-10-20
 discussion: https://github.com/ModernRelay/omnigraph/pull/799
 supersedes:
   - "0034"
@@ -24,6 +24,15 @@ blocked_on:
 ---
 
 # RFC: Server runtime and online deployment
+
+> **RFC 0059 disposition:** [RFC 0059](0059-config-cli-coherency.md) replaces
+> CLI targeting in CLI and conversion. Historical: primitive/mode selectors and
+> literal-root recovery independent of operator configuration discovery; explicit
+> root targets and the isolated-operator-home procedure replace them. Current:
+> exact deployment identities and non-replay, writer-quiescence attestations,
+> admission, ledger conversion and deployment/reconciliation authority. Server
+> startup flags are unchanged. The accepted targeting design remains subject to
+> RFC 0059's implementation cutover and qualification.
 
 ## Summary
 

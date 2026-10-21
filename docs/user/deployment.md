@@ -5,7 +5,7 @@ storage, or Azure Blob Storage. The server always boots from one cluster root
 and exposes its ready applied graphs under `/graphs/{id}/…`; use
 `--require-all-graphs` when any blocked graph must fail startup.
 
-Servers use the v0.13 HTTP contract and open graph storage formats v14 to v16. The
+Servers use the v0.14 HTTP contract and open graph storage formats v14 to v16. The
 cluster ledger has a separate version: explicitly converting it to v2 preserves
 graph data and history. Start with [Operating a cluster](clusters/index.md) to
 create and apply a deployment bundle.
@@ -77,7 +77,7 @@ achieved result or receipt.
 Known loading, blocked or transitioning graphs return 503 (`graph_unavailable`) to callers authorized to
 read `main` or list the management inventory; other callers cannot use this response to discover
 them. Unknown graphs return 404. A 503 does not authorize replaying a write.
-`omnigraph graphs list --server <name|url>` displays graph ID, state and URI;
+`omnigraph graphs list --target <name|url>` displays graph ID, state and URI;
 `--json` preserves the full inventory fields. Minimal discovery remains IDs/names only.
 
 Admitted writes and reads with fully accepted request bodies retain capacity
@@ -99,15 +99,15 @@ and starts the same shutdown without renewing its deadline. Once HTTP connection
 and other known logical owners finish, it exits 2 immediately; the watchdog is
 the upper bound. Unresolved reservations stay charged until exit. This contains
 the process; it does not prove native I/O settled or the engine can be reused.
-A proven pre-effect failure, such as a failed initial schema read or a native-tag
-retirement refusal, releases its reservation and keeps admission open. Error
-status or a transient storage category alone does not establish that proof.
+A failure proven to leave the graph unchanged keeps admission open once its
+storage requests settle; see [storage failures](operations/storage-failures.md).
+Status alone proves nothing; an unsettled publication or unclassified failure fails closed.
 A clean native shutdown exits 0. Set the orchestrator's own
 termination grace longer than this value; a cutoff is crash-equivalent for the
 work it interrupts, and the next open recovers it as after any crash.
 On local storage and S3, the server also closes its storage scope, waits for
 accepted graph and control writes, and releases its own cluster admission.
-The next server can start normally with the same `--cluster`. An initial
+The next server can start normally with the same `--target`. An initial
 `--bootstrap-handoff` receipt is only for the first process; omit it on later
 starts. The data, history and applied configuration remain in place.
 
@@ -223,7 +223,7 @@ loopback address unchanged, for example:
 socat UNIX-LISTEN:/run/omnigraph/server.sock,fork TCP:127.0.0.1:8080
 ```
 
-Clients address it with `--server unix:///run/omnigraph/server.sock`. The
+Clients address it with `--target unix:///run/omnigraph/server.sock`. The
 gateway must pass requests and responses through unchanged, including the
 `Omnigraph-Http-Api` header. Restrict who may connect with the permissions of
 the socket's directory; bearer authentication and policy apply as over TCP.
@@ -243,7 +243,7 @@ put credentials in `cluster.yaml` or graph URIs.
 
 The same storage root must be visible to servers and out-of-band cluster or
 maintenance jobs. Submit schema/query changes and graph additions to the running
-server with `cluster apply --server`; the root's applied revision remains the
+server with `cluster apply --target`; the root's applied revision remains the
 deployment artifact. Direct apply requires ownership transfer before serving.
 
 ## Azure Blob preview

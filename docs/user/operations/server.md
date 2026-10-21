@@ -30,7 +30,7 @@ An applied empty cluster creates no default graph and serves an empty inventory.
 Missing or unapplied state, or a nonempty cluster whose graphs all fail, refuses
 startup. Authentication, policy and data-token root checks still apply.
 
-Use `cluster apply --server URL --config DIR` for schema, query, policy,
+Use `cluster apply --target URL --config DIR` for schema, query, policy,
 provider and Blob-rule changes without restart. Graph additions and removals
 use the same deployment; removal deletes the graph's managed storage and history. Direct apply requires stopped serving and a subsequent
 start; see [cluster deployments](../clusters/index.md).
@@ -59,14 +59,13 @@ its error class, never by its message; see
 
 ## HTTP contract
 
-Upgrade the v0.13 CLI, server and HTTP integrations together. Every protected
-request requires exactly one `Omnigraph-Http-Api: 0.13`: graph, registry and
+Upgrade the CLI, server and HTTP integrations together. Every protected
+request requires exactly one `Omnigraph-Http-Api: 0.14`: graph, registry and
 cluster-deployment calls, including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
 duplicate, combined or unsupported values return `400 api_contract_mismatch`
-after authentication but before graph lookup, body decoding or execution. This
-HTTP identifier is separate from package/storage versions and grants no permission.
-The previous `0.12` value is refused; update integrations to the current routes,
-request/response shapes and credentials before changing their header.
+after authentication but before graph lookup, body decoding or execution. This HTTP identifier is
+separate from package/storage versions and grants no permission. The previous `0.13` value is
+refused; update integrations to the current routes, shapes and credentials before their header.
 
 Ordinary responses, including errors and streams, carry the same header. Check
 it before decoding or emitting the body. A missing/incompatible response header
@@ -75,6 +74,11 @@ means unknown effects, never permission to replay. Proxies must preserve it both
 Server URLs name the service root, including its proxy prefix. Select a graph
 with `--graph`, `default_graph` or `alias.graph`. Migrate graph-qualified server
 URLs to that root plus graph selection; the CLI never guesses a root from a path. A `unix:///absolute/path.sock` URL names a Unix-domain socket instead: its whole path is the socket, so it has no proxy prefix, and requests carry `Host: localhost`; see [Unix-socket access](../deployment.md#unix-socket-access).
+
+Server targets bind a credential owner or anonymous access to an endpoint scope.
+Every composed route must retain that captured choice. A more specific target
+with another owner or anonymous access blocks the request before discovery;
+the CLI never switches credentials to match the nested route.
 
 Public `/healthz`, `/readyz` and `/openapi.json` need no header and identify the
 contract in their responses. Before every graph, registry or deployment request, the CLI sends
@@ -107,6 +111,16 @@ pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
 on a trusted development network. Static tokens without a policy allow only the
 `read` action. Stored-query invocation, export, graph listing, writes, and other
 actions remain denied.
+
+### Assert the actor
+
+A client that means to act as a particular actor sends `Omnigraph-If-Actor: <actor>` with any
+protected request, `/mcp` included. After authentication and the contract check (on `/mcp`,
+before admission), and before graph lookup or any effect, a match changes nothing and a mismatch
+is `412 actor_mismatch` with nothing run; a server without authentication resolves no actor. A
+repeated, padded or empty header is `400 bad_request`. The header never supplies the actor, and a
+server before contract `0.14` refuses the contract first. The CLI sends it for `--as` on served
+writes and on served `cluster plan` and `cluster apply`.
 
 ### Signed data credentials
 
@@ -145,7 +159,7 @@ clock up to 30 seconds ahead, so at most 86,430 seconds can remain on admission.
 Expiry has no grace period. Logout or a permission change at the issuer does
 not revoke an issued token; already accepted operations can finish after
 expiry. Stored-query calls need `invoke_query` plus `read` or `change` for the
-body. Apply policy changes through `cluster apply --server`; editing a source
+body. Apply policy changes through `cluster apply --target`; editing a source
 file alone does not change permissions. Deployment uses
 [current-policy authorization](policy.md#actions); the identity credential supplies no bypass.
 
@@ -218,6 +232,7 @@ endpoint, its tools, settings and limits.
 | `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history (paged with `limit` and `page_token`), per-commit changes, and the unpublished commits of a branch (`GET /commits?unpublished=true`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
 | `/graphs/{id}/changes`, `/diff` | Poll a branch feed, establish a baseline, or diff two points (branches or commit ids) |
 | `/graphs/{id}/schema` | Show the accepted schema |
+| `GET /graphs/{id}/access` | The caller's own actor and the actions its credential allows; see [Learn your access](policy.md#learn-your-access) |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
 
 `/query` also serves `branch list`, the branch reads (`branch diff`, `branch merge-base`, `branch merge … dry run`), `show`, and [explain](../queries/explain.md).
@@ -227,14 +242,14 @@ Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`
 takes an optional `settings` field, and the two GET change routes a `set=`
 parameter; see [Session settings](../queries/index.md#session-settings).
 
-Change a managed graph's schema through `cluster apply --server URL --config DIR`; see
+Change a managed graph's schema through `cluster apply --target URL --config DIR`; see
 [cluster deployments](../clusters/index.md#deploy-without-restarting).
 
 ## Run an inline query
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/query \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{
@@ -253,7 +268,7 @@ writes go to `/mutate` and may select a target `branch`.
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/queries/find_person \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{"params":{"name":"Ada"}}'
@@ -270,7 +285,7 @@ acting on:
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/mutate/if-graph-commit \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -H 'Omnigraph-If-Graph-Commit: <graph_commit_id>' \

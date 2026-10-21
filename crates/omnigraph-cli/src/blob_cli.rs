@@ -531,11 +531,32 @@ mod tests {
 
     #[test]
     fn remote_unauthorized_names_the_missing_credential() {
-        let missing = crate::helpers::MissingCredential::Server("prod".to_string());
-        assert_eq!(
-            remote_blob_error(StatusCode::UNAUTHORIZED, Some(&missing)).to_string(),
-            "Blob read requires authentication\nno credential is stored for server `prod`: \
-             run `omnigraph login prod` or set OMNIGRAPH_TOKEN_PROD"
-        );
+        use crate::helpers::MissingCredential;
+        for (missing, hint, expected) in [
+            (
+                MissingCredential::AnonymousTarget("prod".into()),
+                "target `prod` uses anonymous authentication: configure its credential owner, then run `omnigraph login --target prod`",
+                serde_json::json!({"target":"prod","auth":"anonymous"}),
+            ),
+            (
+                MissingCredential::Unbound {
+                    server_root: "https://graph.example".into(),
+                    config: None,
+                },
+                "no credential is bound to https://graph.example: declare a target for it under `targets:` in ~/.omnigraph/config.yaml, then run `omnigraph login --target <target>` or set OMNIGRAPH_TOKEN_<NAME>",
+                serde_json::json!({"unbound":"https://graph.example"}),
+            ),
+        ] {
+            assert_eq!(
+                remote_blob_error(StatusCode::UNAUTHORIZED, Some(&missing)).to_string(),
+                format!("Blob read requires authentication\n{hint}")
+            );
+            let mut serialized = serde_json::to_value(&missing).unwrap();
+            assert_eq!(
+                serialized.as_object_mut().unwrap().remove("hint"),
+                Some(serde_json::json!(hint))
+            );
+            assert_eq!(serialized, expected);
+        }
     }
 }

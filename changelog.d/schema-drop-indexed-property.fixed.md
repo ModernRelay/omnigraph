@@ -1,0 +1,3 @@
+- `schema plan` and `schema apply` now drop a property that carries `@index`, `@unique`, `@range` or `@check`, together with every constraint that names only dropped properties, and the same commit removes the property's index. Before, such a drop was refused, so an indexed property could never be removed. Removing a constraint from a property that stays, any `@key` change, and a drop that would remove a constraint that also names a remaining field are still refused; see the [schema guide][schema-drop-indexed-property].
+
+[schema-drop-indexed-property]: ../docs/user/schema/index.md#schema-changes

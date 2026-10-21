@@ -1250,7 +1250,7 @@ impl Omnigraph {
                         history_release_bytes,
                     )
                     .await?;
-                let publication = route.publication(&txn)?;
+                let publication = route.publication(&txn).map_err(OmniError::unpublished)?;
                 let commit = self
                     .publish_committed_mutation(committed, &txn, actor_id, publication)
                     .await?;
@@ -1278,14 +1278,23 @@ impl Omnigraph {
     ) -> Result<CommittedStagedMutation> {
         let requested = txn.branch.as_deref();
         self.validate_staged_mutation(&staging, txn).await?;
+        // From the first staged file to the publisher call, every durable
+        // effect is a fresh file or a detached version no manifest names: a
+        // failure here is definite (`Unpublished`), whatever its cause, and a
+        // server must not treat it as an outcome it cannot establish.
         let staged = staging
             .stage_all_with_concurrency(self, requested, stage_write_concurrency)
-            .await?;
-        fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+            .await
+            .map_err(OmniError::unpublished)?;
+        fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
         let lineage_intent = self
             .new_lineage_intent_for_branch(requested, actor_id, history_release_bytes)
-            .await?;
-        let committed = staged.commit_all(self, requested, txn).await?;
+            .await
+            .map_err(OmniError::unpublished)?;
+        let committed = staged
+            .commit_all(self, requested, txn)
+            .await
+            .map_err(OmniError::unpublished)?;
         Ok(CommittedStagedMutation {
             committed,
             lineage_intent,
@@ -1322,10 +1331,11 @@ impl Omnigraph {
         // failure here leaves the graph unchanged and the detached versions as
         // reclaimable garbage. See
         // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
-        fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+        fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;
         // RFC 0067: every effect is a detached commit of its pinned base, so a
         // publish failure leaves the graph unchanged; the error is returned as
-        // is (a moved head is `ReadSetChanged`).
+        // is (a moved head is `ReadSetChanged`). The publisher alone decides
+        // between a definite loss and an outcome it could not read back.
         self.commit_updates_on_branch_with_expected(
             txn.branch.as_deref(),
             &updates,
@@ -1757,9 +1767,9 @@ impl Omnigraph {
 
         // Accumulate the updated batch into the Merge-mode pending stream.
         // The accumulator may now contain entries with the same id as a
-        // prior insert or update on this table; `MutationStaging::finalize`
+        // prior insert or update on this table; `prepare_pending_table`
         // dedupes by id (last-occurrence wins) before issuing the single
-        // `stage_merge_insert` call at end-of-query.
+        // `stage_keyed_write` call at end-of-query.
         let updated_schema = updated.schema();
         staging.append_batch(&table_key, updated_schema, PendingMode::Upsert, updated)?;
 

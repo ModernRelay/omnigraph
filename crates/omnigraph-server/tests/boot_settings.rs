@@ -2264,6 +2264,163 @@ mod owned_shutdown {
     async fn disconnected_write_and_shutdown_share_ownership_v2_swallowed_error() {
         disconnected_write_and_shutdown_share_ownership("v2-swallowed-error").await;
     }
+
+    /// A raw request to the cluster fixture's `knowledge` graph, whose
+    /// schema is `node Person { name: String @key }`.
+    fn send_knowledge_request(address: &str, route: &str, body: &Value) -> TcpStream {
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let body = body.to_string();
+        write!(socket,
+            "POST /graphs/knowledge/{route} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\n{HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT}\r\nContent-Length: {}\r\n\r\n{body}", body.len()
+        ).unwrap();
+        socket.flush().unwrap();
+        socket
+    }
+
+    fn knowledge_response(address: &str, route: &str, body: &Value) -> String {
+        let mut response = String::new();
+        send_knowledge_request(address, route, body)
+            .read_to_string(&mut response)
+            .unwrap();
+        response
+    }
+
+    /// A served write whose storage request fails on one of Lance's
+    /// write-once table files is a definite failure: the caller gets its
+    /// 500, the next write on the same server publishes, reads keep serving,
+    /// readiness stays `serving`, and a clean SIGTERM still releases the
+    /// native lock. Nothing contains the process and nothing poisons the
+    /// storage scope. So is a failure of the publication's own transaction
+    /// file, which precedes the conditional manifest put: no manifest request
+    /// was sent, so the publication is not in doubt. The faults are real
+    /// backend I/O: a file planted where the Person table's `data/` directory
+    /// goes makes its first data-file write fail, and one planted where the
+    /// graph's `__manifest/_transactions/` goes makes the publisher's
+    /// transaction-file write fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn definite_write_failure_keeps_serving_and_releases_the_lock_issue_1067() {
+        let temp = converged_cluster_dir("").await;
+        omnigraph_cluster::upgrade_deployment_ledger(
+            &format!("file://{}", temp.path().display()),
+            true,
+            &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+        )
+        .await
+        .unwrap();
+        let root = temp.path();
+        let graph = root.join("graphs/knowledge.omni");
+        let (commits_before, person_table) = {
+            let db = Omnigraph::open_read_only(graph.to_str().unwrap())
+                .await
+                .unwrap();
+            let commits = db.list_commits(None).await.unwrap().len();
+            let snapshot = db
+                .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+                .await
+                .unwrap();
+            let table = snapshot
+                .dataset("node:Person")
+                .unwrap()
+                .dataset_path
+                .clone();
+            (commits, graph.join(table.trim_start_matches('/')))
+        };
+        let data_blocker = person_table.join("data");
+        assert!(
+            !data_blocker.exists(),
+            "the empty Person table has no data directory yet: {}",
+            data_blocker.display()
+        );
+        let (mut child, address, output_thread) = spawn_owned_child(root, "v2-definite-failure");
+        wait_ready(&address, &mut child.0, "serving").await;
+        let held_lock = fs::read(root.join("__cluster/lock.json")).unwrap();
+
+        let insert = |name: &str| {
+            serde_json::json!({
+                "query": "query insert_person($name: String) { insert Person { name: $name } }",
+                "name": "insert_person",
+                "params": {"name": name}
+            })
+        };
+        fs::write(&data_blocker, b"not a directory").unwrap();
+        let failed = knowledge_response(&address, "mutate", &insert("stranded"));
+        assert!(failed.starts_with("HTTP/1.1 500"), "{failed}");
+        assert!(
+            failed.contains("\"code\":\"internal\""),
+            "a storage failure is the caller's 500: {failed}"
+        );
+        fs::remove_file(&data_blocker).unwrap();
+
+        let transactions = graph.join("__manifest/_transactions");
+        let parked = graph.join("__manifest/_transactions.parked");
+        fs::rename(&transactions, &parked).unwrap();
+        fs::write(&transactions, b"not a directory").unwrap();
+        let unpublished = knowledge_response(&address, "mutate", &insert("unsent"));
+        assert!(unpublished.starts_with("HTTP/1.1 500"), "{unpublished}");
+        fs::remove_file(&transactions).unwrap();
+        fs::rename(&parked, &transactions).unwrap();
+
+        let published = knowledge_response(&address, "mutate", &insert("after"));
+        assert!(
+            published.starts_with("HTTP/1.1 200"),
+            "the next write on the same server must publish: {published}"
+        );
+        let names = knowledge_response(
+            &address,
+            "query",
+            &serde_json::json!({
+                "query": "query names() { match { $p: Person } return { $p.name } }",
+                "name": "names",
+                "params": {}
+            }),
+        );
+        assert!(names.starts_with("HTTP/1.1 200"), "{names}");
+        assert!(names.contains("after"), "{names}");
+        assert!(
+            !names.contains("stranded") && !names.contains("unsent"),
+            "a failed write published: {names}"
+        );
+        wait_ready(&address, &mut child.0, "serving").await;
+
+        assert_eq!(
+            unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "clean shutdown timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "a definite failure never contains the process"
+        );
+        assert!(root.join("serve-returned").exists());
+        output_thread.join().unwrap();
+        assert!(
+            !root.join("__cluster/lock.json").exists(),
+            "clean shutdown releases the lock {}",
+            String::from_utf8_lossy(&held_lock)
+        );
+        let commits_after = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .list_commits(None)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(commits_after, commits_before + 1);
+    }
 }
 
 /// HTTP ownership and retry safety need request/body scheduling and cannot be

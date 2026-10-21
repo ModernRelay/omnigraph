@@ -139,10 +139,16 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
     let mut pipeline = Vec::new();
     let mut bound_vars = HashSet::new();
     let mut fresh = FreshNames::default();
+    let ranked = query
+        .orders
+        .first()
+        .map(|order| order.expr.ranked_variables())
+        .unwrap_or_default();
 
     lower_clauses(
         catalog,
         &query.scope,
+        &ranked,
         &mut pipeline,
         &mut bound_vars,
         &HashSet::new(),
@@ -329,9 +335,12 @@ fn lower_single_mutation(catalog: &Catalog, op: &CheckedMutationOp) -> Result<Mu
     }
 }
 
+/// `ranked` names the bindings the query's leading order key ranks; a
+/// correlated block has no order and passes none.
 fn lower_clauses(
     catalog: &Catalog,
     scope: &CheckedScope,
+    ranked: &[&str],
     pipeline: &mut Vec<IROp>,
     bound_vars: &mut HashSet<String>,
     outer_physical_names: &HashSet<String>,
@@ -368,6 +377,11 @@ fn lower_clauses(
     // order.  The first binding in each component becomes the root (gets
     // a NodeScan); all other bindings in the same component are deferred
     // — their inline filters become post-Expand Filter ops.
+    //
+    // A component holding a binding the leading order key ranks roots there
+    // instead, whatever the declaration order: the ranking starts the
+    // traversal. A ranked binding only a traversal introduces gets a NodeScan
+    // of its checked type, so declaring it does not change the plan.
 
     let binding_set: HashSet<&str> = bindings.iter().map(|b| b.variable.as_str()).collect();
 
@@ -391,14 +405,29 @@ fn lower_clauses(
         .iter()
         .filter_map(|f| f.text_search_subject())
         .collect();
+    // A ranked node binding no declaration introduces, keyed by the
+    // component binding whose place in declaration order its NodeScan takes
+    // (`None`: a component with no declared binding, scanned after the rest).
+    let mut ranked_scans: Vec<(Option<&str>, &str, &str)> = Vec::new();
+    let ranked_nodes: Vec<(&str, &str)> = ranked
+        .iter()
+        .filter_map(|var| match scope.bindings.get(*var) {
+            Some(BoundVariable::Node { type_name }) => Some((*var, type_name.as_str())),
+            Some(BoundVariable::Edge { .. }) | None => None,
+        })
+        .collect();
 
-    for binding in &bindings {
-        if component_visited.contains(binding.variable.as_str()) {
+    let starts = bindings
+        .iter()
+        .map(|binding| binding.variable.as_str())
+        .chain(ranked_nodes.iter().map(|(var, _)| *var));
+    for start in starts {
+        if component_visited.contains(start) {
             continue;
         }
-        // BFS from this binding through the traversal graph
+        // BFS from this variable through the traversal graph
         let mut queue = VecDeque::new();
-        queue.push_back(binding.variable.as_str());
+        queue.push_back(start);
         let mut component_bindings: Vec<&str> = Vec::new();
         let mut component_vars: Vec<&str> = Vec::new();
 
@@ -425,7 +454,27 @@ fn lower_clauses(
             .copied()
             .filter(|var| !bound_vars.contains(*var))
             .collect();
-        let root = scan_root(&inner_bindings, reaches_outer, &searched);
+        let ranked_here: Vec<(&str, &str)> = ranked_nodes
+            .iter()
+            .copied()
+            .filter(|(var, _)| component_vars.contains(var) && !bound_vars.contains(*var))
+            .collect();
+        let root = match ranked_here[..] {
+            [] => scan_root(&inner_bindings, reaches_outer, &searched),
+            [(var, type_name)] => {
+                let declared = inner_bindings.iter().position(|binding| *binding == var);
+                if declared.is_none() {
+                    ranked_scans.push((component_bindings.first().copied(), var, type_name));
+                }
+                declared
+            }
+            _ => {
+                return Err(CompilerError::Plan(format!(
+                    "the leading order key ranks {} bindings one traversal connects; the type checker refuses that rrf()",
+                    ranked_here.len()
+                )));
+            }
+        };
         for (index, var) in inner_bindings.into_iter().enumerate() {
             if Some(index) != root {
                 deferred_set.insert(var.to_string());
@@ -444,6 +493,14 @@ fn lower_clauses(
 
     // Lower bindings into NodeScan ops (skip deferred ones)
     for binding in &bindings {
+        ranked_scans.retain(|&(anchor, variable, type_name)| {
+            if anchor != Some(binding.variable.as_str()) {
+                return true;
+            }
+            pipeline.push(ranked_root_scan(variable, type_name));
+            bound_vars.insert(variable.to_string());
+            false
+        });
         let binding_filters = build_binding_filters(binding, &ctx)?;
 
         // A variable the outer pattern already bound (a negation's inner
@@ -474,6 +531,11 @@ fn lower_clauses(
             filters: binding_filters,
         });
         bound_vars.insert(binding.variable.clone());
+    }
+    // The ranked roots of components no declared binding belongs to.
+    for (_, variable, type_name) in ranked_scans {
+        pipeline.push(ranked_root_scan(variable, type_name));
+        bound_vars.insert(variable.to_string());
     }
 
     // Lower traversals into Expand ops.
@@ -662,6 +724,7 @@ fn lower_clauses(
         lower_clauses(
             catalog,
             &block.inner,
+            &[],
             &mut inner_pipeline,
             &mut inner_bound,
             &physical_names,
@@ -852,6 +915,16 @@ fn build_binding_filters(binding: &CheckedBinding, ctx: &LowerCtx<'_>) -> Result
         )?);
     }
     Ok(filters)
+}
+
+/// The `NodeScan` of a ranked binding only a traversal introduces: every row
+/// of its checked type, filtered later like any other root.
+fn ranked_root_scan(variable: &str, type_name: &str) -> IROp {
+    IROp::NodeScan {
+        variable: variable.to_string(),
+        type_name: type_name.to_string(),
+        filters: Vec::new(),
+    }
 }
 
 /// The index of the component binding that keeps its `NodeScan`: the first one, or,

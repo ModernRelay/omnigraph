@@ -163,7 +163,7 @@ Filter with graph traversal before invoking vector or text ranking. Ranking over
 ```gq
 query related_chunks($artifact_slug: String, $q: Vector(1536)) {
     match {
-        $c: Chunk                                 // declare the ranked binding first
+        $c: Chunk                                 // the ranked binding
         $c partOfArtifact $a                      // scope: only this artifact's chunks
         $a.slug = $artifact_slug
     }
@@ -175,11 +175,11 @@ query related_chunks($artifact_slug: String, $q: Vector(1536)) {
 
 Don't rank over the entire chunk set if you know a traversal can narrow it first.
 
-Declare the ranked binding first and reach the scoping node through the
-traversal. A `nearest` or `bm25` order, alone or as an `rrf` arm, on a variable
-that a traversal introduces (`$a: InformationArtifact { … }` first, then
-`$c partOfArtifact $a`, ranked on `$c`) is refused when the query runs:
-"a traversal destination, which engine v2 does not support".
+The ranked binding starts the traversal whichever binding `match` declares
+first, and whether or not it is declared: with `$a: InformationArtifact { … }`
+first, then `$c partOfArtifact $a`, ranked on `$c`, the query ranks `Chunk`
+and keeps the chunks the traversal reaches. An `rrf` whose two arms rank two
+bindings one traversal connects is refused at type checking (`T59`).
 
 A standalone `nearest` ordering widens an underfilled candidate set, finally
 using an exact scan if needed to fill the limit with available survivors.

@@ -2,7 +2,7 @@
 use super::prepare::{ChangeFilter, CommitListSelection, Pagination};
 use super::{CommitCommand, HistoryScope};
 use crate::client::{self, GraphClient};
-use crate::helpers::{confirm_destructive, write_target};
+use crate::helpers::confirm_destructive;
 use crate::output::{
     CommitChangesHumanStream, CommitChangesJsonStream, write_commit_changes_human,
     write_commit_human, write_commit_list_human, write_json,
@@ -20,7 +20,6 @@ pub(crate) async fn run_commit(
 ) -> Result<()> {
     match command {
         CommitCommand::List {
-            uri,
             branch,
             unpublished,
             unattached,
@@ -31,14 +30,11 @@ pub(crate) async fn run_commit(
             let client = match managed_client {
                 Some(client) => client,
                 None => {
-                    GraphClient::resolve(
+                    GraphClient::from_target(
                         scope.operator,
-                        scope.capability,
-                        scope.server,
+                        scope.target,
                         scope.graph,
-                        uri,
-                        scope.profile,
-                        scope.store,
+                        None,
                         stderr,
                     )
                     .await?
@@ -64,30 +60,15 @@ pub(crate) async fn run_commit(
                 write_commit_list_human(&payload, stdout)?;
             }
         }
-        CommitCommand::Publish {
-            uri,
-            commit_id,
-            json,
-        } => {
-            let client = GraphClient::resolve_with_policy(
+        CommitCommand::Publish { commit_id, json } => {
+            let client = GraphClient::from_target(
                 scope.operator,
-                scope.capability,
-                scope.server,
+                scope.target,
                 scope.graph,
-                uri,
                 scope.actor,
-                scope.profile,
-                scope.store,
                 stderr,
             )
             .await?;
-            write_target(
-                scope.quiet,
-                "commit publish",
-                client.uri(),
-                client.is_remote(),
-                stderr,
-            )?;
             let commit = client.commit_publish(&commit_id, stderr).await?;
             if json {
                 write_json(&commit, stdout)?;
@@ -100,31 +81,16 @@ pub(crate) async fn run_commit(
                 )?;
             }
         }
-        CommitCommand::Drop {
-            uri,
-            commit_id,
-            json,
-        } => {
-            let client = GraphClient::resolve_with_policy(
+        CommitCommand::Drop { commit_id, json } => {
+            let client = GraphClient::from_target(
                 scope.operator,
-                scope.capability,
-                scope.server,
+                scope.target,
                 scope.graph,
-                uri,
                 scope.actor,
-                scope.profile,
-                scope.store,
                 stderr,
             )
             .await?;
             confirm_destructive("commit drop", client.uri(), scope.yes, json, input, stderr)?;
-            write_target(
-                scope.quiet,
-                "commit drop",
-                client.uri(),
-                client.is_remote(),
-                stderr,
-            )?;
             client.commit_drop(&commit_id, stderr).await?;
             if json {
                 write_json(
@@ -138,22 +104,15 @@ pub(crate) async fn run_commit(
                 writeln!(stdout, "dropped commit {commit_id}")?;
             }
         }
-        CommitCommand::Show {
-            uri,
-            commit_id,
-            json,
-        } => {
+        CommitCommand::Show { commit_id, json } => {
             let client = match managed_client {
                 Some(client) => client,
                 None => {
-                    GraphClient::resolve(
+                    GraphClient::from_target(
                         scope.operator,
-                        scope.capability,
-                        scope.server,
+                        scope.target,
                         scope.graph,
-                        uri,
-                        scope.profile,
-                        scope.store,
+                        None,
                         stderr,
                     )
                     .await?
@@ -167,7 +126,6 @@ pub(crate) async fn run_commit(
             }
         }
         CommitCommand::Changes {
-            uri,
             commit_id,
             limit,
             page_token,
@@ -178,17 +136,9 @@ pub(crate) async fn run_commit(
             json,
         } => {
             let settings = client::parse_set_flags(&settings)?;
-            let client = GraphClient::resolve(
-                scope.operator,
-                scope.capability,
-                scope.server,
-                scope.graph,
-                uri,
-                scope.profile,
-                scope.store,
-                stderr,
-            )
-            .await?;
+            let client =
+                GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                    .await?;
             let filter = ChangeFilter::from_args(kinds, types, ops);
             let filter = filter.as_args();
             let pagination = Pagination::from_args(page_token, limit);

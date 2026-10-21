@@ -16,9 +16,9 @@ use omnigraph::instrumentation::{QueryIoProbes, capture_query_io_probes, with_qu
 use omnigraph::loader::LoadMode;
 use omnigraph::{MutationReceipt, Session};
 use omnigraph_compiler::query::ast::{
-    BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite, EmptyFile, Expr,
-    FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt, UnattachedBase,
-    show_statement_name,
+    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite,
+    EmptyFile, Expr, FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt,
+    UnattachedBase, show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::{
@@ -289,7 +289,7 @@ pub struct ControlStep {
 pub enum ControlWrite {
     Create {
         name: String,
-        from: Option<String>,
+        from: Option<BranchCreateFrom>,
         expect: WriteExpect,
     },
     Delete {
@@ -2238,11 +2238,29 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                     source: source.clone(),
                                 }
                             }
-                            BranchStmt::Write(write) => Pending::Control {
-                                ordinal,
-                                prefix: file.settings,
-                                write: ControlSource::Branch(write),
-                            },
+                            BranchStmt::Write(write) => {
+                                if let BranchWrite::Create {
+                                    from: Some(BranchCreateFrom::Commit(commit)),
+                                    ..
+                                } = &write
+                                    && let Some(name) = bound_operand(commit)
+                                {
+                                    if !bound_names.contains(name) {
+                                        return Err(format!(
+                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                                        ));
+                                    }
+                                    if source.matches("${").count() == 1 {
+                                        substitutable_lines
+                                            .extend(section.body.iter().map(|(i, _)| *i));
+                                    }
+                                }
+                                Pending::Control {
+                                    ordinal,
+                                    prefix: file.settings,
+                                    write: ControlSource::Branch(write),
+                                }
+                            }
                         });
                         continue;
                     }
@@ -3347,11 +3365,11 @@ fn check_planned_results(bound: &BoundPlan, result: &QueryResult) -> Result<(), 
     Ok(())
 }
 
-/// The executed plan, its explain document and the same run's report rows.
+/// The executed plan, its explain document and the same run's validated report.
 struct Inspection {
     plan: BoundPlan,
     explain: Value,
-    rows: Result<Vec<report::Row>, String>,
+    report: Result<report::Report, String>,
 }
 
 async fn run_query_step(
@@ -3402,10 +3420,18 @@ async fn run_query_step(
         let outcome = outcome.map_err(&fail)?;
         match outcome {
             Ok(run) => {
+                let explain = run.explain.to_value();
+                let report = report::read_report(&run.report).and_then(|report| {
+                    let profile = run
+                        .profile()
+                        .map_err(|error| format!("profile failed: {error}"))?;
+                    report.validate_ann(&explain, &profile)?;
+                    Ok(report)
+                });
                 let inspection = Inspection {
                     plan: run.plan,
-                    explain: run.explain.to_value(),
-                    rows: report::report_rows(&run.report),
+                    explain,
+                    report,
                 };
                 (Ok(run.result), counts, Some(inspection))
             }
@@ -3427,7 +3453,7 @@ async fn run_query_step(
         return Err(fail(violation));
     }
     if let Some(run) = &inspection {
-        run.rows.as_ref().map_err(|error| fail(error.clone()))?;
+        run.report.as_ref().map_err(|error| fail(error.clone()))?;
     }
     match &step.expect {
         QueryExpect::Rows {
@@ -3440,10 +3466,15 @@ async fn run_query_step(
             if let Some(run) = &inspection {
                 check_bound_plan_round_trip(&run.plan).map_err(&fail)?;
             }
-            if let (Some(plan), Some(Inspection { explain, rows, .. })) = (&step.plan, &inspection)
+            if let (
+                Some(plan),
+                Some(Inspection {
+                    explain, report, ..
+                }),
+            ) = (&step.plan, &inspection)
             {
                 validate_plan_columns(&plan.lines, &session.catalog()).map_err(&fail)?;
-                let report = rows.as_ref().ok().map(Vec::as_slice);
+                let report = report.as_ref().ok();
                 if let Some(mismatch) = plan_mismatch(&plan.lines, explain, report) {
                     return Err(fail(format!(
                         "{mismatch}\nexplain document:\n{}",
@@ -3893,11 +3924,17 @@ async fn run_control_step(
             from,
             expect,
         } => {
-            let parent = from.as_deref().unwrap_or(MAIN_BRANCH);
+            let start = match from {
+                Some(BranchCreateFrom::Commit(commit)) => ReadTarget::snapshot(SnapshotId::new(
+                    resolve_operand(commit, bindings).map_err(&fail)?,
+                )),
+                Some(BranchCreateFrom::Branch(parent)) => ReadTarget::branch(parent.as_str()),
+                None => ReadTarget::branch(MAIN_BRANCH),
+            };
             let outcome = operation(
                 host,
                 step.ordinal,
-                db.branch_create_from_as(ReadTarget::branch(parent), branch, None),
+                db.branch_create_from_as(start, branch, None),
             )
             .await
             .map_err(&fail)?;
@@ -3977,7 +4014,7 @@ async fn run_control_step(
             let executed = outcome.as_ref().ok().map(|receipt| {
                 (
                     receipt.plan.as_ref().map(|explain| explain.to_value()),
-                    receipt.executed,
+                    receipt.executed.clone(),
                 )
             });
             check_write_expect(host, name, expect, outcome).map_err(&fail)?;

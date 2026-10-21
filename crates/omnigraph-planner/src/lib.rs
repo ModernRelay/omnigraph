@@ -54,9 +54,9 @@ pub use cost::{
     AccessPath, AntiJoinStrategy, CSR_BUILD_FACTOR, CoverageProvenance, ExpandCostInputs,
     ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO,
     IndexCoverage, PROBE_CHUNK_KEYS, SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs,
-    chain_rows, choose_access_path, choose_anti_join_strategy, choose_expand_mode,
-    choose_validate_access, direction_probe_factor, estimate_rows, executed_hops,
-    hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
+    ValidateIndexCoverage, chain_rows, choose_access_path, choose_anti_join_strategy,
+    choose_expand_mode, choose_validate_access, direction_probe_factor, estimate_rows,
+    executed_hops, hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
 };
 pub use error::PlanError;
 pub use explain::Explain;
@@ -77,9 +77,9 @@ pub use passes::{PassId, PassRow, PassStage, pass_rows};
 pub use physical::{
     Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, GatePolicy, Hop,
     HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OperatorRow, OrderKey, OverfetchRung,
-    PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineSink, PipelineSource, PipelineSpec,
-    Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind, RankScope,
-    RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
+    PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineShape, PipelineSink, PipelineSource,
+    PipelineSpec, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind,
+    RankScope, RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
 };
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;

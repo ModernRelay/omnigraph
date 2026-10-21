@@ -79,6 +79,7 @@ impl PinnedGraphManifest {
             let mut snapshot = ManifestCoordinator::snapshot_from_state(
                 root_uri,
                 super::read_manifest_state(&dataset).await?,
+                dataset.session(),
             );
             snapshot.graph_branch = native
                 .as_deref()
@@ -101,6 +102,7 @@ impl PinnedGraphManifest {
             root_uri,
             dataset.version().version,
             dataset.manifest().branch.as_deref(),
+            &dataset.session(),
         )?;
         Ok(Self {
             dataset,
@@ -315,16 +317,27 @@ impl ManifestCoordinator {
     /// Resolve a logical graph commit by immutable physical coordinates. A
     /// recreated logical name may reuse its version number, but never its
     /// graph commit id; retired histories remain eligible lookup candidates.
+    /// Test-only: production reads pass the reading handle's control session.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn pinned_graph_commit(
         root_uri: &str,
         commit: &GraphCommit,
     ) -> Result<PinnedGraphManifest> {
-        let main = super::open_manifest_dataset_native_with_session(
+        Self::pinned_graph_commit_with_session(
             root_uri,
-            None,
+            commit,
             &crate::lance_access::control_session(),
         )
-        .await?;
+        .await
+    }
+
+    pub async fn pinned_graph_commit_with_session(
+        root_uri: &str,
+        commit: &GraphCommit,
+        session: &Arc<lance::session::Session>,
+    ) -> Result<PinnedGraphManifest> {
+        let main =
+            super::open_manifest_dataset_native_with_session(root_uri, None, session).await?;
         let legacy = ExtentCache::default();
         let mut candidates = Vec::new();
         match commit.graph_branch.as_deref() {
@@ -382,17 +395,28 @@ impl ManifestCoordinator {
     }
 
     /// The commit graph of every retired branch incarnation by native ref,
-    /// over the settled commits `history` has read.
+    /// over the settled commits `history` has read. Test-only: production
+    /// reads pass the reading handle's control session.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn retired_commit_graphs(
         root_uri: &str,
         history: &HistoryCache,
     ) -> Result<Vec<(String, CommitGraph)>> {
-        let main = super::open_manifest_dataset_native_with_session(
+        Self::retired_commit_graphs_with_session(
             root_uri,
-            None,
+            history,
             &crate::lance_access::control_session(),
         )
-        .await?;
+        .await
+    }
+
+    pub async fn retired_commit_graphs_with_session(
+        root_uri: &str,
+        history: &HistoryCache,
+        session: &Arc<lance::session::Session>,
+    ) -> Result<Vec<(String, CommitGraph)>> {
+        let main =
+            super::open_manifest_dataset_native_with_session(root_uri, None, session).await?;
         let mut names = retired_manifest_branches(&main)
             .await?
             .into_keys()

@@ -48,7 +48,12 @@ load validate unique node:Person unique [email]: access delta
 load validate retained_edges node:Person edge:Knows from: access probe
 load validate retained_edges node:Person edge:Knows to: access probe
 load write: overwrite fragments
+load pipeline 0: CsvSource => Validate
+load pipeline 1: Validate -> FragmentWrite => consumer after 0
 load executed: partitions 1 rows 3
+load executed CsvSource: rows 3
+load executed Validate: rows 3
+load executed FragmentWrite: rows 3
 
 --- csv knows.csv
 from,to,w
@@ -63,10 +68,15 @@ load csv "knows.csv" into edge:Knows mode overwrite header
 --- expect plan
 load route: plan
 load scan: partitions 1 fallback single_scan
-load validate edge_ri edge:Knows from Person: access probe
-load validate edge_ri edge:Knows to Person: access probe
+load validate edge_ri edge:Knows from Person: access scan
+load validate edge_ri edge:Knows to Person: access scan
 load write: overwrite fragments
+load pipeline 0: CsvSource => Validate
+load pipeline 1: Validate -> FragmentWrite => consumer after 0
 load executed: partitions 1 rows 2
+load executed CsvSource: rows 2
+load executed Validate: rows 2
+load executed FragmentWrite: rows 2
 
 --- csv knows_more.csv
 from,to,w
