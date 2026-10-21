@@ -283,6 +283,37 @@ pub(crate) struct RemoteRefusalOutput<'a> {
 
 impl std::error::Error for RemoteErrorCli {}
 
+/// A refusal the CLI decides itself, under the registry code a server answers
+/// the same condition with. Its body carries that code, so a classified
+/// failure takes the code's action and a JSON caller reads the same `code`
+/// from either transport.
+#[derive(Debug)]
+pub(crate) struct CodedRefusal {
+    pub(crate) code: omnigraph_api_types::ErrorCode,
+    pub(crate) message: String,
+}
+
+impl CodedRefusal {
+    pub(crate) fn report(
+        code: omnigraph_api_types::ErrorCode,
+        message: impl Into<String>,
+    ) -> color_eyre::Report {
+        Self {
+            code,
+            message: message.into(),
+        }
+        .into()
+    }
+}
+
+impl std::fmt::Display for CodedRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodedRefusal {}
+
 /// Build the typed CAS-lost error for the embedded transport, mirroring the
 /// structured body a server would have returned so `--json` output is
 /// transport-uniform. `message` is the engine error's own `Display` text, so

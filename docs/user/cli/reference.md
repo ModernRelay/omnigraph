@@ -68,11 +68,12 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
 | `target list/show/add/remove/import` | Inspect, edit or import complete target entries | local |
 | `credential get` | Export a server target’s static token to a pipe | registered server target |
+| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or served |
 | `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its stored token, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
 | `organization members/invitations` | Administer organization membership and invitations | managed account target |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
-| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`target`, `credential`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
+| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`target`, `credential`, `access`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 ## Query inputs and output
 
@@ -97,9 +98,8 @@ envelope pretty and the `rows` array compact; a refusal follows [Diagnostics](..
 
 ### Machine-readable read and write positions
 
-`query --json` returns `graph_commit_id` when its read snapshot has a graph
-head. The id and rows share one pinned snapshot; use that id for a later
-conditional mutation.
+`query --json` returns `graph_commit_id` when its read snapshot has a graph head. The id and
+rows share one pinned snapshot; use that id for a later conditional mutation.
 
 Successful `mutate --json` and `load --json` responses include `commit`, the exact commit published by
 that attempt: `graph_commit_id`, optional `graph_branch`, `graph_manifest_version`, optional parent and
