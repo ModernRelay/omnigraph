@@ -3748,8 +3748,13 @@ fn composed_http_routes_refuse_crossing_captured_auth_boundaries() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            diagnostic.contains("credential_scope_mismatch")
-                || (nested_auth.is_empty() && diagnostic.contains("auth")),
+            if !extra.is_empty() {
+                diagnostic.contains("target_config_invalid")
+                    && diagnostic.contains("targets.nested.default_graph")
+            } else {
+                diagnostic.contains("credential_scope_mismatch")
+                    || (nested_auth.is_empty() && diagnostic.contains("auth"))
+            },
             "{root_auth}/{nested_auth}/{suffix}: {diagnostic}"
         );
         assert!(!diagnostic.contains("parent-secret"));
@@ -5633,7 +5638,7 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
              cluster_id: cluster\n    cluster_incarnation: one\n    default_graph: knowledge\n\
              connections:\n  service:\n    api: https://api.example.com\n    organization_id: org\n    \
              default_auth: human\n    auth:\n      human: {{provider: omnigraph}}\n",
-            graph.to_string_lossy()
+            url::Url::from_file_path(&graph).unwrap()
         ),
     )
     .unwrap();
