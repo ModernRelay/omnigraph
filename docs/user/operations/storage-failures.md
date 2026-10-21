@@ -106,7 +106,9 @@ paths; each records the failure's class.
 
 - `engine failure without definite completion evidence`: the failure's class,
   the status its response sends, and whether its uncertainty is scoped to its
-  storage keys.
+  storage keys. When the failure is a publication whose outcome is unknown, its
+  `publication` field names the graph commit, so you can look the commit up
+  later and see whether it landed.
 - `owned write ended without a definite outcome`: the status its response
   sends, 500 for `outcome_unknown`, and whether it contained the process.
 - `manifest request outcome unknown; re-issuing the identical conditional

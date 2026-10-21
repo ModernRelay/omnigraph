@@ -1452,6 +1452,9 @@ impl ApiError {
 
     fn from_omni(err: OmniError) -> Self {
         let cause = redacted_cause::RedactedCause::of(&err);
+        // An in-doubt publication's graph commit, logged as its own field: the
+        // message that also names it can carry storage paths.
+        let publication = err.publication_id().map(str::to_owned);
         let (err, evidence) = err.into_completion_evidence();
         let storage_outcome = err.is_manifest_publish_in_doubt()
             || matches!(&err, OmniError::Storage(_) | OmniError::Io(_));
@@ -1767,13 +1770,14 @@ impl ApiError {
         let response = response.with_request_facts();
         if response.completion_uncertain {
             // The record of a write's unknown outcome: the failure's class,
-            // the status its response sends, and whether its uncertainty is
-            // scoped to its keys and branch, never its message, which can
-            // carry object URIs. It shares the request's span with the
-            // containment log.
+            // the status its response sends, whether its uncertainty is
+            // scoped to its keys and branch and, for a publication in doubt,
+            // its graph commit, never its message, which can carry object
+            // URIs. It shares the request's span with the containment log.
             tracing::warn!(
                 status = %response.status(),
                 ?cause,
+                publication = publication.as_deref(),
                 scoped = response.scoped_unknown,
                 "engine failure without definite completion evidence"
             );
@@ -3393,6 +3397,42 @@ pub(crate) mod test_log_capture {
 #[cfg(test)]
 mod log_filter_tests {
     use super::test_log_capture::Capture;
+
+    /// An unknown publication's log line names its graph commit in its own
+    /// field, so an operator can look the commit up, and never the message,
+    /// which can carry storage paths. Another uncertain failure names none.
+    #[test]
+    fn an_unknown_publication_logs_its_commit_and_no_message_issue_1067() {
+        let capture = Capture::default();
+        let logs = tracing::subscriber::set_default(capture.subscriber("debug"));
+        let error =
+            super::ApiError::from_omni(omnigraph::error::OmniError::manifest_publish_in_doubt(
+                "01JCOMMITUNKNOWN",
+                "graph commit 01JCOMMITUNKNOWN may be durable: \
+                 s3://bucket/private/__manifest/_versions/7.manifest",
+            ));
+        assert!(error.completion_uncertain());
+        let storage = super::ApiError::from_omni(omnigraph::error::OmniError::Storage(
+            omnigraph::error::StorageFailure::new(
+                omnigraph::error::StorageFailureKind::Unknown,
+                "storage: s3://bucket/private/node/data/1.lance",
+            ),
+        ));
+        assert!(storage.completion_uncertain());
+        drop(logs);
+        let output = capture.output();
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.contains("engine failure without definite completion evidence"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{output}");
+        assert!(
+            lines[0].contains(r#"publication="01JCOMMITUNKNOWN""#),
+            "{output}"
+        );
+        assert!(!lines[1].contains("publication="), "{output}");
+        assert!(!output.contains("s3://bucket"), "{output}");
+    }
 
     #[test]
     fn restricted_dependency_logs_remain_filtered_under_specific_directives() {
