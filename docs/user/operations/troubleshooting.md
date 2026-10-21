@@ -163,7 +163,7 @@ between graph roots.
   [ownership transfer](../deployment.md#writer-topology).
 - Directory boot reads `cluster.yaml` to resolve storage, but served graph,
   query, and policy resources come from applied state. Submit configuration
-  changes with `cluster apply --server` for live activation.
+  changes with `cluster apply --target` for live activation.
 - By default one graph that cannot open is quarantined while healthy graphs
   serve. Use `--require-all-graphs` when partial startup is unacceptable.
 - `external_blob_base_overlaps_storage_root`: an `external_blobs` base lies
@@ -229,10 +229,10 @@ See [Maintenance](maintenance.md) and [Deployment](../deployment.md).
 
 ```bash
 omnigraph version
-omnigraph snapshot --store ./graph.omni --json
-omnigraph commit list --store ./graph.omni --json
-omnigraph cluster status --config ./company-brain --json
-omnigraph repair ./graph.omni --json
+omnigraph snapshot --target ./graph.omni --json
+omnigraph commit list --target ./graph.omni --json
+omnigraph cluster status --target ./company-brain --json
+omnigraph repair --target ./graph.omni --json
 ```
 
 For server requests, retain the HTTP status, response body, request path,

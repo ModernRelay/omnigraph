@@ -3227,7 +3227,7 @@ async fn numeric_snapshot_below(source: Source, archived_source: &str) {
     ManifestCoordinator::open(root)
         .await
         .unwrap()
-        .create_branch("late")
+        .create_branch("late", None)
         .await
         .unwrap();
     let on_main = publish(root, None, 10, HISTORY_RELEASE_BYTES).await;

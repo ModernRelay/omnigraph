@@ -7,6 +7,7 @@ mod bound_plan;
 mod fixture_bounds;
 mod load_plan;
 mod lower_walk;
+mod pipeline_cut;
 mod query_plan;
 mod registry;
 mod scan_access;

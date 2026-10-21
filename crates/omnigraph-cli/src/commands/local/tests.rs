@@ -2,6 +2,24 @@ use std::io::{self, Cursor, Read, Write};
 
 use super::*;
 
+fn target() -> crate::targets::ResolvedTarget {
+    crate::targets::ResolvedTarget::new(
+        crate::targets::TargetBinding::Server {
+            endpoint: "https://prod.example".into(),
+            auth: crate::targets::ServerAuth::Token {
+                owner: "prod".into(),
+            },
+            default_graph: None,
+        },
+        crate::targets::TargetProvenance::Explicit {
+            name: "prod".into(),
+        },
+    )
+}
+fn configure(home: &std::path::Path) {
+    std::fs::write(home.join("config.yaml"), "target_config_version: 1\ntargets:\n  prod:\n    kind: server\n    endpoint: https://prod.example\n    credential: prod\n").unwrap();
+}
+
 struct ClosedOutput;
 
 impl Write for ClosedOutput {
@@ -16,13 +34,14 @@ impl Write for ClosedOutput {
 #[test]
 fn login_reads_one_line_and_explicit_token_does_not_read_stdin() {
     let home = tempfile::tempdir().unwrap();
+    configure(home.path());
     let operator = InvocationConfig::at(Some(home.path().to_path_buf()), None);
     let mut stdin = Cursor::new(b"  first-token  \r\nsecond-token\n");
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     run_login(
         &operator,
-        "prod".into(),
+        &target(),
         None,
         true,
         &mut stdin,
@@ -39,7 +58,8 @@ fn login_reads_one_line_and_explicit_token_does_not_read_stdin() {
         Some("first-token")
     );
     let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-    assert_eq!(report["declared"], false);
+    assert_eq!(report["target"], "prod");
+    assert_eq!(report["credential_stored"], true);
     assert!(!String::from_utf8_lossy(&stdout).contains("first-token"));
     assert!(!String::from_utf8_lossy(&stderr).contains("first-token"));
 
@@ -51,7 +71,7 @@ fn login_reads_one_line_and_explicit_token_does_not_read_stdin() {
     }
     run_login(
         &operator,
-        "prod".into(),
+        &target(),
         Some(" explicit-token ".into()),
         false,
         &mut Unreadable,
@@ -70,6 +90,7 @@ fn login_reads_one_line_and_explicit_token_does_not_read_stdin() {
 #[test]
 fn invalid_login_input_precedes_config_and_keeps_credentials_unchanged() {
     let home = tempfile::tempdir().unwrap();
+    configure(home.path());
     std::fs::write(home.path().join("config.yaml"), "servers: [\n").unwrap();
     let operator = InvocationConfig::at(Some(home.path().to_path_buf()), None);
     let path = operator.credentials_path().unwrap();
@@ -80,7 +101,7 @@ fn invalid_login_input_precedes_config_and_keeps_credentials_unchanged() {
         let mut stderr = Vec::new();
         let error = run_login(
             &operator,
-            "prod".into(),
+            &target(),
             None,
             false,
             &mut Cursor::new(bytes),
@@ -98,13 +119,14 @@ fn invalid_login_input_precedes_config_and_keeps_credentials_unchanged() {
 #[test]
 fn login_and_logout_output_failures_preserve_the_completed_credential_change() {
     let home = tempfile::tempdir().unwrap();
+    configure(home.path());
     let operator = InvocationConfig::at(Some(home.path().to_path_buf()), None);
     let path = operator.credentials_path().unwrap();
     crate::operator::rewrite_credentials_at(&path, "other", Some("untouched")).unwrap();
     for json in [false, true] {
         let error = run_login(
             &operator,
-            "prod".into(),
+            &target(),
             Some("stored".into()),
             json,
             &mut io::empty(),
@@ -122,7 +144,7 @@ fn login_and_logout_output_failures_preserve_the_completed_credential_change() {
                 .as_deref(),
             Some("stored")
         );
-        let error = run_logout(&operator, "prod".into(), json, &mut ClosedOutput).unwrap_err();
+        let error = run_logout(&operator, &target(), json, &mut ClosedOutput).unwrap_err();
         assert_eq!(
             error.downcast_ref::<io::Error>().unwrap().kind(),
             io::ErrorKind::BrokenPipe
@@ -141,51 +163,9 @@ fn login_and_logout_output_failures_preserve_the_completed_credential_change() {
 }
 
 #[test]
-fn profile_reports_use_the_captured_config_and_supplied_warning_sink() {
-    let home = tempfile::tempdir().unwrap();
-    let path = home.path().join("config.yaml");
-    std::fs::write(&path, "future: true\nservers:\n  prod:\n    url: https://original.example\nprofiles:\n  selected:\n    server: prod\n").unwrap();
-    let operator = InvocationConfig::at(Some(home.path().to_path_buf()), Some("selected".into()));
-    let mut stderr = Vec::new();
-    let mut stdout = Vec::new();
-    run_profile(
-        &operator,
-        ProfileCommand::List { json: true },
-        &mut stdout,
-        &mut stderr,
-    )
-    .unwrap();
-    let listed: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-    assert_eq!(listed[0]["active"], true);
-    assert_eq!(
-        String::from_utf8_lossy(&stderr).matches("warning:").count(),
-        1
-    );
-    std::fs::write(&path, "servers: [\n").unwrap();
-    stdout.clear();
-    run_profile(
-        &operator,
-        ProfileCommand::Show {
-            name: None,
-            json: true,
-        },
-        &mut stdout,
-        &mut stderr,
-    )
-    .unwrap();
-    let shown: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-    assert_eq!(shown["name"], "selected");
-    assert_eq!(shown["endpoint"], "https://original.example");
-    assert_eq!(
-        String::from_utf8_lossy(&stderr).matches("warning:").count(),
-        1
-    );
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "servers: [\n");
-}
-
-#[test]
 fn skill_export_delivery_failure_keeps_the_written_files_and_record() {
     let home = tempfile::tempdir().unwrap();
+    configure(home.path());
     for json in [false, true] {
         let dir = home.path().join(if json { "json" } else { "human" });
         let error = run_skill(
@@ -232,6 +212,7 @@ fn skill_export_delivery_failure_keeps_the_written_files_and_record() {
 #[tokio::test]
 async fn embed_report_failure_keeps_the_completed_output_file() {
     let home = tempfile::tempdir().unwrap();
+    configure(home.path());
     let input = home.path().join("input.jsonl");
     let spec = home.path().join("spec.json");
     std::fs::write(

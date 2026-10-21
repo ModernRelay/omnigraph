@@ -148,16 +148,16 @@ commit has does, so the id discloses nothing (see
 Policy commands read the applied bundle from a cluster:
 
 ```bash
-omnigraph policy validate --cluster ./company-brain --graph knowledge
+omnigraph policy validate --target ./company-brain --graph knowledge
 omnigraph policy test --tests policy.tests.yaml \
-  --cluster ./company-brain --graph knowledge
+  --target ./company-brain --graph knowledge
 omnigraph policy explain \
-  --cluster ./company-brain --graph knowledge \
+  --target ./company-brain --graph knowledge \
   --actor act-alice --action read --branch main
 ```
 
 Edit the policy file or its `applies_to` bindings, then run
-`cluster apply --server URL --config DIR`. The server finishes admitted requests
+`cluster apply --target URL --config DIR`. The server finishes admitted requests
 before activating matching HTTP and engine permissions. Later requests use the
 new rules. Cluster management policy changes take effect in the same deployment;
 a newly granted administrator cannot authorize that grant.
@@ -169,7 +169,7 @@ on a graph, so a client can show only the actions it is allowed instead of
 learning them from a refusal:
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.13" \
+curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.14" \
   "https://graph.example/graphs/knowledge/access?branch=feature&target_branch=main"
 ```
 
@@ -224,15 +224,16 @@ For direct CLI writes, actor resolution is:
 2. `operator.actor` in `~/.omnigraph/config.yaml`;
 3. no actor.
 
-When a policy is installed, a missing actor is denied. Served writes reject
-`--as` because only the server may resolve their actor.
+When a policy is installed, a missing actor is denied. Only the server
+resolves a served write's actor; there `--as` is an assertion the server checks
+against the token ([Assert the actor](server.md#assert-the-actor)).
 
 Successful graph commits record the actor for the whole atomic change. Inspect
 the audit trail with:
 
 ```bash
-omnigraph commit list --store ./graph.omni --json
-omnigraph commit show <COMMIT_ID> --store ./graph.omni --json
+omnigraph commit list --target ./graph.omni --json
+omnigraph commit show <COMMIT_ID> --target ./graph.omni --json
 ```
 
 ## Server startup modes

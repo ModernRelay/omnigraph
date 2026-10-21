@@ -23,6 +23,7 @@ pub mod handle_cache;
 pub mod instrumentation;
 pub mod lance_access;
 pub mod lance_clone;
+pub mod manifest_request;
 pub mod metadata;
 pub mod read_memo;
 pub mod seams;

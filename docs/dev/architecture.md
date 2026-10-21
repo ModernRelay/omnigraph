@@ -54,10 +54,11 @@ embedded caller may use the engine directly; the CLI may use an embedded store
 or the HTTP API; the server hosts multiple graphs from one applied cluster
 revision.
 
-The CLI's [scope resolver](../../crates/omnigraph-cli/src/scope.rs) selects an
-ordinary scope from supplied flags, operator configuration and an ambient profile
-value. `InvocationConfig` captures `OMNIGRAPH_PROFILE` once; configuration loading,
-credential acquisition and server discovery remain outside the pure resolver.
+The CLI's [scope resolver](../../crates/omnigraph-cli/src/scope.rs) selects one
+complete target from explicit `--target` or `defaults.target`. `InvocationConfig`
+captures the operator file once; retired profile or folder routing refuses default
+selection. Applicability is checked before credentials and backend access.
+The resolved destination is retained through storage and HTTP execution.
 
 ## Authority model
 
@@ -122,12 +123,28 @@ delivered refusal.
 Command handlers consume supplied input, terminal status and fallible output
 writers; the process-facing application wrapper supplies the actual standard
 streams. [`InvocationConfig`](../../crates/omnigraph-cli/src/operator.rs) captures
-the operator home and ambient profile once, then reads the configuration lazily
+the operator home once, then reads the strict versioned configuration lazily
 at its first consumer. Every consumer shares that result, including a failed
-load; unknown-key warnings go through the supplied diagnostic writer once.
-Ordinary remote client setup resolves its bearer token before discovery and
-retains it through registry probing and the command. Managed credential renewal
-remains with the managed authentication owner.
+load. [`scope`](../../crates/omnigraph-cli/src/scope.rs) captures one target from
+an explicit name/address or `defaults.target`; command source files never route
+an operation. [`planes`](../../crates/omnigraph-cli/src/planes.rs) rejects
+unsupported backend/operation combinations before credential acquisition.
+Graph selection is explicit or the target's `default_graph`; no discovery result
+selects a graph. Local tooling ignores defaults and rejects irrelevant targets.
+The application reports the resolved destination and selection provenance before
+backend execution, using stderr and no suppressible flag.
+
+Ordinary remote setup acquires an endpoint-bound token once and retains it
+through contract discovery and the command. Managed credential renewal remains
+with the managed authentication owner, using the target's declared mechanism.
+Direct targets capture provider destination settings and pass the same authority
+through cluster admission, control storage and Lance sessions. Bound handles
+never reconstruct an endpoint or account from ambient settings: a catalog
+snapshot keeps the control session it was read with, so its table, contract
+and branch-control reads reuse that session's registry. Existing
+non-CLI engine/server constructors retain their own explicit environment contract.
+The [target RFC](../rfcs/0059-config-cli-coherency.md) records the migration and
+credential/recovery custody requirements.
 
 `commands/query` owns `query`, `mutate` and alias execution. Its
 [pure preparation](../../crates/omnigraph-cli/src/commands/query/prepare.rs)
@@ -148,7 +165,7 @@ the cursor flush. Dedicated commit publication and drop share the application's
 write-outcome observation with their `mutate` statement forms.
 
 `commands/transfer` owns `load`, `export` and Blob commands. Blob input capture
-validates ranges and write preconditions before resolving a graph. Stdin comes
+validates ranges and write preconditions before acquiring the graph client. Stdin comes
 from a supplied reader; file and stdin payloads retain the existing byte bound.
 Load retains its source path: `GraphClient` owns backend-specific input reads and managed limits,
 including the embedded writable open before the source read. Transfer handlers
@@ -157,7 +174,7 @@ application completion with any write evidence retained. Blob output files keep
 their existing deferred open and partial-transfer behavior.
 
 `commands/schema` owns initialization, schema commands and lint. The handlers
-preserve each command's source-read and target-resolution order, including cluster
+receive the captured target and preserve cluster
 ownership refusals before init/apply source reads and offline lint without target
 resolution. They render through supplied writers. Schema apply keeps the existing
 client's write evidence; initialization and system-column upgrade retain their
@@ -182,7 +199,7 @@ finish, then returns the failure with its original ID, root and retained lock.
 Neither path replays work to recover output. Deployment and recovery authority
 remain in the cluster crate.
 
-`commands/local` owns ordinary login/logout, profile inspection, version and
+`commands/local` owns server login/logout, version and
 bundled skill/embedding dispatch. Login reads only one line from the supplied
 reader when no explicit token is present; credential changes use the invocation's
 captured operator home. Skill export and embedding generation finish their file

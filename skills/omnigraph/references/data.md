@@ -52,7 +52,7 @@ edits.
 
 ## `mutate` — Single Edits
 
-Runs either directly (`--store`) or through a server (`--server`/profile):
+Runs either directly or through a server, selected by `--target`:
 
 ```bash
 omnigraph mutate add_signal \
@@ -63,7 +63,7 @@ omnigraph mutate add_signal \
 Or invoke a served stored mutation by name:
 
 ```bash
-omnigraph mutate add_signal --server intel-dev --graph spike \
+omnigraph mutate add_signal --target intel-dev --graph spike \
   --params '{"slug":"sig-foo","name":"Foo","brief":"...","stagingTimestamp":"2026-04-14T00:00:00Z","createdAt":"2026-04-14T00:00:00Z","updatedAt":"2026-04-14T00:00:00Z"}'
 ```
 
@@ -162,16 +162,16 @@ Branches exist for **data review**, not schema changes. Schema goes straight to 
 REPO=s3://my-bucket/repos/spike-intel
 
 # 1. Create feature branch from main
-omnigraph branch create --from main staging-2026-04-14 --store $REPO
+omnigraph branch create --from main staging-2026-04-14 --target $REPO
 
 # 2. Load delta onto the branch (merge mode is typical for review)
-omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode merge $REPO
+omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode merge --target $REPO
 
 # 3. Verify on the branch (reads can target --branch or --snapshot)
-omnigraph query recent_signals --query queries/signals.gq --branch staging-2026-04-14 --store $REPO
+omnigraph query recent_signals --query queries/signals.gq --branch staging-2026-04-14 --target $REPO
 
 # 4. Merge to main and delete the source only after publication
-omnigraph branch merge staging-2026-04-14 --into main --delete-branch --store $REPO
+omnigraph branch merge staging-2026-04-14 --into main --delete-branch --target $REPO
 ```
 
 ### Fork a branch in one shot with `--from`
@@ -217,30 +217,30 @@ type), use a feature branch:
 
 ```bash
 omnigraph load --data risky.jsonl --branch recovery-2026-04-14 \
-  --from main --mode overwrite $REPO
+  --from main --mode overwrite --target $REPO
 # inspect, diff, verify reads
-omnigraph branch merge recovery-2026-04-14 --into main --delete-branch --store $REPO
+omnigraph branch merge recovery-2026-04-14 --into main --delete-branch --target $REPO
 ```
 
 ## Branch Commands (quick reference)
 
 ```bash
-omnigraph branch create --from main <branch-name> --store $REPO
-omnigraph branch list --store $REPO
-omnigraph branch merge <branch-name> --into main --delete-branch --store $REPO
-omnigraph branch delete <branch-name> --store $REPO
+omnigraph branch create --from main <branch-name> --target $REPO
+omnigraph branch list --target $REPO
+omnigraph branch merge <branch-name> --into main --delete-branch --target $REPO
+omnigraph branch delete <branch-name> --target $REPO
 ```
 
-All support `--json` for automation-friendly output. Address the graph with a
-positional `file://`/`s3://`/preview `az://` URI (shown), `--store <uri>`, or
-`--server <name>`.
+All support `--json` for automation-friendly output. Address the graph with
+`--target NAME|ADDRESS`; a named or inline root additionally requires a graph
+selection.
 
 ## Inspecting State After Changes
 
 ```bash
-omnigraph snapshot $REPO --branch main --json           # node/edge entity counts
-omnigraph export $REPO --branch main > graph.jsonl      # full JSONL dump
-omnigraph commit list $REPO --branch main --json        # history
+omnigraph snapshot --target $REPO --branch main --json           # node/edge entity counts
+omnigraph export --target $REPO --branch main > graph.jsonl      # full JSONL dump
+omnigraph commit list --target $REPO --branch main --json        # history
 ```
 
 `export` is the right tool for large-snapshot inspection — don't try to page through the whole graph with read queries.

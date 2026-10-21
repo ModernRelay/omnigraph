@@ -558,6 +558,16 @@ in Seams at an explicit step. A step is one of:
   id lookup or the destination table read once as a hash join's build side;
   it fails when the physical plan holds no such scan, the scan is a table
   scan, or its access path differs.
+  A `scan <Type>[ as $var]: ranked nearest` claim may end in
+  `diagnostics present`, after any fetch, probe-cap or eligibility claims. It
+  requires at least one measured attempt for every selected nearest scan,
+  including each nearest RRF arm. BM25 siblings are excluded. All inspected
+  queries validate present ANN metric names/types, unique scan/rung/attempt
+  identities, physical-scan/probe joins and same-run profile preservation.
+  Optional measurements may be absent; zero is valid. Measurements are neither
+  compared across runs nor included in DST replay observations. Exact native
+  counter oracles and synthetic adapter edge cases remain Rust owners, avoiding
+  a native index-construction language in GQT.
   Projection and filter-read lists are sets. Sort identity keys, RankFuse
   downstream row keys and edge-selection members are exact ordered lists.
   `sort tiebreak [$a.@id, $e.@type, $e.@id]` checks the metadata keys

@@ -173,6 +173,7 @@ pub(super) async fn run_load_statement(
             .load_csv_as_with_receipt(&branch, &request, actor_id.as_deref())
             .await
             .map_err(ApiError::from_omni)?;
+        let executed = receipt.executed_plan().map(api::load_executed_output);
         Ok(ChangeOutput {
             branch: receipt.result.branch,
             query_name,
@@ -181,6 +182,7 @@ pub(super) async fn run_load_statement(
             actor_id,
             commit: Some(api::commit_output(&receipt.commit)),
             outcome: None,
+            executed,
         })
     })
     .await
@@ -378,6 +380,7 @@ pub(super) async fn run_branch_statement(
         actor_id,
         commit,
         outcome: Some(outcome),
+        executed: None,
     })
 }
 
@@ -407,6 +410,7 @@ pub(super) async fn run_commit_statement(
         actor_id,
         commit,
         outcome: Some(outcome),
+        executed: None,
     })
 }
 

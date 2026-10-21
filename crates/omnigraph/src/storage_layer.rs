@@ -72,7 +72,9 @@ pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Immutable allowance captured from the effective session once per operation.
 /// Each existing row, payload, parser and removed-id account has this ceiling;
-/// the accounts remain independent and keep their original scopes.
+/// the accounts remain independent and keep their original scopes. Strict
+/// inserts and overwrites also use it as each native file writer's accumulation
+/// target, which can overshoot and is not a total memory ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WriteBudget(u64);
 
@@ -835,6 +837,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
     ) -> Result<StagedHandle>;
 
     /// Stage a rename-only column alteration; see
@@ -1407,8 +1410,9 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
     ) -> Result<StagedHandle> {
-        TableStore::stage_overwrite_batches(self, snapshot.dataset(), batches)
+        TableStore::stage_overwrite_batches(self, snapshot.dataset(), batches, write_budget)
             .await
             .map(StagedHandle::new)
     }

@@ -4479,7 +4479,7 @@ async fn query_endpoint_answers_an_explain_load_statement_as_rows() {
         assert_eq!(validate["inputs"][0]["node"], "CsvSource", "{physical}");
         assert_eq!(explain_tree(&body, "logical")["node"], "FragmentWrite");
         assert_eq!(explain_plan_rows(&body, "route"), ["engine"], "{body}");
-        assert_eq!(explain_plan_rows(&body, "explain_version"), ["6"], "{body}");
+        assert_eq!(explain_plan_rows(&body, "explain_version"), ["7"], "{body}");
     }
     assert_eq!(
         main_head_commit_id(&app).await,

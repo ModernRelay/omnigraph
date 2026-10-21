@@ -477,13 +477,20 @@ pub(crate) async fn execute(
         .await
 }
 
+/// What a load plan run produced: the sink's count and what each node's
+/// operator did, read from its metrics after the plan ran.
+pub(crate) struct LoadRun {
+    pub(crate) rows: u64,
+    pub(crate) operators: Vec<crate::loader::LoadOperatorExecuted>,
+}
+
 /// A load plan run under the statement's own pool: the sink's one `count`
 /// row read back, every owned producer settled before return.
 pub(crate) async fn execute_load(
     bound: &BoundPlan,
     context: &EngineContext<'_>,
     memory: &LoadMemory,
-) -> Result<u64> {
+) -> Result<LoadRun> {
     let ctx = memory.context();
     ctx.run_owned(async {
         let lowering = Lowering::new(bound, context);
@@ -496,7 +503,10 @@ pub(crate) async fn execute_load(
             .ok_or_else(|| {
                 OmniError::manifest_internal("the load plan's root is not a u64 count")
             })?;
-        Ok(counts.iter().flatten().sum())
+        Ok(LoadRun {
+            rows: counts.iter().flatten().sum(),
+            operators: run::load_operator_rows(&lowered, &bound.plan)?,
+        })
     })
     .await
 }
@@ -536,15 +546,7 @@ async fn execute_with_context(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         for (scan, report) in reports {
-            if !report.probes.is_empty() {
-                executed.decide(
-                    scan,
-                    0,
-                    report::Taken::Probes {
-                        attempts: report.probes,
-                    },
-                );
-            }
+            executed.record_probes(scan, 0, &report);
         }
         return Ok(PlanRun {
             result: QueryResult::new(fused.schema(), vec![fused]),
@@ -580,16 +582,8 @@ async fn execute_with_context(
             .unwrap_or_default()
     };
     let report = nearest_report(reports);
-    if let Some(NearestScan { id, .. }) = &nearest
-        && !report.probes.is_empty()
-    {
-        executed.decide(
-            *id,
-            0,
-            report::Taken::Probes {
-                attempts: report.probes.clone(),
-            },
-        );
+    if let Some(NearestScan { id, .. }) = &nearest {
+        executed.record_probes(*id, 0, &report);
     }
     let mut result_batch = result_batch;
     let mut report = report;
@@ -657,15 +651,7 @@ async fn execute_with_context(
                     Box::pin(run_once(&lowering, ctx, &wider, rung)).await?;
                 executed.record(rows);
                 let retried_report = nearest_report(retried_reports);
-                if !retried_report.probes.is_empty() {
-                    executed.decide(
-                        id,
-                        rung,
-                        report::Taken::Probes {
-                            attempts: retried_report.probes.clone(),
-                        },
-                    );
-                }
+                executed.record_probes(id, rung, &retried_report);
                 result_batch = retried;
                 report = retried_report;
                 if let PassStep::Exact { k } = step {

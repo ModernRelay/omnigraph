@@ -74,13 +74,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -92,7 +101,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -113,7 +122,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -134,7 +143,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -161,7 +191,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -182,7 +212,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -212,13 +242,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -240,7 +279,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -261,7 +300,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -282,7 +321,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -303,7 +342,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -324,7 +363,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -345,7 +384,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -366,7 +426,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -393,7 +453,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -414,7 +474,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -455,13 +515,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -473,7 +542,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -494,7 +563,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -515,7 +584,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -542,7 +632,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -563,7 +653,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -595,13 +685,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -623,7 +722,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -644,7 +743,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -665,7 +764,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -686,7 +785,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -707,7 +806,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -728,7 +848,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -755,7 +875,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -776,7 +896,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -810,13 +930,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -828,7 +957,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -849,7 +978,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -870,7 +999,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -891,7 +1020,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -912,7 +1041,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -944,13 +1094,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -962,7 +1121,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -983,7 +1142,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1004,7 +1163,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1025,7 +1184,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1086,13 +1266,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1104,7 +1293,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1125,7 +1314,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1146,7 +1335,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1173,7 +1383,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1194,7 +1404,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1215,7 +1425,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1360,13 +1570,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1404,7 +1623,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1454,7 +1673,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1495,7 +1714,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1532,7 +1751,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1546,7 +1765,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1567,7 +1786,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1588,7 +1807,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1609,7 +1828,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1624,7 +1843,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not strongly match the selected managed Blob validator",
+            "description": "If-Match did not strongly match the selected managed Blob validator; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
             "headers": {
               "Accept-Ranges": {
                 "schema": {
@@ -1645,7 +1864,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1687,7 +1906,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1714,7 +1933,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1735,7 +1954,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1756,7 +1975,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1854,13 +2073,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1891,7 +2119,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1912,7 +2140,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1933,7 +2161,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1954,7 +2182,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1975,7 +2203,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1996,7 +2224,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2017,7 +2245,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2032,7 +2260,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator",
+            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
             "headers": {
               "ETag": {
                 "schema": {
@@ -2044,7 +2272,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2065,7 +2293,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2086,7 +2314,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2107,7 +2335,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2134,7 +2362,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2155,7 +2383,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2253,13 +2481,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -2271,7 +2508,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2292,7 +2529,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2313,7 +2550,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2334,7 +2571,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2355,7 +2592,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2376,7 +2613,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2391,7 +2628,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator",
+            "description": "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
             "headers": {
               "ETag": {
                 "schema": {
@@ -2403,7 +2640,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2424,7 +2661,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2445,7 +2682,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2472,7 +2709,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2493,7 +2730,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2636,13 +2873,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -2680,7 +2926,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2712,7 +2958,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2749,7 +2995,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2763,7 +3009,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2777,7 +3023,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2791,7 +3037,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2805,7 +3051,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2813,7 +3059,7 @@
             }
           },
           "412": {
-            "description": "If-Match did not strongly match the selected managed Blob validator; HEAD responses have no body",
+            "description": "If-Match did not strongly match the selected managed Blob validator; HEAD responses have no body; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
             "headers": {
               "Accept-Ranges": {
                 "schema": {
@@ -2834,7 +3080,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2854,7 +3100,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2868,7 +3114,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2882,7 +3128,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2927,13 +3173,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -2945,7 +3200,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2966,7 +3221,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2987,7 +3242,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3008,7 +3263,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3035,7 +3311,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3056,7 +3332,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3097,13 +3373,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -3125,7 +3410,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3146,7 +3431,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3167,7 +3452,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3188,7 +3473,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3209,7 +3494,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3230,7 +3515,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3251,7 +3536,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3272,7 +3557,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3293,7 +3599,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3320,7 +3626,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3341,7 +3647,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3457,13 +3763,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -3475,7 +3790,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3496,7 +3811,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3517,7 +3832,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3538,7 +3853,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3559,7 +3874,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3580,7 +3895,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3601,7 +3916,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3622,7 +3958,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3649,7 +3985,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3670,7 +4006,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3691,7 +4027,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3734,13 +4070,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -3762,7 +4107,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3783,7 +4128,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3804,7 +4149,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3825,7 +4170,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3846,7 +4191,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3867,7 +4212,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3888,7 +4254,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3909,7 +4275,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3936,7 +4302,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3957,7 +4323,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4018,13 +4384,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -4036,7 +4411,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4057,7 +4432,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4078,7 +4453,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4099,7 +4474,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4120,7 +4495,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4147,7 +4543,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4168,7 +4564,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4189,7 +4585,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4241,13 +4637,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -4259,7 +4664,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4280,7 +4685,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4301,7 +4706,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4322,7 +4727,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4343,7 +4748,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4370,7 +4796,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4391,7 +4817,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4524,13 +4950,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -4542,7 +4977,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4563,7 +4998,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4584,7 +5019,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4605,7 +5040,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4626,7 +5061,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4647,7 +5082,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4668,7 +5103,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4689,7 +5145,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4716,7 +5172,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4737,7 +5193,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4758,7 +5214,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4801,13 +5257,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -4829,7 +5294,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4850,7 +5315,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4871,7 +5336,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4892,7 +5357,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4913,7 +5378,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4934,7 +5399,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4955,7 +5441,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4982,7 +5468,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5003,7 +5489,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5024,7 +5510,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5122,13 +5608,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -5140,7 +5635,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5161,7 +5656,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5182,7 +5677,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5203,7 +5698,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5224,7 +5719,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5245,7 +5761,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5272,7 +5788,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5293,7 +5809,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5345,13 +5861,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -5363,7 +5888,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5384,7 +5909,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5405,7 +5930,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5426,7 +5951,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5447,7 +5972,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5474,7 +6020,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5495,7 +6041,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5545,13 +6091,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -5563,7 +6118,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5577,7 +6132,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5598,7 +6153,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5619,7 +6174,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5640,7 +6195,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5667,7 +6243,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5688,7 +6264,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5807,13 +6383,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -5825,7 +6410,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5846,7 +6431,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5867,7 +6452,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5888,7 +6473,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5909,7 +6494,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5930,7 +6515,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5951,7 +6557,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5978,7 +6584,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5999,7 +6605,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6020,7 +6626,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6072,13 +6678,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -6090,7 +6705,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6111,7 +6726,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6132,7 +6747,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6153,7 +6768,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6174,7 +6789,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6189,13 +6804,13 @@
             }
           },
           "412": {
-            "description": "The target head moved past the commit's captured parent; the commit can only be dropped",
+            "description": "The target head moved past the commit's captured parent; the commit can only be dropped; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6222,7 +6837,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6243,7 +6858,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6359,13 +6974,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -6377,7 +7001,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6398,7 +7022,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6419,7 +7043,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6440,7 +7064,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6461,7 +7085,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6482,7 +7106,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6503,7 +7148,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6530,7 +7175,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6551,7 +7196,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6572,7 +7217,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6615,13 +7260,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -6643,7 +7297,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6660,7 +7314,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6681,7 +7335,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6702,7 +7356,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6723,7 +7377,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6744,7 +7398,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6765,7 +7419,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6786,7 +7461,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6807,7 +7482,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6834,7 +7509,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6855,7 +7530,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6898,13 +7573,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -6926,7 +7610,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6947,7 +7631,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6968,7 +7652,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6989,7 +7673,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7010,7 +7694,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7031,7 +7715,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7052,7 +7757,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7073,7 +7778,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7100,7 +7805,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7121,7 +7826,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7204,13 +7909,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -7233,7 +7947,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7254,7 +7968,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7275,7 +7989,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7296,7 +8010,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7317,7 +8031,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7338,7 +8052,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7359,7 +8073,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7380,7 +8115,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7401,7 +8136,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7422,7 +8157,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7449,7 +8184,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7470,7 +8205,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7513,13 +8248,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -7541,7 +8285,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7562,7 +8306,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7583,7 +8327,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7604,7 +8348,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7625,7 +8369,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7646,7 +8390,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7667,7 +8411,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7688,7 +8453,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7709,7 +8474,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7736,7 +8501,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7757,7 +8522,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7809,13 +8574,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -7837,7 +8611,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7858,7 +8632,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7879,7 +8653,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7900,7 +8674,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7921,7 +8695,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7942,7 +8716,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7957,13 +8731,13 @@
             }
           },
           "412": {
-            "description": "Graph-commit precondition failed; the write had no effect",
+            "description": "Graph-commit precondition failed; the write had no effect; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7984,7 +8758,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8005,7 +8779,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8032,7 +8806,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8053,7 +8827,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8096,13 +8870,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -8114,7 +8897,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8135,7 +8918,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8156,7 +8939,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8177,7 +8960,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8204,7 +9008,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8225,7 +9029,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8277,13 +9081,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -8311,7 +9124,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8332,7 +9145,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8353,7 +9166,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8374,7 +9187,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8395,7 +9208,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8416,7 +9229,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8437,7 +9250,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8458,7 +9292,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8479,7 +9313,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8506,7 +9340,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8527,7 +9361,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8548,7 +9382,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8609,13 +9443,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -8643,7 +9486,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8664,7 +9507,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8685,7 +9528,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8706,7 +9549,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8727,7 +9570,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8748,7 +9591,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8769,7 +9612,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8784,13 +9627,13 @@
             }
           },
           "412": {
-            "description": "Stored mutation graph-commit precondition failed; the write had no effect",
+            "description": "Stored mutation graph-commit precondition failed; the write had no effect; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8811,7 +9654,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8832,7 +9675,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8859,7 +9702,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8880,7 +9723,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8901,7 +9744,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8944,13 +9787,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -8972,7 +9824,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8993,7 +9845,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9014,7 +9866,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9035,7 +9887,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9056,7 +9908,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9077,7 +9929,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9098,7 +9971,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9119,7 +9992,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9146,7 +10019,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9167,7 +10040,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9210,13 +10083,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -9228,7 +10110,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9249,7 +10131,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9270,7 +10152,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9291,7 +10173,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9318,7 +10221,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9339,7 +10242,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9393,13 +10296,22 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.13"
+                "0.14"
               ]
+            }
+          },
+          {
+            "name": "omnigraph-if-actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -9411,7 +10323,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9432,7 +10344,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9453,7 +10365,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9474,7 +10386,28 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "Precondition failed; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9501,7 +10434,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9522,7 +10455,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9568,7 +10501,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9607,7 +10540,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9633,7 +10566,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9654,7 +10587,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.13"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10653,6 +11586,17 @@
               }
             ]
           },
+          "executed": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadExecutedOutput",
+                "description": "Present only when the request was a `load csv` statement whose plan\nthe engine ran (`mode overwrite`): what the plan measured."
+              }
+            ]
+          },
           "outcome": {
             "oneOf": [
               {
@@ -11061,6 +12005,7 @@
           "forbidden",
           "bad_request",
           "api_contract_mismatch",
+          "actor_mismatch",
           "not_found",
           "method_not_allowed",
           "conflict",
@@ -11762,6 +12707,43 @@
           "unsupported"
         ]
       },
+      "LoadExecutedOutput": {
+        "type": "object",
+        "description": "What a `load csv` statement's plan measured as it ran, beside the\nstatement's [`ChangeOutput`]: the source partitions and bytes it read, the\ncount its sink staged, and what each operator did. Absent for an append\nor merge load, which the keyed adapters run, and for every other change.",
+        "required": [
+          "partitions",
+          "rows",
+          "source_bytes",
+          "operators"
+        ],
+        "properties": {
+          "operators": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoadOperatorExecutedOutput"
+            },
+            "description": "One entry per node of the executed plan in post-order, the source\nfirst."
+          },
+          "partitions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Source partitions the plan read.",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Entities the sink staged.",
+            "minimum": 0
+          },
+          "source_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes of the captured source.",
+            "minimum": 0
+          }
+        }
+      },
       "LoadMode": {
         "type": "string",
         "description": "Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.",
@@ -11770,6 +12752,52 @@
           "append",
           "merge"
         ]
+      },
+      "LoadOperatorExecutedOutput": {
+        "type": "object",
+        "description": "What one operator of an executed load plan did.",
+        "required": [
+          "id",
+          "node",
+          "operator",
+          "rows",
+          "elapsed_compute_ns",
+          "wall_ns"
+        ],
+        "properties": {
+          "elapsed_compute_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds the operator was computing: the polls of its stream and of\nits workers, never the time it waited for its input or for storage.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The plan node's `id`, as the explain document numbers it.",
+            "minimum": 0
+          },
+          "node": {
+            "type": "string",
+            "description": "The plan node's kind: `CsvSource`, `Validate`, `FragmentWrite`."
+          },
+          "operator": {
+            "type": "string",
+            "description": "The operator the node built."
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What the operator emitted; the sink counts what it staged.",
+            "minimum": 0
+          },
+          "wall_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds from the operator's first poll to its end, waits included;\n`0` where no end was recorded.",
+            "minimum": 0
+          }
+        }
       },
       "MergeBaseOutput": {
         "type": "object",

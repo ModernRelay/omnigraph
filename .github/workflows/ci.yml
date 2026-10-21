@@ -1324,6 +1324,7 @@ jobs:
             -p omnigraph-cli \
             --test lance_surface_guards \
             --test s3_cluster \
+            --test bound_storage \
             -- --nocapture --test-threads=1 2>&1 | tee -a "$test_log"
 
           # Keep the same package feature graph for this admitted-startup unit
@@ -1357,6 +1358,7 @@ jobs:
             s3::server_boots_cluster_from_bare_storage_uri_and_serves_query \
             settings::tests::s3_bootstrap_handoff_serves_empty_then_deploys_first_graph \
             s3_cluster_full_lifecycle_import_apply_serve_evolve_delete \
+            bound_handle_never_reaches_the_ambient_endpoint \
             cli_cluster_e2e::cluster_e2e_s3_live_apply_without_restart \
             system_local::local_cli_s3_end_to_end_init_load_read_flow
           do

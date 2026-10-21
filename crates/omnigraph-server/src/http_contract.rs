@@ -11,7 +11,7 @@ use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::{Content, Ref, RefOr};
 
 use crate::ApiError;
-use crate::api::{ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
+use crate::api::{ErrorCode, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER, IF_ACTOR_HEADER};
 
 fn mismatch_message() -> String {
     format!(
@@ -76,6 +76,44 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     .parameters
                     .get_or_insert_with(Vec::new)
                     .push(parameter);
+                let mut expected_actor = Parameter::new(IF_ACTOR_HEADER);
+                expected_actor.parameter_in = ParameterIn::Header;
+                expected_actor.required = utoipa::openapi::Required::False;
+                expected_actor.schema = Some(Object::with_type(Type::String).into());
+                expected_actor.description = Some(
+                    "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing."
+                        .to_string(),
+                );
+                operation
+                    .parameters
+                    .get_or_insert_with(Vec::new)
+                    .push(expected_actor);
+                let response = operation
+                    .responses
+                    .responses
+                    .entry("412".into())
+                    .or_insert_with(|| {
+                        let mut response = utoipa::openapi::Response::new("Precondition failed");
+                        response.content.insert(
+                            "application/json".into(),
+                            Content::new(Some(Ref::from_schema_name(
+                                if path.contains("/changes")
+                                    || path.ends_with("/diff")
+                                    || path.ends_with("/merge-base")
+                                {
+                                    "ChangeErrorOutput"
+                                } else {
+                                    "ErrorOutput"
+                                },
+                            ))),
+                        );
+                        response.into()
+                    });
+                if let RefOr::T(response) = response {
+                    response.description.push_str(
+                        "; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
+                    );
+                }
                 let response = operation
                     .responses
                     .responses
