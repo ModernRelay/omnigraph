@@ -687,17 +687,27 @@ impl OmniError {
     /// An error that already carries evidence keeps it: `BeforeEffect` is
     /// the stronger definite claim, and a composer that knows effects
     /// happened since removes it with [`Self::without_pre_effect_evidence`]
-    /// first; explicit uncertainty is never touched.
+    /// first; explicit uncertainty is never touched. A failure under an
+    /// earlier publication keeps that publication and gains the step's own
+    /// proof, `step_unpublished`.
     pub fn unpublished(self) -> Self {
-        if self.completion_evidence().is_some() || !self.outcome_opaque() {
+        if !self.outcome_opaque() {
             return self;
         }
-        self.with_completion_evidence(CompletionEvidence::Unpublished)
+        match self.completion_evidence() {
+            None => self.with_completion_evidence(CompletionEvidence::Unpublished),
+            Some(CompletionEvidence::PartlyPublished {
+                step_unpublished: false,
+            }) => self.with_completion_evidence(CompletionEvidence::PartlyPublished {
+                step_unpublished: true,
+            }),
+            Some(_) => self,
+        }
     }
 
     /// Whether the type of this failure leaves open what happened to the
     /// graph. These are the failures a transport can only call internal.
-    fn outcome_opaque(&self) -> bool {
+    pub fn outcome_opaque(&self) -> bool {
         matches!(
             self.without_evidence(),
             Self::Storage(_)
@@ -1694,6 +1704,18 @@ mod tests {
                 step_unpublished: false
             })
         );
+        // The step's proof arrives after the earlier publication was recorded.
+        let marked_late = OmniError::Io(std::io::Error::other("staged write failed"))
+            .after_earlier_publication()
+            .unpublished();
+        assert_eq!(
+            marked_late.completion_evidence(),
+            Some(CompletionEvidence::PartlyPublished {
+                step_unpublished: true
+            })
+        );
+        let (cause, _) = marked_late.into_completion_evidence();
+        assert!(matches!(cause, OmniError::Io(_)));
     }
 
     fn supported_stream_failures() -> Vec<OmniError> {

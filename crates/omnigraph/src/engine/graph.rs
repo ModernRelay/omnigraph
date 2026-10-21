@@ -288,8 +288,8 @@ fn build_fused_batch(
 /// so a query that is entirely index-served and has no AntiJoin never pays the
 /// O(|E|) CSR build (the whole point of the indexed path). The `Cached` builder
 /// also reuses the cross-query `RuntimeCache` entry; `Direct` builds against an
-/// arbitrary snapshot (time-travel reads); `None` is for queries with no
-/// traversal at all.
+/// arbitrary snapshot (time-travel reads) through its graph's storage; `None`
+/// is for queries with no traversal at all.
 pub struct GraphIndexHandle {
     cell: tokio::sync::OnceCell<Option<Arc<GraphIndex>>>,
     builder: GraphIndexBuilder,
@@ -305,7 +305,12 @@ enum GraphIndexBuilder {
         HashMap<String, (String, String)>,
         SystemColumns,
     ),
-    Direct(Snapshot, HashMap<String, (String, String)>, SystemColumns),
+    Direct(
+        Arc<Omnigraph>,
+        Snapshot,
+        HashMap<String, (String, String)>,
+        SystemColumns,
+    ),
 }
 
 impl GraphIndexHandle {
@@ -329,13 +334,14 @@ impl GraphIndexHandle {
     }
 
     pub(crate) fn direct(
+        db: Arc<Omnigraph>,
         snapshot: Snapshot,
         edge_types: HashMap<String, (String, String)>,
         system_columns: SystemColumns,
     ) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Direct(snapshot, edge_types, system_columns),
+            builder: GraphIndexBuilder::Direct(db, snapshot, edge_types, system_columns),
         }
     }
 
@@ -353,10 +359,15 @@ impl GraphIndexHandle {
                                 .await?,
                         ))
                     }
-                    GraphIndexBuilder::Direct(snapshot, edge_types, system_columns) => {
+                    GraphIndexBuilder::Direct(db, snapshot, edge_types, system_columns) => {
                         Ok(Some(Arc::new(
-                            GraphIndex::load_or_build(snapshot, edge_types, None, *system_columns)
-                                .await?,
+                            GraphIndex::load_or_build(
+                                snapshot,
+                                edge_types,
+                                db.storage_adapter(),
+                                *system_columns,
+                            )
+                            .await?,
                         )))
                     }
                 }

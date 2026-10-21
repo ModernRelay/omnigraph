@@ -1410,6 +1410,7 @@ impl ApiError {
     }
 
     fn from_omni(err: OmniError) -> Self {
+        let cause = redacted_cause::RedactedCause::of(&err);
         let (err, evidence) = err.into_completion_evidence();
         // Keep completion classification separate from HTTP status. Generic
         // DataFusion erases plan-vs-execution provenance: if an owned write
@@ -1716,6 +1717,16 @@ impl ApiError {
                 }
             }
             None => {}
+        }
+        if response.completion_uncertain {
+            // The record of why a write may be contained: the failure's class
+            // and status, never its message, which can carry object URIs. It
+            // shares the request's span with the containment log.
+            tracing::warn!(
+                status = %response.status(),
+                ?cause,
+                "engine failure without definite completion evidence"
+            );
         }
         response
     }
@@ -2506,6 +2517,11 @@ mod api_error_tests {
             ),
             (
                 failed_put().unpublished().after_earlier_publication(),
+                ErrorCode::Internal,
+                partial(DispositionAction::Refresh),
+            ),
+            (
+                failed_put().after_earlier_publication().unpublished(),
                 ErrorCode::Internal,
                 partial(DispositionAction::Refresh),
             ),
