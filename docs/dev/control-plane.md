@@ -308,9 +308,12 @@ of a lease after the first send of its last acknowledged beat, or at once on
 a claim. The first beat races the same deadline counted from the send of the
 lock's own write, because a successor may count silence from the moment the
 record is visible; when it lapses, or the claim read after beat 0 finds a
-claim, acquisition fails and the server does not serve. A fence closes the owner's storage scope before it is reported, so no
-mutation is sent after a successor may claim, whatever the shutdown grace;
-the server then closes admission and exits 2 without releasing. A
+claim, acquisition fails and the server does not serve. A fence fences the
+owner's storage scope (`StorageIoScope::fence`) before it is reported: every
+later request is refused, the parts and cleanup of an admitted multipart
+upload included, and every admitted request is cancelled, so the owner sends
+nothing after the fence however long its shutdown grace lasts. The server
+then closes admission and exits 2 without releasing. A
 serving acquisition that finds a version-3 lock watches the beat listing on
 its own monotonic clock. A new beat refuses it. An empty listing starts the
 silence and the first beat that appears restarts it, because the owner

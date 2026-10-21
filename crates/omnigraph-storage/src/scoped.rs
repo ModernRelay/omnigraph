@@ -41,7 +41,18 @@
 //! acknowledgement already allows. Conditional requests and mutable keys go
 //! to a single-attempt client: a conditional request is resolved by its
 //! owner's re-issue and read-back, which needs every attempt to be its own,
-//! and a mutable key is the class whose late landing matters.
+//! and a mutable key is the class whose late landing matters. A multipart
+//! upload follows its key's class, and its parts, completion and abort follow
+//! the upload.
+//!
+//! [`StorageIoScope::fence`] is stronger than closing. It is for an owner
+//! that has lost its right to write, when a successor may act: it refuses
+//! every later request, including the parts, completion and abort of an
+//! admitted multipart upload, and it cancels every admitted request still
+//! running. A cancelled request's future is dropped, so its client sends no
+//! further attempt and no retry. A request already sent may still be
+//! applied by the store, as after a crash, and its caller sees an ambiguous
+//! error rather than this scope's definite refusal.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -74,12 +85,16 @@ pub struct StorageIoScope {
 struct ScopeInner {
     state: Mutex<ScopeState>,
     changed: Notify,
+    /// Wakes every admitted request when the scope is fenced.
+    fence: Notify,
 }
 
 #[derive(Debug, Default)]
 struct ScopeState {
     pending: usize,
     closed: bool,
+    /// The owner lost its right to write: nothing more is sent.
+    fenced: bool,
     /// Mutable keys whose last request has an unknown outcome. Bounded by
     /// [`MAX_UNSETTLED_KEYS`]; past the bound `unsettled_overflow` refuses
     /// every mutation rather than growing.
@@ -141,6 +156,50 @@ impl StorageIoScope {
     /// Irreversibly refuse new mutation admission.
     pub fn close(&self) {
         self.inner.state.lock().unwrap().closed = true;
+    }
+
+    /// Irreversibly stop sending: refuse every later request, including the
+    /// parts, completion and abort of an admitted multipart upload, and
+    /// cancel every admitted request still running (see the module
+    /// documentation). For an owner whose lease fenced, so that it sends
+    /// nothing after a successor may act, however long the process lives.
+    pub fn fence(&self) {
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            state.closed = true;
+            state.fenced = true;
+        }
+        self.inner.fence.notify_waiters();
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        self.inner.state.lock().unwrap().fenced
+    }
+
+    /// Resolves once the scope is fenced.
+    async fn fenced(&self) {
+        loop {
+            let fence = self.inner.fence.notified();
+            tokio::pin!(fence);
+            fence.as_mut().enable();
+            if self.is_fenced() {
+                return;
+            }
+            fence.await;
+        }
+    }
+
+    /// Run an admitted request until it answers or the scope is fenced. A
+    /// fence drops the request's future, so its client sends nothing more.
+    async fn until_fenced<T>(
+        &self,
+        request: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::select! {
+            biased;
+            result = request => result,
+            () = self.fenced() => Err(fenced_in_flight_error()),
+        }
     }
 
     /// Wait until all admitted requests and multipart lifetimes have settled
@@ -217,6 +276,12 @@ impl StorageIoScope {
         // Only an admitted multipart lifetime can call this. Its outstanding
         // guard prevents an idle observation before the child is registered.
         let mut state = self.inner.state.lock().unwrap();
+        // A close lets an admitted upload finish or abort; a fence sends
+        // nothing more, its cleanup included. Leftover parts are the
+        // bucket's to expire.
+        if state.fenced {
+            return Err(fenced_error());
+        }
         if !cleanup && state.unsettled_overflow {
             return Err(unsettled_overflow_error());
         }
@@ -352,6 +417,28 @@ fn closed_error() -> object_store::Error {
     object_store::Error::Generic {
         store: OWNED_STORE_NAME,
         source: std::io::Error::other("storage mutation admission is closed").into(),
+    }
+}
+
+fn fenced_error() -> object_store::Error {
+    object_store::Error::Generic {
+        store: OWNED_STORE_NAME,
+        source: std::io::Error::other("storage mutation is fenced; nothing more is sent").into(),
+    }
+}
+
+/// The `store` of the error a request cancelled by a fence returns. Not
+/// [`OWNED_STORE_NAME`]: the request may already have been sent, so its
+/// outcome is unknown.
+const FENCED_REQUEST_STORE_NAME: &str = "fenced storage request";
+
+fn fenced_in_flight_error() -> object_store::Error {
+    object_store::Error::Generic {
+        store: FENCED_REQUEST_STORE_NAME,
+        source: std::io::Error::other(
+            "storage mutation was fenced while this request was in flight; it may still land",
+        )
+        .into(),
     }
 }
 
@@ -544,7 +631,11 @@ impl ObjectStore for ScopedObjectStore {
         }
         let client = Arc::clone(self.client(&request));
         let mutation = self.scope.begin(request)?;
-        mutation.finish(client.put_opts(path, payload, opts).await)
+        mutation.finish(
+            self.scope
+                .until_fenced(client.put_opts(path, payload, opts))
+                .await,
+        )
     }
 
     async fn put_multipart_opts(
@@ -555,7 +646,11 @@ impl ObjectStore for ScopedObjectStore {
         let request = Request::new("multipart", path, false);
         let client = Arc::clone(self.client(&request));
         let lifetime = self.scope.begin(request.clone())?;
-        match client.put_multipart_opts(path, opts).await {
+        match self
+            .scope
+            .until_fenced(client.put_multipart_opts(path, opts))
+            .await
+        {
             Ok(inner) => Ok(Box::new(ScopedUpload {
                 inner,
                 lifetime: Some(lifetime),
@@ -596,7 +691,7 @@ impl ObjectStore for ScopedObjectStore {
                         KeyClass::Mutable => single,
                     };
                     let mutation = scope.begin(request)?;
-                    mutation.finish(client.delete(&path).await)?;
+                    mutation.finish(scope.until_fenced(client.delete(&path)).await)?;
                     Ok(path)
                 }
             })
@@ -625,7 +720,11 @@ impl ObjectStore for ScopedObjectStore {
         let request = Request::new("copy", to, conditional);
         let client = Arc::clone(self.client(&request));
         let mutation = self.scope.begin(request)?;
-        mutation.finish(client.copy_opts(from, to, opts).await)
+        mutation.finish(
+            self.scope
+                .until_fenced(client.copy_opts(from, to, opts))
+                .await,
+        )
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()> {
@@ -651,12 +750,21 @@ impl ObjectStore for ScopedObjectStore {
                 mode: object_store::CopyMode::Create,
                 extensions: opts.extensions,
             };
-            match self.single.copy_opts(from, to, copy).await {
+            match self
+                .scope
+                .until_fenced(self.single.copy_opts(from, to, copy))
+                .await
+            {
                 Err(error) => mutation.finish(Err(error)),
                 Ok(()) => {
+                    if self.scope.is_fenced() {
+                        // The copy landed, so this is no refusal; the source
+                        // delete is never sent.
+                        return mutation.finish(Err(fenced_in_flight_error()));
+                    }
                     let mutation =
                         mutation.with_request(Request::new("rename source delete", from, false))?;
-                    mutation.finish(self.single.delete(from).await)
+                    mutation.finish(self.scope.until_fenced(self.single.delete(from)).await)
                 }
             }
         } else {
@@ -669,7 +777,11 @@ impl ObjectStore for ScopedObjectStore {
             }
             let client = Arc::clone(self.client(&request));
             let mutation = self.scope.begin(request)?;
-            mutation.finish(client.rename_opts(from, to, opts).await)
+            mutation.finish(
+                self.scope
+                    .until_fenced(client.rename_opts(from, to, opts))
+                    .await,
+            )
         }
     }
 }
@@ -704,7 +816,8 @@ impl MultipartUpload for ScopedUpload {
             Err(error) => return Box::pin(async move { Err(error) }),
         };
         let part = self.inner.put_part(payload);
-        Box::pin(async move { mutation.finish(part.await) })
+        let scope = self.scope.clone();
+        Box::pin(async move { mutation.finish(scope.until_fenced(part).await) })
     }
 
     async fn complete(&mut self) -> Result<PutResult> {
@@ -714,7 +827,7 @@ impl MultipartUpload for ScopedUpload {
         let mutation = self
             .scope
             .begin_child(self.child("multipart complete"), false)?;
-        let result = mutation.finish(self.inner.complete().await);
+        let result = mutation.finish(self.scope.until_fenced(self.inner.complete()).await);
         if result.is_ok() {
             self.lifetime.take().unwrap().settle();
         }
@@ -728,7 +841,7 @@ impl MultipartUpload for ScopedUpload {
         let mutation = self
             .scope
             .begin_child(self.child("multipart abort"), true)?;
-        let result = mutation.finish(self.inner.abort().await);
+        let result = mutation.finish(self.scope.until_fenced(self.inner.abort()).await);
         if result.is_ok() {
             self.lifetime.take().unwrap().settle();
         }
@@ -1900,6 +2013,85 @@ mod tests {
             scope.wait_idle().await;
             assert!(!scope.is_uncertain(), "a cancelled immutable put settles");
         }
+    }
+
+    /// A fence cancels every admitted request still running, so its client
+    /// sends nothing more, at every mutation boundary. The cancelled request
+    /// may already have been sent, so its error is not the scope's definite
+    /// refusal. Everything later is refused, including the parts, completion
+    /// and abort of an upload admitted before the fence; reads continue.
+    #[tokio::test]
+    async fn a_fence_stops_admitted_requests_and_later_parts_issue_1067() {
+        for point in POINTS {
+            let (scope, store, fault) = fixture(point, false).await;
+            let task = tokio::spawn(mutate(store, point));
+            tokio::time::timeout(Duration::from_secs(2), fault.entered.notified())
+                .await
+                .unwrap();
+            scope.fence();
+            let error = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap_or_else(|_| panic!("{point:?}: a fence ends an admitted request"))
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    object_store::Error::Generic { store, .. } if store == FENCED_REQUEST_STORE_NAME
+                ),
+                "{point:?}: {error}"
+            );
+            scope.wait_idle().await;
+            assert!(scope.is_fenced());
+        }
+
+        let scope = StorageIoScope::new();
+        let inner = Arc::new(InMemory::new());
+        inner
+            .put(&Path::from("source"), "original".into())
+            .await
+            .unwrap();
+        let store = scope.wrap_object_store(inner);
+        let path = Path::from("g/node_Person/data/3f2c4d9e.lance");
+        let mut upload = store.put_multipart(&path).await.unwrap();
+        upload.put_part("data".into()).await.unwrap();
+        scope.fence();
+        let refusals = [
+            upload.put_part("more".into()).await.unwrap_err(),
+            upload.complete().await.map(|_| ()).unwrap_err(),
+            upload.abort().await.unwrap_err(),
+            store
+                .put(&path, "data".into())
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+        ];
+        for refused in refusals {
+            assert!(
+                matches!(
+                    refused,
+                    object_store::Error::Generic { store, .. } if store == OWNED_STORE_NAME
+                ),
+                "nothing is sent after a fence: {refused}"
+            );
+        }
+        drop(upload);
+        scope.wait_idle().await;
+        assert!(
+            store.get(&path).await.is_err(),
+            "the upload never completed"
+        );
+        assert_eq!(
+            store
+                .get(&Path::from("source"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            "original",
+            "reads continue"
+        );
     }
 
     /// A delete the store answers "not found" is definite on any key, and a

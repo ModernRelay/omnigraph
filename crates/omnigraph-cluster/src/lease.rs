@@ -21,9 +21,11 @@
 //! The first beat races the same deadline, counted from the send of the
 //! lock's own write, because a successor may count silence from the moment
 //! the record is visible: a holder whose first beat is not acknowledged in
-//! time gets no lease and must not serve. A fence closes the holder's
-//! storage scope before it is reported, so the holder sends no storage
-//! mutation after a successor may claim, whatever its shutdown grace.
+//! time gets no lease and must not serve. When the lease fences, it fences
+//! the holder's storage scope before it reports the fence: every later
+//! request is refused and every admitted one is cancelled, so the holder
+//! sends nothing after a successor may claim, however long its process
+//! lives.
 //!
 //! Heartbeats, the watch and the claim go through the root outside the
 //! owner's storage scope, on a client with the backend's own retries. A beat
@@ -296,13 +298,15 @@ struct Beat {
     answered: bool,
 }
 
-/// Stop the holder's storage mutations, then report the fence. A successor
-/// may claim the lock five sixths of a lease after the owner's deadline;
-/// closing the scope here, not when the process exits, keeps every
-/// mutation this holder sends before that.
+/// Stop the holder's storage sends, then report the fence. A successor may
+/// claim the lock five sixths of a lease after the owner's deadline, which
+/// can be sooner than the holder's process exits. Fencing the scope here
+/// refuses every later request and cancels every admitted one, so the holder
+/// sends nothing more however long it lives; only a request already sent
+/// can still land, as after a crash.
 fn fence_holder(scope: Option<&StorageIoScope>, fence: LeaseFenced) {
     if let Some(scope) = scope {
-        scope.close();
+        scope.fence();
     }
     tracing::error!(
         ?fence,
@@ -761,6 +765,7 @@ mod tests {
         assert!(owner.1 <= owner_deadline(SECONDS), "{:?}", owner.1);
         assert_eq!(successor.0, Watch::Claimed);
         assert!(successor.1 >= successor_silence(SECONDS));
+        assert!(scope.is_fenced());
         let dir = tempfile::tempdir().unwrap();
         let fenced = ObjectStorageAdapter::local_scoped(scope);
         assert!(
