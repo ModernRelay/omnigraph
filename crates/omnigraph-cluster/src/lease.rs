@@ -642,7 +642,10 @@ mod tests {
             watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "second"),
         );
         assert!(started.elapsed() >= successor_silence(SECONDS));
-        assert_eq!([first.unwrap(), second.unwrap()], [Watch::Silent; 2]);
+        assert_eq!(
+            [first.unwrap(), second.unwrap()],
+            [Watch::Silent, Watch::Silent]
+        );
         assert!(
             store
                 .read_text_if_exists(&claim_uri(&lease_dir(ROOT, "owner")))
