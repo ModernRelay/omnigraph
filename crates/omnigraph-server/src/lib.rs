@@ -1460,6 +1460,29 @@ impl ApiError {
     /// the body agree on both paths.
     fn from_omni_settled(err: OmniError, settle: impl FnOnce(Self) -> Self) -> Self {
         let cause = redacted_cause::RedactedCause::of(&err);
+        // Every translation leaves through this one exit, an internal
+        // replacement included, so the warning reads each one's settled facts.
+        let response = settle(Self::translated(err));
+        if response.completion_uncertain {
+            // The record of a write's unknown outcome: the failure's class,
+            // the status its response sends, and whether its uncertainty is
+            // scoped to its keys and branch, never its message, which can
+            // carry object URIs. It shares the request's span with the
+            // containment log.
+            tracing::warn!(
+                status = %response.status(),
+                ?cause,
+                scoped = response.scoped_unknown,
+                "engine failure without definite completion evidence"
+            );
+        }
+        response
+    }
+
+    /// An engine failure's code, details and completion facts, before its
+    /// operation's own. A failure naming invalid graph type metadata becomes
+    /// an internal error, which takes no completion evidence from it.
+    fn translated(err: OmniError) -> Self {
         let (err, evidence) = err.into_completion_evidence();
         let storage_outcome = err.is_manifest_publish_in_doubt()
             || matches!(&err, OmniError::Storage(_) | OmniError::Io(_));
@@ -1770,22 +1793,6 @@ impl ApiError {
             None => {}
         }
         response.scoped_unknown = response.completion_uncertain && storage_outcome;
-        // The error carries what its operation has done, so its status is the
-        // one its response sends.
-        let response = settle(response);
-        if response.completion_uncertain {
-            // The record of a write's unknown outcome: the failure's class,
-            // the status its response sends, and whether its uncertainty is
-            // scoped to its keys and branch, never its message, which can
-            // carry object URIs. It shares the request's span with the
-            // containment log.
-            tracing::warn!(
-                status = %response.status(),
-                ?cause,
-                scoped = response.scoped_unknown,
-                "engine failure without definite completion evidence"
-            );
-        }
         response
     }
 }
@@ -2484,6 +2491,52 @@ mod api_error_tests {
             assert_eq!(body.http_status(), Some(sent.as_u16()), "{label}");
             assert_logged(&capture, WARNING, sent);
         }
+
+        // A conflict naming an invalid graph type becomes an internal error,
+        // which settles and logs through the same exit: a write's helpers
+        // report its outcome unknown, at the status its body sends.
+        let invalid_key = || OmniError::key_conflict("Person", "Alice");
+        let writes: [(&str, Judge); 2] = [
+            ("step", engine_error_output),
+            ("after a write", |error| {
+                engine_error_output_after(error, true)
+            }),
+        ];
+        for (label, output) in writes {
+            let capture = test_log_capture::Capture::default();
+            let logs = tracing::subscriber::set_default(capture.subscriber("warn"));
+            let body = output(invalid_key());
+            drop(logs);
+            assert_eq!(body.code, Some(api::ErrorCode::OutcomeUnknown), "{label}");
+            assert_eq!(
+                body.disposition,
+                Some(api::DispositionOutput {
+                    effects: api::DispositionEffects::Unknown,
+                    action: api::DispositionAction::Reconcile,
+                }),
+                "{label}"
+            );
+            assert_logged(&capture, WARNING, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        // A read's helper keeps its own facts even inside a request that has
+        // submitted a write.
+        let capture = test_log_capture::Capture::default();
+        let logs = tracing::subscriber::set_default(capture.subscriber("warn"));
+        let runtime = OperationRuntime::default();
+        let body = scope_request(async {
+            runtime
+                .submit((), async { Ok::<_, ApiError>(()).into() })
+                .unwrap()
+                .result()
+                .await
+                .unwrap();
+            engine_read_error_output(datafusion())
+        })
+        .await;
+        drop(logs);
+        assert_eq!(body.http_status(), Some(400));
+        assert_logged(&capture, WARNING, StatusCode::BAD_REQUEST);
     }
 
     /// Each class of refusal asks its caller for one thing. Before any write
