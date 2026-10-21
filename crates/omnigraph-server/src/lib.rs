@@ -1435,6 +1435,14 @@ impl ApiError {
     }
 
     fn from_omni(err: OmniError) -> Self {
+        Self::from_omni_settled(err, Self::with_request_facts)
+    }
+
+    /// [`Self::from_omni`] with `settle` giving the error its final facts
+    /// before the warning reads its status: a served error carries its
+    /// request's, and an embedded caller states its own, so the warning and
+    /// the body agree on both paths.
+    fn from_omni_settled(err: OmniError, settle: impl FnOnce(Self) -> Self) -> Self {
         let cause = redacted_cause::RedactedCause::of(&err);
         let (err, evidence) = err.into_completion_evidence();
         // Keep completion classification separate from HTTP status. Generic
@@ -1743,9 +1751,9 @@ impl ApiError {
             }
             None => {}
         }
-        // The error carries what its request has done, as one leaving an
-        // owned read's task does, so its status is the one its response sends.
-        let response = response.with_request_facts();
+        // The error carries what its operation has done, so its status is the
+        // one its response sends.
+        let response = settle(response);
         if response.completion_uncertain {
             // The record of why a write may be contained: the failure's class
             // and the status its response sends, never its message, which can
@@ -1856,10 +1864,15 @@ impl ApiError {
     /// The output of one step's error, such as a merge's optional source
     /// deletion, judged by that step alone: it may have taken effect only when
     /// its own completion is uncertain.
-    pub(crate) fn into_step_output(mut self) -> ErrorOutput {
+    pub(crate) fn into_step_output(self) -> ErrorOutput {
+        self.into_step().into_judged_output()
+    }
+
+    /// The facts of one step's error, judged by that step alone.
+    fn into_step(mut self) -> Self {
         self.owned_write = self.completion_uncertain;
         self.compound = false;
-        self.into_judged_output()
+        self
     }
 
     /// The output of an error whose facts are final.
@@ -1912,7 +1925,7 @@ impl ApiError {
 /// Project an engine failure into the shared error body, including structured
 /// details, for embedded callers that compose a second effect after success.
 pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
-    ApiError::from_omni(error).into_step_output()
+    ApiError::from_omni_settled(error, ApiError::into_step).into_judged_output()
 }
 
 /// Project an engine failure into the error body a server answers for a
@@ -1927,9 +1940,11 @@ pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
 /// a fork is itself a write, so that changes the disposition only together with
 /// `after_write`.
 pub fn engine_error_output_after(error: OmniError, after_write: bool) -> api::ErrorOutput {
-    let mut error = ApiError::from_omni(error);
-    error.owned_write = after_write;
-    error.into_judged_output()
+    ApiError::from_omni_settled(error, |mut error| {
+        error.owned_write = after_write;
+        error
+    })
+    .into_judged_output()
 }
 
 /// The error body of an embedded read's engine failure: a read writes
@@ -2422,6 +2437,32 @@ mod api_error_tests {
         assert_eq!(sent, StatusCode::INTERNAL_SERVER_ERROR);
         assert_logged(&in_write, WARNING, sent);
         assert_logged(&in_write, CONTAINMENT, sent);
+
+        // An embedded caller states its own facts, and the warning reads them:
+        // one step's failure, a failure after a write, and a read.
+        let datafusion = || OmniError::DataFusion("execution failure".into());
+        type Judge = fn(OmniError) -> api::ErrorOutput;
+        let embedded: [(&str, Judge, StatusCode); 3] = [
+            (
+                "step",
+                engine_error_output,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                "after a write",
+                |error| engine_error_output_after(error, true),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            ("read", engine_read_error_output, StatusCode::BAD_REQUEST),
+        ];
+        for (label, output, sent) in embedded {
+            let capture = test_log_capture::Capture::default();
+            let logs = tracing::subscriber::set_default(capture.subscriber("warn"));
+            let body = output(datafusion());
+            drop(logs);
+            assert_eq!(body.http_status(), Some(sent.as_u16()), "{label}");
+            assert_logged(&capture, WARNING, sent);
+        }
     }
 
     /// Each class of refusal asks its caller for one thing. Before any write
