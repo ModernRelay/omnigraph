@@ -133,15 +133,15 @@ explicit destination refuse a default-only selection. Read the
 
 ## Use a server
 
-Configure a server target with an owner-local `token`/`store` profile as shown
+Configure a server target with `auth: {provider: token, source: {store: {}}}` as shown
 in [operator configuration](targets.md), then install its token explicitly:
 
 ```bash
-printf '%s\n' "$SERVER_TOKEN" | omnigraph credentials set --target standalone --auth operator --stdin
+printf '%s\n' "$SERVER_TOKEN" | omnigraph credentials set --target standalone --stdin
 omnigraph graphs list --target standalone
 omnigraph query sources_for_claim --target standalone --graph knowledge \
   --params '{"claim":"lower-latency"}'
-omnigraph credentials status --target standalone --auth operator --json
+omnigraph credentials status --target standalone --json
 ```
 
 The profile's declared source is the only credential source. There is no
@@ -193,7 +193,7 @@ For managed operations, register a profile and then a target using
 service-attested cluster identity:
 
 ```bash
-omnigraph login --register work
+omnigraph login --create-profile work
 omnigraph cluster list --profile work --json
 omnigraph target add cloud --profile work --cluster CLUSTER_ID
 omnigraph cluster plan --target cloud --json > plan.json

@@ -85,11 +85,11 @@ never activates a revision.
 
 Bearer tokens map actors at the server boundary. Request headers and bodies
 cannot choose another actor. Configure token sources on the server process;
-clients configure a `token`/`store` profile named `operator` on `production`
+clients configure `auth: {provider: token, source: {store: {}}}` on `production`
 using the [operator reference](../../../docs/user/cli/targets.md), then install it:
 
 ```bash
-printf '%s\n' "$TOKEN" | omnigraph credentials set --target production --auth operator --stdin
+printf '%s\n' "$TOKEN" | omnigraph credentials set --target production --stdin
 omnigraph query get_person --target production --graph knowledge
 ```
 

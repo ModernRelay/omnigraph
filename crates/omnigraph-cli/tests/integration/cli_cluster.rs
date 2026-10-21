@@ -197,7 +197,7 @@ fn core_remote_status_uses_only_the_selected_target_credential() {
         fs::write(
             &config_path,
             format!(
-                "{config}  nested:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/{}'\n    default_auth: public\n    auth:\n      public:\n        provider: anonymous\n",
+                "{config}  nested:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/{}'\n    auth:\n      provider: anonymous\n",
                 api.origin, suffix
             ),
         )
@@ -1774,7 +1774,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                 fs::write(
                     home.join("config.yaml"),
                     format!(
-                        "version: 1\ntargets:\n  staging:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: {}\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_STAGING\n    default_graph: knowledge\n",
+                        "version: 1\ntargets:\n  staging:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: {}\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_STAGING\n    default_graph: knowledge\n",
                         data.origin
                     ),
                 )
@@ -2384,17 +2384,12 @@ fn managed_auth_selector_and_api_down_never_open_core() {
         .args(["apply", "--plan", "saved-plan", "--json"])
         .output()
         .unwrap();
-    assert_eq!(mismatch.status.code(), Some(2), "{mismatch:?}");
-    let problem = parse_stdout_json(&mismatch);
-    assert_eq!(problem["code"], "target_incompatible");
+    assert_eq!(mismatch.status.code(), Some(64), "{mismatch:?}");
+    assert!(mismatch.stdout.is_empty(), "{mismatch:?}");
     assert!(
-        problem["error"]
-            .as_str()
-            .unwrap()
-            .contains("managed targets do not accept --auth"),
+        String::from_utf8_lossy(&mismatch.stderr).contains("unexpected argument '--auth'"),
         "{mismatch:?}"
     );
-    assert!(mismatch.stderr.is_empty(), "{mismatch:?}");
     assert!(api.requests().is_empty());
     assert_no_core_effects(temp.path());
     let origin = api.origin.clone();

@@ -10,9 +10,7 @@ mod binding;
 mod exec;
 mod store;
 
-#[cfg(test)]
-pub(crate) use binding::ResourceIdentity;
-pub(crate) use binding::{CredentialRequest, OwnerBinding, OwnerKind, Purpose};
+pub(crate) use binding::{CredentialRequest, OwnerBinding, OwnerKind, Purpose, ResourceIdentity};
 pub(crate) use exec::{ExecSource, acquire_exec};
 pub(crate) use store::{OsSecretStore, SecretStore, acquire_stored};
 
@@ -117,6 +115,7 @@ impl std::error::Error for CredentialError {}
 
 pub(crate) type Result<T> = std::result::Result<T, CredentialError>;
 
+#[derive(Clone)]
 pub(crate) struct BearerSecret(String);
 
 impl BearerSecret {
@@ -166,7 +165,7 @@ impl fmt::Display for BearerSecret {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AcquiredCredential {
     request: CredentialRequest,
     secret: BearerSecret,
@@ -193,7 +192,6 @@ impl AcquiredCredential {
         self.expires_at
     }
 
-    #[cfg(all(test, unix))]
     pub(crate) fn request(&self) -> &CredentialRequest {
         &self.request
     }
@@ -205,6 +203,35 @@ impl AcquiredCredential {
             expires_at: None,
         }
     }
+
+    /// Retain the independently verified lifetime and binding of an issued
+    /// managed data credential through its final HTTP dispatch.
+    pub(crate) fn issued(
+        request: CredentialRequest,
+        token: String,
+        expires_at: OffsetDateTime,
+    ) -> Result<Self> {
+        Ok(Self {
+            request,
+            secret: BearerSecret::new(token)?,
+            expires_at: Some(expires_at),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_credential(endpoint: &str, token: &str) -> AcquiredCredential {
+    let owner = OwnerBinding::new(
+        OwnerKind::Server,
+        "test-owner".into(),
+        "test-auth".into(),
+        endpoint.into(),
+        None,
+    )
+    .unwrap();
+    let request =
+        CredentialRequest::new(owner, Purpose::Data, endpoint.into(), None, None).unwrap();
+    AcquiredCredential::new(&request, BearerSecret::new(token.into()).unwrap())
 }
 
 pub(crate) fn acquire_environment(

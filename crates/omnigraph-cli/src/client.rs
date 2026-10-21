@@ -241,27 +241,38 @@ pub(crate) fn is_catalogue_scope(uri: Option<&str>) -> bool {
 
 impl GraphClient {
     /// A validated managed credential does not resolve operator profiles or tokens.
-    pub(crate) fn managed(endpoint: &str, graph: &str, token: String) -> Result<Self> {
+    pub(crate) fn managed(
+        endpoint: &str,
+        graph: &str,
+        credential: crate::credential_sources::AcquiredCredential,
+    ) -> Result<Self> {
         Self::managed_url(
             endpoint,
             remote_url(endpoint, &["graphs", graph], &[])?,
-            token,
+            credential,
             is_catalogue_scope(Some(graph)),
         )
     }
 
-    pub(crate) fn managed_registry(endpoint: &str, token: String) -> Result<Self> {
-        Self::managed_url(endpoint, endpoint.to_owned(), token, false)
+    pub(crate) fn managed_registry(
+        endpoint: &str,
+        credential: crate::credential_sources::AcquiredCredential,
+    ) -> Result<Self> {
+        Self::managed_url(endpoint, endpoint.to_owned(), credential, false)
     }
 
     fn managed_url(
         endpoint: &str,
         base_url: String,
-        token: String,
+        credential: crate::credential_sources::AcquiredCredential,
         catalogue: bool,
     ) -> Result<Self> {
+        let token = credential
+            .bearer_for(credential.request(), time::OffsetDateTime::now_utc())?
+            .expose()
+            .to_owned();
         Ok(Self::Remote {
-            http: Box::new(GraphHttpClient::managed(endpoint)?),
+            http: Box::new(GraphHttpClient::managed(endpoint)?.with_credential(credential)?),
             base_url,
             token: Some(token),
             response_limit: Some(8 * 1024 * 1024),
@@ -2827,6 +2838,110 @@ mod tests {
         reply
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_http_refuses_credential_expired_during_discovery() {
+        use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+        let directory = tempfile::tempdir().unwrap();
+        let expiry = std::sync::Arc::new(std::sync::Mutex::new(None::<OffsetDateTime>));
+        let server = IntentApiFixture::graph_with_discovery_hook(
+            vec![IntentReply::json(
+                200,
+                json!({"unexpected": "mutation dispatched"}),
+            )],
+            {
+                let expiry = expiry.clone();
+                move || {
+                    let expiry = expiry.lock().unwrap().unwrap();
+                    while OffsetDateTime::now_utc() < expiry {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            },
+        );
+        let helper = directory.path().join("helper.sh");
+        let response = directory.path().join("response.json");
+        let calls = directory.path().join("calls");
+        std::fs::write(
+            &helper,
+            "IFS= read -r request\nprintf 'called\\n' >> \"$2\"\ncat \"$1\"\n",
+        )
+        .unwrap();
+        let configuration = json!({"version": 1, "targets": {"served": {
+            "kind": "server", "endpoint": server.origin, "default_graph": "knowledge",
+            "auth": {
+                "provider": "exec", "command": ["/bin/sh", helper, response, calls]
+            }
+        }}});
+        std::fs::write(
+            directory.path().join("config.yaml"),
+            configuration.to_string(),
+        )
+        .unwrap();
+        let input = InvocationConfig::at(Some(directory.path().to_owned()), None);
+        let cli =
+            crate::invocation::parse_from(["omnigraph", "mutate", "write", "--target", "served"])
+                .unwrap()
+                .cli;
+        let target = crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
+            .unwrap()
+            .unwrap();
+        let authentication = crate::operator_routing::authentication(&cli, &input, Some(&target))
+            .unwrap()
+            .unwrap();
+        crate::operator_routing::test_transport_scope(&[&server.origin], async {
+            crate::operator_routing::AUTH
+                .scope(Some(authentication.clone()), async {
+                    let expires = OffsetDateTime::now_utc() + time::Duration::seconds(2);
+                    *expiry.lock().unwrap() = Some(expires);
+                    std::fs::write(
+                        &response,
+                        json!({"version": 1,
+                            "credential": {"type": "bearer", "token": "expiring-test-only"},
+                            "expires_at": expires.format(&Rfc3339).unwrap()
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    authentication.token().await.unwrap();
+                    let client = GraphClient::from_target(
+                        &input,
+                        &target,
+                        Some("knowledge"),
+                        None,
+                        &mut Vec::new(),
+                    )
+                    .await
+                    .unwrap();
+                    let result = client
+                        .invoke_named::<Value>("write", true, None, None, None, None)
+                        .await;
+                    let requests = server.requests();
+                    assert_eq!(
+                        requests.len(),
+                        1,
+                        "expired credentials must never reach the mutation endpoint"
+                    );
+                    assert_eq!(requests[0].method, "HEAD");
+                    assert!(!requests[0].headers.contains_key("authorization"));
+                    let error = result.unwrap_err();
+                    assert_eq!(
+                        error.downcast_ref::<crate::credential_sources::CredentialError>(),
+                        Some(&crate::credential_sources::CredentialError::Expired)
+                    );
+                    assert!(!format!("{error:?}").contains("expiring-test-only"));
+                    assert_eq!(
+                        std::fs::read_to_string(&calls).unwrap(),
+                        "called\n",
+                        "expiry must not rerun the helper"
+                    );
+                })
+                .await;
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn graph_http_discovery_refuses_before_data_dispatch() {
         use omnigraph_api_types::{
@@ -2943,7 +3058,11 @@ mod tests {
         crate::operator_routing::test_transport_scope(&[&server.origin], async {
             let endpoint = format!("{}/proxy/graphs/front/", server.origin);
             let client = crate::operator_routing::test_transport_scope(&[&endpoint], async {
-                GraphClient::managed(&endpoint, "knowledge", "data-bearer".into())
+                GraphClient::managed(
+                    &endpoint,
+                    "knowledge",
+                    crate::credential_sources::test_credential(&endpoint, "data-bearer"),
+                )
             })
             .await
             .unwrap();
@@ -3171,8 +3290,12 @@ mod tests {
         }
         let server = IntentApiFixture::new(replies);
         crate::operator_routing::test_transport_scope(&[&server.origin], async {
-            let client =
-                GraphClient::managed(&server.origin, "knowledge", "data-bearer".into()).unwrap();
+            let client = GraphClient::managed(
+                &server.origin,
+                "knowledge",
+                crate::credential_sources::test_credential(&server.origin, "data-bearer"),
+            )
+            .unwrap();
             let mut served = 0;
             for form in forms {
                 for dispatched in [false, true] {
@@ -3444,7 +3567,14 @@ mod tests {
                 );
                 let client =
                     crate::operator_routing::test_transport_scope_sync(&[&server.origin], || {
-                        GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
+                        GraphClient::managed(
+                            &server.origin,
+                            "knowledge",
+                            crate::credential_sources::test_credential(
+                                &server.origin,
+                                "data-credential",
+                            ),
+                        )
                     })
                     .unwrap();
                 // Finish synchronous client setup before join_all polls requests.
@@ -3580,7 +3710,10 @@ mod tests {
                             GraphClient::managed(
                                 &server.origin,
                                 "knowledge",
-                                "data-credential".into(),
+                                crate::credential_sources::test_credential(
+                                    &server.origin,
+                                    "data-credential",
+                                ),
                             )
                         },
                     )
@@ -3665,9 +3798,12 @@ mod tests {
     async fn process_setting_is_refused_before_any_request_is_sent() {
         let server = IntentApiFixture::new(vec![]);
         crate::operator_routing::test_transport_scope(&[&server.origin], async {
-            let client =
-                GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
-                    .unwrap();
+            let client = GraphClient::managed(
+                &server.origin,
+                "knowledge",
+                crate::credential_sources::test_credential(&server.origin, "data-credential"),
+            )
+            .unwrap();
             let settings = parse_set_flags(&["stage_write_concurrency=4".to_string()]).unwrap();
             const REFUSAL: &str = "setting `stage_write_concurrency` is a process setting; it is \
                                read from the server's environment, not from a request";
@@ -3787,9 +3923,12 @@ mod tests {
             IntentReply::json(200, change),
         ]);
         crate::operator_routing::test_transport_scope(&[&server.origin], async {
-            let client =
-                GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
-                    .unwrap();
+            let client = GraphClient::managed(
+                &server.origin,
+                "knowledge",
+                crate::credential_sources::test_credential(&server.origin, "data-credential"),
+            )
+            .unwrap();
             let settings = parse_set_flags(&[
                 "merge_lineage=off".to_string(),
                 "ann_nprobes=1".to_string(),

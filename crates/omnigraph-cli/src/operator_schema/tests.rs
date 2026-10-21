@@ -42,9 +42,7 @@ targets:
   server:
     kind: server
     endpoint: https://server.example/prefix
-    auth:
-      public: {provider: anonymous}
-      operator: {provider: token, source: {file: /missing/token}}
+    auth: {provider: anonymous}
     transport: {proxy: {mode: environment}}
   local:
     kind: direct
@@ -83,7 +81,7 @@ fn reject(text: &str) {
 
 fn server(endpoint: &str, profile: &str) -> String {
     format!(
-        "version: 1\ntargets:\n  server:\n    kind: server\n    endpoint: {endpoint:?}\n    auth:\n      profile: {profile}\n"
+        "version: 1\ntargets:\n  server:\n    kind: server\n    endpoint: {endpoint:?}\n    auth: {profile}\n"
     )
 }
 
@@ -265,7 +263,7 @@ fn complete_document_resolves_paths_and_normalizes_routes_without_io() {
     assert!(matches!(
         &config.targets["server"],
         Target::Server {
-            default_auth: None,
+            auth: AuthProfile::Anonymous,
             ..
         }
     ));
@@ -343,8 +341,8 @@ fn duplicates_are_rejected_at_every_mapping_depth() {
             "auth: {provider: omnigraph}\n    auth: {provider: omnigraph}",
         ),
         (
-            "public: {provider: anonymous}",
-            "public: {provider: anonymous}\n      public: {provider: anonymous}",
+            "auth: {provider: anonymous}",
+            "auth: {provider: anonymous, provider: anonymous}",
         ),
         (
             "{provider: omnigraph}",
@@ -379,7 +377,6 @@ fn names_and_references_are_validated_document_wide() {
         reject(&COMPLETE.replacen("  service:", &format!("  {bad}:"), 1));
         reject(&COMPLETE.replacen("  local:", &format!("  {bad}:"), 1));
         reject(&COMPLETE.replacen("  graph-query:", &format!("  {bad}:"), 1));
-        reject(&COMPLETE.replacen("      public:", &format!("      {bad}:"), 1));
     }
     for (needle, replacement) in [
         ("profile: service", "profile: missing"),
@@ -419,6 +416,7 @@ fn required_fields_and_variant_boundaries_are_enforced() {
         "    cluster_id: other\n",
         "    cluster_incarnation: other-generation\n",
         "    endpoint: https://server.example/prefix\n",
+        "    auth: {provider: anonymous}\n",
         "    scope: graph\n",
         "    uri: file:///missing/graph.omni\n",
     ] {
@@ -439,6 +437,7 @@ fn required_fields_and_variant_boundaries_are_enforced() {
     }
     for extra in [
         "profile: service",
+        "default_auth: public",
         "cluster_id: id",
         "scope: graph",
         "storage: {}",
@@ -487,6 +486,8 @@ fn auth_provider_and_source_variants_are_exact() {
     reject(&COMPLETE.replacen("profile: service", "connection: service", 1));
     for profile in [
         "{}",
+        "{public: {provider: anonymous}}",
+        "{reader: {provider: token, source: {env: READER}}, writer: {provider: token, source: {env: WRITER}}}",
         "{provider: workload}",
         "{provider: omnigraph}",
         "{provider: anonymous, source: {env: X}}",
@@ -793,7 +794,7 @@ fn relative_paths_are_literal_and_bound_to_the_supplied_directory() {
         panic!("server expected")
     };
     assert_eq!(
-        auth["profile"],
+        *auth,
         AuthProfile::Token {
             source: TokenSource::File {
                 file: PathBuf::from("/operator/~/literal/$TOKEN")

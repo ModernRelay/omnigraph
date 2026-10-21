@@ -506,8 +506,38 @@ fn resolve_loaded(
 ) -> Result<GraphClient> {
     credential.validate(context)?;
     let endpoint = context.endpoint.as_deref().ok_or_else(|| Failure::refused("data_endpoint_required", "complete the managed target's endpoint before data operations; cluster token reports the issuer endpoint"))?;
+    use crate::credential_sources::{
+        AcquiredCredential, CredentialRequest, OwnerBinding, OwnerKind, Purpose, ResourceIdentity,
+    };
+    // This issued credential binds its verified principal and resource. Its
+    // lifetime is independent from the control credential used to acquire it.
+    let owner = OwnerBinding::new(
+        OwnerKind::Profile,
+        context.organization_id.clone(),
+        credential.actor.clone(),
+        context.api.clone(),
+        Some(context.organization_id.clone()),
+    )
+    .map_err(|_| invalid())?;
+    let request = CredentialRequest::new(
+        owner,
+        Purpose::Data,
+        endpoint.to_owned(),
+        Some(format!("urn:omnigraph:data:{}", context.cluster)),
+        Some(ResourceIdentity {
+            cluster_id: context.cluster.clone(),
+            cluster_incarnation: context.incarnation.clone(),
+        }),
+    )
+    .map_err(|_| invalid())?;
+    let credential = AcquiredCredential::issued(
+        request,
+        credential.token,
+        OffsetDateTime::parse(&credential.expires_at, &Rfc3339).map_err(|_| invalid())?,
+    )
+    .map_err(|_| invalid())?;
     let Some(graph) = graph else {
-        return GraphClient::managed_registry(endpoint, credential.token).map_err(|_| {
+        return GraphClient::managed_registry(endpoint, credential).map_err(|_| {
             Failure::new(
                 "transport_failed",
                 "could not initialize the managed discovery client",
@@ -516,7 +546,7 @@ fn resolve_loaded(
         });
     };
     graph_id(graph)?;
-    GraphClient::managed(endpoint, graph, credential.token).map_err(|_| {
+    GraphClient::managed(endpoint, graph, credential).map_err(|_| {
         Failure::new(
             "transport_failed",
             "could not initialize the managed data client",
