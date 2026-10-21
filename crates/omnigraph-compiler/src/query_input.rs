@@ -126,7 +126,9 @@ impl ToParam for i64 {
 
 impl ToParam for isize {
     fn to_param(self) -> crate::error::Result<Literal> {
-        Ok(Literal::Integer(i128::from(self)))
+        // Why the cast: Rust has no `From<isize> for i128`, and the widening
+        // is exact.
+        Ok(Literal::Integer(self as i128))
     }
 }
 
@@ -156,7 +158,9 @@ impl ToParam for u64 {
 
 impl ToParam for usize {
     fn to_param(self) -> crate::error::Result<Literal> {
-        Ok(Literal::Integer(i128::from(self)))
+        // Why the cast: Rust has no `From<usize> for i128`, and the widening
+        // is exact.
+        Ok(Literal::Integer(self as i128))
     }
 }
 
