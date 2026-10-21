@@ -136,6 +136,33 @@
               }
             }
           },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "403": {
             "description": "",
             "headers": {
@@ -317,6 +344,33 @@
           "400": {
             "description": "; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -577,6 +631,33 @@
               }
             }
           },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "403": {
             "description": "",
             "headers": {
@@ -739,6 +820,33 @@
           "400": {
             "description": "; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -995,6 +1103,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -1159,6 +1273,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -1331,6 +1451,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -1782,6 +1908,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -2157,6 +2289,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -2546,6 +2684,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -3019,6 +3163,12 @@
           "401": {
             "description": "Unauthorized; HEAD responses have no body",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -3229,6 +3379,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -3439,6 +3595,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -3819,6 +3981,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -4136,6 +4304,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -4440,6 +4614,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -4693,6 +4873,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -5006,6 +5192,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -5323,6 +5515,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -5664,6 +5862,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -5917,6 +6121,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -6140,6 +6350,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -6439,6 +6655,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -6734,6 +6956,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -7030,6 +7258,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -7322,6 +7556,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -7639,6 +7879,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -7976,6 +8222,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -8314,6 +8566,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -8640,6 +8898,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -8926,6 +9190,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -9153,6 +9423,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -9515,6 +9791,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -9853,6 +10135,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -10139,6 +10427,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
@@ -10352,6 +10646,12 @@
           "401": {
             "description": "Unauthorized",
             "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              },
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",

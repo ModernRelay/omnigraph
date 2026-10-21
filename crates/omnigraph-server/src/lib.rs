@@ -3,6 +3,7 @@
 
 pub mod api;
 mod blob_transport;
+mod challenge;
 mod deployment;
 mod export_transport;
 mod handlers;
@@ -60,7 +61,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -497,6 +498,9 @@ enum ApiErrorDetails {
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
     FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
+    /// Whether a 401 followed a presented bearer credential. The challenge
+    /// layer renders it as `WWW-Authenticate`; the body carries nothing.
+    Unauthenticated(challenge::Unauthenticated),
 }
 
 impl AppState {
@@ -1037,13 +1041,18 @@ fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerToken
 }
 
 impl ApiError {
-    pub fn unauthorized(message: impl Into<String>) -> Self {
+    /// HTTP 401, recording whether a bearer credential was presented so the
+    /// response's challenge says which (RFC 6750 §3.1).
+    pub(crate) fn unauthorized(
+        reason: challenge::Unauthenticated,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             completion_uncertain: false,
             status: StatusCode::UNAUTHORIZED,
             code: Some(ErrorCode::Unauthorized),
             message: message.into().into_boxed_str(),
-            details: None,
+            details: Some(Box::new(ApiErrorDetails::Unauthenticated(reason))),
         }
     }
 
@@ -1810,8 +1819,16 @@ impl IntoResponse for ApiError {
         {
             headers.insert(axum::http::header::ETAG, etag);
         }
+        let unauthenticated = match self.details.as_deref() {
+            Some(ApiErrorDetails::Unauthenticated(reason)) => Some(*reason),
+            _ => None,
+        };
         let status = self.status;
-        (status, headers, Json(self.into_output())).into_response()
+        let mut response = (status, headers, Json(self.into_output())).into_response();
+        if let Some(reason) = unauthenticated {
+            response.extensions_mut().insert(reason);
+        }
+        response
     }
 }
 
@@ -1855,6 +1872,7 @@ impl ApiError {
                     output.full_text_index_required = Some(value)
                 }
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
+                ApiErrorDetails::Unauthenticated(_) => {}
             }
         }
         output
@@ -3019,7 +3037,11 @@ pub fn build_app(state: AppState) -> Router {
     if state.has_credential_source() {
         app = app.merge(mcp::router(state.clone()));
     }
+    // Every 401, from any router or handler, carries the one challenge, built
+    // once from the fixed OIDC resource binding.
+    let challenge = challenge::Challenge::new(state.oidc_resource_url().as_deref());
     app.layer(middleware::from_fn(http_contract::identify_response))
+        .layer(middleware::from_fn_with_state(challenge, challenge::answer))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

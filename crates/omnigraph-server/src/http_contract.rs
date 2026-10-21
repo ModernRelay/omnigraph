@@ -55,6 +55,27 @@ pub(crate) async fn identify_response(request: Request, next: Next) -> Response 
     response
 }
 
+/// What the `WWW-Authenticate` header of every protected 401 carries.
+const CHALLENGE_DESCRIPTION: &str = "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity.";
+
+/// A refusal documented with the route's error envelope: change routes use
+/// their narrower graph-vocabulary projection.
+fn error_response(path: &str, description: &str) -> RefOr<utoipa::openapi::Response> {
+    let mut response = utoipa::openapi::Response::new(description);
+    response.content.insert(
+        "application/json".into(),
+        Content::new(Some(Ref::from_schema_name(
+            if path.contains("/changes") || path.ends_with("/diff") || path.ends_with("/merge-base")
+            {
+                "ChangeErrorOutput"
+            } else {
+                "ErrorOutput"
+            },
+        ))),
+    );
+    response.into()
+}
+
 pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
     let mut schema = Object::with_type(Type::String);
     schema.enum_values = Some(vec![HTTP_API_CONTRACT.into()]);
@@ -92,23 +113,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     .responses
                     .responses
                     .entry("412".into())
-                    .or_insert_with(|| {
-                        let mut response = utoipa::openapi::Response::new("Precondition failed");
-                        response.content.insert(
-                            "application/json".into(),
-                            Content::new(Some(Ref::from_schema_name(
-                                if path.contains("/changes")
-                                    || path.ends_with("/diff")
-                                    || path.ends_with("/merge-base")
-                                {
-                                    "ChangeErrorOutput"
-                                } else {
-                                    "ErrorOutput"
-                                },
-                            ))),
-                        );
-                        response.into()
-                    });
+                    .or_insert_with(|| error_response(path, "Precondition failed"));
                 if let RefOr::T(response) = response {
                     response.description.push_str(
                         "; actor_mismatch when omnigraph-if-actor names another actor than the credential resolves to",
@@ -118,18 +123,23 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     .responses
                     .responses
                     .entry("400".into())
-                    .or_insert_with(|| {
-                        let mut response = utoipa::openapi::Response::new("Invalid request");
-                        response.content.insert(
-                            "application/json".into(),
-                            Content::new(Some(Ref::from_schema_name("ErrorOutput"))),
-                        );
-                        response.into()
-                    });
+                    .or_insert_with(|| error_response(path, "Invalid request"));
                 if let RefOr::T(response) = response {
                     response.description.push_str(
                         "; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
                     );
+                }
+                // Authentication guards every protected router, and every 401
+                // carries the challenge.
+                let response = operation
+                    .responses
+                    .responses
+                    .entry("401".into())
+                    .or_insert_with(|| error_response(path, "Unauthorized"));
+                if let RefOr::T(response) = response {
+                    let mut header = Header::new(Object::with_type(Type::String));
+                    header.description = Some(CHALLENGE_DESCRIPTION.into());
+                    response.headers.insert("WWW-Authenticate".into(), header);
                 }
             }
             if path.starts_with("/graphs/{graph_id}/") || path.starts_with("/cluster/") {
@@ -158,23 +168,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                         .responses
                         .responses
                         .entry(status.into())
-                        .or_insert_with(|| {
-                            let mut response = utoipa::openapi::Response::new(description);
-                            response.content.insert(
-                                "application/json".into(),
-                                Content::new(Some(Ref::from_schema_name(
-                                    if path.contains("/changes")
-                                        || path.ends_with("/diff")
-                                        || path.ends_with("/merge-base")
-                                    {
-                                        "ChangeErrorOutput"
-                                    } else {
-                                        "ErrorOutput"
-                                    },
-                                ))),
-                            );
-                            response.into()
-                        });
+                        .or_insert_with(|| error_response(path, description));
                     if let RefOr::T(response) = response {
                         if !response.description.contains(description) {
                             response.description.push_str("; ");

@@ -16,16 +16,17 @@ tokens, signed data tokens, or an
 [OIDC resource identity](server.md#oidc-resource-identities-and-mcp)
 (`--oidc-identity-trust`). A server without credentials has no MCP.
 
-| Credentials | `/mcp` | OAuth discovery and challenge |
-|---|---|---|
-| Static or signed data tokens | mounted | none |
-| OIDC resource identity, alone or with tokens | mounted | served |
+| Credentials | `/mcp` | OAuth discovery | Challenge on a 401 |
+|---|---|---|---|
+| Static or signed data tokens | mounted | none | `Bearer` |
+| OIDC resource identity, alone or with tokens | mounted | served | `Bearer resource_metadata="<url>"` |
 
 With static or signed tokens, configure the client with the URL and an
 `Authorization: Bearer <token>` header; Claude Code and Cursor support this
 directly. With OIDC, the resource identifier in the trust file is the URL users
 enter in their MCP client, for example `https://graphs.example.com/mcp`, and the
-client signs in through OAuth.
+client signs in through OAuth. An identifier naming the service root also lets
+REST clients sign in; see [Sign-in and discovery](#sign-in-and-discovery).
 
 The endpoint is stateless Streamable HTTP built on the official Rust MCP SDK:
 each request is a `POST` that carries its own bearer credential and gets a JSON
@@ -35,7 +36,8 @@ later unauthenticated request.
 ### Sign-in and discovery
 
 A request without a valid credential is refused with 401 before its body is
-read. With OIDC, the response's challenge names the protected-resource metadata:
+read, with the same [challenge](server.md#authentication) as every other route.
+With OIDC, the challenge names the protected-resource metadata:
 
 ```text
 WWW-Authenticate: Bearer resource_metadata="https://graphs.example.com/.well-known/oauth-protected-resource/mcp"
@@ -43,7 +45,17 @@ WWW-Authenticate: Bearer resource_metadata="https://graphs.example.com/.well-kno
 
 When a bearer credential was presented and refused (expired, wrong audience,
 unknown subject), the challenge also carries `error="invalid_token"`, which tells
-a client to refresh or sign in again.
+a client to refresh or sign in again. Without OIDC the challenge is `Bearer`,
+which advertises no sign-in flow.
+
+The server has one resource identifier, so every route's challenge names the
+same metadata. A client that follows a challenge checks that the metadata's
+`resource` matches the URL it requested (RFC 9728 §3.3); the MCP TypeScript SDK
+accepts an identifier whose path is a prefix of that URL. An identifier naming
+the service root, such as `https://graphs.example.com`, is a prefix of every
+route's URL. One naming `https://graphs.example.com/mcp` matches only this
+endpoint, so a REST client must not use its metadata. Name the service root when
+REST clients should discover sign-in from a challenge.
 
 The server answers the metadata both at `/.well-known/oauth-protected-resource`
 and at the advertised path: the well-known prefix followed by the resource
