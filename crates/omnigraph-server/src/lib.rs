@@ -492,6 +492,14 @@ pub struct ApiError {
     /// Set when the engine proved the failing step published nothing itself,
     /// with no-effect or no-publication evidence, whatever its type.
     unpublished: bool,
+    /// The outcome is unknown only for storage requests whose uncertainty
+    /// is scoped to their own keys: a publication in doubt, whose late
+    /// landing its version key fences (the version is created only if
+    /// absent, so it lands before the branch's next publication or never),
+    /// or an opaque storage failure, whose mutable keys the storage scope
+    /// holds unsettled. Such an error reports its unknown outcome but does
+    /// not contain the process.
+    scoped_unknown: bool,
 }
 
 #[derive(Debug)]
@@ -1101,6 +1109,7 @@ impl ApiError {
             owned_write: false,
             compound: false,
             unpublished: false,
+            scoped_unknown: false,
         }
     }
 
@@ -1434,12 +1443,21 @@ impl ApiError {
         self.completion_uncertain
     }
 
+    /// Whether this error's unknown outcome leaves the process's own state
+    /// unproven, so the process must be contained: an uncertain completion
+    /// the engine does not scope to its storage keys.
+    pub(crate) fn contains_process(&self) -> bool {
+        self.completion_uncertain && !self.scoped_unknown
+    }
+
     fn from_omni(err: OmniError) -> Self {
         let cause = redacted_cause::RedactedCause::of(&err);
         // An in-doubt publication's graph commit, logged as its own field: the
         // message that also names it can carry storage paths.
         let publication = err.publication_id().map(str::to_owned);
         let (err, evidence) = err.into_completion_evidence();
+        let storage_outcome = err.is_manifest_publish_in_doubt()
+            || matches!(&err, OmniError::Storage(_) | OmniError::Io(_));
         // Keep completion classification separate from HTTP status. Generic
         // DataFusion erases plan-vs-execution provenance: if an owned write
         // unexpectedly returns it, contain the epoch until typed engine
@@ -1746,18 +1764,21 @@ impl ApiError {
             }
             None => {}
         }
+        response.scoped_unknown = response.completion_uncertain && storage_outcome;
         // The error carries what its request has done, as one leaving an
         // owned read's task does, so its status is the one its response sends.
         let response = response.with_request_facts();
         if response.completion_uncertain {
-            // The record of why a write may be contained: the failure's class,
-            // the status its response sends and, for a publication in doubt,
+            // The record of a write's unknown outcome: the failure's class,
+            // the status its response sends, whether its uncertainty is
+            // scoped to its keys and branch and, for a publication in doubt,
             // its graph commit, never its message, which can carry object
             // URIs. It shares the request's span with the containment log.
             tracing::warn!(
                 status = %response.status(),
                 ?cause,
                 publication = publication.as_deref(),
+                scoped = response.scoped_unknown,
                 "engine failure without definite completion evidence"
             );
         }

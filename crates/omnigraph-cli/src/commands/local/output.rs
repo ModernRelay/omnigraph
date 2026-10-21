@@ -5,29 +5,6 @@ use color_eyre::eyre::Result;
 use serde::Serialize;
 use std::io::Write;
 
-pub(crate) fn finish_login(target: &str, json: bool, stdout: &mut dyn Write) -> Result<()> {
-    if json {
-        write_json(
-            &serde_json::json!({"target": target, "credential_stored": true}),
-            stdout,
-        )
-    } else {
-        writeln!(stdout, "stored credential for target '{target}'")?;
-        Ok(())
-    }
-}
-pub(crate) fn finish_logout(target: &str, json: bool, stdout: &mut dyn Write) -> Result<()> {
-    if json {
-        write_json(
-            &serde_json::json!({"target": target, "credential_removed": true}),
-            stdout,
-        )
-    } else {
-        writeln!(stdout, "removed credential for target '{target}'")?;
-        Ok(())
-    }
-}
-
 /// The version this binary reports, `omnigraph --version` included
 /// ([`omnigraph_api_types::build`]).
 pub(crate) static PACKAGE_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {

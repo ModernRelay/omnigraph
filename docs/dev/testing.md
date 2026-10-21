@@ -217,13 +217,26 @@ filtering and wrong-plane refusal before configuration or HTTP access. The exist
 `system_remote` deployment matrix owns real server completion after delivery loss;
 these CLI changes require no additional query-semantic GQT cases.
 
-Local command tests in `commands/local` own supplied login input, credential
-changes after report failure, captured target configuration, and completed skill
-or embedding files after output loss. `skill.rs` owns exact file delivery and its
-existing broken-pipe exception. Extend `cli_schema_config` for version and skill
-process behavior and `cli_data` for target/embedding output. Its existing
-discovery-swap fixture also replaces the credential file, requiring registry
-probing and the subsequent command to retain the original token. Application and
+Operator schema/routing owners cover whole-document validity, independent
+profile/target defaults, single-identity managed profiles, standalone auth
+selection and immutable target-to-profile bindings.
+Credential-source owners cover bounded stdin/env/file/exec acquisition, absence
+of fallback, helper failures and secret redaction. Target/application tests own
+static set/remove, no-network/no-helper/noninteractive status and pipe-only export
+before secret acquisition. Managed authentication tests own independent profile
+sessions, principal/session collision refusal, refresh coordination and logout
+cache clearing; lifecycle fixtures retain original-identity recovery checks.
+Transport owners cover prefix boundaries, no redirects, explicit proxy selection,
+CA capture and unsupported trust combinations. Extend the shared served-client
+fixtures across managed and standalone graph commands instead of adding an
+allowlist-specific test setup.
+
+`commands/local` retains version, skill and embedding output ownership.
+`skill.rs` owns exact file delivery and its broken-pipe exception; extend
+`cli_schema_config` for process behavior. Credential replacement during discovery
+must not change the token used by an already captured invocation.
+
+Application and
 managed-output tests own completion, partial-write and flush failures; managed
 authentication/lifecycle fixtures own the pre-dispatch diagnostic gates and
 accepted-identity recovery output when stderr fails. Application tests keep
@@ -237,11 +250,10 @@ The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server
-PID; neither apply nor recovery polling may resubmit. The `unix://` server
-transport goes through `tests/support/unix_gateway.rs`, a byte-for-byte
-Unix-socket relay to the server's TCP address: `system_remote` runs the CLI's
-data verbs through it, and the in-source `client.rs` tests own the request
-target, discovery and refusals over the socket.
+PID; neither apply nor recovery polling may resubmit. The old Unix-gateway
+fixture does not qualify a version-1 operator transport: Unix socket targets are
+unsupported. Keep lower-level transport coverage distinct from public resolver
+capability/refusal tests.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 

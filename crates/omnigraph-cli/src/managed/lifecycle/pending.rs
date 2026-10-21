@@ -10,6 +10,10 @@ const ACCEPTED: &str = "accepted-lifecycle.json";
 const MAX_ACCEPTED: usize = 128;
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 
+fn owner_profile() -> Option<String> {
+    crate::operator_routing::journal_owner()
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Pending {
@@ -19,6 +23,8 @@ pub(super) struct Pending {
     request_digest: String,
     principal_id: String,
     account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_profile: Option<String>,
     pub(super) idempotency_key: String,
     #[serde(skip)]
     pub(super) fresh: bool,
@@ -144,7 +150,7 @@ fn directory_at(
             Ok(_) => {
                 return Err(Failure::refused(
                     "legacy_lifecycle_custody",
-                    "legacy lifecycle evidence requires target import before another lifecycle submission; preserve the project .omnigraph directory",
+                    "legacy lifecycle evidence requires config recover-operations --profile NAME --source DIR before another lifecycle submission; preserve the project .omnigraph directory",
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -173,7 +179,7 @@ fn verify_retired_custody(source: &Path, home: &Path) -> Result<()> {
     let missing = || {
         Failure::refused(
             "legacy_lifecycle_custody",
-            "retired lifecycle evidence has not been preserved in this operator home; run target import here before another lifecycle submission",
+            "retired lifecycle evidence has not been preserved in this operator home; run config recover-operations --profile NAME --source DIR before another lifecycle submission",
         )
     };
     if let Some(pending) = evidence.pending {
@@ -278,13 +284,19 @@ pub(super) fn prepare(
         "{:x}",
         Sha256::digest(serde_json::to_vec(body).map_err(|_| failure())?)
     );
-    let matches = |existing: &Pending| {
+    let same_request = |existing: &Pending| {
         existing.version == 1
             && existing.api == api
             && existing.path == path
             && existing.request_digest == request_digest
             && existing.principal_id == principal.principal_id
             && existing.account_id == principal.account_id
+    };
+    let matches = |existing: &Pending| {
+        same_request(existing)
+            && (existing.owner_profile == owner_profile()
+                || existing.owner_profile.is_none()
+                    && explicit == Some(existing.idempotency_key.as_str()))
     };
     if let Some(existing) = read::<Pending>(dir, PENDING)? {
         if !matches(&existing) || explicit.is_some_and(|key| key != existing.idempotency_key) {
@@ -311,7 +323,7 @@ pub(super) fn prepare(
         if record.request.api != api || record.request.account_id != principal.account_id {
             return Err(failure());
         }
-        if matches(&record.request) && explicit.is_none() {
+        if same_request(&record.request) && explicit.is_none() {
             let mut error = Failure::refused(
                 "accepted_lifecycle_requires_key",
                 "this exact lifecycle request was already accepted; observe its operation or supply its original idempotency key explicitly",
@@ -346,6 +358,7 @@ pub(super) fn prepare(
         request_digest,
         principal_id: principal.principal_id.clone(),
         account_id: principal.account_id.clone(),
+        owner_profile: owner_profile(),
         idempotency_key: idempotency_key(explicit, stderr)?,
         fresh: true,
     };
@@ -375,6 +388,7 @@ pub(super) fn record(dir: &Path, request: &Pending, identity: &Identity) -> Resu
             || existing.request.path != request.path
             || existing.request.request_digest != request.request_digest
             || existing.request.principal_id != request.principal_id
+            || existing.request.owner_profile != request.owner_profile
             || existing.request.account_id != request.account_id
             || existing.identity != *identity
         {

@@ -519,83 +519,86 @@ async fn baseline_keeps_installed_snapshot_locked_through_cursor_delivery() {
                 headers: vec![("content-type".into(), "application/x-ndjson".into())],
                 body,
             }]);
-            let client =
-                GraphClient::managed(&server.origin, "knowledge", "test-token".into()).unwrap();
-            let mut output = CursorOutput {
-                path: path.clone(),
-                competing_lock: OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .write(true)
-                    .open(temp.path().join("snapshot.jsonl.lock"))
-                    .unwrap(),
-                fault,
-                bytes: Vec::new(),
-                flushes: 0,
-            };
-            let result = capture_baseline(
-                &client,
-                None,
-                &ChangeFilterArgs {
-                    kinds: &[],
-                    types: &[],
-                    ops: &[],
-                },
-                &path,
-                json,
-                &mut output,
-            )
-            .await;
-            if fault.is_some() {
-                assert_eq!(
-                    result
-                        .unwrap_err()
-                        .downcast_ref::<io::Error>()
-                        .unwrap()
-                        .kind(),
-                    io::ErrorKind::BrokenPipe
-                );
-            } else {
-                result.unwrap();
-                if json {
+            crate::operator_routing::test_transport_scope(&[&server.origin], async {
+                let client =
+                    GraphClient::managed(&server.origin, "knowledge", "test-token".into()).unwrap();
+                let mut output = CursorOutput {
+                    path: path.clone(),
+                    competing_lock: OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .write(true)
+                        .open(temp.path().join("snapshot.jsonl.lock"))
+                        .unwrap(),
+                    fault,
+                    bytes: Vec::new(),
+                    flushes: 0,
+                };
+                let result = capture_baseline(
+                    &client,
+                    None,
+                    &ChangeFilterArgs {
+                        kinds: &[],
+                        types: &[],
+                        ops: &[],
+                    },
+                    &path,
+                    json,
+                    &mut output,
+                )
+                .await;
+                if fault.is_some() {
                     assert_eq!(
-                        serde_json::from_slice::<Value>(&output.bytes).unwrap(),
-                        json!({"snapshot_commit_id":"head", "resume_cursor":"resume"})
+                        result
+                            .unwrap_err()
+                            .downcast_ref::<io::Error>()
+                            .unwrap()
+                            .kind(),
+                        io::ErrorKind::BrokenPipe
                     );
                 } else {
-                    let text = String::from_utf8(output.bytes.clone()).unwrap();
-                    assert!(text.contains("head") && text.contains("resume"), "{text}");
+                    result.unwrap();
+                    if json {
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&output.bytes).unwrap(),
+                            json!({"snapshot_commit_id":"head", "resume_cursor":"resume"})
+                        );
+                    } else {
+                        let text = String::from_utf8(output.bytes.clone()).unwrap();
+                        assert!(text.contains("head") && text.contains("resume"), "{text}");
+                    }
                 }
-            }
-            assert_eq!(
-                output.flushes,
-                usize::from(!matches!(fault, Some(OutputFault::AfterPrefix)))
-            );
-            assert_eq!(
-                std::fs::read(&path).unwrap(),
-                SNAPSHOT,
-                "output failure must preserve the installed snapshot"
-            );
-            assert_eq!(
-                unsafe {
-                    libc::flock(
-                        output.competing_lock.as_raw_fd(),
-                        libc::LOCK_EX | libc::LOCK_NB,
-                    )
-                },
-                0,
-                "capture must release its lock on success and failure"
-            );
-            assert_eq!(
-                unsafe { libc::flock(output.competing_lock.as_raw_fd(), libc::LOCK_UN) },
-                0
-            );
-            assert_eq!(
-                server.workflow_requests().len(),
-                1,
-                "capture must not replay"
-            );
-            server.assert_complete();
+                assert_eq!(
+                    output.flushes,
+                    usize::from(!matches!(fault, Some(OutputFault::AfterPrefix)))
+                );
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    SNAPSHOT,
+                    "output failure must preserve the installed snapshot"
+                );
+                assert_eq!(
+                    unsafe {
+                        libc::flock(
+                            output.competing_lock.as_raw_fd(),
+                            libc::LOCK_EX | libc::LOCK_NB,
+                        )
+                    },
+                    0,
+                    "capture must release its lock on success and failure"
+                );
+                assert_eq!(
+                    unsafe { libc::flock(output.competing_lock.as_raw_fd(), libc::LOCK_UN) },
+                    0
+                );
+                assert_eq!(
+                    server.workflow_requests().len(),
+                    1,
+                    "capture must not replay"
+                );
+                server.assert_complete();
+            })
+            .await;
         }
     }
 }
@@ -634,180 +637,189 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                         "actor_id":null, "commit":commit})
                 };
                 let server = IntentApiFixture::graph(vec![IntentReply::json(200, receipt)]);
-                let client =
-                    GraphClient::managed(&server.origin, "knowledge", "test-token".into()).unwrap();
-                let mut stdout = FailingOutput {
-                    fault,
-                    bytes: Vec::new(),
-                };
-                let mut stderr = Vec::new();
-                let (result, evidence) =
-                    command_outcome::observe(command_outcome::CommandKind::Write, async {
-                        if command == "load" {
-                            execute_load(
-                                &client,
-                                LoadOperation {
-                                    branch: "main".into(),
-                                    from: None,
-                                    data: data.clone(),
-                                    mode: CliLoadMode::Append,
-                                    settings: Vec::new(),
-                                    json,
-                                },
-                                false,
-                                &mut crate::input::Input {
-                                    reader: &mut io::empty(),
-                                    is_terminal: false,
-                                },
-                                &mut stdout,
-                                &mut stderr,
-                            )
-                            .await?;
-                        } else {
-                            execute_blob(
-                                &client,
-                                BlobOperation::Write {
-                                    query: BlobWriteQuery {
-                                        entity: BlobEntityKind::Node,
-                                        r#type: "Document".into(),
-                                        id: "manual".into(),
-                                        property: "content".into(),
-                                        branch: None,
+                crate::operator_routing::test_transport_scope(&[&server.origin], async {
+                    let client =
+                        GraphClient::managed(&server.origin, "knowledge", "test-token".into())
+                            .unwrap();
+                    let mut stdout = FailingOutput {
+                        fault,
+                        bytes: Vec::new(),
+                    };
+                    let mut stderr = Vec::new();
+                    let (result, evidence) =
+                        command_outcome::observe(command_outcome::CommandKind::Write, async {
+                            if command == "load" {
+                                execute_load(
+                                    &client,
+                                    LoadOperation {
+                                        branch: "main".into(),
+                                        from: None,
+                                        data: data.clone(),
+                                        mode: CliLoadMode::Append,
+                                        settings: Vec::new(),
+                                        json,
                                     },
-                                    bytes: (command == "put")
-                                        .then(|| bytes::Bytes::from_static(b"\x00\xff\n")),
-                                    if_match: None,
-                                    precondition: None,
-                                    json,
-                                },
-                                &mut stdout,
-                                &mut Vec::new(),
-                            )
-                            .await?;
+                                    false,
+                                    &mut crate::input::Input {
+                                        reader: &mut io::empty(),
+                                        is_terminal: false,
+                                    },
+                                    &mut stdout,
+                                    &mut stderr,
+                                )
+                                .await?;
+                            } else {
+                                execute_blob(
+                                    &client,
+                                    BlobOperation::Write {
+                                        query: BlobWriteQuery {
+                                            entity: BlobEntityKind::Node,
+                                            r#type: "Document".into(),
+                                            id: "manual".into(),
+                                            property: "content".into(),
+                                            branch: None,
+                                        },
+                                        bytes: (command == "put")
+                                            .then(|| bytes::Bytes::from_static(b"\x00\xff\n")),
+                                        if_match: None,
+                                        precondition: None,
+                                        json,
+                                    },
+                                    &mut stdout,
+                                    &mut Vec::new(),
+                                )
+                                .await?;
+                            }
+                            Ok::<_, color_eyre::Report>(Completion::success())
+                        })
+                        .await;
+                    assert_eq!(result.is_ok(), matches!(fault, OutputFault::Flush));
+                    let completed = finish(
+                        result,
+                        Some(evidence),
+                        None,
+                        json.then_some(MachineErrors::Json),
+                        false,
+                        &mut stdout,
+                        &mut stderr,
+                    );
+                    if json || matches!(fault, OutputFault::Flush) {
+                        let error = completed.unwrap_err();
+                        let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
+                        let failure = serde_json::to_value(&undelivered.failure).unwrap();
+                        assert_eq!(
+                            failure["disposition"],
+                            json!({"effects":"unknown", "action":"reconcile"})
+                        );
+                        assert_eq!(
+                            undelivered
+                                .delivery
+                                .downcast_ref::<io::Error>()
+                                .unwrap()
+                                .kind(),
+                            io::ErrorKind::BrokenPipe
+                        );
+                    } else {
+                        assert_eq!(completed.unwrap().code(), 2);
+                    }
+                    if json || matches!(fault, OutputFault::Flush) {
+                        assert!(stderr.is_empty());
+                    } else {
+                        let diagnostic = String::from_utf8(stderr).unwrap();
+                        assert!(
+                            diagnostic.contains("unknown") && diagnostic.contains("reconcile"),
+                            "{diagnostic}"
+                        );
+                    }
+                    let requests = server.workflow_requests();
+                    assert_eq!(
+                        requests.len(),
+                        1,
+                        "{command}: output failure must not replay"
+                    );
+                    assert_eq!(
+                        requests[0].method,
+                        match command {
+                            "load" => "POST",
+                            "put" => "PUT",
+                            _ => "DELETE",
                         }
-                        Ok::<_, color_eyre::Report>(Completion::success())
-                    })
-                    .await;
-                assert_eq!(result.is_ok(), matches!(fault, OutputFault::Flush));
-                let completed = finish(
-                    result,
-                    Some(evidence),
-                    None,
-                    json.then_some(MachineErrors::Json),
-                    false,
-                    &mut stdout,
-                    &mut stderr,
-                );
-                if json || matches!(fault, OutputFault::Flush) {
-                    let error = completed.unwrap_err();
-                    let undelivered = error.downcast_ref::<UndeliveredFailure>().unwrap();
-                    let failure = serde_json::to_value(&undelivered.failure).unwrap();
-                    assert_eq!(
-                        failure["disposition"],
-                        json!({"effects":"unknown", "action":"reconcile"})
                     );
                     assert_eq!(
-                        undelivered
-                            .delivery
-                            .downcast_ref::<io::Error>()
-                            .unwrap()
-                            .kind(),
-                        io::ErrorKind::BrokenPipe
+                        requests[0].raw_body.as_slice(),
+                        match command {
+                            "load" => source.as_slice(),
+                            "put" => b"\x00\xff\n",
+                            _ => b"",
+                        }
                     );
-                } else {
-                    assert_eq!(completed.unwrap().code(), 2);
-                }
-                if json || matches!(fault, OutputFault::Flush) {
-                    assert!(stderr.is_empty());
-                } else {
-                    let diagnostic = String::from_utf8(stderr).unwrap();
-                    assert!(
-                        diagnostic.contains("unknown") && diagnostic.contains("reconcile"),
-                        "{diagnostic}"
-                    );
-                }
-                let requests = server.workflow_requests();
-                assert_eq!(
-                    requests.len(),
-                    1,
-                    "{command}: output failure must not replay"
-                );
-                assert_eq!(
-                    requests[0].method,
-                    match command {
-                        "load" => "POST",
-                        "put" => "PUT",
-                        _ => "DELETE",
-                    }
-                );
-                assert_eq!(
-                    requests[0].raw_body.as_slice(),
-                    match command {
-                        "load" => source.as_slice(),
-                        "put" => b"\x00\xff\n",
-                        _ => b"",
-                    }
-                );
-                server.assert_complete();
+                    server.assert_complete();
+                })
+                .await;
             }
         }
     }
     // Losing the target announcement happens before the load is dispatched.
     let server = IntentApiFixture::graph(Vec::new());
-    let client = GraphClient::managed(&server.origin, "knowledge", "test-token".into()).unwrap();
-    let mut stdout = Vec::new();
-    let mut stderr = FailingOutput {
-        fault: OutputFault::AfterPrefix,
-        bytes: Vec::new(),
-    };
-    let (result, evidence) = command_outcome::observe(command_outcome::CommandKind::Write, async {
-        crate::scope::report(
-            &crate::operator::InvocationConfig::at(None, None),
-            &server_test_target(&server.origin),
-            Some("knowledge"),
-            Some(crate::scope::WriteScope::Branch("main")),
-            &mut stderr,
-        )?;
-        execute_load(
-            &client,
-            LoadOperation {
-                branch: "main".into(),
-                from: None,
-                data,
-                mode: CliLoadMode::Append,
-                settings: Vec::new(),
-                json: true,
-            },
+    crate::operator_routing::test_transport_scope(&[&server.origin], async {
+        let client =
+            GraphClient::managed(&server.origin, "knowledge", "test-token".into()).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = FailingOutput {
+            fault: OutputFault::AfterPrefix,
+            bytes: Vec::new(),
+        };
+        let (result, evidence) =
+            command_outcome::observe(command_outcome::CommandKind::Write, async {
+                crate::scope::report(
+                    &crate::operator::InvocationConfig::at(None, None),
+                    &server_test_target(&server.origin),
+                    Some("knowledge"),
+                    Some(crate::scope::WriteScope::Branch("main")),
+                    &mut stderr,
+                )?;
+                execute_load(
+                    &client,
+                    LoadOperation {
+                        branch: "main".into(),
+                        from: None,
+                        data,
+                        mode: CliLoadMode::Append,
+                        settings: Vec::new(),
+                        json: true,
+                    },
+                    false,
+                    &mut crate::input::Input {
+                        reader: &mut io::empty(),
+                        is_terminal: false,
+                    },
+                    &mut stdout,
+                    &mut stderr,
+                )
+                .await?;
+                Ok::<_, color_eyre::Report>(Completion::success())
+            })
+            .await;
+        let completion = finish(
+            result,
+            Some(evidence),
+            None,
+            Some(MachineErrors::Json),
             false,
-            &mut crate::input::Input {
-                reader: &mut io::empty(),
-                is_terminal: false,
-            },
             &mut stdout,
             &mut stderr,
         )
-        .await?;
-        Ok::<_, color_eyre::Report>(Completion::success())
+        .unwrap();
+        assert_eq!(completion.code(), 1);
+        let failure: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            failure["disposition"],
+            json!({"effects":"none", "action":"refresh"})
+        );
+        assert!(server.requests().is_empty());
+        server.assert_complete();
     })
     .await;
-    let completion = finish(
-        result,
-        Some(evidence),
-        None,
-        Some(MachineErrors::Json),
-        false,
-        &mut stdout,
-        &mut stderr,
-    )
-    .unwrap();
-    assert_eq!(completion.code(), 1);
-    let failure: Value = serde_json::from_slice(&stdout).unwrap();
-    assert_eq!(
-        failure["disposition"],
-        json!({"effects":"none", "action":"refresh"})
-    );
-    assert!(server.requests().is_empty());
-    server.assert_complete();
 }
 
 #[tokio::test]
@@ -858,7 +870,6 @@ async fn mutation_scope_delivery_failure_precedes_writable_open() {
                     actor: None,
                     yes: false,
                 },
-                None,
                 &mut crate::input::Input {
                     reader: &mut io::empty(),
                     is_terminal: false,
@@ -912,66 +923,69 @@ async fn transfer_reads_use_the_supplied_sink_and_propagate_delivery_errors() {
                 ],
                 body: body.to_vec(),
             }]);
-            let client =
-                GraphClient::managed(&server.origin, "knowledge", "test-token".into()).unwrap();
-            let mut stdout = FailingOutput {
-                fault,
-                bytes: Vec::new(),
-            };
-            let query = blob_query(
-                BlobEntityKind::Node,
-                "Document".into(),
-                "manual".into(),
-                "content".into(),
-                None,
-                None,
-            );
-            let result = if command == "export" {
-                execute_export(&client, "main", &[], &mut stdout).await
-            } else {
-                let operation = if command == "get" {
-                    BlobOperation::Get {
-                        query,
-                        range: None,
-                        out: None,
-                    }
-                } else {
-                    BlobOperation::Stat {
-                        query,
-                        json: command == "stat-json",
-                    }
+            crate::operator_routing::test_transport_scope(&[&server.origin], async {
+                let client =
+                    GraphClient::managed(&server.origin, "knowledge", "test-token".into()).unwrap();
+                let mut stdout = FailingOutput {
+                    fault,
+                    bytes: Vec::new(),
                 };
-                execute_blob(&client, operation, &mut stdout, &mut Vec::new()).await
-            };
-            let mut stderr = Vec::new();
-            let error = finish(
-                result.map(|()| Completion::success()),
-                None,
-                None,
-                None,
-                false,
-                &mut stdout,
-                &mut stderr,
-            )
-            .unwrap_err();
-            assert_eq!(
-                error.downcast_ref::<io::Error>().unwrap().kind(),
-                io::ErrorKind::BrokenPipe
-            );
-            assert!(stderr.is_empty());
-            if command == "export" || command == "get" {
-                let expected = if matches!(fault, OutputFault::AfterPrefix) {
-                    &body[..5]
-                } else {
-                    body
-                };
-                assert_eq!(
-                    stdout.bytes, expected,
-                    "raw output must not include diagnostics"
+                let query = blob_query(
+                    BlobEntityKind::Node,
+                    "Document".into(),
+                    "manual".into(),
+                    "content".into(),
+                    None,
+                    None,
                 );
-            }
-            assert_eq!(server.workflow_requests().len(), 1);
-            server.assert_complete();
+                let result = if command == "export" {
+                    execute_export(&client, "main", &[], &mut stdout).await
+                } else {
+                    let operation = if command == "get" {
+                        BlobOperation::Get {
+                            query,
+                            range: None,
+                            out: None,
+                        }
+                    } else {
+                        BlobOperation::Stat {
+                            query,
+                            json: command == "stat-json",
+                        }
+                    };
+                    execute_blob(&client, operation, &mut stdout, &mut Vec::new()).await
+                };
+                let mut stderr = Vec::new();
+                let error = finish(
+                    result.map(|()| Completion::success()),
+                    None,
+                    None,
+                    None,
+                    false,
+                    &mut stdout,
+                    &mut stderr,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().kind(),
+                    io::ErrorKind::BrokenPipe
+                );
+                assert!(stderr.is_empty());
+                if command == "export" || command == "get" {
+                    let expected = if matches!(fault, OutputFault::AfterPrefix) {
+                        &body[..5]
+                    } else {
+                        body
+                    };
+                    assert_eq!(
+                        stdout.bytes, expected,
+                        "raw output must not include diagnostics"
+                    );
+                }
+                assert_eq!(server.workflow_requests().len(), 1);
+                server.assert_complete();
+            })
+            .await;
         }
     }
 }
@@ -987,10 +1001,13 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
         }
     }
     let server = IntentApiFixture::graph(Vec::new());
+    crate::operator_routing::test_transport_scope(&[&server.origin], async {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.yaml"), format!("version: 1\ntargets:\n  test:\n    kind: server\n    endpoint: {}\n    auth: {{public: {{provider: anonymous}}}}\n    default_auth: public\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n", server.origin, crate::tls_gateway::ca_path().display())).unwrap();
     let parsed = parse_from([
         "omnigraph",
         "--target",
-        &server.origin,
+        "test",
         "--graph",
         "knowledge",
         "blob",
@@ -1006,7 +1023,7 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
     let mut stderr = Vec::new();
     let completion = super::execute(
         parsed,
-        crate::operator::InvocationConfig::at(None, None),
+        crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
         &mut FailedInput,
         false,
         &mut stdout,
@@ -1028,6 +1045,7 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
     );
     assert!(server.requests().is_empty());
     server.assert_complete();
+}).await;
 }
 
 #[tokio::test]
