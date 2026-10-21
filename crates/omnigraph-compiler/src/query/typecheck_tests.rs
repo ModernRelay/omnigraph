@@ -236,14 +236,28 @@ insert Shared { label: "node" }
     assert!(message.contains("edge:Shared"), "{message}");
 }
 
-/// Issue 921: a qualified name resolves only in the namespace it names.
+/// Issue 921: a qualified name resolves only in the namespace it names, so a
+/// name the other namespace declares is unknown in the named one.
 #[test]
 fn mutation_target_refuses_a_name_missing_from_its_namespace_issue_921() {
-    let catalog = setup_same_named_node_and_edge();
+    let schema = parse_schema(
+        r#"
+node OnlyNode {
+label: String
+}
+edge OnlyEdge: OnlyNode -> OnlyNode {
+label: String?
+}
+"#,
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+
+    // The node type is not an edge type.
     let qf = parse_query(
         r#"
-query insert_label() {
-insert edge:Label { label: "x" }
+query insert_node_as_edge() {
+insert edge:OnlyNode { label: "x" }
 }
 "#,
     )
@@ -252,7 +266,22 @@ insert edge:Label { label: "x" }
     let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
     let message = err.to_string();
     assert!(message.contains("T4"), "{message}");
-    assert!(message.contains("unknown edge type `Label`"), "{message}");
+    assert!(message.contains("unknown edge type `OnlyNode`"), "{message}");
+
+    // The edge type is not a node type.
+    let qf = parse_query(
+        r#"
+query insert_edge_as_node() {
+insert node:OnlyEdge { label: "x" }
+}
+"#,
+    )
+    .unwrap();
+
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("T1"), "{message}");
+    assert!(message.contains("unknown node type `OnlyEdge`"), "{message}");
 }
 
 fn setup_list() -> Catalog {

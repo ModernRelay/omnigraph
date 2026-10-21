@@ -1172,7 +1172,7 @@ fn parse_mutation_target(
                 });
             }
             Rule::type_name => type_name = part.as_str().to_string(),
-            other => unreachable!("grammar: mutation_target holds no {other}"),
+            other => unreachable!("grammar: mutation_target holds no {other:?}"),
         }
     }
     Ok((kind, type_name))
