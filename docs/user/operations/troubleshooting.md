@@ -104,8 +104,9 @@ lost response is `unknown` with `reconcile`. A read command changes nothing, so
 its failure always has `effects: none`. JSON mode writes the failure to stdout,
 or to stderr when part of the result, such as a streamed page, already reached
 stdout. Stdout then keeps the bytes already written, which can end inside an
-unfinished object, as for `diff --json` or `changes poll --json`, and the
-failure document is on stderr. Human mode prints the `disposition` line on
+unfinished object, as for `diff`, `branch diff`, `commit changes` and
+`changes poll` with `--json` when they follow every page, and the failure
+document is on stderr. Human mode prints the `disposition` line on
 stderr. A target refusal on these commands exits 1 with `action: fix`. HTTP
 failures also retain `http_status` and, when present, the original
 `retry_after` string.

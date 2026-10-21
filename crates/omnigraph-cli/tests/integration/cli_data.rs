@@ -5455,6 +5455,310 @@ fn target_list_and_show_have_the_same_versioned_binding() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown target"));
 }
 
+/// `access` says what the caller may do at a target. A cluster graph's
+/// applied policy decides for the declared actor, whether a root target with
+/// `--graph` or the graph's own store is addressed; a standalone graph
+/// without a policy allows everything once it opens; a store that holds no
+/// graph refuses, a damaged one keeps its own failure; a server target
+/// answers through its access route with the target's token, `--as` riding
+/// as the actor assertion; and a catalogue or managed target refuses before
+/// any I/O.
+#[test]
+fn access_reports_what_the_caller_may_do_at_a_target() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
+    let actions = |report: &Value, key: &str| -> Vec<String> {
+        report[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key}: {report}"))
+            .iter()
+            .map(|action| action.as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // A cluster graph through a root target: its applied policy decides for
+    // the declared actor.
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
+    let decide = |actor: Option<&str>, branch: &str| -> Value {
+        let mut command = cli();
+        command
+            .arg("access")
+            .arg("--target")
+            .arg(cluster.path())
+            .args(["--graph", "knowledge", "--branch", branch, "--json"]);
+        if let Some(actor) = actor {
+            command.args(["--as", actor]);
+        }
+        parse_stdout_json(&output_success(&mut command))
+    };
+    let feature = decide(Some("act-bruno"), "feature");
+    assert_eq!(feature["protocol"], 1, "{feature}");
+    assert_eq!(feature["source"], "direct", "{feature}");
+    assert_eq!(feature["graph_id"], "knowledge");
+    assert_eq!(feature["actor"], "act-bruno");
+    assert!(
+        actions(&feature, "actions").contains(&"change".to_string()),
+        "{feature}"
+    );
+    let main = decide(Some("act-bruno"), "main");
+    assert!(
+        actions(&main, "actions").contains(&"read".to_string()),
+        "{main}"
+    );
+    assert!(
+        !actions(&main, "actions").contains(&"change".to_string()),
+        "{main}"
+    );
+    let nobody = decide(None, "feature");
+    assert!(actions(&nobody, "graph_wide").is_empty(), "{nobody}");
+    assert!(actions(&nobody, "actions").is_empty(), "{nobody}");
+    // A graph the cluster does not apply has no policy to read, so access
+    // refuses rather than report every action allowed.
+    let unknown = output_failure(
+        cli()
+            .arg("access")
+            .arg("--target")
+            .arg(cluster.path())
+            .args(["--graph", "missing", "--json"]),
+    );
+    assert_eq!(unknown.status.code(), Some(1), "{unknown:?}");
+    let refusal = parse_stdout_json(&unknown);
+    assert_eq!(refusal["code"], "not_found", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+    assert!(
+        refusal["error"].as_str().unwrap().contains("knowledge"),
+        "{refusal}"
+    );
+    // The same graph addressed by its store answers from the cluster's
+    // applied ledger, exactly as the root target does, and an unapplied
+    // `storage:` in the cluster's configuration moves neither answer.
+    let store = cluster.path().join("graphs").join("knowledge.omni");
+    let by_store = || {
+        parse_stdout_json(&output_success(
+            cli().arg("access").arg("--target").arg(&store).args([
+                "--as",
+                "act-bruno",
+                "--branch",
+                "main",
+                "--json",
+            ]),
+        ))
+    };
+    let mut expected = main.clone();
+    expected["target"] = json!(store.to_string_lossy());
+    assert_eq!(by_store(), expected);
+    let config = cluster.path().join("cluster.yaml");
+    let applied = fs::read_to_string(&config).unwrap();
+    let elsewhere = tempdir().unwrap();
+    fs::write(
+        &config,
+        format!("storage: {}\n{applied}", elsewhere.path().display()),
+    )
+    .unwrap();
+    assert_eq!(by_store(), expected);
+    assert_eq!(decide(Some("act-bruno"), "main"), main);
+    fs::write(&config, applied).unwrap();
+    // Legacy recovery evidence quarantines the cluster's only graph, so the
+    // loader serves nothing; the graph is unavailable, not the cluster
+    // broken, through either address.
+    let recoveries = cluster.path().join("__cluster").join("recoveries");
+    fs::create_dir_all(&recoveries).unwrap();
+    fs::write(
+        recoveries.join("op-pending.json"),
+        json!({
+            "schema_version": 1,
+            "operation_id": "op-pending",
+            "started_at": "1970-01-01T00:00:00Z",
+            "kind": "schema_apply",
+            "graph_id": "knowledge",
+            "graph_uri": store.to_string_lossy(),
+            "desired_schema_digest": "pending",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for target in [cluster.path().to_path_buf(), store.clone()] {
+        let mut command = cli();
+        command.arg("access").arg("--target").arg(&target);
+        if target == cluster.path() {
+            command.args(["--graph", "knowledge"]);
+        }
+        let quarantined = output_failure(command.args(["--branch", "main", "--json"]));
+        // The code's own action and exit, as a server answers it.
+        assert_eq!(quarantined.status.code(), Some(75), "{quarantined:?}");
+        let refusal = parse_stdout_json(&quarantined);
+        assert_eq!(refusal["code"], "graph_unavailable", "{refusal}");
+        assert_eq!(
+            refusal["disposition"],
+            json!({"effects": "none", "action": "retry"}),
+            "{refusal}"
+        );
+        assert!(
+            refusal["error"]
+                .as_str()
+                .unwrap()
+                .contains("awaits recovery"),
+            "{refusal}"
+        );
+    }
+
+    // A store that holds no graph has no policy to report.
+    let temp = tempdir().unwrap();
+    let missing = output_failure(
+        cli()
+            .arg("access")
+            .arg("--target")
+            .arg(temp.path().join("absent.omni"))
+            .args(["--branch", "main", "--json"]),
+    );
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+    let refusal = parse_stdout_json(&missing);
+    assert_eq!(refusal["code"], "not_found", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+    // A graph whose manifest names a missing object is damaged, not absent:
+    // the open's own failure stands.
+    let damaged = temp.path().join("damaged.omni");
+    init_graph(&damaged);
+    fs::remove_dir_all(damaged.join("__manifest").join("data")).unwrap();
+    let failure = output_failure(
+        cli()
+            .arg("access")
+            .arg("--target")
+            .arg(&damaged)
+            .args(["--branch", "main", "--json"]),
+    );
+    let failure = parse_stdout_json(&failure);
+    assert_eq!(failure["code"], "internal", "{failure}");
+    assert_eq!(failure["disposition"]["effects"], "none", "{failure}");
+
+    // A standalone graph without a policy allows every action.
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let home = tempdir().unwrap();
+    let rows = IntentReply::json(
+        200,
+        json!({
+            "actor":"act-me", "graph_id":"knowledge", "graph_wide":["read"],
+            "branch":"main", "target_branch":null, "actions":["read","change"]
+        }),
+    );
+    let served = IntentApiFixture::graph(vec![rows]);
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "target_config_version: 1\ntargets:\n  \
+             local:\n    kind: direct\n    scope: graph\n    uri: '{}'\n  \
+             served:\n    kind: server\n    endpoint: '{}'\n    credential: served\n    default_graph: knowledge\n  \
+             cloud:\n    kind: managed\n    scope: cluster\n    api: https://api.example.com\n    \
+             organization_id: org\n    cluster_id: cluster\n    cluster_incarnation: one\n    \
+             control_auth: human-device\n    default_graph: knowledge\n",
+            graph.to_string_lossy(),
+            served.origin
+        ),
+    )
+    .unwrap();
+    let local = parse_stdout_json(&output_success(
+        cli().env("OMNIGRAPH_HOME", home.path()).args([
+            "access",
+            "--target",
+            "local",
+            "--branch",
+            "main",
+            "--target-branch",
+            "feature",
+            "--json",
+        ]),
+    ));
+    assert_eq!(local["target"], "local");
+    assert_eq!(local["source"], "direct");
+    assert_eq!(local["graph_id"], "default", "{local}");
+    assert_eq!(local["target_branch"], "feature", "{local}");
+    for action in [
+        "read",
+        "change",
+        "branch_create",
+        "branch_merge",
+        "commit_publish",
+    ] {
+        assert!(
+            actions(&local, "actions").contains(&action.to_string()),
+            "{action}: {local}"
+        );
+    }
+    // The text names the target branch for the actions decided into it.
+    let text = output_success(cli().env("OMNIGRAPH_HOME", home.path()).args([
+        "access",
+        "--target",
+        "local",
+        "--branch",
+        "main",
+        "--target-branch",
+        "feature",
+    ]));
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        text.contains("\nfrom main into feature: branch_create, branch_merge\n"),
+        "{text}"
+    );
+    let on_main = text
+        .lines()
+        .find(|line| line.starts_with("on main: "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        on_main.contains("change") && !on_main.contains("branch_create"),
+        "{text}"
+    );
+
+    // A server target asks its access route, with the target's token, and
+    // `--as` rides as the actor assertion.
+    let report = parse_stdout_json(&output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_TOKEN_SERVED", "served-token")
+            .args([
+                "access", "--target", "served", "--as", "act-me", "--branch", "main", "--json",
+            ]),
+    ));
+    assert_eq!(report["source"], "server", "{report}");
+    assert_eq!(report["target"], "served");
+    assert_eq!(actions(&report, "actions"), ["read", "change"]);
+    let requests = served.workflow_requests();
+    let request = requests.last().unwrap();
+    assert_eq!(request.method, "GET");
+    assert!(
+        request.path.starts_with("/graphs/knowledge/access"),
+        "{}",
+        request.path
+    );
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer served-token")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get("omnigraph-if-actor")
+            .map(String::as_str),
+        Some("act-me")
+    );
+    served.assert_complete();
+
+    // The catalogue carries no policy and managed data qualifies each
+    // operation separately: both refuse before any I/O.
+    for target in ["og_catalog", "cloud"] {
+        let refused = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["access", "--target", target, "--json"]),
+        );
+        let refusal = parse_stdout_json(&refused);
+        assert_eq!(
+            refusal["code"], "target_incompatible",
+            "{target}: {refusal}"
+        );
+    }
+}
+
 #[test]
 fn legacy_profile_commands_and_environment_cannot_select_a_backend() {
     let home = target_home();

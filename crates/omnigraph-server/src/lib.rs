@@ -1200,13 +1200,38 @@ impl ApiError {
         )
     }
 
-    /// The HTTP status this error answers with: its code's.
+    /// The HTTP status a response to this error sends: the status of the code
+    /// it answers under, so a write the server could not settle sends 500
+    /// whatever failed underneath. The response is built from it, and every
+    /// log of an error's status reads it, so the two cannot disagree. It
+    /// judges the facts the error carries; a response first adds its
+    /// request's.
     pub(crate) fn status(&self) -> StatusCode {
+        let code = self.answered_code(self.disposition());
         let status = match self.details.as_deref() {
-            Some(ApiErrorDetails::BranchStartRefusal(refusal)) => refusal.reason.http_status(),
-            _ => self.code.http_statuses().first().copied().unwrap_or(500),
+            Some(ApiErrorDetails::BranchStartRefusal(refusal))
+                if code == ErrorCode::BranchStartRefusal =>
+            {
+                Some(refusal.reason.http_status())
+            }
+            _ => code.http_statuses().first().copied(),
         };
-        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        // A code no HTTP response carries belongs to MCP results, which never
+        // become a response; reaching one here is a server failure.
+        status
+            .and_then(|status| StatusCode::from_u16(status).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+
+    /// The code a response to this error carries. A write the server could
+    /// not settle is named by what its caller must do, whatever failed
+    /// underneath; a recovery intent keeps its own code.
+    fn answered_code(&self, disposition: api::DispositionOutput) -> ErrorCode {
+        if disposition.action == api::DispositionAction::Reconcile && self.completion_uncertain {
+            ErrorCode::OutcomeUnknown
+        } else {
+            self.code
+        }
     }
 
     /// The human-readable message body, used by tests to assert the wire
@@ -1718,10 +1743,14 @@ impl ApiError {
             }
             None => {}
         }
+        // The error carries what its request has done, as one leaving an
+        // owned read's task does, so its status is the one its response sends.
+        let response = response.with_request_facts();
         if response.completion_uncertain {
             // The record of why a write may be contained: the failure's class
-            // and status, never its message, which can carry object URIs. It
-            // shares the request's span with the containment log.
+            // and the status its response sends, never its message, which can
+            // carry object URIs. It shares the request's span with the
+            // containment log.
             tracing::warn!(
                 status = %response.status(),
                 ?cause,
@@ -1784,20 +1813,14 @@ fn format_key_conflict(
 /// whose action is `retry`.
 const RETRY_AFTER_SECONDS: &str = "60";
 
-/// The HTTP status a body is answered under, one of its code's. A code no
-/// HTTP response carries belongs to MCP results, which never become a
-/// response; reaching one here is a server failure.
-fn status_of(output: &ErrorOutput) -> StatusCode {
-    output
-        .http_status()
-        .and_then(|status| StatusCode::from_u16(status).ok())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-}
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let error = self.with_request_facts();
+        // The answered code fixes the status: a write the server could not
+        // settle answers 500 whatever failed underneath.
+        let status = error.status();
         let mut headers = axum::http::HeaderMap::new();
-        if let Some(ApiErrorDetails::BlobPreconditionFailure(failure)) = self.details.as_deref()
+        if let Some(ApiErrorDetails::BlobPreconditionFailure(failure)) = error.details.as_deref()
             && let Some(etag) = failure
                 .current_etag
                 .as_deref()
@@ -1805,10 +1828,7 @@ impl IntoResponse for ApiError {
         {
             headers.insert(axum::http::header::ETAG, etag);
         }
-        let output = self.into_output();
-        // The answered code fixes the status: a write the server could not
-        // settle answers 500 whatever failed underneath.
-        let status = status_of(&output);
+        let output = error.into_judged_output();
         if output
             .disposition
             .is_some_and(|disposition| disposition.action == api::DispositionAction::Retry)
@@ -1845,18 +1865,9 @@ impl ApiError {
     /// The output of an error whose facts are final.
     fn into_judged_output(self) -> ErrorOutput {
         let disposition = self.disposition();
+        let code = self.answered_code(disposition);
         let mut output = ErrorOutput::message(self.message);
-        // A write the server could not settle is named by what the caller
-        // must do about it, whatever failed underneath; a recovery intent
-        // keeps its own code.
-        output.code = Some(
-            if disposition.action == api::DispositionAction::Reconcile && self.completion_uncertain
-            {
-                ErrorCode::OutcomeUnknown
-            } else {
-                self.code
-            },
-        );
+        output.code = Some(code);
         output.disposition = Some(disposition);
         if let Some(details) = self.details {
             match *details {
@@ -2248,7 +2259,8 @@ mod api_error_tests {
 
     /// Every error answers under one of its code's statuses, a write the server
     /// could not settle under 500 whatever failed underneath, and every 429
-    /// or 503 that asks for a retry says when.
+    /// or 503 that asks for a retry says when. The status a log reads from
+    /// the error is the one its response sends.
     #[tokio::test]
     async fn the_answered_code_fixes_the_status_and_retry_after() {
         let answer = |error: ApiError| async move {
@@ -2326,10 +2338,90 @@ mod api_error_tests {
                 None,
             ),
         ] {
+            let logged = error.status();
             let answered = answer(error).await;
             assert_eq!(answered, (status, code, retry_after));
+            assert_eq!(logged, status, "{code:?}");
             assert!(code.http_statuses().contains(&status.as_u16()), "{code:?}");
         }
+    }
+
+    /// An uncertain engine failure's warning, and the error a contained write
+    /// logs, record the status the response sends: a read's failure keeps
+    /// its code's, and one after a write answers `outcome_unknown` with 500
+    /// whatever its cause's code, whether the write translated it or the
+    /// request did after submitting the write.
+    #[tokio::test]
+    async fn an_uncertain_engine_failure_logs_the_status_its_response_sends() {
+        use crate::operations::{OperationRuntime, OwnedResult, scope_request};
+        const WARNING: &str = "engine failure without definite completion evidence";
+        const CONTAINMENT: &str = "owned write ended without a definite outcome";
+        // A `bad_request` whose completion is unknown.
+        let failure = || ApiError::from_omni(OmniError::DataFusion("execution failure".into()));
+        let assert_logged =
+            |capture: &test_log_capture::Capture, message: &str, sent: StatusCode| {
+                let logs = capture.output();
+                let lines: Vec<&str> = logs.lines().filter(|line| line.contains(message)).collect();
+                assert_eq!(lines.len(), 1, "{message}: {logs}");
+                assert!(lines[0].contains(&format!("status={sent}")), "{logs}");
+            };
+        // Tracing caches a log site's interest when the site is first hit, and
+        // a concurrent test reaching it under no subscriber caches it as never.
+        // Hit both sites first, so installing each capture below rebuilds it.
+        drop(failure());
+        let _ = OperationRuntime::default()
+            .submit((), async {
+                OwnedResult::from(Err::<(), _>(ApiError::internal("first")))
+            })
+            .unwrap()
+            .result()
+            .await;
+
+        let read = test_log_capture::Capture::default();
+        let logs = tracing::subscriber::set_default(read.subscriber("warn"));
+        let sent = scope_request(async { failure().into_response().status() }).await;
+        drop(logs);
+        assert_eq!(sent, StatusCode::BAD_REQUEST);
+        assert_logged(&read, WARNING, sent);
+
+        let after_write = test_log_capture::Capture::default();
+        let logs = tracing::subscriber::set_default(after_write.subscriber("warn"));
+        let runtime = OperationRuntime::default();
+        let sent = scope_request(async {
+            runtime
+                .submit((), async { Ok::<_, ApiError>(()).into() })
+                .unwrap()
+                .result()
+                .await
+                .unwrap();
+            failure().into_response().status()
+        })
+        .await;
+        drop(logs);
+        assert_eq!(sent, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_logged(&after_write, WARNING, sent);
+
+        let in_write = test_log_capture::Capture::default();
+        let logs = tracing::subscriber::set_default(in_write.subscriber("warn"));
+        let runtime = OperationRuntime::default();
+        let sent = scope_request(async {
+            runtime
+                .submit(
+                    (),
+                    async move { OwnedResult::from(Err::<(), _>(failure())) },
+                )
+                .unwrap()
+                .result()
+                .await
+                .unwrap_err()
+                .into_response()
+                .status()
+        })
+        .await;
+        drop(logs);
+        assert_eq!(sent, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_logged(&in_write, WARNING, sent);
+        assert_logged(&in_write, CONTAINMENT, sent);
     }
 
     /// Each class of refusal asks its caller for one thing. Before any write

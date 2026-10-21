@@ -54,6 +54,7 @@ pub(crate) struct VersionOutput {
 pub(crate) struct ProtocolVersionsOutput {
     pub(crate) target: u32,
     pub(crate) credential: u32,
+    pub(crate) access: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +89,7 @@ impl VersionOutput {
             protocols: ProtocolVersionsOutput {
                 target: crate::targets::TARGET_PROTOCOL,
                 credential: crate::targets::CREDENTIAL_PROTOCOL,
+                access: crate::targets::ACCESS_PROTOCOL,
             },
             internal_schema: InternalSchemaOutput {
                 writes: INTERNAL_MANIFEST_SCHEMA_VERSION,

@@ -1923,6 +1923,80 @@ pub enum AccessAction {
     InvokeQuery,
 }
 
+impl AccessAction {
+    /// Every action the access report names, in report order.
+    pub const ALL: [AccessAction; 10] = [
+        AccessAction::Read,
+        AccessAction::Export,
+        AccessAction::Change,
+        AccessAction::SchemaApply,
+        AccessAction::BranchCreate,
+        AccessAction::BranchDelete,
+        AccessAction::BranchMerge,
+        AccessAction::CommitPublish,
+        AccessAction::CommitDrop,
+        AccessAction::InvokeQuery,
+    ];
+
+    /// Whether the report decides this action from `branch` into
+    /// `target_branch` (`branch_create`, `branch_merge`), rather than on
+    /// `branch` alone.
+    pub fn is_transition(self) -> bool {
+        access_slot(self.into()) == Some(AccessSlot::Transition)
+    }
+}
+
+/// Where the access report puts a named branch for an action: the slot of
+/// the policy request the route that performs it builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessSlot {
+    /// Decided only graph-wide: the action names no branch.
+    GraphWide,
+    /// The named branch is the source (`read`, `export`, `change`).
+    Source,
+    /// The named branch is the target (`schema_apply`, `branch_delete`,
+    /// `commit_publish`, `commit_drop`).
+    Target,
+    /// From the named branch into `target_branch` (`branch_create`,
+    /// `branch_merge`).
+    Transition,
+}
+
+/// Each policy action's slot in the access report, or `None` for one no
+/// graph's report names. The match is exhaustive, so a new policy action is
+/// classified here before it compiles, for the route and the CLI at once.
+fn access_slot(action: omnigraph_policy::PolicyAction) -> Option<AccessSlot> {
+    use omnigraph_policy::PolicyAction as P;
+    match action {
+        P::Read | P::Export | P::Change => Some(AccessSlot::Source),
+        P::SchemaApply | P::BranchDelete | P::CommitPublish | P::CommitDrop => {
+            Some(AccessSlot::Target)
+        }
+        P::BranchCreate | P::BranchMerge => Some(AccessSlot::Transition),
+        P::InvokeQuery => Some(AccessSlot::GraphWide),
+        // Server- or operator-scoped: no graph's access report names them.
+        P::Admin | P::GraphList | P::ConfigManage => None,
+    }
+}
+
+impl From<AccessAction> for omnigraph_policy::PolicyAction {
+    fn from(access: AccessAction) -> Self {
+        use omnigraph_policy::PolicyAction as P;
+        match access {
+            AccessAction::Read => P::Read,
+            AccessAction::Export => P::Export,
+            AccessAction::Change => P::Change,
+            AccessAction::SchemaApply => P::SchemaApply,
+            AccessAction::BranchCreate => P::BranchCreate,
+            AccessAction::BranchDelete => P::BranchDelete,
+            AccessAction::BranchMerge => P::BranchMerge,
+            AccessAction::CommitPublish => P::CommitPublish,
+            AccessAction::CommitDrop => P::CommitDrop,
+            AccessAction::InvokeQuery => P::InvokeQuery,
+        }
+    }
+}
+
 /// What the caller's own credential may do on one graph, by the graph's
 /// installed policy. It names actions, never the rules that allow them, and
 /// says nothing about any other actor.
@@ -1948,6 +2022,62 @@ pub struct AccessOutput {
     /// target. With `target_branch` as well, also `branch_create` and
     /// `branch_merge` from `branch` into it. Empty without `branch`.
     pub actions: Vec<AccessAction>,
+}
+
+impl AccessOutput {
+    /// Decide every action in the shape a policy decides it: graph-wide; on
+    /// `branch` (`read`, `export` and `change` as the request's branch, the
+    /// branch-targeted actions as its target); and from `branch` to
+    /// `target_branch` for `branch_create` and `branch_merge`. `allowed`
+    /// is the decision for one action with its branch and target branch.
+    pub fn evaluate<E>(
+        actor: Option<String>,
+        graph_id: String,
+        branch: Option<String>,
+        target_branch: Option<String>,
+        mut allowed: impl FnMut(AccessAction, Option<&str>, Option<&str>) -> Result<bool, E>,
+    ) -> Result<Self, E> {
+        let mut graph_wide = Vec::new();
+        for access in AccessAction::ALL {
+            if allowed(access, None, None)? {
+                graph_wide.push(access);
+            }
+        }
+        let mut actions = Vec::new();
+        if let Some(branch) = branch.as_deref() {
+            for slot in [
+                AccessSlot::Source,
+                AccessSlot::Target,
+                AccessSlot::Transition,
+            ] {
+                for access in AccessAction::ALL {
+                    if access_slot(access.into()) != Some(slot) {
+                        continue;
+                    }
+                    let (source, target) = match slot {
+                        AccessSlot::Source => (Some(branch), None),
+                        AccessSlot::Target => (None, Some(branch)),
+                        AccessSlot::Transition => match target_branch.as_deref() {
+                            Some(target) => (Some(branch), Some(target)),
+                            None => continue,
+                        },
+                        AccessSlot::GraphWide => continue,
+                    };
+                    if allowed(access, source, target)? {
+                        actions.push(access);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            actor,
+            graph_id,
+            graph_wide,
+            branch,
+            target_branch,
+            actions,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -3341,6 +3471,25 @@ mod tests {
     /// which status; one that no HTTP response carries names the surface that
     /// sends it. The published enum lists every code once, in its wire
     /// spelling, beside its status.
+    #[test]
+    fn every_reported_access_action_has_a_slot() {
+        use super::{AccessAction, access_slot};
+        for access in AccessAction::ALL {
+            assert!(
+                access_slot(access.into()).is_some(),
+                "{access:?} is reported but has no slot"
+            );
+        }
+        let transitions: Vec<AccessAction> = AccessAction::ALL
+            .into_iter()
+            .filter(|access| access.is_transition())
+            .collect();
+        assert_eq!(
+            transitions,
+            [AccessAction::BranchCreate, AccessAction::BranchMerge]
+        );
+    }
+
     #[test]
     fn every_error_code_documents_its_status() {
         use super::ErrorCode;

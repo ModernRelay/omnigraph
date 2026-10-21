@@ -1,10 +1,12 @@
-//! The `target` and `credential` command groups: the operator
-//! configuration's named targets, and a server target's static token for
-//! another program.
+//! The `target` and `credential` command groups and `access`: the operator
+//! configuration's named targets, a server target's static token for another
+//! program, and what the caller may do at a target.
 
+mod access;
 mod args;
 
-pub(crate) use args::{CredentialCommand, TargetCommand};
+pub(crate) use access::run_access;
+pub(crate) use args::{AccessArgs, CredentialCommand, TargetCommand};
 
 use std::io::{Read, Write};
 
