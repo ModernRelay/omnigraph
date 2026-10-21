@@ -183,7 +183,6 @@ mod tests {
         for flag in [
             "--target",
             "--profile",
-            "--auth",
             "--operator-config",
             "--graph",
             "--as",

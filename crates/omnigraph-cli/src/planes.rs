@@ -199,15 +199,6 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     {
         bail!("credentials requires exactly one explicit --profile or --target");
     }
-    if cli.auth.is_some()
-        && (cli.profile.is_some()
-            || matches!(
-                need,
-                Requirement::ManagedAccount | Requirement::Authentication
-            ))
-    {
-        bail!("managed operations do not accept --auth; select a profile or managed target");
-    }
     if matches!(
         cli.command,
         Command::Config {
@@ -241,17 +232,6 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     }
     if matches!(need, Requirement::ManagedAccount) && cli.target.is_some() {
         bail!("this operation selects --profile, not --target");
-    }
-    if matches!(need, Requirement::Local)
-        && cli.auth.is_some()
-        && !matches!(
-            cli.command,
-            Command::Target {
-                command: TargetCommand::Inspect { resolved: true, .. }
-            }
-        )
-    {
-        bail!("{} does not accept --auth", command_label(&cli.command));
     }
     if matches!(need, Requirement::Local | Requirement::Alias) && cli.target.is_some() {
         bail!("{} does not accept --target", command_label(&cli.command));
@@ -410,13 +390,10 @@ pub(crate) fn validate_target(
             command_label(&cli.command)
         );
     }
-    if matches!(target.binding, Managed(_)) && cli.auth.is_some() {
-        bail!("managed targets do not accept --auth");
-    }
     if let Command::Credential { command } = &cli.command {
         match &target.binding {
-            Server { .. } if cli.target.is_none() || cli.auth.is_none() => {
-                bail!("standalone credentials require explicit --target and --auth");
+            Server { .. } if cli.target.is_none() => {
+                bail!("standalone credentials require explicit --target");
             }
             Managed(binding)
                 if binding.cluster.is_some() && !matches!(command, CredentialCommand::Export) =>

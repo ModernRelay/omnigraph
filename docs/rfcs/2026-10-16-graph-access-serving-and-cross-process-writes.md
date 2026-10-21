@@ -390,8 +390,11 @@ object.
   outcome is final once the attempted `__manifest` version is readable, by the
   [read-back](#engine-control-facts-on-the-version-cas) rule:
   the write landed if it holds the publication id, and lost if it holds
-  another and the store never acknowledged this attempt. While that version is
-  absent the outcome stays unknown, until some commit holds it. It
+  another, since a create-if-absent cannot land once its version is held. The
+  check cannot see whether the store acknowledged the attempt; the in-doubt
+  result of an acknowledged attempt stays on the publisher's read-back, which
+  holds the request record. While that version is absent the outcome stays
+  unknown, until some commit holds it. It
   arrives with the attempt identity of [cross-process
   writes](#cross-process-writes). Under an actor view that hides the commit
   listing, the check answers for the caller's own publication id and returns
@@ -1535,6 +1538,9 @@ proposal.
   acknowledged attempt whose version holds another fact stays unknown. The
   version-key fence covers linear publications; §5 keeps the detached proposal
   and snapshot.
+- 2026-10-21: `disposition.check`, a later read that cannot see the store's
+  acknowledgement, reports a loss once the attempted version holds another
+  commit; the acknowledged in-doubt result stays on the publisher's read-back.
 - 2026-10-21: A1 implemented for issue
   [#1020](https://github.com/ModernRelay/omnigraph/issues/1020). Superseded
   sentences: "Every 401 would carry … and a bare `WWW-Authenticate: Bearer`

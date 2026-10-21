@@ -67,11 +67,11 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `cluster create/list/members/pull/push/delete/undo-delete/token/operation/history/cancel` | Operate a managed cluster | profile or managed target |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
-| `login`, `logout` | Register a profile or manage an `omnigraph` profile session | managed profile |
-| `target list/inspect/add/refresh/remove` (`register` aliases `add`) | Inspect/edit targets; managed add/refresh uses discovery | local or managed API |
-| `credentials set/status/remove/export` | Manage static custody or export access to a pipe; explicit profile or standalone target/auth required | profile or server; managed target for export |
+| `login`, `logout` | Create a profile with `login --create-profile NAME` or manage an existing `omnigraph` profile session | managed profile |
+| `target list/inspect/add/refresh/remove` | Inspect/edit targets; managed add/refresh uses discovery | local or managed API |
+| `credentials set/status/remove/export` | Manage static custody or export access to a pipe; explicit profile or standalone target required | profile or server; managed target for export |
 | `config validate` | Validate the whole operator file offline | local |
-| `config rename-profile/rename-target/rename-auth/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
+| `config rename-profile/rename-target/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
 | `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
 | `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or served |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
@@ -198,7 +198,7 @@ Account operations use a profile. Resource operations use a managed target
 referencing it; see [registration](targets.md#login-and-registration).
 
 ```bash
-omnigraph login --register work
+omnigraph login --create-profile work
 omnigraph cluster list --profile work --json
 omnigraph target add production --profile work --cluster CLUSTER_ID
 ```

@@ -68,18 +68,18 @@ not fencing for older binaries or raw storage tools. Azure writers also require
 
 ## Live server deployment
 
-Configure `production` as a server target with a `token`/`store` profile named
-`operator`; see [operator configuration](../../../docs/user/cli/targets.md).
+Configure `production` as a server target with `auth: {provider: token, source: {store: {}}}`;
+see [operator configuration](../../../docs/user/cli/targets.md).
 
 ```bash
-printf '%s' "$TOKEN" | omnigraph credentials set --target production --auth operator --stdin
+printf '%s' "$TOKEN" | omnigraph credentials set --target production --stdin
 omnigraph cluster plan --target production --config . --json
 omnigraph cluster apply --target production --config . --timeout 1800 --json
 omnigraph cluster status --target production --deployment-id ID --wait --timeout 1800 --json
 omnigraph query find_person --target production --params '{"name":"Alice"}' --json
 ```
 
-A named server target uses only its selected owner-local auth profile. Remote
+A named server target uses only its declared auth provider. Remote
 inline URLs and Unix socket targets are unsupported.
 The server derives the actor from authentication;
 `--as` on a server `plan` or `apply` only asserts it, and another actor is

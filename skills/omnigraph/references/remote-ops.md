@@ -13,11 +13,11 @@ than the transport status alone.
 
 ## Address the graph
 
-Register a server target with a `token`/`store` profile named `operator` using
+Add a server target with `auth: {provider: token, source: {store: {}}}` using
 [operator configuration](../../../docs/user/cli/targets.md), then install it:
 
 ```bash
-printf '%s\n' "$TOKEN" | omnigraph credentials set --target production --auth operator --stdin
+printf '%s\n' "$TOKEN" | omnigraph credentials set --target production --stdin
 omnigraph query get_person --target production --graph knowledge \
   --params '{"email":"ada@example.com"}' --json
 ```

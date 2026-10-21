@@ -246,6 +246,14 @@ barrier test proves reported failures do not wait for blocked runtime work;
 `cli_schema_config` owns help/version/refusal statuses with closed streams.
 These are CLI boundary contracts; query-semantic GQT cases remain unchanged.
 
+The operator-config owners also cover read-only YAML and parent directories with
+writable private credential state, preservation/conflict checks when relocating
+legacy state, and explicit profile creation versus default-profile login.
+The existing client and managed-auth fixtures delay discovery or a later request
+past credential expiry and assert that no authenticated operation is dispatched.
+Standalone flat-auth fixtures retain distinct-target identity isolation, including
+two targets sharing an endpoint; no auth-name fallback remains.
+
 The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation

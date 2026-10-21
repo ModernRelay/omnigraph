@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-20
-updated: 2026-10-21
+updated: 2026-10-22
 discussion: null
 supersedes: []
 superseded_by: []
@@ -22,11 +22,38 @@ MUST, MUST NOT, SHOULD and MAY express requirements of the proposed implementati
 
 ## Recommendation
 
-Use two main configuration sections: `profiles` for managed service and organization access, and `targets` for concrete resource access. Each managed profile owns exactly one auth provider and one identity. Only standalone servers retain named auth maps. Resolve all references into one immutable invocation binding before sending credentials or performing an operation.
+Use two main configuration sections: `profiles` for managed service and organization access, and `targets` for concrete resource access. Each managed profile and each standalone server target owns exactly one auth provider and one identity. Resolve all references into one immutable invocation binding before sending credentials or performing an operation.
 
 A managed profile is first-class operator configuration, not a cluster target. BYOC is deployment placement, not a new client access kind. Direct storage and standalone servers remain independent of managed profiles.
 
-The common experience MUST be login, register a resource, then operate on it. Users SHOULD NOT need to hand-author authentication internals. Advanced providers add capability without making a simple managed login verbose. Authentication configuration selects credential acquisition; it never grants authorization.
+The common experience MUST be explicitly create a profile, add a target, then operate on it. Subsequent login authenticates an existing profile. Users SHOULD NOT need to hand-author authentication internals. Advanced providers add capability without making a simple managed login verbose. Authentication configuration selects credential acquisition; it never grants authorization.
+
+### 22 October consistency amendment
+
+Standalone authentication uses the same flat provider shape as managed profiles.
+Different identities at the same server use separate targets; duplicated endpoint
+settings are accepted in exchange for removing named auth maps, `default_auth`,
+`--auth`, and `config rename-auth`. Existing standalone stored credentials are
+reinstalled explicitly after this shape change, never inferred from an old auth name.
+
+Profile creation is `login --create-profile NAME`; the former `--register`
+spelling and the redundant `target register` alias are removed. Bare login and
+managed target add honor `defaults.profile`, with no implicit profile creation
+or changes to routing defaults. Listing and inspection expose the selected
+destination and authentication configuration without acquiring credentials.
+
+Authenticated reads may use read-only operator YAML and its read-only parent
+directory. Mutable ownership metadata, generations, locks, and rename journals
+belong in private operator-home state associated with the configuration path.
+Existing metadata is imported while preserving IDs and refusing conflicting
+copies; uncertain operation evidence and compatible rename journals remain intact.
+An interrupted old server-auth rename must be recovered with the previous CLI
+before flattening YAML; the new CLI preserves incompatible journals and refuses.
+
+Typed credential binding and expiry survive acquisition and discovery until the
+final send boundary. Expired credentials refuse before dispatch; this grants no
+authority to replay a mutation. Issued managed data credentials keep their own
+expiry independently of the control credential used to acquire them.
 
 ## Design precedents
 
@@ -34,10 +61,10 @@ This revision replaces `connections` with `profiles`, managed target `connection
 with `profile`, `defaults.connection` with `defaults.profile`, and `--connection`
 with `--profile`. Old fields and selectors are rejected, with no importer or
 compatibility aliases. Each former managed auth identity becomes a separate
-profile containing one provider object; managed `default_auth` is removed.
+profile containing one provider object; `default_auth` is removed.
 `config rename-profile FROM TO` replaces `rename-connection` and preserves
 credential custody while updating target references and the profile default.
-`config rename-auth server TARGET FROM TO` remains standalone-only.
+Standalone targets also contain one provider object and have no auth-name selector.
 
 These are design inputs, not claims that another product implements this specification.
 
@@ -110,12 +137,10 @@ targets:
   personal:
     kind: server
     endpoint: https://graph.example.com
-    default_auth: personal-token
     auth:
-      personal-token:
-        provider: token
-        source:
-          store: {}
+      provider: token
+      source:
+        store: {}
 
   scratch:
     kind: direct
@@ -143,7 +168,7 @@ The operator document is one YAML mapping with the following public fields. Unle
 | Document | `version: 1`; optional `profiles`, `targets`, `aliases`, `defaults` |
 | Profile | `api`, `organization_id`, one `auth` provider object; optional `transport` |
 | Managed target | `kind: managed`, `profile`, `cluster_id`, `cluster_incarnation`; optional `endpoint`, `transport`, `default_graph` |
-| Server target | `kind: server`, `endpoint`, `auth`; optional `default_auth`, `transport`, `default_graph` |
+| Server target | `kind: server`, `endpoint`, one `auth` provider; optional `transport`, `default_graph` |
 | Direct graph target | `kind: direct`, `scope: graph`, `uri` |
 | Direct root target | `kind: direct`, `scope: root`, `uri`; optional `default_graph` |
 | Defaults | Optional `profile`, `target`, `output`; no standalone auth default |
@@ -163,7 +188,7 @@ Graph selection is `--graph` followed by the selected target's `default_graph`; 
 
 `default_graph`, alias `graph` and `--graph` contain the exact graph identifier accepted by the graph API, not a display-name lookup. If a backend uses name-like identifiers, the CLI MUST preserve those semantics rather than claim a stronger immutable identity. Per-graph recreation protection requires a backend generation/identity contract and is not provided by pinning the cluster incarnation alone. Direct version-1 URIs are absolute local `file://` URIs without query, fragment or remote authority; cloud URI variants remain deferred until their schemas are specified.
 
-Aliases bind a stored read-query identifier (`query`, not a file path or inline program) to an explicit target. `graph` is required for multi-graph targets and forbidden for direct-graph targets, whose URI supplies it. Aliases never inherit `default_graph`. An alias MUST NOT change auth configuration or routing; caller target/graph overrides are rejected. `--auth` selects a named entry only on a bound standalone server; managed aliases retain their target's pinned profile. Normal credential acquisition can invoke that owner's helper, but the alias cannot define a helper. `params` is a mapping of query parameter names to JSON-compatible values, including null where the query type allows it. Caller parameters shallowly replace same-name defaults; values are passed as typed parameters, never interpolated. Aliases MUST NOT invoke mutations and use the ordinary resolver and authorization checks.
+Aliases bind a stored read-query identifier (`query`, not a file path or inline program) to an explicit target. `graph` is required for multi-graph targets and forbidden for direct-graph targets, whose URI supplies it. Aliases never inherit `default_graph`. An alias MUST NOT change auth configuration or routing; caller target/graph overrides are rejected. Standalone aliases use their target's provider; managed aliases retain their target's pinned profile. Normal credential acquisition can invoke that owner's helper, but the alias cannot define a helper. `params` is a mapping of query parameter names to JSON-compatible values, including null where the query type allows it. Caller parameters shallowly replace same-name defaults; values are passed as typed parameters, never interpolated. Aliases MUST NOT invoke mutations and use the ordinary resolver and authorization checks.
 
 `defaults.output` has exactly `table | json | jsonl | csv | kv` and applies only to tabular/read-result commands supporting `--format`. Selection is explicit `--format`, then `defaults.output`, then `table`. A selected format unsupported by that read command fails before execution; it never silently substitutes another format. Action commands, durable receipts and errors use their own documented human/structured output contracts and ignore this read-result default. Raw credential export always ignores it. Machine stdout MUST NOT contain destination notices or diagnostics.
 
@@ -173,7 +198,7 @@ There are no general destination environment-variable overrides in version 1. En
 
 ### Exact proposed syntax
 
-A managed profile declares `auth` as one tagged provider object. Standalone servers retain a named `auth` map and optional `default_auth`. `provider` is the discriminator. Unknown fields and irrelevant provider fields are errors; there is no untyped options bag. Transport configuration is separate. Do not add `protocol: oauth | bearer`: OAuth is an acquisition/authorization framework and can issue bearer credentials, so those are not mutually exclusive protocols.
+A managed profile or standalone server target declares `auth` as one tagged provider object. `provider` is the discriminator. Unknown fields and irrelevant provider fields are errors; there is no untyped options bag. Transport configuration is separate. Do not add `protocol: oauth | bearer`: OAuth is an acquisition/authorization framework and can issue bearer credentials, so those are not mutually exclusive protocols.
 
 For a managed profile:
 
@@ -182,34 +207,13 @@ auth:
   provider: omnigraph
 ```
 
-For a standalone server, named provider alternatives remain available:
+For a standalone server, choose one provider, for example:
 
 ```yaml
-default_auth: stored-token
 auth:
-
-  stored-token:
-    provider: token
-    source:
-      store: {}
-
-  injected-token:
-    provider: token
-    source:
-      env: OG_SERVICE_TOKEN
-
-  mounted-token:
-    provider: token
-    source:
-      file: /var/run/omnigraph/token
-
-  external-helper:
-    provider: exec
-    command: ["/usr/local/bin/example-credential-helper", "get"]
-    timeout: 30s
-
-  public:
-    provider: anonymous
+  provider: token
+  source:
+    env: OG_SERVICE_TOKEN
 ```
 
 This is a catalogue of alternatives, not a valid set for every owner. Managed profiles reject anonymous authentication. `omnigraph` is initially available only on managed profiles. `token` and `exec` do not imply that the managed service accepts the resulting credential or recognizes a workload; the verified service contract must permit the credential class. Standalone servers may use only providers supported by that deployment. Direct storage uses native provider credentials separately; these HTTP providers do not replace AWS/Azure credential providers.
@@ -228,7 +232,9 @@ A file source is an explicit externally managed secret, not a plaintext fallback
 
 Managed operations use the selected profile's single provider and reject `--auth`. Managed targets always use their pinned profile; neither `defaults.profile` nor a global `--profile` can override it. Managed profiles reject `default_auth` and nested named auth maps.
 
-Only standalone servers have named `auth` entries. `--auth NAME` overrides the server's `default_auth`; without either, selection refuses even with one entry.
+Standalone targets also have one `auth` provider. There are no named auth entries,
+`default_auth`, or `--auth` overrides; select a different named target to use a
+different identity.
 
 A profile describes credential acquisition; it does not assert a verified principal. On successful login, bind the profile to the server-verified identity in private local state. Two profiles in one organization may hold two independent human identities. Replacing a profile's principal requires an explicit account-replacement operation, and never retargets an already running command.
 
@@ -283,14 +289,14 @@ Profile binding identifiers are local metadata independent of nicknames. Support
 `login` and `logout` manage `provider: omnigraph` sessions. `credentials` manages locally installed static credentials and explicit access-credential export; it is not another routing/configuration registry. `config` and `target` declare providers and destinations. Static-token installation MUST NOT be overloaded onto `login`.
 
 ```sh
-omnigraph credentials set --target production --auth operator --stdin
-omnigraph credentials status --target production --auth operator
-omnigraph credentials remove --target production --auth operator
+omnigraph credentials set --target production --stdin
+omnigraph credentials status --target production
+omnigraph credentials remove --target production
 omnigraph credentials set --profile work --stdin
-omnigraph credentials export --target production --auth operator
+omnigraph credentials export --target production
 ```
 
-These commands require exactly one explicit owner selector. Managed credentials use `--profile NAME` without `--auth`; standalone credentials use `--target NAME --auth PROFILE`. Managed-target export uses its pinned profile without `--auth`. Defaults do not apply. For set/status/remove, the selector names an owner: a profile or standalone server target. Managed targets MUST use their profile selector for those operations to avoid confusing control credentials with derived data tokens. Direct targets have no HTTP credential owner and reject this command family.
+These commands require exactly one explicit owner selector. Managed credentials use `--profile NAME`; standalone credentials use `--target NAME`. Managed-target export uses its pinned profile. Defaults do not apply. For set/status/remove, the selector names an owner: a profile or standalone server target. Managed targets MUST use their profile selector for those operations to avoid confusing control credentials with derived data tokens. Direct targets have no HTTP credential owner and reject this command family.
 
 | Provider/source | Set/remove | Status | Export |
 | --- | --- | --- | --- |
@@ -311,8 +317,8 @@ Export is not a sandbox: the receiving process can copy or disclose the secret. 
 ### Onboarding and resource selection
 
 ```sh
-omnigraph login --register modernrelay
-omnigraph login --api https://control.example.com --register private
+omnigraph login --create-profile modernrelay
+omnigraph login --api https://control.example.com --create-profile private
 
 omnigraph login --profile modernrelay
 omnigraph organization members list --profile modernrelay
@@ -330,7 +336,7 @@ omnigraph target refresh mr-managed
 omnigraph config validate
 ```
 
-For a new profile, `login --register NAME` creates `auth: {provider: omnigraph}`, performs verified login and organization selection, then atomically saves the profile. Login rejects `--auth`; `login --profile NAME` selects an existing profile. An existing registration is never overwritten by this command. Bare `login` is the interactive onboarding wizard: it uses the hosted API default, proposes the profile name `omnigraph` and asks for an organization where needed, and makes the same explicit registration. In noninteractive mode, incomplete onboarding fails. None of these operations changes `defaults.target` or `defaults.profile` without an explicit configuration command.
+For a new profile, `login --create-profile NAME` creates `auth: {provider: omnigraph}`, performs verified login and organization selection, then atomically saves the profile. `--api` and `--organization` apply only during creation. `login --profile NAME` selects an existing profile; bare `login` uses `defaults.profile` and refuses with selection/setup guidance when none exists. Creation never overwrites an existing name, and ordinary login never creates a missing entry. In noninteractive mode, incomplete onboarding fails. None of these operations changes `defaults.target` or `defaults.profile`.
 
 Account-level operations select a profile. Resource operations select a target. These selectors are mutually exclusive. Login/logout accept a profile or resolve a managed target to its profile, and operate only on an `omnigraph` profile. Standalone server profiles use `credentials` or external source management instead; they do not have a platform-login session in version 1.
 

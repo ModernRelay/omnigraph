@@ -56,7 +56,7 @@ prints the exact flags of the installed binary.
 | `logout` | — | Clear the selected platform session and report revocation |
 | `target` | `list` `inspect` `add` `refresh` `remove` | Manage resource bindings |
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
-| `config` | `validate` `rename-profile` `rename-target` `rename-auth` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
+| `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
 | `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
@@ -361,14 +361,14 @@ Secrets never belong in YAML. Login/logout are platform-session operations;
 static tokens use explicit owner/profile commands:
 
 ```bash
-omnigraph credentials set --target production --auth operator --stdin < /secure/token-input
-omnigraph credentials status --target production --auth operator --json
-omnigraph credentials remove --target production --auth operator
-omnigraph credentials export --target production --auth operator | consumer
+omnigraph credentials set --target production --stdin < /secure/token-input
+omnigraph credentials status --target production --json
+omnigraph credentials remove --target production
+omnigraph credentials export --target production | consumer
 omnigraph target list --json
 omnigraph target inspect production --resolved --json
 omnigraph config validate --json
-omnigraph access --target production --auth operator --branch main --json
+omnigraph access --target production --branch main --json
 ```
 
 `access` reports the server-resolved actor and allowed graph actions; it is the
@@ -384,10 +384,11 @@ pipe, not terminal/file output, and never exports refresh credentials.
 --cluster ID` uses authenticated discovery. `target refresh NAME` explicitly
 refreshes a managed endpoint without changing its incarnation. `target remove
 NAME` keeps credentials/journals and requires remaining references to be valid.
-`target register` aliases `add`. Onboarding accepts `--organization ID` alongside
-`--register NAME` and optional `--api URL`. Bare login proposes profile name
-`omnigraph` and API `https://platform.omnigraph.dev`. Login rejects `--auth`;
-`login --profile NAME` selects an existing profile.
+Onboarding requires `login --create-profile NAME`, with optional `--organization ID`
+and `--api URL` (default `https://platform.omnigraph.dev`). Bare login uses
+`defaults.profile`; `login --profile NAME` selects an existing profile. Missing
+profiles never cause implicit creation, and creation refuses existing names.
+Managed target add uses `--profile NAME` or `defaults.profile`.
 `config recover-operations --source DIR --profile NAME [--json]`
 preserves matching legacy folder evidence; it neither converts config nor submits
 operations. See the [upgrade reference](../../../docs/user/cli/targets.md#upgrade-from-the-old-format).
@@ -397,7 +398,6 @@ Rename commands preserve custody and update references/defaults:
 ```bash
 omnigraph config rename-profile work company
 omnigraph config rename-target production live
-omnigraph config rename-auth server standalone operator administrator
 omnigraph config recover-rename --operator-config /path/to/config.yaml
 omnigraph login --profile company --replace-principal NEW_PRINCIPAL_ID
 ```
@@ -406,16 +406,15 @@ Rename/recover-rename have no `--json`. Recover an interrupted rename against th
 same operator file; a conflicting later edit refuses. Principal replacement
 requires an existing profile or managed target, verifies the
 **new** principal ID, and invalidates derived credentials. It conflicts with
-onboarding `--register`, `--api` and `--organization`.
+onboarding `--create-profile`, `--api` and `--organization`.
 
 ## Addressing a Graph
 
 Use `--target NAME` or `defaults.target` for resource operations and
 `--profile NAME` or `defaults.profile` for account operations; selectors
 are mutually exclusive. Managed targets use their pinned profile; global/default
-profiles cannot override it, and managed `--auth` is rejected. Standalone
-`--auth` then `default_auth` selects an entry; without either, refuse even
-with one entry. No last-used identity supplies selection.
+profiles cannot override it. Standalone targets own one auth provider; different
+identities use different targets. There is no `--auth` selector or last-used identity.
 `--config DIR` supplies deployment source and never routes a command.
 
 Direct graph/root targets use local files only. Inline local paths and `file://`

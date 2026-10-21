@@ -355,7 +355,35 @@ fn automation(origin: &str, token: Option<String>, api: Option<String>) -> Resul
 
 enum Source {
     Human(renewal::Identity),
-    Automation(String),
+    Automation(crate::credential_sources::AcquiredCredential),
+}
+
+pub(super) fn acquired_bearer<'a>(
+    credential: &'a crate::credential_sources::AcquiredCredential,
+    origin: &str,
+) -> Result<&'a str> {
+    let request = credential.request();
+    if request.purpose() != crate::credential_sources::Purpose::Control
+        || canonical_origin(request.endpoint())? != canonical_origin(origin)?
+    {
+        return Err(Failure::refused(
+            "credential_origin_mismatch",
+            "the captured credential belongs to another control destination",
+        ));
+    }
+    credential
+        .bearer_for(request, OffsetDateTime::now_utc())
+        .map(|secret| secret.expose())
+        .map_err(|error| match error {
+            crate::credential_sources::CredentialError::Expired => Failure::refused(
+                "credential_expired",
+                "the captured control credential has expired; no request was sent",
+            ),
+            _ => Failure::refused(
+                "credential_invalid",
+                "the captured control credential is invalid",
+            ),
+        })
 }
 
 pub(super) struct Selection {
@@ -379,7 +407,7 @@ async fn select_with(
     store: &dyn Store,
     origin: &str,
     organization: Option<&str>,
-    token: Option<String>,
+    credential: Option<crate::credential_sources::AcquiredCredential>,
     api: Option<String>,
     mechanism: super::ControlAuth,
 ) -> Result<Option<Selection>> {
@@ -387,13 +415,18 @@ async fn select_with(
         super::organization_id(org)?;
     }
     if mechanism == super::ControlAuth::AutomationEnv {
+        let token = credential
+            .as_ref()
+            .map(|credential| acquired_bearer(credential, origin).map(str::to_owned))
+            .transpose()?;
         let token = automation(origin, token, api)?.ok_or_else(|| {
             Failure::refused(
                 "automation_credential_required",
                 "automation targets require OMNIGRAPH_CONTROL_TOKEN and OMNIGRAPH_CONTROL_API",
             )
         })?;
-        let body = Api::new(origin.into(), Some(token.clone()))?
+        let credential = credential.ok_or_else(Failure::protocol)?;
+        let body = Api::with_credential(origin.into(), credential.clone())?
             .request(Method::GET, "/v1/auth/session", None, None)
             .await
             .map_err(|failure| scrub(failure, &token))?;
@@ -402,7 +435,7 @@ async fn select_with(
         return Ok(Some(Selection {
             account_id: account.into(),
             principal_id: bounded_string(&body["data"], "principal_id", 1024)?.into(),
-            source: Source::Automation(token),
+            source: Source::Automation(credential),
         }));
     }
     Ok(
@@ -414,7 +447,9 @@ async fn select_with(
     )
 }
 
-async fn configured_token(origin: &str) -> Result<Option<String>> {
+async fn configured_token(
+    origin: &str,
+) -> Result<Option<crate::credential_sources::AcquiredCredential>> {
     let auth = crate::operator_routing::AUTH
         .try_with(Clone::clone)
         .ok()
@@ -428,7 +463,15 @@ async fn configured_token(origin: &str) -> Result<Option<String>> {
             "selected owner belongs to another service route",
         ));
     }
-    auth.token().await.map_err(|_| {
+    auth.acquire_credential().await.map_err(|error| {
+        if error.downcast_ref::<crate::credential_sources::CredentialError>()
+            == Some(&crate::credential_sources::CredentialError::Expired)
+        {
+            return Failure::refused(
+                "credential_expired",
+                "the captured control credential has expired; no request was sent",
+            );
+        }
         Failure::refused(
             "credential_unavailable",
             "selected credential source failed; no fallback was attempted",
@@ -496,7 +539,9 @@ async fn select_human_with(
 impl Selection {
     pub(super) async fn credential(&self, origin: &str) -> Result<String> {
         match &self.source {
-            Source::Automation(token) => Ok(token.clone()),
+            Source::Automation(credential) => {
+                acquired_bearer(credential, origin).map(str::to_owned)
+            }
             Source::Human(identity) => {
                 let _lock = coordination::lock(origin).await?;
                 renewal::credential(&AUTHKIT_STORE, origin, identity).await
@@ -517,17 +562,17 @@ async fn selected_principal_with(
     store: &dyn Store,
     origin: &str,
     organization: Option<&str>,
-    token: Option<String>,
+    credential: Option<crate::credential_sources::AcquiredCredential>,
     api: Option<String>,
     mechanism: super::ControlAuth,
 ) -> Result<Option<String>> {
     // A valid data credential keeps its independent lifetime after control
     // credentials are removed. Absence cannot fall back to human custody.
-    if mechanism == super::ControlAuth::AutomationEnv && token.is_none() && api.is_none() {
+    if mechanism == super::ControlAuth::AutomationEnv && credential.is_none() && api.is_none() {
         return Ok(None);
     }
     Ok(
-        select_with(store, origin, organization, token, api, mechanism)
+        select_with(store, origin, organization, credential, api, mechanism)
             .await?
             .map(|s| s.principal_id),
     )

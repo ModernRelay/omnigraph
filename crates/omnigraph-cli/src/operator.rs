@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::read_format::{ReadOutputFormat, TableCellLayout};
 
@@ -89,6 +90,7 @@ pub(crate) struct InvocationConfig {
     directory: Option<PathBuf>,
     explicit_path: Option<PathBuf>,
     captured: OnceLock<std::result::Result<OperatorConfig, String>>,
+    auth_state: OnceLock<std::result::Result<PathBuf, String>>,
 }
 
 impl InvocationConfig {
@@ -100,6 +102,7 @@ impl InvocationConfig {
             directory,
             explicit_path: None,
             captured: OnceLock::new(),
+            auth_state: OnceLock::new(),
         }
     }
     pub(crate) fn directory(&self) -> Option<&Path> {
@@ -113,10 +116,46 @@ impl InvocationConfig {
             .as_ref()
             .map(|dir| dir.join(OPERATOR_CONFIG_FILE))
     }
+    /// Local custody is separate from the operator document, which may be mounted
+    /// read-only. The path is only a namespace; UUIDs and request constraints still
+    /// bind credentials. Resolve directory aliases but preserve the file name so
+    /// projected configuration symlink rotation does not change the namespace.
+    pub(crate) fn auth_state_path(&self) -> Result<PathBuf> {
+        self.auth_state
+            .get_or_init(|| {
+                (|| -> Result<PathBuf> {
+                    let directory = self.directory().ok_or_else(|| {
+                        eyre!("credential custody requires OMNIGRAPH_HOME or a user home directory")
+                    })?;
+                    let config = self
+                        .config_path()
+                        .ok_or_else(|| eyre!("no operator configuration path"))?;
+                    let config = normalized_config_path(&config)?;
+                    let key = Sha256::digest(config.as_os_str().as_encoded_bytes());
+                    Ok(std::path::absolute(directory)?
+                        .join("auth-state")
+                        .join(format!("{key:x}.json")))
+                })()
+                .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .cloned()
+            .map_err(|error| eyre!(error.clone()))
+    }
+    pub(crate) fn check_rename_pending(&self) -> Result<()> {
+        if let Some(config) = self.config_path() {
+            crate::operator_routing::check_rename_pending(&config)?;
+            if self.directory.is_some() {
+                crate::operator_routing::check_state_rename_pending(&self.auth_state_path()?)?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn with_path(mut self, path: Option<&str>, cwd: &Path) -> Self {
         if let Some(path) = path {
             self.explicit_path = Some(cwd.join(expand_tilde(path)));
             self.captured = OnceLock::new();
+            self.auth_state = OnceLock::new();
         }
         self
     }
@@ -133,7 +172,8 @@ impl InvocationConfig {
                                 path.display()
                             ));
                         }
-                        load_operator_config_at(&path)
+                        self.check_rename_pending()
+                            .and_then(|()| load_operator_config_at(&path))
                     }
                     None => crate::operator_routing::parse(
                         "version: 1\n",
@@ -145,6 +185,39 @@ impl InvocationConfig {
             .as_ref()
             .map_err(|message| crate::targets::refusal("target_config_invalid", message.clone()))
     }
+}
+
+fn normalized_config_path(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| eyre!("operator configuration path has no file name"))?;
+    let mut parent = absolute
+        .parent()
+        .ok_or_else(|| eyre!("operator configuration path has no parent"))?
+        .to_owned();
+    let mut missing = Vec::new();
+    let mut resolved = loop {
+        match std::fs::canonicalize(&parent) {
+            Ok(parent) => break parent,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(
+                    parent
+                        .file_name()
+                        .ok_or_else(|| {
+                            eyre!("operator configuration parent could not be resolved")
+                        })?
+                        .to_owned(),
+                );
+                parent.pop();
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    for part in missing.into_iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved.join(name))
 }
 
 /// Bounded operator-owned text input, including config, credentials and backups.
@@ -223,6 +296,73 @@ mod tests {
                 .contains("does not exist")
         );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn credential_state_namespace_is_local_and_distinguishes_operator_documents() {
+        let documents = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let input = |name| {
+            InvocationConfig::at(Some(home.path().to_owned()), None)
+                .with_path(Some(name), documents.path())
+        };
+        let first = input("first.yaml").auth_state_path().unwrap();
+        let second = input("second.yaml").auth_state_path().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            first.parent(),
+            Some(home.path().join("auth-state").as_path())
+        );
+        std::fs::write(documents.path().join("first.yaml"), "version: 1\n").unwrap();
+        assert_eq!(input("first.yaml").auth_state_path().unwrap(), first);
+        std::fs::write(
+            documents.path().join("replacement.yaml"),
+            "version: 1\n# replacement\n",
+        )
+        .unwrap();
+        std::fs::rename(
+            documents.path().join("replacement.yaml"),
+            documents.path().join("first.yaml"),
+        )
+        .unwrap();
+        assert_eq!(input("first.yaml").auth_state_path().unwrap(), first);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn credential_state_resolves_directory_aliases_but_survives_projected_file_rotation() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let documents = directory.path().join("documents");
+        std::fs::create_dir(&documents).unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&documents, &alias).unwrap();
+        for name in ["first.yaml", "second.yaml"] {
+            std::fs::write(documents.join(name), "version: 1\n").unwrap();
+        }
+        symlink("first.yaml", documents.join("mounted.yaml")).unwrap();
+        let home = directory.path().join("home");
+        let input = |path: &Path| {
+            InvocationConfig::at(Some(home.clone()), None)
+                .with_path(Some(path.to_str().unwrap()), directory.path())
+        };
+        let before = input(&documents.join("mounted.yaml"))
+            .auth_state_path()
+            .unwrap();
+        assert_eq!(
+            input(&alias.join("mounted.yaml"))
+                .auth_state_path()
+                .unwrap(),
+            before
+        );
+        std::fs::remove_file(documents.join("mounted.yaml")).unwrap();
+        symlink("second.yaml", documents.join("mounted.yaml")).unwrap();
+        assert_eq!(
+            input(&documents.join("mounted.yaml"))
+                .auth_state_path()
+                .unwrap(),
+            before
+        );
+        assert!(!home.exists());
     }
     #[test]
     fn expand_tilde_resolves_home_prefix() {

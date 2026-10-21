@@ -347,7 +347,7 @@ fn help_groups_commands_by_capability() {
             && stdout.contains("defaults.target")
             && stdout
                 .contains("Select resources with --target and account operations with --profile")
-            && stdout.contains("--auth")
+            && !stdout.contains("--auth")
             && stdout.contains("--operator-config selects one operator file")
             && stdout.contains("--config supplies deployment sources"),
         "target/capability guidance missing from --help:\n{stdout}"
@@ -1300,7 +1300,7 @@ defaults:
     ] {
         output_failure(&mut invoke(&args));
     }
-    for selector in ["--profile", "--auth", "--operator-config", "--target"] {
+    for selector in ["--profile", "--operator-config", "--target"] {
         let output = output_failure(
             cli()
                 .env("OMNIGRAPH_HOME", home.path())
@@ -1313,6 +1313,8 @@ defaults:
     }
     for args in [
         vec!["cluster", "list", "--connection", "account"],
+        vec!["query", "--target", "cluster", "--auth", "old", "-e", "q"],
+        vec!["config", "rename-auth", "server", "old", "first", "second"],
         vec!["config", "rename-connection", "account", "renamed"],
     ] {
         let output = output_failure(&mut invoke(&args));
@@ -1344,6 +1346,8 @@ fn operator_config_clean_slate_refuses_legacy_and_ambiguous_documents() {
         "version: 1\n---\nversion: 1\n",
         "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, credential: old}\n",
         "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, auth: anonymous}\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, auth: {named: {provider: anonymous}}}\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, auth: {provider: anonymous}, default_auth: named}\n",
         "version: 1\nconnections:\n  old: {api: http://127.0.0.1:9, organization_id: org, auth: {token: {provider: token, source: {env: UNUSED}}}}\n",
         "version: 1\ntargets:\n  old: {kind: server, endpoint: http://127.0.0.1:9, auth: {token: {provider: token, source: {env: UNUSED}}}}\n",
     ] {
@@ -1371,7 +1375,7 @@ fn operator_config_clean_slate_refuses_legacy_and_ambiguous_documents() {
 }
 
 #[test]
-fn server_auth_requires_explicit_profile_or_declared_default_without_fallback() {
+fn server_target_uses_one_auth_source_without_fallback() {
     let home = tempfile::tempdir().unwrap();
     let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
     let config = home.path().join("config.yaml");
@@ -1384,43 +1388,22 @@ targets:
     kind: server
     endpoint: {}
     auth:
-      selected:
-        provider: token
-        source: {{env: CLI_TEST_SELECTED_TOKEN}}
+      provider: token
+      source: {{env: CLI_TEST_SELECTED_TOKEN}}
 "#,
             server.origin
         ),
     )
     .unwrap();
     let before = fs::read(&config).unwrap();
-    // Even a sole profile is not selected implicitly. Missing selected input
-    // cannot fall back to the old convention or unkeyed variables.
-    for args in [
-        vec![],
-        vec!["--auth", "selected"],
-        vec!["--auth", "unknown"],
-    ] {
-        output_failure(
-            cli()
-                .env("OMNIGRAPH_HOME", home.path())
-                .env_remove("CLI_TEST_SELECTED_TOKEN")
-                .env("OMNIGRAPH_TOKEN_SERVER", "must-not-be-used")
-                .env("OMNIGRAPH_BEARER_TOKEN", "must-not-be-used")
-                .args([
-                    "--target",
-                    "server",
-                    "--graph",
-                    "knowledge",
-                    "branch",
-                    "list",
-                ])
-                .args(args),
-        );
-    }
-    let output = output_failure(
+    // The sole configured source cannot fall back to the retired keyed or
+    // unkeyed token variables when it is absent.
+    output_failure(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
-            .env("CLI_TEST_SELECTED_TOKEN", "must-not-be-used")
+            .env_remove("CLI_TEST_SELECTED_TOKEN")
+            .env("OMNIGRAPH_TOKEN_SERVER", "must-not-be-used")
+            .env("OMNIGRAPH_BEARER_TOKEN", "must-not-be-used")
             .args([
                 "--target",
                 "server",
@@ -1430,15 +1413,14 @@ targets:
                 "list",
             ]),
     );
-    let diagnostic = format!(
-        "{}{}",
-        stdout_string(&output),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        diagnostic.contains("--auth") || diagnostic.contains("default_auth"),
-        "{diagnostic}"
-    );
+    let status = parse_stdout_json(&output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("CLI_TEST_SELECTED_TOKEN", "present-but-not-read")
+            .args(["credentials", "status", "--target", "server", "--json"]),
+    ));
+    assert_eq!(status["availability"], "present");
+    assert_eq!(status["server_validity"], "unverified");
     assert_eq!(fs::read(&config).unwrap(), before);
     assert!(server.requests().is_empty());
     server.assert_complete();
