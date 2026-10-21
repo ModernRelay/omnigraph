@@ -2520,7 +2520,7 @@ async fn stage_overwrite_batches_keeps_every_batch_in_one_overwrite() {
         let pre_version = ds.version().version;
 
         let staged = store
-            .stage_overwrite_batches(&ds, inputs.clone(), budget)
+            .stage_overwrite_batches(&ds, inputs.clone(), budget, 1)
             .await
             .unwrap();
         assert!(matches!(
@@ -2611,7 +2611,7 @@ async fn stage_overwrite_batches_with_no_batch_empties_the_table_keeping_its_sch
     let pre_version = ds.version().version;
 
     let staged = store
-        .stage_overwrite_batches(&ds, Vec::new(), WriteBudget::default())
+        .stage_overwrite_batches(&ds, Vec::new(), WriteBudget::default(), 4)
         .await
         .unwrap();
     assert!(staged.new_fragments().is_empty());
@@ -2632,6 +2632,212 @@ async fn stage_overwrite_batches_with_no_batch_empties_the_table_keeping_its_sch
         arrow_schema::Schema::from(ds.schema()),
         "an overwrite without a batch keeps the committed schema"
     );
+}
+
+/// Ids in scan order, unsorted: the order the fragments were published in.
+fn ids_in_order(batches: &[RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..ids.len())
+                .map(|i| ids.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Several writers stage one overwrite: chunks of exactly the file target (4
+/// rows here, the 3-row batches sliced where they straddle it), one Lance call
+/// and file per chunk, staged and committed in chunk order, read back in input order.
+#[tokio::test]
+async fn stage_overwrite_batches_fans_out_writers_in_chunk_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let pre_version = ds.version().version;
+    let expected: Vec<String> = (0..14).map(|i| format!("p{i:02}")).collect();
+    let mut inputs: Vec<RecordBatch> = expected
+        .chunks(3)
+        .map(|ids| {
+            person_batch(
+                &ids.iter()
+                    .map(|id| (id.as_str(), Some(1)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    inputs.insert(3, person_batch(&[]));
+    assert_eq!(
+        super::overwrite_chunks(inputs.clone(), 4)
+            .iter()
+            .map(|chunk| chunk.iter().map(RecordBatch::num_rows).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        vec![vec![3, 1], vec![2, 2], vec![1, 3], vec![2]],
+        "each chunk holds exactly 4 rows, the straddling batch sliced"
+    );
+
+    let staged = store
+        .stage_overwrite_chunks(&ds, inputs, WriteBudget::default(), 3, 4)
+        .await
+        .unwrap();
+    assert!(matches!(
+        staged.transaction.operation,
+        Operation::Overwrite { .. }
+    ));
+    let staged_rows: Vec<usize> = staged
+        .new_fragments()
+        .iter()
+        .map(|fragment| fragment.physical_rows.unwrap_or(0))
+        .collect();
+    assert_eq!(
+        staged_rows,
+        vec![4, 4, 4, 2],
+        "one file per chunk, in chunk order"
+    );
+    assert!(
+        staged
+            .new_fragments()
+            .iter()
+            .all(|fragment| fragment.files.len() == 1)
+    );
+    assert_eq!(
+        staged
+            .new_fragments()
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    let before_commit = store
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
+        .await
+        .unwrap();
+    assert_eq!(ids_in_order(&before_commit), expected);
+    assert_eq!(ds.version().version, pre_version);
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.version().version, pre_version + 1);
+    let committed: Vec<(u64, usize)> = new_ds
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment.physical_rows.unwrap_or(0)))
+        .collect();
+    assert_eq!(
+        committed.iter().map(|(_, rows)| *rows).collect::<Vec<_>>(),
+        vec![4, 4, 4, 2]
+    );
+    assert!(committed.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert_eq!(
+        new_ds.manifest.uses_stable_row_ids(),
+        ds.manifest.uses_stable_row_ids()
+    );
+    let after = store.scan_batches(&new_ds).await.unwrap();
+    assert_eq!(ids_in_order(&after), expected);
+}
+
+/// Batches of two schemas are refused before any writer starts, as one Lance
+/// call refuses them (no data file written, HEAD stays), where Lance's own
+/// overwrite would publish a mixed table; a zero-row batch of another schema is dropped.
+#[tokio::test]
+async fn stage_overwrite_batches_refuses_mixed_schemas_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let pre_version = ds.version().version;
+    let other_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+        Field::new("extra", DataType::Int32, true),
+    ]));
+    let other = RecordBatch::try_new(
+        Arc::clone(&other_schema),
+        vec![
+            Arc::new(StringArray::from(vec!["zed"])),
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![2])),
+        ],
+    )
+    .unwrap();
+    let other_empty = RecordBatch::new_empty(other_schema);
+    let inputs = vec![
+        person_batch(&[("a", Some(1)), ("b", Some(2))]),
+        person_batch(&[("c", Some(3)), ("d", Some(4))]),
+        other,
+    ];
+
+    let data_files = || {
+        std::fs::read_dir(format!("{uri}/data"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "lance"))
+            .count()
+    };
+    let before = data_files();
+
+    let error = store
+        .stage_overwrite_chunks(&ds, inputs, WriteBudget::default(), 2, 2)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("one schema"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("field `extra` Int32 in one batch only"),
+        "{error}"
+    );
+    assert_eq!(data_files(), before, "no chunk was written");
+    assert_eq!(ds.version().version, pre_version);
+    assert_eq!(
+        Dataset::open(&uri).await.unwrap().version().version,
+        pre_version
+    );
+
+    let staged = store
+        .stage_overwrite_chunks(
+            &ds,
+            vec![
+                other_empty,
+                person_batch(&[("a", Some(1)), ("b", Some(2))]),
+                person_batch(&[("c", Some(3)), ("d", Some(4))]),
+            ],
+            WriteBudget::default(),
+            2,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        staged
+            .new_fragments()
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or(0))
+            .collect::<Vec<_>>(),
+        vec![2, 2],
+        "the zero-row batch of another schema is dropped"
+    );
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.schema().fields.len(), 2);
+    let after = store.scan_batches(&new_ds).await.unwrap();
+    assert_eq!(ids_in_order(&after), ["a", "b", "c", "d"]);
 }
 
 /// A mixed BTREE + FTS + full-table vector batch writes immutable index files

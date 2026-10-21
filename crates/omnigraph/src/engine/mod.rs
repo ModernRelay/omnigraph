@@ -108,13 +108,15 @@ pub(crate) struct LoadFacts {
 }
 
 /// The write verb's facts: the graph handle and the open transaction the
-/// sink stages under, the session's write allowance, and the slot the sink
-/// deposits its staged transaction in for the driver to commit.
+/// sink stages under, the session's write allowance, the Lance writers the
+/// sink runs at once (the session's `stage_write_concurrency`), and the slot
+/// the sink deposits its staged transaction in for the driver to commit.
 #[derive(Clone)]
 pub(crate) struct LoadWrite {
     pub(crate) db: Arc<crate::db::Omnigraph>,
     pub(crate) txn: Arc<crate::db::WriteTxn>,
     pub(crate) write_budget: crate::storage_layer::WriteBudget,
+    pub(crate) writers: usize,
     pub(crate) staged: Arc<std::sync::Mutex<Option<crate::exec::staging::StagedMutation>>>,
 }
 

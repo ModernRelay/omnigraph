@@ -304,8 +304,12 @@ range `1..=64`); it is `process` scope, so the server takes it from
 `OMNIGRAPH_LOAD_CONCURRENCY` and a direct CLI run from that variable or from
 `--set` on `load`, `ingest` or `mutate` (a JSONL input carries no `set` line),
 and an invalid or `0` value refuses startup instead of running the default.
-Delete staging remains serial. This affects preparation only—one
-request still publishes exactly one graph commit.
+The same width is the number of Lance writers a `load csv` overwrite runs at
+once: its batches are cut into runs of at most one Lance file (1 M rows), each
+run written by its own writer, and the files are published in input order, so
+the table's files are the ones a single writer would have produced. Delete
+staging remains serial. This affects preparation only—one request still
+publishes exactly one graph commit.
 
 A stale strict update, delete, or overwrite can return `read_set_conflict`.
 Refresh the branch and retry deliberately. A `key_conflict` means an append or

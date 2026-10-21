@@ -410,7 +410,12 @@ concurrency. The `stage_write_concurrency` session setting (`process` scope,
 range `1..=64`; process default `OMNIGRAPH_LOAD_CONCURRENCY`, an invalid or
 `0` value refusing startup instead of running the default) selects that
 width for both Load and
-ordinary insert/update mutations (default 8). Delete transactions remain
+ordinary insert/update mutations (default 8), and inside one `load csv`
+overwrite the number of Lance writers (`TableStore::stage_overwrite_batches`
+cuts the batches at Lance's file target into contiguous chunks, runs one
+`execute_uncommitted` per chunk with that many in flight, and joins the
+chunks' fragments in chunk order into the one `Operation::Overwrite`, so the
+files and their order are those of a single call). Delete transactions remain
 serial. The setting changes only
 fragment preparation: every participant still commits detached and crosses
 one graph-manifest publication.
