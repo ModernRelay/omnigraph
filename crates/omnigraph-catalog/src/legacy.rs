@@ -1525,8 +1525,13 @@ pub mod write {
         pub async fn fork(&mut self, source: Option<&str>, native: &str) -> Result<u64> {
             let mut dataset = self.head(source)?.clone();
             let version = dataset.version().version;
-            match crate::branch_control::create_branch_recoverably(&mut dataset, native, version)
-                .await?
+            match crate::branch_control::create_branch_recoverably(
+                &mut dataset,
+                native,
+                version,
+                None,
+            )
+            .await?
             {
                 crate::branch_control::BranchCreateOutcome::Created => {}
                 crate::branch_control::BranchCreateOutcome::RefAlreadyExists => {

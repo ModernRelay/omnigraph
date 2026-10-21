@@ -1286,7 +1286,7 @@ async fn test_snapshot_at_reads_branch_pinned_historical_state() {
 
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let main_manifest_version = mc.version();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let snap = mc.snapshot();
     let person_entry = snap.dataset("node:Person").unwrap().clone();
@@ -1373,7 +1373,7 @@ async fn test_branch_manifest_namespace_uses_entry_owner_branch_for_latest_table
     let catalog = build_test_catalog();
 
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let snap = mc.snapshot();
     let person_entry = snap.dataset("node:Person").unwrap().clone();
@@ -1993,7 +1993,7 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
     let catalog = build_test_catalog();
 
     let mut main_mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    main_mc.create_branch("feature").await.unwrap();
+    main_mc.create_branch("feature", None).await.unwrap();
 
     let snap = main_mc.snapshot();
     let person_entry = snap.dataset("node:Person").unwrap().clone();
@@ -2032,7 +2032,7 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
     let mut feature_mc = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
-    feature_mc.create_branch("experiment").await.unwrap();
+    feature_mc.create_branch("experiment", None).await.unwrap();
     feature_ds
         .create_branch("experiment", feature_version, None)
         .await
@@ -2873,7 +2873,7 @@ async fn branch_inherits_main_internal_schema_stamp() {
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let main_ds = open_manifest_dataset(uri, None).await.unwrap();
     let feature_ds = open_manifest_dataset(uri, Some("feature")).await.unwrap();
@@ -2977,7 +2977,7 @@ async fn assert_exact_named_head_race(establish_head: bool) {
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let publisher = GraphNamespacePublisher::new(uri, Some("feature"));
     let empty = HashMap::new();
@@ -3247,7 +3247,7 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let old_branch = open_manifest_dataset(uri, Some("feature")).await.unwrap();
     let old_identifier = old_branch.branch_identifier().await.unwrap();
@@ -3283,7 +3283,7 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
         old_branch.branch_identifier().await,
         Err(lance::Error::RefNotFound { .. })
     ));
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
     assert_ne!(
         probe_dataset_latest_incarnation(&old_branch, Some("feature"))
             .await
@@ -4311,7 +4311,7 @@ async fn fresh_fork_publishes_on_top_of_the_head_it_inherits() {
     mc.commit_changes_with_lineage(&[], &HashMap::new(), Some(&on_main))
         .await
         .unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let fork = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
@@ -4413,12 +4413,12 @@ async fn recreated_branch_has_no_exact_head_and_inherits_the_head_of_its_source(
         outcome.head
     };
 
-    mc.create_branch("b").await.unwrap();
+    mc.create_branch("b", None).await.unwrap();
     let on_b = publish("b").await;
     ManifestCoordinator::open_at_branch(uri, "b")
         .await
         .unwrap()
-        .create_branch("c")
+        .create_branch("c", None)
         .await
         .unwrap();
     let on_c = publish("c").await;
@@ -4430,7 +4430,7 @@ async fn recreated_branch_has_no_exact_head_and_inherits_the_head_of_its_source(
     ManifestCoordinator::open_at_branch(uri, "c")
         .await
         .unwrap()
-        .create_branch("b")
+        .create_branch("b", None)
         .await
         .unwrap();
 
@@ -4509,7 +4509,7 @@ async fn unattached_root_on_a_fresh_branch_records_the_inherited_head() {
     mc.commit_changes_with_lineage(&[], &HashMap::new(), Some(&on_main))
         .await
         .unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
     let fork = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -4955,7 +4955,7 @@ async fn generation_is_the_greatest_parent_generation_plus_one() {
     let mut mc = ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
     let publish = |branch: Option<&'static str>, merged_parent: Option<BranchRecords>| async move {
         GraphNamespacePublisher::new(uri, branch)
             .publish(
@@ -5173,7 +5173,7 @@ async fn merge_publish_appends_the_records_of_an_idle_branch() {
     let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut feature = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -5294,7 +5294,7 @@ async fn branch_records_of_a_wide_unchanged_catalog_rebuild_no_table_rows() {
     let mut main = ManifestCoordinator::init(uri, &build_wide_catalog())
         .await
         .unwrap();
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut feature = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -5374,11 +5374,11 @@ async fn branch_delete_appends_the_commits_the_branch_wrote() {
         .await
         .unwrap();
 
-    main.create_branch("unwritten").await.unwrap();
+    main.create_branch("unwritten", None).await.unwrap();
     main.delete_branch("unwritten").await.unwrap();
     assert_eq!(history_row_count(uri).await, 0);
 
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut feature = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -5446,10 +5446,11 @@ async fn branch_delete_appends_the_commits_the_branch_wrote() {
         Some(head.commit.clone())
     );
 
-    let snapshot = head.snapshot(uri).unwrap();
+    let snapshot = head.snapshot(uri, &session).unwrap();
     let at_head = ManifestCoordinator::snapshot_from_state(
         uri,
         read_manifest_state(&feature_manifest).await.unwrap(),
+        Arc::clone(&session),
     );
     assert_eq!(snapshot.version, at_head.version);
     assert_eq!(snapshot.graph_heads, at_head.graph_heads);
@@ -5466,7 +5467,7 @@ async fn branch_delete_appends_the_commits_the_branch_wrote() {
         .await
         .unwrap_err();
     assert!(matches!(error, OmniError::BranchNotFound { .. }), "{error}");
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let error = ManifestCoordinator::ensure_incarnation_live(uri, &session, &head.commit)
         .await
         .unwrap_err();
@@ -6340,7 +6341,7 @@ async fn repeated_merge_base_search_makes_no_request() {
         publish_block_commit(&mut main, fat_block_intent(None)).await;
     }
     let fork_point = main.head().graph_commit_id.clone();
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut feature = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -6880,7 +6881,7 @@ async fn fork_inherits_the_buffer_and_the_replaced_rows_of_the_version_it_forks(
         .await
         .unwrap();
     }
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut fork = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -7000,7 +7001,7 @@ async fn block_placement_preserves_fork_and_parent_records_through_two_releases(
          slot 0, so the fork releases A[0..5] before main releases all of A"
     );
     let block = format!("blocks/{}/", inherited.block);
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut fork = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -7240,7 +7241,7 @@ async fn merge_into_a_full_buffer_appends_both_lineages_in_one_append() {
     let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut feature = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -7332,7 +7333,7 @@ async fn repeated_merges_of_an_open_source_block_append_each_commit_once_and_sta
     let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    main.create_branch("f").await.unwrap();
+    main.create_branch("f", None).await.unwrap();
     let mut source = ManifestCoordinator::open_at_branch(uri, "f").await.unwrap();
     let mut first = None;
     for _ in 0..MERGES {
@@ -7405,7 +7406,7 @@ async fn merges_separated_by_a_target_release_append_each_source_commit_once() {
     let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    main.create_branch("f").await.unwrap();
+    main.create_branch("f", None).await.unwrap();
     let mut source = ManifestCoordinator::open_at_branch(uri, "f").await.unwrap();
     let mut merge_base = main.head().graph_commit_id.clone();
     let mut first = None;
@@ -7576,7 +7577,9 @@ async fn several_targets_merging_one_open_source_block_keep_its_head_readable_in
         .unwrap();
     let mut fork_bases = Vec::new();
     for target in 0..TARGETS {
-        main.create_branch(&format!("t{target}")).await.unwrap();
+        main.create_branch(&format!("t{target}"), None)
+            .await
+            .unwrap();
         fork_bases.push(main.head().graph_commit_id.clone());
         main.commit_changes_with_lineage(&[], &HashMap::new(), Some(&block_intent()))
             .await
@@ -7717,7 +7720,7 @@ async fn merge_and_delete_append_only_the_commits_no_other_lineage_keeps() {
         publish_on(&mut main, None, None).await;
     }
 
-    main.create_branch("task").await.unwrap();
+    main.create_branch("task", None).await.unwrap();
     let mut task = ManifestCoordinator::open_at_branch(uri, "task")
         .await
         .unwrap();
@@ -7736,7 +7739,7 @@ async fn merge_and_delete_append_only_the_commits_no_other_lineage_keeps() {
         "the deleted branch wrote one commit"
     );
 
-    main.create_branch("slow").await.unwrap();
+    main.create_branch("slow", None).await.unwrap();
     let mut slow = ManifestCoordinator::open_at_branch(uri, "slow")
         .await
         .unwrap();
@@ -7774,12 +7777,12 @@ async fn merge_and_delete_append_only_the_commits_no_other_lineage_keeps() {
         "main appended every commit the branch inherited from it"
     );
 
-    main.create_branch("outer").await.unwrap();
+    main.create_branch("outer", None).await.unwrap();
     let mut outer = ManifestCoordinator::open_at_branch(uri, "outer")
         .await
         .unwrap();
     let on_outer = publish_on(&mut outer, Some("outer"), None).await;
-    outer.create_branch("inner").await.unwrap();
+    outer.create_branch("inner", None).await.unwrap();
     let mut inner = ManifestCoordinator::open_at_branch(uri, "inner")
         .await
         .unwrap();
@@ -7813,8 +7816,8 @@ async fn merge_and_delete_append_only_the_commits_no_other_lineage_keeps() {
         "each delete acknowledges its already archived records"
     );
 
-    main.create_branch("left").await.unwrap();
-    main.create_branch("right").await.unwrap();
+    main.create_branch("left", None).await.unwrap();
+    main.create_branch("right", None).await.unwrap();
     let mut left = ManifestCoordinator::open_at_branch(uri, "left")
         .await
         .unwrap();
@@ -8805,7 +8808,9 @@ async fn publish_replaces_the_schema_contract_row_and_carries_it_forward() {
         .into_iter()
         .find(|record| record.commit.graph_manifest_version == genesis_version)
         .unwrap();
-    let historical = old_record.snapshot(uri).unwrap();
+    let historical = old_record
+        .snapshot(uri, &crate::lance_access::control_session())
+        .unwrap();
     assert_eq!(historical.schema_contract(), Some(&genesis_contract.head));
     assert_eq!(
         ManifestCoordinator::read_schema_contract_for_snapshot(uri, &historical)
@@ -10981,7 +10986,9 @@ async fn schema_content_is_archived_by_digest_and_serves_commit_snapshots() {
     let read_genesis_contract = |record: HistoryRecord| {
         let uri = uri.clone();
         async move {
-            let snapshot = record.snapshot(&uri).unwrap();
+            let snapshot = record
+                .snapshot(&uri, &crate::lance_access::control_session())
+                .unwrap();
             let sent = HistoryGets::default();
             let probes = sent.probes();
             let opens = probes.internal_open_count.clone();
@@ -11021,7 +11028,10 @@ async fn schema_content_is_archived_by_digest_and_serves_commit_snapshots() {
         .expect("the release archived the genesis commit");
     assert_eq!(archived.commit, genesis);
     assert_eq!(read_genesis_contract(archived).await, genesis_contract);
-    let latest = mc.head_record().snapshot(&uri).unwrap();
+    let latest = mc
+        .head_record()
+        .snapshot(&uri, &mc.control_session())
+        .unwrap();
     assert_eq!(
         ManifestCoordinator::read_schema_contract_for_snapshot(&uri, &latest)
             .await
@@ -11044,7 +11054,10 @@ async fn missing_or_inconsistent_archived_schema_content_fails_closed() {
     let digest = mc.head().schema_content_hash.clone().unwrap();
     let path = schema_object_path(dir.path(), &digest);
     let intact = std::fs::read(&path).unwrap();
-    let snapshot = mc.head_record().snapshot(&uri).unwrap();
+    let snapshot = mc
+        .head_record()
+        .snapshot(&uri, &mc.control_session())
+        .unwrap();
     let read = || async {
         let direct = super::history::read_schema(&uri, &session, &digest, &contract.head).await;
         let through = ManifestCoordinator::read_schema_contract_for_snapshot(&uri, &snapshot).await;
@@ -11110,7 +11123,9 @@ async fn missing_or_inconsistent_archived_schema_content_fails_closed() {
     refused(
         ManifestCoordinator::read_schema_contract_for_snapshot(
             &uri,
-            &unnamed.snapshot(&uri).unwrap(),
+            &unnamed
+                .snapshot(&uri, &crate::lance_access::control_session())
+                .unwrap(),
         )
         .await,
         "recorded no schema content",
@@ -14000,7 +14015,7 @@ async fn assert_legacy_versions_of_an_upgraded_root(target: u32) {
         assert_eq!(super::migrations::read_stamp(&converted_feature), Some(14));
 
         let mut main = ManifestCoordinator::open(root).await.unwrap();
-        main.create_branch("after_upgrade").await.unwrap();
+        main.create_branch("after_upgrade", None).await.unwrap();
 
         for (logical, old_head, person_version) in [
             ("feature", f4.commit.graph_commit_id.as_str(), 6),

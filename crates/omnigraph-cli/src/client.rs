@@ -2689,7 +2689,8 @@ fn verified_blob_precondition(error: color_eyre::eyre::Report) -> color_eyre::ey
         Ok(remote)
             if remote.status == StatusCode::PRECONDITION_FAILED
                 && remote.output.blob_precondition_failure.is_some()
-                && remote.output.code == Some(omnigraph_api_types::ErrorCode::Conflict)
+                && remote.output.code
+                    == Some(omnigraph_api_types::ErrorCode::PreconditionFailed)
                 && crate::command_outcome::single_request()
                 && {
                     let mut rest = remote.output.clone();
@@ -3249,17 +3250,17 @@ mod tests {
         assert_eq!(compound.exit, 1);
         assert_eq!(single.exit, 75);
         assert_eq!(
-            serde_json::to_value(compound).unwrap()["command_outcome"],
+            serde_json::to_value(compound).unwrap()["disposition"],
             json!({
-                "execution":"unknown", "effects":"unknown", "action":"reconcile"
+                "effects":"unknown", "action":"reconcile"
             })
         );
         let single = serde_json::to_value(single).unwrap();
         assert_eq!(single["retry_after"], "Wed, 21 Oct 2026 07:28:00 GMT");
         assert_eq!(
-            single["command_outcome"],
+            single["disposition"],
             json!({
-                "execution":"not_started", "effects":"none", "action":"retry"
+                "effects":"none", "action":"retry"
             })
         );
         // A later read's typed refusal cannot erase an earlier successful
@@ -3274,21 +3275,21 @@ mod tests {
             let compound = attempt(true, read_refusal, kind).await;
             assert_eq!(compound.exit, 1);
             assert_eq!(
-                serde_json::to_value(compound).unwrap()["command_outcome"]["effects"],
+                serde_json::to_value(compound).unwrap()["disposition"]["effects"],
                 "unknown"
             );
         }
         let conditional = attempt(false, false, Refusal::Condition).await;
         assert_eq!(conditional.exit, 4);
         assert_eq!(
-            serde_json::to_value(conditional).unwrap()["command_outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"})
+            serde_json::to_value(conditional).unwrap()["disposition"],
+            json!({"effects":"none","action":"refresh"})
         );
         let denied = attempt(false, false, Refusal::Denied).await;
         assert_eq!(denied.exit, 1);
         assert_eq!(
-            serde_json::to_value(denied).unwrap()["command_outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"})
+            serde_json::to_value(denied).unwrap()["disposition"],
+            json!({"effects":"none","action":"refresh"})
         );
     }
 

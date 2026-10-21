@@ -4,7 +4,10 @@
 use std::sync::{Arc, Mutex};
 
 use color_eyre::Report;
-use omnigraph_api_types::{ErrorCode, ErrorOutput};
+use omnigraph_api_types::{
+    DispositionAction as Action, DispositionEffects as Effects, DispositionOutput, ErrorCode,
+    ErrorOutput,
+};
 use reqwest::StatusCode;
 use serde::Serialize;
 
@@ -147,41 +150,13 @@ pub(crate) fn writable_open() {
     update(|state| state.writable_open = true);
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Execution {
-    NotStarted,
-    Unknown,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Effects {
-    None,
-    Unknown,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Action {
-    Retry,
-    Refresh,
-    Recover,
-    Reconcile,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct CommandOutcome {
-    execution: Execution,
-    effects: Effects,
-    action: Action,
-}
-
+/// The failure the CLI prints for a data write: the server's error body, its
+/// `disposition` reconciled with what this command's own requests show, and
+/// the transport facts beside it.
 #[derive(Debug, Serialize)]
 pub(crate) struct Failure {
     #[serde(flatten)]
     pub(crate) output: ErrorOutput,
-    pub(crate) command_outcome: CommandOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) http_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,6 +171,13 @@ pub(crate) struct Failure {
 }
 
 impl Failure {
+    /// The whole command's disposition, which `classify` always sets.
+    pub(crate) fn disposition(&self) -> DispositionOutput {
+        self.output
+            .disposition
+            .expect("a classified failure carries its disposition")
+    }
+
     pub(crate) fn classify(error: Report, evidence: Evidence) -> Self {
         let remote = error.downcast_ref::<RemoteErrorCli>();
         let precondition = error.downcast_ref::<PreconditionFailedCli>();
@@ -228,6 +210,17 @@ impl Failure {
             evidence.retry_after
         };
         let missing_credential = remote.and_then(|remote| remote.missing_credential.clone());
+        // A server states the disposition of the one request it answered; that
+        // is the whole command's only when that request was the command's sole
+        // effectful one.
+        let served = remote
+            .filter(|_| single)
+            .and_then(|remote| remote.output.disposition)
+            .or_else(|| {
+                precondition
+                    .filter(|_| single)
+                    .and_then(|value| value.output.disposition)
+            });
         let output = if let Some(remote) = remote {
             remote.output.clone()
         } else if let Some(precondition) = precondition {
@@ -253,6 +246,8 @@ impl Failure {
             || output.full_text_index_required.is_some()
         {
             Action::Recover
+        } else if let Some(action) = admission {
+            action
         } else if not_started
             || output.precondition_failure.is_some()
             || output.blob_precondition_failure.is_some()
@@ -265,25 +260,27 @@ impl Failure {
             || output.diagnostic.is_some()
             || output.branch_start_refusal.is_some()
         {
-            Action::Refresh
+            // A refusal of the request itself is fixed; any other is read
+            // again first.
+            match output.code.map(ErrorCode::action) {
+                Some(Action::Fix) => Action::Fix,
+                _ => Action::Refresh,
+            }
         } else {
             Action::Reconcile
         };
+        let disposition = served.unwrap_or(DispositionOutput {
+            effects: if not_started {
+                Effects::None
+            } else {
+                Effects::Unknown
+            },
+            action,
+        });
+        let mut output = output;
+        output.disposition = Some(disposition);
         Self {
             output,
-            command_outcome: CommandOutcome {
-                execution: if not_started {
-                    Execution::NotStarted
-                } else {
-                    Execution::Unknown
-                },
-                effects: if not_started {
-                    Effects::None
-                } else {
-                    Effects::Unknown
-                },
-                action,
-            },
             http_status,
             retry_after,
             request_dispatched,
@@ -300,16 +297,17 @@ impl Failure {
 }
 
 /// The typed refusals the server sends before it admits a write, each code
-/// under its own status. A busy actor may retry the whole command; failed
-/// authentication, an unsupported contract, a refused `--as` assertion or a
-/// policy denial needs a changed credential, client or grant first.
+/// under its own status, and what each asks for. A busy actor may retry the
+/// whole command; failed authentication, an unsupported contract or a refused
+/// `--as` assertion needs a fixed credential or client, and a policy denial a
+/// changed grant.
 fn admission_refusal(status: StatusCode, code: Option<&ErrorCode>) -> Option<Action> {
     match (status, code?) {
-        (StatusCode::TOO_MANY_REQUESTS, ErrorCode::TooManyRequests) => Some(Action::Retry),
-        (StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized)
-        | (StatusCode::BAD_REQUEST, ErrorCode::ApiContractMismatch)
-        | (StatusCode::PRECONDITION_FAILED, ErrorCode::ActorMismatch)
-        | (StatusCode::FORBIDDEN, ErrorCode::Forbidden) => Some(Action::Refresh),
+        (StatusCode::TOO_MANY_REQUESTS, code @ ErrorCode::TooManyRequests)
+        | (StatusCode::UNAUTHORIZED, code @ ErrorCode::Unauthorized)
+        | (StatusCode::BAD_REQUEST, code @ ErrorCode::ApiContractMismatch)
+        | (StatusCode::PRECONDITION_FAILED, code @ ErrorCode::ActorMismatch)
+        | (StatusCode::FORBIDDEN, code @ ErrorCode::Forbidden) => Some(code.action()),
         _ => None,
     }
 }

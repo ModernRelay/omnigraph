@@ -448,7 +448,10 @@ fn remote_refusal(
                 .precondition_failure
                 .as_ref()
                 .is_some_and(|details| Some(details.expected.as_str()) == expected_commit)
-            && error.code.is_none()
+            && matches!(
+                error.code,
+                None | Some(omnigraph_api_types::ErrorCode::PreconditionFailed)
+            )
             && crate::command_outcome::single_request()
             && {
                 let mut rest = error.clone();

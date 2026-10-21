@@ -391,11 +391,6 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
-        "read_schema_contract_at",
-    ),
-    (
-        "omnigraph-catalog/lib.rs",
-        "ManifestCoordinator",
         "read_schema_contract_for_snapshot",
     ),
     (
@@ -520,16 +515,10 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "ManifestCoordinator",
         "open_exact_genesis",
     ),
-    ("omnigraph-catalog/lib.rs", "ManifestCoordinator", "open"),
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "open_with_session",
-    ),
-    (
-        "omnigraph-catalog/lib.rs",
-        "ManifestCoordinator",
-        "open_at_branch",
     ),
     (
         "omnigraph-catalog/lib.rs",
@@ -539,17 +528,7 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
-        "snapshot_at",
-    ),
-    (
-        "omnigraph-catalog/lib.rs",
-        "ManifestCoordinator",
         "snapshot_at_with_session",
-    ),
-    (
-        "omnigraph-catalog/lib.rs",
-        "ManifestCoordinator",
-        "snapshot_at_in",
     ),
     (
         "omnigraph-catalog/lib.rs",
@@ -559,17 +538,7 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "omnigraph-catalog/retention.rs",
         "ManifestCoordinator",
-        "pinned_graph_commit",
-    ),
-    (
-        "omnigraph-catalog/retention.rs",
-        "ManifestCoordinator",
         "pinned_graph_commit_with_session",
-    ),
-    (
-        "omnigraph-catalog/retention.rs",
-        "ManifestCoordinator",
-        "retired_commit_graphs",
     ),
     (
         "omnigraph-catalog/retention.rs",
