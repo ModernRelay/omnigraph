@@ -28,23 +28,16 @@ pub(crate) enum Unauthenticated {
 /// The token of the request's one bearer credential.
 ///
 /// The scheme is case-insensitive (RFC 9110 §11.1) and one or more spaces
-/// separate it from the token (RFC 6750 §2.1). A missing header, another
-/// scheme or a `Bearer` without a token presents no credential. A bearer
-/// credential among several `Authorization` headers, or one whose value is
-/// not visible ASCII, is presented and refused.
+/// separate it from the token (RFC 6750 §2.1). A missing header, several
+/// `Authorization` headers, another scheme or a `Bearer` without a token
+/// presents no single credential, so the client is asked for one; nothing was
+/// checked that it should refresh. A bearer value that is not visible ASCII is
+/// presented and refused.
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
     let mut values = headers.get_all(AUTHORIZATION).iter();
     let (Some(value), None) = (values.next(), values.next()) else {
-        let presented = headers
-            .get_all(AUTHORIZATION)
-            .iter()
-            .any(|value| token_bytes(value.as_bytes()).is_some());
         return Err(ApiError::unauthorized(
-            if presented {
-                Unauthenticated::Refused
-            } else {
-                Unauthenticated::NoCredential
-            },
+            Unauthenticated::NoCredential,
             "one bearer credential is required",
         ));
     };
@@ -174,8 +167,9 @@ mod tests {
             (&[&b"Bearersecret"[..]][..], none),
             (&[&b"Bearer\tsecret"[..]][..], none),
             (&[&b"Basic a"[..], &b"Basic b"[..]][..], none),
-            (&[&b"Bearer a"[..], &b"Bearer a"[..]][..], refused),
-            (&[&b"Basic a"[..], &b"bearer b"[..]][..], refused),
+            // Several values are not a single credential, so none was refused.
+            (&[&b"Bearer a"[..], &b"Bearer a"[..]][..], none),
+            (&[&b"Basic a"[..], &b"bearer b"[..]][..], none),
             (&[&b"Bearer \xff"[..]][..], refused),
         ] {
             assert_eq!(read(values).unwrap_err().0, reason, "{values:?}");

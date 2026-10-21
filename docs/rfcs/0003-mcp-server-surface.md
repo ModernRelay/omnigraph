@@ -136,13 +136,12 @@ credential adds `error="invalid_token"` (see [Challenge](#challenge)). A plain
   bearer credential was refused carries
   `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="<url>"`.
 - The server has one resource identifier, so every route's challenge names the
-  same metadata. RFC 9728 §3.3 has a client that followed a challenge check
-  that the metadata's `resource` matches the URL it requested. An identifier
-  naming the service root (`https://graphs.example.com`) is a path prefix of
-  every route's URL, which the MCP TypeScript SDK accepts
-  (`checkResourceAllowed`) and a REST client can compare the same way; one
-  naming `/mcp` matches only that endpoint, so a REST client must not use its
-  metadata.
+  same metadata. RFC 9728 §3.3 has a client that followed a challenge require
+  the metadata's `resource` to equal the URL it requested, so a strict client
+  uses it only on the URL the identifier names. A client that accepts a path
+  prefix, as the MCP TypeScript SDK does (`checkResourceAllowed`), can use an
+  identifier naming the service root (`https://graphs.example.com`) on every
+  route; one naming `/mcp` matches only that endpoint.
 
 ### Host and Origin
 
@@ -336,9 +335,10 @@ its default cannot remove the refusal silently.
 The challenge belongs to the authentication decision, not to a router.
 Authentication reads the request's one `Authorization` header once: the scheme
 is case-insensitive (RFC 9110 §11.1) and one or more spaces precede the token
-(RFC 6750 §2.1). Another scheme, a missing header or a `Bearer` without a token
-presents no credential; a bearer token that does not authenticate, or a bearer
-credential among several `Authorization` headers, is a refused one. The 401
+(RFC 6750 §2.1). Another scheme, a missing header, several `Authorization`
+headers or a `Bearer` without a token presents no single credential, so the
+challenge asks for one rather than telling the client to refresh; a bearer token
+that does not authenticate is a refused one. The 401
 records which. One layer outside every router renders the server's challenge on
 every 401 response, including one a handler returns: `Bearer`, plus
 `error="invalid_token"` when a presented bearer credential was refused (RFC 6750

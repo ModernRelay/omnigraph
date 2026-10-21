@@ -1108,7 +1108,8 @@ async fn issue_1020_every_401_carries_the_one_bearer_challenge() {
         (vec!["Bearer wrong"], true),
         (vec!["bearer wrong"], true),
         (vec![wrong_audience.as_str()], true),
-        (vec!["Bearer secret", "Bearer secret"], true),
+        // Several values are not a single credential: asked for one, not refused.
+        (vec!["Bearer secret", "Bearer secret"], false),
     ];
 
     let mut mismatched = Vec::new();

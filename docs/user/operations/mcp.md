@@ -25,8 +25,9 @@ With static or signed tokens, configure the client with the URL and an
 `Authorization: Bearer <token>` header; Claude Code and Cursor support this
 directly. With OIDC, the resource identifier in the trust file is the URL users
 enter in their MCP client, for example `https://graphs.example.com/mcp`, and the
-client signs in through OAuth. An identifier naming the service root also lets
-REST clients sign in; see [Sign-in and discovery](#sign-in-and-discovery).
+client signs in through OAuth. With an identifier naming the service root,
+clients that accept a path prefix can also sign in from other routes; see
+[Sign-in and discovery](#sign-in-and-discovery).
 
 The endpoint is stateless Streamable HTTP built on the official Rust MCP SDK:
 each request is a `POST` that carries its own bearer credential and gets a JSON
@@ -49,13 +50,14 @@ a client to refresh or sign in again. Without OIDC the challenge is `Bearer`,
 which advertises no sign-in flow.
 
 The server has one resource identifier, so every route's challenge names the
-same metadata. A client that follows a challenge checks that the metadata's
-`resource` matches the URL it requested (RFC 9728 §3.3); the MCP TypeScript SDK
-accepts an identifier whose path is a prefix of that URL. An identifier naming
-the service root, such as `https://graphs.example.com`, is a prefix of every
-route's URL. One naming `https://graphs.example.com/mcp` matches only this
-endpoint, so a REST client must not use its metadata. Name the service root when
-REST clients should discover sign-in from a challenge.
+same metadata. RFC 9728 §3.3 has a client that followed a challenge require the
+metadata's `resource` to equal the URL it requested, so a strict client uses the
+metadata only on the URL the identifier names. Some clients accept an identifier
+whose path is a prefix of that URL, as the MCP TypeScript SDK does
+(`checkResourceAllowed`). For them, an identifier naming the service root, such
+as `https://graphs.example.com`, covers every route, and one naming
+`https://graphs.example.com/mcp` covers only this endpoint. Name the service root
+when clients that accept a prefix should discover sign-in from any route.
 
 The server answers the metadata both at `/.well-known/oauth-protected-resource`
 and at the advertised path: the well-known prefix followed by the resource
