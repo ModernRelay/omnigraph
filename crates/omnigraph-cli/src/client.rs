@@ -18,8 +18,9 @@ use omnigraph_api_types::{
     GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryRequest, ReadOutput,
     SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
     branch_read_output, change_baseline_output, change_feed_output, change_scope,
-    commit_changes_output, commit_output, diff_output, load_executed_output, merge_base_output,
-    read_output, schema_apply_output, show_read_output, snapshot_payload,
+    commit_changes_output, commit_output, diff_output, graph_batch_load_receipt_output,
+    load_executed_output, merge_base_output, read_output, schema_apply_output, show_read_output,
+    snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
@@ -44,7 +45,6 @@ use crate::helpers::{
     remote_response_json_bounded, remote_url, resolve_actor_with_config, select_named_query,
 };
 use crate::operator::InvocationConfig;
-use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 use crate::targets::{ResolvedTarget, TargetBinding};
 
 const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
@@ -1078,9 +1078,10 @@ impl GraphClient {
     }
 
     /// `load` — bulk-load `data` (a file path) onto `branch`, forking from
-    /// `from` if missing. Returns the CLI `LoadOutput`; each arm keeps its
-    /// own mapping (remote uses the logical graph-batch result, embedded reads
-    /// the engine `LoadResult` directly).
+    /// `from` if missing. Both arms return the load route's body: the remote
+    /// arm as the server sent it, the embedded arm built from the engine
+    /// receipt by the constructor the route uses, attributed to this
+    /// process's actor.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn load(
         &self,
@@ -1090,7 +1091,7 @@ impl GraphClient {
         mode: CliLoadMode,
         settings: &[(SettingId, SettingValue)],
         stderr: &mut dyn Write,
-    ) -> Result<LoadOutput> {
+    ) -> Result<GraphBatchLoadOutput> {
         match self {
             GraphClient::Remote {
                 http,
@@ -1125,14 +1126,7 @@ impl GraphClient {
                 // One attempt only. A lost response may follow a committed
                 // load or a created branch; neither can be replayed blindly.
                 let response = http.send(request).await?;
-                let output: GraphBatchLoadOutput =
-                    remote_response_json_bounded(response, token.as_deref(), *response_limit)
-                        .await?;
-                Ok(load_output_from_graph_batch(
-                    base_url,
-                    mode.as_str(),
-                    &output,
-                ))
+                remote_response_json_bounded(response, token.as_deref(), *response_limit).await
             }
             GraphClient::Embedded {
                 uri,
@@ -1150,12 +1144,11 @@ impl GraphClient {
                         actor.as_deref(),
                     )
                     .await?;
-                Ok(load_output_from_receipt(
-                    uri,
-                    branch,
-                    mode.as_str(),
+                Ok(graph_batch_load_receipt_output(
                     &receipt,
                     &session.catalog(),
+                    mode.into(),
+                    actor.clone(),
                 ))
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("load")),

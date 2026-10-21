@@ -411,7 +411,9 @@ fails with "has no text rendering". Do not use it, or set it as
 
 Mutations do not take `--format`; use `--json`. Successful `mutate --json` and
 `load --json` include the exact published `commit` (`null` for a no-op
-mutation). `query --json` includes `graph_commit_id` when the read snapshot has
+mutation). `load --json` prints the HTTP load route's body on direct and served
+targets alike: `actor_id` is the write's actor and `base_branch` is `null`
+without `--from`; it carries no `uri`. `query --json` includes `graph_commit_id` when the read snapshot has
 an effective graph head (a fresh pre-commit graph can omit it). When returned,
 use that position with `mutate --if-commit`; see [`changes.md`](changes.md).
 

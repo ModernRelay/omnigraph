@@ -3,8 +3,7 @@
 use color_eyre::eyre::{Result, bail};
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
-    CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput,
-    SchemaApplyOutput, SnapshotDatasetOutput,
+    CommitOutput, ErrorOutput, GraphBatchLoadOutput, SchemaApplyOutput, SnapshotDatasetOutput,
 };
 use omnigraph_cluster::{DiagnosticSeverity, PlanOutput, StateSyncOutput, ValidateOutput};
 use omnigraph_compiler::{

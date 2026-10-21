@@ -792,6 +792,20 @@ fn parity_load() {
         "--json",
     ]);
     assert_write_parity("load", &l, &r);
+    // Both arms print the load route's body: the write's actor, an explicit
+    // null base branch without `--from`, and no field the route lacks.
+    for (arm, output) in [("local", &l), ("remote", &r)] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["actor_id"], PARITY_ACTOR, "{arm}");
+        assert_eq!(
+            payload.get("base_branch"),
+            Some(&serde_json::Value::Null),
+            "{arm}"
+        );
+        let body: omnigraph_api_types::GraphBatchLoadOutput =
+            serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&body).unwrap(), payload, "{arm}");
+    }
 
     // Canonical load is strict graph-batch syntax, but Overwrite uses Lance's
     // replacement transaction rather than RFC-023's keyed Append/Merge adapter.

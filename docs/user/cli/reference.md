@@ -101,10 +101,10 @@ head. The id and rows share one pinned snapshot; use that id for a later
 conditional mutation.
 
 Successful `mutate --json` and `load --json` responses include `commit`, the exact commit published by
-that attempt. It contains `graph_commit_id`, optional `graph_branch`,
-`graph_manifest_version`, optional parent and merged-parent ids, optional
-`actor_id`, and `created_at` in Unix microseconds. A successful mutation
-that changes no entities returns `"commit": null`.
+that attempt: `graph_commit_id`, optional `graph_branch`, `graph_manifest_version`, optional parent and
+merged-parent ids, optional `actor_id`, and `created_at` in Unix microseconds. A successful mutation
+that changes no entities returns `"commit": null`. On every target `load --json` prints the body of
+`POST /graphs/{id}/load/ndjson`, with the write's `actor_id` and a `base_branch` that is `null` without `--from`.
 
 `--json` and read `--format json` preserve structured errors on stdout. Data-write failures
 report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands).

@@ -1755,6 +1755,15 @@ fn load_json_outputs_summary_for_main_branch() {
     );
     assert!(payload["commit"]["graph_commit_id"].is_string());
     assert!(payload["commit"]["graph_manifest_version"].is_number());
+    // The load route's body, field for field: no address, the write's actor
+    // (none is configured here) and a null base branch without `--from`.
+    assert!(payload.get("uri").is_none(), "{payload}");
+    assert_eq!(payload.get("base_branch"), Some(&Value::Null));
+    assert_eq!(payload.get("actor_id"), Some(&Value::Null));
+    assert_eq!(payload["actor_id"], payload["commit"]["actor_id"]);
+    let body: omnigraph_api_types::GraphBatchLoadOutput =
+        serde_json::from_value(payload.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&body).unwrap(), payload);
 
     let commits = parse_stdout_json(&output_success(
         cli()
