@@ -2,12 +2,12 @@
 rfc: "2026-10-19-storage-outcomes-and-restartable-ownership"
 title: "Storage outcomes per operation and restartable ownership"
 track: maintainer
-status: draft
+status: accepted
 implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-19
-updated: 2026-10-20
+updated: 2026-10-21
 discussion: https://github.com/ModernRelay/omnigraph/issues/1067
 supersedes: []
 superseded_by: []
@@ -420,7 +420,7 @@ patterns are added:
 - `__cluster/lease/<lock_id>/beat-<seq>.json`: the owner's heartbeats,
   created put-if-absent;
 - `__cluster/lease/<lock_id>/superseded.json`: the takeover claim, created
-  put-if-absent by a successor that found the owner silent. It fences the
+  put-if-absent by a successor that found the owner silent. It signals the
   owner; it elects nobody.
 
 Version 1, version 2 released markers and the bootstrap handoff are
@@ -433,9 +433,10 @@ a key only its owner creates, under a lock id no other process uses, so a
 copy that lands late only keeps a successor waiting. It needs neither the
 scope's accounting nor the single-attempt client of §3. A failed beat
 therefore leaves no key unsettled, and beats continue after the scope
-closes for a release. A retried create that finds its object present is
-resolved as §2 resolves a conditional request, by what the object proves:
-only this owner, or for a claim only this successor, could have written it.
+closes for a release. A retried beat create that finds its object present
+is resolved as §2 resolves a conditional request, by what the object proves:
+only this owner could have written it. A claim proves nothing about who
+wrote it, and needs not to: any successor's claim only fences the owner.
 
 **Owner.** After acquiring the lock, the owner writes beat 0 before it
 admits work, then a new beat every `lease_seconds / 3`. Before each beat it
@@ -479,10 +480,16 @@ beat. After
 then replaces `lock.json` with its own version-3 record by if-match on the
 ETag it first read.
 
-- The claim elects nobody. It only fences an owner that is somehow still
-  running, at that owner's next beat. A claim already there, from this
-  successor's earlier request or from another successor, changes nothing,
-  and the silence is always this successor's own observation.
+- The claim elects nobody, and it is not the fence. The owner's own timer
+  fenced it five sixths of a lease before any successor may claim. The claim
+  is a second signal the owner reads before each beat, and nothing may rely
+  on it: a takeover removes the old lease directory, claim included, as soon
+  as its if-match applies, which can be before the owner's next beat. A
+  claim already there, from this successor's earlier request or from another
+  successor, changes nothing, and the silence is always this successor's own
+  observation. No check may compare the claim's body with this successor's
+  lock id: that elects again, and a stopped successor's claim would block
+  every later start.
 - The if-match alone decides the next owner. Of two successors, or of a
   successor and the old owner's release (if-match on the ETag it read),
   exactly one applies. A changed ETag means the lock changed, by another
@@ -739,3 +746,10 @@ phase 3.
   start obeyed, so no server could take the lock. Each successor now waits
   out its own silence, and the if-match on `lock.json` alone decides the next
   owner.
+- 2026-10-21: Accepted on the maintainer's instruction after review approved
+  this text, #1096 and #1097. The [owned server
+  operations](2026-09-30-owned-server-operations.md) and [engine
+  settlement](2026-10-01-engine-settlement-and-resource-bounds.md) decisions
+  carry disposition notes for the parts this replaces. §7 now says a claim
+  proves nothing about its writer, and that the owner's timer, not the claim,
+  is the fence.
