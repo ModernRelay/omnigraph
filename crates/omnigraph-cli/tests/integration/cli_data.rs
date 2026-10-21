@@ -5527,7 +5527,8 @@ fn catalogue_scope_reads_the_binary_registries_without_a_store() {
         );
         let stderr = String::from_utf8_lossy(&listed.stderr);
         assert!(
-            stderr.contains("`branch list` is not available under `og_catalog`"),
+            stderr.contains("target_incompatible")
+                && stderr.contains("branch list is not available for this target kind and scope"),
             "{stderr}"
         );
     }
