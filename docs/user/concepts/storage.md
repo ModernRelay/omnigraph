@@ -13,6 +13,15 @@ datasets directly.
 | `s3://bucket/prefix/graph.omni` | Amazon S3 or an S3-compatible service |
 | `az://container/prefix/graph.omni` | Azure Blob Storage qualification preview |
 
+Other schemes, including `gs://`, are refused; there is no native Google Cloud
+Storage support. Writers rely on conditional writes: the store must refuse to
+create an object that already exists (`If-None-Match: *`) and refuse to replace
+one whose ETag has changed (`If-Match`). Amazon S3 supports both, and CI tests
+the `s3://` path against RustFS. Other S3-compatible services, such as
+Cloudflare R2 or Google Cloud Storage through its S3-compatible API, are not
+qualified. Confirm that a service enforces both conditions before you write to
+it: one that ignores them can let two writers overwrite each other's commits.
+
 An `http://` or `https://` URL addresses an OmniGraph server; it is not a graph
 storage URI. CLI commands use `--target NAME|ADDRESS` for both server and direct-storage
 destinations; the selected kind determines command availability.

@@ -57,6 +57,28 @@ graphs:
 Inline API keys are rejected. `${ENV_VAR}` references are resolved when the
 server starts, not when the cluster configuration is planned or applied.
 
+## Network egress
+
+OmniGraph calls the embedding provider only to turn text into a vector:
+
+- a `nearest` query whose argument is text sends that text;
+- `omnigraph embed` sends each source value it embeds.
+
+Loads, mutations and `nearest` queries given a vector never call a provider;
+`@embed` does not populate vectors during a load
+([schema annotation](#schema-annotation)).
+
+A cluster-served graph uses the provider its `embedding_provider` names. A
+served graph without one, and every direct or embedded use, resolves the
+provider from the process environment as described above; with nothing set,
+that is OpenRouter. When the provider's API key is missing, the call fails
+before any request is sent.
+
+No setting turns providers off. `mock` makes no network calls, but it answers
+text queries with deterministic vectors that are not comparable with real
+ones. A text `nearest` on a property whose `@embed` records a `model` is
+refused under `mock` unless `OMNIGRAPH_EMBED_MODEL` names that model.
+
 ## Schema annotation
 
 Associate a vector with its source text:

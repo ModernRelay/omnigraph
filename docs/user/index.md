@@ -46,6 +46,7 @@ deployment.
 - [Deployment](deployment.md)
 - [Storage failures](operations/storage-failures.md)
 - [Authorization and actors](operations/policy.md)
+- [Data protection](operations/data-protection.md)
 - [Maintenance](operations/maintenance.md)
 - [Storage-format upgrades](operations/upgrade.md)
 
