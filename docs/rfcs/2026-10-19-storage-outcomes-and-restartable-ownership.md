@@ -419,8 +419,9 @@ patterns are added:
 
 - `__cluster/lease/<lock_id>/beat-<seq>.json`: the owner's heartbeats,
   created put-if-absent;
-- `__cluster/lease/<lock_id>/superseded.json`: one successor's takeover
-  claim, created put-if-absent and naming that successor's lock id.
+- `__cluster/lease/<lock_id>/superseded.json`: the takeover claim, created
+  put-if-absent by a successor that found the owner silent. It fences the
+  owner; it elects nobody.
 
 Version 1, version 2 released markers and the bootstrap handoff are
 unchanged.
@@ -474,21 +475,24 @@ deadline, counted from the lock write, fences it before this silence ends.
 An empty listing after a beat was seen means the beats were removed, by a
 clean release or a takeover, and the successor refuses as it does for a new
 beat. After
-`3/2 × lease_seconds` of silence the successor creates the claim:
+`3/2 × lease_seconds` of silence the successor makes sure the claim exists,
+then replaces `lock.json` with its own version-3 record by if-match on the
+ETag it first read.
 
-- If it wins, or finds a claim that names its own lock id (its own earlier
-  request, which landed unacknowledged), it replaces `lock.json` with its
-  own version-3 record by if-match on the ETag it first read. The old
-  owner's release is if-match on the ETag it read, so of a release and a
-  takeover in flight together exactly one applies. A changed ETag means the
-  lock changed, usually by a clean release: the successor refuses, and the
-  next start acquires the released lock normally.
-- If another successor's claim is there, that successor won, and this one
-  refuses.
+- The claim elects nobody. It only fences an owner that is somehow still
+  running, at that owner's next beat. A claim already there, from this
+  successor's earlier request or from another successor, changes nothing,
+  and the silence is always this successor's own observation.
+- The if-match alone decides the next owner. Of two successors, or of a
+  successor and the old owner's release (if-match on the ETag it read),
+  exactly one applies. A changed ETag means the lock changed, by another
+  takeover or a clean release: the successor refuses, and the next start
+  acquires the released lock normally or watches the new owner's beats.
+- A successor that stops between its claim and its if-match leaves
+  `lock.json` at the dead owner's version, so the next start takes it over
+  the same way, after its own silence.
 
-A successor that dies between its claim and its replacement leaves a claim
-no one acts on; that lock needs the exact-ID unlock. The successor never
-takes over a version-1 lock.
+The successor never takes over a version-1 lock.
 
 **Timing.** Every beat the owner counts became visible no earlier than its
 first send `s`, and the lock record no earlier than its own send. A successor's silence starts no earlier than the moment the
@@ -729,3 +733,9 @@ phase 3.
   later request, multipart parts and cleanup included, and cancels every
   admitted one, so a fenced owner sends what a crashed owner sends. Adding
   the grace to the successor's silence is recorded under Alternatives.
+- 2026-10-21: After review, the claim is a fence signal, not an election: a
+  claim already present no longer refuses a successor. A successor that
+  claimed and then stopped before its if-match left a claim every later
+  start obeyed, so no server could take the lock. Each successor now waits
+  out its own silence, and the if-match on `lock.json` alone decides the next
+  owner.
