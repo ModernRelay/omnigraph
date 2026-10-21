@@ -6,9 +6,13 @@
 //! of a lease. A successor that finds the lock held watches those beats: a
 //! new beat means the owner is alive, and the successor refuses. When no
 //! beat appears for a lease and a half of the successor's own monotonic
-//! time, the successor claims the lock once by creating
-//! `__cluster/lease/<lock_id>/superseded.json` put-if-absent, then replaces
-//! `lock.json` with its own record by if-match on the version it first read.
+//! time, the successor creates `__cluster/lease/<lock_id>/superseded.json`
+//! if absent, which fences an owner that is somehow still running, then
+//! replaces `lock.json` with its own record by if-match on the version it
+//! first read. The if-match, never the claim, decides the next owner: of two
+//! successors, or of a successor and the old owner's release, exactly one
+//! applies. A claim left by a successor that stopped before its if-match
+//! decides nothing, so the next start takes the lock over the same way.
 //!
 //! The owner fences itself first. It measures from the time it first sent
 //! its last acknowledged beat, and when two thirds of a lease pass without a
@@ -376,14 +380,19 @@ impl Beat {
 /// What a successor found when it watched a held version-3 lock.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Watch {
-    /// A beat appeared, or another successor claimed the lock first.
+    /// A beat appeared, or the beats it saw were removed by a release or a
+    /// takeover: the lock is not this successor's to take now.
     Alive,
-    /// This successor holds the claim: it may replace `lock.json`.
-    Claimed,
+    /// No beat for a lease and a half, and the claim is in place: the owner
+    /// has fenced. The successor may replace `lock.json` by if-match on the
+    /// version it read, which alone decides the next owner.
+    Silent,
 }
 
-/// Watch `lock_id`'s beats for a lease and a half of silence, then claim the
-/// lock. `poll` is how often the beat listing is read.
+/// Watch `lock_id`'s beats for a lease and a half of silence, then make sure
+/// the claim exists. A claim already there, from this successor or another,
+/// changes nothing: it only fences an owner that is somehow still running,
+/// and the silence is this successor's own observation.
 pub async fn watch_and_claim(
     adapter: &dyn StorageAdapter,
     root: &str,
@@ -397,9 +406,6 @@ pub async fn watch_and_claim(
     let mut newest = newest_beat(adapter, &dir).await?;
     let mut since = Instant::now();
     loop {
-        if adapter.read_text_if_exists(&claim).await?.is_some() {
-            return Ok(Watch::Alive);
-        }
         if since.elapsed() >= successor_silence(seconds) {
             break;
         }
@@ -420,18 +426,9 @@ pub async fn watch_and_claim(
         "newest_beat": newest,
     })
     .to_string();
-    if adapter.write_text_if_absent(&claim, &payload).await? {
-        return Ok(Watch::Claimed);
-    }
-    // A claim is already present. A retry finds this successor's own claim
-    // when an earlier attempt landed unacknowledged; any other is another
-    // successor's.
-    let own = adapter
-        .read_text_if_exists(&claim)
-        .await?
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .is_some_and(|claim| claim["successor_lock_id"] == successor_lock_id);
-    Ok(if own { Watch::Claimed } else { Watch::Alive })
+    // Created or already present, the claim is in place either way.
+    adapter.write_text_if_absent(&claim, &payload).await?;
+    Ok(Watch::Silent)
 }
 
 #[cfg(test)]
@@ -449,9 +446,8 @@ mod tests {
     /// An in-memory store that can stop acknowledging beats, the way a
     /// partitioned owner's requests stop coming back; fail some beats
     /// without applying them; lose the answer to beats it applied; leave
-    /// beats unanswered for good; and answer a claim it applied as already
-    /// present, the way a retried create whose first attempt landed is
-    /// answered.
+    /// beats unanswered for good; and let a successor claim while a beat is
+    /// in flight.
     #[derive(Debug)]
     struct Beats {
         inner: Arc<dyn StorageAdapter>,
@@ -459,7 +455,6 @@ mod tests {
         failures: AtomicUsize,
         lost_answers: AtomicUsize,
         hang: AtomicBool,
-        claim_retried: AtomicBool,
         claim_with_next_beat: AtomicBool,
     }
 
@@ -471,7 +466,6 @@ mod tests {
                 failures: AtomicUsize::new(0),
                 lost_answers: AtomicUsize::new(0),
                 hang: AtomicBool::new(false),
-                claim_retried: AtomicBool::new(false),
                 claim_with_next_beat: AtomicBool::new(false),
             })
         }
@@ -550,9 +544,6 @@ mod tests {
             }
             if created && beat && take_one(&self.lost_answers) {
                 return Err(unanswered());
-            }
-            if uri.ends_with("/superseded.json") && self.claim_retried.load(Ordering::SeqCst) {
-                return Ok(false);
             }
             Ok(created)
         }
@@ -635,11 +626,13 @@ mod tests {
         assert_eq!(fenced_within(&keeper, Duration::from_secs(60)).await, None);
     }
 
-    /// A dead owner's beats stop. A successor claims the lock after a lease
-    /// and a half of silence, never sooner, and only one of two successors
-    /// wins the claim.
+    /// A dead owner's beats stop. Each successor finds it silent after a
+    /// lease and a half of its own observation, never sooner, and the claim
+    /// is in place. The claim elects nobody: two successors both find the
+    /// owner silent, and their if-match on `lock.json` picks one
+    /// (`state_lock`).
     #[tokio::test(start_paused = true)]
-    async fn a_successor_claims_a_silent_owner_after_a_lease_and_a_half_issue_1067() {
+    async fn a_successor_finds_a_silent_owner_after_a_lease_and_a_half_issue_1067() {
         let store = Beats::new();
         let keeper = start(&store, "owner").await;
         drop(keeper);
@@ -649,9 +642,14 @@ mod tests {
             watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "second"),
         );
         assert!(started.elapsed() >= successor_silence(SECONDS));
-        let mut outcomes = [first.unwrap(), second.unwrap()];
-        outcomes.sort_by_key(|watch| *watch == Watch::Claimed);
-        assert_eq!(outcomes, [Watch::Alive, Watch::Claimed]);
+        assert_eq!([first.unwrap(), second.unwrap()], [Watch::Silent; 2]);
+        assert!(
+            store
+                .read_text_if_exists(&claim_uri(&lease_dir(ROOT, "owner")))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// An owner whose beats go unacknowledged fences itself after two missed
@@ -709,26 +707,35 @@ mod tests {
         );
     }
 
-    /// A successor whose claim landed while its answer was lost finds the
-    /// claim on its retry and recognizes it as its own; another successor's
-    /// claim is not.
+    /// A successor that claimed and then stopped before its if-match leaves
+    /// the claim behind and `lock.json` unchanged. The claim must not stop
+    /// the next start: that successor, or another, waits out its own lease
+    /// and a half of silence and finds the owner silent.
     #[tokio::test(start_paused = true)]
-    async fn a_successor_recognizes_its_own_claim_issue_1067() {
+    async fn a_claim_left_by_a_stopped_successor_does_not_block_takeover_issue_1067() {
         let store = Beats::new();
         drop(start(&store, "owner").await);
-        store.claim_retried.store(true, Ordering::SeqCst);
         assert_eq!(
-            watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "first")
+            watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "stopped")
                 .await
                 .unwrap(),
-            Watch::Claimed
+            Watch::Silent
         );
-        assert_eq!(
-            watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, "second")
-                .await
-                .unwrap(),
-            Watch::Alive
-        );
+        // That successor stops here, before its if-match.
+        for successor in ["stopped", "later"] {
+            let started = Instant::now();
+            assert_eq!(
+                watch_and_claim(store.as_ref(), ROOT, "owner", SECONDS, successor)
+                    .await
+                    .unwrap(),
+                Watch::Silent,
+                "{successor}"
+            );
+            assert!(
+                started.elapsed() >= successor_silence(SECONDS),
+                "{successor} waits out its own silence"
+            );
+        }
     }
 
     /// The lock is visible before the first beat lands, and a successor may
@@ -763,7 +770,7 @@ mod tests {
         );
         assert_eq!(owner.0, Err(LeaseFenced::Lapsed));
         assert!(owner.1 <= owner_deadline(SECONDS), "{:?}", owner.1);
-        assert_eq!(successor.0, Watch::Claimed);
+        assert_eq!(successor.0, Watch::Silent);
         assert!(successor.1 >= successor_silence(SECONDS));
         assert!(scope.is_fenced());
         let dir = tempfile::tempdir().unwrap();

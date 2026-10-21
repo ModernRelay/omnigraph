@@ -382,11 +382,13 @@ async fn acquire_state_lock_leased(
 }
 
 /// Take over an S3 leased lock whose owner has gone silent (`lease`): watch
-/// its heartbeats, claim it once, then replace `lock.json` with `lock` by
-/// if-match on the version first read. The old owner's clean release is
-/// if-match on the version it read too, so of a release and a replacement
-/// in flight together exactly one applies, and the loser refuses. Returns
-/// when the replacement was sent, if it applied.
+/// its heartbeats, make sure the claim exists, then replace `lock.json` with
+/// `lock` by if-match on the version first read. That if-match alone decides
+/// the next owner: of two successors, or of a successor and the old owner's
+/// clean release (if-match on the version it read), exactly one applies, and
+/// the loser refuses. A replacement that does not apply leaves `lock.json` at
+/// that version, so the next start takes it over the same way. Returns when
+/// the replacement was sent, if it applied.
 #[allow(clippy::too_many_arguments)]
 async fn take_over(
     adapter: &Arc<dyn StorageAdapter>,
@@ -730,6 +732,59 @@ mod tests {
                 .is_empty(),
             "the superseded owner's beats are removed"
         );
+    }
+
+    /// A successor that claimed and then stopped before its if-match leaves
+    /// the claim and the dead owner's record. The next start still takes
+    /// the lock over after its own silence, and of two starts racing, the
+    /// if-match picks exactly one.
+    #[tokio::test]
+    async fn a_takeover_survives_a_successor_that_stopped_after_its_claim_issue_1067() {
+        const LEASE: u32 = 2;
+        let store: Arc<dyn StorageAdapter> =
+            Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
+        let lock_uri = "/lease-tests/__cluster/lock.json";
+        let root = cluster_root_from_lock_uri(lock_uri).unwrap();
+        let acquire = || {
+            acquire_state_lock_leased(
+                store.clone(),
+                store.clone(),
+                StorageKind::S3,
+                lock_uri,
+                SERVE_OPERATION,
+                LEASE,
+            )
+        };
+        let StateLockAcquire::Acquired(owner) = acquire().await.unwrap() else {
+            panic!("a fresh root is free");
+        };
+        let previous = owner.lock_id().to_string();
+        drop(owner);
+        // A successor found the owner silent and claimed, then stopped
+        // before replacing `lock.json`.
+        assert_eq!(
+            crate::lease::watch_and_claim(store.as_ref(), &root, &previous, LEASE, "stopped")
+                .await
+                .unwrap(),
+            crate::lease::Watch::Silent
+        );
+        let started = tokio::time::Instant::now();
+        let (first, second) = tokio::join!(acquire(), acquire());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(u64::from(LEASE)) * 3 / 2,
+            "each start waits out its own silence"
+        );
+        let acquired: Vec<StateLockGuard> = [first.unwrap(), second.unwrap()]
+            .into_iter()
+            .filter_map(|outcome| match outcome {
+                StateLockAcquire::Acquired(guard) => Some(guard),
+                StateLockAcquire::Held => None,
+            })
+            .collect();
+        assert_eq!(acquired.len(), 1, "the if-match picks exactly one");
+        let stored = StateLockFile::parse(&store.read_text(lock_uri).await.unwrap()).unwrap();
+        assert_eq!(stored.lock_id(), acquired[0].lock_id());
+        assert_ne!(stored.lock_id(), previous);
     }
 
     /// The old owner's clean release and a successor's replacement are both

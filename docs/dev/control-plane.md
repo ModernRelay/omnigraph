@@ -319,10 +319,13 @@ its own monotonic clock. A new beat refuses it. An empty listing starts the
 silence and the first beat that appears restarts it, because the owner
 writes its lock before its first beat lands; an empty listing after a beat
 was seen refuses, like a new beat. A lease and a half of silence
-lets it create the claim, once (a claim already present is its own only when
-it names this successor's lock id), then replace `lock.json` by if-match on
-the version it first read. The owner's clean release is if-match on the
-version it read, so of the two exactly one applies. A clean release stops
+lets it make sure the claim exists (a claim already there, from any
+successor, only fences an owner that is somehow still running), then
+replace `lock.json` by if-match on the version it first read. That if-match
+alone decides the next owner: of two successors, or of a successor and the
+owner's clean release (if-match on the version it read), exactly one
+applies. A successor that stops between its claim and its if-match leaves
+`lock.json` unchanged, so the next start takes it over the same way. A clean release stops
 beating, deletes the lease directory, then releases as above. The lease
 coordinates liveness only; requests a dead owner sent before it fenced are
 fresh keys, conditional publications or audited mutable keys, which the

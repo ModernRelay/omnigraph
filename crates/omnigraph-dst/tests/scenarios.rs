@@ -6574,7 +6574,7 @@ fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
                     .await
                     .unwrap()
                 {
-                    Watch::Claimed => {
+                    Watch::Silent => {
                         let claimed = Instant::now();
                         assert!(
                             claimed.duration_since(watching) >= lease * 3 / 2,
