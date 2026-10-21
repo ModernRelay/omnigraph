@@ -104,8 +104,9 @@ lost response is `unknown` with `reconcile`. A read command changes nothing, so
 its failure always has `effects: none`. JSON mode writes the failure to stdout,
 or to stderr when part of the result, such as a streamed page, already reached
 stdout. Stdout then keeps the bytes already written, which can end inside an
-unfinished object, as for `diff --json` or `changes poll --json`, and the
-failure document is on stderr. Human mode prints the `disposition` line on
+unfinished object, as for `diff`, `branch diff`, `commit changes` and
+`changes poll` with `--json` when they follow every page, and the failure
+document is on stderr. Human mode prints the `disposition` line on
 stderr. A target refusal on these commands exits 1 with `action: fix`. HTTP
 failures also retain `http_status` and, when present, the original
 `retry_after` string.
@@ -218,8 +219,11 @@ between graph roots.
 - Apply refuses existing unmanaged roots and missing managed graphs that remain
   declared. Restore authoritative data to keep a missing graph, or remove its
   declaration to delete it; see [deployment boundaries](../clusters/index.md#deployment-boundaries).
-- A retained lock requires prior-owner and accepted-I/O quiescence, exclusion
-  of other admissions/unlocks, and its exact ID; follow
+- A server restarted after a crash takes over its predecessor's leased S3 lock
+  once the predecessor's heartbeats have been silent for a lease and a half
+  (45 seconds by default). A lock with no lease (on a local or Azure root, or
+  an older binary's) requires prior-owner and accepted-I/O quiescence, exclusion of other
+  admissions/unlocks, and its exact ID; follow
   [ownership transfer](../deployment.md#writer-topology).
 - Directory boot reads `cluster.yaml` to resolve storage, but served graph,
   query, and policy resources come from applied state. Submit configuration

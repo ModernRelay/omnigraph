@@ -535,7 +535,7 @@ mod tests {
         for (missing, hint, expected) in [
             (
                 MissingCredential::AnonymousTarget("prod".into()),
-                "target `prod` uses anonymous authentication: configure its credential owner, then run `omnigraph login --target prod`",
+                "target `prod` uses anonymous authentication: configure and select a token or exec auth profile; for a token profile with source: store, run `omnigraph credentials set --target prod --auth <profile> --stdin`",
                 serde_json::json!({"target":"prod","auth":"anonymous"}),
             ),
             (
@@ -543,7 +543,7 @@ mod tests {
                     server_root: "https://graph.example".into(),
                     config: None,
                 },
-                "no credential is bound to https://graph.example: declare a target for it under `targets:` in ~/.omnigraph/config.yaml, then run `omnigraph login --target <target>` or set OMNIGRAPH_TOKEN_<NAME>",
+                "no credential is bound to https://graph.example: declare a server target and explicit auth profile under `targets:` in ~/.omnigraph/config.yaml; select it with --target and --auth",
                 serde_json::json!({"unbound":"https://graph.example"}),
             ),
         ] {

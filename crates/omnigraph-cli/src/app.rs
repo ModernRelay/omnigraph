@@ -134,7 +134,8 @@ async fn execute(
 }
 
 /// A command's stdout, noting whether any of its result reached it. A failure
-/// after part of a result goes to stderr, so stdout keeps a single result.
+/// after part of a result goes to stderr, so stdout holds only result bytes,
+/// which can end inside an unfinished object.
 struct StartedOutput<'a> {
     inner: &'a mut dyn Write,
     started: bool,
@@ -243,7 +244,8 @@ fn finish(
         let delivered = (|| -> Result<()> {
             match machine {
                 // Part of the result already reached stdout, so the failure
-                // envelope goes to stderr and stdout keeps one result.
+                // envelope goes to stderr and stdout keeps only the bytes
+                // already written.
                 Some(format) if result_started => {
                     write_machine(&failure, format, stderr)?;
                     stderr.flush()?;
@@ -419,7 +421,92 @@ async fn run(
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let cwd = std::env::current_dir()?;
-    let target = scope::resolve(&cli, &operator, &cwd, explicit_config, stderr)?;
+    planes::guard_addressing(&cli)?;
+    let operator = operator.with_path(cli.operator_config.as_deref(), &cwd);
+    if let Command::Login {
+        register,
+        api,
+        organization,
+        ..
+    } = &cli.command
+    {
+        if register.is_some() || (cli.target.is_none() && cli.profile.is_none()) {
+            if matches!(
+                &cli.command,
+                Command::Login {
+                    replace_principal: Some(_),
+                    ..
+                }
+            ) {
+                color_eyre::eyre::bail!(
+                    "principal replacement requires an explicit existing --profile or --target"
+                );
+            }
+            let name = if let Some(name) = register {
+                name.clone()
+            } else {
+                if !stdin_is_terminal {
+                    color_eyre::eyre::bail!("noninteractive onboarding requires --register NAME");
+                }
+                write!(stderr, "Profile name [omnigraph]: ")?;
+                stderr.flush()?;
+                let mut bytes = Vec::new();
+                let mut byte = [0u8; 1];
+                while bytes.len() < 257 {
+                    match stdin.read(&mut byte) {
+                        Ok(0) => break,
+                        Ok(_) if byte[0] == b'\n' => break,
+                        Ok(_) => bytes.push(byte[0]),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                let name = String::from_utf8(bytes)?.trim().to_owned();
+                if name.is_empty() {
+                    "omnigraph".to_owned()
+                } else {
+                    name
+                }
+            };
+            commands::targets::onboard(
+                &operator,
+                &name,
+                api.as_deref().unwrap_or("https://platform.omnigraph.dev"),
+                organization.as_deref(),
+                stdout,
+                stderr,
+            )
+            .await?;
+            return Ok(Completion::exit(0));
+        }
+        if api.is_some() || organization.is_some() {
+            color_eyre::eyre::bail!(
+                "--api and --organization are only available during new profile registration"
+            );
+        }
+    }
+    let mut target = scope::resolve(&cli, &operator, &cwd, explicit_config, stderr)?;
+    let authentication = crate::operator_routing::authentication(&cli, &operator, target.as_ref())?;
+    if let Some(target) = &mut target {
+        let label = target.label().to_owned();
+        match &mut target.binding {
+            targets::TargetBinding::Managed(binding) => {
+                if authentication.as_ref().is_some_and(|auth| {
+                    !matches!(auth.profile, crate::operator_schema::AuthProfile::Omnigraph)
+                }) {
+                    binding.control_auth = managed::ControlAuth::AutomationEnv;
+                }
+            }
+            targets::TargetBinding::Server { auth, .. } => {
+                *auth = if authentication.is_some() {
+                    targets::ServerAuth::Token { owner: label }
+                } else {
+                    targets::ServerAuth::Anonymous
+                };
+            }
+            _ => {}
+        }
+    }
     if let Some(target) = &target {
         let graph = if let Command::Alias(args) = &cli.command {
             let alias = &operator.get(stderr)?.aliases[&args.name];
@@ -437,7 +524,51 @@ async fn run(
             stderr,
         )?;
     }
-    let managed_data = if let Some(targets::ResolvedTarget {
+    let transports = crate::operator_routing::Transports::capture(&operator, target.as_ref())?;
+    crate::operator_routing::TRANSPORTS
+        .scope(
+            transports,
+            crate::operator_routing::AUTH.scope(
+                authentication,
+                run_bound(
+                    cli,
+                    operator,
+                    target,
+                    machine,
+                    stdin,
+                    stdin_is_terminal,
+                    stdout,
+                    stderr,
+                ),
+            ),
+        )
+        .await
+}
+
+async fn run_bound(
+    cli: Cli,
+    operator: operator::InvocationConfig,
+    target: Option<targets::ResolvedTarget>,
+    machine: &mut Option<MachineErrors>,
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Completion> {
+    crate::operator_routing::freeze_transports(&cli, target.as_ref())?;
+    if matches!(
+        target.as_ref().map(|t| &t.binding),
+        Some(targets::TargetBinding::Server { .. })
+    ) && !matches!(
+        cli.command,
+        Command::Credential { .. } | Command::Login { .. } | Command::Logout { .. }
+    ) {
+        let auth = crate::operator_routing::AUTH.with(Clone::clone);
+        if let Some(auth) = auth {
+            auth.token().await?;
+        }
+    }
+    if let Some(targets::ResolvedTarget {
         binding: targets::TargetBinding::Managed(binding),
         ..
     }) = &target
@@ -445,13 +576,7 @@ async fn run(
         if let Some(result) = managed::dispatch(&cli, binding, &operator, stderr).await {
             return Ok(Completion::exit(result.emit(stdout, stderr)?));
         }
-        match managed::data::client(&cli, binding).await {
-            Ok(client) => Some(client),
-            Err(output) => return Ok(Completion::exit(output.emit(stdout, stderr)?)),
-        }
-    } else {
-        None
-    };
+    }
     let required_target = || {
         target
             .as_ref()
@@ -462,20 +587,37 @@ async fn run(
         is_terminal: stdin_is_terminal,
     };
     match cli.command {
-        Command::Login { token, json } => commands::local::run_login(
-            &operator,
-            required_target(),
-            token,
-            json,
-            input.reader,
-            stdout,
-            stderr,
-        )?,
-        Command::Logout { json } => {
-            commands::local::run_logout(&operator, required_target(), json, stdout)?
+        Command::Login { .. } | Command::Logout { .. } => {
+            color_eyre::eyre::bail!("login/logout require a managed profile")
         }
         Command::Target { command } => {
-            commands::targets::run_target(&operator, command, input.reader, stdout, stderr)?
+            commands::targets::run_target(
+                &operator,
+                target.as_ref(),
+                (cli.profile.as_deref(), cli.auth.as_deref()),
+                command,
+                input.reader,
+                stdout,
+                stderr,
+            )
+            .await?
+        }
+        Command::Config { command } => {
+            commands::targets::run_config(&operator, target.as_ref(), command, stdout, stderr)?
+        }
+        Command::Credential { command } => {
+            commands::targets::run_credential(
+                required_target(),
+                command,
+                cli.auth
+                    .as_deref()
+                    .or(cli.profile.as_deref())
+                    .unwrap_or_else(|| required_target().label()),
+                input.is_terminal,
+                input.reader,
+                stdout,
+            )
+            .await?
         }
         Command::Access(args) => {
             commands::targets::run_access(
@@ -489,14 +631,6 @@ async fn run(
             )
             .await?
         }
-        Command::Credential { command } => commands::targets::run_credential(
-            &operator,
-            required_target(),
-            command,
-            std::io::stdout().is_terminal(),
-            stdout,
-            stderr,
-        )?,
         Command::Mcp(args) => {
             return commands::mcp::run(
                 args,
@@ -527,7 +661,6 @@ async fn run(
                     actor: cli.as_actor.as_deref(),
                     yes: cli.yes,
                 },
-                managed_data,
                 &mut input,
                 stdout,
                 stderr,
@@ -575,7 +708,6 @@ async fn run(
                     actor: cli.as_actor.as_deref(),
                     yes: cli.yes,
                 },
-                managed_data,
                 &mut input,
                 stdout,
                 stderr,
@@ -685,6 +817,9 @@ async fn run(
             )
             .await?;
         }
+        Command::Catalogue(args) => {
+            commands::query::run_catalogue(args, &operator, machine, stdout, stderr).await?;
+        }
         Command::Query(args) => {
             commands::query::run_query(
                 args,
@@ -695,7 +830,6 @@ async fn run(
                     actor: cli.as_actor.as_deref(),
                     yes: cli.yes,
                 },
-                managed_data,
                 machine,
                 stdout,
                 stderr,
@@ -712,7 +846,6 @@ async fn run(
                     actor: cli.as_actor.as_deref(),
                     yes: cli.yes,
                 },
-                managed_data,
                 &mut input,
                 stdout,
                 stderr,
@@ -836,7 +969,6 @@ async fn run(
                     target: required_target(),
                     graph: cli.graph.as_deref(),
                 },
-                managed_data,
                 stdout,
                 stderr,
             )

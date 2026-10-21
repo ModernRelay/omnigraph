@@ -185,10 +185,11 @@ If present, `storage` is an equality assertion: a mismatch refuses before
 effects. Remote operations require an absolute path or `file://`, `s3://` or
 `az://` URI and read only source files from the caller's filesystem.
 
-A direct target's provider settings fix its account, service endpoint and
-region independently of its credentials. Use the native provider credential
-chain. Azure remains a qualification preview and requires the admission wrapper
-for every writer; see [Deployment](../deployment.md#azure-blob-preview).
+Operator version 1 accepts only local-file direct targets. The storage assertion
+above describes the deployment root; it does not enable CLI cloud-direct access.
+Cloud storage credentials and provider settings belong to the server or embedded
+initializer. Azure remains a qualification preview and requires its admission
+wrapper for every writer; see [Deployment](../deployment.md#azure-blob-preview).
 
 ## Declared paths
 

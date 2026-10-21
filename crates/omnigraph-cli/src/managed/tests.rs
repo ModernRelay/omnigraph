@@ -1,6 +1,52 @@
 use super::*;
 use clap::Parser;
 
+#[test]
+fn registration_uses_only_attested_endpoint_and_refuses_incarnation_drift() {
+    let mut binding = Binding {
+        api: "https://api.example/prefix".into(),
+        organization_id: Some("org_test".into()),
+        cluster: None,
+        control_auth: ControlAuth::HumanDevice,
+    };
+    let mut row = json!({"cluster_id":"cluster_one","incarnation":"incarnation_one","endpoint":"https://unattested.example"});
+    let listing = |row: &Value| json!({"data":{"clusters":[row]}});
+    let target = target_from_listing(&binding, "work", "cluster_one", &listing(&row)).unwrap();
+    assert!(matches!(
+        target,
+        crate::operator_schema::Target::Managed { endpoint: None, .. }
+    ));
+    row["data_endpoint"] = json!("https://data.example/prefix");
+    let target = target_from_listing(&binding, "work", "cluster_one", &listing(&row)).unwrap();
+    assert!(
+        matches!(target, crate::operator_schema::Target::Managed { endpoint: Some(endpoint), .. } if endpoint == "https://data.example/prefix/")
+    );
+    binding.cluster = Some(ClusterBinding {
+        cluster_id: "cluster_one".into(),
+        cluster_incarnation: "incarnation_other".into(),
+        endpoint: Some("https://existing.example/".into()),
+        default_graph: None,
+    });
+    assert_eq!(
+        target_from_listing(&binding, "work", "cluster_one", &listing(&row))
+            .unwrap_err()
+            .body["type"],
+        "target_mismatch"
+    );
+    binding.cluster = None;
+    row["data_endpoint"] = json!("http://127.0.0.1:9000");
+    assert!(target_from_listing(&binding, "work", "cluster_one", &listing(&row)).is_err());
+    assert!(
+        target_from_listing(
+            &binding,
+            "work",
+            "cluster_one",
+            &json!({"data":{"clusters":[row,row]}})
+        )
+        .is_err()
+    );
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum OutputFault {
     PartialWrite,
@@ -208,6 +254,7 @@ async fn managed_deployment_delivery_failures_never_submit_or_poll_again() {
             } else {
                 vec![]
             });
+            crate::operator_routing::test_transport_scope(&[&server.origin], async {
             let api =
                 Api::new(server.origin.clone(), Some("automation-secret".to_owned())).unwrap();
             let context = Context {
@@ -306,6 +353,7 @@ async fn managed_deployment_delivery_failures_never_submit_or_poll_again() {
             }
             assert_eq!(server.requests().len(), usize::from(fail_after_key));
             server.assert_complete();
+        }).await;
         }
     }
 }
@@ -316,6 +364,10 @@ fn origins_are_canonical_and_credentials_cannot_change_destination() {
         ("https://CONTROL.example:443/", "https://control.example"),
         ("http://127.0.0.1:3000", "http://127.0.0.1:3000"),
         ("http://[::1]:3000/", "http://[::1]:3000"),
+        (
+            "https://control.example/Prefix/",
+            "https://control.example/Prefix",
+        ),
     ] {
         assert_eq!(canonical_origin(input).unwrap(), expected);
     }
@@ -324,7 +376,6 @@ fn origins_are_canonical_and_credentials_cannot_change_destination() {
         "http://127.0.0.2",
         "http://localhost.evil",
         "https://user@control.example",
-        "https://control.example/path",
         "https://control.example?x",
         "https://control.example#x",
         "file:///tmp/root",
@@ -333,6 +384,28 @@ fn origins_are_canonical_and_credentials_cannot_change_destination() {
     }
     for bad in ["", "../other", "run?x", "run#x", "run:cancel", "run/other"] {
         assert!(identifier(bad).is_err());
+    }
+}
+
+#[test]
+fn control_routes_preserve_prefix_and_refuse_escape_before_credentials() {
+    let api = Api::new(
+        "https://control.example/Prefix".into(),
+        Some("secret".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        api.url("/v1/clusters?limit=10").unwrap().as_str(),
+        "https://control.example/Prefix/v1/clusters?limit=10"
+    );
+    for path in [
+        "//evil.example/v1/clusters",
+        "/v1/../../sibling",
+        "/v1/%2e%2e/sibling",
+        "/v1/%252e%252e/sibling",
+        "https://evil.example/v1/clusters",
+    ] {
+        assert!(api.url(path).is_err());
     }
 }
 
@@ -360,8 +433,6 @@ fn lifecycle_outcomes_preserve_public_exit_contract() {
 fn retired_managed_selectors_refuse_and_targets_do_not_add_selector_commands() {
     for args in [
         vec!["login", "old-name"],
-        vec!["login", "--api", "https://control.example"],
-        vec!["login", "--organization", "org_one"],
         vec!["use", "cluster-one"],
         vec!["cluster", "status", "--managed"],
         vec!["cluster", "status", "--config", "."],
@@ -371,6 +442,13 @@ fn retired_managed_selectors_refuse_and_targets_do_not_add_selector_commands() {
     }
     for verb in ["login", "logout"] {
         assert!(Cli::try_parse_from(["omnigraph", verb, "--target", "account"]).is_ok());
+        assert!(Cli::try_parse_from(["omnigraph", verb, "--profile", "work"]).is_ok());
+    }
+    for args in [
+        vec!["login", "--api", "https://control.example"],
+        vec!["login", "--organization", "org_one"],
+    ] {
+        assert!(Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).is_ok());
     }
 }
 

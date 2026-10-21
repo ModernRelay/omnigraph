@@ -6515,3 +6515,114 @@ async fn dst_publication_requests_get_a_definite_outcome_issue_1067() {
         .unwrap_or_else(|error| panic!("case {n}: the next write publishes: {error:?}"));
     }
 }
+
+/// LEASE TAKEOVER under seeded timing: an owner beats for a seeded while,
+/// then dies with one heartbeat request in flight that storage applies late,
+/// at a seeded moment that can fall before, during or after a successor's
+/// watch. A beat that lands during the watch sends the successor away, which
+/// is the safe direction; the successor that claims the lock does so only
+/// after a lease and a half of silence since the last beat it saw; and the
+/// dead owner's beats that land after the claim fence nothing: the
+/// successor keeps renewing, and a third process watching it refuses.
+#[test]
+#[serial]
+fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
+    use omnigraph_cluster::lease_protocol::{LeaseKeeper, Watch, lease_dir, watch_and_claim};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    const SECONDS: u32 = 30;
+    let lease = Duration::from_secs(u64::from(SECONDS));
+    for seed in 0..16u64 {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .rng_seed(tokio::runtime::RngSeed::from_bytes(&seed.to_le_bytes()))
+            .enable_time()
+            .start_paused(true)
+            .build_local(Default::default())
+            .expect("seeded paused runtime builds");
+        runtime.block_on(async move {
+            let mut rng = SplitMix64(seed ^ 0x004C_4541_5345);
+            let store: Arc<dyn omnigraph_storage::StorageAdapter> =
+                Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
+            let root = "cluster";
+            let owner =
+                LeaseKeeper::start(store.clone(), root, "owner", SECONDS, Instant::now(), None)
+                    .await
+                    .expect("the owner's first beat lands");
+            tokio::time::sleep(Duration::from_millis(rng.below(90_000))).await;
+            drop(owner);
+            let died = Instant::now();
+            let late = Duration::from_millis(rng.below(150_000));
+            let late_beat = format!("{}/beat-{:020}.json", lease_dir(root, "owner"), u64::MAX);
+            let landed = Arc::new(std::sync::Mutex::new(None));
+            tokio::spawn({
+                let store = store.clone();
+                let landed = landed.clone();
+                async move {
+                    tokio::time::sleep(late).await;
+                    store.write_text_if_absent(&late_beat, "{}").await.unwrap();
+                    *landed.lock().unwrap() = Some(Instant::now());
+                }
+            });
+
+            let mut attempts = 0;
+            let claimed_at = loop {
+                attempts += 1;
+                assert!(attempts <= 4, "seed {seed}: a silent owner is taken over");
+                let watching = Instant::now();
+                match watch_and_claim(store.as_ref(), root, "owner", SECONDS, "successor")
+                    .await
+                    .unwrap()
+                {
+                    Watch::Silent => {
+                        let claimed = Instant::now();
+                        assert!(
+                            claimed.duration_since(watching) >= lease * 3 / 2,
+                            "seed {seed}: a claim waits out a lease and a half"
+                        );
+                        if let Some(at) = *landed.lock().unwrap() {
+                            assert!(
+                                at <= watching || claimed.duration_since(at) >= lease * 3 / 2,
+                                "seed {seed}: no claim within a lease and a half of a seen beat"
+                            );
+                        }
+                        break claimed;
+                    }
+                    Watch::Alive => {
+                        assert!(
+                            landed.lock().unwrap().is_some(),
+                            "seed {seed}: only the late beat can send a successor away"
+                        );
+                    }
+                }
+            };
+            assert!(
+                claimed_at.duration_since(died) >= lease * 3 / 2,
+                "seed {seed}"
+            );
+
+            let successor = LeaseKeeper::start(
+                store.clone(),
+                root,
+                "successor",
+                SECONDS,
+                Instant::now(),
+                None,
+            )
+            .await
+            .expect("the successor's first beat lands");
+            tokio::time::sleep(lease * 6).await;
+            assert!(
+                successor.fenced().borrow().is_none(),
+                "seed {seed}: the dead owner's late beat fences nothing"
+            );
+            assert_eq!(
+                watch_and_claim(store.as_ref(), root, "successor", SECONDS, "third")
+                    .await
+                    .unwrap(),
+                Watch::Alive,
+                "seed {seed}: a live successor keeps a third process out"
+            );
+        });
+    }
+}

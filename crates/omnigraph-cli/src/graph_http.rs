@@ -146,25 +146,6 @@ impl RequestTarget {
         Self { endpoint, segments }
     }
 
-    /// Protocol-1 binding identity: exactly the endpoint and path used by
-    /// credential scope matching, never a URL's display spelling. Unix paths
-    /// retain their decoded bytes so distinct non-UTF-8 sockets cannot alias.
-    pub(crate) fn binding_identity(&self) -> serde_json::Value {
-        let endpoint = match &self.endpoint {
-            Endpoint::Tcp { scheme, host, port } => serde_json::json!({
-                "transport": "tcp", "scheme": scheme, "host": host, "port": port
-            }),
-            #[cfg(unix)]
-            Endpoint::Unix(socket) => {
-                use std::os::unix::ffi::OsStrExt;
-                serde_json::json!({
-                    "transport": "unix", "socket": socket.as_os_str().as_bytes()
-                })
-            }
-        };
-        serde_json::json!({"endpoint": endpoint, "segments": self.segments})
-    }
-
     /// Whether this target is `base` or lies under it: the same endpoint, and
     /// a path whose leading segments are all of `base`'s.
     pub(crate) fn is_under(&self, base: &Self) -> bool {
@@ -291,6 +272,7 @@ impl std::error::Error for ApiContractError {}
 /// The explicit server root owns discovery, including any proxy path prefix.
 /// Never derive it from a graph URL: a proxy prefix may itself contain `graphs`.
 pub(crate) struct GraphHttpClient {
+    operator_transport: Option<crate::operator_transport::CapturedTransport>,
     client: reqwest::Client,
     transport: ServerTransport,
     health_url: Url,
@@ -347,10 +329,22 @@ impl GraphHttpClient {
 
     /// Every client of one root shares its transport; only the managed JSON
     /// deadlines differ.
-    fn build(transport: &ServerTransport, managed: bool) -> Result<reqwest::Client> {
+    fn build(
+        transport: &ServerTransport,
+        managed: bool,
+        captured: Option<&crate::operator_transport::CapturedTransport>,
+    ) -> Result<reqwest::Client> {
         let builder = reqwest::Client::builder()
+            .no_proxy()
+            .tls_built_in_webpki_certs(false)
+            .tls_built_in_native_certs(true)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never());
+        let builder = if let Some(captured) = captured {
+            captured.apply(builder)?
+        } else {
+            builder
+        };
         let builder = match transport {
             ServerTransport::Tcp => builder,
             // Proxies and DNS do not apply to the socket.
@@ -368,6 +362,7 @@ impl GraphHttpClient {
     }
 
     fn with_deadline(server_root: &str, managed: bool) -> Result<Self> {
+        let operator_transport = crate::operator_routing::transport(server_root)?;
         let transport = ServerTransport::parse(server_root)?;
         let mut health_url =
             transport.http_url(&crate::helpers::remote_url(server_root, &["healthz"], &[])?)?;
@@ -375,7 +370,8 @@ impl GraphHttpClient {
         let _ = health_url.set_username("");
         let _ = health_url.set_password(None);
         Ok(Self {
-            client: Self::build(&transport, managed)?,
+            client: Self::build(&transport, managed, operator_transport.as_ref())?,
+            operator_transport,
             transport,
             health_url,
             missing_credential: None,
@@ -411,7 +407,8 @@ impl GraphHttpClient {
     /// inheriting the managed JSON request's total thirty-second deadline.
     pub(crate) fn blob_delivery(&self) -> Result<Self> {
         Ok(Self {
-            client: Self::build(&self.transport, false)?,
+            client: Self::build(&self.transport, false, self.operator_transport.as_ref())?,
+            operator_transport: self.operator_transport.clone(),
             transport: self.transport.clone(),
             health_url: self.health_url.clone(),
             missing_credential: self.missing_credential.clone(),
