@@ -1,6 +1,20 @@
-//! Arguments for the `target` and `credential` command groups.
+//! Arguments for the `target` and `credential` command groups and `access`.
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
+
+#[derive(Debug, Args)]
+pub(crate) struct AccessArgs {
+    /// Also decide the actions on this branch: `read`, `export` and `change`
+    /// on it, and the branch-targeted actions with it as the target.
+    #[arg(long)]
+    pub(crate) branch: Option<String>,
+    /// With --branch, decide `branch_create` and `branch_merge` from it into
+    /// this branch.
+    #[arg(long, requires = "branch")]
+    pub(crate) target_branch: Option<String>,
+    #[arg(long)]
+    pub(crate) json: bool,
+}
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum TargetCommand {

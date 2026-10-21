@@ -810,6 +810,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 actor_id,
                 history_release_bytes,
                 write_budget,
+                stage_write_concurrency,
                 memory,
                 executed,
             ))
@@ -1264,6 +1265,7 @@ async fn load_csv_overwrite_plan(
     actor_id: Option<&str>,
     history_release_bytes: HistoryReleaseBytes,
     write_budget: WriteBudget,
+    stage_write_concurrency: usize,
     memory: &crate::engine::LoadMemory,
     mut executed: LoadExecuted,
 ) -> Result<LoadReceipt> {
@@ -1296,6 +1298,7 @@ async fn load_csv_overwrite_plan(
             db: Arc::clone(db),
             txn: Arc::new(txn.clone()),
             write_budget,
+            writers: stage_write_concurrency,
             staged: Arc::clone(&staged),
         }),
     };

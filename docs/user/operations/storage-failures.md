@@ -32,11 +32,11 @@ The outcome stays unknown if no re-issue settles the request or the committed
 version cannot be read back reliably. A local filesystem error can also occur
 after a write has taken effect, so an error alone does not prove that nothing
 was published. When the outcome remains unknown, the write answers 500
-(`outcome_unknown` on MCP), and the server keeps serving. Each manifest
-version is created only if absent, so the request lands before the branch's
-next publication or never: the branch's next write either finds it and builds
-on it, or takes that version first, after which the late request can no longer
-land. A read that does not show the write is therefore not proof that it
+`outcome_unknown` on HTTP and MCP alike, and the server keeps serving. Each
+manifest version is created only if absent, so the request lands before the
+branch's next publication or never: the branch's next write either finds it and
+builds on it, or takes that version first, after which the late request can no
+longer land. A read that does not show the write is therefore not proof that it
 failed until another commit follows its base; read the branch's commits before
 repeating it.
 
@@ -70,9 +70,10 @@ No storage-failure log carries an error's message, which can name storage
 paths; each records the failure's class.
 
 - `engine failure without definite completion evidence`: the failure's class,
-  and whether its uncertainty is scoped to its storage keys.
-- `owned write ended without a definite outcome`: the write's status, and
-  whether it contained the process.
+  the status its response sends, and whether its uncertainty is scoped to its
+  storage keys.
+- `owned write ended without a definite outcome`: the status its response
+  sends, 500 for `outcome_unknown`, and whether it contained the process.
 - `manifest request outcome unknown; re-issuing the identical conditional
   request`, for each re-issue, and
   `manifest request outcome unknown after every re-issue` when none settles.

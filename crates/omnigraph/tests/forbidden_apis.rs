@@ -301,6 +301,10 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only_with_storage"),
     ("db/omnigraph.rs", "ensure_no_pending_recovery"),
     ("db/omnigraph.rs", "ensure_no_pending_recovery_with_storage"),
+    // Each opens the latest `__manifest` version through the core chokepoint
+    // and drops it; it returns only whether Lance found the dataset.
+    ("db/omnigraph.rs", "exists"),
+    ("db/omnigraph.rs", "exists_with_storage"),
     ("db/omnigraph.rs", "manifest_has_external_base_paths"),
     ("db/omnigraph/export.rs", "capture_served_export_cut"),
     (
