@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-11
-updated: 2026-10-17
+updated: 2026-10-20
 discussion: null
 supersedes: []
 superseded_by: []
@@ -147,9 +147,11 @@ Approximate operators satisfy neither form, so they are not offered to
 restricted actors on placed types.
 
 Writes obey the dual rule: a write by `a` succeeds only if every row it creates,
-changes or removes is writable in `V(a)`, and its outcome reveals nothing
-outside `V(a)` beyond the disclosures listed under
-[What is not promised](#what-is-not-promised).
+changes or removes is writable in `V(a)` at the authorization state its attempt
+captured, and its outcome reveals nothing outside `V(a)` beyond the disclosures
+listed under [What is not promised](#what-is-not-promised). On `main` that state
+is also the state at publication. On another branch it can be one revocation
+older, the window stated there.
 
 ### Silent filtering with a signal
 
@@ -187,8 +189,19 @@ with the same error, byte for byte, as a query naming something never declared.
   write succeeds, exactly these facts and nothing more
   ([Constraint disclosures](#constraint-disclosures)): whether a key exists in
   that type; whether a value tuple of a `@unique` constraint on that type exists
-  in it; whether an edge's source has reached its `@card` bound; and, when it
-  deletes a node, whether the node has an edge the writer cannot see.
+  in it; whether adding or removing an edge would take its source past a `@card`
+  maximum or below a `@card` minimum; when it deletes a node, whether the node
+  has an edge the writer cannot see; and, when it merges, whether a row outside
+  its view changed on either side since the merge base.
+- **Branch writes during a revocation.** A write on a branch other than `main`
+  is authorized against the authorization state its attempt captured. A
+  revocation published on `main` while that attempt runs can miss that one
+  attempt ([Capturing a view](#capturing-a-view)). The window is one attempt,
+  bounded by the write deadline; its rows land only on that branch; every later
+  read of the branch applies the current state, and merging the rows into
+  `main` checks them again for the merging actor. Closing the window would need
+  a compare-and-swap across two branch chains, which Lance does not provide, or
+  a process-local lock, which fences nothing across processes.
 - **Retraction on existing branches.** Moving a row to a more restricted
   securable on `main` does not change the row on branches forked before the
   move; readers of those branches keep the old placement until
@@ -235,13 +248,14 @@ team's grants do not reach you.
 
 ```pg
 node Person @securable {               // each person has a personal securable
-  email: String @key
+  subject: String @key                  // identity-provider subject, never reassigned
+  email: String?
   actor: String? @principal @unique     // "principal:<sub>" or a static-token actor id
 }
 
-node Team @group @securable @in(slug) { slug: String @key }
-node Channel @group @securable @in(slug) { slug: String @key  name: String }
-node Folder @securable @in(slug) { slug: String @key }
+node Team @group @securable @in(slug) { slug: String @key }          // "okta:00g1…"
+node Channel @group @securable @in(slug) { slug: String @key  name: String? }  // "slack:C123"
+node Folder @securable @in(slug) { slug: String @key }                // "drive:0B7x…"
 node Class @securable { slug: String @key }     // fixed securables for columns and types
 
 edge MemberOf: Person -> Team @member {
@@ -286,10 +300,13 @@ type per relation.
 
 ### Rules that complete the model
 
-- **Unique securable keys.** Securable keys are unique across every
+- **Unique, permanent securable keys.** Securable keys are unique across every
   `@securable` type, checked when a securable row is written. A placement value
-  therefore needs no type, and connectors use prefixed keys such as
-  `slack:C123`, `folder:q3-board` or a person's email.
+  therefore needs no type. A key names one securable for the graph's lifetime
+  ([Identity bindings](#identity-bindings)), so connectors use prefixed,
+  immutable source ids such as `slack:C123`, a Drive file id or an
+  identity-provider subject, never a name or an email address that can be
+  reassigned.
 - **Unique actor ids** across every `@principal` property. A graph may have
   several principal types: people, agents, recipients.
 - **The internal group.** The ***internal group*** is the `@group` row keyed
@@ -300,16 +317,18 @@ type per relation.
     it;
   - write validation refuses an explicit `@member` edge into it and a `@deny`
     edge onto it;
-  - only bypass actors create or delete it.
+  - only bypass actors create it, on `main`, and it is never deleted.
 - **Placement.** `@in(p)` on a type places each row in the securable whose key
   is the row's `p`. `@in("key")` on a type places the whole type; on a property,
   that column. A type may carry several `@in`; data is visible only when every
   one of its securables is readable. A null `p` places the row in no securable,
   so only bypass actors see it.
 - **Fixed placements are checked references.** Schema apply refuses an
-  `@in("key")` whose key is not a securable on `main`, and deleting a securable
-  row that a fixed `@in` names is refused. A misspelling fails loudly instead of
-  hiding a column from everyone.
+  `@in("key")` whose key is not a securable on `main`. A misspelling fails
+  loudly instead of hiding a column from everyone.
+- **Placed columns are nullable.** Schema apply refuses a fixed `@in` on a
+  non-null property. A writer who cannot see the column leaves it null on
+  insert and unchanged on update, and receives no error that names it.
 - **Securables are placed like any row.** `node Channel @group @securable
   @in(slug)` places each channel in itself, so only those who can read it know
   it exists. `Person` is a securable but unplaced, so people stay visible while
@@ -333,10 +352,10 @@ Schema apply validates the declarations:
 These declarations set the schema feature `actor-views`, which builds that do
 not implement this RFC refuse to open
 ([Compatibility](#compatibility-and-reversibility)). Each `@in(p)` property gets
-a BTREE index. A schema lint warns when a type with a per-row `@in` is keyed on,
-or declares `@unique` over, a property that looks human-meaningful, such as an
-email or a name, because writers can probe it
-([Constraint disclosures](#constraint-disclosures)).
+a BTREE index. A schema lint warns when a securable type, or a type with a
+per-row `@in`, is keyed on or declares `@unique` over a property that looks
+human-meaningful, such as an email or a name: such a key can be reassigned, and
+writers can probe it ([Constraint disclosures](#constraint-disclosures)).
 
 ### Identity bindings
 
@@ -348,19 +367,29 @@ load and merge ([Writes](#writes)):
 
 | Operation | Rule in the first scope |
 |---|---|
-| Assign, change or clear a `@principal` value | Bypass actors only, typically the connector that mirrors the identity provider. |
-| Create a securable | Bypass actors only. |
+| Assign, change or clear a `@principal` value | Bypass actors only, on `main`, typically the connector that mirrors the identity provider. |
+| Create a securable | Bypass actors only, on `main`. |
 | Change a securable's key | Refused for everyone; a key is identity, not data. |
-| Delete a securable | Refused for everyone while a per-row or fixed placement names it; bypass actors move or delete the rows first. |
-| Create, delete or re-key the internal group row | Bypass actors only. |
+| Delete a securable | Refused for everyone. A securable is retired by deleting its access edges and moving or deleting its rows; the row stays, so its key is never reused. |
+| Create or re-key the internal group row | Bypass actors only, on `main`; it is never deleted. |
+| Write any other property of a securable or group row | On `main` only, under the ordinary write rules. |
 
-Refusals carry `identity_binding_denied` or, for a named securable,
-`securable_in_use`. With these rules a restricted writer cannot take over
-another person's identity by moving an actor id, cannot squat a securable key
-before a connector mirrors it, and cannot inherit rows by re-creating a deleted
-key. Creation by restricted actors returns once placements store packed
-references ([Phase 6](#rollout)): a new securable then gets a fresh id that no
-placement can already name, and an id is never reused.
+Refusals carry `identity_binding_denied`. With these rules a restricted writer
+cannot take over another person's identity by moving an actor id, and cannot
+squat a securable key before a connector mirrors it.
+
+No key that ever named a securable names another. Rows placed under a key
+therefore never pass to a different securable, on `main`, on a branch forked at
+any time, or in a retained snapshot. A check at delete time could not promise
+that: placement values also live on branches, whose chains `main`'s
+compare-and-swap does not fence, and in retained history. A securable row holds
+an identity, not personal data: erasing a person clears their properties and
+removes their personal data elsewhere, and leaves the key-only row.
+
+Deletion returns with packed placement references ([Phase 6](#rollout)): a
+placement then names a securable by a node id that is never reused, so a new
+securable cannot be named by any existing placement, and restricted actors may
+create securables.
 
 ### Computing access
 
@@ -482,7 +511,8 @@ views:
 - `bypass` lists cluster groups whose view is the whole graph: the break-glass,
   connector and maintenance path, named after Postgres's `BYPASSRLS`. Served
   bypass reads are recorded through the existing policy decision log. Only a
-  bypass actor manages identity bindings or removes a placement from the schema.
+  bypass actor manages identity bindings, applies a schema or runs maintenance
+  on an `actor-views` graph.
 - `limits` bound one actor's view and its exact searches ([Bounds](#bounds)).
 
 No new Cedar action is needed. Who may change access to a securable is the
@@ -562,8 +592,9 @@ For an actor whose view of a placed type is restricted:
 | Delete that would cascade to an edge the actor cannot see | Refused with `delete_blocked`. |
 | Edge insert | Both endpoints must be visible, and the edge type's fixed placement writable; a hidden endpoint fails exactly as a missing one. |
 | `load --mode overwrite` and `load csv … overwrite` | Refused when the actor's view of any type in the batch is restricted. |
-| Branch merge, including a dry run | Refused unless every row in the merge diff is writable by the actor. Conflicts are reported without entity ids. |
+| Branch merge, including a dry run and `--as-commit` | Refused with `view_write_denied` and no conflict payload unless every row changed on either side since the merge base is writable by the actor. Only then is the merge evaluated, and its conflicts, all on visible rows, are reported as today. |
 | Writes to identity bindings | As in [Identity bindings](#identity-bindings). |
+| Schema apply, `optimize`, `cleanup`, index and full-text builds, `upgrade` | They validate or report on every row of the types they touch, so on an `actor-views` graph they need a bypass actor as well as their Cedar action. |
 
 Access edges have their own rules, for every actor that is not bypass:
 
@@ -572,10 +603,10 @@ Access edges have their own rules, for every actor that is not bypass:
   source of an inherits or requires edge).
 - Writing a `@member` edge into a group needs `owner` on it. A group type that
   is not also a securable has no owners, so only bypass actors manage it.
-- Access edges and `@principal` properties are written only on `main`. A branch
-  write, a merge, a branch promotion or a restore that touches them is refused.
-  Without that rule a branch forked before a revocation would bring the revoked
-  access back.
+- Access edges, `@principal` properties, and securable and group rows are
+  written only on `main`. A branch write, a merge, a branch promotion or a
+  restore that touches them is refused. Without that rule a branch forked before
+  a revocation would bring the revoked access back.
 
 #### Constraint disclosures
 
@@ -583,22 +614,28 @@ Constraints hold over the whole type, hidden rows included, so a constraint
 check's outcome can depend on hidden rows. Every system surveyed enforces
 constraints globally and documents the resulting channel; Postgres says
 constraint checks "always bypass row security". This RFC states exactly what a
-restricted writer of a placed type may learn, and refuses every other outcome
-that would say more:
+restricted writer of a placed type may learn. The table lists every write check
+whose outcome can depend on hidden rows or hidden schema; every other check
+reads only the view, and every outcome that would say more is refused:
 
-| Constraint | What the outcome may reveal | What is withheld |
+| Check | What the outcome may reveal | What is withheld |
 |---|---|---|
 | `@key` | Whether the key exists in the type | The row's id, values and placement |
 | `@unique` (including an interface-wide one) | Whether the written value tuple exists in the type | The other holder's id, values and placement |
-| `@card` on an edge type | Whether the source has reached the bound | The count and the hidden edges |
+| `@card` maximum, on an edge insert | Whether the source already has the maximum number of edges | The count and the hidden edges |
+| `@card` minimum, on an edge delete | Whether the source keeps at least the minimum without the deleted edge, which can depend on hidden edges | The count and the hidden edges |
 | Cascade on delete | Whether the node has an edge the writer cannot see | Which edges, how many |
+| Branch merge | Whether a row outside the view changed on either side since the merge base | Which rows, how many, and every conflict |
+| Required properties | Nothing: a placed column is nullable, and no error names a hidden column | — |
 | Securable keys | Nothing: only bypass actors create securables in the first scope | — |
 
-Errors for restricted actors carry the constraint and property names only. The
-lint above flags placed types whose keys or `@unique` properties are
-human-meaningful; opaque keys make probing impractical. Uniqueness scoped to a
-placement, which would close the `@unique` channel, is an open question
-([Unresolved questions](#unresolved-questions)).
+Errors for restricted actors carry the constraint and visible property names
+only; today's `@card` message names the source and the count, which the server
+strips. The lint above flags placed types whose keys or `@unique` properties
+are human-meaningful; opaque keys make probing impractical. Uniqueness scoped
+to a placement, which would close the `@unique` channel, and cardinality over
+visible edges, which would close the `@card` channels at the cost of integrity,
+are open questions ([Unresolved questions](#unresolved-questions)).
 
 ### Agents and delegated credentials
 
@@ -926,10 +963,14 @@ capture the new content under the old access.
   branch and table gates are contention control, not the guarantee.
 - **Writes on another branch** publish on that branch's chain, which `main`'s
   access tables are not part of, so the compare-and-swap cannot fence a
-  revocation on `main`. Such a write is authorized against the authorization
-  state captured in its attempt; a revocation published on `main` during that
-  attempt can miss at most that attempt. Every later read applies the current
-  state.
+  revocation on `main`. `commit_all` takes the schema permit shared, then the
+  attempt branch's gate and its table gates (`crates/omnigraph/src/exec/staging.rs`);
+  no gate orders a `main` publication against it, and the gates are
+  process-local in any case. Such a write is therefore authorized against the
+  authorization state captured in its attempt: a revocation published on
+  `main` during that attempt can miss that one attempt, the window stated in
+  [What is not promised](#what-is-not-promised). Every later attempt and read
+  applies the current state.
 
 Edge windows are evaluated at the request's admission time on the server, one
 clock for the whole request, as SpiceDB evaluates expiry in its datastore to
@@ -988,17 +1029,19 @@ rows:
 
 - a staged change to a `@principal` value, a new securable, a changed securable
   key, or a write to the internal group row by a non-bypass actor is refused;
-- a deleted securable is checked against every per-row placement property with
-  one `IsIn` count on its BTREE, and against every fixed `@in`;
+- a staged delete of a securable row is refused for every actor;
+- a staged write to a securable or group row, an access edge or a `@principal`
+  value on a branch other than `main` is refused;
 - uniqueness of securable keys and actor ids across types, and the internal
-  group's reserved key, are checked against the committed state; a concurrent
-  duplicate makes the publication's compare-and-swap fail.
+  group's reserved key, are checked against the committed state of `main`;
+  every such row is written on `main`, so a concurrent duplicate makes the
+  publication's compare-and-swap fail and the retry sees it.
 
 Under the integer node identity draft (carried with the polymorphic types draft)
 a per-row placement would store the securable's packed node reference instead of
-its key. Ids are never reused, so a re-created securable never inherits rows,
-and restricted creation becomes safe. That switch is [Phase 6](#rollout) and
-needs four things: placement properties join merge's remapping of coalesced ids
+its key. Ids are never reused, so a placement can never name a securable created
+after it, securables may be deleted, and restricted creation becomes safe. That
+switch is [Phase 6](#rollout) and needs four things: placement properties join merge's remapping of coalesced ids
 and its correspondence table; securable types are excluded from natural-key
 coalescing; a reference to a deleted securable is unreadable rather than an
 error; and writers name a securable by key, typed when keys are not unique
@@ -1089,11 +1132,13 @@ Restricted search on a placed type is exact and scored only from the view
 Lance's flat path adds every counted input row to the supplied scorer
 (`initialize_scorer`, `lance-index-11.0.0/src/scalar/inverted/index/flat_search.rs:539-588`).
 With a zero base the statistics are exactly the visible rows': document count,
-document frequencies and total length over the rows the operator counts, all of
-them visible. Every visible row is scored from its text and no postings are
-read, so neither hidden rows, nor index coverage, nor stale index entries left
-by updates (the overlay-stale rows Lance's indexed path blocks) can change a
-restricted score. The tokenizer comes from the column's full-text segment, which
+document frequencies and total length over the visible rows with nonempty
+analyzed text, since the operator counts only a row with at least one token
+(`tokenize_and_count`, same file). The query's own filters run after scoring,
+so they never rescope the statistics. Every visible row is scored from its
+text and no postings are read, so neither hidden rows, nor index coverage, nor
+stale index entries left by updates (the overlay-stale rows Lance's indexed
+path blocks) can change a restricted score. The tokenizer comes from the column's full-text segment, which
 every committed version holds for a declared column (the full-text analyzer
 fence in `docs/dev/lance.md`).
 
@@ -1104,9 +1149,10 @@ defined as the actor's view. Once that draft's exact evaluator lands, restricted
 
 A restricted `bm25` across several member types of an abstract binding needs one
 scorer over the union of the visible members' rows. Lance 11's flat operator
-counts only its own input, and its shared-scorer hook (`with_shared_scorer`) is
-`pub(crate)`, so it stays refused for restricted actors on placed members until
-each arm can receive the other arms' view statistics as its base scorer
+counts only its own input and its shared-scorer hook (`with_shared_scorer`) is
+`pub(crate)`, so each arm takes the other arms' view statistics as its base
+scorer, collected in a first pass. Multi-member `bm25` stays refused for every
+actor until the polymorphic types draft admits it
 ([Polymorphic types](#polymorphic-types)).
 
 The cost is one pass over the visible rows' text per query; the counted batch is
@@ -1251,7 +1297,6 @@ applies the view, or refuses with `view_restricted`.
   | `placement_required` | 400 | not started, no effects |
   | `delete_blocked` | 409 | not started, no effects |
   | `identity_binding_denied` | 403 | not started, no effects |
-  | `securable_in_use` | 409 | not started, no effects |
   | `view_limit_exceeded` | 422 | not started, no effects |
 
   `key_conflict` becomes a code too, and a restricted actor's response omits its
@@ -1299,7 +1344,8 @@ the property's visibility is the same for every member. Type-level `@in` belongs
 to concrete types and is not inherited through `implements`.
 
 **Removing a placement** from any concrete type or property, by any route, is
-refused unless the applying actor is bypass. The routes are deleting the
+the act of a bypass actor, since schema apply on an `actor-views` graph needs
+one, and schema plan lists each removal. The routes are deleting the
 annotation, dropping the placement property (which the constraint-dropping rule
 of ModernRelay/omnigraph#1062 would otherwise do silently), removing an
 interface property, removing `implements`, and narrowing an endpoint so a member
@@ -1329,18 +1375,21 @@ groups each hop's frontier by the type half of its packed references and masks
 each restricted member type.
 
 **Search across members.** That RFC admits `bm25` across members only under one
-corpus contract, with the statistics source this RFC selects, through one engine
-module shared by both RFCs, and refuses it until an upstream Lance scanner
-option ships. This revision changes the source it names for restricted actors
-from public or uniform statistics to view statistics
-([D10](#d10-restricted-search-is-exact-and-scored-from-the-view)). For a
-restricted actor the corpus is the visible rows of the visible members. A single
-member needs no upstream change: the flat operator reads no postings, so the
-overlay-stale rows that make that RFC reject engine-built plans do not arise.
-Several members need each arm's base scorer to be the other arms' view
-statistics; that RFC's proposed upstream call for a dataset's corpus statistics
-provides them if it accepts a filtered input. Until then multi-member `bm25`
-stays refused for restricted actors, as it is for everyone under that RFC today.
+corpus contract, with one population per query chosen by the actor as this RFC
+chooses it, collected by one engine module shared by both RFCs, the only code
+that chooses or sums statistics. Since its 2026-10-18 revision a restricted
+actor's population is view statistics for every arm
+([D10](#d10-restricted-search-is-exact-and-scored-from-the-view)): each member's
+visible rows with nonempty analyzed text, summed, with each arm's base scorer
+the other arms' sum. The two drafts agree on the plans. The bypass route keeps
+Lance's planner and waits for an upstream scanner option, because an
+engine-built indexed plan could not block overlay-stale rows. The restricted
+route reads no postings, so this RFC builds its plan in the engine. Lance 11's
+public `flat_bm25_search_stream_with_options_and_scorer` returns the scorer it
+counted, so a first pass with a zero base yields each arm's view statistics
+today, at the cost of tokenizing the visible text twice. Multi-member `bm25`
+stays refused for every actor until the scanner option ships, so a restricted
+actor never ranks across members where a bypass actor cannot.
 
 **Graph index.** That RFC's phase 3 moves the graph index to one global ordinal
 space. Per-view masks ([Phase 8](#rollout)) target that space: one bitmap per
@@ -1349,7 +1398,7 @@ view and index instance.
 **Write enforcement point.** An interface-wide mutation is checked in attempt
 validation and again in the commit revalidation, as every write is
 ([Writes](#writes)); a check before staging could not see staged placement
-values. That RFC's Policy text should name the same point.
+values. That RFC's Policy section names the same point.
 
 **Catalog route, schema hash, descriptors and feeds.** The structured type
 catalog route that RFC adds serves the view catalog. Reads by a restricted actor
@@ -1472,8 +1521,8 @@ not a list in policy. One mechanism governs rows, columns and types, and one
 kind of group governs data. The trade-off is that the owner of a fixed
 securable can expose a column by granting it, where a policy list would have
 needed a reviewed change. Every grant is an audited commit, owners are already
-trusted with their securable's rows, and removing a placement from the schema
-still needs a bypass actor.
+trusted with their securable's rows, and schema apply, the only way to remove a
+placement, needs a bypass actor.
 
 ### D3. Placement is a property
 
@@ -1545,8 +1594,12 @@ which data belongs to which audience, so they are not free text that any writer
 with `change` may set. One lifecycle, enforced in shared write validation,
 covers all three, instead of an exception per construct. The first scope
 reserves their changes to bypass actors, which are typically the connectors that
-mirror identity providers and source ACLs. Packed references later remove
-reuse by construction.
+mirror identity providers and source ACLs, writes them only on `main`, and never
+deletes a securable, so no key ever names a second securable. Invariant 6 says a
+dropped identity is not the next row that reuses its name; with string keys the
+only way to honor it everywhere a placement can live (live branches and retained
+snapshots, not only `main`) is never to drop the identity. Packed references
+later make deletion safe by construction.
 
 ### D10. Restricted search is exact and scored from the view
 
@@ -1618,8 +1671,8 @@ compare-and-swap.
   the graph unfiltered.
 - **Schema apply.** Adding these annotations is a new plan step; today any
   annotation change other than `@description` and `@instruction` is refused
-  (`crates/omnigraph-compiler/src/catalog/schema_plan.rs`). Removing a placement
-  requires a bypass actor.
+  (`crates/omnigraph-compiler/src/catalog/schema_plan.rs`). On an `actor-views`
+  graph schema apply needs a bypass actor.
 - **Policy.** Version-2 bundles are refused by older builds, which refuse
   unknown versions and fields.
 - **Wire.** The `view` response object, the new error codes and the redacted
@@ -1711,12 +1764,15 @@ Rust owners above carry them.
 Cases the generators and fixtures must include:
 
 - **Identity:** a restricted writer moving its actor id onto a privileged
-  principal; squatting a securable key before a connector mirrors it; deleting
-  and re-creating a securable key that placements name; an explicit `@member`
-  edge into the internal group; a `@deny` onto it.
+  principal; squatting a securable key before a connector mirrors it; deleting a
+  securable on `main`; writing a securable, group or access row on a branch and
+  merging it; an explicit `@member` edge into the internal group; a `@deny`
+  onto it.
 - **Capture order:** a DST schedule that commits a revocation and new content
-  between the two captures of a branch read, and a write racing an access change
-  in another process.
+  between the two captures of a branch read; a write on `main` racing an access
+  change in another process, which must retry or refuse; and a branch write
+  racing a revocation on `main`, which may land at most that one attempt and
+  whose rows the next read of the branch hides.
 - **Search:** paired graphs that differ only in hidden rows for `bm25`, `nearest`
   and `rrf`; the same graph before and after optimize and after a full-text
   rebuild, giving identical restricted scores.
@@ -1844,8 +1900,8 @@ Restricted actors cannot yet write placed types; they are refused with
 - Every read surface in [Surfaces](#surfaces), MCP tools and resources included;
   the direct-and-served rule; serving refusals.
 - Polymorphic types, if union scans have landed: per-arm conjuncts and member
-  sets from the view catalog; multi-member `bm25` stays refused for restricted
-  actors until each arm can take the other arms' view statistics.
+  sets from the view catalog; multi-member `bm25` stays refused for every actor
+  until the polymorphic types draft admits it.
 - Lance guards for `IsIn` prefiltering, the flat scorer and `CountPushdown`.
 
 Exit: the paired-graph property holds over scans, aggregates, single- and
@@ -1861,15 +1917,18 @@ request's authorization state hides.
 - Personal-securable default, `placement_required`, `view_write_denied`,
   `key_conflict` without ids, `delete_blocked`, overwrite refusal, edge endpoint
   visibility, view-scoped matching and counts.
-- Constraint disclosures exactly as tabled.
+- Constraint disclosures exactly as tabled, including the `@card` minimum and the
+  merge refusal without a conflict payload.
 - Access-edge rules: owner roles, `main` only.
 - Access pins as compare-and-swap expectations; the own-attempt settle lookup.
 - Server stripping of foreign facts for restricted actors.
 
 Exit: `writes.rs` and `policy_engine_chassis.rs` cover every row of the write and
 disclosure tables; each refusal leaves the manifest head, table pins and lineage
-unchanged; a write racing an access change in another process retries or
-refuses.
+unchanged; a write on `main` racing an access change in another process retries
+or refuses; a branch write racing a revocation on `main` lands at most that one
+attempt, as [What is not promised](#what-is-not-promised) states, and the next
+read of the branch applies the revocation.
 
 ### Later phases
 
@@ -1900,7 +1959,8 @@ For the first scope:
 
 1. Whether design partners accept the write disclosures in
    [Constraint disclosures](#constraint-disclosures), or need `@unique` scoped to
-   a placement before Phase 3.
+   a placement, or `@card` counted over visible edges for restricted writers,
+   before Phase 3.
 2. Whether denied principals should see the deny edges that bar them, as some
    ethical-wall practice expects, or only owners.
 3. Whether restricted reads on branches forked before a move need the
@@ -1935,10 +1995,7 @@ placement.
   - Restricted search is exact and scored from the view (D10). Public and uniform
     statistics are withdrawn; restricted `bm25` uses Lance's flat operator over
     the visible rows with a zero base scorer, matching the analyzed lexical
-    search draft's population; restricted `nearest` is exact. The polymorphic
-    types draft's corpus contract takes its statistics source from this RFC,
-    so it now names view statistics; restricted multi-member `bm25` stays
-    refused until each arm can take the other arms' view statistics.
+    search draft's population; restricted `nearest` is exact.
   - The view conjunct has its own eligibility, always before scoring, because
     `main`'s eligibility rule moves filters after scoring on partly indexed
     properties.
@@ -1962,6 +2019,27 @@ placement.
     references, computed and edge placement, acceleration, history and feeds,
     and sharing are later phases.
   - Code citations moved to file and symbol at `9575b044`.
+- 2026-10-20: Revised against the review of 2026-10-18:
+  - A branch write is authorized at its attempt's captured state. The window in
+    which a revocation on `main` misses one branch attempt is stated in the
+    contract, in What is not promised and in the Phase 3 exit, because no
+    cross-chain compare-and-swap exists and a process-local gate fences
+    nothing across processes.
+  - Securables are never deleted in the first scope, and securable, group and
+    access rows are written only on `main`, so no key ever names a second
+    securable on any branch or snapshot. Keys are immutable source ids;
+    deletion returns with packed references.
+  - The disclosure table lists every check whose outcome can depend on hidden
+    rows or schema: the `@card` minimum and merge are added; placed columns are
+    nullable so no error names a hidden column; a restricted merge with hidden
+    changes is refused without a conflict payload; schema apply and maintenance
+    need a bypass actor.
+  - Restricted `bm25` statistics cover visible rows with nonempty analyzed text,
+    as the analyzed lexical search draft defines them; the query's filters do
+    not rescope them.
+  - The polymorphic types draft adopted view statistics on 2026-10-18 and
+    records the same plan split; multi-member `bm25` stays refused for every
+    actor until its scanner option ships.
 
 ## Appendix A: validated assumptions
 
@@ -1985,6 +2063,8 @@ Verdicts: ✓ confirmed, ◐ partly true (the design uses the corrected form),
 | Mask plus `count_rows` | ◐ | `CountPushdown` expects a `ScalarIndexExec` (`io/exec/count_pushdown.rs:228-235`); untested, guarded before use |
 | Compaction materializes deletions above 10%; stable ids skip index remap | ✓ | `dataset/optimize.rs:322, 2580` |
 | Merge-insert cannot fail on a conditional match | ✓ | `merge_insert.rs:425-449`; `assign_action.rs:107-139` |
+| The flat full-text operator counts only rows with at least one analyzed token | ✓ | For row-level documents, `tokenize_and_count` in `scalar/inverted/index/flat_search.rs` appends a row only when `all_tokens > 0` |
+| A public flat search returns the scorer it counted | ✓ | `flat_bm25_search_stream_with_options_and_scorer`, `scalar/inverted/index/flat_search.rs:857` |
 
 ### Engine read path
 
@@ -2017,6 +2097,8 @@ Verdicts: ✓ confirmed, ◐ partly true (the design uses the corrected form),
 | Edge properties may be named `from` | ✗ | `from` and `to` are reserved insert parameters on edges (`docs/user/schema/index.md`) |
 | Schema apply is main-only with a single live branch | ✓ | `schema_apply.rs`; ModernRelay/omnigraph#963 would lift the single-branch part |
 | Edge endpoints have BTREEs | ✓ | `table_ops.rs` builds BTREEs on id, src and dst |
+| `@card` is checked only at its maximum | ✗ | `card_violations` checks the maximum, then the minimum, and its message names the source and the count (`crates/omnigraph/src/validate/kernels.rs`) |
+| A null for a non-null property is refused with a message naming it | ✓ | `resolve_assignments` in `crates/omnigraph/src/exec/mutation.rs` |
 
 ### Server, policy and cluster
 
@@ -2036,6 +2118,7 @@ Verdicts: ✓ confirmed, ◐ partly true (the design uses the corrected form),
 | Graphs in a cluster share storage and credentials | ✓ | `crates/omnigraph-cluster/src/store.rs`; `crates/omnigraph-storage/src/lib.rs` |
 | Read caches flush on every observed advance of `main` | ✓ | `invalidate_read_caches` in `crates/omnigraph/src/db/omnigraph.rs` |
 | A commit holds the schema gate exclusively | ✗ | `commit_all` takes the shared side (`acquire_schema_shared`), so the gates order but do not exclude a concurrent access write |
+| A branch commit is ordered against a publication on `main` | ✗ | `commit_all` takes the shared schema permit, the attempt branch's gate and its table gates (`crates/omnigraph/src/exec/staging.rs`); the `__manifest` compare-and-swap is per branch chain |
 
 ## Appendix B: prior art
 
