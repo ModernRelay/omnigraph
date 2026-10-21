@@ -134,7 +134,8 @@ async fn execute(
 }
 
 /// A command's stdout, noting whether any of its result reached it. A failure
-/// after part of a result goes to stderr, so stdout keeps a single result.
+/// after part of a result goes to stderr, so stdout holds only result bytes,
+/// which can end inside an unfinished object.
 struct StartedOutput<'a> {
     inner: &'a mut dyn Write,
     started: bool,
@@ -243,7 +244,8 @@ fn finish(
         let delivered = (|| -> Result<()> {
             match machine {
                 // Part of the result already reached stdout, so the failure
-                // envelope goes to stderr and stdout keeps one result.
+                // envelope goes to stderr and stdout keeps only the bytes
+                // already written.
                 Some(format) if result_started => {
                     write_machine(&failure, format, stderr)?;
                     stderr.flush()?;
