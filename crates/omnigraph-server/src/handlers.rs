@@ -3255,7 +3255,7 @@ pub(crate) async fn server_branch_merge(
                 match delete_merged_source_branch(&handle, actor.as_ref(), &request.source).await {
                     Ok(()) => (Some(true), None),
                     Err(error) => {
-                        uncertain = error.completion_uncertain();
+                        uncertain = error.contains_process();
                         (Some(false), Some(error.into_step_output()))
                     }
                 }

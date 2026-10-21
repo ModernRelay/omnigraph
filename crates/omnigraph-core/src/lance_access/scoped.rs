@@ -40,8 +40,9 @@ impl ObjectStoreProvider for ScopedProvider {
         mut base_path: Url,
         params: &ObjectStoreParams,
     ) -> lance_core::Result<ObjectStore> {
-        // Lance applies this environment override after explicit parameters.
-        // Refuse it rather than silently losing the single-attempt guarantee.
+        // Lance applies this environment override after explicit parameters,
+        // to both clients below. Refuse it rather than silently losing the
+        // single-attempt guarantee of conditional and mutable requests.
         if std::env::var("OBJECT_STORE_CLIENT_MAX_RETRIES")
             .is_ok_and(|value| value.parse::<usize>() != Ok(0))
         {
@@ -68,7 +69,20 @@ impl ObjectStoreProvider for ScopedProvider {
                 "lifetime-scoped storage requires the native object-store provider",
             ));
         }
-        options.retain(|key, _| !key.eq_ignore_ascii_case("client_max_retries"));
+        options.retain(|key, _| {
+            !key.eq_ignore_ascii_case("client_max_retries")
+                && !key.eq_ignore_ascii_case("lance_aimd_max_retries")
+        });
+        // Reads and fresh immutable writes keep Lance's own bounded retries
+        // (`client_max_retries` 3, `lance_aimd_max_retries` 3): a retry
+        // re-sends the same bytes to a name only that request uses.
+        let mut retrying = params.clone();
+        retrying.storage_options_accessor = Some(Arc::new(
+            StorageOptionsAccessor::with_static_options(options.clone()),
+        ));
+        // Conditional requests and mutable keys make one attempt each: their
+        // owners resolve an ambiguous answer by re-issue and read-back, which
+        // needs every attempt to be visible to them.
         options.insert("client_max_retries".into(), "0".into());
         options.insert("lance_aimd_max_retries".into(), "0".into());
         params.storage_options_accessor = Some(Arc::new(
@@ -84,8 +98,11 @@ impl ObjectStoreProvider for ScopedProvider {
             )
             .map_err(|_| lance_core::Error::invalid_input("could not scope the local store"))?;
         }
-        let mut store = self.inner.new_store(base_path, &params).await?;
-        store.inner = self.scope.wrap_object_store(store.inner);
+        let single = self.inner.new_store(base_path.clone(), &params).await?;
+        let mut store = self.inner.new_store(base_path, &retrying).await?;
+        store.inner = self
+            .scope
+            .wrap_object_stores(Arc::clone(&store.inner), single.inner);
         Ok(store)
     }
 

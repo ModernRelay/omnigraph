@@ -16,7 +16,7 @@ deployment.
 - [Query language](queries/index.md), [session settings](queries/settings.md), [explain](queries/explain.md), [explaining a load statement](queries/explain-load.md), and the [engine catalogue](queries/catalogue.md)
 - [Traversal patterns and edge selections](queries/traversal.md)
 - [Diagnostics](queries/diagnostics.md)
-- [Mutations and loading](mutations/index.md)
+- [Mutations and loading](mutations/index.md) and [conditional mutations](mutations/conditional.md)
 - [Search](search/index.md) and [embeddings](search/embeddings.md)
 - [Blob values](blobs.md)
 - [Storage and durability](concepts/storage.md)
