@@ -369,9 +369,11 @@ object.
   or its outcome is unknown, because its manifest request got no definite
   answer. This RFC owns only how they are reported. A write the server could
   not settle answers `outcome_unknown`, never a plain `internal`, and later
-  writes to its branch proceed: its version key fences it, so the branch's
-  next publication either builds on the late commit or takes its version
-  first. Every other error keeps its code, and its disposition follows from
+  writes to its branch proceed as [§5 of storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093) decides: a linear publication's
+  version key fences it, so the branch's next publication either builds on the
+  late commit or takes its version first, and a detached proposal or
+  unattached snapshot settles as that section says, not by the next linear
+  version. Every other error keeps its code, and its disposition follows from
   what the server knows:
 
   | Error | `effects` | `action` |
@@ -385,7 +387,11 @@ object.
   A later phase adds `disposition.check`, what a later read needs to settle an
   unknown write: its branch and its publication id (a graph commit id, or a
   control fact's attempt id), with the branch's head before the write. The
-  outcome is final once the branch moves past the attempted version. It
+  outcome is final once the attempted `__manifest` version is readable, by the
+  [read-back](#engine-control-facts-on-the-version-cas) rule:
+  the write landed if it holds the publication id, and lost if it holds
+  another and the store never acknowledged this attempt. While that version is
+  absent the outcome stays unknown, until some commit holds it. It
   arrives with the attempt identity of [cross-process
   writes](#cross-process-writes). Under an actor view that hides the commit
   listing, the check answers for the caller's own publication id and returns
@@ -751,22 +757,28 @@ commit id is a row publication's:
 
 - **Read-back.** After a lost acknowledgement, the publisher settles the
   attempt as [#1092](https://github.com/ModernRelay/omnigraph/pull/1092) splits
-  a row publication's. A request its request record shows was never sent lost.
-  A version that holds a fact with the attempt id landed. A version that holds
-  another fact lost, unless the store acknowledged this attempt. Anything else,
-  an absent version at checkout or a failed read, stays unknown, and the
-  version key settles it. The row read-back compares heads, which cannot tell
-  two control facts apart, since neither moves the head.
+  a row publication's. A request its request record shows could not have
+  landed lost: one never sent, or one the store refused before it could apply.
+  Otherwise the publisher reads the attempted version, and a readable version
+  is final. It landed if the version holds a fact with the attempt id. It lost
+  if the version holds another fact and the store never acknowledged this
+  attempt; after an acknowledgement it stays unknown, as the publisher reports
+  an acknowledged attempt in doubt. An absent version stays unknown until some
+  commit holds it, and a failed read until a read succeeds. The row read-back
+  compares heads, which cannot tell two control facts apart, since neither
+  moves the head.
 - **The owner's retry.** A fact with the operation's own attempt id is its own
   landed attempt, never a refusal: the operation goes on to its follow-ups,
   the ref, the deregistration, the archive and unlink, or the tag release.
-- **Unknown outcomes.** A control fact whose request stays ambiguous is fenced
-  by its version key, as a row publication is in [storage outcomes per
-  operation](https://github.com/ModernRelay/omnigraph/pull/1093): the chain's
-  next publication either loads it or takes its version first. A read of the
-  registration, tombstone or drop record is final only after the chain moves
-  past the attempted version. The attempt id stays on the fact, in the log and
-  in `disposition.check`.
+- **Unknown outcomes.** Every control fact is a linear publication on its
+  chain, so one whose request stays ambiguous is fenced by its version key, as
+  a linear row publication is in [§5 of storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093): the chain's next publication either
+  loads it or takes its version first. A read of the registration, tombstone
+  or drop record is final once the attempted version is readable, by the
+  read-back rule above, without waiting for a later version: a create's
+  follow-up writes the ref, not another manifest version, so the chain may stay
+  at the registration. The attempt id stays on the fact, in the log and in
+  `disposition.check`.
 
 The refusals in the table apply to facts with another attempt id, with two
 convergent exceptions: a delete that finds its branch tombstoned by another
@@ -1101,9 +1113,11 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   - Each precondition kind refuses on an attempt a fact names and passes one it
     does not.
   - With two control facts on one chain, a lost acknowledgement reads back as
-    landed only for the fact carrying the attempt's own id, a never-sent
-    request reads back as lost, and an unreadable or absent attempted version
-    stays unknown until the chain moves past it.
+    landed only for the fact carrying the attempt's own id. A never-sent or
+    refused request reads back as lost. Another fact at a readable attempted
+    version reads back as lost without an acknowledgement and as unknown after
+    one. An absent or unreadable attempted version stays unknown, and a
+    readable one settles without a later publication.
   - A delete and a drop that find another attempt's fact complete the
     follow-ups and succeed.
   - An operation retried with its attempt id goes on to its follow-ups.
@@ -1514,3 +1528,10 @@ proposal.
   its refusals join the one registry with `effects: none` and `action: fix`,
   and under a view that hides commit listings `disposition.check` answers only
   for the caller's own publication and receipt.
+- 2026-10-21: A read of an attempted version is final once that version is
+  readable, as storage outcomes per operation's §5 has it, not once the chain
+  moves past it, which a create whose follow-up writes only the ref would
+  never see. A refused request is a loss beside a never-sent one, and an
+  acknowledged attempt whose version holds another fact stays unknown. The
+  version-key fence covers linear publications; §5 keeps the detached proposal
+  and snapshot.
