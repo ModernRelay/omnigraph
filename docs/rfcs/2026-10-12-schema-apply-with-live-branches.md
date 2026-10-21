@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-12
-updated: 2026-10-17
+updated: 2026-10-20
 discussion: null
 supersedes: []
 superseded_by: []
@@ -41,9 +41,10 @@ dry runs and previews stay free of effects and the merge keeps its fast paths.
 
 Each later relaxation in Future work only turns refusals into merges and needs
 no format change. The counter needs storage stamp 17, written by each branch's
-first publication. Older binaries refuse the graph once main carries it. The
-design does not add schema apply on named branches or a way to apply one
-change to every branch.
+first publication. An older binary fails at its next read or write of main
+once main carries it; a branch still at stamp 16 stays usable under its own
+contract. The design does not add schema apply on named branches or a way to
+apply one change to every branch.
 
 ## Motivation
 
@@ -89,12 +90,23 @@ main into lagging branches promptly after a migration avoids this.
 
 ### Applying while branches are live
 
-`omnigraph schema apply` on main succeeds while other branches exist, unless a
-live branch changed, since its merge base with main, a table the apply
-changes. The refusal names each such branch and table and gives two remedies:
-merge the branch into main first, or delete it. Schema preview and plan report
-the same list without refusing. A preview's list is advisory, including a
-stored deployment preview; the check at apply is authoritative.
+`omnigraph schema apply` on main succeeds while other branches exist unless,
+for some live branch and some table the apply changes, merging main into that
+branch right after the apply would be refused. That is the case when the
+branch changed the table since its merge base with main, or when that base
+holds the table in another shape (a criss-cross history). It includes a table
+the branch could already not merge because of an earlier apply: such a table
+refuses every later apply that changes it, until the branch is deleted or its
+work is redone on a branch created from main. The refusal names each branch
+and table and gives the remedies: merge the branch into main first where that
+merge is still allowed, or delete the branch.
+
+A third result is `cannot prove`: the check ran out of its work budget for a
+branch before reaching an answer. It names the branch and refuses the apply.
+
+Schema preview and plan report the same branches and tables without refusing.
+A preview's list is advisory, including a stored deployment preview; the check
+at apply is authoritative.
 
 An apply ***changes a table*** when it adds, renames or drops one of the
 type's properties, declares a full-text `@index` on it, or drops the type.
@@ -165,9 +177,12 @@ unattached snapshots rooted at the earlier head expire as they do after any
 other publication. A catch-up merge can tombstone a type on its target when
 the newer contract dropped it.
 
-A branch that changed a table that a newer contract changed cannot merge that
-table in either direction. Its rows stay readable and exportable on the
-branch; the work is redone on a branch created from main.
+A merge publishes once, so a `schema_diverged` refusal refuses the whole
+merge, not only the named table: none of the branch's commits reach the target.
+A branch that changed a table that a newer contract changed therefore cannot
+merge with that side in either direction. Its rows stay readable and
+exportable on the branch, and all of its work, the other tables included, is
+redone on a branch created from main.
 
 ### Dropped data
 
@@ -216,9 +231,19 @@ Sequence 0 is sound because no two live branches' contract rows that both read
 0 differ. Every contract write before this release required a graph with only
 main, so all live branches shared one contract until the first stamped write.
 Branch creation at a commit ([ModernRelay/omnigraph#1016](https://github.com/ModernRelay/omnigraph/pull/1016))
-keeps this true by refusing a commit whose contract differs from the source's
-current one. Relaxing that refusal under this RFC must still refuse a commit
-whose differing contract has no sequence. A merge base may hold a sequence-0
+keeps this true. It compares the commit's contract with the contract at the
+captured head of the branch that wrote the commit and refuses a difference as
+`schema_changed`, and it writes no contract row: the new branch's first
+`__manifest` version is a clone of the version that published the commit, so
+it carries that commit's row, with its sequence once stamp 17 writes one.
+
+Under this RFC that refusal can become narrower: refuse only a differing
+contract that has no sequence. A differing contract that carries a sequence is
+an older contract, and the started branch is then a lagging branch that has
+changed nothing since its merge base, the commit itself. Merging it back, and
+the apply check against it, follow the rules below unchanged. Because the
+sequence is part of the compared identity, a commit from before a rename and
+back compares as different, which the narrower refusal allows. A merge base may hold a sequence-0
 contract with different content, for example from main's history before an
 earlier apply. That is expected: the base is read by content, never by
 sequence.
@@ -293,12 +318,42 @@ A migrated table merges only if:
    target, adopted when it is the source, or tombstoned when the merged
    contract drops the type.
 
-Otherwise the merge is refused with `schema_diverged` before any effect. The
+Otherwise the merge is refused with `schema_diverged` before any effect.
+
+Condition 1 is safe because every contract write that changes a table's
+signature re-pins that table in the same publication, so a version shared by
+both sides already has the merged contract's signature. The merge checks this
+and fails closed: a shared version whose signature differs from the merged
+contract's is an integrity error, not a merge. The
 newer side's version already carries the merged contract's signature,
 including its full-text declarations and index metadata, so no version is
 evolved, prepared or converted. When the older side's registration equals the
 base's, condition 2 is today's adopt or skip route, and the catch-up of an
 untouched table costs a pointer change.
+
+Adopting the newer side's version of a migrated table still needs a
+validation delta for cross-table checks. Today the adopt route builds it by
+comparing the base's and the source's rows by column name, which is the
+cross-shape comparison the prototype's add and rename cases failed on. For a
+migrated table the delta is computed on keys only: inserted and deleted `__id`
+values, and `__src` and `__dst` for edges, which every shape shares because
+schema apply never changes system columns and the system-column upgrade
+refuses while other branches are live. The delta feeds the referential and
+cardinality checks against the merged state, including old and new endpoints
+of edges whose endpoint types were renamed. Value constraints are not
+re-checked: the adopted version is whole and was valid under the newer
+contract. Every supported migration keeps existing rows valid: added
+properties must be nullable, only `@index` can be added as a constraint,
+enums only widen, and type, nullability, key and other constraint changes are
+refused by the planner. A constraint is removed only together with the
+dropped property it names
+([ModernRelay/omnigraph#1062](https://github.com/ModernRelay/omnigraph/pull/1062)),
+which loosens validation. A future migration that tightens validation without
+changing stored columns, such as adding a required or unique property or the
+narrowing steps proposed in
+[ModernRelay/omnigraph#884](https://github.com/ModernRelay/omnigraph/pull/884),
+must enter the stored signature or refuse while a live branch has changed an
+affected table.
 
 Condition 2's signature test is what keeps every comparison within one shape.
 In the normal case the merge base descends from the main commit that wrote the
@@ -321,13 +376,18 @@ cheap paths answer first:
 
 1. Equal registrations: unchanged.
 2. The merge's lineage candidate discovery compares the two versions' data,
-   overlay and deletion files by identity. No candidates means unchanged.
-   Index-only commits keep those files, so an index rebuild costs nothing
-   here.
-3. Otherwise the merge compares the candidate rows, or, where lineage
-   discovery does not apply, the two versions' rows in order. This covers Blob
-   tables, tables on pre-v11 forks and pins without stable row ids or the
-   exact-id key. Compaction therefore changes cost, not the answer.
+   overlay and deletion files by identity. A discovery that completes with no
+   candidates means unchanged. Index-only commits keep those files, so an
+   index rebuild costs nothing here.
+3. Otherwise the merge compares the candidate rows. A discovery that does not
+   complete is not an empty result: when its candidate budget trips, or it
+   does not apply (Blob tables, differing table paths such as pre-v11 forks,
+   a failed version pin, pins without stable row ids or the exact-id key), the
+   merge compares the two versions' rows in order. Compaction therefore
+   changes cost, not the answer. Because condition 2 has already proved both
+   versions have one shape, a user column missing from either side during this
+   comparison is an integrity error, as the comparator already reports it
+   (`schema-gated change row is missing column`), never "unchanged".
 
 Only the older side is checked: the newer side's version is taken whole
 whether or not it changed. Every step is a read of committed versions under
@@ -387,9 +447,12 @@ table effect:
    authority cache per branch and builds a full write capture, and the second
    opens a full snapshot. A base written by a since-deleted branch is accepted
    here.
-4. Apply condition 2 to each such table. Refuse when the branch changed one,
-   or when its base gives the table another signature. Tables a branch can
-   already not merge because of an earlier apply are reported, not refused.
+4. Apply condition 2 to each such table, and refuse exactly when it fails:
+   the branch changed the table since the base, or the base gives the table
+   another signature. There is no other predicate. A table the branch could
+   already not merge because of an earlier apply fails condition 2 again and
+   refuses this apply too, so an apply refusal and the later merge refusal
+   always agree.
 5. Re-list the branch inventory and compare each branch's incarnation and head
    with the first listing; a difference repeats the check for that branch.
 
@@ -398,7 +461,8 @@ its bounded walk (100,000 visits or 32 MiB). Those limits do not cover that
 loading. The check therefore runs under its own per-branch budget on registry
 bytes, index size, history reads and comparison work, fixed by the cost gate
 in `blocked_on`. A branch that exceeds it, or the walk limits, refuses the
-apply with a "cannot prove" message naming the branch. This budget refusal is
+apply with `cannot prove`, naming the branch; it is the third result, beside
+success and a condition-2 refusal, and the user section lists it. This budget refusal is
 the one outcome that can depend on physical state: a table whose rows need an
 ordered comparison costs more after an index rebuild or compaction moved its
 registration. The answer, whenever it is reached, depends only on rows.
@@ -450,7 +514,7 @@ the table after the branch forked.
   [ModernRelay/omnigraph#1012](https://github.com/ModernRelay/omnigraph/pull/1012),
   may add the same fields at its own measured cost.
 - Merge errors gain `schema_diverged`; apply errors gain
-  `branch_changed_table`.
+  `branch_changed_table` and, for the budget result, `branch_check_unproven`.
 - `omnigraph upgrade` gains the stamp-only route to 17.
 - `openapi.json` is regenerated for the new parameter, fields and reasons.
 
@@ -471,7 +535,12 @@ catalog memo and the accepted-catalog cache share one key.
 ### Lance behavior relied on
 
 Reviewed against unmodified Lance 11.0.0 source and the table schema,
-transaction, branch and tag, versioning and data evolution pages.
+transaction, branch and tag, versioning and data evolution pages, and
+rechecked against Lance 13.0.0, the version main pins since
+[ModernRelay/omnigraph#1072](https://github.com/ModernRelay/omnigraph/pull/1072):
+`Manifest::max_field_id` still derives from the schema and the referenced
+data files, `fix_schema` and the default-tokenizer fallback are unchanged, and
+detached commits still take random versions.
 
 - A detached commit writes a new, randomly numbered manifest and never changes
   an existing version, so main's table effects cannot alter a branch's pin.
@@ -492,8 +561,14 @@ transaction, branch and tag, versioning and data evolution pages.
   segment written by schema apply, carries the configured analyzer, as the
   guard `fts_untrained_segment_applies_its_analyzer_to_rows_it_does_not_cover`
   pins. This is why a full-text `@index` enters the stored signature, and why
-  the merge takes the newer side's version with its declaration whole.
-- Lance 11 has no public surface that reads a version through an uncommitted
+  the merge takes the newer side's version with its declaration whole. Since
+  [ModernRelay/omnigraph#1066](https://github.com/ModernRelay/omnigraph/pull/1066)
+  a full-text call on a property with no declared segment is refused with
+  `full_text_index_required` instead of answering with that tokenizer, so a
+  version published without its declaration would refuse searches rather
+  than mis-rank them; the signature rule keeps such a version from being
+  published.
+- Lance 13 has no public surface that reads a version through an uncommitted
   schema change. This RFC needs none, because it never compares versions of
   different shapes.
 
@@ -623,8 +698,9 @@ and signatures this RFC stores, and each only turns a refusal into a merge.
 
 Each assumption above was checked in code at commit `a3af0c85`; the facts
 quoted in Motivation and Design were rechecked at `f53bf4fb` and
-`fe69c039`, and the stamp, the refusals, merge capture and route selection,
-the publisher and the dry run at `9575b044`:
+`fe69c039`, the stamp, the refusals, merge capture and route selection, the
+publisher and the dry run at `9575b044`, and all of these again at `7fd9cc90`,
+after the Lance 13.0.0 upgrade:
 
 - Contract rows: only schema apply and the system-column upgrade produce
   `ManifestChange::SchemaContract` outside tests; the publisher carries the
@@ -643,7 +719,9 @@ the publisher and the dry run at `9575b044`:
   inherited registration names; cleanup retains every live branch's head and
   creation version; `optimize` runs on main.
 - Planner totality: added properties must be nullable, `AddConstraint` is
-  limited to `@index`, enums only widen, and removing an `@index` is refused.
+  limited to `@index`, enums only widen, and removing an `@index` from a
+  property that stays is refused; a drop removes only the constraints that
+  name nothing but the dropped property (#1062).
   Type renames, enum widening, non-full-text indexes and metadata changes have
   no table effect; a full-text `@index` declares its analyzer on the table.
 - Merge: equal-contract capture, one catalog for all images, alias matching,
@@ -657,8 +735,11 @@ the publisher and the dry run at `9575b044`:
   pins without changing rows.
 - Stamps: every manifest scan and every publish refuses an unsupported stamp;
   stamps 15 and 16 were written by first publication; main is at 16.
-- Branch creation at a commit (#1016, open) refuses a commit whose contract
-  differs from the source's current one.
+- Branch creation at a commit (#1016, merged) compares the commit's contract
+  with the contract at the captured head of the branch that wrote it, refuses
+  a difference as `schema_changed`, and writes no contract row.
+- Full-text calls on a property without a declared segment refuse with
+  `full_text_index_required` (#1066).
 
 ### Prototype (2026-10-12)
 
@@ -686,8 +767,8 @@ prototype is not committed; the tests below replace it.
 
 | Owner | Proof |
 |---|---|
-| `tests/schema_apply.rs` | Apply with live untouched branches leaves their pins and contracts; a change to a table a branch changed refuses, naming branch and table; non-table changes never refuse; an index rebuild or compaction on the branch, before or after the apply, never changes the outcome; a Blob table with an index build on the branch, then a drop on main; preview lists affected branches and writes nothing; budget and walk-limit refusals; incarnation recheck |
-| `tests/integration/merge_truth_table.rs` | Each schema change in both directions between main and a branch and between two named branches, with and without the older side changing the table; type add, rename and drop; `Person → Human → Person` with a branch caught up to the middle contract; a property dropped and re-added under the same name with a criss-cross base refuses; the published contract has the larger sequence; the dry run reports the same outcome and writes nothing |
+| `tests/schema_apply.rs` | Apply with live untouched branches leaves their pins and contracts; a change to a table a branch changed refuses, naming branch and table; non-table changes never refuse; an index rebuild or compaction on the branch, before or after the apply, never changes the outcome; a Blob table with an index build on the branch, then a drop on main; preview lists affected branches and writes nothing; a second apply on a table the branch can already not merge refuses with the same branch and table; `cannot prove` on budget and walk limits; incarnation recheck |
+| `tests/integration/merge_truth_table.rs` | Each schema change in both directions between main and a branch and between two named branches, with and without the older side changing the table; type add, rename and drop; `Person → Human → Person` with a branch caught up to the middle contract; a property dropped and re-added under the same name with a criss-cross base refuses; the published contract has the larger sequence; a refusal publishes none of the branch's tables; an adopted migrated table's validation delta reads only system columns and still catches an orphaned edge; a shared version whose signature differs from the merged contract is an integrity error; a lineage discovery that does not complete falls through to the ordered comparison; the dry run reports the same outcome and writes nothing |
 | `tests/integration/merge_fast_forward.rs` | A catch-up adopts main's version of each migrated table and skips untouched ones: route assertions and `ordered_cursor_scan_calls`; a fast forward publishes the contract |
 | `omnigraph-catalog` tests | The ordering property over every pair of commits, including content-equal contracts with different sequences; sequence 0 for pre-17 rows; the publisher refuses a lower sequence or a contract change without lineage |
 | `tests/failpoints.rs`, `tests/detached_commit_matrix.rs` | A cross-contract merge interrupted before publication leaves the branch's contract and pins; after publication both are complete |
@@ -699,6 +780,7 @@ prototype is not committed; the tests below replace it.
 | Cluster `tests.rs` | Deployment no longer refuses a graph with branches; the ledger's `schema_contracts` digest is unchanged by a sequence increment |
 | `db/upgrade/tests.rs`, CLI `crossversion_upgrade.rs` | Stamp 17 on first publication and by the stamp-only route; a stamp-16 binary refuses a stamp-17 main at open and, while already open, at its next scan and publication |
 | `tests/integration/engine_v2_plan_replay.rs` | A plan bound before a catch-up merge refuses replay after it |
+| `tests/integration/branching.rs` | A start at a commit whose contract differs from the writing branch's head refuses with `schema_changed`; once relaxed, a differing contract with a sequence starts a lagging branch and one without a sequence still refuses |
 | Other merge owners | Legacy pre-v11 table forks, Blob tables, inherited interface properties and renamed edge endpoints under a cross-contract merge |
 | DST harness | Schema operations with live branches; the model keeps one contract and sequence per branch |
 | Cost instrument | The `blocked_on` gate |
@@ -801,3 +883,16 @@ in order of increasing machinery.
   the one physical dependence. Group commit (#785), branch creation at a
   commit (#1016) and branch details (#1012) were aligned, and a test owner
   path was corrected.
+- 2026-10-20: Revised after a maintainer review of `4fb15738` and a check of
+  main through `7fd9cc90`. The apply check has one success predicate, the
+  merge rule's condition 2, so a table a branch can already not merge refuses
+  every later apply that changes it; `cannot prove` is named as the third
+  result. The adopted table's validation delta is keys-only again, since
+  today's adopt route compares rows by column name. A refusal is stated to
+  refuse the whole merge, an unfinished lineage discovery falls through to the
+  ordered comparison, a shared version is checked against the merged
+  signature, and the summary's older-binary fence matches the user section.
+  Branch creation at a commit (#1016, merged) is described as it landed, with
+  the narrower refusal this RFC permits. Lance facts were rechecked on 13.0.0
+  (#1072), and the full-text refusal (#1066) and constraint removal with a
+  dropped property (#1062) were recorded.
