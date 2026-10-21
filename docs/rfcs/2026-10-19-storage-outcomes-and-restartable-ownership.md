@@ -290,7 +290,10 @@ for each store:
 
 The scoped store routes each request by class:
 
-- reads, fresh writes and multipart uploads go to the retrying client;
+- reads and fresh writes go to the retrying client;
+- a multipart upload follows its key's class, and its parts, completion and
+  abort follow the upload: an upload to a mutable key stays on the
+  single-attempt client;
 - conditional requests go to the single-attempt client, and only the
   resolver of §2 re-issues them, so every attempt is visible and logged;
 - mutable requests go to the single-attempt client.
@@ -315,6 +318,15 @@ place:
   The scope logs the first unknown request for each key, with its operation,
   class and error kind.
 - ***held transaction files***: unchanged.
+
+The scope also has a ***fence***, stronger than closing it, for an owner
+that has lost its right to write (§7). A fence refuses every later request,
+including the parts, completion and abort of a multipart upload admitted
+before it, and cancels every admitted request still running. A cancelled
+request's future is dropped, so its client sends no further attempt and no
+retry. The cancelled request's caller gets an ambiguous error, not the
+scope's definite refusal, because its last attempt may already be on the
+wire. Reads continue.
 
 Each set is capped, at 4096 keys. Past the cap the scope refuses new
 mutations: writes fail fast, and reads continue. Clean release requires an
@@ -439,10 +451,11 @@ silence from the moment that record is visible. If beat 0 is not
 acknowledged by then, acquisition fails and the process does not serve; the
 lock stays for a successor. After beat 0 is acknowledged, the owner reads
 the claim once more before it admits work. When the timer fires, or a claim exists, the
-owner ***fences***: the lease closes the owner's storage scope before it
-reports the fence, so no mutation is sent after a successor may claim,
-whatever the server's shutdown grace. The server then closes operation
-admission and exits nonzero. It never resumes, because a successor may
+owner ***fences***: the lease fences the owner's storage scope (§4) before
+it reports the fence. Every later request is refused and every admitted one
+is cancelled, so from the fence on the owner sends nothing: no new request,
+no retry and no multipart part, however long its process lives. The server
+then closes operation admission and exits nonzero after its shutdown grace. It never resumes, because a successor may
 already act. A clean
 release stops beating, deletes its lease directory, and releases `lock.json`
 as today, by if-match; if that release fails, the lock is a silent leased
@@ -483,18 +496,20 @@ newest beat it saw became visible, so the takeover happens at least
 `3/2 × lease_seconds` after `s`. The owner fenced by `s + 2/3 ×
 lease_seconds`. The gap, five sixths of a lease, covers clock-rate drift and
 a stalled runtime. A beat that lands after its owner fenced only makes a
-successor refuse once more. Closing the scope refuses every new mutation;
-it does not recall a request the store already accepted. Such a request was
-sent before the fence, within the lease, and lands like a dead owner's: by
-the classes below it cannot corrupt state. A fresh-key put still in its
-client's retry loop re-sends the same bytes to its own fresh name. S3 lists a created
+successor refuse once more. The fence sends nothing after it, so the only
+storage effects that can follow the fence are attempts already on the wire.
+Those were sent before the fence, within the lease, and land like a dead
+owner's: by the classes below they cannot corrupt state. The process may
+outlive the fence by its shutdown grace, but the grace adds no send, so the
+gap needs no term for it. S3 lists a created
 object as soon as the create
 is acknowledged, so a counted beat is visible to every successor's listing.
 A store whose listing lags its creates could hide a beat from a successor,
 and is outside this protocol.
 
-**Why late requests are harmless.** A dead owner's requests were sent before
-its own lease ran out. A request the store applies after the takeover is:
+**Why late requests are harmless.** A dead owner's requests, and a fenced
+owner's, were sent before its own lease ran out. A request the store applies
+after the takeover is:
 
 - a fresh key, unreachable;
 - a conditional request, which applies at most once against the CAS the
@@ -577,6 +592,13 @@ On the deny-list:
   serializes successors but not the old owner: an exact-owner delete it had
   already sent can remove the successor's record. Refused until local roots
   have a conditional update.
+- **Add the shutdown grace to the successor's silence.** A successor would
+  wait out the owner's grace before claiming, and a lease shorter than the
+  grace allows would be refused. That is a second clock the successor cannot
+  see: the grace is the owner's server setting, so the lock record would have
+  to carry it, every takeover would grow by it, and every future operation
+  with its own drain time would add a term. Fencing the scope instead makes
+  a fenced owner send what a crashed one sends.
 - **Heartbeats on the scope's single-attempt client.** One unanswered beat,
   a 503 like the incident's, left the owner one more chance before its
   deadline. It also left the beat key unsettled, so the scope refused the
@@ -593,7 +615,9 @@ The owners to extend:
 
 - **Storage, `scoped::tests::*_issue_1067`.** Request classes and routing;
   per-key refusal; the cap; that a fresh-key failure never blocks another
-  key.
+  key; that a fence cancels an admitted request at every mutation boundary
+  with an ambiguous error, and refuses the parts, completion and abort of an
+  upload admitted before it.
 - **Core, `manifest_request` and the `lance_clone` handler tests.**
   Re-issue, refusal, the held version and the unresolved outcome. These ship
   with #1092.
@@ -690,12 +714,18 @@ phase 3.
   local and Azure locks keep the exact-ID unlock, and a shared network
   filesystem needs no separate rule. Only a server's lock is leased, because
   a CLI writer has nothing that stops its writes on a fence. The first beat
-  races the owner's deadline counted from the lock write, and a fence closes
-  the owner's storage scope before it is reported, so a shutdown grace
-  longer than the fence-to-claim gap sends nothing late. Heartbeats moved off the scope's
+  races the owner's deadline counted from the lock write. Heartbeats moved off the scope's
   single-attempt client to the root's retrying client, an existing beat
   counts from its first send, and §7 defines the empty listing. §2 no longer
   claims every late manifest finds its transaction file: a table's file is
   swept as an orphan after seven days, so the scope's hold stays. §5 is
   limited to linear overwrites. The lease length is settled as
   `OMNIGRAPH_CLUSTER_LEASE_SECONDS`, 2 to 600 seconds, default 30.
+- 2026-10-20: After review, a lease fence fences the owner's storage scope
+  instead of closing it: closing refused new requests but let an admitted
+  request keep retrying and an admitted multipart upload keep sending parts
+  until the process exited, and the default 25 s shutdown grace is longer
+  than the fence-to-claim gap of any lease under 30 s. A fence refuses every
+  later request, multipart parts and cleanup included, and cancels every
+  admitted one, so a fenced owner sends what a crashed owner sends. Adding
+  the grace to the successor's silence is recorded under Alternatives.
