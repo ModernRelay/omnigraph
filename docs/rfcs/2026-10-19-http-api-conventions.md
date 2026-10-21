@@ -7,8 +7,8 @@ implementation: not-started
 authors:
   - Ragnor Comerford
 created: 2026-10-19
-updated: 2026-10-19
-discussion: null
+updated: 2026-10-21
+discussion: https://github.com/ModernRelay/omnigraph/pull/1089
 supersedes: []
 superseded_by: []
 blocked_on: []
@@ -18,246 +18,455 @@ blocked_on: []
 
 ## Summary
 
-The HTTP API gets one written style, enforced by a test over the generated
-`openapi.json`. The style covers paths and parameters, methods and statuses,
-the error body, headers, schemas, pagination and the spec itself. Operations
-that break it are renamed or reshaped. Each incompatible change ships in a
-batch with one HTTP contract bump, never by itself. This RFC changes no
-operation's meaning, authorization or storage effect.
+The HTTP API gets one written style, held by a test over the generated
+`openapi.json`. The style covers names, paths and parameters, headers, schemas,
+lists and the spec's coverage. It adds no second source beside the owners that
+already hold a contract: the `ErrorCode` registry owns codes and statuses, the
+operation table of [Graph access and cross-process writes][graph-access] owns
+operation names, and the shipped code owns branch-action dispatch, the
+fail-closed graph-commit routes and the change-route error schema.
+
+Today's deviations are pinned as named exceptions, so a new one fails CI. One
+batch of renames removes most of them under the next HTTP contract value after
+0.14. The renames change spellings only: operationIds, path parameter names,
+schema names, one response field and one query parameter. No route moves, and
+no status, operation meaning, authorization or storage effect changes.
 
 ## Motivation
 
 The spec grew one route at a time, and each route made its own local choices.
-An audit of the spec at contract 0.14 found the following:
+An audit of `openapi.json` at contract 0.14, 41 operations on 34 paths, found
+the following:
 
-- **operationIds** use four styles: 22 are `cluster_` plus camelCase, 4 are
-  `cluster_` plus snake_case, 5 are snake_case, 4 are camelCase and 2 are a
-  single word. The `cluster_` prefix is left over from routes that no longer
-  exist.
+- **operationIds** use six forms: 22 are `cluster_` plus camelCase, 4
+  `cluster_` plus snake_case, 4 `cluster_` plus one word (`cluster_export`,
+  `cluster_load`, `cluster_mutate`, `cluster_query`), 5 snake_case (the four
+  deployment ids and `health_head`), 4 camelCase (`listGraphs`,
+  `discoverGraphs` and the two OAuth metadata ids) and 2 one word (`health`,
+  `readiness`). `nest_paths_under_cluster_prefix` adds `cluster_` to every
+  per-graph operation so a nested id cannot collide with a flat one. The
+  router no longer serves any flat protected route.
 - **Path parameters** are `{graph_id}`, `{commit_id}`, `{branch}` and `{name}`,
-  except `/cluster/deployments/{id}`.
-- **A branch named `merge`, `diff` or `merge-base`** collides with the static
-  routes `/branches/merge`, `/branches/diff` and `/branches/merge-base`: its
-  delete reaches the static route and answers 405. That defect is fixed on its
-  own, outside this RFC. The convention below keeps it from recurring.
-- **Statuses** are inconsistent:
-  - deletes answer 200 or 204;
-  - creates answer 200, never 201;
-  - a `limit` above its ceiling answers 413, which is meant for bodies;
-  - some reads hide a policy denial as 404 and others answer 403, under no
-    stated rule;
-  - 401 carries no `WWW-Authenticate`.
-- **Responses in the spec**: 500 is documented on 11 of 36 operations, and the
-  `/cluster/*` routes document no 401.
+  plus `{id}` on `/cluster/deployments/{id}` and `{resource_path}` on the OAuth
+  metadata path.
 - **Schemas**:
-  - 62 names end in `*Output`, 11 in `*Request` and 5 in `*Response`;
-  - 7 enum names end in `Output` and 13 don't;
-  - `BlobEntityKind` duplicates `EntityKindOutput`;
-  - `ChangeErrorOutput` is a second error body;
-  - `AccessOutput.actor` sits beside `actor_id` in 9 schemas.
-- **Pagination**:
-  - the parameter names `page_token`, `limit` and `next_page_token` agree;
-  - commits bound `limit` to 1–1000, while diffs and changes state no ceiling;
-  - `/commits` without a limit lists the whole history;
-  - two mutually exclusive booleans (`unpublished`, `unattached`) stand in for
-    one enum;
-  - branch, graph and query lists are not paginated.
+  - of 100 schemas, 65 names end in `Output`, 11 in `Request` and 5 in
+    `Response`;
+  - of 20 string enums, 6 end in `Output` and 14 carry no suffix;
+  - `BlobEntityKind` and `EntityKindOutput` hold the same two values;
+  - `AccessOutput.actor` names the actor that 9 other schemas call `actor_id`.
+- **Lists**:
+  - `page_token`, `limit` and `next_page_token` agree everywhere;
+  - only the commit list puts its ceiling on the schema (`maximum: 1000`); the
+    diffs and commit changes name a ceiling in prose only, and the change
+    feed's `limit` has no description;
+  - `GET /commits` without `limit` and `page_token` lists the whole history;
+  - two exclusive booleans, `unpublished` and `unattached`, select a listing
+    that one enum could;
+  - branch, graph and query lists are not paged.
+- **Responses in the spec**:
+  - 500 is documented on 11 of 41 operations, and no write documents the 500
+    `outcome_unknown` it can send;
+  - the `/cluster/*` routes document no 401;
+  - a graph-route 401 carries no `WWW-Authenticate`, while `/mcp` sends one
+    when OIDC is configured.
+- **Existence hiding** has no written rule. A graph the caller may not see, a
+  stored query it may not invoke, a diff side or a commit's changes on a
+  branch it may not read, and a commit it may not branch from, publish or drop
+  answer 404 `not_found`. Other denials answer 403 `forbidden`,
+  `GET …/commits/{commit_id}` among them.
 - **Coverage**:
-  - `/openapi.json`, `/mcp` and the catalogue routes are served but not in the
-    spec;
-  - there is no `tags` array;
-  - six parameters have no description.
-- **MCP tools** use other names for the same operations:
-  - MCP `query` runs a stored read, while HTTP `POST /query` runs an inline one;
-  - MCP `read` runs an inline query;
-  - tool arguments are `graph` and `name` where HTTP uses `graph_id` and
-    `branch`.
+  - `/openapi.json`, `/mcp` and the catalogue routes under
+    `/graphs/og_catalog` are served but not in the spec;
+  - every operation has a tag, but the spec declares no top-level `tags` array;
+  - six parameters have no description: the change feed's `limit`, `kind`,
+    `type` and `op`, and `branch` on the commit list and the snapshot.
+- **MCP tools** use a third naming form (`branches_list`, `commits_get`)
+  beside the CLI's `branch list`. MCP `query` runs a stored read where
+  `POST …/query` runs an inline one, and MCP `read` runs the inline query.
+  Tool arguments call the graph `graph` where HTTP says `graph_id`.
+
+Statuses are not on this list. `ApiError::status` sends the status of the code
+a response answers, from the `ErrorCode` registry, so the status gaps above
+are documentation gaps.
 
 Each choice was cheap when it was made. Five more routes without a written
-rule would add five more styles, and every client, SDK and the MCP surface
+rule would add five more forms, and every client, SDK and the MCP surface
 would keep paying for each one. One written rule with a test is the smaller
 long-term cost.
 
 ## User and operational behavior
 
-Clients see the conventions below. Nothing changes until a batch ships, and
-each batch is announced with its contract version in a breaking release note.
+Clients see the conventions below. Nothing changes on the wire until the
+rename batch ships under a new contract value, announced in a breaking release
+note.
+
+### Names
+
+- **One name per operation.** The [graph-access RFC's one set of
+  operations][one-set] puts one table in `omnigraph-api-types` that names each
+  graph operation once, with its route, MCP tool and CLI command or a declared
+  exception. The operationId of an operation the table binds is the table's
+  name in lowerCamelCase, with no prefix: `branch list` becomes `branchList`.
+  The inventory test that binds the table's routes, tools and commands also
+  checks the operationId. This RFC chooses no operationId ahead of the table,
+  and until the table lands the lint pins today's ids.
+- **Paths outside `/graphs/{graph_id}`** form classes with their own shapes.
+  The lint knows each class as a row:
+
+| Class | Paths | operationIds |
+|---|---|---|
+| Graph management | `/graphs`, `/graphs/discovery` | `listGraphs`, `discoverGraphs` |
+| Deployment control | `/cluster/plan`, `/cluster/deployments`, `/cluster/deployments/{id}` | `deployment_plan`, `deployment_apply`, `deployment_status`, `deployment_lookup` |
+| Process probes | `/healthz`, `/readyz` | `health`, `health_head`, `readiness` |
+| Protected-resource metadata | `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/{resource_path}` | `oauthProtectedResourceMetadata`, `oauthProtectedResourceMetadataAtResourcePath` |
+| Not in the spec | `/openapi.json`, `/mcp`, `/graphs/og_catalog/…` | none; see [Coverage](#coverage) |
+
+The first four classes are `ALWAYS_FLAT_PATHS` in `handlers.rs`: they stay
+flat and get no prefix. Their operationIds stay pinned rows until the
+operation table binds them. The protected-resource metadata keeps its ids for
+good, because RFC 9728 defines that operation and its path, not OmniGraph.
 
 ### Paths and parameters
 
-- **Resource paths** are plural nouns under `/graphs/{graph_id}`. An action
-  that is not CRUD on a resource is a sub-resource noun (`/merges`, `/diffs`),
-  never a verb, and never a static segment beside a `{param}` in the same
-  collection.
+- **Graph paths** sit under `/graphs/{graph_id}`. A collection is a plural
+  noun (`/branches`, `/commits`, `/queries`, `/changes`), one resource is a
+  singular noun (`/schema`, `/snapshot`, `/access`, `/blob`), and an action is
+  its command word: on the graph (`/query`, `/mutate`, `/load`, `/export`,
+  `/diff`) or on one item (`/commits/{commit_id}/publish`).
+- **Branch actions share `/branches/{branch}` through one dispatch.** The
+  router matches one route for the whole shape, and `BranchAction` in
+  `handlers.rs` owns each action's name, method and handler: POST
+  `/branches/merge` merges, GET or HEAD `/branches/diff` and
+  `/branches/merge-base` read, and DELETE of any name, these three included,
+  deletes that branch. Any other method answers 405 with an `Allow` header
+  naming what that name serves. A new action on a collection joins such a
+  dispatch, so it never shadows an item name. Moving these URLs would be a
+  breaking batch of its own and needs a client reason stronger than path
+  shape.
 - **Path parameters** name their resource: `{graph_id}`, `{branch_name}`,
-  `{commit_id}`, `{query_name}`, `{deployment_id}`.
-- **Query parameters** are snake_case. Booleans are bare adjectives. A choice
-  among values is a string enum, not mutually exclusive booleans.
+  `{commit_id}`, `{query_name}`, `{deployment_id}`. `{resource_path}` keeps
+  its protocol name.
+- **Query parameters** are snake_case. A boolean is a bare adjective
+  (`detailed`, as [#1012][pr-1012] proposes). A choice among values is one
+  string enum, not exclusive booleans.
 
 ### Methods and statuses
 
-- **Methods**: GET reads and never takes a body. A read whose input does not
-  fit a URL is `POST` on a `…/queries`-style resource and is documented as
-  safe. PUT replaces, DELETE removes, POST creates or runs.
-- **Success statuses**: 200 returns a body, 201 creates a resource and names it
-  in the body, 204 returns nothing.
-- **Error statuses**:
-  - 400: any invalid input, including an out-of-range `limit`;
-  - 401: carries `WWW-Authenticate` (RFC #1017 appendix A1);
-  - 403: a denial;
-  - 404: a missing resource, and a denial only under one written
-    existence-hiding rule, stated per resource;
-  - 409: a state conflict;
-  - 412: only for a failed `If-*` precondition;
-  - 413: only for a body;
-  - 429: per actor, with `Retry-After`;
-  - 503: unavailable for the scope the code names, the server, a graph or one
-    branch with a pending publication, with `Retry-After` when retrying is safe.
+- **Methods**: GET reads and takes no body. A read whose input does not fit a
+  URL is a POST (`POST …/query`, `POST …/export`). PUT replaces, DELETE
+  removes, POST creates or runs.
+- **Success**: 200 returns a body and 204 returns none, as the routes do
+  today. A create answers 200 with its receipt (`POST …/branches` returns
+  `BranchCreateOutput`), and so does a delete that reports what it removed
+  (`DELETE …/branches/{branch}` returns `BranchDeleteOutput`). Commit drop has
+  no body and answers 204. `mutate`, `load`, `query` and `merge` run work and
+  create no REST resource, so they answer 200. This RFC adds no 201. Other
+  success and redirect statuses keep their HTTP meaning: 202 when
+  `POST /cluster/deployments` durably accepts a deployment, and 206, 302 and
+  304 on Blob GET (302 and 304 on HEAD too).
+- **Errors**: `ErrorCode` in `omnigraph-api-types` owns every code, the
+  statuses it is sent under and the `disposition` action it asks for.
+  `ApiError::status` sends the status of the code a response answers. The
+  guide and the lint read statuses from the registry and copy none. The
+  conventions below rest on these registry facts at 0.14:
+  - An error body answers 503 only with `service_unavailable` or
+    `graph_unavailable`, which ask for a retry after `Retry-After`, or with
+    `recovery_required`, which asks the caller to recover, not to retry.
+    `/readyz` answers 503 as a probe result while the replica is not ready.
+  - A write the server could not settle answers 500 `outcome_unknown`,
+    whatever failed underneath, with `effects: unknown` and `action:
+    reconcile`. The caller reads the target before writing again and never
+    replays the write, as [Storage outcomes per operation and restartable
+    ownership][storage-outcomes] and the [dispositions][dispositions] of the
+    graph-access RFC decide. An unknown publication blocks nothing: later
+    writes to its branch proceed.
+  - 413 `payload_too_large` covers a body and bounded work: a `limit` above its
+    ceiling, and the entity, byte and chain ceilings of mutate, load, merge,
+    diffs and changes. It asks the caller to split the work. A zero `limit` is
+    400, because the request itself is malformed.
+  - 429 `too_many_requests` covers three caps: an actor's, the server's, and
+    the MCP endpoint's concurrent tool calls.
+  - 412 answers a failed precondition: `actor_mismatch`, or
+    `precondition_failed` for a graph commit or a Blob `If-Match`.
+  - The spec uses the error statuses 400, 401, 403, 404, 405, 408, 409, 410,
+    412, 413, 415, 416, 424, 429, 500 and 503. Draft [#951][pr-951] adds 422
+    `view_limit_exceeded`.
 
-### Error body and headers
+### Headers and preconditions
 
-- **The error body** is one `ErrorOutput` with `error`, `code` and
-  `disposition` required. Each code has one meaning, a detail field that
-  carries the code's own name, and documentation of the statuses it is sent
-  under. `ChangeErrorOutput` folds into it.
-- **Headers** are written in Title-Case as `Omnigraph-*`. A request
-  precondition is `Omnigraph-If-*` and answers 412. Standard headers are used
-  where they apply: `If-Match`/`ETag`, `Retry-After`, `Cache-Control`,
-  `Content-Type`.
+- **Spelling**: OmniGraph headers are `Omnigraph-*`, published in Title-Case
+  as `display_header_name` writes them. Standard headers keep their names and
+  HTTP meaning: `If-Match`, `If-None-Match`, `Range`, `If-Range` and `ETag` on
+  Blob cells, and `Retry-After`, `Cache-Control`, `Allow` and `Content-Type`.
+- **Preconditions**: an OmniGraph precondition is an `Omnigraph-If-*` header,
+  and a failed one answers 412 with its code. Standard conditional headers keep
+  their HTTP statuses: a Blob `If-None-Match` match answers 304, and a failed
+  Blob `If-Match` answers 412.
+- **The graph-commit precondition keeps its two fail-closed routes.**
+  `POST …/mutate/if-graph-commit` and `POST …/queries/{name}/if-graph-commit`
+  require `Omnigraph-If-Graph-Commit` and refuse a missing, empty, duplicate or
+  entity-tag value with 400. `POST …/mutate` and `POST …/queries/{name}`
+  refuse the header with 400 and name the conditional route
+  (`reject_graph_commit_expected_head`). A dropped header therefore never runs
+  an unconditional write. MCP `mutate` takes the conditional handler when
+  `if_graph_commit` is set. This RFC chooses these two operations over one
+  route with an optional header. A future precondition whose absence would
+  turn a conditional write into an unconditional one takes the same shape.
+- **`Omnigraph-If-Actor`** stays optional on every protected route. It only
+  checks the actor the credential already resolved: a match changes nothing,
+  and a mismatch answers 412 `actor_mismatch` before graph lookup.
 
-### Schemas and pagination
+### Error bodies
 
-- **Schema names**: request bodies are `*Request` and responses `*Output`.
-  Enums carry no suffix. One schema exists per concept.
-- **Field names**: identifiers are `*_id`, the actor is `actor_id`, times are
-  `*_at` in int64 epoch microseconds, and an absent optional field is omitted
-  rather than `null`.
-- **Lists** are `{<plural>: [...], next_page_token}`. `limit` has a documented
-  default and maximum, every list is bounded, and a list without a page token
-  returns at most the default.
+- **One runtime body.** Servers serialize `ErrorOutput`, with `error`, `code`
+  and `disposition` on every error response, and typed details beside them.
+- **A route family publishes the subset it can set.** The change routes
+  (`…/changes`, `…/changes/baseline`, `…/commits/{commit_id}/changes`,
+  `…/diff`, `…/branches/diff`, `…/branches/merge-base`) publish
+  `ChangeErrorOutput`, a wire-compatible projection of `ErrorOutput`.
+  `change_route_error` is an allowlist and turns every other engine error into
+  a fixed 500, so a new `OmniError` cannot put a storage identifier on the
+  wire. The projection does not advertise `key_conflict`, `merge_conflicts` or
+  `read_set_conflict`, which those routes cannot send. This RFC keeps it.
 
-### The spec
+### Schemas and fields
 
-- **Coverage**: every served route is in the spec, `/mcp` included as a
-  described operation.
-- **operationIds** are lowerCamel `verbNoun` with no prefix, and every
-  operation has a tag from a declared `tags` array.
-- **Shared responses** (400, 401, 404, 405, 412, 429, 500, 503) are injected
-  into every protected operation from one place, as the contract header is.
-- **MCP tools** take the operation names and argument names of the HTTP
-  operation they wrap, as RFC #1017's one operation table requires.
+- **Schema names**: a request body is `*Request`, a response is `*Output`, and
+  an enum carries no suffix. One schema exists per concept. A published
+  projection such as `ChangeErrorOutput` is a named row in the table.
+- **Field names**: identifiers are `*_id`, the actor is `actor_id`, and times
+  are `*_at` in int64 epoch microseconds, as the commit and write schemas
+  already are. A new optional field is omitted when absent rather than `null`.
+  Existing fields keep their encoding.
+
+### Lists
+
+- **Shape**: a page carries its items under a plural name beside
+  `next_page_token`, with `limit` and `page_token` parameters, as every paged
+  list does today.
+- **Bounds are documented**: every `limit` states its default and its ceiling,
+  in its description and as the schema's `minimum` and `maximum`. A `limit`
+  above the ceiling keeps its 413. Today only the commit list does this.
+- **A new list is paged from its first release.** Today's unbounded lists stay
+  as they are: `GET /commits` without `limit` and `page_token` lists the whole
+  history, and the branch, graph and query lists are not paged. Bounding them
+  changes what a caller receives, so it is a page-token design of its own and
+  not part of this RFC. That design also owns the branch-list `details` that
+  #1012 adds, so the branch page is designed once.
+
+### Coverage
+
+- **Every graph, management and deployment route is in the spec**, with a tag
+  from a declared top-level `tags` array.
+- **Two surfaces are documented elsewhere.** `GET /openapi.json` is not
+  self-listed, as the [server guide](../user/operations/server.md) says. `/mcp`
+  is the MCP endpoint: MCP's `tools/list` and the
+  [MCP guide](../user/operations/mcp.md) describe its tools, which one OpenAPI
+  operation cannot.
+- **The catalogue is a reserved graph id.** `og_catalog` is the scope every
+  binary serves without a store, and the `og_` prefix is reserved for system
+  graph ids. Only `POST /graphs/og_catalog/query` and
+  `GET /graphs/og_catalog/schema` serve it, with the bodies of `POST …/query`
+  and `GET …/schema`, and the query refuses `branch` and `snapshot`. Every
+  other path under the prefix answers 405 `method_not_allowed` before any
+  effect (`handlers/catalogue.rs`). The spec documents the reserved id and
+  these refusals on the `graph_id` parameter, not as a second query operation
+  ([catalogue guide](../user/queries/catalogue.md)).
 
 ## Design
 
-**One source.** The conventions live in `docs/dev/http-api.md`, a developer
-guide this RFC adds. `openapi::spec_follows_the_api_conventions`, a new
-server test beside the OpenAPI drift test, checks the generated spec against
-them:
+**One table.** `docs/dev/http-api.md`, a developer guide this RFC adds, holds
+the conventions as one table: each rule, the paths and operations it applies
+to, and each pinned exception with its reason. `openapi::spec_follows_the_api_conventions`,
+a new test in `crates/omnigraph-server/tests/integration/openapi.rs` beside
+`openapi_spec_is_up_to_date`, reads that table and checks the generated spec
+against it, as `skill_command_index_lists_every_public_command` in
+`crates/omnigraph-cli/src/skill.rs` reads the skill's command index. The
+guide's prose explains the table. No rule has a second copy in Rust.
 
-- operationId style and uniqueness;
-- path parameter names, and no static segment beside a `{param}`;
-- Title-Case header names, and that `If-*` alone answers 412;
-- the required error-body fields;
+The lint checks shape:
+
+- operationId uniqueness, and the table's rendering for each operation the
+  operation table binds;
+- path classes and path parameter names;
+- parameter names, and a description on every parameter;
+- header spelling;
 - schema name suffixes;
-- every list operation's `limit` bounds;
-- a description on every parameter;
-- the shared responses on every protected operation;
-- a tag on every operation.
+- each `limit`'s documented default and ceiling;
+- a tag on every operation, from the declared `tags` array.
 
-An exception is a named, reviewed row in the test, as `forbidden_apis` pins
-its exceptions, so a new deviation fails CI instead of joining the spec.
+It reads statuses instead of listing them. A response whose description names
+a registry code must document a status that `ErrorCode::http_statuses` lists
+for that code. On today's spec that check finds no mismatch. The responses the
+router produces stay with `describe_contract` in `http_contract.rs`, which
+already adds 400 `api_contract_mismatch`, 404, 405 and 412 `actor_mismatch`
+to every protected operation, 429 and 503 to graph and deployment routes, and
+408 and 413 to those of them that take a body. The lint adds no response to
+any operation.
 
-**Batches.** A batch is the set of renames and reshapes that ship under one
-HTTP contract bump. The server accepts exactly one contract, so a batch moves
-clients and servers together, as 0.13 and 0.14 did. Additive changes, such as
-new optional fields, newly documented responses and descriptions, need no
-bump and land whenever the lint does.
+The lint extends the checks that already live in that file:
+`openapi_operations_have_tags`, `multi_mode_operation_ids_are_unique`, the
+Title-Case header check in
+`openapi_describes_api_contract_admission_and_response_identity`, and
+`change_error_output_schema_matches_every_change_route_detail`, which pins the
+change-route projection.
+
+An exception is a named, reviewed row in the table, as `forbidden_apis` pins
+its exceptions, so a new deviation fails CI instead of joining the spec. Some
+rows are permanent classes, such as protocol-defined paths and process
+probes. Each other row names the batch or design that removes it.
+
+**Batches.** A batch is the set of renames that ship under one HTTP contract
+value. The server accepts exactly one: `require_contract` refuses every other
+value before graph lookup. A batch therefore moves clients and servers
+together, as 0.13 and 0.14 did. Additive changes, such as newly documented
+responses, bounds and descriptions, need no new value and land with the lint.
+
+**Not in this RFC.** Statuses, operation names, the change-route schema, the
+conditional routes and the branch-action URLs keep their owners. Merging
+`/load` with `/load/ndjson`, or `/diff` with `/branches/diff`, would merge
+operations with different bodies and meanings; the operation table decides
+operations, so neither merge is proposed here. Bounded lists are the separate
+page-token design above. `WWW-Authenticate` on graph-route 401s is appendix
+[A1][a1] of the graph-access RFC and issue
+[#1020](https://github.com/ModernRelay/omnigraph/issues/1020).
 
 ## Invariants
 
 - Invariant 9: query semantics stay typed. The conventions rename transport
   shapes, never query semantics.
-- Invariant 10: trust stays at the boundary. Only `Omnigraph-If-*` headers can
-  narrow a request, and no header supplies identity.
-- Invariant 11: failures are bounded and observable. The error body and
-  `Retry-After` make the outcome explicit on every refusal.
-- Invariant 12: one source of truth. The conventions guide is the source, the
-  lint derives from it, and the MCP names derive from the operation table.
+- Invariant 10: trust stays at the boundary. No header supplies the trusted
+  actor: the bearer credential resolves it, and `Omnigraph-If-Actor` only
+  checks the actor the credential already resolved.
+- Invariant 11: failures are bounded and observable. A retry is what a code's
+  `disposition` asks for. An unsettled write answers 500 `outcome_unknown` and
+  is reconciled, never replayed. No convention here asks for a retry the
+  registry does not.
+- Invariant 12: one source of truth. The conventions are one table that the
+  lint reads. Statuses stay in `ErrorCode`, router responses in
+  `describe_contract`, operation names in the operation table and the
+  change-route schema in `ChangeErrorOutput`. This RFC copies none of them.
 
 No deny-list item is involved.
 
 ## Compatibility and reversibility
 
-The lint and additive documentation are free to land and to revert. Each
-breaking batch is one contract bump with a breaking release note listing
-every rename. Only `openapi.json` and the HTTP routes change: no storage,
-query or authorization contract. Old route spellings are not kept as aliases,
-because the server accepts one contract. A reverted batch is another bump.
+The lint, its table and the additive documentation are free to land and to
+revert. The rename batch takes one new contract value, with one breaking
+release-note row per change:
+
+| Change | Where | Breaking-note row |
+|---|---|---|
+| operationIds rendered from the operation table, without `cluster_` | Every operation under `/graphs/{graph_id}` | Regenerate SDKs. Method names change; the wire does not. |
+| `{branch}` becomes `{branch_name}`, `{name}` becomes `{query_name}`, `{id}` becomes `{deployment_id}` | `/branches/{branch}`; `/queries/{name}` and `/queries/{name}/if-graph-commit`; `/cluster/deployments/{id}` | SDK argument names change; URLs do not. |
+| `*Response` becomes `*Output`; enums drop `Output`; `BlobEntityKind` and `EntityKindOutput` become one `EntityKind` | The 5 `*Response` schemas and the 6 `*Output` enums | SDK type names change; values do not. |
+| `AccessOutput.actor` becomes `actor_id` | `GET …/access`, MCP `access`, `omnigraph access --json` | Read `actor_id`. The CLI's access protocol moves from 1 to 2. |
+| `unpublished` and `unattached` become one `listing` enum: `history` (the default), `unpublished`, `unattached` | `GET …/commits` | Send `listing=unpublished` for `unpublished=true`. Those listings still refuse `limit` and `page_token`. |
+
+Dropping `cluster_` updates `multi_mode_openapi_prefixes_operation_ids_with_cluster`
+to assert the table's ids. Uniqueness then rests on
+`multi_mode_operation_ids_are_unique` and the lint. Old spellings are not kept
+as aliases, because the server accepts one contract: a client that still sends
+0.14 is refused with 400 `api_contract_mismatch` before graph lookup. The
+batch changes names in `openapi.json` and two wire spellings, `actor_id` and
+`listing`; no storage, query or authorization contract changes. A reverted
+batch is another new value.
 
 ## Alternatives
 
-- **Do nothing.** Every new route keeps adding a style, the generated SDKs
-  keep exposing four operationId conventions, and the MCP and HTTP names keep
-  drifting.
-- **Fix each inconsistency when its route is touched.** This spreads
-  breaking renames over many bumps, so clients migrate many times.
+- **Do nothing.** Every new route keeps adding a form, the generated SDKs keep
+  exposing six operationId forms, and the MCP and HTTP names keep drifting.
+- **Fix each inconsistency when its route is touched.** This spreads breaking
+  renames over many contract values, so clients migrate many times.
 - **Adopt an external linter (Spectral) with a public ruleset.** A public
-  ruleset covers generic rules, but not the ones specific to OmniGraph, such
-  as `If-*` alone answering 412, the shared-response set or the error-body
-  fields. A Rust test over the generated spec keeps the check beside the
-  existing OpenAPI drift test and needs no new toolchain. Spectral can still
-  run in CI later if the generic rules are wanted.
+  ruleset covers generic rules, but not the ones specific to OmniGraph: the
+  operation-table rendering, the registry-derived status check or the pinned
+  classes. A Rust test over the generated spec stays in the existing owner and
+  needs no new toolchain. Spectral can still run in CI later if the generic
+  rules are wanted.
+- **A status table in the guide.** It would be a second list beside
+  `ErrorCode`, and it would drift from what `ApiError::status` sends.
+- **One mutate route with an optional `Omnigraph-If-Graph-Commit`.** A client
+  that drops the header would run an unconditional write.
+- **Moving the branch actions off `/branches/{branch}`.** `BranchAction`
+  already lets every branch name be deleted and keeps the action URLs; a move
+  would make every client migrate for path shape alone.
+- **201 for creates, and 400 for a `limit` above its ceiling.** Both change
+  what callers observe. A create already returns its receipt with 200, and 413
+  tells the caller to split the work, where 400 says the request is malformed.
+- **One error schema for every route.** It would advertise conflict details on
+  change routes that cannot send them.
 
 ## Evidence and tests
 
 - `crates/omnigraph-server/tests/integration/openapi.rs` owns the new lint,
-  beside `openapi_spec_is_up_to_date`.
-- Each batch updates the existing route owners: `data_routes`, `auth_policy`,
-  `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings` and `mcp`,
-  plus the CLI's `GraphHttpClient` and managed fixtures.
-- The branch-name collision gets its own regression in `data_routes` with its
-  fix.
+  beside `openapi_spec_is_up_to_date`, and extends the checks named in
+  [Design](#design).
+- The rename batch updates the existing route owners: `data_routes`,
+  `auth_policy`, `schema_routes`, `stored_queries`, `multi_graph`,
+  `boot_settings` and `mcp`, plus the CLI's `GraphHttpClient`, its access
+  command and managed fixtures, and
+  `multi_mode_openapi_prefixes_operation_ids_with_cluster`.
+- The conventions this RFC writes down are already held:
+  `data_routes::remote_branch_delete_flow_works` creates and deletes branches
+  named `merge`, `diff` and `merge-base` and checks the 405 `Allow` header of
+  every other method, and `data_routes::mutate_graph_commit_precondition_issue_365`
+  holds the fail-closed conditional route.
 
 ## Rollout
 
-1. **The lint and the guide.** Exceptions are pinned as they stand today.
-   This is additive and can land now.
-2. **The 0.14 batch, with the RFC #1017 stack.** The stack already bumps the
-   contract. It brings the error body in line (`disposition`, required fields,
-   one code per meaning, documented statuses), plus `Omnigraph-If-Actor`,
-   Title-Case headers and the shared responses.
-3. **The next contract batch**:
-   - operationIds without the prefix;
-   - path parameter names;
-   - 201 and 204;
-   - `limit` bounds, and 400 above them;
-   - `*Response` renamed to `*Output`;
-   - enum suffixes;
-   - the `ChangeErrorOutput` fold;
-   - `actor` renamed to `actor_id`;
-   - pagination on branch, graph and query lists;
-   - `WWW-Authenticate` on 401.
-4. **Route reshapes**, each listed in the batch it ships with:
-   - `/mutate/if-graph-commit` and `/queries/{name}/if-graph-commit` fold into
-     an optional `Omnigraph-If-Graph-Commit` header on the main routes;
-   - `/load` and `/load/ndjson` become one operation selected by
-     `Content-Type`;
-   - `/diff` and `/branches/diff` merge;
-   - the static `/branches/*` actions move off the branch collection;
-   - MCP tool names follow the operation table.
+1. **The lint, its table and the additive documentation.** Today's exceptions
+   are pinned as they stand. The same change documents the six missing
+   parameter descriptions, the `limit` bounds of diffs and changes, 401 on the
+   `/cluster/*` routes, the 500 each handler can send (`outcome_unknown` on a
+   write included), the top-level `tags` array and the reserved `og_catalog`
+   id. It needs no new contract value and can land now.
+2. **The rename batch**, under the next contract value after 0.14, once the
+   operation table lands in `omnigraph-api-types`, so that the operationIds
+   render from it. Its rows are the table in
+   [Compatibility and reversibility](#compatibility-and-reversibility).
+   Contract 0.14 already shipped with the graph-access stack
+   ([#1074](https://github.com/ModernRelay/omnigraph/pull/1074) and
+   [#1076](https://github.com/ModernRelay/omnigraph/pull/1076)):
+   `disposition`, the code registry and `Omnigraph-If-Actor`. Nothing in this
+   RFC rides it.
 
-`implementation` moves to `in-progress` with step 1 and to `complete` when the
-lint carries no exception rows.
+`implementation` moves to `in-progress` with step 1 and to `complete` when
+step 2 ships and only the permanent classes and the rows owned by the
+page-token design remain in the table.
 
 ## Unresolved questions
 
-- Should the existence-hiding rule be "hide on every read of a resource the
-  caller cannot read", or only on commits and stored queries as today?
-- Should the static branch actions move to `/graphs/{graph_id}/merges` and
-  similar top-level resources, or under `/graphs/{graph_id}/branches/{branch_name}/…`?
+- **Existence hiding.** `not_found` already says the caller may not learn that
+  a resource exists, and [Motivation](#motivation) lists where a denial answers
+  404 today and where it answers 403. Draft #951 refuses a view-restricted
+  read with 403 `view_restricted`, and a hidden name there produces the same
+  error as an undeclared one. Which rule decides between 404 and 403 for each
+  resource, and should #951's view model settle it rather than this RFC?
 
 ## Decision log
 
 - 2026-10-19: Drafted from an audit of the spec at contract 0.14. Ragnor
   chose to fix the branch-name collision now, on its own, and to carry the
   remaining conventions and migrations in this RFC.
+- 2026-10-21: Revised after review on #1089 so that no rule sits beside a
+  contract the code already enforces. Statuses stay with `ErrorCode` and
+  `describe_contract`: the status table, the shared-response injection, the
+  pending-publication 503, 201 and the 413-to-400 move are gone, and an
+  unsettled write stays 500 `outcome_unknown`. Names derive from the
+  graph-access operation table, the `cluster_` prefix drops in the rename
+  batch, and the non-graph path classes are named. The fail-closed conditional
+  routes, `ChangeErrorOutput` and the `BranchAction` dispatch stay; the
+  branch-action move and the route merges are dropped. The renames take the
+  next contract value after 0.14, bounded lists become a page-token design
+  shared with #1012, the audit counts were refreshed against `openapi.json`,
+  and the conventions became one table the lint reads.
+
+[graph-access]: 2026-10-16-graph-access-serving-and-cross-process-writes.md
+[one-set]: 2026-10-16-graph-access-serving-and-cross-process-writes.md#one-set-of-operations
+[dispositions]: 2026-10-16-graph-access-serving-and-cross-process-writes.md#dispositions-and-refusals
+[a1]: 2026-10-16-graph-access-serving-and-cross-process-writes.md#a1-www-authenticate-on-every-401
+[storage-outcomes]: 2026-10-19-storage-outcomes-and-restartable-ownership.md
+[pr-1012]: https://github.com/ModernRelay/omnigraph/pull/1012
+[pr-951]: https://github.com/ModernRelay/omnigraph/pull/951
