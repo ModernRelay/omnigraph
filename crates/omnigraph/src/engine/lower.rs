@@ -21,6 +21,7 @@ use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use datafusion::physical_plan::execution_plan::EmissionType;
 use omnigraph_compiler::ir::SubqueryPredicate;
 use omnigraph_compiler::query::ast::LoadStmtMode;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
@@ -474,10 +475,22 @@ impl<'l, 'a> Walk<'l, 'a> {
             .into()
     }
 
-    /// The one operator of node `id`.
+    /// The one operator of node `id`; DataFusion's `AggregateExec`, the one
+    /// operator not built through a shape, has its emission compared against
+    /// the plan's cut (`Final` while its input order mode is linear).
     fn built(&mut self, id: NodeId, operator: impl ExecutionPlan) -> Lowers<Plan> {
         let plan: Plan = Arc::new(operator);
         let node = self.lowering.node(id)?;
+        if matches!(node, PhysicalNode::Aggregate { .. })
+            && plan.properties().emission_type != EmissionType::Final
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "node {id} `Aggregate` is a pipeline breaker in the plan but `{}` emits {:?}",
+                plan.name(),
+                plan.properties().emission_type,
+            ))
+            .into());
+        }
         if matches!(
             node,
             PhysicalNode::Projection { .. }

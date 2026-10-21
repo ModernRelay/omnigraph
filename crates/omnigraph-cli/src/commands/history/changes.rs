@@ -69,7 +69,6 @@ pub(crate) async fn run_changes(
 ) -> Result<()> {
     match command {
         ChangesCommand::Poll {
-            uri,
             branch,
             cursor,
             start,
@@ -81,17 +80,9 @@ pub(crate) async fn run_changes(
             json,
         } => {
             let settings = client::parse_set_flags(&settings)?;
-            let client = GraphClient::resolve(
-                scope.operator,
-                scope.capability,
-                scope.server,
-                scope.graph,
-                uri,
-                scope.profile,
-                scope.store,
-                stderr,
-            )
-            .await?;
+            let client =
+                GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                    .await?;
             let filter = ChangeFilter::from_args(kinds, types, ops);
             let filter = filter.as_args();
             let pagination = Pagination::from_args(None, limit);
@@ -142,7 +133,6 @@ pub(crate) async fn run_changes(
             }
         }
         ChangesCommand::Baseline {
-            uri,
             branch,
             kinds,
             types,
@@ -150,17 +140,9 @@ pub(crate) async fn run_changes(
             out,
             json,
         } => {
-            let client = GraphClient::resolve(
-                scope.operator,
-                scope.capability,
-                scope.server,
-                scope.graph,
-                uri,
-                scope.profile,
-                scope.store,
-                stderr,
-            )
-            .await?;
+            let client =
+                GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                    .await?;
             let filter = ChangeFilter::from_args(kinds, types, ops);
             let filter = filter.as_args();
             capture_baseline(&client, branch.as_deref(), &filter, &out, json, stdout).await?;

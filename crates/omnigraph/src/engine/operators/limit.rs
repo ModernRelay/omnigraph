@@ -6,32 +6,37 @@ use std::sync::Arc;
 
 use datafusion::common::Result as DfResult;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use futures::StreamExt;
 
-use super::{empty_stream, polled, streaming_properties};
+use super::shape::{Mapped, Streaming, empty};
 
-#[derive(Debug)]
 pub(crate) struct LimitExec {
     input: Arc<dyn ExecutionPlan>,
     rows: usize,
-    properties: Arc<PlanProperties>,
+    shape: Streaming,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl LimitExec {
     pub(crate) fn new(input: Arc<dyn ExecutionPlan>, rows: usize) -> Self {
-        let properties = streaming_properties(input.schema());
+        let shape = Streaming::new(input.schema());
         Self {
             input,
             rows,
-            properties,
+            shape,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+}
+
+impl fmt::Debug for LimitExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LimitExec")
+            .field("rows", &self.rows)
+            .finish_non_exhaustive()
     }
 }
 
@@ -51,7 +56,7 @@ impl ExecutionPlan for LimitExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -84,40 +89,23 @@ impl ExecutionPlan for LimitExec {
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "LimitExec has one partition");
         if self.rows == 0 {
-            return Ok(polled(&self.metrics, empty_stream(self.schema())));
+            return Ok(empty(&self.metrics, self.schema()));
         }
         let input = self.input.execute(0, ctx)?;
-        let baseline = BaselineMetrics::new(&self.metrics, 0);
-        let stream =
-            futures::stream::try_unfold((input, self.rows), move |(mut input, remaining)| {
-                let baseline = baseline.clone();
-                async move {
-                    if remaining == 0 {
-                        baseline.done();
-                        return Ok(None);
-                    }
-                    match input.next().await {
-                        Some(Ok(batch)) => {
-                            let taken = batch.num_rows().min(remaining);
-                            let batch = if taken < batch.num_rows() {
-                                batch.slice(0, taken)
-                            } else {
-                                batch
-                            };
-                            baseline.record_output(taken);
-                            Ok(Some((batch, (input, remaining - taken))))
-                        }
-                        Some(Err(error)) => Err(error),
-                        None => {
-                            baseline.done();
-                            Ok(None)
-                        }
-                    }
-                }
-            });
-        Ok(polled(
-            &self.metrics,
-            Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream)),
-        ))
+        let mut remaining = self.rows;
+        Ok(self.shape.map(&self.metrics, input, move |batch| {
+            let taken = batch.num_rows().min(remaining);
+            let batch = if taken < batch.num_rows() {
+                batch.slice(0, taken)
+            } else {
+                batch
+            };
+            remaining -= taken;
+            Ok(if remaining == 0 {
+                Mapped::Last(batch)
+            } else {
+                Mapped::Batch { batch, lease: None }
+            })
+        }))
     }
 }

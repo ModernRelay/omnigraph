@@ -46,6 +46,7 @@ use lance_file::version::LanceFileVersion;
 use lance_table::format::Fragment;
 
 use crate::error::{OmniError, Result};
+use crate::manifest_request::ManifestRequestProbe;
 use crate::migrations::{
     INTERNAL_MANIFEST_SCHEMA_VERSION, guard_row_layout, read_stamp, stamp_entry,
 };
@@ -105,6 +106,29 @@ async fn overwrite_placed(
     cold: Option<&LineageRegistry>,
     placement: Placement,
 ) -> Result<(Dataset, RecordBatch)> {
+    let probe = ManifestRequestProbe::new();
+    overwrite_probed(dataset, rows, cold, placement, probe.clone())
+        .await
+        .map_err(|error| {
+            // Every failure before the conditional manifest create, and one
+            // the store refused outright, publishes nothing: no request for
+            // the version can land. A request that may have applied stays
+            // opaque for the publisher's read-back.
+            if probe.outcome().may_have_landed() {
+                error
+            } else {
+                error.unpublished()
+            }
+        })
+}
+
+async fn overwrite_probed(
+    dataset: Dataset,
+    rows: &ManifestRows,
+    cold: Option<&LineageRegistry>,
+    placement: Placement,
+    probe: ManifestRequestProbe,
+) -> Result<(Dataset, RecordBatch)> {
     guard_row_layout(&dataset)?;
     let mut metadata = dataset.schema().metadata.clone();
     let (stamp_key, stamp_value) = stamp_entry(INTERNAL_MANIFEST_SCHEMA_VERSION);
@@ -149,6 +173,9 @@ async fn overwrite_placed(
         initial_bases: None,
     };
     let mut transaction = TransactionBuilder::new(dataset.version().version, operation).build();
+    let handler = crate::lance_clone::probed_commit_handler(&dataset, probe)
+        .await
+        .map_err(OmniError::storage)?;
     let builder = match placement {
         Placement::Linear => CommitBuilder::new(dataset).with_max_retries(0),
         Placement::Detached { properties } => {
@@ -159,6 +186,7 @@ async fn overwrite_placed(
         }
     };
     let committed = builder
+        .with_commit_handler(handler)
         .with_skip_auto_cleanup(true)
         .execute(transaction)
         .await

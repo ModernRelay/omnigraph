@@ -63,7 +63,7 @@ use sha2::Digest as _;
 
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
-use crate::storage::{StorageAdapter, storage_for_uri};
+use crate::storage::StorageAdapter;
 
 use super::{CsrIndex, GraphIndex, TypeIndex};
 
@@ -606,29 +606,12 @@ fn decode_body(header: &Header, payload: &[u8]) -> Result<GraphIndex> {
 pub(crate) async fn load(
     snapshot: &Snapshot,
     edge_types: &HashMap<String, (String, String)>,
-    adapter: Option<&dyn StorageAdapter>,
+    adapter: &dyn StorageAdapter,
 ) -> Option<(GraphIndex, Vec<TableStamp>)> {
-    let root = snapshot.root_uri();
-    let uri = artifact_uri(root);
-    // Prefer the caller's adapter (the db's own, possibly instrumented or
-    // injected — a fallback-constructed adapter would bypass IO counting and
-    // any injected configuration); derive one from the root URI only when no
-    // owning adapter exists (the Direct builder).
-    let fallback;
-    let adapter: &dyn StorageAdapter = match adapter {
-        Some(a) => a,
-        None => match storage_for_uri(root) {
-            Ok(a) => {
-                fallback = a;
-                fallback.as_ref()
-            }
-            Err(e) => {
-                tracing::debug!(target: "omnigraph::graph_index", error = %e,
-                    "graph index artifact store unavailable; building in memory");
-                return None;
-            }
-        },
-    };
+    // The owning handle's adapter: an adapter derived from the root URI would
+    // bypass IO counting, any injected configuration and the handle's storage
+    // binding.
+    let uri = artifact_uri(snapshot.root_uri());
     let bytes = match adapter
         .read_bytes_if_exists_bounded(&uri, MAX_ARTIFACT_BYTES)
         .await

@@ -641,14 +641,13 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         "params": {"name": "contract-write", "age": 27}
     })
     .to_string();
-    let expected_message = format!(
-        "exactly one {HTTP_API_CONTRACT_HEADER} header with value {HTTP_API_CONTRACT} is required"
-    );
+    let expected_message =
+        format!("exactly one Omnigraph-Http-Api header with value {HTTP_API_CONTRACT} is required");
     let cases = [
         Vec::new(),
         vec![HeaderValue::from_static("0.11")],
         vec![HeaderValue::from_static("0.12")],
-        vec![HeaderValue::from_static("0.14")],
+        vec![HeaderValue::from_static("0.13")],
         vec![HeaderValue::from_str(&format!("{HTTP_API_CONTRACT}, {HTTP_API_CONTRACT}")).unwrap()],
         vec![
             HeaderValue::from_static(HTTP_API_CONTRACT),
@@ -756,7 +755,7 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         .clone()
         .oneshot(
             Request::post(g("/mutate"))
-                .header("Omnigraph-Http-Api", "0.13")
+                .header("Omnigraph-Http-Api", HTTP_API_CONTRACT)
                 .header("authorization", "Bearer demo-token")
                 .header("content-type", "application/json")
                 .body(Body::from(payload))
@@ -787,6 +786,210 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
             HTTP_API_CONTRACT
         );
     }
+}
+
+/// A request refused before any handler runs, because no route or method
+/// matches or its body, query string or path parameter does not decode,
+/// answers the error body every other refusal does.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_and_unrouted_requests_answer_the_error_body() {
+    use omnigraph_server::api::{
+        DispositionAction, DispositionEffects, DispositionOutput, ErrorCode,
+    };
+
+    let (temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let graph = graph_path(temp.path());
+    let before = manifest_dataset_version(&graph).await;
+    let request = |method: Method, path: &str, body: &'static str| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer demo-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let cases = [
+        // A body that is not JSON, and JSON of the wrong shape.
+        (
+            request(Method::POST, &g("/load"), "{"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/load"), r#"{"data":5}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/branches"), r#"{"name":5}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/changes/baseline"), "{"),
+            StatusCode::BAD_REQUEST,
+        ),
+        // Query strings that do not decode.
+        (
+            request(Method::GET, &g("/snapshot?branch=a&branch=b"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/load/ndjson?mode=sideways"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits?limit=many"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        // Path parameters that are not UTF-8.
+        (
+            request(Method::DELETE, &g("/branches/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::DELETE, &g("/commits/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/commits/%FF/publish"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits/%FF/changes"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, "/cluster/deployments/%FF", ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        // No route, inside and outside a graph, and a method a route does
+        // not serve.
+        (
+            Request::get("/no-such-route").body(Body::empty()).unwrap(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            request(Method::GET, &g("/no-such-route"), ""),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            request(Method::PUT, &g("/snapshot"), ""),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ];
+    for (request, status) in cases {
+        let what = format!("{} {}", request.method(), request.uri());
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status, "{what}");
+        assert_eq!(
+            response.headers()[HTTP_API_CONTRACT_HEADER],
+            HTTP_API_CONTRACT,
+            "{what}"
+        );
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            assert_eq!(response.headers()["allow"], "GET,HEAD", "{what}");
+        }
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("{what}: {}", String::from_utf8_lossy(&body)));
+        let code = match status {
+            StatusCode::NOT_FOUND => ErrorCode::NotFound,
+            StatusCode::METHOD_NOT_ALLOWED => ErrorCode::MethodNotAllowed,
+            _ => ErrorCode::BadRequest,
+        };
+        assert_eq!(error.code, Some(code), "{what}: {}", error.error);
+        assert_eq!(
+            error.disposition,
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action: DispositionAction::Fix,
+            }),
+            "{what}"
+        );
+    }
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+}
+
+/// A method a protected route does not serve is answered by the same guards
+/// as one it serves: authentication, the contract and the actor assertion
+/// refuse first, and only a request they admit learns which methods the path
+/// serves. One route of each protected router; MCP serves its own methods
+/// behind its own guards.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unserved_method_on_a_protected_route_answers_after_every_guard() {
+    use omnigraph_server::api::{
+        DispositionAction, DispositionEffects, DispositionOutput, ErrorCode,
+    };
+
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let routes = [
+        (Method::PUT, g("/snapshot"), "GET,HEAD"),
+        (Method::PUT, g("/branches/feature"), "DELETE"),
+        (Method::PUT, "/graphs".to_string(), "GET,HEAD"),
+        (Method::PUT, "/cluster/plan".to_string(), "POST"),
+        (Method::GET, "/graphs/og_catalog/query".to_string(), "POST"),
+    ];
+    for (method, path, allow) in routes {
+        let what = format!("{method} {path}");
+
+        let (status, body) =
+            json_response(&app, expecting(method.clone(), &path, None, &[], None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}: {body}");
+        assert_code(body, ErrorCode::Unauthorized, &what);
+
+        let mut request = expecting(method.clone(), &path, Some("demo-token"), &[], None);
+        request
+            .headers_mut()
+            .insert(HTTP_API_CONTRACT_HEADER, HeaderValue::from_static("0.11"));
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+        assert_code(body, ErrorCode::ApiContractMismatch, &what);
+
+        let (status, body) = json_response(
+            &app,
+            expecting(
+                method.clone(),
+                &path,
+                Some("demo-token"),
+                &["act-someone-else"],
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{what}: {body}");
+        assert_code(body, ErrorCode::ActorMismatch, &what);
+
+        let response = app
+            .clone()
+            .oneshot(expecting(method, &path, Some("demo-token"), &[], None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{what}");
+        assert_eq!(response.headers()["allow"], allow, "{what}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("{what}: {}", String::from_utf8_lossy(&body)));
+        assert_eq!(error.code, Some(ErrorCode::MethodNotAllowed), "{what}");
+        assert_eq!(
+            error.disposition,
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action: DispositionAction::Fix,
+            }),
+            "{what}"
+        );
+    }
+
+    let response = app
+        .clone()
+        .oneshot(expecting(Method::PUT, "/mcp", None, &[], None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "PUT /mcp");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2450,6 +2653,7 @@ async fn branch_statements_take_their_routes_policy_decision() {
     assert_forbidden(status, body, "branch create by a reader");
     let create = BranchCreateRequest {
         from: None,
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (status, body) = json_response(
@@ -2473,6 +2677,43 @@ async fn branch_statements_take_their_routes_policy_decision() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["actor_id"], "act-ragnor");
     assert_eq!(body["outcome"]["kind"], "created");
+    let head = body["outcome"]["from_commit_id"]
+        .as_str()
+        .expect("the receipt names the commit the branch starts at")
+        .to_string();
+
+    // A commit start the actor may not branch from answers the 404 of a
+    // `from` that names nothing, on both doors: the id discloses nothing.
+    let at_head = format!("branch create at_head from commit \"{head}\"");
+    let (status, body) =
+        json_response(&app, statement_request("/mutate", "reader-token", &at_head)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let create_at_head = BranchCreateRequest {
+        from: None,
+        from_commit: Some(head.clone()),
+        name: "at_head".to_string(),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("authorization", "Bearer reader-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create_at_head).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) =
+        json_response(&app, statement_request("/mutate", "admin-token", &at_head)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["outcome"]["from"], "main",
+        "the branch that wrote the commit"
+    );
+    assert_eq!(body["outcome"]["from_commit_id"], head);
 
     let (status, body) = json_response(
         &app,
@@ -2494,7 +2735,10 @@ async fn branch_statements_take_their_routes_policy_decision() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["rows"], json!([{"name": "feature"}, {"name": "main"}]));
+    assert_eq!(
+        body["rows"],
+        json!([{"name": "at_head"}, {"name": "feature"}, {"name": "main"}])
+    );
     let (status, body) = json_response(
         &app,
         statement_request("/query", "admin-token", "branch list"),
@@ -2758,6 +3002,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
+        from_commit: None,
         name: "feature".to_string(),
     };
     let (create_status, _) = json_response(
@@ -3599,6 +3844,187 @@ fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -
     let checksum = sha2::Sha256::digest(&encoded);
     encoded.extend_from_slice(&checksum);
     engine.encode(encoded)
+}
+
+fn expecting(
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+    expected: &[&str],
+    body: Option<Value>,
+) -> Request<Body> {
+    let mut request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .uri(uri)
+        .method(method);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    for actor in expected {
+        request = request.header(omnigraph_server::api::IF_ACTOR_HEADER, *actor);
+    }
+    match body {
+        Some(body) => request
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+        None => request.body(Body::empty()).unwrap(),
+    }
+}
+
+fn assert_code(body: Value, code: omnigraph_server::api::ErrorCode, what: &str) {
+    let error: ErrorOutput = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(error.code, Some(code), "{what}: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expected_actor_header_narrows_a_request_and_never_supplies_an_actor() {
+    use omnigraph_server::api::ErrorCode;
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    drop(db);
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_YAML).unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![
+                ("act-bruno".to_string(), "bruno-token".to_string()),
+                ("act-ragnor".to_string(), "ragnor-token".to_string()),
+            ],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+    let change = json!({
+        "query": MUTATION_QUERIES,
+        "name": "insert_person",
+        "params": {"name": "Mina", "age": 28},
+        "branch": "feature",
+    });
+
+    // A matching assertion changes nothing.
+    let (status, body) = json_response(
+        &app,
+        expecting(
+            Method::GET,
+            &g("/snapshot"),
+            Some("bruno-token"),
+            &["act-bruno"],
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A mismatch refuses the write before it runs, and never makes the
+    // request act as the asserted actor.
+    let before = manifest_dataset_version(&graph).await;
+    let (status, body) = json_response(
+        &app,
+        expecting(
+            Method::POST,
+            &g("/mutate"),
+            Some("bruno-token"),
+            &["act-ragnor"],
+            Some(change.clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_code(body.clone(), ErrorCode::ActorMismatch, "mutate");
+    assert!(
+        body["error"].as_str().unwrap().contains("act-bruno"),
+        "{body}"
+    );
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+
+    for (what, request) in [
+        (
+            "registry",
+            expecting(
+                Method::GET,
+                "/graphs",
+                Some("bruno-token"),
+                &["act-ragnor"],
+                None,
+            ),
+        ),
+        (
+            "change feed",
+            expecting(
+                Method::GET,
+                &g("/changes?start=beginning"),
+                Some("bruno-token"),
+                &["act-ragnor"],
+                None,
+            ),
+        ),
+    ] {
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{what}: {body}");
+        assert_code(body, ErrorCode::ActorMismatch, what);
+    }
+
+    // Refusals before it keep their order: authentication, then the contract.
+    let (status, _) = json_response(
+        &app,
+        expecting(Method::GET, &g("/snapshot"), None, &["act-bruno"], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let mut no_contract = expecting(
+        Method::GET,
+        &g("/snapshot"),
+        Some("bruno-token"),
+        &["act-ragnor"],
+        None,
+    );
+    no_contract.headers_mut().remove(HTTP_API_CONTRACT_HEADER);
+    let (status, body) = json_response(&app, no_contract).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_code(body, ErrorCode::ApiContractMismatch, "contract first");
+
+    // A repeated, padded or empty assertion is malformed.
+    for expected in [
+        &["act-bruno", "act-bruno"][..],
+        &[" act-bruno"][..],
+        &[""][..],
+    ] {
+        let (status, body) = json_response(
+            &app,
+            expecting(
+                Method::GET,
+                &g("/snapshot"),
+                Some("bruno-token"),
+                expected,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{expected:?}: {body}");
+        assert_code(body, ErrorCode::BadRequest, "malformed");
+    }
+
+    // Without authentication there is no actor to match.
+    drop(app);
+    let app = build_app(
+        AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap(),
+    );
+    let (status, body) = json_response(
+        &app,
+        expecting(Method::GET, &g("/snapshot"), None, &["act-bruno"], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_code(body, ErrorCode::ActorMismatch, "unauthenticated");
 }
 
 async fn access(app: &axum::Router, query: &str, token: Option<&str>) -> (StatusCode, Value) {

@@ -106,7 +106,7 @@ fn validate_token(token: &str) -> Result<()> {
 fn login_required() -> Failure {
     Failure::refused(
         "login_required",
-        "sign in with login --api before continuing",
+        "sign in with login --target NAME before continuing",
     )
 }
 
@@ -168,11 +168,18 @@ async fn select_with(
     organization: Option<&str>,
     token: Option<String>,
     api: Option<String>,
+    mechanism: super::ControlAuth,
 ) -> Result<Option<Selection>> {
     if let Some(org) = organization {
         super::organization_id(org)?;
     }
-    if let Some(token) = automation(origin, token, api)? {
+    if mechanism == super::ControlAuth::AutomationEnv {
+        let token = automation(origin, token, api)?.ok_or_else(|| {
+            Failure::refused(
+                "automation_credential_required",
+                "automation targets require OMNIGRAPH_CONTROL_TOKEN and OMNIGRAPH_CONTROL_API",
+            )
+        })?;
         let body = Api::new(origin.into(), Some(token.clone()))?
             .request(Method::GET, "/v1/auth/session", None, None)
             .await
@@ -194,14 +201,27 @@ async fn select_with(
     )
 }
 
-pub(super) async fn select(origin: &str, organization: Option<&str>) -> Result<Selection> {
+pub(super) async fn select(
+    origin: &str,
+    organization: Option<&str>,
+    mechanism: super::ControlAuth,
+) -> Result<Selection> {
     let _lock = coordination::lock(origin).await?;
     let selected = select_with(
         &AUTHKIT_STORE,
         origin,
         organization,
-        env("OMNIGRAPH_CONTROL_TOKEN")?,
-        env("OMNIGRAPH_CONTROL_API")?,
+        if mechanism == super::ControlAuth::AutomationEnv {
+            env("OMNIGRAPH_CONTROL_TOKEN")?
+        } else {
+            None
+        },
+        if mechanism == super::ControlAuth::AutomationEnv {
+            env("OMNIGRAPH_CONTROL_API")?
+        } else {
+            None
+        },
+        mechanism,
     )
     .await?
     .ok_or_else(login_required)?;
@@ -242,20 +262,41 @@ async fn selected_principal_with(
     organization: Option<&str>,
     token: Option<String>,
     api: Option<String>,
+    mechanism: super::ControlAuth,
 ) -> Result<Option<String>> {
-    Ok(select_with(store, origin, organization, token, api)
-        .await?
-        .map(|s| s.principal_id))
+    // A valid data credential keeps its independent lifetime after control
+    // credentials are removed. Absence cannot fall back to human custody.
+    if mechanism == super::ControlAuth::AutomationEnv && token.is_none() && api.is_none() {
+        return Ok(None);
+    }
+    Ok(
+        select_with(store, origin, organization, token, api, mechanism)
+            .await?
+            .map(|s| s.principal_id),
+    )
 }
 
-pub(super) async fn selected_principal(origin: &str, organization: &str) -> Result<Option<String>> {
+pub(super) async fn selected_principal(
+    origin: &str,
+    organization: &str,
+    mechanism: super::ControlAuth,
+) -> Result<Option<String>> {
     let _lock = coordination::lock(origin).await?;
     selected_principal_with(
         &AUTHKIT_STORE,
         origin,
         Some(organization),
-        env("OMNIGRAPH_CONTROL_TOKEN")?,
-        env("OMNIGRAPH_CONTROL_API")?,
+        if mechanism == super::ControlAuth::AutomationEnv {
+            env("OMNIGRAPH_CONTROL_TOKEN")?
+        } else {
+            None
+        },
+        if mechanism == super::ControlAuth::AutomationEnv {
+            env("OMNIGRAPH_CONTROL_API")?
+        } else {
+            None
+        },
+        mechanism,
     )
     .await
 }
@@ -335,8 +376,9 @@ async fn login_with(
     organization: Option<&str>,
     stderr: &mut dyn Write,
 ) -> Result<Value> {
-    let _ = store.get(origin)?;
-    if let Some(saved) = renewal::load_selected(store, origin, organization)?
+    renewal::validate_custody(store, origin)?;
+    if organization.is_some()
+        && let Some(saved) = renewal::load_selected(store, origin, organization)?
         && saved.config == config
         && saved.state == renewal::RefreshState::Ready
         && renewal::timestamp(&saved.refresh_expires_at)? > OffsetDateTime::now_utc()
@@ -411,7 +453,7 @@ async fn login_with(
         if next >= deadline {
             return Err(Failure::refused(
                 "device_expired",
-                "device sign-in expired; run login --api again",
+                "device sign-in expired; run login --target NAME again",
             ));
         }
         tokio::time::sleep_until(next).await;
@@ -420,7 +462,7 @@ async fn login_with(
             .map_err(|_| {
                 Failure::refused(
                     "device_expired",
-                    "device sign-in expired; run login --api again",
+                    "device sign-in expired; run login --target NAME again",
                 )
             })?;
         match reply {
@@ -474,7 +516,7 @@ pub(super) async fn login(
     stderr: &mut dyn Write,
 ) -> Result<Value> {
     let _lock = coordination::lock(&origin).await?;
-    let _ = AUTHKIT_STORE.get(&origin)?;
+    renewal::validate_custody(&AUTHKIT_STORE, &origin)?;
     let config = provider::Config::discover(&origin).await?;
     let provider = provider::Provider::new(&config)?;
     login_with(

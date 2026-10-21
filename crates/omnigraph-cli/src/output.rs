@@ -514,35 +514,6 @@ pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Wri
     write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn write_cluster_status_human(
-    output: &StatusOutput,
-    stdout: &mut dyn Write,
-) -> Result<()> {
-    if output.ok {
-        let state = &output.state_observations;
-        if state.state_found {
-            writeln!(
-                stdout,
-                "cluster state: revision {}, {} resource(s)",
-                state.state_revision, state.resource_count
-            )?;
-            if let Some(digest) = state.applied_config_digest.as_deref() {
-                writeln!(stdout, "  applied config: {digest}")?;
-            }
-            if state.locked {
-                writeln!(stdout, "  lock: held{}", cluster_lock_summary(state))?;
-            } else {
-                writeln!(stdout, "  lock: not held")?;
-            }
-        } else {
-            writeln!(stdout, "cluster state missing")?;
-        }
-    } else {
-        writeln!(stdout, "cluster status failed")?;
-    }
-    write_cluster_diagnostics(&output.diagnostics, stdout)
-}
-
 pub(crate) fn write_cluster_state_sync_human(
     output: &StateSyncOutput,
     stdout: &mut dyn Write,
@@ -585,33 +556,6 @@ pub(crate) fn write_cluster_state_sync_human(
         }
     } else {
         writeln!(stdout, "cluster {operation} failed")?;
-    }
-    write_cluster_diagnostics(&output.diagnostics, stdout)
-}
-
-pub(crate) fn write_cluster_force_unlock_human(
-    output: &ForceUnlockOutput,
-    stdout: &mut dyn Write,
-) -> Result<()> {
-    if output.ok {
-        if output.lock_removed {
-            writeln!(
-                stdout,
-                "cluster force-unlock: removed lock{}",
-                cluster_lock_summary(&output.state_observations)
-            )?;
-        } else {
-            writeln!(stdout, "cluster force-unlock: no lock removed")?;
-        }
-    } else {
-        writeln!(stdout, "cluster force-unlock failed")?;
-        if output.state_observations.locked {
-            writeln!(
-                stdout,
-                "  lock: held{}",
-                cluster_lock_summary(&output.state_observations)
-            )?;
-        }
     }
     write_cluster_diagnostics(&output.diagnostics, stdout)
 }
@@ -715,23 +659,6 @@ pub(crate) fn finish_cluster_plan(
     Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_status(
-    output: &StatusOutput,
-    json: bool,
-    stdout: &mut dyn Write,
-) -> Result<Completion> {
-    if json {
-        write_json(output, stdout)?;
-    } else {
-        write_cluster_status_human(output, stdout)?;
-    }
-    if !output.ok {
-        stdout.flush()?;
-        return Ok(Completion::exit(1));
-    }
-    Ok(Completion::success())
-}
-
 pub(crate) fn finish_cluster_state_sync(
     output: &StateSyncOutput,
     json: bool,
@@ -741,23 +668,6 @@ pub(crate) fn finish_cluster_state_sync(
         write_json(output, stdout)?;
     } else {
         write_cluster_state_sync_human(output, stdout)?;
-    }
-    if !output.ok {
-        stdout.flush()?;
-        return Ok(Completion::exit(1));
-    }
-    Ok(Completion::success())
-}
-
-pub(crate) fn finish_cluster_force_unlock(
-    output: &ForceUnlockOutput,
-    json: bool,
-    stdout: &mut dyn Write,
-) -> Result<Completion> {
-    if json {
-        write_json(output, stdout)?;
-    } else {
-        write_cluster_force_unlock_human(output, stdout)?;
     }
     if !output.ok {
         stdout.flush()?;
@@ -1104,8 +1014,15 @@ pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Wr
 /// prints; a mutation's prints the affected counts.
 pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) -> Result<()> {
     match &output.outcome {
-        Some(BranchOutcomeOutput::Created { from, name }) => {
-            writeln!(writer, "created branch {name} from {from}")?;
+        Some(BranchOutcomeOutput::Created {
+            from,
+            name,
+            from_commit_id,
+        }) => {
+            writeln!(
+                writer,
+                "created branch {name} from {from} at {from_commit_id}"
+            )?;
         }
         Some(BranchOutcomeOutput::Deleted { name }) => writeln!(writer, "deleted branch {name}")?,
         Some(BranchOutcomeOutput::Merged {

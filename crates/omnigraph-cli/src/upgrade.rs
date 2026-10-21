@@ -4,56 +4,29 @@ use color_eyre::eyre::{Result, bail};
 
 use crate::app::Completion;
 use crate::commands::maintenance::args::UpgradeArgs;
-use crate::helpers::{resolve_local_uri, write_target};
 use crate::output::write_json;
-use crate::{planes, scope};
+use crate::scope;
 
 pub(crate) async fn run(
-    input: &crate::operator::InvocationConfig,
+    target: &crate::targets::ResolvedTarget,
     args: UpgradeArgs,
-    profile: Option<&str>,
-    store: Option<&str>,
-    quiet: bool,
     stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
+    _stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let UpgradeArgs {
-        uri,
         check,
         to_format,
         json,
     } = args;
-    let target = scope::resolve_scope(
-        input.get(stderr)?,
-        input.profile(),
-        planes::Capability::Direct,
-        scope::ScopeFlags {
-            profile,
-            store,
-            server: None,
-            cluster: None,
-            graph: None,
-            uri,
-        },
-    )?;
-    if target.cluster.is_some() {
-        bail!(
-            "upgrade refuses cluster-managed graphs; a qualified cluster upgrade operation is required"
-        );
+    if !matches!(
+        target.binding,
+        crate::targets::TargetBinding::DirectGraph { .. }
+    ) {
+        bail!("upgrade requires a direct graph target; cluster graph upgrades are not qualified");
     }
-    let uri = resolve_local_uri(target.uri, "upgrade")?;
-    let uri = omnigraph::storage::normalize_root_uri(&uri)?;
-    let uri = if omnigraph::storage::storage_kind_for_uri(&uri)?
-        == omnigraph::storage::StorageKind::Local
-    {
-        std::fs::canonicalize(&uri)?
-            .to_str()
-            .ok_or_else(|| color_eyre::eyre::eyre!("upgrade path is not valid UTF-8"))?
-            .to_owned()
-    } else {
-        uri
-    };
-    if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri)
+    let uri = scope::direct_graph_uri(target, None).await?;
+    let binding = scope::capture_storage_binding(target)?.for_uri(&uri)?;
+    if let Some(root) = omnigraph_cluster::cluster_root_for_graph_binding(&binding)
         .await
         .map_err(|diagnostic| {
             color_eyre::eyre::eyre!("{}: {}", diagnostic.path, diagnostic.message)
@@ -63,12 +36,14 @@ pub(crate) async fn run(
             "upgrade refuses graph `{uri}` inside cluster `{root}`; a qualified cluster upgrade operation is required"
         );
     }
-    if !check {
-        write_target(quiet, "upgrade", &uri, false, stderr)?;
-    }
-    let report =
-        omnigraph::db::upgrade_storage(&uri, omnigraph::db::UpgradeOptions { check, to_format })
-            .await?;
+    let report = omnigraph::db::upgrade_storage_as_with_storage(
+        binding.uri(),
+        omnigraph::db::UpgradeOptions { check, to_format },
+        None,
+        None,
+        omnigraph::storage::storage_for_binding(&binding)?,
+    )
+    .await?;
     finish_report(&report, json, stdout)
 }
 
@@ -175,7 +150,7 @@ fn write_human(report: &omnigraph::db::UpgradeReport, writer: &mut dyn Write) ->
             writer,
             "Check is advisory. Keep the graph offline: stop all readers, writers and \
              maintenance, retain a verified backup of the whole root, then run `omnigraph \
-             upgrade <graph>` without `--check`."
+             upgrade --target <graph>` without `--check`."
         )?;
     }
     Ok(())
@@ -255,7 +230,7 @@ mod tests {
                 "source: 0 live refs, 0 retired refs, 0 orphan writers, 0 legacy commits, 0 bookkeeping versions, 0 absent parents\n",
                 "legacy objects: 0 data files, 0 id shards, 0 writer shards, 0 schema contents, 0 bytes\n",
                 "census: 0 reads, 0 cells\nunsupported_source: inspect the source\n",
-                "Check is advisory. Keep the graph offline: stop all readers, writers and maintenance, retain a verified backup of the whole root, then run `omnigraph upgrade <graph>` without `--check`.\n",
+                "Check is advisory. Keep the graph offline: stop all readers, writers and maintenance, retain a verified backup of the whole root, then run `omnigraph upgrade --target <graph>` without `--check`.\n",
             )
         );
 
@@ -342,53 +317,33 @@ mod tests {
     }
 
     #[test]
-    fn storage_upgrade_parses_explicit_route_and_check_options() {
+    fn storage_upgrade_parses_target_and_check_options() {
         let cli = Cli::try_parse_from([
             "omnigraph",
             "upgrade",
-            "graph.omni",
+            "--target",
+            "./graph.omni",
             "--check",
             "--to-format",
             "15",
             "--json",
         ])
         .unwrap();
-        assert!(
-            matches!(&cli.command, Command::Upgrade(UpgradeArgs { uri: Some(uri), check: true, to_format: Some(15), json: true }) if uri == "graph.omni")
-        );
-        assert_eq!(
-            planes::command_capability(&cli.command),
-            planes::Capability::Direct
-        );
-        assert!(planes::guard_addressing(&cli).is_ok());
-        let cli = Cli::try_parse_from(["omnigraph", "--store", "graph.omni", "upgrade"]).unwrap();
+        assert_eq!(cli.target.as_deref(), Some("./graph.omni"));
         assert!(matches!(
             cli.command,
             Command::Upgrade(UpgradeArgs {
-                uri: None,
-                check: false,
-                to_format: None,
-                json: false
+                check: true,
+                to_format: Some(15),
+                json: true
             })
         ));
-    }
-
-    #[test]
-    fn storage_upgrade_rejects_served_and_cluster_addressing() {
-        for flag in ["--server", "--cluster", "--graph"] {
-            let cli =
-                Cli::try_parse_from(["omnigraph", flag, "prod", "upgrade", "graph.omni"]).unwrap();
-            assert!(planes::guard_addressing(&cli).is_err(), "{flag}");
+        for args in [
+            vec!["upgrade", "graph.omni"],
+            vec!["upgrade", "--store", "graph.omni"],
+            vec!["upgrade", "--to-format", "not-a-version"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).is_err());
         }
-        assert!(
-            Cli::try_parse_from([
-                "omnigraph",
-                "upgrade",
-                "graph.omni",
-                "--to-format",
-                "not-a-version"
-            ])
-            .is_err()
-        );
     }
 }

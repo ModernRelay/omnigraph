@@ -33,9 +33,9 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_planner::{HydratedBinding, ROW_ADDRESS_PREFIX, hydrate_chunk_bytes};
 
+use super::external;
 use super::memory::WorkMemory;
-use super::producer::{BatchSender, producer_stream};
-use super::{external, polled, streaming_properties};
+use super::shape::{BatchSender, Flow, Streamed, Streaming, work};
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
 
@@ -79,7 +79,7 @@ pub(crate) struct HydrateExec {
     tables: Vec<SchemaRef>,
     layout: Vec<Slot>,
     snapshot: Snapshot,
-    properties: Arc<PlanProperties>,
+    shape: Streaming,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -184,14 +184,14 @@ impl HydrateExec {
                 "a hydrated column fills return position {position}, past the return's {width}"
             )));
         }
-        let properties = streaming_properties(Arc::new(Schema::new(fields)));
+        let shape = Streaming::new(Arc::new(Schema::new(fields)));
         Ok(Self {
             input,
             bindings,
             tables,
             layout,
             snapshot,
-            properties,
+            shape,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -238,7 +238,7 @@ impl ExecutionPlan for HydrateExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -256,7 +256,7 @@ impl ExecutionPlan for HydrateExec {
             tables: self.tables.clone(),
             layout: self.layout.clone(),
             snapshot: self.snapshot.clone(),
-            properties: Arc::clone(&self.properties),
+            shape: Streaming::new(self.schema()),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
@@ -267,32 +267,27 @@ impl ExecutionPlan for HydrateExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "HydrateExec has one partition");
-        let schema: SchemaRef = self.schema();
-        let input = self.input.execute(0, Arc::clone(&ctx))?;
-        let mut work = WorkMemory::new(ctx, "HydrateExec")?;
-        work.set_metrics(self.metrics.clone());
-        work.metric("input_rows", 0);
-        work.metric("hydrated_rows", 0);
-        work.metric(SINGLE_ROW_READS, 0);
-        let plan = Hydration {
+        let memory = work(Arc::clone(&ctx), "HydrateExec", &self.metrics)?;
+        memory.metric("input_rows", 0);
+        memory.metric("hydrated_rows", 0);
+        memory.metric(SINGLE_ROW_READS, 0);
+        let body = Hydration {
             layout: self.layout.clone(),
             bindings: self.bindings.clone(),
             tables: self.tables.clone(),
             snapshot: self.snapshot.clone(),
-            schema: Arc::clone(&schema),
+            schema: self.schema(),
             peak: MetricBuilder::new(&self.metrics).gauge(PEAK_CHUNK_BYTES, 0),
+            opened: None,
         };
-        let stream = producer_stream(
-            schema,
-            Arc::new(work),
-            Some(&self.metrics),
-            move |memory, sender| async move { hydrate(input, plan, &memory, &sender).await },
-        );
-        Ok(polled(&self.metrics, stream))
+        let input = Arc::clone(&self.input);
+        Ok(self
+            .shape
+            .produce(memory, &self.metrics, move || input.execute(0, ctx), body))
     }
 }
 
-/// What one execution hydrates, moved into its producer.
+/// What one execution hydrates, the per-batch body of its producer.
 struct Hydration {
     layout: Vec<Slot>,
     bindings: Vec<HydratedBinding>,
@@ -300,6 +295,18 @@ struct Hydration {
     snapshot: Snapshot,
     schema: SchemaRef,
     peak: Gauge,
+    opened: Option<Sources>,
+}
+
+/// What the open left the body: each binding's source, the bound's shares (a
+/// quarter reserved for Lance's read-ahead, the rest for a chunk's decoded rows
+/// and copies, half of it the rows) and the costliest row seen, which plans.
+struct Sources {
+    sources: Vec<Source>,
+    budget: usize,
+    target: usize,
+    _reserved: WorkMemory,
+    row_bytes: usize,
 }
 
 /// One deferred binding's pinned table and the columns taken from it.
@@ -322,95 +329,103 @@ struct Source {
     values: SchemaRef,
 }
 
-async fn hydrate(
-    mut input: SendableRecordBatchStream,
-    plan: Hydration,
-    memory: &Arc<WorkMemory>,
-    sender: &BatchSender,
-) -> DfResult<()> {
-    let hard = usize::try_from(hydrate_chunk_bytes(memory.pool_bytes())).unwrap_or(usize::MAX);
-    // A quarter of the bound is what Lance may read ahead of the decoder; the
-    // rest holds a chunk's decoded rows and their copies, half of it the rows.
-    let read_ahead = (hard / 4).max(1);
-    let budget = hard.saturating_sub(read_ahead).max(1);
-    let target = (budget / 2).max(1);
-    let reserved = memory.child(READ_AHEAD)?;
-    reserved.grow(read_ahead)?;
-    let mut sources = Vec::with_capacity(plan.bindings.len());
-    for (binding, declared) in plan.bindings.iter().zip(&plan.tables) {
-        let storage = |error| {
-            external(OmniError::storage_context(
-                format!("hydrating the return columns of `${}`", binding.binding),
-                error,
-            ))
-        };
-        let dataset = Arc::new(
-            plan.snapshot
-                .open_lance_dataset(&binding.table.type_key)
-                .await
-                .map_err(external)?,
-        );
-        let mut properties: Vec<&str> = Vec::new();
-        for column in &binding.columns {
-            if !properties.contains(&column.property.as_str()) {
-                properties.push(&column.property);
+impl Hydration {
+    async fn open(&self, memory: &Arc<WorkMemory>) -> DfResult<Sources> {
+        let hard = usize::try_from(hydrate_chunk_bytes(memory.pool_bytes())).unwrap_or(usize::MAX);
+        let read_ahead = (hard / 4).max(1);
+        let budget = hard.saturating_sub(read_ahead).max(1);
+        let target = (budget / 2).max(1);
+        let reserved = memory.child(READ_AHEAD)?;
+        reserved.grow(read_ahead)?;
+        let mut sources = Vec::with_capacity(self.bindings.len());
+        for (binding, declared) in self.bindings.iter().zip(&self.tables) {
+            let storage = |error| {
+                external(OmniError::storage_context(
+                    format!("hydrating the return columns of `${}`", binding.binding),
+                    error,
+                ))
+            };
+            let dataset = Arc::new(
+                self.snapshot
+                    .open_lance_dataset(&binding.table.type_key)
+                    .await
+                    .map_err(external)?,
+            );
+            let mut properties: Vec<&str> = Vec::new();
+            for column in &binding.columns {
+                if !properties.contains(&column.property.as_str()) {
+                    properties.push(&column.property);
+                }
             }
-        }
-        crate::engine::typed_value::check_stored_schema(
-            &dataset,
-            declared,
-            &binding.table.type_key,
-            plan.snapshot.contract_covers(&binding.table.type_key),
-            properties.iter().copied(),
-        )
-        .map_err(external)?;
-        let schema = dataset.schema().project(&properties).map_err(storage)?;
-        let store = dataset.object_store(None).await.map_err(storage)?;
-        let inherited = dataset
-            .get_fragments()
-            .iter()
-            .filter(|fragment| {
-                fragment
-                    .metadata()
-                    .files
-                    .iter()
-                    .any(|file| file.base_id.is_some())
-            })
-            .map(|fragment| fragment.id() as u32)
-            .collect();
-        let values = binding
-            .columns
-            .iter()
-            .map(|column| {
-                let field = plan.schema.field_with_name(&column.output)?;
-                Ok(Field::new(&column.output, field.data_type().clone(), true))
-            })
-            .collect::<DfResult<Vec<Field>>>()?;
-        sources.push(Source {
-            binding: binding.binding.clone(),
-            address: address_column(&binding.binding),
-            dataset,
-            schema: Arc::new(schema),
-            scheduler: ScanScheduler::new(store, SchedulerConfig::new(read_ahead as u64)),
-            inherited: Arc::new(inherited),
-            columns: binding
+            crate::engine::typed_value::check_stored_schema(
+                &dataset,
+                declared,
+                &binding.table.type_key,
+                self.snapshot.contract_covers(&binding.table.type_key),
+                properties.iter().copied(),
+            )
+            .map_err(external)?;
+            let schema = dataset.schema().project(&properties).map_err(storage)?;
+            let store = dataset.object_store(None).await.map_err(storage)?;
+            let inherited = dataset
+                .get_fragments()
+                .iter()
+                .filter(|fragment| {
+                    fragment
+                        .metadata()
+                        .files
+                        .iter()
+                        .any(|file| file.base_id.is_some())
+                })
+                .map(|fragment| fragment.id() as u32)
+                .collect();
+            let values = binding
                 .columns
                 .iter()
-                .map(|column| (column.output.clone(), column.property.clone()))
-                .collect(),
-            values: Arc::new(Schema::new(values)),
-        });
+                .map(|column| {
+                    let field = self.schema.field_with_name(&column.output)?;
+                    Ok(Field::new(&column.output, field.data_type().clone(), true))
+                })
+                .collect::<DfResult<Vec<Field>>>()?;
+            sources.push(Source {
+                binding: binding.binding.clone(),
+                address: address_column(&binding.binding),
+                dataset,
+                schema: Arc::new(schema),
+                scheduler: ScanScheduler::new(store, SchedulerConfig::new(read_ahead as u64)),
+                inherited: Arc::new(inherited),
+                columns: binding
+                    .columns
+                    .iter()
+                    .map(|column| (column.output.clone(), column.property.clone()))
+                    .collect(),
+                values: Arc::new(Schema::new(values)),
+            });
+        }
+        Ok(Sources {
+            sources,
+            budget,
+            target,
+            _reserved: reserved,
+            row_bytes: 0,
+        })
     }
-    // The costliest output row seen so far, its decoded row and its copy,
-    // plans the next window's rows.
-    let mut row_bytes = 0usize;
-    while let Some(batch) = input.next().await {
-        let batch = batch?;
+
+    async fn hydrate(
+        &mut self,
+        batch: RecordBatch,
+        memory: &Arc<WorkMemory>,
+        sender: &BatchSender,
+    ) -> DfResult<()> {
+        let opened = self.opened.as_mut().ok_or_else(|| {
+            DataFusionError::Internal("hydration ran before its sources were opened".into())
+        })?;
         memory.metric("input_rows", batch.num_rows());
         let mut start = 0;
         while start < batch.num_rows() {
-            let planned = target
-                .checked_div(row_bytes)
+            let planned = opened
+                .target
+                .checked_div(opened.row_bytes)
                 .map_or(SEED_ROWS, |rows| rows.max(1));
             let mut rows = planned.min(batch.num_rows() - start);
             loop {
@@ -420,11 +435,11 @@ async fn hydrate(
                 let mut fetched_bytes = 0usize;
                 let fetched = match fetch_window(
                     &window,
-                    &sources,
+                    &opened.sources,
                     &chunk,
-                    (rows > 1).then_some(target),
+                    (rows > 1).then_some(opened.target),
                     &mut fetched_bytes,
-                    &plan.peak,
+                    &self.peak,
                 )
                 .await?
                 {
@@ -433,8 +448,8 @@ async fn hydrate(
                     // it: plan again from the widest row decoded.
                     Fetch::Stopped { widest } => {
                         let widest = widest.max(1);
-                        row_bytes = row_bytes.max(widest.saturating_mul(2));
-                        rows = (target / widest).clamp(1, rows.div_ceil(2));
+                        opened.row_bytes = opened.row_bytes.max(widest.saturating_mul(2));
+                        rows = (opened.target / widest).clamp(1, rows.div_ceil(2));
                         continue;
                     }
                 };
@@ -444,16 +459,17 @@ async fn hydrate(
                 // next window.
                 let mut keep = rows;
                 let mut copied = copy_bytes(&fetched, keep, &chunk)?;
-                while keep > 1 && fetched_bytes.saturating_add(copied) > budget {
+                while keep > 1 && fetched_bytes.saturating_add(copied) > opened.budget {
                     keep = keep.div_ceil(2);
                     copied = copy_bytes(&fetched, keep, &chunk)?;
                 }
-                row_bytes = row_bytes
+                opened.row_bytes = opened
+                    .row_bytes
                     .max(fetched_bytes.saturating_add(copied) / keep)
                     .max(1);
                 let taken = fetched
                     .iter()
-                    .zip(&sources)
+                    .zip(&opened.sources)
                     .map(|(fetched, source)| {
                         chunk
                             .interleave_once(
@@ -470,9 +486,9 @@ async fn hydrate(
                     .flatten()
                     .map(|column| column.get_array_memory_size())
                     .sum::<usize>();
-                plan.peak.set_max(fetched_bytes.saturating_add(copies));
+                self.peak.set_max(fetched_bytes.saturating_add(copies));
                 drop(fetched);
-                let output = assemble(&window.slice(0, keep), &taken, &plan)?;
+                let output = assemble(&window.slice(0, keep), &taken, &self.layout, &self.schema)?;
                 chunk.output(&output)?;
                 memory.metric("hydrated_rows", keep);
                 sender.send(output, chunk).await?;
@@ -480,9 +496,40 @@ async fn hydrate(
                 break;
             }
         }
+        Ok(())
     }
-    drop(reserved);
-    Ok(())
+}
+
+impl Streamed for Hydration {
+    fn open<'a>(&'a mut self, memory: &'a Arc<WorkMemory>) -> BoxFuture<'a, DfResult<bool>> {
+        Box::pin(async move {
+            self.opened = Some(Hydration::open(self, memory).await?);
+            Ok(true)
+        })
+    }
+
+    fn batch<'a>(
+        &'a mut self,
+        batch: RecordBatch,
+        memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, DfResult<Flow>> {
+        Box::pin(async move {
+            self.hydrate(batch, memory, sender).await?;
+            Ok(Flow::Continue)
+        })
+    }
+
+    fn finish<'a>(
+        &'a mut self,
+        _memory: &'a Arc<WorkMemory>,
+        _sender: &'a BatchSender,
+    ) -> BoxFuture<'a, DfResult<()>> {
+        Box::pin(async move {
+            drop(self.opened.take());
+            Ok(())
+        })
+    }
 }
 
 /// One source's rows for a window: `rows` holds the deferred columns of each
@@ -733,23 +780,22 @@ async fn fragment_rows(
         .boxed())
 }
 
-/// The return columns of `window` in return order, as `plan.layout` places
-/// them: a deferred one from its source's taken arrays, any other from the
-/// window.
+/// The return columns of `window` in return order, as `layout` places them:
+/// a deferred one from its source's taken arrays, any other from the window.
 fn assemble(
     window: &RecordBatch,
     taken: &[Vec<ArrayRef>],
-    plan: &Hydration,
+    layout: &[Slot],
+    schema: &SchemaRef,
 ) -> DfResult<RecordBatch> {
-    let columns = plan
-        .layout
+    let columns = layout
         .iter()
         .map(|slot| match *slot {
             Slot::Input(index) => Arc::clone(window.column(index)),
             Slot::Hydrated { binding, column } => Arc::clone(&taken[binding][column]),
         })
         .collect::<Vec<ArrayRef>>();
-    Ok(RecordBatch::try_new(Arc::clone(&plan.schema), columns)?)
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
 #[cfg(test)]

@@ -220,6 +220,7 @@ then dated RFCs by date.
 | [0055](0055-gq-branch-statements.md) | Branch statements in GQ | maintainer | draft | in-progress |
 | [0057](0057-bounded-merge-preparation.md) | Accepted-context reuse and bounded merge preparation | maintainer | accepted | in-progress |
 | [0058](0058-retained-merged-ancestry.md) | Retained merged ancestry | maintainer | draft | not-started |
+| [0059](0059-config-cli-coherency.md) | Named targets and CLI coherency | maintainer | accepted | complete |
 | [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |
 | [0062](0062-manifest-version-clock.md) | Manifest version as the table registration clock | maintainer | draft | in-progress |
 | [0063](0063-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |
@@ -249,4 +250,5 @@ then dated RFCs by date.
 | [2026-10-11](2026-10-11-unattached-graph-branches.md) | Unattached graph branches | maintainer | draft | not-started |
 | [2026-10-15](2026-10-15-bulk-load-as-a-query-plan.md) | Bulk load as a query plan | maintainer | draft | partial |
 | [2026-10-16](2026-10-16-engine-catalogue.md) | Engine catalogue | maintainer | draft | in-progress |
+| [2026-10-16](2026-10-16-graph-access-serving-and-cross-process-writes.md) | Graph access and cross-process writes | maintainer | accepted | in-progress |
 | [2026-10-19](2026-10-19-storage-outcomes-and-restartable-ownership.md) | Storage outcomes per operation and restartable ownership | maintainer | draft | in-progress |

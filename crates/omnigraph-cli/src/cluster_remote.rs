@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use crate::cli::{Cli, ClusterCommand, Command};
+use crate::cli::ClusterCommand;
 use crate::commands::cluster::core_deployment_result;
-use crate::graph_http::{ApiContractError, GraphHttpClient, ServerTransport};
+use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::helpers::{
     RemoteErrorCli, apply_bearer_token, remote_response_json_bounded, remote_url,
-    resolve_server_flag_with_config, served_client_with_config,
 };
 use crate::output::write_json;
+use crate::targets::{ResolvedTarget, TargetBinding};
 
 const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
@@ -151,22 +151,21 @@ struct RemoteCluster {
 }
 
 impl RemoteCluster {
+    /// `expected_actor` is the actor `--as` asserts: every request carries
+    /// it, and the server refuses one whose credential resolves to another.
     fn new(
         input: &crate::operator::InvocationConfig,
-        server: &str,
-        stderr: &mut dyn Write,
+        target: &ResolvedTarget,
+        expected_actor: Option<&str>,
     ) -> Result<Self> {
-        // Preserve literal address errors before operator-config errors.
-        // Named addresses need configuration first.
-        if server.contains("://") {
-            ServerTransport::parse(server)?;
-        }
-        let operator_config = input.get(stderr)?;
-        let root = resolve_server_flag_with_config(operator_config, Some(server), None)?
-            .expect("explicit server");
-        let (client, token) = served_client_with_config(input, operator_config, &root, &root)?;
+        let TargetBinding::Server { endpoint, auth, .. } = &target.binding else {
+            bail!("remote cluster operations require a server target");
+        };
+        let client =
+            GraphHttpClient::server_target(input, target)?.with_expected_actor(expected_actor);
+        let token = crate::targets::resolve_server_token(input, auth, endpoint)?;
         Ok(Self {
-            root,
+            root: endpoint.clone(),
             token,
             client,
         })
@@ -400,7 +399,7 @@ impl RemoteCluster {
             Err(error) => {
                 let delivery = writeln!(
                     stderr,
-                    "Inspect cluster status --server <SERVER> --deployment-id {id}; a lost response does not authorize replay."
+                    "Inspect cluster status --target <TARGET> --deployment-id {id}; a lost response does not authorize replay."
                 )
                 .and_then(|()| stderr.flush());
                 Err(match delivery {
@@ -475,49 +474,48 @@ fn wait_timeout(
     Err(WaitTimeout.into())
 }
 
-pub(crate) async fn dispatch(
+pub(crate) async fn run(
     input: &crate::operator::InvocationConfig,
-    cli: &Cli,
+    command: &ClusterCommand,
+    target: &ResolvedTarget,
+    expected_actor: Option<&str>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-) -> Result<bool> {
-    let Some(server) = cli.server.as_deref() else {
-        return Ok(false);
-    };
-    let Command::Cluster {
-        managed: false,
-        command,
-    } = &cli.command
-    else {
-        return Ok(false);
-    };
+) -> Result<()> {
+    // Refuse the source-free ID form before source capture or credential acquisition.
+    if let ClusterCommand::Apply {
+        config,
+        deployment_id,
+        writers_stopped,
+        ..
+    } = command
+    {
+        if *writers_stopped {
+            bail!("--writers-stopped requires a direct-root target");
+        }
+        if config.is_none() && deployment_id.is_some() {
+            bail!(
+                "server apply with --deployment-id requires explicit --config; use cluster status --deployment-id ID --target TARGET to observe without source"
+            );
+        }
+    }
     if !matches!(
         command,
         ClusterCommand::Plan { .. } | ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
     ) {
-        return Ok(false);
+        bail!("this cluster operation is not supported by a server target");
     }
-    crate::planes::guard_addressing(cli)?;
-    if cli.cluster.is_some() {
-        bail!("--server and --cluster are mutually exclusive");
-    }
-    if cli.as_actor.is_some() {
-        bail!(
-            "--as cannot be used with --server; the server resolves the actor from the bearer token"
-        );
-    }
-    if matches!(
-        command,
-        ClusterCommand::Apply {
-            writers_stopped: true,
-            ..
-        }
-    ) {
-        bail!("--writers-stopped cannot be used with --server");
-    }
-    let remote = RemoteCluster::new(input, server, stderr)?;
+    let remote = RemoteCluster::new(input, target, expected_actor)?;
     match command {
-        ClusterCommand::Plan { config, json, .. } => remote.plan(config, *json, stdout).await?,
+        ClusterCommand::Plan { config, json, .. } => {
+            remote
+                .plan(
+                    config.as_deref().unwrap_or_else(|| Path::new(".")),
+                    *json,
+                    stdout,
+                )
+                .await?
+        }
         ClusterCommand::Apply {
             config,
             deployment_id,
@@ -527,7 +525,7 @@ pub(crate) async fn dispatch(
         } => {
             remote
                 .apply(
-                    config,
+                    config.as_deref().unwrap_or_else(|| Path::new(".")),
                     deployment_id.as_deref(),
                     *json,
                     run.no_wait,
@@ -565,9 +563,9 @@ pub(crate) async fn dispatch(
                 write_json(&status, stdout)?;
             }
         }
-        _ => unreachable!(),
+        _ => unreachable!("server applicability checked before client construction"),
     }
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -650,6 +648,51 @@ mod tests {
         std::fs::write(source.path().join("cluster.yaml"), "version: 1\nmetadata:\n  name: output-fixture\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  knowledge:\n    schema: ./people.pg\n").unwrap();
         let root = "file:///server-only-storage";
         let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV:1:01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        // An ID without explicit source is never submitted when the same argv
+        // selects a server. Refuse before even reading its credential file.
+        let credentials = source.path().join("credentials");
+        std::fs::write(&credentials, "{").unwrap();
+        let input = crate::operator::InvocationConfig::at(Some(source.path().to_path_buf()), None);
+        for provenance in [
+            crate::targets::TargetProvenance::Explicit {
+                name: "fixture".into(),
+            },
+            crate::targets::TargetProvenance::Default {
+                name: "fixture".into(),
+            },
+        ] {
+            let api = IntentApiFixture::graph(vec![]);
+            let target = ResolvedTarget::new(
+                TargetBinding::Server {
+                    endpoint: api.origin.clone(),
+                    auth: crate::targets::ServerAuth::Token {
+                        owner: "fixture".into(),
+                    },
+                    default_graph: None,
+                },
+                provenance,
+            );
+            let command = ClusterCommand::Apply {
+                config: None,
+                json: true,
+                deployment_id: Some(id.into()),
+                writers_stopped: false,
+                plan: None,
+                run: crate::commands::cluster::ClusterRunArgs::default(),
+            };
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let error = run(&input, &command, &target, None, &mut out, &mut err)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("requires explicit --config"),
+                "{error:?}"
+            );
+            assert!(out.is_empty() && err.is_empty());
+            assert!(api.workflow_requests().is_empty());
+            api.assert_complete();
+        }
         let digest = omnigraph_cluster::capture_deployment_for_server(source.path(), root)
             .unwrap()
             .input_digest()

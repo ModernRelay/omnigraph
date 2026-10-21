@@ -1,336 +1,446 @@
-//! Declared CLI "planes" (RFC 0010 Slice 1).
-//!
-//! Every subcommand belongs to exactly one plane. This classification is the
-//! single source of truth the wrong-plane guard consumes — and that later
-//! RFC 0010 slices (the capability surface, plane-grouped help) will consume
-//! too. The `command_plane` match is **exhaustive on purpose**: adding a
-//! `Command` variant is a compile error until its plane is declared, so the
-//! surface cannot silently drift from the command set.
-//!
-//! See [docs/rfcs/0010-cli-planes.md].
+//! Operation applicability for the single target resolver.
+//! This exhaustive command match owns backend availability before credentials or I/O.
 
-use color_eyre::Result;
-use color_eyre::eyre::bail;
+use crate::cli::*;
+use crate::targets::{ResolvedTarget, TargetBinding};
+use color_eyre::eyre::{Result, bail};
 
-use crate::cli::{
-    BlobCommand, BranchCommand, ChangesCommand, Cli, ClusterCommand, Command, CommitCommand,
-    GraphsCommand, QueriesCommand, SchemaCommand, SkillCommand,
-};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Plane {
-    /// Runs against a graph, embedded **or** via `--server` (the `GraphClient`
-    /// axis). The only plane on which the data-plane addressing flags
-    /// (`--server`/`--graph`) apply.
-    Data,
-    /// Direct storage access; no server. Maintenance + local-only inspection
-    /// that must work with the server down.
-    Storage,
-    /// Operates on a cluster directory, not a graph URI.
-    Control,
-    /// Touches no graph at all — session / config / local tooling.
-    Session,
-}
-
-impl std::fmt::Display for Plane {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Plane::Data => "data",
-            Plane::Storage => "storage",
-            Plane::Control => "control",
-            Plane::Session => "session",
-        })
-    }
-}
-
-/// What a command *needs*, in the user-facing vocabulary (RFC 0011). This is the
-/// language CLI errors and `--help` speak; `Plane` stays the internal classifier
-/// (`Capability` is derived from it, so the two cannot drift).
-///
-/// - `any` — graph-scoped data; served via a server scope, or direct against a
-///   store scope. Accepts `--server`/`--graph`.
-/// - `served` — requires a server. Accepts `--server`/`--graph`.
-/// - `direct` — storage-native; opens storage directly, never through a server.
-/// - `control` — operates on a cluster (control plane).
-/// - `local` — addresses no graph at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Capability {
-    Any,
-    Served,
-    Direct,
-    Control,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Requirement {
     Local,
+    Alias,
+    Graph {
+        direct_only: bool,
+        root: bool,
+        managed: bool,
+        catalogue: bool,
+    },
+    Standalone,
+    Registry,
+    Root,
+    /// A whole direct root, optionally filtered by `--graph`, or one served
+    /// graph: the server answers per graph, so a server target selects one.
+    RootOrServedGraph,
+    Deployment,
+    ManagedAccount,
+    ManagedCluster,
+    ManagedOperation,
+    Authentication,
+    Credential,
 }
 
-impl Capability {
-    /// A human phrase for error messages (`` `optimize` is a {…} command ``).
-    pub(crate) fn describe(self) -> &'static str {
-        match self {
-            Capability::Any => "data",
-            Capability::Served => "served",
-            Capability::Direct => "direct (storage-native)",
-            Capability::Control => "cluster control",
-            Capability::Local => "local",
-        }
-    }
-}
-
-/// The global scope-addressing flags, exhaustively. Adding a flag forces a
-/// row in `flag_applies` and in the guard's reporting — the same
-/// can't-silently-drift construction as the exhaustive `command_plane` match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScopeFlag {
-    Server,
-    Cluster,
-    Graph,
-    Store,
-    As,
-    Profile,
-}
-
-impl ScopeFlag {
-    /// Guard evaluation order: first offending flag wins, preserving the
-    /// pre-matrix reporting precedence server → cluster → graph.
-    pub(crate) const ALL: [ScopeFlag; 6] = [
-        ScopeFlag::Server,
-        ScopeFlag::Cluster,
-        ScopeFlag::Graph,
-        ScopeFlag::Store,
-        ScopeFlag::As,
-        ScopeFlag::Profile,
-    ];
-
-    fn flag_name(self) -> &'static str {
-        match self {
-            ScopeFlag::Server => "--server",
-            ScopeFlag::Cluster => "--cluster",
-            ScopeFlag::Graph => "--graph",
-            ScopeFlag::Store => "--store",
-            ScopeFlag::As => "--as",
-            ScopeFlag::Profile => "--profile",
-        }
-    }
-
-    /// What the flag means, for the wrong-address error ("{clause} and does
-    /// not apply").
-    fn rejection_clause(self) -> &'static str {
-        match self {
-            ScopeFlag::Server => "--server addresses a served graph",
-            ScopeFlag::Cluster => "--cluster addresses a cluster-scoped command",
-            ScopeFlag::Graph => "--graph selects a graph within a server or cluster scope",
-            ScopeFlag::Store => "--store addresses a single graph's storage directly",
-            ScopeFlag::As => {
-                "--as sets the actor for a direct-engine or actor-bound cluster operation"
-            }
-            ScopeFlag::Profile => "--profile selects a scope bundle",
-        }
-    }
-
-    fn is_set(self, cli: &Cli) -> bool {
-        match self {
-            ScopeFlag::Server => cli.server.is_some(),
-            ScopeFlag::Cluster => cli.cluster.is_some(),
-            ScopeFlag::Graph => cli.graph.is_some(),
-            ScopeFlag::Store => cli.store.is_some(),
-            ScopeFlag::As => cli.as_actor.is_some(),
-            ScopeFlag::Profile => cli.profile.is_some(),
-        }
-    }
-}
-
-/// Which scope flags a verb can consume: one declarative matrix keyed by
-/// capability, plus the one per-command refinement (`accepts_cluster_addressing`
-/// — cluster addressing is per-command, not per-capability: optimize/repair/
-/// cleanup/lint accept it while the equally-`direct` init/schema-plan do not).
-fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool {
-    use Capability::*;
-    let cluster_ok = accepts_cluster_addressing(cmd);
-    let graph_ok = accepts_graph_selector(cmd);
-    match flag {
-        // Served addressing always needs a server. `graphs list` uses the bare
-        // registry scope.
-        ScopeFlag::Server => {
-            matches!(capability, Any | Served)
-                || matches!(
-                    cmd,
-                    Command::Cluster {
-                        command: ClusterCommand::Plan { .. }
-                            | ClusterCommand::Apply { .. }
-                            | ClusterCommand::Status { .. },
-                        managed: false,
-                    }
-                )
-        }
-        ScopeFlag::Cluster => cluster_ok,
-        // The one graph selector across scopes: a served graph (`any`), or a
-        // cluster graph on verbs that take
-        // cluster addressing. The other served-only command, `graphs list`,
-        // rejects it because that command IS the registry enumeration.
-        ScopeFlag::Graph => match capability {
-            Any => true,
-            Direct | Control => graph_ok,
-            Served => graph_ok,
-            Local => false,
+pub(crate) fn requirement(command: &Command) -> Requirement {
+    use Requirement::*;
+    match command {
+        Command::Query(_) => Graph {
+            direct_only: false,
+            root: true,
+            managed: true,
+            catalogue: true,
         },
-        // `direct` refines per command: the maintenance verbs (optimize/
-        // repair/cleanup/schema plan/lint) resolve their target through
-        // `resolve_maintenance_uri`, which consumes --store; `init` addresses
-        // its target with a required positional URI and never reads it.
-        ScopeFlag::Store => match capability {
-            Any => true,
-            Direct => !matches!(cmd, Command::Init(_)),
-            Served | Control | Local => false,
+        Command::Mutate(_) | Command::Load(_) => Graph {
+            direct_only: false,
+            root: true,
+            managed: true,
+            catalogue: false,
         },
-        // The actor rides direct-engine writes (`any` via --store) and cluster
-        // writes; Blob get/stat are reads and never consume it, while Blob
-        // put/clear are writes and do; commit list/show/changes and commit
-        // publish/drop split the same way. Served writes
-        // resolve the actor from the bearer token
-        // (rejected downstream with its own message). On `direct`, full-text
-        // rebuild attributes its graph publication; other maintenance verbs
-        // record no actor. `control` refines per command:
-        // Apply/upgrade attribute an actor; plan checks the intended actor
-        // against execution preflight. Other read-only control verbs do not.
-        ScopeFlag::As => match capability {
-            // `--as` names an actor for a direct/`--store` WRITE; a served write
-            // resolves the actor from its token. The read commands (`query`,
-            // `diff`, `changes`, `commit list/show/changes`, `blob get/stat`,
-            // `branch diff/merge-base`) attribute no actor on either surface,
-            // so accepting `--as` there is a silent no-op — reject it instead.
-            // `commit` mixes reads and writes; its match is exhaustive so a
-            // new subcommand is classified before it compiles.
-            Any => match cmd {
-                Command::Commit { command } => match command {
-                    CommitCommand::Publish { .. } | CommitCommand::Drop { .. } => true,
-                    CommitCommand::List { .. }
-                    | CommitCommand::Show { .. }
-                    | CommitCommand::Changes { .. } => false,
-                },
-                _ => !matches!(
-                    cmd,
-                    Command::Blob {
-                        command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
-                    } | Command::Changes { .. }
-                        | Command::Diff(_)
-                        | Command::Branch {
-                            command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
-                        }
-                        | Command::Query(_)
-                ),
-            },
-            Control => matches!(
-                cmd,
-                Command::Cluster {
-                    command: ClusterCommand::Plan { .. }
-                        | ClusterCommand::Apply { .. }
-                        | ClusterCommand::UpgradeLedger { .. },
-                    managed: false,
-                }
-            ),
-            Direct => matches!(
-                cmd,
-                Command::RebuildFullTextIndexes(_)
-                    | Command::Schema {
-                        command: SchemaCommand::Apply { .. }
-                    }
-            ),
-            Served | Local => false,
+        Command::Commit {
+            command: CommitCommand::List { .. } | CommitCommand::Show { .. },
+        } => Graph {
+            direct_only: false,
+            root: true,
+            managed: true,
+            catalogue: false,
         },
-        // A profile is consumed wherever scope resolution runs: the data/
-        // served resolvers, the maintenance-URI resolver, and the policy/
-        // queries cluster-scope resolver. `init` (positional target only),
-        // the `cluster` family (`--config`), and local verbs never resolve a
-        // scope, so an explicit --profile there would be silently discarded —
-        // including any store binding it carries. The ambient
-        // $OMNIGRAPH_PROFILE default remains ignored by those verbs (config
-        // default vs explicit intent — the same rule as `default_graph` on
-        // the registry path).
-        ScopeFlag::Profile => match capability {
-            Any | Served => true,
-            Direct => !matches!(cmd, Command::Init(_)),
-            Control => !matches!(cmd, Command::Cluster { .. }),
-            Local => false,
+        Command::Schema {
+            command: SchemaCommand::Show { .. },
+        } => Graph {
+            direct_only: false,
+            root: true,
+            managed: false,
+            catalogue: true,
         },
-    }
-}
-
-/// The capability a subcommand needs, derived from its `Plane` (the exhaustive
-/// classifier) plus the Data→Served refinement: registry-scoped `graphs`
-/// is remote-only.
-///
-/// This reflects *current enforced behavior*, so messages stay truthful:
-/// `queries`/`policy` read a cluster's applied state (`Control`).
-pub(crate) fn command_capability(cmd: &Command) -> Capability {
-    if matches!(cmd, Command::Graphs { .. }) {
-        return Capability::Served;
-    }
-    match command_plane(cmd) {
-        Plane::Data => Capability::Any,
-        Plane::Storage => Capability::Direct,
-        Plane::Control => Capability::Control,
-        Plane::Session => Capability::Local,
-    }
-}
-
-/// The plane a subcommand belongs to. Exhaustive — a new `Command` variant
-/// will not compile until classified. Descends into the nested enums where
-/// the plane differs per subcommand (`schema plan`/`apply` are storage while
-/// `schema show` is data; `queries`/`policy` read cluster applied state).
-pub(crate) fn command_plane(cmd: &Command) -> Plane {
-    match cmd {
-        Command::Query(_)
-        | Command::Mutate(_)
-        | Command::Load(_)
-        | Command::Branch { .. }
+        Command::Branch { .. }
         | Command::Snapshot(_)
         | Command::Export(_)
         | Command::Blob { .. }
-        | Command::Commit { .. }
         | Command::Diff(_)
         | Command::Changes { .. }
-        | Command::Graphs { .. } => Plane::Data,
-        Command::Schema {
-            command: SchemaCommand::Show { .. },
-        } => Plane::Data,
-        Command::Schema {
+        | Command::Commit {
             command:
-                SchemaCommand::Plan { .. }
-                | SchemaCommand::Apply { .. }
-                | SchemaCommand::UpgradeSystemColumns { .. },
-        } => Plane::Storage,
-        // `queries` and `policy` tooling now source their inputs from a
-        // cluster's applied state (`--cluster`), so they live on the control
-        // plane (RFC 0011 — omnigraph.yaml excised from the CLI).
-        Command::Queries { .. } => Plane::Control,
-        Command::Policy { .. } => Plane::Control,
+                CommitCommand::Publish { .. }
+                | CommitCommand::Drop { .. }
+                | CommitCommand::Changes { .. },
+        } => Graph {
+            direct_only: false,
+            root: true,
+            managed: false,
+            catalogue: false,
+        },
         Command::Init(_)
         | Command::Upgrade(_)
+        | Command::Schema {
+            command: SchemaCommand::Apply { .. } | SchemaCommand::UpgradeSystemColumns { .. },
+        } => Standalone,
+        Command::Schema {
+            command: SchemaCommand::Plan { .. },
+        }
         | Command::Optimize(_)
         | Command::RebuildFullTextIndexes(_)
         | Command::Repair(_)
-        | Command::Cleanup(_)
-        | Command::Lint(_) => Plane::Storage,
-        Command::Cluster { .. } | Command::Organization { .. } => Plane::Control,
-        Command::Alias(_)
+        | Command::Cleanup(_) => Graph {
+            direct_only: true,
+            root: true,
+            managed: false,
+            catalogue: false,
+        },
+        Command::Lint(args) => {
+            if args.schema.is_some() {
+                Local
+            } else {
+                Graph {
+                    direct_only: true,
+                    root: true,
+                    managed: false,
+                    catalogue: false,
+                }
+            }
+        }
+        Command::Graphs { .. } => Registry,
+        Command::Queries {
+            command: QueriesCommand::List { .. },
+        } => RootOrServedGraph,
+        Command::Queries {
+            command: QueriesCommand::Validate { .. },
+        }
+        | Command::Policy { .. } => Root,
+        Command::Cluster { command } => match command {
+            ClusterCommand::Validate { .. } => Local,
+            ClusterCommand::Plan { .. }
+            | ClusterCommand::Apply { .. }
+            | ClusterCommand::Status { .. } => Deployment,
+            ClusterCommand::Observe { .. }
+            | ClusterCommand::ForceUnlock { .. }
+            | ClusterCommand::UpgradeLedger { .. } => Root,
+            ClusterCommand::Create { .. } | ClusterCommand::List { .. } => ManagedAccount,
+            ClusterCommand::Members { .. }
+            | ClusterCommand::Pull { .. }
+            | ClusterCommand::Push { .. }
+            | ClusterCommand::Delete { .. }
+            | ClusterCommand::UndoDelete { .. }
+            | ClusterCommand::Token { .. }
+            | ClusterCommand::History { .. }
+            | ClusterCommand::Cancel { .. } => ManagedCluster,
+            ClusterCommand::Operation { .. } => ManagedOperation,
+        },
+        Command::Organization { .. } => ManagedAccount,
+        Command::Alias(_) => Alias,
+        Command::Login { .. } | Command::Logout { .. } => Authentication,
+        Command::Credential { .. } => Credential,
+        Command::Target { .. }
         | Command::Embed(_)
-        | Command::Login { .. }
-        | Command::Logout { .. }
-        | Command::Use { .. }
-        | Command::Profile { .. }
         | Command::Skill { .. }
-        | Command::Version { .. } => Plane::Session,
+        | Command::Version { .. } => Local,
     }
 }
 
-/// User-facing label for a subcommand (descends one level for the nested
-/// families so messages read `schema plan`, `queries validate`, etc.).
+pub(crate) fn root_input(command: &Command) -> bool {
+    matches!(
+        requirement(command),
+        Requirement::Root | Requirement::RootOrServedGraph | Requirement::Deployment
+    )
+}
+
+/// Whether the operation addresses one graph of `target`, so `--graph` or the
+/// target's `default_graph` must select it before any I/O.
+pub(crate) fn selects_graph(command: &Command, target: &ResolvedTarget) -> bool {
+    match requirement(command) {
+        Requirement::Graph { .. } => true,
+        Requirement::RootOrServedGraph => matches!(target.binding, TargetBinding::Server { .. }),
+        _ => false,
+    }
+}
+
+/// Flag applicability does not acquire configuration or a credential.
+pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
+    let need = requirement(&cli.command);
+    if matches!(need, Requirement::Local | Requirement::Alias) && cli.target.is_some() {
+        bail!("{} does not accept --target", command_label(&cli.command));
+    }
+    if cli.graph.is_some()
+        && !matches!(
+            need,
+            Requirement::Graph { .. } | Requirement::Root | Requirement::RootOrServedGraph
+        )
+    {
+        bail!("{} does not accept --graph", command_label(&cli.command));
+    }
+    if cli.graph.is_some() && matches!(&cli.command, Command::Cluster { .. }) {
+        bail!("cluster operations address the whole target and do not accept --graph");
+    }
+    if cli.as_actor.is_some() && !accepts_actor(&cli.command) {
+        bail!("{} does not accept --as", command_label(&cli.command));
+    }
+    Ok(())
+}
+
+/// An explicit actor applies only to an actor-consuming operation. Match mixed
+/// families exhaustively so new leaves need a decision; read-only families
+/// refuse as a whole. A served target still derives identity from its
+/// credential and carries `--as` as the `Omnigraph-If-Actor` assertion.
+fn accepts_actor(command: &Command) -> bool {
+    match command {
+        Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => true,
+        Command::Branch { command } => match command {
+            BranchCommand::Create { .. }
+            | BranchCommand::Delete { .. }
+            | BranchCommand::Merge { .. } => true,
+            BranchCommand::List { .. }
+            | BranchCommand::Diff { .. }
+            | BranchCommand::MergeBase { .. } => false,
+        },
+        Command::Blob { command } => match command {
+            BlobCommand::Put { .. } | BlobCommand::Clear { .. } => true,
+            BlobCommand::Get { .. } | BlobCommand::Stat { .. } => false,
+        },
+        Command::Commit { command } => match command {
+            CommitCommand::Publish { .. } | CommitCommand::Drop { .. } => true,
+            CommitCommand::List { .. }
+            | CommitCommand::Show { .. }
+            | CommitCommand::Changes { .. } => false,
+        },
+        Command::Schema { command } => match command {
+            SchemaCommand::Apply { .. } => true,
+            SchemaCommand::Plan { .. }
+            | SchemaCommand::Show { .. }
+            | SchemaCommand::UpgradeSystemColumns { .. } => false,
+        },
+        Command::Cluster { command } => match command {
+            // Plan checks the intended actor; apply and upgrade attribute it.
+            // A served plan or apply asserts it; validate_target refuses
+            // --as on managed targets.
+            ClusterCommand::Plan { .. }
+            | ClusterCommand::Apply { .. }
+            | ClusterCommand::UpgradeLedger { .. } => true,
+            ClusterCommand::Validate { .. }
+            | ClusterCommand::Status { .. }
+            | ClusterCommand::Observe { .. }
+            | ClusterCommand::ForceUnlock { .. }
+            | ClusterCommand::Create { .. }
+            | ClusterCommand::List { .. }
+            | ClusterCommand::Members { .. }
+            | ClusterCommand::Pull { .. }
+            | ClusterCommand::Push { .. }
+            | ClusterCommand::Delete { .. }
+            | ClusterCommand::UndoDelete { .. }
+            | ClusterCommand::Token { .. }
+            | ClusterCommand::Operation { .. }
+            | ClusterCommand::History { .. }
+            | ClusterCommand::Cancel { .. } => false,
+        },
+        Command::Query(_)
+        | Command::Snapshot(_)
+        | Command::Export(_)
+        | Command::Diff(_)
+        | Command::Changes { .. }
+        | Command::Graphs { .. }
+        | Command::Queries { .. }
+        | Command::Policy { .. }
+        | Command::Organization { .. }
+        | Command::Init(_)
+        | Command::Upgrade(_)
+        | Command::Optimize(_)
+        | Command::Repair(_)
+        | Command::Cleanup(_)
+        | Command::Lint(_)
+        | Command::Alias(_)
+        | Command::Embed(_)
+        | Command::Login { .. }
+        | Command::Logout { .. }
+        | Command::Target { .. }
+        | Command::Credential { .. }
+        | Command::Skill { .. }
+        | Command::Version { .. } => false,
+    }
+}
+
+/// Reject unsupported access kinds before any credential lookup or backend request.
+pub(crate) fn validate_target(
+    cli: &Cli,
+    target: &ResolvedTarget,
+    explicit_config: bool,
+) -> Result<()> {
+    use Requirement::*;
+    use TargetBinding::*;
+    let need = requirement(&cli.command);
+    let allowed = match (&need, &target.binding) {
+        (Graph { .. } | Standalone, DirectGraph { .. }) => true,
+        (Graph { root: true, .. } | Root | RootOrServedGraph | Deployment, DirectRoot { .. }) => {
+            true
+        }
+        (
+            Graph {
+                catalogue: true, ..
+            },
+            DirectCatalogue,
+        ) => true,
+        (
+            Graph {
+                direct_only: false, ..
+            }
+            | Registry
+            | RootOrServedGraph
+            | Deployment
+            | Authentication
+            | Credential
+            | Alias,
+            Server { .. },
+        ) => true,
+        (
+            Graph { managed: true, .. } | Registry | Deployment | ManagedCluster,
+            Managed(binding),
+        ) => binding.cluster.is_some(),
+        (ManagedAccount, Managed(binding)) => binding.cluster.is_none(),
+        (ManagedOperation | Authentication, Managed(_)) => true,
+        _ => false,
+    };
+    if !allowed {
+        bail!(
+            "{} is not available for this target kind and scope",
+            command_label(&cli.command)
+        );
+    }
+    let invocation = match &cli.command {
+        Command::Query(args) => Some((
+            args.name.as_deref(),
+            args.query.is_some() || args.query_string.is_some(),
+        )),
+        Command::Mutate(args) => Some((
+            args.name.as_deref(),
+            args.query.is_some() || args.query_string.is_some(),
+        )),
+        _ => None,
+    };
+    if let Some((name, false)) = invocation {
+        if name.is_none() {
+            bail!("provide a stored query name, -e '<gq>' or --query <file>");
+        }
+        if !matches!(target.binding, Server { .. } | Managed(_)) {
+            bail!(
+                "stored query invocation requires a server or managed target; use -e '<gq>' or --query <file> with direct storage"
+            );
+        }
+    }
+    if cli.graph.is_some() && matches!(target.binding, DirectGraph { .. } | DirectCatalogue) {
+        bail!("a direct graph or catalogue target already identifies its graph; remove --graph");
+    }
+    // A served target derives identity from its credential and sends `--as`
+    // as an assertion the server checks; a managed target asserts nothing.
+    if cli.as_actor.is_some() && matches!(target.binding, Managed(_)) {
+        bail!(
+            "--as is not available for a managed target; it derives identity from its credential"
+        );
+    }
+    if matches!(
+        (&cli.command, &target.binding),
+        (Command::Login { token: Some(_), .. }, Managed(_))
+    ) {
+        bail!(
+            "--token applies to server login only; a managed target uses its declared authentication mechanism"
+        );
+    }
+    if let Command::Cluster { command } = &cli.command {
+        let managed = matches!(target.binding, Managed(_));
+        match command {
+            ClusterCommand::Apply {
+                deployment_id,
+                writers_stopped,
+                plan,
+                run,
+                ..
+            } => {
+                if managed {
+                    if deployment_id.is_some() || *writers_stopped || explicit_config {
+                        bail!(
+                            "managed apply uses --plan and does not accept --deployment-id, --writers-stopped or --config"
+                        );
+                    }
+                    if plan.is_none() {
+                        bail!("managed apply requires --plan PREVIEW_ID");
+                    }
+                } else {
+                    if plan.is_some() || run.idempotency_key.is_some() {
+                        bail!("--plan and --idempotency-key require a managed target");
+                    }
+                    if *writers_stopped && (explicit_config || deployment_id.is_none()) {
+                        bail!("--writers-stopped requires --deployment-id without --config");
+                    }
+                    if matches!(target.binding, Server { .. }) {
+                        if *writers_stopped {
+                            bail!("--writers-stopped requires a direct root target");
+                        }
+                        if deployment_id.is_some() && !explicit_config {
+                            bail!(
+                                "source submission with --deployment-id requires explicit --config; use cluster status --deployment-id ID to observe"
+                            );
+                        }
+                    } else if run.no_wait || run.timeout.is_some() {
+                        bail!("deployment wait options require a server or managed target");
+                    }
+                    if *writers_stopped && !target.is_explicit() {
+                        bail!("writer-attested recovery requires explicit --target");
+                    }
+                }
+            }
+            ClusterCommand::Plan { revision, run, .. } => {
+                if managed && explicit_config {
+                    bail!("managed plan uses pushed source and does not accept --config");
+                }
+                if !managed
+                    && (revision.is_some()
+                        || run.no_wait
+                        || run.timeout.is_some()
+                        || run.idempotency_key.is_some())
+                {
+                    bail!("revision and plan-run options require a managed target");
+                }
+            }
+            ClusterCommand::Status {
+                deployment_id,
+                run_id,
+                wait,
+                ..
+            } => {
+                if managed && deployment_id.is_some() {
+                    bail!("managed status accepts a positional deployment ID");
+                }
+                if !managed && run_id.is_some() {
+                    bail!(
+                        "a positional delivery ID requires a managed target; use --deployment-id"
+                    );
+                }
+                if !managed && matches!(target.binding, DirectRoot { .. }) && *wait {
+                    bail!("--wait requires a server or managed target");
+                }
+            }
+            ClusterCommand::ForceUnlock { .. } | ClusterCommand::UpgradeLedger { .. }
+                if !target.is_explicit() =>
+            {
+                bail!("recovery effects require explicit --target")
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn command_label(cmd: &Command) -> &'static str {
     match cmd {
         Command::Version { .. } => "version",
         Command::Login { .. } => "login",
         Command::Logout { .. } => "logout",
-        Command::Use { .. } => "use",
-        Command::Profile { .. } => "profile",
+        Command::Target { .. } => "target",
+        Command::Credential { .. } => "credential",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",
@@ -338,7 +448,14 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Embed(_) => "embed",
         Command::Init(_) => "init",
         Command::Load(_) => "load",
-        Command::Branch { .. } => "branch",
+        Command::Branch { command } => match command {
+            BranchCommand::Create { .. } => "branch create",
+            BranchCommand::List { .. } => "branch list",
+            BranchCommand::Delete { .. } => "branch delete",
+            BranchCommand::Merge { .. } => "branch merge",
+            BranchCommand::Diff { .. } => "branch diff",
+            BranchCommand::MergeBase { .. } => "branch merge-base",
+        },
         Command::Schema { command } => match command {
             SchemaCommand::Plan { .. } => "schema plan",
             SchemaCommand::Apply { .. } => "schema apply",
@@ -387,390 +504,187 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
     }
 }
 
-/// The verbs that consume a cluster scope. Maintenance/lint select a graph with
-/// `--cluster <root> --graph <id>`; policy/queries inspect the cluster's
-/// applied control-plane state and may optionally use `--graph` to select one
-/// bundle/registry. `init` is storage-plane too but *creates* a graph (cluster
-/// graphs are born from `cluster apply`, not `init`), and `schema plan` takes a
-/// positional URI, so the guard rejects `--cluster`/`--graph` there rather than
-/// silently dropping the flag.
-pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
-    matches!(
-        cmd,
-        Command::Optimize(_)
-            | Command::RebuildFullTextIndexes(_)
-            | Command::Repair(_)
-            | Command::Cleanup(_)
-            // `lint` can type-check a `.gq` against a cluster graph's schema
-            // (RFC 0011): `--cluster <dir> --graph <id>`.
-            | Command::Lint(_)
-            // The policy/queries tooling addresses a cluster's applied state
-            // (RFC 0011): `--cluster <dir>` selects the cluster, `--graph <id>`
-            // picks a graph's bundle/registry within it.
-            | Command::Policy { .. }
-            | Command::Queries { .. }
-            | Command::Cluster { command: ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
-                | ClusterCommand::ForceUnlock { .. } | ClusterCommand::UpgradeLedger { .. }, managed: false }
-    )
-}
-
-/// Commands that consume the global `--graph` selector, which is exactly the
-/// set that consumes global `--cluster` addressing.
-fn accepts_graph_selector(cmd: &Command) -> bool {
-    accepts_cluster_addressing(cmd) && !matches!(cmd, Command::Cluster { .. })
-}
-
-/// Reject a scope-addressing flag (`--server`/`--cluster`/`--graph`) on a verb
-/// that cannot consume it, rather than silently dropping it (the old behavior:
-/// e.g. `optimize --server prod` dropped `--server` and failed later with an
-/// unrelated message). `alias` gets an extra guard because its binding owns all
-/// addressing and several ignored globals sit outside this three-flag guard.
-/// Each flag has a distinct valid surface:
-/// - `--server` → served-graph scopes (`any`/`served`);
-/// - `--cluster` → cluster-scoped direct/control verbs;
-/// - `--graph` → any multi-graph scope: a served scope *or* a cluster one.
-///
-/// RFC 0010 Slice 1, generalized for RFC 0011 cluster addressing.
-pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
-    if let Command::Alias(_) = &cli.command {
-        // The binding owns all addressing. The listing keeps its historical
-        // flag order (error text is observable contract).
-        let flags: Vec<&str> = [
-            ScopeFlag::Server,
-            ScopeFlag::Graph,
-            ScopeFlag::Store,
-            ScopeFlag::Cluster,
-            ScopeFlag::Profile,
-            ScopeFlag::As,
-        ]
-        .into_iter()
-        .filter(|flag| flag.is_set(cli))
-        .map(ScopeFlag::flag_name)
-        .collect();
-        if !flags.is_empty() {
-            bail!(
-                "`alias` uses the server, graph, and stored query declared in \
-                 `aliases.<name>` in ~/.omnigraph/config.yaml; remove global scope \
-                 flag(s): {}",
-                flags.join(", ")
-            );
-        }
-    }
-    let capability = command_capability(&cli.command);
-    let label = command_label(&cli.command);
-    for flag in ScopeFlag::ALL {
-        if flag.is_set(cli) && !flag_applies(flag, capability, &cli.command) {
-            bail!(
-                "`{label}` is a {} command; {} and does not apply.{}",
-                capability.describe(),
-                flag.rejection_clause(),
-                remediation(capability, &cli.command),
-            );
-        }
-    }
-    Ok(())
-}
-
-/// The "what to do instead" tail for a wrong-address error, by capability.
-/// Includes its own leading space when non-empty so the caller appends it
-/// directly — an empty tail (`any`, which only reaches this fn for a
-/// misplaced `--cluster`) leaves no trailing space.
-fn remediation(capability: Capability, cmd: &Command) -> &'static str {
-    match capability {
-        Capability::Direct => match cmd {
-            Command::Init(_) => " Pass a storage URI.",
-            Command::Schema {
-                command: SchemaCommand::Apply { .. },
-            } => {
-                " Pass a standalone storage URI, or deploy the schema with `cluster apply --server <SERVER> --config <CONFIG>`."
-            }
-            Command::Optimize(_)
-            | Command::RebuildFullTextIndexes(_)
-            | Command::Repair(_)
-            | Command::Cleanup(_) => " Pass a storage URI, or --cluster <dir> --graph <id>.",
-            _ => " Pass a storage URI.",
-        },
-        Capability::Control => match cmd {
-            Command::Cluster { .. } => {
-                " It operates on a cluster config directory (pass --config <dir>)."
-            }
-            Command::Policy { .. } | Command::Queries { .. } => {
-                " It operates on a cluster (pass --cluster <dir|uri>, or select a cluster profile)."
-            }
-            _ => " It operates on a cluster.",
-        },
-        Capability::Local => " It does not address a graph.",
-        Capability::Served => " Address the server with --server <name|url> or --profile <name>.",
-        Capability::Any => "",
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
-    use super::*;
-
+    use clap::CommandFactory;
     #[test]
-    fn scope_flag_matrix_matches_capabilities_issue_1023() {
-        // The full flag × capability contract in one place. Rows cover every
-        // capability, and both cluster_ok refinements of `direct` (optimize vs
-        // init) and of `control` (queries vs cluster). `graphs` is
-        // registry-only and accepts neither --store nor --as.
-        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
-        // (command, [server, cluster, graph, store, as, profile])
-        let rows = [
-            (
-                parse(&["omnigraph", "query", "q"]),
-                [true, false, true, true, false, true],
-            ),
-            (
-                parse(&[
-                    "omnigraph",
-                    "blob",
-                    "stat",
-                    "node",
-                    "Document",
-                    "readme",
-                    "content",
-                ]),
-                [true, false, true, true, false, true],
-            ),
-            (
-                parse(&["omnigraph", "graphs", "list"]),
-                [true, false, false, false, false, true],
-            ),
-            // The change surfaces are ordinary data-plane verbs: served or
-            // embedded, never cluster-addressed. Like every read, they reject
-            // `--as` (5th column false) — a served read resolves the actor from
-            // its token and an embedded read attributes none.
-            (
-                parse(&["omnigraph", "commit", "changes", "some-commit"]),
-                [true, false, true, true, false, true],
-            ),
-            (
-                parse(&["omnigraph", "commit", "list"]),
-                [true, false, true, true, false, true],
-            ),
-            (
-                parse(&["omnigraph", "commit", "show", "some-commit"]),
-                [true, false, true, true, false, true],
-            ),
-            // `commit publish` and `commit drop` write, so a direct target
-            // takes `--as` as every other direct write does.
-            (
-                parse(&["omnigraph", "commit", "publish", "some-commit"]),
-                [true, false, true, true, true, true],
-            ),
-            (
-                parse(&["omnigraph", "commit", "drop", "some-commit"]),
-                [true, false, true, true, true, true],
-            ),
-            (
-                parse(&["omnigraph", "changes", "poll"]),
-                [true, false, true, true, false, true],
-            ),
-            (
-                parse(&["omnigraph", "changes", "baseline", "--out", "b.jsonl"]),
-                [true, false, true, true, false, true],
-            ),
-            (
-                parse(&["omnigraph", "schema", "apply", "--schema", "s.pg", "g.omni"]),
-                [false, false, false, true, true, true],
-            ),
-            (
-                parse(&["omnigraph", "optimize", "g.omni"]),
-                [false, true, true, true, false, true],
-            ),
-            (
-                parse(&["omnigraph", "rebuild-full-text-indexes", "g.omni"]),
-                [false, true, true, true, true, true],
-            ),
-            // `init` addresses its target positionally and never resolves a
-            // scope — --store and --profile are rejected, not silently
-            // ignored (unlike the other direct verbs).
-            (
-                parse(&["omnigraph", "init", "--schema", "s.pg", "g.omni"]),
-                [false, false, false, false, false, false],
-            ),
-            // Plan checks the intended actor; other read-only control verbs
-            // do not. Apply/upgrade attribute it. The cluster family accepts
-            // root addressing for durable deployment/recovery, without graph
-            // selection or profile scope.
-            (
-                parse(&["omnigraph", "queries", "list"]),
-                [false, true, true, false, false, true],
-            ),
-            (
-                parse(&["omnigraph", "cluster", "status", "--config", "."]),
-                [true, true, false, false, false, false],
-            ),
-            (
-                parse(&["omnigraph", "cluster", "plan", "--config", "."]),
-                [true, false, false, false, true, false],
-            ),
-            (
-                parse(&["omnigraph", "cluster", "apply", "--config", "."]),
-                [true, true, false, false, true, false],
-            ),
-            (
-                parse(&["omnigraph", "cluster", "force-unlock", "lock-id"]),
-                [false, true, false, false, false, false],
-            ),
-            (
-                parse(&[
-                    "omnigraph",
-                    "cluster",
-                    "upgrade-ledger",
-                    "--cluster",
-                    "file:///cluster",
-                    "--writers-stopped",
-                ]),
-                [false, true, false, false, true, false],
-            ),
-            (
-                parse(&["omnigraph", "cluster", "status", "--managed"]),
-                [false, false, false, false, false, false],
-            ),
-            (
-                parse(&["omnigraph", "cluster", "plan", "--managed"]),
-                [false, false, false, false, false, false],
-            ),
-            (
-                parse(&[
-                    "omnigraph",
-                    "cluster",
-                    "apply",
-                    "--managed",
-                    "--plan",
-                    "plan",
-                ]),
-                [false, false, false, false, false, false],
-            ),
-            (
-                parse(&["omnigraph", "version"]),
-                [false, false, false, false, false, false],
-            ),
-            (
-                parse(&["omnigraph", "skill", "export", "skills/omnigraph"]),
-                [false, false, false, false, false, false],
-            ),
-        ];
-        for (cmd, expected) in &rows {
-            let capability = command_capability(cmd);
-            for (flag, want) in ScopeFlag::ALL.into_iter().zip(*expected) {
-                assert_eq!(
-                    flag_applies(flag, capability, cmd),
-                    want,
-                    "{flag:?} on `{}` ({capability:?})",
-                    command_label(cmd),
+    fn parser_exposes_only_one_destination_selector() {
+        fn walk(command: &clap::Command) {
+            for argument in command.get_arguments() {
+                assert!(
+                    !matches!(
+                        argument.get_long(),
+                        Some(
+                            "server"
+                                | "store"
+                                | "cluster"
+                                | "profile"
+                                | "managed"
+                                | "direct"
+                                | "quiet"
+                                | "api"
+                                | "organization"
+                                | "uri"
+                        )
+                    ),
+                    "retired flag in {}: {:?}",
+                    command.get_name(),
+                    argument.get_long()
                 );
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn live_cluster_scope_conflicts_refuse_before_discovery() {
-        let cases: &[(&[&str], &str)] = &[
-            (&["--as", "spoofed"], "--as cannot be used with --server"),
-            (
-                &["--cluster", "file:///unused"],
-                "--server and --cluster are mutually exclusive",
-            ),
-            (
-                &["--writers-stopped", "--deployment-id", "unused"],
-                "--writers-stopped cannot be used with --server",
-            ),
-            (&["--graph", "knowledge"], "--graph selects a graph"),
-        ];
-        for (extra, expected) in cases {
-            let mut args = vec![
-                "omnigraph",
-                "cluster",
-                "apply",
-                "--server",
-                "http://127.0.0.1:1",
-            ];
-            args.extend_from_slice(extra);
-            let cli = Cli::try_parse_from(args).unwrap();
-            let error = crate::cluster_remote::dispatch(
-                &crate::operator::InvocationConfig::at(None, None),
-                &cli,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-            assert!(error.contains(expected), "{error}");
-        }
-    }
-
-    #[test]
-    fn command_capability_classifies_representative_verbs() {
-        let cap = |args: &[&str]| command_capability(&Cli::try_parse_from(args).unwrap().command);
-        // The one Data→Served refinement: the registry-scoped `graphs` family.
-        assert_eq!(cap(&["omnigraph", "graphs", "list"]), Capability::Served);
-        assert_eq!(
-            cap(&[
-                "omnigraph",
-                "blob",
-                "get",
-                "node",
-                "Document",
-                "readme",
-                "content",
-            ]),
-            Capability::Any
-        );
-        assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
-        assert_eq!(
-            cap(&["omnigraph", "optimize", "graph.omni"]),
-            Capability::Direct
-        );
-        assert_eq!(
-            cap(&["omnigraph", "rebuild-full-text-indexes", "graph.omni"]),
-            Capability::Direct
-        );
-        assert_eq!(
-            cap(&[
-                "omnigraph",
-                "schema",
-                "plan",
-                "--schema",
-                "s.pg",
-                "graph.omni"
-            ]),
-            Capability::Direct
-        );
-        assert_eq!(
-            cap(&["omnigraph", "cluster", "status", "--config", "."]),
-            Capability::Control
-        );
-        assert_eq!(cap(&["omnigraph", "version"]), Capability::Local);
-        assert_eq!(cap(&["omnigraph", "skill", "show"]), Capability::Local);
-        // `queries`/`policy` tooling reads cluster state now (control plane).
-        assert_eq!(cap(&["omnigraph", "queries", "list"]), Capability::Control);
-        assert_eq!(
-            cap(&["omnigraph", "policy", "validate"]),
-            Capability::Control
-        );
-    }
-
-    #[test]
-    fn every_capability_describes_distinctly() {
-        let phrases = [
-            Capability::Any.describe(),
-            Capability::Served.describe(),
-            Capability::Direct.describe(),
-            Capability::Control.describe(),
-            Capability::Local.describe(),
-        ];
-        for (i, a) in phrases.iter().enumerate() {
-            assert!(!a.is_empty());
-            for b in &phrases[i + 1..] {
-                assert_ne!(a, b);
+            for child in command.get_subcommands() {
+                walk(child);
             }
+        }
+        let command = crate::cli::Cli::command();
+        walk(&command);
+        assert!(
+            !command
+                .get_subcommands()
+                .any(|c| matches!(c.get_name(), "use" | "profile"))
+        );
+    }
+    #[test]
+    fn actor_flag_matrix_matches_consumption_issue_1023() {
+        use clap::Parser;
+
+        let cases: &[(&[&str], bool)] = &[
+            (&["mutate", "-e", "q"], true),
+            (&["load", "--data", "d.jsonl", "--mode", "append"], true),
+            (&["rebuild-full-text-indexes"], true),
+            (&["branch", "create", "b"], true),
+            (&["branch", "delete", "b"], true),
+            (&["branch", "merge", "b"], true),
+            (&["branch", "list"], false),
+            (&["branch", "diff", "b"], false),
+            (&["branch", "merge-base", "b"], false),
+            (
+                &["blob", "put", "node", "Document", "readme", "content"],
+                true,
+            ),
+            (
+                &["blob", "clear", "node", "Document", "readme", "content"],
+                true,
+            ),
+            (
+                &["blob", "get", "node", "Document", "readme", "content"],
+                false,
+            ),
+            (
+                &["blob", "stat", "node", "Document", "readme", "content"],
+                false,
+            ),
+            (&["commit", "publish", "c"], true),
+            (&["commit", "drop", "c"], true),
+            (&["commit", "list"], false),
+            (&["commit", "show", "c"], false),
+            (&["commit", "changes", "c"], false),
+            (&["schema", "apply", "--schema", "s.pg"], true),
+            (&["schema", "plan", "--schema", "s.pg"], false),
+            (&["schema", "show"], false),
+            (&["schema", "upgrade-system-columns"], false),
+            (&["cluster", "plan"], true),
+            (&["cluster", "apply"], true),
+            (&["cluster", "upgrade-ledger", "--writers-stopped"], true),
+            (&["cluster", "validate"], false),
+            (&["cluster", "status"], false),
+            (&["cluster", "observe"], false),
+            (&["cluster", "force-unlock", "lock"], false),
+            (&["cluster", "create", "c"], false),
+            (&["cluster", "list"], false),
+            (&["cluster", "members", "list"], false),
+            (&["cluster", "pull", "--out", "out"], false),
+            (
+                &[
+                    "cluster",
+                    "push",
+                    "--expected-revision",
+                    "rev",
+                    "--message",
+                    "m",
+                ],
+                false,
+            ),
+            (&["cluster", "delete", "--incarnation", "inc"], false),
+            (
+                &[
+                    "cluster",
+                    "undo-delete",
+                    "--incarnation",
+                    "inc",
+                    "--deletion-id",
+                    "id",
+                ],
+                false,
+            ),
+            (&["cluster", "token"], false),
+            (&["cluster", "operation", "id"], false),
+            (&["cluster", "history"], false),
+            (&["cluster", "cancel", "id"], false),
+            (&["query", "-e", "q"], false),
+            (&["snapshot"], false),
+            (&["export"], false),
+            (&["diff", "--from", "a", "--to", "b"], false),
+            (&["changes", "poll"], false),
+            (&["changes", "baseline", "--out", "out"], false),
+            (&["optimize"], false),
+            (&["cleanup"], false),
+        ];
+        for &(args, accepts_actor) in cases {
+            let argv = ["omnigraph"]
+                .into_iter()
+                .chain(args.iter().copied())
+                .chain(["--as", "act-writer"]);
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let result = super::guard_addressing(&cli);
+            assert_eq!(result.is_ok(), accepts_actor, "{args:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn as_refusal_names_the_subcommand() {
+        use clap::Parser;
+
+        let cases: &[(&[&str], &str)] = &[
+            (&["branch", "list"], "branch list"),
+            (&["branch", "diff", "b"], "branch diff"),
+            (&["branch", "merge-base", "b"], "branch merge-base"),
+            (&["commit", "show", "c"], "commit show"),
+            (&["snapshot"], "snapshot"),
+            (&["export"], "export"),
+            (&["schema", "show"], "schema show"),
+        ];
+        for &(args, label) in cases {
+            let argv = ["omnigraph"]
+                .into_iter()
+                .chain(args.iter().copied())
+                .chain(["--as", "act-reader"]);
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let error = super::guard_addressing(&cli).unwrap_err().to_string();
+            assert_eq!(error, format!("{label} does not accept --as"));
+        }
+    }
+
+    #[test]
+    fn removed_flags_fail_before_configuration_or_io() {
+        for flag in [
+            "--server",
+            "--store",
+            "--cluster",
+            "--profile",
+            "--managed",
+            "--direct",
+            "--quiet",
+            "--uri",
+            "--api",
+            "--organization",
+        ] {
+            let error = crate::invocation::parse_from(["omnigraph", "query", "q", flag, "old"])
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{flag}");
+        }
+        for command in ["use", "profile"] {
+            assert!(crate::invocation::parse_from(["omnigraph", command]).is_err());
         }
     }
 }

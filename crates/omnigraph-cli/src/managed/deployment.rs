@@ -188,7 +188,11 @@ async fn submit(
         tokio::time::timeout_at(deadline, request).await.unwrap_or_else(|_| Err(Failure::new("wait_timeout", "local submission deadline reached; acceptance is unknown; retain the original idempotency key", 5)))
     };
     result.map(|body| (body, key.clone())).map_err(|error| {
-        if error.exit == 2 {
+        if error.exit == 2
+            && !error
+                .response_status
+                .is_some_and(|status| status.is_success())
+        {
             error
         } else {
             retain_submission(error, &key, body)
@@ -251,7 +255,7 @@ async fn wait(
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
             identity.diagnostic(stderr, format_args!(
-                "wait deadline reached; inspect `cluster status --managed {}`; no work was cancelled or resubmitted\n",
+                "wait deadline reached; inspect `cluster status {} --target NAME`; no work was cancelled or resubmitted\n",
                 identity.deployment_id
             ))?;
             return Ok((body, 5));
@@ -270,6 +274,7 @@ async fn wait(
             Ok(Ok(response)) => {
                 return Err(identity.retain(Failure {
                     body: response.body,
+                    response_status: Some(response.status),
                     exit: if response.status.is_client_error() {
                         2
                     } else {
@@ -353,7 +358,7 @@ pub(super) async fn dispatch(
             let plan = plan.as_deref().ok_or_else(|| {
                 Failure::refused(
                     "plan_required",
-                    "cluster apply --managed requires --plan <preview-id>",
+                    "managed cluster apply requires --plan <preview-id>",
                 )
             })?;
             identifier(plan)?;

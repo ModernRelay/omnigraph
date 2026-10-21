@@ -246,13 +246,12 @@ schema is declared (`graphs.<id>.schema:` in `cluster.yaml`) and converged:
 
 ```bash
 $EDITOR schema.pg
-omnigraph cluster plan  --config . --observe   # migration steps; takes no cluster lock
-omnigraph cluster apply --server <name|url> --config .
+omnigraph cluster plan --target ./cluster --config . --observe   # migration steps; takes no cluster lock
+omnigraph cluster apply --target <name|url> --config .
 # the running server publishes and activates the new shape; no restart
 ```
 
-Without `--server`, `cluster apply --config . --as <you>` writes the storage
-root itself: stop the server and transfer its cluster lock first (see
+With a direct-root target, `cluster apply --target ./cluster --config . --as <you>` writes storage directly: stop the server and transfer its cluster lock first (see
 [`cluster.md`](cluster.md)), then start the server to serve the new shape.
 
 Differences from direct `schema apply` (on a non-cluster store): out-of-band

@@ -1059,6 +1059,8 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ChangeBaselineRecord",
     "ChangeDiffRefusalOutput",
     "ChangeDiffRefusalReason",
+    "BranchStartRefusalOutput",
+    "BranchStartRefusalReason",
     "BlobRangeOutput",
     "ExternalBlobSourceOutput",
     "ExportRequest",
@@ -1259,7 +1261,7 @@ fn branch_outcome_output_schema_is_tagged_by_kind() {
             .collect();
         fields.sort_unstable();
         let expected: &[&str] = match kind {
-            "created" => &["from", "name"],
+            "created" => &["from", "from_commit_id", "name"],
             "deleted" => &["name"],
             "merged" => &["merge", "source", "target"],
             "published" => &[],
@@ -1379,6 +1381,44 @@ fn error_output_schema_has_expected_fields() {
     let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("error"));
     assert!(props.contains_key("code"));
+    // A server sends the message, the code and the disposition on every error,
+    // never null.
+    for name in ["ErrorOutput", "ChangeErrorOutput"] {
+        let body = &doc["components"]["schemas"][name];
+        let required: HashSet<&str> = body["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            required,
+            HashSet::from(["error", "code", "disposition"]),
+            "{name}"
+        );
+        assert_eq!(
+            body["properties"]["code"]["$ref"], "#/components/schemas/ErrorCode",
+            "{name}"
+        );
+        assert_eq!(
+            body["properties"]["disposition"]["$ref"], "#/components/schemas/DispositionOutput",
+            "{name}"
+        );
+        assert!(body["properties"].get("outcome").is_none(), "{name}");
+    }
+    let disposition = &doc["components"]["schemas"]["DispositionOutput"];
+    assert_eq!(
+        disposition["required"],
+        serde_json::json!(["effects", "action"])
+    );
+    assert_eq!(
+        doc["components"]["schemas"]["DispositionEffects"]["enum"],
+        serde_json::json!(["none", "partial", "unknown"])
+    );
+    assert_eq!(
+        doc["components"]["schemas"]["DispositionAction"]["enum"],
+        serde_json::json!(["fix", "refresh", "retry", "recover", "reconcile"])
+    );
     assert!(props.contains_key("merge_conflicts"));
     assert!(props.contains_key("published_dataset_version_conflict"));
     assert!(props.contains_key("read_set_conflict"));
@@ -1399,6 +1439,45 @@ fn error_output_schema_has_expected_fields() {
             .iter()
             .any(|field| field == "full_text_index_rebuild_required")
     );
+    // A refused branch start is an optional detail; `POST /branches` declares
+    // its 409 and its 410 (a commit cleanup no longer retains) with it.
+    let branch_start = &props["branch_start_refusal"];
+    assert!(
+        branch_start["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|schema| { schema["$ref"] == "#/components/schemas/BranchStartRefusalOutput" })
+    );
+    assert_eq!(
+        doc["components"]["schemas"]["BranchStartRefusalReason"]["enum"],
+        serde_json::json!([
+            "not_retained",
+            "schema_changed",
+            "earlier_storage_format",
+            "branch_deleted",
+            "unpublished_commit",
+            "unattached_snapshot",
+            "unknown"
+        ])
+    );
+    let create = &doc["paths"]["/graphs/{graph_id}/branches"]["post"]["responses"];
+    for status in ["404", "409", "410"] {
+        assert_eq!(
+            create[status]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "POST /branches {status}"
+        );
+    }
+    for status in ["409", "410"] {
+        assert!(
+            create[status]["description"]
+                .as_str()
+                .unwrap()
+                .contains("branch_start_refusal"),
+            "POST /branches {status} must name the refusal detail"
+        );
+    }
     let details = &doc["components"]["schemas"]["FullTextIndexRebuildRequiredOutput"];
     let required: HashSet<&str> = details["required"]
         .as_array()
@@ -1479,6 +1558,7 @@ fn change_error_output_schema_matches_every_change_route_detail() {
     for field in [
         "error",
         "code",
+        "disposition",
         "resource_limit",
         "recovery_required",
         "change_feed_gap",
@@ -1491,7 +1571,7 @@ fn change_error_output_schema_matches_every_change_route_detail() {
     }
     assert_eq!(
         props.len(),
-        6,
+        7,
         "change errors must not grow generic storage-conflict details: {props:?}"
     );
 }
@@ -1664,14 +1744,28 @@ fn error_code_schema_has_expected_variants() {
             "forbidden",
             "bad_request",
             "api_contract_mismatch",
+            "actor_mismatch",
+            "outcome_unknown",
+            "precondition_failed",
+            "recovery_required",
+            "external_blob_source",
+            "change_feed_gap",
             "not_found",
             "method_not_allowed",
+            "request_timeout",
             "conflict",
+            "branch_start_refusal",
             "unattached_cannot_publish",
+            "payload_too_large",
+            "unsupported_media_type",
+            "range_not_satisfiable",
             "too_many_requests",
             "service_unavailable",
             "graph_unavailable",
             "internal",
+            "cancelled",
+            "deadline_exceeded",
+            "result_too_large",
         ]),
         "ErrorCode must match the closed HTTP contract, including its \
          explicit API admission and graph availability refusals",
@@ -2617,15 +2711,66 @@ fn openapi_describes_api_contract_admission_and_response_identity() {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
+            // Header names are published in Title-Case; the wire constants are
+            // their lowercase spelling.
+            assert!(
+                parameters
+                    .iter()
+                    .all(|parameter| parameter["in"] != "header"
+                        || parameter["name"]
+                            .as_str()
+                            .unwrap()
+                            .split('-')
+                            .all(|part| part.starts_with(|c: char| c.is_ascii_uppercase()))),
+                "{method} {path}: {parameters:?}"
+            );
             let contract_parameters: Vec<_> = parameters
                 .iter()
-                .filter(|parameter| parameter["name"] == HTTP_API_CONTRACT_HEADER)
+                .filter(|parameter| parameter["name"] == "Omnigraph-Http-Api")
                 .collect();
             let oauth = path.starts_with("/.well-known/oauth-protected-resource");
             let protected =
                 path == "/graphs" || path.starts_with("/graphs/") || path.starts_with("/cluster/");
             if protected {
                 assert_eq!(contract_parameters.len(), 1, "{method} {path}");
+                assert_eq!(
+                    HTTP_API_CONTRACT_HEADER,
+                    contract_parameters[0]["name"]
+                        .as_str()
+                        .unwrap()
+                        .to_ascii_lowercase()
+                );
+                assert!(
+                    parameters
+                        .iter()
+                        .any(|parameter| parameter["name"] == "Omnigraph-If-Actor"),
+                    "{method} {path}"
+                );
+                // The router's own refusals reach every protected operation,
+                // and a path under a graph names one that may not be served.
+                let responses = &operation["responses"];
+                for status in ["404", "405"] {
+                    assert!(responses[status].is_object(), "{method} {path} {status}");
+                }
+                assert!(
+                    responses["405"]["headers"]["Allow"].is_object(),
+                    "{method} {path}"
+                );
+                if path.starts_with("/graphs/{graph_id}/") {
+                    assert!(
+                        responses["404"]["description"]
+                            .as_str()
+                            .unwrap()
+                            .contains("no graph"),
+                        "{method} {path}"
+                    );
+                }
+                if path.starts_with("/graphs/{graph_id}/") || path.starts_with("/cluster/") {
+                    assert!(
+                        responses["503"]["headers"]["Retry-After"].is_object(),
+                        "{method} {path}"
+                    );
+                }
                 let parameter = contract_parameters[0];
                 assert_eq!(parameter["in"], "header");
                 assert_eq!(parameter["required"], true);
@@ -2666,7 +2811,7 @@ fn openapi_describes_api_contract_admission_and_response_identity() {
                         "HEAD {path} {status} must not promise a response body"
                     );
                 }
-                let contract = &response["headers"][HTTP_API_CONTRACT_HEADER];
+                let contract = &response["headers"]["Omnigraph-Http-Api"];
                 if oauth {
                     assert!(contract.is_null(), "{method} {path} {status}");
                 } else {

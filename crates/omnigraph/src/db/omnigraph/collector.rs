@@ -433,6 +433,42 @@ impl CollectorPathSnapshot {
         Ok(missing.into_iter().collect())
     }
 
+    /// The location of a captured object that no longer exists, or `None`
+    /// when every one does. Probes at most `concurrency` objects at once and
+    /// stops at the first missing one, so a complete inventory costs one
+    /// request per object and an incomplete one usually far fewer.
+    pub(crate) async fn first_missing_location(
+        &self,
+        concurrency: usize,
+    ) -> Result<Option<String>> {
+        use futures::StreamExt;
+        if let Some((location, _)) = self.missing_at_capture.first() {
+            return Ok(Some(location.clone()));
+        }
+        let mut probes = futures::stream::iter(self.objects.iter().cloned())
+            .map(|object| async move {
+                let present = object
+                    .store
+                    .exists(&object.path)
+                    .await
+                    .map_err(OmniError::storage)?;
+                Ok::<_, OmniError>((!present).then_some(object.location))
+            })
+            .buffer_unordered(concurrency.max(1));
+        while let Some(probed) = probes.next().await {
+            if let Some(location) = probed? {
+                return Ok(Some(location));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Move `other`'s captured objects into this inventory.
+    pub(crate) fn absorb(&mut self, other: CollectorPathSnapshot) {
+        self.objects.extend(other.objects);
+        self.missing_at_capture.extend(other.missing_at_capture);
+    }
+
     fn insert(
         &mut self,
         location: &str,
@@ -523,7 +559,7 @@ async fn capture_index_paths(
     Ok(())
 }
 
-async fn capture_dataset_paths(
+pub(crate) async fn capture_dataset_paths(
     snapshot: &mut CollectorPathSnapshot,
     dataset: &lance::Dataset,
     location: &str,
@@ -851,8 +887,12 @@ async fn retained_merge_bases(
             if resolver.search().needs_import() {
                 if retired.is_none() {
                     retired = Some(
-                        ManifestCoordinator::retired_commit_graphs(db.root_uri(), &db.history)
-                            .await?,
+                        ManifestCoordinator::retired_commit_graphs_with_session(
+                            db.root_uri(),
+                            &db.history,
+                            &db.control_session(),
+                        )
+                        .await?,
                     );
                 }
                 for (native, graph) in retired.as_ref().expect("retired histories were loaded") {
@@ -1042,7 +1082,7 @@ pub(crate) async fn plan_collection(
                     report
                         .protected_manifest_branches
                         .extend(tag.branch.iter().cloned());
-                    let snapshot = candidate.snapshot(db.root_uri())?;
+                    let snapshot = candidate.snapshot(db.root_uri(), &db.control_session())?;
                     record_roots(db, &snapshot, &mut roots, &mut tables);
                 }
             }
@@ -1066,7 +1106,7 @@ pub(crate) async fn plan_collection(
                     report
                         .protected_manifest_branches
                         .extend(tag.branch.iter().cloned());
-                    let snapshot = candidate.snapshot(db.root_uri())?;
+                    let snapshot = candidate.snapshot(db.root_uri(), &db.control_session())?;
                     record_roots(db, &snapshot, &mut roots, &mut tables);
                     report.retained_unattached_tags.push(record);
                 }
@@ -1134,7 +1174,7 @@ pub(crate) async fn plan_collection(
                 .extend(candidate.property.native_branch.iter().cloned());
             record_roots(
                 db,
-                &candidate.snapshot(db.root_uri())?,
+                &candidate.snapshot(db.root_uri(), &db.control_session())?,
                 &mut roots,
                 &mut tables,
             );
@@ -1144,7 +1184,12 @@ pub(crate) async fn plan_collection(
     let (bases, imported_owners) = retained_merge_bases(db, &captured_lineages, live_count).await?;
     report.protected_manifest_branches.extend(imported_owners);
     for base in bases {
-        let pinned = ManifestCoordinator::pinned_graph_commit(db.root_uri(), &base).await?;
+        let pinned = ManifestCoordinator::pinned_graph_commit_with_session(
+            db.root_uri(),
+            &base,
+            &db.control_session(),
+        )
+        .await?;
         report
             .protected_manifest_branches
             .extend(pinned.dataset.manifest().branch.iter().cloned());
@@ -2264,6 +2309,7 @@ mod borrowed_origin_tests {
             &mut source,
             "legacy-table",
             restored_version,
+            None,
         )
         .await
         .unwrap();
@@ -2422,19 +2468,28 @@ mod borrowed_origin_tests {
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         let mut source = snapshot.open_lance_dataset("node:Person").await.unwrap();
         let version = source.version().version;
-        let fork =
-            crate::storage_layer::lance_clone::create_branch(&mut source, "native-only", version)
-                .await
-                .unwrap();
+        let fork = crate::storage_layer::lance_clone::create_branch(
+            &mut source,
+            "native-only",
+            version,
+            None,
+        )
+        .await
+        .unwrap();
         let native_version = fork.version().version;
         source
             .tags()
             .create("native-reader", ("native-only", native_version))
             .await
             .unwrap();
-        crate::storage_layer::lance_clone::create_branch(&mut source, "unrelated-native", version)
-            .await
-            .unwrap();
+        crate::storage_layer::lance_clone::create_branch(
+            &mut source,
+            "unrelated-native",
+            version,
+            None,
+        )
+        .await
+        .unwrap();
         let table_uri = source.uri().to_string();
         drop((source, fork, snapshot));
         load_person(&db, "current", 99).await;
@@ -2642,6 +2697,71 @@ mod overlay_retention_tests {
             .iter()
             .find(|plan| plan.location == table_uri)
             .unwrap();
+        if !cfg!(debug_assertions) {
+            // Native overlays are experimental in release builds. Qualify refusal
+            // and retention without enabling the process-wide upstream opt-in.
+            assert!(!lance_table::feature_flags::can_read_dataset(
+                lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES
+            ));
+            assert_ne!(
+                overlay.manifest().reader_feature_flags
+                    & lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+                0
+            );
+            // forbidden-api-allow: test-only cold read verifies native release refusal
+            let error = lance::dataset::builder::DatasetBuilder::from_uri(&table_uri)
+                .with_session(Arc::new(lance::session::Session::default()))
+                .with_version(version)
+                .load()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, lance::Error::NotSupported { .. }),
+                "{error:?}"
+            );
+            assert!(
+                plan.errors
+                    .iter()
+                    .any(|error| error.contains("Not supported")),
+                "{:?}",
+                plan.errors
+            );
+            assert!(report.tables.iter().all(|plan| {
+                plan.sweep_paths.is_empty()
+                    && plan.dead_paths.is_empty()
+                    && plan.orphan_paths.is_empty()
+            }));
+            let mut expected = CollectorPathSnapshot::default();
+            capture_dataset_paths(&mut expected, &source, &table_uri)
+                .await
+                .unwrap();
+            capture_dataset_paths(&mut expected, &overlay, &table_uri)
+                .await
+                .unwrap();
+            assert!(
+                expected
+                    .objects
+                    .iter()
+                    .any(|object| object.path == overlay_path)
+            );
+            assert!(expected.missing_paths().await.unwrap().is_empty());
+            let rows = db.cleanup(options).await.unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row.type_key == entry.type_key)
+                .unwrap();
+            assert!(
+                row.error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("trace did not finish")),
+                "{row:?}"
+            );
+            assert_eq!(row.bytes_removed, 0);
+            assert_eq!(row.old_versions_removed, 0);
+            assert_eq!(row.manifests_removed, 0);
+            assert!(expected.missing_paths().await.unwrap().is_empty());
+            return;
+        }
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(if foreign {
             plan.foreign_versions.contains(&version)
@@ -2833,6 +2953,7 @@ mod native_table_tag_tests {
                 &mut source,
                 "registered-native",
                 source_version,
+                None,
             )
             .await
             .unwrap();

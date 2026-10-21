@@ -394,9 +394,21 @@ pub async fn upgrade_storage_as(
     actor: Option<&str>,
     policy: Option<&dyn omnigraph_policy::PolicyChecker>,
 ) -> Result<UpgradeReport> {
-    upgrade_within(uri, options, actor, policy, Bounds::SERVED).await
+    upgrade_storage_as_with_storage(uri, options, actor, policy, storage_for_uri(uri)?).await
 }
 
+/// Offline upgrade using one explicitly captured destination for all control and data IO.
+pub async fn upgrade_storage_as_with_storage(
+    uri: &str,
+    options: UpgradeOptions,
+    actor: Option<&str>,
+    policy: Option<&dyn omnigraph_policy::PolicyChecker>,
+    storage: Arc<dyn StorageAdapter>,
+) -> Result<UpgradeReport> {
+    upgrade_within_storage(uri, options, actor, policy, Bounds::SERVED, storage).await
+}
+
+#[cfg(test)]
 async fn upgrade_within(
     uri: &str,
     options: UpgradeOptions,
@@ -404,9 +416,20 @@ async fn upgrade_within(
     policy: Option<&dyn omnigraph_policy::PolicyChecker>,
     bounds: Bounds,
 ) -> Result<UpgradeReport> {
+    upgrade_within_storage(uri, options, actor, policy, bounds, storage_for_uri(uri)?).await
+}
+
+async fn upgrade_within_storage(
+    uri: &str,
+    options: UpgradeOptions,
+    actor: Option<&str>,
+    policy: Option<&dyn omnigraph_policy::PolicyChecker>,
+    bounds: Bounds,
+    storage: Arc<dyn StorageAdapter>,
+) -> Result<UpgradeReport> {
     let root = normalize_root_uri(uri)?;
     let mut report = UpgradeReport::started(root.clone(), options);
-    if let Err(error) = run(&root, options, actor, policy, bounds, &mut report).await {
+    if let Err(error) = run(&root, options, actor, policy, bounds, &mut report, storage).await {
         report.failed(&error);
     }
     Ok(report)
@@ -416,9 +439,16 @@ fn invalid(message: impl Into<String>) -> OmniError {
     OmniError::manifest(message.into())
 }
 
+#[cfg(test)]
 async fn open(root: &str, native: Option<&str>) -> Result<Dataset> {
-    open_manifest_dataset_native_with_session(root, native, &crate::lance_access::control_session())
-        .await
+    open_with_session(root, native, &crate::lance_access::control_session()).await
+}
+async fn open_with_session(
+    root: &str,
+    native: Option<&str>,
+    session: &Arc<Session>,
+) -> Result<Dataset> {
+    open_manifest_dataset_native_with_session(root, native, session).await
 }
 
 fn named(native: Option<&str>) -> String {
@@ -462,9 +492,11 @@ async fn run(
     policy: Option<&dyn omnigraph_policy::PolicyChecker>,
     bounds: Bounds,
     report: &mut UpgradeReport,
+    storage: Arc<dyn StorageAdapter>,
 ) -> Result<()> {
-    let session = crate::lance_access::control_session();
-    let main = open(root, None).await?;
+    let session =
+        crate::lance_access::LanceAccessContext::with_storage(storage.as_ref()).control_session();
+    let main = open_with_session(root, None, &session).await?;
     report.observed_format = read_stamp(&main);
     let pending = match intent_from(&main) {
         Ok(pending) => pending,
@@ -491,7 +523,7 @@ async fn run(
         );
         return Ok(());
     }
-    let storage = crate::storage::decorate(storage_for_uri(root)?);
+    let storage = crate::storage::decorate(storage);
     let sidecars = pending_legacy_sidecars(root, storage.as_ref()).await?;
     if !sidecars.is_empty() {
         report.source_recovery(
@@ -602,7 +634,7 @@ async fn run(
             ),
         );
     }
-    verify_inventory(root, &branches, &retire, pending.as_ref(), source).await?;
+    verify_inventory(root, &branches, &retire, pending.as_ref(), source, &session).await?;
 
     let directory = match &pending {
         Some(intent) => {
@@ -643,7 +675,7 @@ async fn run(
                     );
                     return Ok(());
                 }
-                let findings = preflight_refs(root, &branches).await?;
+                let findings = preflight_refs(root, &branches, &session).await?;
                 if !findings.is_empty() {
                     report.findings.extend(findings);
                     return Ok(());
@@ -670,12 +702,13 @@ async fn run(
             let layout = pending
                 .as_ref()
                 .map_or(LegacyLayout::CURRENT, |intent| intent.legacy.layout);
-            let census = match legacy::census_within(
+            let census = match legacy::census_within_with_session(
                 root,
                 &input,
                 reader,
                 bounds.census_cells,
                 bounds.census_snapshot_bytes,
+                &session,
             )
             .await
             {
@@ -751,18 +784,28 @@ async fn run(
                 report.outcome = UpgradeOutcome::CheckPassed;
                 return Ok(());
             }
-            verify_inventory(root, &intent.branches, &intent.retire, None, source).await?;
+            verify_inventory(
+                root,
+                &intent.branches,
+                &intent.retire,
+                None,
+                source,
+                &session,
+            )
+            .await?;
             history::archive_schema(root, &session, &contract).await?;
             let pinned = intent.branches.last();
             let target = intent.target_format;
-            if !fence_main(root, pinned, json, source, target, report).await? {
+            if !fence_main_with_session(root, pinned, json, source, target, report, &session)
+                .await?
+            {
                 return Ok(());
             }
             intent
         }
     };
     fail(&UPGRADE_AFTER_FENCE)?;
-    retire_locks(root, &intent.retire).await?;
+    retire_locks(root, &intent.retire, &session).await?;
 
     if let Some((census, _)) = &census {
         match legacy::materialize(root, &session, census, &intent.legacy).await {
@@ -779,7 +822,7 @@ async fn run(
 
     for branch in &intent.branches {
         let native = branch.native.as_deref();
-        let current = open(root, native).await?;
+        let current = open_with_session(root, native, &session).await?;
         if crate::branch_control::dataset_branch_identifier(&current)
             .await
             .map_err(OmniError::storage)?
@@ -807,7 +850,7 @@ async fn run(
     }
     for branch in &intent.branches {
         let native = branch.native.as_deref();
-        let current = open(root, native).await?;
+        let current = open_with_session(root, native, &session).await?;
         if !branch_completed(&current, branch, &intent)? {
             return Err(invalid(format!(
                 "{} is not converted; the graph cannot be activated",
@@ -828,10 +871,11 @@ async fn run(
         &intent.retire,
         Some(&intent),
         source,
+        &session,
     )
     .await?;
     fail(&UPGRADE_BEFORE_ACTIVATION)?;
-    publish_activation(open(root, None).await?).await?;
+    publish_activation(open_with_session(root, None, &session).await?).await?;
     report.last_durable_completed_boundary = Some("activated".into());
     fail(&UPGRADE_AFTER_ACTIVATION)?;
     report.outcome = UpgradeOutcome::Completed;
@@ -868,11 +912,11 @@ fn partition_locks(
 
 /// Retire every ref of `retire` as a 0.11.x branch delete does; one already
 /// retired under its pinned identity is left as it is.
-async fn retire_locks(root: &str, retire: &[SourceLock]) -> Result<()> {
+async fn retire_locks(root: &str, retire: &[SourceLock], session: &Arc<Session>) -> Result<()> {
     if retire.is_empty() {
         return Ok(());
     }
-    let main = open(root, None).await?;
+    let main = open_with_session(root, None, session).await?;
     for lock in retire {
         retire_branch_recoverably(&main, &lock.native, &lock.identity).await?;
     }
@@ -935,7 +979,7 @@ async fn route(
                 .schema_contract
                 .as_ref()
                 .ok_or_else(|| invalid("storage upgrade intent names no schema contract"))?;
-            let session = crate::lance_access::control_session();
+            let session = main.session();
             match history::read_schema(root, &session, &bound.content_sha256, &bound.identity).await
             {
                 Ok(contract) => (contract, None),
@@ -1410,8 +1454,9 @@ async fn verify_inventory(
     retire: &[SourceLock],
     pending: Option<&UpgradeIntent>,
     source: UpgradeSource,
+    session: &Arc<Session>,
 ) -> Result<()> {
-    let main = open(root, None).await?;
+    let main = open_with_session(root, None, session).await?;
     let observed: BTreeSet<String> =
         crate::branch_control::list_live_manifest_branch_contents(&main)
             .await?
@@ -1433,7 +1478,7 @@ async fn verify_inventory(
     }
     for branch in branches {
         let native = branch.native.as_deref();
-        let dataset = open(root, native).await?;
+        let dataset = open_with_session(root, native, session).await?;
         if crate::branch_control::dataset_branch_identifier(&dataset)
             .await
             .map_err(OmniError::storage)?
@@ -1458,7 +1503,11 @@ async fn verify_inventory(
 
 /// What the engine checks of every live head before the census reads it: one
 /// logical name per ref and the `object_id` key evidence.
-async fn preflight_refs(root: &str, branches: &[SourceBranch]) -> Result<Vec<UpgradeFinding>> {
+async fn preflight_refs(
+    root: &str,
+    branches: &[SourceBranch],
+    session: &Arc<Session>,
+) -> Result<Vec<UpgradeFinding>> {
     let unsupported = |message: String| UpgradeFinding {
         code: "unsupported_source".into(),
         message,
@@ -1476,7 +1525,7 @@ async fn preflight_refs(root: &str, branches: &[SourceBranch]) -> Result<Vec<Upg
                 )));
             }
         }
-        let head = open(root, native)
+        let head = open_with_session(root, native, session)
             .await?
             .checkout_version(branch.version)
             .await
@@ -1745,6 +1794,7 @@ async fn validate_converted_contract(
 /// Commit the fence on a main still at `pinned`; an error wrote nothing. `false`
 /// when the commit failed: whether main carries the intent is then unknown, and
 /// the report holds that recovery.
+#[cfg(test)]
 async fn fence_main(
     root: &str,
     pinned: Option<&SourceBranch>,
@@ -1753,7 +1803,28 @@ async fn fence_main(
     target: u32,
     report: &mut UpgradeReport,
 ) -> Result<bool> {
-    let unfenced = open(root, None).await?;
+    fence_main_with_session(
+        root,
+        pinned,
+        intent,
+        source,
+        target,
+        report,
+        &crate::lance_access::control_session(),
+    )
+    .await
+}
+
+async fn fence_main_with_session(
+    root: &str,
+    pinned: Option<&SourceBranch>,
+    intent: String,
+    source: UpgradeSource,
+    target: u32,
+    report: &mut UpgradeReport,
+    session: &Arc<Session>,
+) -> Result<bool> {
+    let unfenced = open_with_session(root, None, session).await?;
     if let Some(pinned) = pinned {
         verify_source_head(&unfenced, pinned, false, source)?;
     }
@@ -1787,11 +1858,12 @@ async fn stamp_live_refs(
     policy: Option<&dyn omnigraph_policy::PolicyChecker>,
     report: &mut UpgradeReport,
 ) -> Result<()> {
+    let session = main.session();
     let mut refs = inventory(main).await?;
     refs.rotate_right(1);
     let mut behind = Vec::new();
     for branch in &refs {
-        let dataset = open(root, branch.native.as_deref()).await?;
+        let dataset = open_with_session(root, branch.native.as_deref(), &session).await?;
         if read_stamp(&dataset).is_some_and(|stamp| stamp < INTERNAL_MANIFEST_SCHEMA_VERSION) {
             behind.push((branch, dataset));
         }

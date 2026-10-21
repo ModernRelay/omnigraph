@@ -239,6 +239,15 @@ pub async fn read_serving_snapshot_from_storage(
     read_snapshot_with_store(&backend).await
 }
 
+/// Read applied state using the provider authority captured for the selected target.
+pub async fn read_serving_snapshot_with_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    let backend =
+        ClusterStore::for_storage_binding(binding).map_err(|diagnostic| vec![diagnostic])?;
+    read_snapshot_with_store(&backend).await
+}
+
 /// Project only deployment-affected graphs and their verified runtime payloads.
 /// The ledger and cluster management policy remain authoritative in full;
 /// unrelated graph payload availability cannot veto an independent cutover.
@@ -303,10 +312,28 @@ async fn read_root_bound_snapshot_with_store(
 /// Local aliases are resolved before testing the layout. Non-cluster-shaped
 /// remote URIs never probe storage. Works for `file://`, `s3://`, and `az://`.
 pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Result<Option<String>, Diagnostic> {
-    // Resolve aliases before deciding that a graph is standalone. A symlink to
-    // a managed graph can have any filename. Also inspect the lexical layout
-    // so a managed graph symlink escaping the root is refused by v2 admission.
-    let canonical = crate::admission::canonical_graph_uri(graph_uri)?;
+    cluster_root_for_graph_impl(graph_uri, None).await
+}
+
+/// Probe cluster ownership without re-resolving provider endpoints from the environment.
+pub async fn cluster_root_for_graph_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+) -> Result<Option<String>, Diagnostic> {
+    cluster_root_for_graph_impl(binding.requested_uri(), Some(binding)).await
+}
+
+async fn cluster_root_for_graph_impl(
+    graph_uri: &str,
+    binding: Option<&omnigraph_storage::CapturedStorageBinding>,
+) -> Result<Option<String>, Diagnostic> {
+    // A captured destination is already canonical: resolving its original
+    // alias again could probe a different graph than execution will open.
+    // Unbound callers resolve aliases here. Also inspect the lexical layout so
+    // a managed graph symlink escaping the root is refused by v2 admission.
+    let canonical = match binding {
+        Some(binding) => binding.uri().to_owned(),
+        None => crate::admission::canonical_graph_uri(graph_uri)?,
+    };
     let lexical = omnigraph_storage::normalize_root_uri(graph_uri).map_err(|error| {
         Diagnostic::error("cluster_graph_uri_error", "graph", error.to_string())
     })?;
@@ -318,7 +345,15 @@ pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Result<Option<String
         if !roots.insert(root.clone()) {
             continue;
         }
-        let store = ClusterStore::for_storage_root(&root)?;
+        let store = match binding {
+            Some(binding) => {
+                let root_binding = binding.for_uri(&root).map_err(|error| {
+                    Diagnostic::error("storage_root_invalid", "storage", error.to_string())
+                })?;
+                ClusterStore::for_storage_binding(&root_binding)?
+            }
+            None => ClusterStore::for_storage_root(&root)?,
+        };
         let has_state = store.has_state().await.map_err(|error| {
             Diagnostic::error(
                 "cluster_state_probe_error",
@@ -351,6 +386,23 @@ pub async fn resolve_graph_storage_uri(
     graph_id: &str,
 ) -> Result<String, Diagnostic> {
     let backend = open_cluster_backend(cluster)?;
+    resolve_graph_storage_uri_with_store(&backend, graph_id).await
+}
+
+/// Resolve a graph from the selected root's applied state with fixed provider authority.
+pub async fn resolve_graph_storage_uri_with_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+    graph_id: &str,
+) -> Result<String, Diagnostic> {
+    let backend = ClusterStore::for_storage_binding(binding)?;
+    resolve_graph_storage_uri_with_store(&backend, graph_id).await
+}
+
+async fn resolve_graph_storage_uri_with_store(
+    backend: &ClusterStore,
+    graph_id: &str,
+) -> Result<String, Diagnostic> {
+    let cluster = backend.display_root();
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
     let state = snapshot
@@ -385,6 +437,19 @@ pub async fn resolve_graph_storage_uri(
 /// `--graph` is selected (RFC-011 Decision 7).
 pub async fn cluster_graph_ids(cluster: &str) -> Result<Vec<String>, Diagnostic> {
     let backend = open_cluster_backend(cluster)?;
+    cluster_graph_ids_with_store(&backend).await
+}
+
+/// Enumerate the applied root using fixed provider authority.
+pub async fn cluster_graph_ids_with_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+) -> Result<Vec<String>, Diagnostic> {
+    let backend = ClusterStore::for_storage_binding(binding)?;
+    cluster_graph_ids_with_store(&backend).await
+}
+
+async fn cluster_graph_ids_with_store(backend: &ClusterStore) -> Result<Vec<String>, Diagnostic> {
+    let cluster = backend.display_root();
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
     let state = snapshot
