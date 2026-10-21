@@ -98,9 +98,8 @@ envelope pretty and the `rows` array compact; a refusal follows [Diagnostics](..
 
 ### Machine-readable read and write positions
 
-`query --json` returns `graph_commit_id` when its read snapshot has a graph
-head. The id and rows share one pinned snapshot; use that id for a later
-conditional mutation.
+`query --json` returns `graph_commit_id` when its read snapshot has a graph head. The id and
+rows share one pinned snapshot; use that id for a later conditional mutation.
 
 Successful `mutate --json` and `load --json` responses include `commit`, the exact commit published by
 that attempt. It contains `graph_commit_id`, optional `graph_branch`,
