@@ -28,8 +28,9 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 yaml_serde = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-std", "io-util"] }
-reqwest = { workspace = true, features = ["blocking", "stream"] }
+libyaml-rs = "0.3"
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "process"] }
+reqwest = { workspace = true, features = ["blocking", "stream", "rustls-tls-native-roots"] }
 futures = { workspace = true }
 tempfile = { workspace = true }
 url = { workspace = true }
@@ -41,6 +42,11 @@ time = { workspace = true, features = ["parsing"] }
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 keyring = { version = "3.6.3", features = ["apple-native"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+security-framework = "3"
+security-framework-sys = { version = "2.17", default-features = false }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }
 
@@ -48,6 +54,8 @@ keyring = { version = "3.6.3", features = ["windows-native"] }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
 
 [dev-dependencies]
+rcgen = "0.13.2"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 assert_cmd = "2"
 predicates = "3"
 serde_json = { workspace = true }

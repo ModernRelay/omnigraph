@@ -4,444 +4,527 @@
 
 mod access;
 mod args;
-
+use crate::credential_sources::{self as credentials, SecretStore};
+use crate::operator::InvocationConfig;
+use crate::operator_schema::{AuthProfile, Target, TokenSource};
+use crate::targets::{self, ResolvedTarget, TargetBinding};
 pub(crate) use access::run_access;
-pub(crate) use args::{AccessArgs, CredentialCommand, TargetCommand};
-
+pub(crate) use args::{AccessArgs, ConfigCommand, CredentialCommand, TargetCommand};
+use color_eyre::eyre::{Result, bail, eyre};
 use std::io::{Read, Write};
 
-use color_eyre::Result;
-use serde::Serialize;
-
-use crate::operator::InvocationConfig;
-use crate::output::write_json;
-use crate::targets::refusal;
-use crate::targets::{
-    self, CREDENTIAL_PROTOCOL, ConfigEditLock, ResolvedTarget, ServerAuth, TARGET_PROTOCOL,
-    TargetBinding, TargetEntry, TargetOutput, TargetProvenance,
-};
-
-/// The most a `target add` entry on stdin may hold.
-const ENTRY_MAX_BYTES: u64 = 64 * 1024;
-
-#[derive(Serialize)]
-struct ShowOutput {
-    protocol: u32,
-    default: bool,
-    #[serde(flatten)]
-    target: TargetOutput,
+fn path(input: &InvocationConfig) -> Result<std::path::PathBuf> {
+    input
+        .config_path()
+        .ok_or_else(|| eyre!("no operator configuration path"))
 }
 
-#[derive(Serialize)]
-struct AddOutput {
-    protocol: u32,
-    added: TargetOutput,
-}
-
-#[derive(Serialize)]
-struct RemoveOutput {
-    protocol: u32,
-    removed: String,
-    /// The credential owner whose stored token, if any, the removal kept.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kept_credential: Option<String>,
-}
-
-pub(crate) fn run_target(
+fn edit(
     input: &InvocationConfig,
+    change: impl FnOnce(&mut crate::operator_schema::OperatorConfig) -> Result<()>,
+) -> Result<()> {
+    let path = path(input)?;
+    let _lock = targets::ConfigEditLock::acquire(&path)?;
+    crate::operator_routing::check_rename_pending(&path)?;
+    let before = crate::operator::read_operator_file(&path, "operator config")?
+        .unwrap_or_else(|| "version: 1\n".into());
+    let mut config = crate::operator_schema::parse(&before, path.parent().unwrap())?;
+    change(&mut config)?;
+    let after = yaml_serde::to_string(&config)?;
+    crate::operator_schema::parse(&after, path.parent().unwrap())?;
+    targets::replace_file(&path, &after)
+}
+
+pub(crate) async fn onboard(
+    input: &InvocationConfig,
+    name: &str,
+    api: &str,
+    organization: Option<&str>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    if !targets::valid_name(name) {
+        bail!("profile names must start with an ASCII letter");
+    }
+    let configured = input.get(stderr)?;
+    if configured
+        .schema
+        .as_ref()
+        .is_some_and(|s| s.profiles.contains_key(name))
+    {
+        bail!("profile already exists; use login --profile");
+    }
+    let candidate = serde_json::json!({"version":1,"profiles":{name:{"api":api,"organization_id":"org_pending","auth":{"provider":"omnigraph"}}}});
+    let validated =
+        crate::operator_schema::parse(&serde_json::to_string(&candidate)?, &configured.base_dir)?;
+    let mut profile = validated.profiles[name].clone();
+    let route = profile.api.trim_end_matches('/').to_owned();
+    profile.api = route.clone();
+    let auth = crate::operator_routing::registration_auth(input, name, &route)?;
+    crate::operator_routing::AUTH.scope(Some(auth), async {
+            let receipt = crate::managed::register_login(route.clone(), organization, stderr).await?;
+        let organization = receipt["data"]["account_id"].as_str().ok_or_else(|| eyre!("verified login response has no organization"))?;
+        profile.organization_id = organization.to_owned();
+        if let Err(error) = edit(input, |config| {
+            if config.profiles.contains_key(name) { bail!("profile was registered concurrently"); }
+            config.profiles.insert(name.into(), profile);
+            Ok(())
+        }) {
+            let cleanup = crate::managed::discard_registration(route, organization).await;
+            bail!("profile could not be saved: {error}; session cleanup completed: {}", cleanup.is_ok());
+        }
+        crate::output::write_json(&serde_json::json!({"registered":name,"profile":name,"organization_id":organization}), stdout)
+    }).await
+}
+
+pub(crate) fn run_config(
+    input: &InvocationConfig,
+    selected: Option<&ResolvedTarget>,
+    command: ConfigCommand,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    if matches!(command, ConfigCommand::RecoverRename) {
+        crate::operator_routing::recover_rename(input)?;
+        writeln!(stdout, "configuration rename recovered")?;
+        return Ok(());
+    }
+    input.get(stderr)?;
+    match command {
+        ConfigCommand::RenameProfile { from, to } => {
+            crate::operator_routing::rename(
+                input,
+                crate::operator_routing::Rename::Profile,
+                &from,
+                &to,
+            )?;
+            writeln!(stdout, "profile renamed; profile custody preserved")?;
+            Ok(())
+        }
+        ConfigCommand::RenameTarget { from, to } => {
+            crate::operator_routing::rename(
+                input,
+                crate::operator_routing::Rename::Target,
+                &from,
+                &to,
+            )?;
+            writeln!(stdout, "target renamed; profile custody preserved")?;
+            Ok(())
+        }
+        ConfigCommand::RenameAuth {
+            kind: args::RenameOwner::Server,
+            owner,
+            from,
+            to,
+        } => {
+            crate::operator_routing::rename(
+                input,
+                crate::operator_routing::Rename::Auth { owner },
+                &from,
+                &to,
+            )?;
+            writeln!(stdout, "auth profile renamed; custody preserved")?;
+            Ok(())
+        }
+        ConfigCommand::RecoverRename => unreachable!(),
+        ConfigCommand::RecoverOperations { source, json } => {
+            let TargetBinding::Managed(binding) = &selected
+                .ok_or_else(|| eyre!("select --profile NAME"))?
+                .binding
+            else {
+                bail!("operation recovery requires a profile");
+            };
+            let home = input
+                .directory()
+                .ok_or_else(|| eyre!("operation recovery requires an operator home"))?;
+            crate::managed::import_custody(&source, home, binding)?;
+            if json {
+                crate::output::write_json(
+                    &serde_json::json!({"operation_evidence_preserved":true}),
+                    stdout,
+                )
+            } else {
+                writeln!(
+                    stdout,
+                    "operation evidence preserved; resume with the original verified principal and explicit original idempotency key"
+                )?;
+                Ok(())
+            }
+        }
+        ConfigCommand::Validate { json: true } => {
+            crate::output::write_json(&serde_json::json!({"valid":true,"version":1}), stdout)
+        }
+        ConfigCommand::Validate { json: false } => {
+            writeln!(stdout, "operator configuration is valid")?;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) async fn run_target(
+    input: &InvocationConfig,
+    selected: Option<&ResolvedTarget>,
+    selection: (Option<&str>, Option<&str>),
     command: TargetCommand,
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
+    let (profile, auth_override) = selection;
     match command {
-        TargetCommand::Import { json } => {
-            let path = config_path(input)?;
-            let _lock = ConfigEditLock::acquire(&path)?;
-            let before = read_config_text(&path)?;
-            let imported = targets::import::convert(
-                &before,
-                path.parent().unwrap_or(std::path::Path::new(".")),
-            )?;
-            let mut config = crate::operator::parse_operator_config(&imported.text)?;
-            config.base_dir = path
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .to_owned();
-            let source = std::env::current_dir()?;
-            if let Some((api, organization)) = crate::managed::legacy_custody_binding(&source)? {
-                let mut selected: Option<crate::managed::Binding> = None;
-                for name in config.targets.keys() {
-                    if let Ok(TargetBinding::Managed(mut binding)) = config.binding(name) {
-                        if binding.api == api
-                            && binding.organization_id.as_deref() == Some(&organization)
-                        {
-                            binding.cluster = None;
-                            if selected.as_ref().is_some_and(|other| other != &binding) {
-                                return Err(refusal(
-                                    "legacy_custody_ambiguous",
-                                    "legacy recovery evidence matches conflicting managed authentication bindings",
-                                ));
-                            }
-                            selected = Some(binding);
-                        }
-                    }
-                }
-                let binding = selected.ok_or_else(|| refusal("legacy_custody_binding_required", "legacy lifecycle evidence requires a complete matching managed target; preserve the original folder and configure that API/organization before importing"))?;
-                let home = input.directory().ok_or_else(|| {
-                    refusal(
-                        "config_not_editable",
-                        "set OMNIGRAPH_HOME to import lifecycle custody",
-                    )
-                })?;
-                crate::managed::import_custody(&source, home, &binding)?;
+        TargetCommand::List { json } => {
+            let config = input.get(stderr)?;
+            let source = config.schema.as_ref().map(|s| &s.targets);
+            if json {
+                return crate::output::write_json(&source, stdout);
             }
-            if imported.text != before {
-                let backup = path.with_file_name("config.legacy.yaml");
-                match std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&backup)
-                {
-                    Ok(mut file) => {
-                        file.write_all(before.as_bytes())?;
-                        file.sync_all()?;
-                    }
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::AlreadyExists
-                            && read_config_text(&backup)? == before => {}
-                    Err(error) => return Err(error.into()),
-                }
-                if let Some(credentials) = input.credentials_path() {
-                    for (owner, endpoint) in &imported.credentials {
-                        if let Some(saved) =
-                            crate::operator::read_bound_credential_at(&credentials, owner)?
-                        {
-                            if let Some(bound) = &saved.endpoint {
-                                if crate::graph_http::RequestTarget::of(bound, bound)?
-                                    != crate::graph_http::RequestTarget::of(endpoint, endpoint)?
-                                {
-                                    return Err(refusal(
-                                        "credential_scope_mismatch",
-                                        "legacy credential is already bound to a different endpoint; nothing was imported",
-                                    ));
-                                }
-                            }
-                            crate::operator::rewrite_bound_credentials_at(
-                                &credentials,
-                                owner,
-                                Some(endpoint),
-                                Some(&saved.token),
-                            )?;
+            if let Some(source) = source {
+                for (name, target) in source {
+                    writeln!(
+                        stdout,
+                        "{name}\t{}",
+                        match target {
+                            Target::Managed { .. } => "managed",
+                            Target::Server { .. } => "server",
+                            Target::Direct { .. } => "direct",
                         }
-                    }
+                    )?;
                 }
-                targets::replace_file(&path, &imported.text)?;
+            }
+            Ok(())
+        }
+        TargetCommand::Inspect {
+            name,
+            resolved,
+            json,
+        } => {
+            let config = input.get(stderr)?;
+            let source = config
+                .schema
+                .as_ref()
+                .ok_or_else(|| eyre!("no operator configuration"))?;
+            let target = source
+                .targets
+                .get(&name)
+                .ok_or_else(|| eyre!("unknown target '{name}'"))?;
+            let mut output = serde_json::json!({"name":name,"target":target});
+            if resolved {
+                let profiles = match target {
+                    Target::Managed { profile, .. } => {
+                        if auth_override.is_some() {
+                            bail!("managed targets do not accept --auth");
+                        }
+                        output["profile"] = serde_json::to_value(&source.profiles[profile])?;
+                        None
+                    }
+                    Target::Server {
+                        auth, default_auth, ..
+                    } => Some((auth, default_auth.as_deref())),
+                    Target::Direct { .. } => None,
+                };
+                if let Some((profiles, default)) = profiles {
+                    let (name, _) =
+                        crate::operator_routing::choose(profiles, default, auth_override)?;
+                    output["auth_profile"] = serde_json::json!({"name":name,"source":if auth_override.is_some() { "explicit" } else { "owner default" }});
+                } else if auth_override.is_some() {
+                    bail!("direct targets do not accept --auth");
+                }
+                output["identity"] =
+                    serde_json::json!({"status":"unknown","source":"offline inspection"});
             }
             if json {
-                write_json(&targets::list_output(&config), stdout)
+                crate::output::write_json(&output, stdout)
+            } else {
+                writeln!(stdout, "{}", serde_json::to_string_pretty(&output)?)?;
+                Ok(())
+            }
+        }
+        TargetCommand::Add {
+            name,
+            cluster,
+            json,
+        } => {
+            let frozen = input.get(stderr)?;
+            if !targets::valid_name(&name) {
+                bail!(
+                    "target names must start with an ASCII letter and contain only ASCII letters, digits, dot, underscore or hyphen"
+                );
+            }
+            if frozen.targets.contains_key(&name) {
+                bail!("target already exists");
+            }
+            let expected_profile = profile.and_then(|name| {
+                frozen
+                    .schema
+                    .as_ref()
+                    .and_then(|source| source.profiles.get(name))
+            });
+            let entry = if let Some(cluster) = cluster {
+                let profile =
+                    profile.ok_or_else(|| eyre!("managed registration requires --profile NAME"))?;
+                let TargetBinding::Managed(binding) = &selected
+                    .ok_or_else(|| eyre!("no selected profile"))?
+                    .binding
+                else {
+                    bail!("managed registration requires a profile");
+                };
+                crate::managed::register_target(binding, profile, &cluster).await?
+            } else {
+                if profile.is_some() {
+                    bail!("--profile requires --cluster");
+                }
+                let mut bytes = Vec::new();
+                stdin.take(65537).read_to_end(&mut bytes)?;
+                if bytes.len() > 65536 {
+                    bail!("target input exceeds 64 KiB");
+                }
+                serde_json::from_slice::<Target>(&bytes)?
+            };
+            edit(input, |config| {
+                if let Some(profile) = profile {
+                    if config.profiles.get(profile) != expected_profile {
+                        bail!("profile changed during registration");
+                    }
+                }
+                if config.targets.contains_key(&name) {
+                    bail!("target already exists");
+                }
+                config.targets.insert(name.clone(), entry);
+                Ok(())
+            })?;
+            if json {
+                crate::output::write_json(&serde_json::json!({"registered":name}), stdout)
+            } else {
+                writeln!(stdout, "registered target '{name}'")?;
+                Ok(())
+            }
+        }
+        TargetCommand::Refresh { name, json } => {
+            let config = input.get(stderr)?;
+            let source = config
+                .schema
+                .as_ref()
+                .ok_or_else(|| eyre!("no operator configuration"))?;
+            let old = source
+                .targets
+                .get(&name)
+                .ok_or_else(|| eyre!("unknown target"))?;
+            let Target::Managed {
+                profile,
+                cluster_id,
+                cluster_incarnation,
+                ..
+            } = old
+            else {
+                bail!("refresh requires a managed target");
+            };
+            let TargetBinding::Managed(binding) =
+                &selected.ok_or_else(|| eyre!("no selected target"))?.binding
+            else {
+                bail!("refresh requires a managed target");
+            };
+            let fresh = crate::managed::register_target(binding, profile, cluster_id).await?;
+            let Target::Managed {
+                cluster_incarnation: incarnation,
+                endpoint,
+                ..
+            } = fresh
+            else {
+                unreachable!()
+            };
+            if incarnation != *cluster_incarnation {
+                bail!("cluster incarnation changed; refresh cannot rebind a resource");
+            }
+            let previous = match old {
+                Target::Managed { endpoint, .. } => endpoint.clone(),
+                _ => unreachable!(),
+            };
+            let endpoint_available = endpoint.is_some();
+            let endpoint = endpoint.or_else(|| previous.clone());
+            edit(input, |current| {
+                if current.profiles.get(profile) != source.profiles.get(profile) {
+                    bail!("profile changed during refresh");
+                }
+                let entry = current
+                    .targets
+                    .get_mut(&name)
+                    .ok_or_else(|| eyre!("target was removed"))?;
+                if entry != old {
+                    bail!("target changed during refresh");
+                }
+                if let Target::Managed {
+                    endpoint: current, ..
+                } = entry
+                {
+                    *current = endpoint.clone();
+                }
+                Ok(())
+            })?;
+            let result = serde_json::json!({"target":name,"previous_endpoint":previous,"endpoint":endpoint,"endpoint_available":endpoint_available});
+            if json {
+                crate::output::write_json(&result, stdout)
+            } else {
+                writeln!(stdout, "{}", serde_json::to_string_pretty(&result)?)?;
+                Ok(())
+            }
+        }
+        TargetCommand::Remove { name, json } => {
+            edit(input, |config| {
+                if config.targets.remove(&name).is_none() {
+                    bail!("unknown target");
+                }
+                Ok(())
+            })?;
+            if json {
+                crate::output::write_json(
+                    &serde_json::json!({"removed":name,"credentials_preserved":true}),
+                    stdout,
+                )
             } else {
                 writeln!(
                     stdout,
-                    "imported {} targets; original config is preserved as config.legacy.yaml",
-                    config.targets.len()
+                    "removed target '{name}'; credential custody and operation journals preserved"
                 )?;
                 Ok(())
             }
         }
-        TargetCommand::List { json } => {
-            let config = input.get(stderr)?;
-            let listing = targets::list_output(config);
-            if json {
-                return write_json(&listing, stdout);
-            }
-            if listing.targets.is_empty() {
-                writeln!(
-                    stdout,
-                    "no targets (add one with `omnigraph target add NAME`)"
-                )?;
-            }
-            for target in &listing.targets {
-                let default = listing.default_target.as_deref() == Some(target.name.as_str());
-                targets::write_target_line(target, default, stdout)?;
-            }
-            Ok(())
-        }
-        TargetCommand::Show { name, json } => {
-            let config = input.get(stderr)?;
-            let target = TargetOutput::of(&name, config.target(&name)?, &config.base_dir);
-            let default = config.default_target() == Some(name.as_str());
-            if json {
-                return write_json(
-                    &ShowOutput {
-                        protocol: TARGET_PROTOCOL,
-                        default,
-                        target,
-                    },
-                    stdout,
-                );
-            }
-            targets::write_target_line(&target, default, stdout)
-        }
-        TargetCommand::Add { name, json } => {
-            let path = config_path(input)?;
-            if !targets::valid_name(&name) {
-                return Err(refusal(
-                    "target_invalid",
-                    format!(
-                        "target name `{name}` must contain 1–64 ASCII letters, digits, `-`, `_` or `.` and not be reserved"
-                    ),
-                ));
-            }
-            let entry = read_entry(stdin)?;
-            entry.binding_at(&name, path.parent().unwrap_or(std::path::Path::new(".")))?;
-            let _lock = ConfigEditLock::acquire(&path)?;
-            let before = read_config_text(&path)?;
-            let current = crate::operator::parse_operator_config(&before)
-                .map_err(|error| refusal("target_config_invalid", error.to_string()))?;
-            if current.targets.contains_key(&name) {
-                return Err(refusal(
-                    "target_exists",
-                    format!(
-                        "target '{name}' already exists; remove it first with `omnigraph target remove {name}`"
-                    ),
-                ));
-            }
-            let after = targets::add_entry_text(&before, &name, &entry)?;
-            let mut expected = current.targets.clone();
-            expected.insert(name.clone(), entry.clone());
-            targets::verify_edit(&before, &after, &expected)?;
-            targets::replace_file(&path, &after)?;
-            let added = TargetOutput::of(
-                &name,
-                &entry,
-                path.parent().unwrap_or(std::path::Path::new(".")),
-            );
-            if json {
-                return write_json(
-                    &AddOutput {
-                        protocol: TARGET_PROTOCOL,
-                        added,
-                    },
-                    stdout,
-                );
-            }
-            write!(stdout, "added ")?;
-            targets::write_target_line(&added, false, stdout)
-        }
-        TargetCommand::Remove { name, json } => {
-            let path = config_path(input)?;
-            let _lock = ConfigEditLock::acquire(&path)?;
-            let before = read_config_text(&path)?;
-            let current = crate::operator::parse_operator_config(&before)
-                .map_err(|error| refusal("target_config_invalid", error.to_string()))?;
-            let entry = current.target(&name)?.clone();
-            if current.default_target() == Some(name.as_str()) {
-                return Err(refusal(
-                    "target_is_default",
-                    format!(
-                        "target '{name}' is `defaults.target`; change the default before removing it"
-                    ),
-                ));
-            }
-            let after = targets::remove_entry_text(&before, &name)?;
-            let mut expected = current.targets.clone();
-            expected.remove(&name);
-            targets::verify_edit(&before, &after, &expected)?;
-            targets::replace_file(&path, &after)?;
-            let kept_credential = entry.credential.clone();
-            if json {
-                return write_json(
-                    &RemoveOutput {
-                        protocol: TARGET_PROTOCOL,
-                        removed: name,
-                        kept_credential,
-                    },
-                    stdout,
-                );
-            }
-            writeln!(stdout, "removed target '{name}'")?;
-            if let Some(owner) = kept_credential {
-                writeln!(
-                    stdout,
-                    "its stored credential `{owner}`, if any, stays; log out before removing its last target to clear it"
-                )?;
-            }
-            Ok(())
-        }
     }
 }
 
-fn config_path(input: &InvocationConfig) -> Result<std::path::PathBuf> {
-    input.config_path().ok_or_else(|| {
-        refusal(
-            "config_not_editable",
-            "no home directory resolvable for the operator config; set OMNIGRAPH_HOME",
-        )
-    })
-}
-
-fn read_config_text(path: &std::path::Path) -> Result<String> {
-    crate::operator::read_operator_file(path, "operator config")
-        .map(|text| text.unwrap_or_default())
-        .map_err(|error| refusal("target_config_invalid", error.to_string()))
-}
-
-fn read_entry(stdin: &mut dyn Read) -> Result<TargetEntry> {
-    let mut text = String::new();
-    stdin.take(ENTRY_MAX_BYTES + 1).read_to_string(&mut text)?;
-    if text.len() as u64 > ENTRY_MAX_BYTES {
-        return Err(refusal(
-            "target_invalid",
-            format!("the target entry on stdin is larger than {ENTRY_MAX_BYTES} bytes"),
-        ));
+pub(crate) fn stdout_is_pipe() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata("/dev/stdout").is_ok_and(|m| m.file_type().is_fifo())
     }
-    serde_json::from_str(&text).map_err(|error| {
-        refusal(
-            "target_invalid",
-            format!("the target entry on stdin is not a JSON target entry: {error}"),
-        )
-    })
-}
-
-#[derive(Serialize)]
-struct CredentialOutput<'a> {
-    protocol: u32,
-    target: &'a str,
-    owner: &'a str,
-    endpoint: &'a str,
-    scheme: &'static str,
-    token: &'a str,
-    source: &'static str,
-}
-
-/// `credential get` writes a token only to something that is not a
-/// terminal, so a token never lands in scrollback.
-fn refuse_terminal(stdout_is_terminal: bool) -> Result<()> {
-    if stdout_is_terminal {
-        return Err(refusal(
-            "credential_terminal",
-            "credential get writes a token only to a pipe or a file, never to a terminal",
-        ));
+    #[cfg(not(unix))]
+    {
+        false
     }
-    Ok(())
 }
 
-pub(crate) fn run_credential(
-    input: &InvocationConfig,
+pub(crate) async fn run_credential(
     target: &ResolvedTarget,
     command: CredentialCommand,
-    stdout_is_terminal: bool,
+    profile_name: &str,
+    stdin_is_terminal: bool,
+    stdin: &mut dyn Read,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
 ) -> Result<()> {
-    refuse_terminal(stdout_is_terminal)?;
-    let name = match &target.provenance {
-        TargetProvenance::Explicit { name } | TargetProvenance::Default { name } => name,
-        TargetProvenance::Inline { .. } => {
-            return Err(refusal(
-                "target_kind_unsupported",
-                "credential get requires a registered server target",
-            ));
-        }
-    };
-    let (endpoint, auth, owner) = match &target.binding {
-        TargetBinding::Server {
-            endpoint,
-            auth: auth @ ServerAuth::Token { owner },
-            ..
-        } => (endpoint, auth, owner),
-        TargetBinding::Server {
-            auth: ServerAuth::Anonymous,
-            ..
-        } => {
-            return Err(refusal(
-                "credential_anonymous",
-                format!("target '{name}' uses anonymous access, so it has no credential"),
-            ));
-        }
-        _ => {
-            return Err(refusal(
-                "target_kind_unsupported",
-                "credential get requires a registered server target",
-            ));
-        }
-    };
+    if matches!(command, CredentialCommand::Set { .. }) && stdin_is_terminal {
+        bail!("credentials set --stdin requires redirected input");
+    }
+    if matches!(command, CredentialCommand::Export) && !stdout_is_pipe() {
+        bail!(
+            "credentials export requires stdout to be a pipe; terminals and regular files are refused"
+        );
+    }
+    if matches!(&target.binding, TargetBinding::Managed(binding) if binding.cluster.is_some())
+        && !matches!(command, CredentialCommand::Export)
+    {
+        bail!("set/status/remove select the managed profile with --profile");
+    }
+    let auth = crate::operator_routing::AUTH.with(Clone::clone);
+    if auth.is_none() && matches!(command, CredentialCommand::Status { .. }) {
+        return crate::output::write_json(
+            &serde_json::json!({"owner":target.label(),"profile":profile_name,"availability":"anonymous","identity":"unknown"}),
+            stdout,
+        );
+    }
+    let auth = auth.ok_or_else(|| eyre!("anonymous access has no credential"))?;
     match command {
-        CredentialCommand::Get { json } => {
-            let variable = crate::operator::token_env_name(owner);
-            let source = if std::env::var(&variable)
-                .ok()
-                .is_some_and(|v| !v.trim().is_empty())
-            {
-                "environment"
-            } else {
-                "credentials_file"
-            };
-            let token = targets::resolve_server_token(input, auth, endpoint)?
-                .ok_or_else(|| refusal("credential_missing", "selected target has no token"))?;
-            if json {
-                return write_json(
-                    &CredentialOutput {
-                        protocol: CREDENTIAL_PROTOCOL,
-                        target: name,
-                        owner,
-                        endpoint,
-                        scheme: "bearer",
-                        token: &token,
-                        source,
-                    },
-                    stdout,
-                );
+        CredentialCommand::Set { replace, .. } => {
+            if !matches!(
+                auth.profile,
+                AuthProfile::Token {
+                    source: TokenSource::Store { .. }
+                }
+            ) {
+                bail!("set requires provider: token with source: store");
             }
+            let _lock = crate::managed::credential_lock().await?;
+            if !replace && credentials::OsSecretStore.get(&auth.owner)?.is_some() {
+                bail!("credential already exists; use --replace");
+            }
+            let mut bytes = Vec::new();
+            stdin
+                .take(credentials::MAX_CREDENTIAL_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            let secret = credentials::BearerSecret::from_input(bytes)?;
+            auth.invalidate()?;
+            crate::managed::clear_profile_data()?;
+            credentials::OsSecretStore.put(&auth.owner, &secret)?;
+            writeln!(stdout, "credential installed; server validity unverified")?;
+        }
+        CredentialCommand::Remove => {
+            if !matches!(
+                auth.profile,
+                AuthProfile::Token {
+                    source: TokenSource::Store { .. }
+                }
+            ) {
+                bail!("remove requires provider: token with source: store");
+            }
+            let _lock = crate::managed::credential_lock().await?;
+            auth.invalidate()?;
+            credentials::OsSecretStore.remove(&auth.owner)?;
+            crate::managed::clear_profile_data()?;
+            writeln!(
+                stdout,
+                "local credential removed; remote revocation not requested"
+            )?;
+        }
+        CredentialCommand::Status { json } => {
+            let availability = match &auth.profile {
+                AuthProfile::Token {
+                    source: TokenSource::Store { .. },
+                } => "unknown",
+                AuthProfile::Token {
+                    source: TokenSource::Env { env },
+                } => {
+                    if std::env::var_os(env).is_some() {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                }
+                AuthProfile::Token {
+                    source: TokenSource::File { file },
+                } => {
+                    if std::fs::metadata(file).is_ok_and(|m| m.is_file()) {
+                        "present"
+                    } else {
+                        "unavailable"
+                    }
+                }
+                AuthProfile::Exec { .. } => "not executed",
+                AuthProfile::Omnigraph => "unknown",
+                AuthProfile::Anonymous => "anonymous",
+            };
+            let mut result = serde_json::json!({"owner":auth.owner,"profile":profile_name,"availability":availability,"identity":"unknown","server_validity":"unverified","observed_at":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?,"verified_at":null});
+            if matches!(auth.profile, AuthProfile::Omnigraph) {
+                if let TargetBinding::Managed(binding) = &target.binding {
+                    result["session"] = crate::managed::credential_status(binding);
+                }
+            }
+            if json {
+                crate::output::write_json(&result, stdout)?;
+            } else {
+                writeln!(stdout, "{}", serde_json::to_string_pretty(&result)?)?;
+            }
+        }
+        CredentialCommand::Export => {
+            let token = match &target.binding {
+                TargetBinding::Managed(binding) => {
+                    crate::managed::export_credential(binding).await?
+                }
+                _ => auth
+                    .token()
+                    .await?
+                    .ok_or_else(|| eyre!("selected profile has no exportable credential"))?,
+            };
             writeln!(stdout, "{token}")?;
-            Ok(())
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_token_never_goes_to_a_terminal() {
-        let refused = refuse_terminal(true).unwrap_err();
-        let refusal = refused
-            .downcast_ref::<crate::targets::TargetError>()
-            .unwrap();
-        assert_eq!(refusal.code, "credential_terminal");
-        refuse_terminal(false).unwrap();
-        let input = InvocationConfig::at(None, None);
-        let target = ResolvedTarget::new(
-            TargetBinding::Server {
-                endpoint: "https://example.com".into(),
-                auth: ServerAuth::Token {
-                    owner: "not-configured".into(),
-                },
-                default_graph: None,
-            },
-            TargetProvenance::Explicit {
-                name: "selected".into(),
-            },
-        );
-        let mut output = Vec::new();
-        let error = run_credential(
-            &input,
-            &target,
-            CredentialCommand::Get { json: false },
-            true,
-            &mut output,
-            &mut Vec::new(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error
-                .downcast_ref::<crate::targets::TargetError>()
-                .unwrap()
-                .code,
-            "credential_terminal"
-        );
-        assert!(output.is_empty());
-    }
+    Ok(())
 }

@@ -21,7 +21,7 @@ pub(crate) struct LoadOperation {
 pub(crate) async fn run_load(
     args: LoadArgs,
     scope: TransferScope<'_>,
-    managed_client: Option<GraphClient>,
+
     input: &mut crate::input::Input<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -35,19 +35,14 @@ pub(crate) async fn run_load(
         json,
     } = args;
     let settings = client::parse_set_flags(&settings)?;
-    let client = match managed_client {
-        Some(client) => client,
-        None => {
-            GraphClient::from_target(
-                scope.operator,
-                scope.target,
-                scope.graph,
-                scope.actor,
-                stderr,
-            )
-            .await?
-        }
-    };
+    let client = GraphClient::from_target(
+        scope.operator,
+        scope.target,
+        scope.graph,
+        scope.actor,
+        stderr,
+    )
+    .await?;
     let operation = LoadOperation {
         branch: resolve_branch(branch, None, "main"),
         from,

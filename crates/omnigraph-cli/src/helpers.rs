@@ -90,6 +90,7 @@ pub(crate) fn remote_url(base: &str, segments: &[&str], query: &[(&str, &str)]) 
     Ok(url.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_bearer_token(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -171,16 +172,17 @@ impl std::fmt::Display for MissingCredential {
         match self {
             Self::AnonymousTarget(name) => write!(
                 f,
-                "target `{name}` uses anonymous authentication: configure its credential owner, \
-                 then run `omnigraph login --target {name}`"
+                "target `{name}` uses anonymous authentication: configure and select a token or exec \
+                 auth profile; for a token profile with source: store, run \
+                 `omnigraph credentials set --target {name} --auth <profile> --stdin`"
             ),
             Self::Unbound {
                 server_root,
                 config,
             } => write!(
                 f,
-                "no credential is bound to {server_root}: declare a target for it under `targets:` in {}, \
-                 then run `omnigraph login --target <target>` or set OMNIGRAPH_TOKEN_<NAME>",
+                "no credential is bound to {server_root}: declare a server target and explicit auth \
+                 profile under `targets:` in {}; select it with --target and --auth",
                 config.as_deref().map_or_else(
                     || "~/.omnigraph/config.yaml".to_string(),
                     |path| path.display().to_string()
@@ -209,17 +211,22 @@ pub(crate) fn with_missing_credential(
 
 /// A graph identifier is one unambiguous URL/storage path segment.
 pub(crate) fn require_graph_segment(graph: &str) -> Result<()> {
-    if graph.is_empty()
-        || !graph
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        color_eyre::eyre::bail!(
-            "invalid graph `{graph}`: a graph name is one path segment of ASCII letters, \
-             digits, `-` or `_`"
-        );
+    if graph != "og_catalog" {
+        omnigraph_server::GraphId::try_from(graph).map_err(|error| {
+            color_eyre::eyre::eyre!(
+                "invalid graph `{graph}`: a graph name is one path segment; {error}"
+            )
+        })?;
     }
     Ok(())
+}
+
+pub(crate) fn valid_managed_identifier(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 pub(crate) fn apply_bearer_token(

@@ -31,7 +31,7 @@ deployment.
 
 - [CLI guide](cli/index.md)
 - [CLI reference](cli/reference.md)
-- [Operator targets and credentials](cli/targets.md)
+- [Operator profiles, targets and credentials](cli/targets.md)
 - [Managed data credentials and queries](cli/managed-data.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [Managed organization members and invitations](cli/managed-team.md)
@@ -44,7 +44,7 @@ deployment.
 - [Operating a cluster](clusters/index.md)
 - [`cluster.yaml` reference](clusters/config.md)
 - [Deployment](deployment.md)
-- [Storage failures](operations/storage-failures.md)
+- [Storage failures and restart](operations/storage-failures.md)
 - [Authorization and actors](operations/policy.md)
 - [Maintenance](operations/maintenance.md)
 - [Storage-format upgrades](operations/upgrade.md)

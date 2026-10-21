@@ -5,7 +5,7 @@ atomically across the whole graph.
 
 ```bash
 omnigraph branch merge review/2026-04-25 --into main \
-  --target s3://bucket/graph.omni
+  --target ./graph.omni
 ```
 
 The source is positional. `--into` defaults to `main`.
@@ -76,7 +76,7 @@ normal review-branch lifecycle:
 
 ```bash
 omnigraph branch merge review/2026-04-25 --into main --delete-branch \
-  --target s3://bucket/graph.omni
+  --target ./graph.omni
 ```
 
 Deletion happens after a successful merge and has its own authorization check.

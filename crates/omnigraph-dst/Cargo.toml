@@ -36,6 +36,10 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 serial_test = "3"
+# The cluster lock's lease protocol, simulated in `scenarios.rs`.
+omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.14.0", features = ["test-util"] }
+# The control-object adapter that protocol writes through.
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.14.0" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }

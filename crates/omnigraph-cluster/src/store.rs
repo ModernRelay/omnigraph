@@ -30,6 +30,12 @@ use crate::{
 #[derive(Debug, Clone)]
 pub(crate) struct ClusterStore {
     adapter: Arc<dyn StorageAdapter>,
+    /// The same root outside any owner's storage scope, with the backend's
+    /// own retries. The lock's lease writes through it: a heartbeat is a
+    /// fresh key whose late landing only keeps a successor waiting, so its
+    /// requests neither need the scope's accounting nor stop when the scope
+    /// closes for a release.
+    lease_adapter: Arc<dyn StorageAdapter>,
     /// Concrete backend evidence used by lock/authority factories. Unlike the
     /// public adapter trait, callers cannot implement this handle.
     storage: StorageHandle,
@@ -208,6 +214,7 @@ impl ClusterStore {
             .expect("local storage adapter construction is infallible for file:// roots");
         let adapter = storage.adapter();
         Self {
+            lease_adapter: adapter.clone(),
             adapter,
             storage,
             binding: None,
@@ -248,6 +255,7 @@ impl ClusterStore {
         })?;
         Ok(Self {
             adapter: storage.adapter(),
+            lease_adapter: storage.adapter(),
             storage,
             binding: None,
             root: normalized.clone(),
@@ -274,6 +282,7 @@ impl ClusterStore {
         };
         Ok(Self {
             adapter: storage.adapter(),
+            lease_adapter: storage.adapter(),
             storage,
             binding: Some(binding.clone()),
             root,
@@ -313,6 +322,7 @@ impl ClusterStore {
 
     #[cfg(test)]
     pub(crate) fn with_bootstrap_test_adapter(mut self, adapter: Arc<dyn StorageAdapter>) -> Self {
+        self.lease_adapter = adapter.clone();
         self.adapter = adapter;
         self
     }
@@ -393,6 +403,7 @@ impl ClusterStore {
     ) -> Result<StateLockGuard, Diagnostic> {
         crate::state_lock::claim_bootstrap_lock(
             self.adapter.clone(),
+            self.lease_adapter.clone(),
             self.kind(),
             &self.uri(CLUSTER_LOCK_FILE),
             id,
@@ -1131,6 +1142,7 @@ impl ClusterStore {
         let lock_uri = self.uri(CLUSTER_LOCK_FILE);
         match acquire_state_lock(
             self.adapter.clone(),
+            self.lease_adapter.clone(),
             self.storage.kind(),
             &lock_uri,
             operation,
@@ -1160,6 +1172,16 @@ impl ClusterStore {
                 CLUSTER_LOCK_FILE,
                 format!("could not write state lock: {err}"),
             )),
+        }
+    }
+
+    /// Best-effort removal of a stopped lease's beats before its release.
+    pub(crate) async fn remove_lease_dir(&self, dir: &str) {
+        // The error and the directory name storage paths, which logs never
+        // carry. Heartbeats left under a released lock's id are inert: no
+        // successor watches an id that no longer holds the lock.
+        if self.lease_adapter.delete_prefix(dir).await.is_err() {
+            tracing::warn!("could not remove a released lease's heartbeats");
         }
     }
 
