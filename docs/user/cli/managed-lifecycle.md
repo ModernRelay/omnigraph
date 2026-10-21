@@ -3,8 +3,8 @@
 These commands use your managed service identity and permissions. They do not
 open graph storage or require cloud credentials. The service must support
 cluster creation and lifecycle operations; an older service returns a refusal.
-Every command below selects a registered target. Configure `account` as a
-managed account target and `production` as its managed cluster target; see
+Account commands select a connection and resource commands select a target.
+Configure `work` as a managed connection and `production` as its target; see
 [managed target configuration](reference.md#managed-cluster-commands).
 
 ## Find a cluster and recover its configuration
@@ -12,9 +12,9 @@ managed account target and `production` as its managed cluster target; see
 After signing in, list the clusters visible to your selected organization:
 
 ```sh
-omnigraph login --target account
-omnigraph cluster list --target account --json
-# Add a cluster target with the returned cluster ID and incarnation.
+omnigraph login --connection work
+omnigraph cluster list --connection work --json
+omnigraph target add production --connection work --cluster CLUSTER_ID
 omnigraph cluster pull --target production --out customer-config --json
 ```
 
@@ -61,17 +61,17 @@ enroll and remove people through the same cached CLI login.
 
 ## Create an empty cluster
 
-Use a complete account target:
+Use a complete connection:
 
 ```sh
-omnigraph login --target account
-omnigraph cluster create customer-demo --target account --no-wait --json
+omnigraph login --connection work
+omnigraph cluster create customer-demo --connection work --no-wait --json
 ```
 
 The service reserves a cluster and operation. Creation returns its identity;
 it never creates configuration files, binds a directory or changes the selected
 target. Keep `data.canonical_root`, `data.incarnation` and `data.operation_id`,
-then add a cluster target using those verified values. Without `--no-wait`, the
+then register it with `target add production --connection work --cluster CLUSTER_ID`. Without `--no-wait`, the
 command waits for initial bootstrap and serving readiness. `data.state` is the
 operation outcome; `data.lifecycle.phase` reports provisioning progress.
 
@@ -80,14 +80,15 @@ sets a local 1–3600-second deadline; the default is 300. A timeout does not
 cancel creation. Follow the saved operation explicitly:
 
 ```sh
-omnigraph cluster operation OPERATION_ID --target account --json
-omnigraph cluster operation OPERATION_ID --target account --wait --timeout 600 --json
+omnigraph cluster operation OPERATION_ID --connection work --json
+omnigraph cluster operation OPERATION_ID --connection work --wait --timeout 600 --json
 ```
 
-Account targets can observe creation before a cluster target exists. A cluster
+Connections can observe creation before a cluster target exists. A cluster
 target can observe only an operation for its pinned cluster and incarnation.
-Private clusters still require the connection reported by your service, such as
-an explicit port forward; `ready` does not imply a public endpoint.
+A `ready` cluster does not imply a reachable endpoint. The selected service must
+attest the route; this configuration rewrite does not qualify private/BYOC routes
+or tunnel transports.
 
 ## Prepare and apply configuration
 
@@ -196,15 +197,11 @@ recovery evidence. A completed request without an explicit key is not silently
 submitted again. Use `cluster operation ID` to observe; supplying the retained
 key explicitly resubmits only that same idempotent request.
 
-Legacy `.omnigraph/pending-lifecycle.json` or `last-lifecycle.json` blocks new
-lifecycle submissions even with an explicit target. From that folder, run
-`omnigraph target import` with a matching configured API and organization. It
-copies validated evidence durably before retiring the originals; conflicts
-preserve the originals and refuse. If you later use a different operator
-directory, run `target import` from the original folder again to copy its retained
-lifecycle evidence into that directory before another lifecycle submission.
-Preserve the old directory and isolate older CLI binaries until recovery is
-settled. Never delete uncertain pending evidence to force a new submission.
+Preserve legacy pending and accepted lifecycle evidence. Use the explicit
+[operation-evidence recovery command](targets.md#upgrade-from-the-old-format)
+for old folder records; it does not convert config or submit operations. Resume
+with the original verified principal and original idempotency key. Never delete
+uncertain evidence to force a new submission.
 
 JSON output is one response on stdout; progress and idempotency information use
 stderr. A local deadline exits 5 and retains the latest operation response.

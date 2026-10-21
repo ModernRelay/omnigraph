@@ -110,7 +110,9 @@ fn served_policy_state(server: &TestServer) -> (Value, Value) {
         parse_stdout_json(&output_success(
             cli()
                 .envs(server.credential("bruno-tok"))
-                .args(["--target", &server.base_url, "--graph", "knowledge"])
+                .args(["--target"])
+                .fixture_target(&server.base_url)
+                .args(["--graph", "knowledge"])
                 .args(arguments)
                 .arg("--json"),
         ))
@@ -704,14 +706,14 @@ fn cli_object_store_end_to_end_init_load_read_flow(graph_uri: &str) {
     let query = query_root.join("test.gq");
     fs::copy(fixture("test.gq"), &query).unwrap();
 
-    output_success(
-        cli()
-            .current_dir(query_root)
-            .arg("init")
-            .arg("--schema")
-            .arg(fixture("test.pg"))
-            .arg(graph_uri),
-    );
+    fs::copy(fixture("test.pg"), temp.path().join("test.pg")).unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        format!("version: 1\nstorage: {graph_uri}\ngraphs:\n  knowledge:\n    schema: ./test.pg\n"),
+    )
+    .unwrap();
+    bootstrap_cluster_fixture(temp.path(), graph_uri);
+    let server = spawn_server_with_cluster(temp.path());
     output_success(
         cli()
             .current_dir(query_root)
@@ -725,17 +727,18 @@ fn cli_object_store_end_to_end_init_load_read_flow(graph_uri: &str) {
             .arg("--data")
             .arg(fixture("test.jsonl"))
             .arg("--target")
-            .arg(graph_uri),
+            .fixture_target(&server.base_url)
+            .args(["--graph", "knowledge"]),
     );
 
-    // RFC-011: the graph is addressed by `--target <uri>`; the `.gq` path is
-    // resolved cwd-relative (no omnigraph.yaml `query.roots`).
+    // The named served target owns cloud access; query files remain cwd-relative.
     let read = parse_stdout_json(&output_success(
         cli()
             .current_dir(query_root)
             .arg("query")
             .arg("--target")
-            .arg(graph_uri)
+            .fixture_target(&server.base_url)
+            .args(["--graph", "knowledge"])
             .arg("--query")
             .arg("test.gq")
             .arg("get_person")
@@ -751,7 +754,8 @@ fn cli_object_store_end_to_end_init_load_read_flow(graph_uri: &str) {
             .current_dir(query_root)
             .arg("snapshot")
             .arg("--target")
-            .arg(graph_uri)
+            .fixture_target(&server.base_url)
+            .args(["--graph", "knowledge"])
             .arg("--json"),
     ));
     assert!(snapshot["datasets"].is_array());
@@ -1243,7 +1247,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
     let no_token = cli()
         .arg("mutate")
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         .arg("--graph")
         .arg("knowledge")
         .arg("-e")
@@ -1263,7 +1267,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
         .envs(server.credential("bruno-tok"))
         .arg("mutate")
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         .arg("--graph")
         .arg("knowledge")
         .arg("-e")
@@ -1288,7 +1292,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
             .envs(server.credential("ragnor-tok"))
             .arg("mutate")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg("knowledge")
             .arg("-e")
@@ -1310,7 +1314,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
             .envs(server.credential("bruno-tok"))
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg("knowledge")
             .arg("--query")
@@ -1404,7 +1408,7 @@ fn local_cli_load_enforces_engine_layer_policy() {
         // so the policy check (not the confirmation refusal) is what denies.
         .arg("--yes")
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         .arg("--graph")
         .arg("knowledge")
         .arg("--data")
@@ -1430,7 +1434,7 @@ fn local_cli_load_enforces_engine_layer_policy() {
             .arg("overwrite")
             .arg("--yes")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg("knowledge")
             .arg("--data")
@@ -1470,7 +1474,7 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
         .arg("--mode")
         .arg("merge")
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         .arg("--graph")
         .arg("knowledge")
         .arg("--data")
@@ -1498,7 +1502,7 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
             .arg("--mode")
             .arg("merge")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg("knowledge")
             .arg("--data")
@@ -1531,7 +1535,7 @@ fn local_cli_branch_create_enforces_engine_layer_policy() {
         .arg("branch")
         .arg("create")
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         .arg("--graph")
         .arg("knowledge")
         .arg("--from")
@@ -1555,7 +1559,7 @@ fn local_cli_branch_create_enforces_engine_layer_policy() {
             .arg("branch")
             .arg("create")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg("knowledge")
             .arg("--from")
@@ -1584,7 +1588,7 @@ fn local_cli_branch_delete_enforces_engine_layer_policy() {
             .arg("branch")
             .arg("create")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg("knowledge")
             .arg("--from")
@@ -1600,7 +1604,7 @@ fn local_cli_branch_delete_enforces_engine_layer_policy() {
         .arg("delete")
         .arg("--yes")
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         .arg("--graph")
         .arg("knowledge")
         .arg("doomed")
@@ -1623,7 +1627,7 @@ fn local_cli_branch_delete_enforces_engine_layer_policy() {
             .arg("delete")
             .arg("--yes")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg("knowledge")
             .arg("doomed"),
@@ -1651,7 +1655,7 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
             .arg("branch")
             .arg("create")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg("knowledge")
             .arg("--from")
@@ -1664,7 +1668,7 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
         .arg("branch")
         .arg("merge")
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         .arg("--graph")
         .arg("knowledge")
         .arg("merge-feature")
@@ -1688,7 +1692,7 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
             .arg("branch")
             .arg("merge")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg("knowledge")
             .arg("merge-feature")
@@ -1697,79 +1701,63 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
     );
 }
 
-// ─── RFC-011: operator.actor cascade ──────────────────────────────────────
-//
-// The CLI actor chain is `--as` > `operator.actor` (in the operator config
-// at $OMNIGRAPH_HOME/config.yaml) > none. These two tests pin that order on
-// a direct (`--target`) write. RFC-011 makes direct-store writes unpoliced,
-// so the assertion is on which `actor_id` the write records, not on a Cedar
-// allow/deny — the actor still has to be resolved correctly and stamped onto
-// the commit.
-
-/// An operator config (`$OMNIGRAPH_HOME/config.yaml`) carrying just
-/// `operator.actor`. Pointing OMNIGRAPH_HOME at the holding dir makes the
-/// CLI read it as the operator layer.
-fn operator_home_with_actor(actor: &str) -> tempfile::TempDir {
+// Version 1 deliberately rejects config-level actors. Direct writes identify
+// their actor through --as; a rejected legacy config must not publish a commit.
+#[test]
+fn local_cli_actor_from_config_is_refused_without_writing() {
+    let graph = SystemGraph::loaded();
     let home = tempfile::tempdir().unwrap();
     fs::write(
         home.path().join("config.yaml"),
-        format!("target_config_version: 1\noperator:\n  actor: {actor}\n"),
+        "version: 1\noperator:\n  actor: act-ragnor\n",
     )
     .unwrap();
-    home
-}
-
-#[test]
-fn local_cli_actor_from_config_used_when_no_flag() {
-    // operator.actor: act-ragnor in the operator config, no --as flag →
-    // the write records act-ragnor. Proves the operator-layer actor source
-    // is consulted when `--as` is absent.
-    let graph = SystemGraph::loaded();
-    let home = operator_home_with_actor("act-ragnor");
+    let before = resolved_snapshot_id(graph.path(), "main");
     let mutation_file = insert_person_query(&graph, "system-local-cli-actor.gq");
-
-    let allowed = parse_stdout_json(&output_success(
-        cli()
-            .env("OMNIGRAPH_HOME", home.path())
-            .arg("mutate")
-            .arg("--target")
-            .arg(graph.path())
-            .arg("--query")
-            .arg(&mutation_file)
-            .arg("--params")
-            .arg(r#"{"name":"ConfigActorEve","age":18}"#)
-            .arg("--json"),
-    ));
-    assert_eq!(allowed["affected_nodes"], 1);
-    assert_eq!(allowed["actor_id"], "act-ragnor");
+    for extra in [vec![], vec!["--as", "act-bruno"]] {
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(extra)
+                .arg("mutate")
+                .arg("--target")
+                .arg(graph.path())
+                .arg("--query")
+                .arg(&mutation_file)
+                .args([
+                    "--params",
+                    r#"{"name":"ConfigActorEve","age":18}"#,
+                    "--json",
+                ]),
+        );
+        let diagnostic = format!(
+            "{}{}",
+            stdout_string(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(diagnostic.contains("operator"), "{diagnostic}");
+        assert_eq!(resolved_snapshot_id(graph.path(), "main"), before);
+    }
 }
 
 #[test]
-fn local_cli_actor_flag_overrides_config_actor() {
-    // operator.actor: act-ragnor in the config + --as act-bruno on the CLI →
-    // the write records act-bruno. The flag wins per the precedence rule.
-    // Without this test, a future change that reverses precedence would ride
-    // through silently.
+fn local_cli_actor_flag_records_explicit_actor() {
     let graph = SystemGraph::loaded();
-    let home = operator_home_with_actor("act-ragnor");
-    let mutation_file = insert_person_query(&graph, "system-local-cli-actor-override.gq");
-
-    let overridden = parse_stdout_json(&output_success(
+    let home = tempfile::tempdir().unwrap();
+    fs::write(home.path().join("config.yaml"), "version: 1\n").unwrap();
+    let mutation_file = insert_person_query(&graph, "system-local-cli-actor-explicit.gq");
+    let result = parse_stdout_json(&output_success(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
-            .arg("--as")
-            .arg("act-bruno")
-            .arg("mutate")
+            .args(["--as", "act-bruno", "mutate"])
             .arg("--target")
             .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
-            .arg("--params")
-            .arg(r#"{"name":"OverrideEve","age":19}"#)
-            .arg("--json"),
+            .args(["--params", r#"{"name":"ExplicitEve","age":19}"#, "--json"]),
     ));
-    assert_eq!(overridden["affected_nodes"], 1);
-    assert_eq!(overridden["actor_id"], "act-bruno");
+    assert_eq!(result["affected_nodes"], 1);
+    assert_eq!(result["actor_id"], "act-bruno");
 }
 
 /// Phase 5 (RFC-005): "applied means serving" — converge a cluster with the
@@ -2415,184 +2403,167 @@ fn cluster_server_boot_ignores_local_config_in_cwd() {
     std::fs::write(cwd.path().join("omnigraph.yaml"), "{{{{ not yaml").unwrap();
 
     let server = spawn_server_with_cluster_in(cluster.path(), cwd.path());
-    let response = reqwest::blocking::get(format!("{}/healthz", server.base_url)).unwrap();
+    let response = graph_http_client()
+        .get(format!("{}/healthz", server.base_url))
+        .send()
+        .unwrap();
     assert!(response.status().is_success());
 }
 
-/// RFC-007 PR 2: keyed credentials end to end — `login` stores a 0600
-/// credential, the URL-matched server's token chain authenticates remote
-/// reads (env > file), a non-matching URL never sees the token (§D5 rule
-/// 3), and `logout` forgets local custody. The unkeyed `OMNIGRAPH_BEARER_TOKEN`
-/// never fills a missing named credential; declared token targets refuse locally.
-/// Unbound anonymous requests that receive a 401 explain how to bind a target.
+/// Explicit sources are the only credential authority. File rotation is a new
+/// invocation; ambient keyed/unkeyed variables and legacy custody never win.
 #[test]
 fn local_cli_keyed_credentials_authenticate_url_matched_server_issue_1022() {
-    // RFC-011 cluster-only: the server boots from a converged cluster
-    // serving the fixture graph under id `local`; tokens-only boot is
-    // default-deny, which still permits `read`.
     let cluster = converged_loaded_cluster("local", None);
     let server = spawn_server_with_cluster_env(
         cluster.path(),
         &[("OMNIGRAPH_SERVER_BEARER_TOKEN", "secret-tok")],
     );
-    let operator_home = tempfile::tempdir().unwrap();
-    let write_server_url = |url: &str| {
-        fs::write(
-            operator_home.path().join("config.yaml"),
-            format!("target_config_version: 1\ntargets:\n  test-srv:\n    kind: server\n    endpoint: {url}\n    credential: test-srv\n"),
-        )
-        .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let token = home.path().join("token");
+    let write_config = |url: &str, source: &str| {
+        fs::write(home.path().join("config.yaml"), format!(
+            "version: 1\ntargets:\n  test-srv:\n    kind: server\n    endpoint: {url}\n    default_auth: explicit\n    auth:\n      explicit:\n        provider: token\n        source: {source}\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n",
+            tls_gateway::ca_path().display())).unwrap();
     };
-    write_server_url(&server.base_url);
-
-    let remote_read = |envs: &[(&str, &str)]| {
+    write_config(&server.base_url, "{file: ./token}");
+    let read = |envs: &[(&str, &str)]| {
         let mut command = cli();
-        command.env("OMNIGRAPH_HOME", operator_home.path());
-        for (name, value) in envs {
-            command.env(name, value);
+        command.env("OMNIGRAPH_HOME", home.path());
+        for (key, value) in envs {
+            command.env(key, value);
         }
         command
-            .arg("query")
-            .arg("--target")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg("local")
-            .arg("--query")
+            .args(["query", "--target", "test-srv"])
+            .args(["--graph", "local", "--query"])
             .arg(fixture("test.gq"))
-            .arg("get_person")
-            .arg("--params")
-            .arg(r#"{"name":"Alice"}"#)
-            .arg("--json")
+            .args(["get_person", "--params", r#"{"name":"Alice"}"#, "--json"])
             .output()
             .unwrap()
     };
-
-    // The declared token owner is missing: refuse before sending a request.
-    let output = remote_read(&[]);
-    assert!(!output.status.success(), "{output:?}");
-
-    // The unkeyed variable holds the server's real token, yet a declared
-    // server with no keyed token gets no credential.
-    let output = remote_read(&[("OMNIGRAPH_BEARER_TOKEN", "secret-tok")]);
+    let ambient = [
+        ("OMNIGRAPH_BEARER_TOKEN", "secret-tok"),
+        ("OMNIGRAPH_TOKEN_TEST_SRV", "secret-tok"),
+    ];
     assert!(
-        !output.status.success(),
-        "the unkeyed token must not reach a declared server: {output:?}"
+        !read(&ambient).status.success(),
+        "ambient variables cannot fill a missing file"
     );
-    let refusal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    fs::write(
+        home.path().join("credentials"),
+        format!(
+            "[test-srv]\nendpoint = {}\ntoken = secret-tok\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
     assert!(
-        refusal["error"]
-            .as_str()
-            .unwrap()
-            .contains("credential_missing"),
-        "{refusal}"
+        !read(&ambient).status.success(),
+        "legacy plaintext custody is inert"
     );
-    assert!(
-        refusal["error"]
-            .as_str()
-            .unwrap()
-            .contains("OMNIGRAPH_TOKEN_TEST_SRV"),
-        "{refusal}"
-    );
-    assert!(refusal.get("http_status").is_none(), "{refusal}");
-    assert!(refusal.get("missing_credential").is_none(), "{refusal}");
-    assert_eq!(refusal["code"], "credential_missing", "{refusal}");
-    assert_eq!(output.status.code(), Some(2));
-
-    // login with a WRONG token (via stdin, the documented pipe flow).
-    let output = cli()
-        .env("OMNIGRAPH_HOME", operator_home.path())
-        .arg("login")
-        .args(["--target", "test-srv"])
-        .write_stdin("wrong-tok\n")
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let output = remote_read(&[]);
-    assert!(
-        !output.status.success(),
-        "wrong token must not authenticate"
-    );
-
-    // Re-login rotates to the right token (via --token); 0600 on disk.
-    let output = cli()
-        .env("OMNIGRAPH_HOME", operator_home.path())
-        .arg("login")
-        .args(["--target", "test-srv"])
-        .arg("--token")
-        .arg("secret-tok")
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let credentials = operator_home.path().join("credentials");
-    let text = fs::read_to_string(&credentials).unwrap();
-    assert!(text.contains("[test-srv]"), "{text}");
+    fs::write(&token, "wrong-tok\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&credentials).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "{:o}", mode & 0o777);
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let output = remote_read(&[]);
     assert!(
-        output.status.success(),
-        "keyed credential must authenticate the URL-matched server: {output:?}"
+        !read(&ambient).status.success(),
+        "ambient auth cannot override the declared source"
     );
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["rows"][0]["p.name"], "Alice");
+    fs::write(&token, "secret-tok\n").unwrap();
+    let output = read(&[("OMNIGRAPH_TOKEN_TEST_SRV", "wrong-token")]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(parse_stdout_json(&output)["rows"][0]["p.name"], "Alice");
 
-    // OMNIGRAPH_TOKEN_<NAME> env outranks the credentials file.
-    let output = remote_read(&[("OMNIGRAPH_TOKEN_TEST_SRV", "env-wrong")]);
-    assert!(
-        !output.status.success(),
-        "keyed env token must outrank the credentials file"
-    );
+    // Operator CA selection is authoritative: a valid ambient root cannot
+    // rescue an invalid explicitly configured replacement bundle.
+    let config_path = home.path().join("config.yaml");
+    let trusted_config = fs::read_to_string(&config_path).unwrap();
+    let invalid_ca = home.path().join("invalid-ca.pem");
+    fs::write(&invalid_ca, "not a PEM certificate\n").unwrap();
+    fs::write(
+        &config_path,
+        trusted_config.replace(
+            tls_gateway::ca_path().to_str().unwrap(),
+            invalid_ca.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    let refused = read(&[("SSL_CERT_FILE", tls_gateway::ca_path().to_str().unwrap())]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(!String::from_utf8_lossy(&refused.stderr).contains("secret-tok"));
+    fs::write(&config_path, &trusted_config).unwrap();
+    let restored = read(&[]);
+    assert!(restored.status.success(), "{restored:?}");
+    assert_eq!(parse_stdout_json(&restored)["rows"][0]["p.name"], "Alice");
 
-    // §D5 rule 3: a URL matching no operator server never sees the token,
-    // neither the keyed one nor the unkeyed variable.
-    write_server_url("http://127.0.0.1:1");
-    let output = remote_read(&[("OMNIGRAPH_BEARER_TOKEN", "secret-tok")]);
+    let credential = |verb: &str| {
+        let mut command = cli();
+        command.env("OMNIGRAPH_HOME", home.path()).args([
+            "--target",
+            "test-srv",
+            "--auth",
+            "explicit",
+            "credentials",
+            verb,
+        ]);
+        command
+    };
+    let status = parse_stdout_json(&output_success(credential("status").arg("--json")));
+    assert_eq!(status["availability"], "present");
+    assert_eq!(status["server_validity"], "unverified");
     assert!(
-        !output.status.success(),
-        "token keyed to another url must not be sent here: {output:?}"
-    );
-    let refusal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(refusal["code"], "unauthorized", "{refusal}");
-    // The server's own message is passed through unchanged.
-    assert!(
-        !refusal["error"]
-            .as_str()
+        !serde_json::to_string(&status)
             .unwrap()
-            .contains("no credential is"),
-        "{refusal}"
+            .contains("secret-tok")
     );
     assert_eq!(
-        refusal["missing_credential"],
-        serde_json::json!({
-            "unbound": server.base_url,
-            "hint": format!(
-                "no credential is bound to {}: declare a target for it under `targets:` in {}, then run \
-                 `omnigraph login --target <target>` or set OMNIGRAPH_TOKEN_<NAME>",
-                server.base_url,
-                operator_home.path().join("config.yaml").display()
-            )
-        })
+        stdout_string(&output_success(&mut credential("export"))),
+        "secret-tok\n"
     );
-    write_server_url(&server.base_url);
-
-    // Logout forgets local credentials and is idempotent.
-    for _ in 0..2 {
-        let output = cli()
-            .env("OMNIGRAPH_HOME", operator_home.path())
-            .arg("logout")
-            .args(["--target", "test-srv"])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
+    // These refusals must never touch the OS secret store or change the file.
+    output_failure(
+        credential("set")
+            .arg("--stdin")
+            .write_stdin("replacement\n"),
+    );
+    output_failure(&mut credential("remove"));
+    output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["login", "--target", "test-srv"]),
+    );
+    output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["logout", "--target", "test-srv"]),
+    );
+    assert_eq!(fs::read_to_string(&token).unwrap(), "secret-tok\n");
+    for args in [
+        vec!["credentials", "status", "--target", "test-srv"],
+        vec!["credentials", "status", "--auth", "explicit"],
+        vec!["login", "--target", "test-srv", "--token", "never-print"],
+    ] {
+        output_failure(cli().env("OMNIGRAPH_HOME", home.path()).args(args));
     }
-    let output = remote_read(&[]);
+    write_config("https://127.0.0.1:1", "{file: ./token}");
     assert!(
-        !output.status.success(),
-        "logout must remove the stored credential"
+        !read(&ambient).status.success(),
+        "a different endpoint must never inherit a token"
+    );
+    write_config(&server.base_url, "{env: CLI_FIXTURE_EXPLICIT_TOKEN}");
+    assert!(!read(&ambient).status.success());
+    assert!(
+        read(&[("CLI_FIXTURE_EXPLICIT_TOKEN", "secret-tok")])
+            .status
+            .success()
+    );
+    fs::remove_file(&token).unwrap();
+    write_config(&server.base_url, "{file: ./token}");
+    assert!(
+        !read(&ambient).status.success(),
+        "removed source cannot fall back"
     );
 }
 
@@ -2600,6 +2571,7 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server_issue_1022() {
 /// stored queries) end to end, with the keyed credential from PR 2.
 #[test]
 fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
+    let ca = tls_gateway::ca_path().display();
     // RFC-011 cluster-only: build a converged cluster serving graph `local`
     // with a stored query `find_person` and a per-graph policy granting the
     // operator invoke_query + read (invoke_query is policy-gated — anti-probing
@@ -2650,21 +2622,17 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     fs::write(
         operator_home.path().join("config.yaml"),
         format!(
-            "target_config_version: 1\ntargets:\n  dev:\n    kind: server\n    endpoint: {}\n    credential: dev\naliases:\n  who:\n    target: dev\n    graph: local\n    query: find_person\n    args: [name]\n  create_person:\n    target: dev\n    graph: local\n    query: insert_person\n    args: [name]\n",
+            "version: 1\ntargets:\n  dev:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: {}\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          file: ./token\naliases:\n  who:\n    target: dev\n    graph: local\n    query: find_person\n  create_person:\n    target: dev\n    graph: local\n    query: insert_person\n",
             server.base_url
         ),
     )
     .unwrap();
-    fs::write(
-        operator_home.path().join("credentials"),
-        format!("[dev]\nendpoint = {}\ntoken = srv-tok\n", server.base_url),
-    )
-    .unwrap();
+    fs::write(operator_home.path().join("token"), "srv-tok\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(
-            operator_home.path().join("credentials"),
+            operator_home.path().join("token"),
             fs::Permissions::from_mode(0o600),
         )
         .unwrap();
@@ -2676,7 +2644,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .env("OMNIGRAPH_HOME", operator_home.path())
         .arg("alias")
         .arg("who")
-        .arg("Alice")
+        .args(["--params", r#"{"name":"Alice"}"#])
         .arg("--json")
         .output()
         .unwrap();
@@ -2693,7 +2661,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .env("OMNIGRAPH_HOME", operator_home.path())
         .arg("alias")
         .arg("create_person")
-        .arg("AliasGuardPerson")
+        .args(["--params", r#"{"name":"AliasGuardPerson"}"#])
         .output()
         .unwrap();
     assert!(!output.status.success(), "mutation alias must fail");
@@ -2808,7 +2776,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .env("OMNIGRAPH_HOME", operator_home.path())
         .arg("query")
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         .arg("--target")
         .arg("dev")
         .arg("--query-string")

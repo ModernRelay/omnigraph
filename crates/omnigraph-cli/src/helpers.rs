@@ -90,6 +90,7 @@ pub(crate) fn remote_url(base: &str, segments: &[&str], query: &[(&str, &str)]) 
     Ok(url.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_bearer_token(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -171,16 +172,17 @@ impl std::fmt::Display for MissingCredential {
         match self {
             Self::AnonymousTarget(name) => write!(
                 f,
-                "target `{name}` uses anonymous authentication: configure its credential owner, \
-                 then run `omnigraph login --target {name}`"
+                "target `{name}` uses anonymous authentication: configure and select a token or exec \
+                 auth profile; for a token profile with source: store, run \
+                 `omnigraph credentials set --target {name} --auth <profile> --stdin`"
             ),
             Self::Unbound {
                 server_root,
                 config,
             } => write!(
                 f,
-                "no credential is bound to {server_root}: declare a target for it under `targets:` in {}, \
-                 then run `omnigraph login --target <target>` or set OMNIGRAPH_TOKEN_<NAME>",
+                "no credential is bound to {server_root}: declare a server target and explicit auth \
+                 profile under `targets:` in {}; select it with --target and --auth",
                 config.as_deref().map_or_else(
                     || "~/.omnigraph/config.yaml".to_string(),
                     |path| path.display().to_string()

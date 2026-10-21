@@ -40,7 +40,7 @@ pub(crate) struct GraphScope<'a> {
 pub(crate) async fn run_query(
     args: QueryArgs,
     scope: GraphScope<'_>,
-    managed_client: Option<GraphClient>,
+
     machine: &mut Option<MachineErrors>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -60,11 +60,8 @@ pub(crate) async fn run_query(
     let operator = scope.operator.get(stderr)?;
     let presentation = ReadPresentation::capture(operator, format, json, None);
     *machine = presentation.machine_errors();
-    let client = if let Some(client) = managed_client {
-        client
-    } else {
-        GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr).await?
-    };
+    let client =
+        GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr).await?;
     let params_json = load_params_json(&params)?;
     let has_target = branch.is_some() || snapshot.is_some();
     if has_target && matches!(client, GraphClient::Catalogue) {
@@ -144,7 +141,7 @@ pub(crate) async fn run_query(
 pub(crate) async fn run_mutate(
     args: MutateArgs,
     scope: GraphScope<'_>,
-    managed_client: Option<GraphClient>,
+
     input: &mut Input<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -160,18 +157,14 @@ pub(crate) async fn run_mutate(
         json,
     } = args;
     let settings = parse_set_flags(&settings)?;
-    let client = if let Some(client) = managed_client {
-        client
-    } else {
-        GraphClient::from_target(
-            scope.operator,
-            scope.target,
-            scope.graph,
-            scope.actor,
-            stderr,
-        )
-        .await?
-    };
+    let client = GraphClient::from_target(
+        scope.operator,
+        scope.target,
+        scope.graph,
+        scope.actor,
+        stderr,
+    )
+    .await?;
     let params_json = load_params_json(&params)?;
     let source = load_source(query.as_ref(), query_string.as_deref())?;
     let operation = prepare::prepare_mutation(

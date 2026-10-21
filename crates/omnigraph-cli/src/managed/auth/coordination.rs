@@ -4,6 +4,17 @@ use sha2::{Digest as _, Sha256};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug)]
+pub(crate) struct LockGuard {
+    file: File,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 fn failed() -> Failure {
     Failure::refused(
         "session_lock_unavailable",
@@ -104,12 +115,12 @@ fn open(directory: &Path, origin: &str) -> Result<File> {
     Ok(file)
 }
 
-pub(super) async fn lock_at(directory: &Path, origin: &str, wait: Duration) -> Result<File> {
+pub(super) async fn lock_at(directory: &Path, origin: &str, wait: Duration) -> Result<LockGuard> {
     let file = open(directory, origin)?;
     let deadline = Instant::now() + wait;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(LockGuard { file }),
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -124,11 +135,36 @@ pub(super) async fn lock_at(directory: &Path, origin: &str, wait: Duration) -> R
     }
 }
 
-pub(super) async fn lock(origin: &str) -> Result<File> {
+pub(super) async fn lock(origin: &str) -> Result<LockGuard> {
     // Stable per-account location, independent of working folder and OMNIGRAPH_HOME.
     lock_at(
         &home()?.join(".omnigraph-session-locks"),
-        origin,
+        &crate::operator_routing::namespace(origin),
+        Duration::from_secs(40),
+    )
+    .await
+}
+
+pub(super) fn cache_index_lock() -> Result<LockGuard> {
+    cache_index_lock_at(&home()?.join(".omnigraph-session-locks"))
+}
+
+fn cache_index_lock_at(directory: &Path) -> Result<LockGuard> {
+    let file = open(
+        directory,
+        &format!(
+            "{}:data-cache-index",
+            crate::operator_routing::data_profile_namespace().ok_or_else(failed)?
+        ),
+    )?;
+    file.try_lock().map_err(|_| failed())?;
+    Ok(LockGuard { file })
+}
+
+pub(super) async fn global_session_lock() -> Result<LockGuard> {
+    lock_at(
+        &home()?.join(".omnigraph-session-locks"),
+        "provider-session-claims",
         Duration::from_secs(40),
     )
     .await
@@ -137,6 +173,76 @@ pub(super) async fn lock(origin: &str) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cache_index_lock_is_profile_wide_across_clusters_and_generations() {
+        let root = tempfile::tempdir().unwrap();
+        let input = crate::operator::InvocationConfig::at(Some(root.path().to_owned()), None);
+        let first = crate::operator_routing::registration_auth(
+            &input,
+            "work",
+            "first",
+            "https://api.example",
+        )
+        .unwrap();
+        let other = crate::operator_routing::registration_auth(
+            &input,
+            "work",
+            "other",
+            "https://api.example",
+        )
+        .unwrap();
+        let directory = root.path().join("locks");
+        let held = crate::operator_routing::AUTH
+            .scope(Some(first.clone()), async {
+                cache_index_lock_at(&directory).unwrap()
+            })
+            .await;
+        #[cfg(unix)]
+        let inherited = held.file.try_clone().unwrap();
+        first.invalidate().unwrap();
+        let renewed = crate::operator_routing::registration_auth(
+            &input,
+            "work",
+            "first",
+            "https://replacement.example",
+        )
+        .unwrap();
+        crate::operator_routing::AUTH
+            .scope(Some(renewed), async {
+                assert!(cache_index_lock_at(&directory).is_err());
+            })
+            .await;
+        crate::operator_routing::AUTH
+            .scope(Some(other), async {
+                assert!(cache_index_lock_at(&directory).is_ok());
+            })
+            .await;
+        drop(held);
+        crate::operator_routing::AUTH
+            .scope(Some(first), async {
+                assert!(cache_index_lock_at(&directory).is_ok());
+            })
+            .await;
+        #[cfg(unix)]
+        drop(inherited);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guard_drop_unlocks_while_a_duplicate_description_remains_open() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("locks");
+        let held = lock_at(&directory, "origin", Duration::ZERO).await.unwrap();
+        let inherited = held.file.try_clone().unwrap();
+        assert!(lock_at(&directory, "origin", Duration::ZERO).await.is_err());
+        drop(held);
+        let successor = lock_at(&directory, "origin", Duration::ZERO).await.unwrap();
+        drop(inherited);
+        assert!(lock_at(&directory, "origin", Duration::ZERO).await.is_err());
+        drop(successor);
+        assert!(lock_at(&directory, "origin", Duration::ZERO).await.is_ok());
+    }
 
     #[tokio::test]
     async fn same_origin_wait_is_bounded_and_other_origins_are_independent() {

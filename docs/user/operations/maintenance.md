@@ -13,12 +13,13 @@ or select a graph from a cluster root:
 
 ```bash
 omnigraph optimize --target ./graph.omni
-omnigraph optimize --target s3://company/omnigraph --graph knowledge
+omnigraph optimize --target ./cluster-root --graph knowledge
 ```
 
-Follow the command-specific concurrency requirements below. Azure writers
-must also run through `omnigraph-azure-admission`; Azure support remains a
-qualification preview pending the adversarial live-Azure matrix.
+Follow the command-specific concurrency requirements below. Operator version 1
+accepts local-file direct targets only; cloud-direct maintenance is not exposed
+by this CLI. Engine/server cloud support does not change that client boundary.
+See [operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
 ## Optimize
 
@@ -100,7 +101,7 @@ failing the run. Run optimize again after loading or generating vectors.
 
 ```bash
 omnigraph rebuild-full-text-indexes --target ./graph.omni --branch main
-omnigraph rebuild-full-text-indexes --target s3://company/omnigraph \
+omnigraph rebuild-full-text-indexes --target ./cluster-root \
   --graph knowledge --branch review --json
 ```
 
@@ -237,10 +238,6 @@ its name is gone: immediately with `--keep` alone, and with `--older-than`
 only after every object of the fork is older than the cutoff. Native tags,
 readable graph snapshots and required native ancestors also protect forks. Choose a policy that matches
 your rollback and audit needs.
-
-For `s3://` and `az://` targets, destructive execution also requires an
-interactive confirmation or `--yes`. Non-interactive and JSON runs refuse
-without `--yes`.
 
 Before cleanup:
 

@@ -55,9 +55,9 @@ or the HTTP API; the server hosts multiple graphs from one applied cluster
 revision.
 
 The CLI's [scope resolver](../../crates/omnigraph-cli/src/scope.rs) selects one
-complete target from explicit `--target` or `defaults.target`. `InvocationConfig`
-captures the operator file once; retired profile or folder routing refuses default
-selection. Applicability is checked before credentials and backend access.
+connection for account operations or target for resource operations. Explicit
+selectors override their respective declarative defaults. `InvocationConfig`
+captures one complete operator file; repository/folder state never selects it. Applicability is checked before credentials and backend access.
 The resolved destination is retained through storage and HTTP execution.
 
 ## Authority model
@@ -125,26 +125,35 @@ writers; the process-facing application wrapper supplies the actual standard
 streams. [`InvocationConfig`](../../crates/omnigraph-cli/src/operator.rs) captures
 the operator home once, then reads the strict versioned configuration lazily
 at its first consumer. Every consumer shares that result, including a failed
-load. [`scope`](../../crates/omnigraph-cli/src/scope.rs) captures one target from
-an explicit name/address or `defaults.target`; command source files never route
-an operation. [`planes`](../../crates/omnigraph-cli/src/planes.rs) rejects
-unsupported backend/operation combinations before credential acquisition.
-Graph selection is explicit or the target's `default_graph`; no discovery result
-selects a graph. Local tooling ignores defaults and rejects irrelevant targets.
-The application reports the resolved destination and selection provenance before
-backend execution, using stderr and no suppressible flag.
+load. [`operator_schema`](../../crates/omnigraph-cli/src/operator_schema.rs) owns
+strict `version: 1` grammar and whole-document validation; its published JSON
+Schema is a related contract, not a substitute for cross-reference validation.
+[`scope`](../../crates/omnigraph-cli/src/scope.rs) selects connection or resource
+by command class. [`operator_routing`](../../crates/omnigraph-cli/src/operator_routing.rs)
+resolves owner-local auth and transport into the invocation; source files never
+route execution. [`planes`](../../crates/omnigraph-cli/src/planes.rs) rejects
+unsupported command/backend combinations. Graph selection is explicit or target
+`default_graph`; discovery never selects one. Local tooling ignores defaults
+and rejects irrelevant routing flags. Diagnostics use stderr.
 
-Ordinary remote setup acquires an endpoint-bound token once and retains it
-through contract discovery and the command. Managed credential renewal remains
-with the managed authentication owner, using the target's declared mechanism.
-Direct targets capture provider destination settings and pass the same authority
-through cluster admission, control storage and Lance sessions. Bound handles
-never reconstruct an endpoint or account from ambient settings: a catalog
-snapshot keeps the control session it was read with, so its table, contract
-and branch-control reads reuse that session's registry. Existing
-non-CLI engine/server constructors retain their own explicit environment contract.
-The [target RFC](../rfcs/0059-config-cli-coherency.md) records the migration and
-credential/recovery custody requirements.
+[`credential_sources`](../../crates/omnigraph-cli/src/credential_sources.rs)
+owns bounded token sources and the exec protocol. Providers acquire credentials
+for frozen destinations; they cannot return routing authority. Managed acquisition
+exchanges control access for a verified cluster-bound data credential before
+constructing the common served `GraphClient`. There is no per-command managed
+allowlist or control credential at a graph endpoint. Real direct-only capability
+boundaries remain in dispatch. Operator direct targets support local files only;
+engine/server cloud-storage constructors retain their independent contracts.
+
+[`operator_transport`](../../crates/omnigraph-cli/src/operator_transport.rs)
+captures declared proxy/CA inputs once. Direct routing ignores ambient proxies;
+control and data settings are independent, and identity-provider traffic does
+not inherit either. Version 1 rejects custom destination CA combined with an
+HTTPS proxy; HTTP CONNECT proxies support custom destination CAs. Workload federation, cloud-direct
+schemas, BYOC private-route attestation and additional transports are not implied
+by the config rewrite. See the
+[operator RFC](../rfcs/2026-10-20-operator-connections-and-credential-providers.md)
+for rationale and [user reference](../user/cli/targets.md) for the supported contract.
 
 `commands/query` owns `query`, `mutate` and alias execution. Its
 [pure preparation](../../crates/omnigraph-cli/src/commands/query/prepare.rs)
@@ -199,20 +208,19 @@ finish, then returns the failure with its original ID, root and retained lock.
 Neither path replays work to recover output. Deployment and recovery authority
 remain in the cluster crate.
 
-`commands/local` owns server login/logout, version and
-bundled skill/embedding dispatch. Login reads only one line from the supplied
-reader when no explicit token is present; credential changes use the invocation's
-captured operator home. Skill export and embedding generation finish their file
-work before delivering the report. Output failure does not undo or repeat that
-work. `skill show` retains its existing narrow suppression of `BrokenPipe` while
-writing or flushing the selected file. Managed account, organization and
-lifecycle handlers keep their existing owners and use the same supplied output
-boundary, including identity diagnostics before dispatch.
-
-CLI unit tests own invocation preparation and presentation; CLI process tests
-own argument, environment, configuration, transport, output and exit behavior.
-GQT owns query semantics across its execution adapters. Keep those boundaries
-separate when extending the existing owners in [testing](testing.md#server-and-cli-ownership).
+`commands/local` owns version and bundled skill/embedding dispatch.
+`commands/targets` owns offline configuration validation, target editing and
+credential commands, including journaled owner/profile renames that preserve
+binding IDs and explicit rename recovery. `managed` owns platform onboarding,
+verified principal replacement, session lifecycle and
+authenticated resource registration. Static installation is `credentials set
+--stdin`, never login. Status must remain network/helper-free and noninteractive;
+export checks pipe-only output before acquiring any secret. Configuration,
+secret custody, derived data cache and unresolved operation journals have separate
+lifecycles. Skill export and embedding generation finish file work before reports;
+output failure does not undo or repeat it. `skill show` retains its narrow
+`BrokenPipe` exception. Managed handlers use the supplied output boundary,
+including identity diagnostics before dispatch.
 
 ## Principal flows
 

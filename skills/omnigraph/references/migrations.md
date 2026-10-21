@@ -220,12 +220,22 @@ v0.10 also removes ambiguous client vocabulary such as `table_key`, `row_id`,
 entity, property, graph-manifest, and published-dataset terms plus
 `export --type`. See the [v0.10.0 upgrade procedure](https://github.com/ModernRelay/omnigraph/blob/v0.10.0/docs/user/operations/upgrade.md).
 
+## Operator configuration rewrite
+
+`version: 1` replaces the old target format without backward compatibility.
+Replace account targets with connections, select owner-local auth profiles, and
+install static credentials with `credentials set --stdin`. There is no config
+importer. `config recover-operations --source DIR --connection NAME --auth PROFILE`
+preserves matching legacy folder lifecycle evidence separately; retain old operator
+homes and reconcile unresolved operations under the original identity and key. See the primary
+[operator reference](../../../docs/user/cli/targets.md#upgrade-from-the-old-format).
+
 ## Pre-0.7 configuration
 
 | Before | Current |
 |---|---|
 | `omnigraph.yaml` | `cluster.yaml` for team deployment plus `~/.omnigraph/config.yaml` for operator settings |
-| `cli.actor` | `operator.actor` |
+| `cli.actor` / `operator.actor` | Explicit `--as ACTOR` for direct writes |
 | `cli.graph` / `server.graph` | a target’s `default_graph` plus `defaults.target` |
 | `targets:` / `target:` | `graphs:` / `graph:` |
 
@@ -237,7 +247,7 @@ targets, output defaults and aliases into the versioned operator file.
 
 | Before | Current |
 |---|---|
-| `--server`, `--store`, `--cluster`, `--profile` | One complete `--target NAME\|ADDRESS`; use `target import` for legacy operator configuration |
+| `--server`, `--store`, `--cluster`, `--profile` | `--target NAME\|LOCAL_PATH` for resources, `--connection NAME` for account operations; rebuild configuration without an importer |
 | positional backend URL or URI | `--target NAME\|ADDRESS` (only `init` retains its positional creation address) |
 | `--cluster-graph <id>` | `--target ROOT --graph ID` |
 | query `--name <q>` | positional query name plus `--query`/`-e` for ad-hoc source |

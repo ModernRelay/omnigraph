@@ -184,7 +184,11 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
                     } else {
                         "--target"
                     },
-                    &server.base_url,
+                    &if binary == old.as_path() {
+                        server.legacy_base_url()
+                    } else {
+                        support::KEYED_SERVER_NAME.to_owned()
+                    },
                     "--graph",
                     "knowledge",
                     "--json",
@@ -207,7 +211,11 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
                     } else {
                         "--target"
                     },
-                    &server.base_url,
+                    &if binary == old.as_path() {
+                        server.legacy_base_url()
+                    } else {
+                        support::KEYED_SERVER_NAME.to_owned()
+                    },
                     "--config",
                 ])
                 .arg(root)
@@ -215,6 +223,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         ))
     };
     let http = reqwest::blocking::Client::builder()
+        .add_root_certificate(support::tls_gateway::certificate())
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
@@ -1675,12 +1684,23 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
 
     let query_command = |target: &[&str], branch: &str, name: &str, params: &str| {
         let mut command = cli();
-        command
-            .args([
-                "query", name, "--query", query_path, "--branch", branch, "--params", params,
-                "--json",
-            ])
-            .args(target);
+        command.args([
+            "query", name, "--query", query_path, "--branch", branch, "--params", params, "--json",
+        ]);
+        if target
+            .get(1)
+            .is_some_and(|value| value.starts_with("https://"))
+        {
+            command
+                .env(
+                    "OMNIGRAPH_HOME",
+                    support::tls_gateway::anonymous_home(target[1]),
+                )
+                .args(["--target", support::KEYED_SERVER_NAME])
+                .args(&target[2..]);
+        } else {
+            command.args(target);
+        }
         command
     };
     let direct = ["--target", rebuilt_uri];

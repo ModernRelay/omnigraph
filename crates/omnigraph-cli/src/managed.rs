@@ -19,12 +19,6 @@ mod lifecycle;
 mod members;
 mod organization;
 
-pub(crate) fn legacy_custody_binding(
-    source: &Path,
-) -> color_eyre::Result<Option<(String, String)>> {
-    lifecycle::pending::legacy_binding(source)
-}
-
 pub(crate) fn import_custody(
     source: &Path,
     home: &Path,
@@ -336,6 +330,7 @@ struct Context {
     api: String,
     organization_id: String,
     endpoint: Option<String>,
+    #[cfg(test)]
     default_graph: Option<String>,
     control_auth: ControlAuth,
 }
@@ -375,6 +370,7 @@ impl Binding {
             api: self.api.clone(),
             organization_id,
             endpoint: cluster.endpoint.clone(),
+            #[cfg(test)]
             default_graph: cluster.default_graph.clone(),
             control_auth: self.control_auth,
         })
@@ -388,6 +384,136 @@ impl Binding {
         )
         .await
     }
+}
+
+pub(crate) fn clear_profile_data() -> color_eyre::Result<()> {
+    auth::clear_data().map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
+}
+
+pub(crate) fn credential_status(binding: &Binding) -> Value {
+    auth::local_status(&binding.api, binding.organization_id.as_deref())
+}
+
+pub(crate) async fn credential_lock() -> color_eyre::Result<auth::LockGuard> {
+    auth::cache_lock("static-credential-edit")
+        .await
+        .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
+}
+
+pub(crate) async fn register_login(
+    api: String,
+    organization: Option<&str>,
+    stderr: &mut dyn Write,
+) -> color_eyre::Result<Value> {
+    auth::login(api, organization, stderr)
+        .await
+        .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
+}
+
+pub(crate) async fn discard_registration(
+    api: String,
+    organization: &str,
+) -> color_eyre::Result<()> {
+    auth::logout(api, Some(organization))
+        .await
+        .map(|_| ())
+        .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
+}
+
+pub(crate) async fn export_credential(binding: &Binding) -> color_eyre::Result<String> {
+    if binding.cluster.is_some() {
+        let client = data::resource(binding, None).await?;
+        if let crate::client::GraphClient::Remote {
+            token: Some(token), ..
+        } = client
+        {
+            return Ok(token);
+        }
+        color_eyre::eyre::bail!("managed exchange returned no credential");
+    }
+    let selected = auth::select(
+        &binding.api,
+        binding.organization_id.as_deref(),
+        binding.control_auth,
+    )
+    .await
+    .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))?;
+    selected
+        .credential(&binding.api)
+        .await
+        .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
+}
+
+fn attested_endpoint(row: &Value) -> Result<Option<String>> {
+    match row.get("data_endpoint") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(endpoint)) => {
+            let canonical = canonical_origin(endpoint)?;
+            if !canonical.starts_with("https://") {
+                return Err(Failure::protocol());
+            }
+            Ok(Some(format!("{canonical}/")))
+        }
+        Some(_) => Err(Failure::protocol()),
+    }
+}
+
+pub(crate) async fn register_target(
+    binding: &Binding,
+    connection: &str,
+    cluster: &str,
+) -> color_eyre::Result<crate::operator_schema::Target> {
+    let result = async {
+        identifier(cluster)?;
+        let api = binding.client().await?;
+        let body = api.request(Method::GET, "/v1/clusters", None, None).await?;
+        target_from_listing(binding, connection, cluster, &body)
+    }
+    .await;
+    result.map_err(|failure: Failure| color_eyre::eyre::eyre!("{}", failure.body))
+}
+
+fn target_from_listing(
+    binding: &Binding,
+    connection: &str,
+    cluster: &str,
+    body: &Value,
+) -> Result<crate::operator_schema::Target> {
+    identifier(cluster)?;
+    let rows = body["data"]["clusters"]
+        .as_array()
+        .ok_or_else(Failure::protocol)?;
+    let mut matches = rows
+        .iter()
+        .filter(|row| row["cluster_id"].as_str() == Some(cluster));
+    let row = matches.next().ok_or_else(|| {
+        Failure::refused(
+            "cluster_not_found",
+            "cluster not found in selected organization",
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(Failure::protocol());
+    }
+    let incarnation = row["incarnation"].as_str().ok_or_else(Failure::protocol)?;
+    identifier(incarnation)?;
+    if let Some(existing) = &binding.cluster {
+        if existing.cluster_id != cluster || existing.cluster_incarnation != incarnation {
+            return Err(Failure::refused(
+                "target_mismatch",
+                "registration refresh cannot change the cluster incarnation",
+            ));
+        }
+    }
+    let endpoint = attested_endpoint(row)?;
+    Ok(crate::operator_schema::Target::Managed {
+        connection: connection.into(),
+        cluster_id: cluster.into(),
+        cluster_incarnation: incarnation.into(),
+        endpoint,
+        transport: None,
+        default_graph: None,
+    })
 }
 
 impl Context {
@@ -429,7 +555,6 @@ fn canonical_origin(input: &str) -> Result<String> {
     let url = Url::parse(input).map_err(|_| invalid())?;
     if !url.username().is_empty()
         || url.password().is_some()
-        || url.path() != "/"
         || url.query().is_some()
         || url.fragment().is_some()
         || url.host().is_none()
@@ -439,7 +564,7 @@ fn canonical_origin(input: &str) -> Result<String> {
     {
         return Err(invalid());
     }
-    Ok(url.origin().ascii_serialization())
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
 fn identifier(value: &str) -> Result<()> {
@@ -492,8 +617,43 @@ struct ResponseLimits {
 }
 
 impl Api {
+    fn url(&self, path: &str) -> Result<Url> {
+        let raw_path = path.split('?').next().unwrap_or_default();
+        let lower = raw_path.to_ascii_lowercase();
+        if !path.starts_with("/v1/")
+            || raw_path.contains('\\')
+            || raw_path
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."))
+            || ["%2e", "%2f", "%5c", "%25"]
+                .iter()
+                .any(|encoding| lower.contains(encoding))
+        {
+            return Err(Failure::refused(
+                "request_scope_invalid",
+                "control request must remain inside the selected API route",
+            ));
+        }
+        let base = Url::parse(&format!("{}/", self.origin.trim_end_matches('/')))
+            .map_err(|_| Failure::protocol())?;
+        let url = base.join(&path[1..]).map_err(|_| Failure::protocol())?;
+        let root = crate::graph_http::RequestTarget::of(base.as_str(), base.as_str())
+            .map_err(|_| Failure::protocol())?;
+        let request = crate::graph_http::RequestTarget::of(base.as_str(), url.as_str())
+            .map_err(|_| Failure::protocol())?;
+        if !request.is_under(&root) {
+            return Err(Failure::protocol());
+        }
+        Ok(url)
+    }
     fn new(origin: String, token: Option<String>) -> Result<Self> {
-        let client = Client::builder()
+        let client = crate::operator_routing::http_builder(&origin)
+            .map_err(|_| {
+                Failure::refused(
+                    "transport_invalid",
+                    "selected control transport could not be captured",
+                )
+            })?
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(REQUEST_TIMEOUT)
@@ -593,15 +753,13 @@ impl Api {
             max_body,
             preserve_contents,
         } = limits;
+        let url = self.url(path)?;
         let token = if let Some(selection) = &self.selection {
             Some(Box::pin(selection.credential(&self.origin)).await?)
         } else {
             self.token.clone()
         };
-        let mut request = self
-            .client
-            .request(method, format!("{}{path}", self.origin))
-            .timeout(timeout);
+        let mut request = self.client.request(method, url).timeout(timeout);
         if let Some(token) = &token {
             let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|_| {
@@ -820,7 +978,11 @@ pub(crate) async fn dispatch(
             }
             Some(organization::dispatch(binding, args, command, stderr).await)
         }
-        Command::Login { json, .. } => {
+        Command::Login {
+            json,
+            replace_principal,
+            ..
+        } => {
             let result = async {
                 reject_scope(cli)?;
                 if binding.control_auth != ControlAuth::HumanDevice {
@@ -832,9 +994,10 @@ pub(crate) async fn dispatch(
                 if binding.cluster.is_some() {
                     binding.organization()?;
                 }
-                auth::login(
+                auth::login_replacing(
                     binding.api.clone(),
                     binding.organization_id.as_deref(),
+                    replace_principal.as_deref(),
                     stderr,
                 )
                 .await
@@ -851,6 +1014,18 @@ pub(crate) async fn dispatch(
                         "authentication_mode_conflict",
                         "automation targets cannot alter human login sessions",
                     ));
+                }
+                if let Some(profile) = crate::operator_routing::AUTH
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten()
+                {
+                    profile.invalidate().map_err(|_| {
+                        Failure::refused(
+                            "credential_custody_failed",
+                            "could not invalidate the selected profile cache generation",
+                        )
+                    })?;
                 }
                 auth::logout(binding.api.clone(), Some(organization)).await
             }

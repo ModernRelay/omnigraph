@@ -214,19 +214,17 @@ and storage credentials in the platform's secret store.
 
 ## Unix-socket access
 
-`omnigraph-server` listens on TCP only. Some local clients can open a Unix-domain
-socket but no TCP connection, such as an agent whose sandbox allows one socket
-path. To serve them, run a gateway that relays the socket to the server's
-loopback address unchanged, for example:
+`omnigraph-server` listens on TCP only. For clients with Unix socket support,
+a gateway can relay a socket to its loopback listener:
 
 ```bash
 socat UNIX-LISTEN:/run/omnigraph/server.sock,fork TCP:127.0.0.1:8080
 ```
 
-Clients address it with `--target unix:///run/omnigraph/server.sock`. The
-gateway must pass requests and responses through unchanged, including the
-`Omnigraph-Http-Api` header. Restrict who may connect with the permissions of
-the socket's directory; bearer authentication and policy apply as over TCP.
+The version-1 CLI does not accept Unix socket targets; use a registered HTTPS
+endpoint instead. Relay requests and responses unchanged, including
+`Omnigraph-Http-Api`. Restrict socket-directory permissions; bearer authentication
+and policy still apply.
 
 ## S3-compatible storage
 

@@ -164,6 +164,9 @@ pub(crate) enum ClusterCommand {
         run: ClusterRunArgs,
     },
     /// For a managed target, cache an identity credential for this cluster, or forget it locally.
+    #[command(
+        about = "Persist or clear a managed cluster data credential in the OS secure store; ordinary resource commands use invocation-only credentials for env/file/exec auth"
+    )]
     Token {
         /// Emit JSON instead of human text.
         #[arg(long)]

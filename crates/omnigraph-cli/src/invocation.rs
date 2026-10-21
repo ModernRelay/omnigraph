@@ -159,7 +159,14 @@ mod tests {
 
     #[test]
     fn global_selectors_are_singletons_across_command_levels() {
-        for flag in ["--target", "--graph", "--as"] {
+        for flag in [
+            "--target",
+            "--connection",
+            "--auth",
+            "--operator-config",
+            "--graph",
+            "--as",
+        ] {
             for args in [
                 vec![
                     flag.into(),

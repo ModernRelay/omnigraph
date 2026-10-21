@@ -16,7 +16,7 @@ query operators() {
 ```
 
 The declarations, one per type, are in [`catalogue.gq`](catalogue.gq);
-`omnigraph schema show --target og_catalog` prints them. Ordinary `schema show`
+ordinary `schema show`
 prints only the graph's reusable schema source; `--json` includes the
 built-in declarations in the separate `catalogue_source` field.
 
@@ -24,14 +24,15 @@ built-in declarations in the separate `catalogue_source` field.
 
 | Scope | Command |
 |---|---|
-| no store at all | `omnigraph query --target og_catalog -e '<gq>'` |
 | beside a graph's own types | `omnigraph query --target <uri> -e '<gq>'` |
 | served | `omnigraph query --target <name> --graph og_catalog -e '<gq>'` |
 
 `og_catalog` is a reserved scope the binary serves without opening a store:
 no branch, no snapshot, no graph commit in the answer, and `--branch` or
-`--snapshot` is refused. Only the exact token selects it; `./og_catalog`, an
-absolute path and a `file://` URI stay ordinary store addresses. The prefix
+`--snapshot` is refused. Operator version 1 does not provide a standalone catalogue target. Use a
+registered served target with `--graph og_catalog`, or query catalogue types
+beside an ordinary local graph. Local `./og_catalog` and `file://` paths remain
+ordinary store addresses. The prefix
 `og_` is reserved for system graph ids: a deployment cannot create a graph
 named `og_…`.
 

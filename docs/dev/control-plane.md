@@ -24,16 +24,26 @@ existing configuration-owned root selection.
 
 ## Managed CLI sessions
 
-A managed target supplies API, organization, authentication mechanism and optional
-cluster identity. Folder context cannot select a destination. The CLI validates
-operation applicability before credentials, HTTP or storage access. Legacy
-lifecycle evidence has a separate preservation guard: an explicit target cannot
-bypass pending/accepted custody migration.
+A connection owns API, organization and named authentication profiles. A managed
+target references it and pins cluster identity/incarnation plus an optional data
+endpoint. Whole-document structural validation precedes selected credential and
+runtime capability checks. Registration consumes authenticated endpoint attestation;
+refresh verifies unchanged incarnation and never synthesizes a route. This does
+not qualify BYOC private routing. See the [operator reference](../user/cli/targets.md)
+and [decision](../rfcs/2026-10-20-operator-connections-and-credential-providers.md).
+
+Pending/accepted lifecycle evidence remains separate from configuration and
+credential custody. Preserve it across removal, logout and upgrade. Retiring the
+old grammar does not authorize discarding unresolved work or replaying it under
+a new identity. `config recover-operations --source DIR --connection NAME`
+preserves matching legacy folder evidence without accepting old configuration
+or submitting remote operations; `managed/lifecycle/pending` owns that copy/retire
+protocol.
 
 The CLI's managed HTTP adapter obtains current access before each new request,
 including status polls. A rotating credential pair lives only in the OS
 keychain, independently of configuration directories and graph credentials.
-Local origin-scoped locking and a persisted pending marker prevent duplicate
+Profile-scoped coordination and a persisted pending marker prevent duplicate
 client exchanges; the provider owns credential rotation and session authority.
 The API verifies provider access and maps it to a stable principal. An uncertain
 exchange never authorizes a write replay.
@@ -400,8 +410,8 @@ authorization still applies to ready graphs.
 The CLI's versioned keychain cache verifies endpoint and identity bindings before
 replacement. Unsupported caches refuse without automatic replacement. The provider-native client acquires missing/expired identity
 credentials before an operation using the selected managed target.
-A server target keeps the
-existing catalog unless `graphs list --discovery` is requested; the CLI never
+Both managed and standalone targets request the
+ordinary graph catalog unless `graphs list --discovery` is requested; the CLI never
 infers routing from an arbitrary bearer token's unverified shape.
 
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the

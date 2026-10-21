@@ -101,19 +101,14 @@ pub(crate) async fn run_policy(
 pub(crate) async fn run_graphs(
     command: GraphsCommand,
     scope: ControlScope<'_>,
-    managed_data: Option<GraphClient>,
+
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     match command {
         GraphsCommand::List { json, discovery } => {
-            let (client, discovery) = match managed_data {
-                Some(client) => (client, true),
-                None => (
-                    GraphClient::registry_from_target(scope.operator, scope.target, stderr).await?,
-                    discovery,
-                ),
-            };
+            let client =
+                GraphClient::registry_from_target(scope.operator, scope.target, stderr).await?;
             if discovery {
                 let payload = client.discover_graphs().await?;
                 output::write_graphs_discovery(&payload, json, stdout)?;

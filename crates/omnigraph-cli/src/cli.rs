@@ -1,5 +1,5 @@
 //! The clap surface: every command, subcommand, and argument struct
-//! Destination selection is exclusively `--target` or `defaults.target`.
+//! Connections select control operations; targets select resources.
 
 pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
@@ -28,17 +28,23 @@ use crate::embed::EmbedArgs;
 #[command(about = "Omnigraph graph database CLI")]
 #[command(version = crate::commands::local::output::PACKAGE_VERSION.as_str(), disable_version_flag = true)]
 #[command(
-    after_help = "Select a destination with --target NAME|ADDRESS, or configure defaults.target.
-Target kind determines command availability. --config supplies source files only.
-Use target list/show/add/remove/import to manage operator configuration."
+    after_help = "Select resources with --target and account operations with --connection.
+Select an owner-local profile with --auth. --operator-config selects one operator file.
+--config supplies deployment sources. Use config validate and target inspect for offline checks."
 )]
 pub(crate) struct Cli {
-    /// Named target or inline storage/server address; otherwise defaults.target.
+    #[arg(long, global = true, help = "Named connection for control-plane operations; otherwise defaults.connection", conflicts_with = "target", value_parser = crate::invocation::single_selector("--connection"))]
+    pub(crate) connection: Option<String>,
+    #[arg(long, global = true, help = "Authentication profile on the selected owner; otherwise its default_auth", value_parser = crate::invocation::single_selector("--auth"))]
+    pub(crate) auth: Option<String>,
+    #[arg(long, global = true, help = "Use this operator configuration file instead of the default, without merging", value_parser = crate::invocation::single_selector("--operator-config"))]
+    pub(crate) operator_config: Option<String>,
+    /// Named resource target or inline local storage address; otherwise defaults.target.
     #[arg(long, global = true, value_name = "NAME|ADDRESS", value_parser = crate::invocation::single_selector("--target"))]
     pub(crate) target: Option<String>,
 
     /// Actor id for direct-engine writes and actor-bound cluster operations;
-    /// overrides `operator.actor`. On a served write it is an assertion: the
+    /// On a served write it is an assertion: the
     /// request carries `omnigraph-if-actor`, and the server refuses it
     /// before anything runs when the bearer token resolves to another actor.
     /// With a policy configured but no actor set, a direct operation is
@@ -169,15 +175,20 @@ pub(crate) enum Command {
     },
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
-    /// Authenticate the selected server or managed human-device target.
+    /// Sign in to a managed connection or register a new connection.
     Login {
-        /// Server token. Prefer piping it on stdin to avoid shell history.
-        #[arg(long)]
-        token: Option<String>,
+        #[arg(long, conflicts_with_all = ["register", "api", "organization"], requires = "auth")]
+        replace_principal: Option<String>,
+        #[arg(long, conflicts_with_all = ["connection", "target"])]
+        register: Option<String>,
+        #[arg(long, conflicts_with_all = ["connection", "target"])]
+        api: Option<String>,
+        #[arg(long, conflicts_with_all = ["connection", "target"])]
+        organization: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Remove the selected server credential or revoke its managed session.
+    /// Remove the selected managed session and attempt remote revocation.
     Logout {
         #[arg(long)]
         json: bool,
@@ -187,10 +198,18 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: TargetCommand,
     },
-    /// Read a selected server credential for another local client.
+    /// Manage an explicitly selected owner/profile credential or export access through a pipe.
+    #[command(name = "credentials")]
     Credential {
         #[command(subcommand)]
         command: CredentialCommand,
+    },
+    #[command(
+        about = "Validate operator configuration, rename bindings, or recover interrupted edits"
+    )]
+    Config {
+        #[command(subcommand)]
+        command: crate::commands::targets::ConfigCommand,
     },
     /// Export or print the agent skill built into this binary, which matches
     /// this CLI's commands and HTTP contract.

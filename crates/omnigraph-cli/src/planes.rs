@@ -12,7 +12,7 @@ pub(crate) enum Requirement {
     Graph {
         direct_only: bool,
         root: bool,
-        managed: bool,
+
         catalogue: bool,
     },
     Standalone,
@@ -32,13 +32,13 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         Command::Query(_) => Graph {
             direct_only: false,
             root: true,
-            managed: true,
+
             catalogue: true,
         },
         Command::Mutate(_) | Command::Load(_) => Graph {
             direct_only: false,
             root: true,
-            managed: true,
+
             catalogue: false,
         },
         Command::Commit {
@@ -46,7 +46,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         } => Graph {
             direct_only: false,
             root: true,
-            managed: true,
+
             catalogue: false,
         },
         Command::Schema {
@@ -54,7 +54,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         } => Graph {
             direct_only: false,
             root: true,
-            managed: false,
+
             catalogue: true,
         },
         Command::Branch { .. }
@@ -71,7 +71,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         } => Graph {
             direct_only: false,
             root: true,
-            managed: false,
+
             catalogue: false,
         },
         Command::Init(_)
@@ -88,7 +88,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         | Command::Cleanup(_) => Graph {
             direct_only: true,
             root: true,
-            managed: false,
+
             catalogue: false,
         },
         Command::Lint(args) => {
@@ -98,7 +98,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
                 Graph {
                     direct_only: true,
                     root: true,
-                    managed: false,
+
                     catalogue: false,
                 }
             }
@@ -128,7 +128,19 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         Command::Alias(_) => Alias,
         Command::Login { .. } | Command::Logout { .. } => Authentication,
         Command::Credential { .. } => Credential,
+        Command::Target {
+            command: TargetCommand::Add {
+                cluster: Some(_), ..
+            },
+        } => ManagedAccount,
+        Command::Target {
+            command: TargetCommand::Refresh { .. },
+        } => ManagedCluster,
+        Command::Config {
+            command: crate::commands::targets::ConfigCommand::RecoverOperations { .. },
+        } => ManagedAccount,
         Command::Target { .. }
+        | Command::Config { .. }
         | Command::Embed(_)
         | Command::Skill { .. }
         | Command::Version { .. } => Local,
@@ -145,6 +157,51 @@ pub(crate) fn root_input(command: &Command) -> bool {
 /// Flag applicability does not acquire configuration or a credential.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     let need = requirement(&cli.command);
+    if matches!(
+        cli.command,
+        Command::Target {
+            command: TargetCommand::Refresh { .. }
+        }
+    ) && cli.target.is_some()
+    {
+        bail!("target refresh already names its target; remove --target");
+    }
+    if let Command::Credential { command } = &cli.command {
+        if cli.auth.is_none() || (cli.target.is_some() == cli.connection.is_some()) {
+            bail!(
+                "credentials requires exactly one explicit --connection or --target and explicit --auth"
+            );
+        }
+        let _ = command;
+    }
+    if cli.connection.is_some()
+        && !matches!(
+            need,
+            Requirement::ManagedAccount
+                | Requirement::Authentication
+                | Requirement::Credential
+                | Requirement::ManagedOperation
+        )
+    {
+        bail!(
+            "{} does not accept --connection",
+            command_label(&cli.command)
+        );
+    }
+    if matches!(need, Requirement::ManagedAccount) && cli.target.is_some() {
+        bail!("this operation selects --connection, not --target");
+    }
+    if matches!(need, Requirement::Local)
+        && cli.auth.is_some()
+        && !matches!(
+            cli.command,
+            Command::Target {
+                command: TargetCommand::Inspect { resolved: true, .. }
+            }
+        )
+    {
+        bail!("{} does not accept --auth", command_label(&cli.command));
+    }
     if matches!(need, Requirement::Local | Requirement::Alias) && cli.target.is_some() {
         bail!("{} does not accept --target", command_label(&cli.command));
     }
@@ -234,6 +291,7 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Login { .. }
         | Command::Logout { .. }
         | Command::Target { .. }
+        | Command::Config { .. }
         | Command::Credential { .. }
         | Command::Skill { .. }
         | Command::Version { .. } => false,
@@ -250,8 +308,8 @@ pub(crate) fn validate_target(
     use TargetBinding::*;
     let need = requirement(&cli.command);
     let allowed = match (&need, &target.binding) {
-        (Graph { .. } | Standalone, DirectGraph { .. }) => true,
-        (Graph { root: true, .. } | Root | Deployment, DirectRoot { .. }) => true,
+        (Graph { .. } | Standalone | Alias, DirectGraph { .. }) => true,
+        (Graph { root: true, .. } | Root | Deployment | Alias, DirectRoot { .. }) => true,
         (
             Graph {
                 catalogue: true, ..
@@ -270,11 +328,17 @@ pub(crate) fn validate_target(
             Server { .. },
         ) => true,
         (
-            Graph { managed: true, .. } | Registry | Deployment | ManagedCluster,
+            Graph {
+                direct_only: false, ..
+            }
+            | Registry
+            | Deployment
+            | ManagedCluster
+            | Alias,
             Managed(binding),
         ) => binding.cluster.is_some(),
         (ManagedAccount, Managed(binding)) => binding.cluster.is_none(),
-        (ManagedOperation | Authentication, Managed(_)) => true,
+        (ManagedOperation | Authentication | Credential, Managed(_)) => true,
         _ => false,
     };
     if !allowed {
@@ -314,12 +378,11 @@ pub(crate) fn validate_target(
             "--as is not available for a managed target; it derives identity from its credential"
         );
     }
-    if matches!(
-        (&cli.command, &target.binding),
-        (Command::Login { token: Some(_), .. }, Managed(_))
-    ) {
+    if matches!(cli.command, Command::Login { .. } | Command::Logout { .. })
+        && !matches!(target.binding, Managed(_))
+    {
         bail!(
-            "--token applies to server login only; a managed target uses its declared authentication mechanism"
+            "login/logout require a managed connection with provider: omnigraph; use credentials for static tokens"
         );
     }
     if let Command::Cluster { command } = &cli.command {
@@ -413,6 +476,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Login { .. } => "login",
         Command::Logout { .. } => "logout",
         Command::Target { .. } => "target",
+        Command::Config { .. } => "config",
         Command::Credential { .. } => "credential",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
@@ -488,16 +552,7 @@ mod tests {
                     !matches!(
                         argument.get_long(),
                         Some(
-                            "server"
-                                | "store"
-                                | "cluster"
-                                | "profile"
-                                | "managed"
-                                | "direct"
-                                | "quiet"
-                                | "api"
-                                | "organization"
-                                | "uri"
+                            "server" | "store" | "profile" | "managed" | "direct" | "quiet" | "uri"
                         )
                     ),
                     "retired flag in {}: {:?}",

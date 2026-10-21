@@ -3,8 +3,8 @@
 //! For every CLI verb with an `is_remote` fork, run the identical
 //! invocation against (a) the local graph directly and (b) a spawned
 //! server on a twin copy of the same graph. Actor-bearing operations use the
-//! SAME actor on both arms (local `operator.actor: act-parity`, which writes
-//! resolve and reads ignore; remote bearer token resolving to `act-parity`).
+//! SAME actor on both arms (explicit local `--as act-parity` where supported;
+//! remote bearer token resolving to `act-parity`).
 //! Scrub the declared-volatile allowlist
 //! (`support::scrub_volatile` — ids, wall-clock, transport locations);
 //! everything else must match exactly.
@@ -253,6 +253,7 @@ fn parity_query() {
 
 #[test]
 fn parity_schema_show() {
+    let ca = tls_gateway::ca_path().display();
     let p = parity();
     let (l, r) = p.run(&["schema", "show", "--json"]);
     assert_parity("schema show", &l, &r);
@@ -272,14 +273,13 @@ fn parity_schema_show() {
     std::fs::write(
         home.join("config.yaml"),
         format!(
-            "target_config_version: 1\ntargets:\n  local:\n    kind: server\n    endpoint: '{}'\n    credential: local\n    default_graph: og_catalog\n",
+            "version: 1\ntargets:\n  local:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_LOCAL\n    default_graph: og_catalog\n",
             p.server.base_url
         ),
     )
     .unwrap();
     for addressing in [
-        vec!["--target", "og_catalog"],
-        vec!["--target", &p.server.base_url, "--graph", "og_catalog"],
+        vec!["--target", "local", "--graph", "og_catalog"],
         vec!["--target", "local"],
     ] {
         let output = output_success(
@@ -454,11 +454,14 @@ fn parity_mutate() {
                     .env("OMNIGRAPH_HOME", &p.local_operator_home)
                     .arg("--target")
                     .arg(&p.local);
+                if parity_accepts_actor(args) {
+                    command.args(["--as", PARITY_ACTOR]);
+                }
             } else {
                 command
                     .envs(p.server.credential(PARITY_TOKEN))
                     .arg("--target")
-                    .arg(&p.server.base_url)
+                    .fixture_target(&p.server.base_url)
                     .arg("--graph")
                     .arg(PARITY_GRAPH_ID);
             }
@@ -1055,7 +1058,8 @@ fn assert_slow_export_and_baseline_complete(p: &Parity) {
         "fixture must exceed socket buffers"
     );
 
-    let address = p.server.base_url.strip_prefix("http://").unwrap();
+    let upstream = tls_gateway::http_upstream(&p.server.base_url);
+    let address = upstream.strip_prefix("http://").unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()

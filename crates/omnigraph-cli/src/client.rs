@@ -274,6 +274,9 @@ impl GraphClient {
         target: &ResolvedTarget,
         _stderr: &mut dyn Write,
     ) -> Result<Self> {
+        if let TargetBinding::Managed(binding) = &target.binding {
+            return crate::managed::data::resource(binding, None).await;
+        }
         let TargetBinding::Server { endpoint, auth, .. } = &target.binding else {
             bail!("graph discovery requires a server target");
         };
@@ -328,8 +331,10 @@ impl GraphClient {
                     catalogue: is_catalogue_scope(Some(graph)),
                 })
             }
-            TargetBinding::Managed(_) => {
-                bail!("managed graph operations require a qualified managed client")
+            TargetBinding::Managed(binding) => {
+                let graph =
+                    crate::scope::graph_selection(target, graph)?.expect("managed graph selection");
+                crate::managed::data::resource(binding, Some(graph)).await
             }
         }
     }
@@ -2780,87 +2785,102 @@ mod tests {
         };
 
         let target = IntentApiFixture::new(vec![]);
-        let cases: [(u16, Vec<(String, String)>); 9] = [
-            (200, vec![]),
-            (200, vec![(HEADER.into(), "0.11".into())]),
-            (200, vec![(HEADER.into(), "0.12".into())]),
-            (200, vec![(HEADER.into(), "0.13".into())]),
-            (
-                200,
-                vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],
-            ),
-            (
-                200,
-                vec![
-                    (HEADER.into(), CONTRACT.into()),
-                    (HEADER.into(), CONTRACT.into()),
-                ],
-            ),
-            (401, vec![(HEADER.into(), CONTRACT.into())]),
-            (503, vec![(HEADER.into(), CONTRACT.into())]),
-            (
-                302,
-                vec![
-                    (HEADER.into(), CONTRACT.into()),
-                    ("Location".into(), target.origin.clone()),
-                ],
-            ),
-        ];
-        for managed in [false, true] {
-            let server = IntentApiFixture::new(
-                cases
-                    .iter()
-                    .map(|(status, headers)| IntentReply {
-                        status: *status,
-                        headers: headers.clone(),
-                        body: b"secret untrusted body".to_vec(),
-                    })
-                    .collect(),
+        crate::operator_routing::test_transport_scope(&[&target.origin], async {
+            let cases: [(u16, Vec<(String, String)>); 9] = [
+                (200, vec![]),
+                (200, vec![(HEADER.into(), "0.11".into())]),
+                (200, vec![(HEADER.into(), "0.12".into())]),
+                (200, vec![(HEADER.into(), "0.13".into())]),
+                (
+                    200,
+                    vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],
+                ),
+                (
+                    200,
+                    vec![
+                        (HEADER.into(), CONTRACT.into()),
+                        (HEADER.into(), CONTRACT.into()),
+                    ],
+                ),
+                (401, vec![(HEADER.into(), CONTRACT.into())]),
+                (503, vec![(HEADER.into(), CONTRACT.into())]),
+                (
+                    302,
+                    vec![
+                        (HEADER.into(), CONTRACT.into()),
+                        ("Location".into(), target.origin.clone()),
+                    ],
+                ),
+            ];
+            for managed in [false, true] {
+                let server = IntentApiFixture::new(
+                    cases
+                        .iter()
+                        .map(|(status, headers)| IntentReply {
+                            status: *status,
+                            headers: headers.clone(),
+                            body: b"secret untrusted body".to_vec(),
+                        })
+                        .collect(),
+                );
+                crate::operator_routing::test_transport_scope(&[&server.origin], async {
+                    let mut endpoint = url::Url::parse(&server.origin).unwrap();
+                    endpoint.set_username("secret-user").unwrap();
+                    endpoint.set_password(Some("secret-password")).unwrap();
+                    let http = crate::operator_routing::test_transport_scope(
+                        &[endpoint.as_str()],
+                        async {
+                            if managed {
+                                GraphHttpClient::managed(endpoint.as_str())
+                            } else {
+                                GraphHttpClient::new(endpoint.as_str())
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    for (i, (status, _)) in cases.iter().enumerate() {
+                        let error = remote_json::<Value>(
+                            &http,
+                            Method::POST,
+                            format!("{}/graphs/knowledge/mutate", server.origin),
+                            Some(json!({"query":"mutation m() {}"})),
+                            Some("secret-bearer"),
+                        )
+                        .await
+                        .unwrap_err();
+                        let contract = error.downcast_ref::<ApiContractError>().unwrap();
+                        assert!(!contract.request_dispatched);
+                        assert_eq!(contract.http_status, Some(*status));
+                        assert!(!format!("{error:?}").contains("secret"));
+                        let requests = server.requests();
+                        assert_eq!(requests.len(), i + 1);
+                        assert_eq!(requests[i].method, "HEAD");
+                        assert_eq!(requests[i].path, "/healthz");
+                        assert!(!requests[i].headers.contains_key("authorization"));
+                    }
+                    server.assert_complete();
+                })
+                .await;
+            }
+            assert!(
+                target.requests().is_empty(),
+                "discovery never follows redirects"
             );
-            let mut endpoint = url::Url::parse(&server.origin).unwrap();
-            endpoint.set_username("secret-user").unwrap();
-            endpoint.set_password(Some("secret-password")).unwrap();
-            let http = if managed {
-                GraphHttpClient::managed(endpoint.as_str())
-            } else {
-                GraphHttpClient::new(endpoint.as_str())
-            }
-            .unwrap();
-            for (i, (status, _)) in cases.iter().enumerate() {
-                let error = remote_json::<Value>(
-                    &http,
-                    Method::POST,
-                    format!("{}/graphs/knowledge/mutate", server.origin),
-                    Some(json!({"query":"mutation m() {}"})),
-                    Some("secret-bearer"),
-                )
-                .await
-                .unwrap_err();
-                let contract = error.downcast_ref::<ApiContractError>().unwrap();
-                assert!(!contract.request_dispatched);
-                assert_eq!(contract.http_status, Some(*status));
-                assert!(!format!("{error:?}").contains("secret"));
-                let requests = server.requests();
-                assert_eq!(requests.len(), i + 1);
-                assert_eq!(requests[i].method, "HEAD");
-                assert_eq!(requests[i].path, "/healthz");
-                assert!(!requests[i].headers.contains_key("authorization"));
-            }
-            server.assert_complete();
-        }
-        assert!(
-            target.requests().is_empty(),
-            "discovery never follows redirects"
-        );
-        let server = IntentApiFixture::new(vec![IntentReply::json(200, json!(null))]);
-        let input = InvocationConfig::at(None, None);
-        let target = server_target(&server.origin);
-        let probe = GraphClient::registry_from_target(&input, &target, &mut Vec::new())
-            .await
-            .unwrap();
-        let error = probe.list_graphs().await.unwrap_err();
-        assert!(error.downcast_ref::<ApiContractError>().is_some());
-        server.assert_complete();
+            let server = IntentApiFixture::new(vec![IntentReply::json(200, json!(null))]);
+            crate::operator_routing::test_transport_scope(&[&server.origin], async {
+                let input = InvocationConfig::at(None, None);
+                let target = server_target(&server.origin);
+                let probe = GraphClient::registry_from_target(&input, &target, &mut Vec::new())
+                    .await
+                    .unwrap();
+                let error = probe.list_graphs().await.unwrap_err();
+                assert!(error.downcast_ref::<ApiContractError>().is_some());
+                server.assert_complete();
+            })
+            .await;
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -2871,32 +2891,39 @@ mod tests {
             contract_reply(204, json!(null)),
             contract_reply(200, json!({"two": 2})),
         ]);
-        let endpoint = format!("{}/proxy/graphs/front/", server.origin);
-        let client = GraphClient::managed(&endpoint, "knowledge", "data-bearer".into()).unwrap();
-        for expected in [json!({"one":1}), json!({"two":2})] {
-            let value: Value = client
-                .invoke_named("read", false, None, None, None, None)
-                .await
-                .unwrap();
-            assert_eq!(value, expected);
-        }
-        let requests = server.requests();
-        assert_eq!(requests.len(), 4);
-        for pair in requests.chunks_exact(2) {
-            assert_eq!(pair[0].method, "HEAD");
-            assert_eq!(pair[0].path, "/proxy/graphs/front/healthz");
-            assert!(!pair[0].headers.contains_key("authorization"));
-            assert_eq!(
-                pair[1].path,
-                "/proxy/graphs/front/graphs/knowledge/queries/read"
-            );
-            assert_eq!(pair[1].headers["authorization"], "Bearer data-bearer");
-            assert_eq!(
-                pair[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
-                omnigraph_api_types::HTTP_API_CONTRACT
-            );
-        }
-        server.assert_complete();
+        crate::operator_routing::test_transport_scope(&[&server.origin], async {
+            let endpoint = format!("{}/proxy/graphs/front/", server.origin);
+            let client = crate::operator_routing::test_transport_scope(&[&endpoint], async {
+                GraphClient::managed(&endpoint, "knowledge", "data-bearer".into())
+            })
+            .await
+            .unwrap();
+            for expected in [json!({"one":1}), json!({"two":2})] {
+                let value: Value = client
+                    .invoke_named("read", false, None, None, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(value, expected);
+            }
+            let requests = server.requests();
+            assert_eq!(requests.len(), 4);
+            for pair in requests.chunks_exact(2) {
+                assert_eq!(pair[0].method, "HEAD");
+                assert_eq!(pair[0].path, "/proxy/graphs/front/healthz");
+                assert!(!pair[0].headers.contains_key("authorization"));
+                assert_eq!(
+                    pair[1].path,
+                    "/proxy/graphs/front/graphs/knowledge/queries/read"
+                );
+                assert_eq!(pair[1].headers["authorization"], "Bearer data-bearer");
+                assert_eq!(
+                    pair[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
+                    omnigraph_api_types::HTTP_API_CONTRACT
+                );
+            }
+            server.assert_complete();
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -2906,61 +2933,72 @@ mod tests {
             vec![contract_reply(200, json!(null))],
             std::time::Duration::from_millis(5_250),
         );
-        let http = GraphHttpClient::new(&server.origin).unwrap();
-        let started = std::time::Instant::now();
-        let error = remote_json::<Value>(
-            &http,
-            Method::GET,
-            format!("{}/graphs", server.origin),
-            None,
-            Some("secret"),
-        )
-        .await
-        .unwrap_err();
-        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        let contract = error.downcast_ref::<ApiContractError>().unwrap();
-        assert!(!contract.request_dispatched);
-        assert_eq!(contract.http_status, None);
-        assert!(contract.error.contains("timed out"), "{error:?}");
-        server.assert_complete();
+        crate::operator_routing::test_transport_scope(&[&server.origin], async {
+            let http = GraphHttpClient::new(&server.origin).unwrap();
+            let started = std::time::Instant::now();
+            let error = remote_json::<Value>(
+                &http,
+                Method::GET,
+                format!("{}/graphs", server.origin),
+                None,
+                Some("secret"),
+            )
+            .await
+            .unwrap_err();
+            assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            let contract = error.downcast_ref::<ApiContractError>().unwrap();
+            assert!(!contract.request_dispatched);
+            assert_eq!(contract.http_status, None);
+            assert!(contract.error.contains("timed out"), "{error:?}");
+            server.assert_complete();
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn graph_http_discovery_preserves_connection_failure_without_credentials() {
         let server = IntentApiFixture::new(vec![]);
-        let mut endpoint = url::Url::parse(&server.origin).unwrap();
-        endpoint.set_username("secret-user").unwrap();
-        endpoint.set_password(Some("secret-password")).unwrap();
-        endpoint.set_query(Some("api_key=secret-query"));
-        drop(server);
+        let origin = server.origin.clone();
+        crate::operator_routing::test_transport_scope(&[&origin], async {
+            let mut endpoint = url::Url::parse(&server.origin).unwrap();
+            endpoint.set_username("secret-user").unwrap();
+            endpoint.set_password(Some("secret-password")).unwrap();
+            endpoint.set_query(Some("api_key=secret-query"));
+            drop(server);
 
-        let http = GraphHttpClient::new(endpoint.as_str()).unwrap();
-        let error = remote_json::<Value>(
-            &http,
-            Method::POST,
-            remote_url(endpoint.as_str(), &["graphs", "knowledge", "change"], &[]).unwrap(),
-            Some(json!({})),
-            Some("secret-bearer"),
-        )
-        .await
-        .unwrap_err();
-        let contract = error.downcast_ref::<ApiContractError>().unwrap();
-        assert!(!contract.request_dispatched);
-        assert_eq!(contract.http_status, None);
-        assert!(contract.error.contains("connection failed"), "{error:?}");
-        assert!(
-            contract
-                .error
-                .contains(omnigraph_api_types::HTTP_API_CONTRACT_HEADER)
-        );
-        assert!(
-            contract
-                .error
-                .contains(omnigraph_api_types::HTTP_API_CONTRACT)
-        );
-        assert!(!format!("{error:?}").contains("secret"));
-        assert!(!serde_json::to_string(contract).unwrap().contains("secret"));
+            let http = crate::operator_routing::test_transport_scope(&[endpoint.as_str()], async {
+                GraphHttpClient::new(endpoint.as_str())
+            })
+            .await
+            .unwrap();
+            let error = remote_json::<Value>(
+                &http,
+                Method::POST,
+                remote_url(endpoint.as_str(), &["graphs", "knowledge", "change"], &[]).unwrap(),
+                Some(json!({})),
+                Some("secret-bearer"),
+            )
+            .await
+            .unwrap_err();
+            let contract = error.downcast_ref::<ApiContractError>().unwrap();
+            assert!(!contract.request_dispatched);
+            assert_eq!(contract.http_status, None);
+            assert!(contract.error.contains("connection failed"), "{error:?}");
+            assert!(
+                contract
+                    .error
+                    .contains(omnigraph_api_types::HTTP_API_CONTRACT_HEADER)
+            );
+            assert!(
+                contract
+                    .error
+                    .contains(omnigraph_api_types::HTTP_API_CONTRACT)
+            );
+            assert!(!format!("{error:?}").contains("secret"));
+            assert!(!serde_json::to_string(contract).unwrap().contains("secret"));
+        })
+        .await;
     }
 
     /// A `unix://` root's whole path names the socket: the server receives
@@ -2970,80 +3008,83 @@ mod tests {
     #[tokio::test]
     async fn graph_http_over_a_unix_socket_sends_root_relative_targets_issue_979() {
         let server = IntentApiFixture::graph(vec![contract_reply(200, json!({"ok": true}))]);
-        let gateway = crate::unix_gateway_fixture::UnixGateway::new(&server.origin);
-        let root = gateway.url();
-        let http = GraphHttpClient::new(&root).unwrap();
-        crate::helpers::require_graph_segment("knowledge").unwrap();
-        let base = remote_url(&root, &["graphs", "knowledge"], &[]).unwrap();
-        let value: Value = remote_json(
-            &http,
-            Method::GET,
-            remote_url(&base, &["branches", "etl/run 1"], &[("branch", "a b")]).unwrap(),
-            None,
-            Some("data-bearer"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(value, json!({"ok": true}));
-        let requests = server.requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].method, "HEAD");
-        assert_eq!(requests[0].path, "/healthz");
-        assert!(!requests[0].headers.contains_key("authorization"));
-        assert_eq!(
-            requests[1].path,
-            "/graphs/knowledge/branches/etl%2Frun%201?branch=a+b"
-        );
-        assert_eq!(requests[1].headers["host"], "localhost");
-        assert_eq!(requests[1].headers["authorization"], "Bearer data-bearer");
-        assert_eq!(
-            requests[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
-            omnigraph_api_types::HTTP_API_CONTRACT
-        );
-        assert_eq!(gateway.connections(), 2, "both requests used the socket");
-        server.assert_complete();
-
-        // `--graph` refuses anything but one plain segment before any URL is
-        // composed; the transport still refuses a composed URL that climbs
-        // out of the root.
-        let refusal = crate::helpers::require_graph_segment("../..").unwrap_err();
-        assert!(
-            refusal
-                .to_string()
-                .contains("a graph name is one path segment"),
-            "{refusal}"
-        );
-        for outside in [
-            format!("{root}2/graphs"),
-            remote_url(&format!("{root}/graphs/../.."), &["snapshot"], &[]).unwrap(),
-        ] {
-            let error = http.request(Method::GET, outside.clone()).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("outside the Unix-socket server root"),
-                "{outside}: {error}"
+        crate::operator_routing::test_transport_scope(&[&server.origin], async {
+            let gateway = crate::unix_gateway_fixture::UnixGateway::new(&server.origin);
+            let root = gateway.url();
+            let http = GraphHttpClient::new(&root).unwrap();
+            crate::helpers::require_graph_segment("knowledge").unwrap();
+            let base = remote_url(&root, &["graphs", "knowledge"], &[]).unwrap();
+            let value: Value = remote_json(
+                &http,
+                Method::GET,
+                remote_url(&base, &["branches", "etl/run 1"], &[("branch", "a b")]).unwrap(),
+                None,
+                Some("data-bearer"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(value, json!({"ok": true}));
+            let requests = server.requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].method, "HEAD");
+            assert_eq!(requests[0].path, "/healthz");
+            assert!(!requests[0].headers.contains_key("authorization"));
+            assert_eq!(
+                requests[1].path,
+                "/graphs/knowledge/branches/etl%2Frun%201?branch=a+b"
             );
-        }
-        assert_eq!(server.requests().len(), 2);
+            assert_eq!(requests[1].headers["host"], "localhost");
+            assert_eq!(requests[1].headers["authorization"], "Bearer data-bearer");
+            assert_eq!(
+                requests[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
+                omnigraph_api_types::HTTP_API_CONTRACT
+            );
+            assert_eq!(gateway.connections(), 2, "both requests used the socket");
+            server.assert_complete();
 
-        // Removing the socket fails discovery before the data request.
-        drop(gateway);
-        let error = remote_json::<Value>(
-            &http,
-            Method::GET,
-            remote_url(&base, &["snapshot"], &[]).unwrap(),
-            None,
-            Some("data-bearer"),
-        )
-        .await
-        .unwrap_err();
-        let contract = error.downcast_ref::<ApiContractError>().unwrap();
-        assert!(!contract.request_dispatched);
-        assert!(
-            contract.error.contains("connection failed (Unix socket)"),
-            "{error:?}"
-        );
+            // `--graph` refuses anything but one plain segment before any URL is
+            // composed; the transport still refuses a composed URL that climbs
+            // out of the root.
+            let refusal = crate::helpers::require_graph_segment("../..").unwrap_err();
+            assert!(
+                refusal
+                    .to_string()
+                    .contains("a graph name is one path segment"),
+                "{refusal}"
+            );
+            for outside in [
+                format!("{root}2/graphs"),
+                remote_url(&format!("{root}/graphs/../.."), &["snapshot"], &[]).unwrap(),
+            ] {
+                let error = http.request(Method::GET, outside.clone()).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("outside the Unix-socket server root"),
+                    "{outside}: {error}"
+                );
+            }
+            assert_eq!(server.requests().len(), 2);
+
+            // Removing the socket fails discovery before the data request.
+            drop(gateway);
+            let error = remote_json::<Value>(
+                &http,
+                Method::GET,
+                remote_url(&base, &["snapshot"], &[]).unwrap(),
+                None,
+                Some("data-bearer"),
+            )
+            .await
+            .unwrap_err();
+            let contract = error.downcast_ref::<ApiContractError>().unwrap();
+            assert!(!contract.request_dispatched);
+            assert!(
+                contract.error.contains("connection failed (Unix socket)"),
+                "{error:?}"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3080,60 +3121,63 @@ mod tests {
             }
         }
         let server = IntentApiFixture::new(replies);
-        let client =
-            GraphClient::managed(&server.origin, "knowledge", "data-bearer".into()).unwrap();
-        let mut served = 0;
-        for form in forms {
-            for dispatched in [false, true] {
-                let mut output = Vec::new();
-                let result = match form {
-                    "json" => client
-                        .invoke_named::<Value>("write", true, None, None, None, None)
-                        .await
-                        .map(|_| ()),
-                    "ndjson" => client
-                        .load(
-                            "main",
-                            None,
-                            file.path().to_str().unwrap(),
-                            CliLoadMode::Append,
-                            &[],
-                            &mut std::io::sink(),
-                        )
-                        .await
-                        .map(|_| ()),
-                    "baseline" => client
-                        .change_baseline(
-                            None,
-                            &ChangeFilterArgs {
-                                kinds: &[],
-                                types: &[],
-                                ops: &[],
-                            },
-                            &mut output,
-                        )
-                        .await
-                        .map(|_| ()),
-                    "export" => client.export("main", &[], &mut output).await,
-                    "blob-get" => client.blob_get(&blob, None, &mut output).await,
-                    "blob-head" => client.blob_stat(&blob).await.map(|_| ()),
-                    _ => unreachable!(),
-                };
-                let error = result.unwrap_err();
-                let contract = error
-                    .downcast_ref::<ApiContractError>()
-                    .unwrap_or_else(|| panic!("{form}: {error:?}"));
-                assert_eq!(contract.request_dispatched, dispatched, "{form}");
-                assert_eq!(contract.http_status, Some(200));
-                assert!(
-                    output.is_empty(),
-                    "{form} must validate before writing any bytes"
-                );
-                served += if dispatched { 2 } else { 1 };
-                assert_eq!(server.requests().len(), served, "{form}");
+        crate::operator_routing::test_transport_scope(&[&server.origin], async {
+            let client =
+                GraphClient::managed(&server.origin, "knowledge", "data-bearer".into()).unwrap();
+            let mut served = 0;
+            for form in forms {
+                for dispatched in [false, true] {
+                    let mut output = Vec::new();
+                    let result = match form {
+                        "json" => client
+                            .invoke_named::<Value>("write", true, None, None, None, None)
+                            .await
+                            .map(|_| ()),
+                        "ndjson" => client
+                            .load(
+                                "main",
+                                None,
+                                file.path().to_str().unwrap(),
+                                CliLoadMode::Append,
+                                &[],
+                                &mut std::io::sink(),
+                            )
+                            .await
+                            .map(|_| ()),
+                        "baseline" => client
+                            .change_baseline(
+                                None,
+                                &ChangeFilterArgs {
+                                    kinds: &[],
+                                    types: &[],
+                                    ops: &[],
+                                },
+                                &mut output,
+                            )
+                            .await
+                            .map(|_| ()),
+                        "export" => client.export("main", &[], &mut output).await,
+                        "blob-get" => client.blob_get(&blob, None, &mut output).await,
+                        "blob-head" => client.blob_stat(&blob).await.map(|_| ()),
+                        _ => unreachable!(),
+                    };
+                    let error = result.unwrap_err();
+                    let contract = error
+                        .downcast_ref::<ApiContractError>()
+                        .unwrap_or_else(|| panic!("{form}: {error:?}"));
+                    assert_eq!(contract.request_dispatched, dispatched, "{form}");
+                    assert_eq!(contract.http_status, Some(200));
+                    assert!(
+                        output.is_empty(),
+                        "{form} must validate before writing any bytes"
+                    );
+                    served += if dispatched { 2 } else { 1 };
+                    assert_eq!(server.requests().len(), served, "{form}");
+                }
             }
-        }
-        server.assert_complete();
+            server.assert_complete();
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3141,31 +3185,37 @@ mod tests {
         // These statuses exercise response forwarding and redirect refusal.
         // They are not reqwest's retryable HTTP/2 or HTTP/3 transport faults.
         let target = IntentApiFixture::new(vec![]);
-        for status in [302, 429, 503] {
-            let mut reply = contract_reply(status, json!({"error":"stop"}));
-            reply
-                .headers
-                .push(("Location".into(), target.origin.clone()));
-            let server = IntentApiFixture::graph(vec![reply]);
-            let http = GraphHttpClient::new(&server.origin).unwrap();
-            let error = remote_json::<Value>(
-                &http,
-                Method::POST,
-                format!("{}/graphs/knowledge/mutate", server.origin),
-                Some(json!({})),
-                Some("data-bearer"),
-            )
-            .await
-            .unwrap_err();
-            assert!(error.downcast_ref::<RemoteErrorCli>().is_some());
-            assert_eq!(
-                server.requests().len(),
-                2,
-                "one discovery and one data request"
-            );
-            server.assert_complete();
-        }
-        assert!(target.requests().is_empty());
+        crate::operator_routing::test_transport_scope(&[&target.origin], async {
+            for status in [302, 429, 503] {
+                let mut reply = contract_reply(status, json!({"error":"stop"}));
+                reply
+                    .headers
+                    .push(("Location".into(), target.origin.clone()));
+                let server = IntentApiFixture::graph(vec![reply]);
+                crate::operator_routing::test_transport_scope(&[&server.origin], async {
+                    let http = GraphHttpClient::new(&server.origin).unwrap();
+                    let error = remote_json::<Value>(
+                        &http,
+                        Method::POST,
+                        format!("{}/graphs/knowledge/mutate", server.origin),
+                        Some(json!({})),
+                        Some("data-bearer"),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert!(error.downcast_ref::<RemoteErrorCli>().is_some());
+                    assert_eq!(
+                        server.requests().len(),
+                        2,
+                        "one discovery and one data request"
+                    );
+                    server.assert_complete();
+                })
+                .await;
+            }
+            assert!(target.requests().is_empty());
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3205,41 +3255,44 @@ mod tests {
                 vec![refusal]
             };
             let server = IntentApiFixture::graph(replies);
-            let http = GraphHttpClient::new(&server.origin).unwrap();
-            let (error, evidence) = crate::command_outcome::observe(async {
-                if earlier_request {
-                    remote_json::<Value>(
+            crate::operator_routing::test_transport_scope(&[&server.origin], async {
+                let http = GraphHttpClient::new(&server.origin).unwrap();
+                let (error, evidence) = crate::command_outcome::observe(async {
+                    if earlier_request {
+                        remote_json::<Value>(
+                            &http,
+                            Method::POST,
+                            format!("{}/graphs/knowledge/branches", server.origin),
+                            Some(json!({"name":"review"})),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    remote_json_with_graph_commit_precondition::<Value>(
                         &http,
-                        Method::POST,
-                        format!("{}/graphs/knowledge/branches", server.origin),
-                        Some(json!({"name":"review"})),
+                        if read_refusal {
+                            Method::GET
+                        } else {
+                            Method::POST
+                        },
+                        format!("{}/graphs/knowledge/mutate", server.origin),
+                        Some(json!({"query":"mutation m() {}"})),
                         None,
+                        conditional.then_some("head-a"),
                     )
                     .await
-                    .unwrap();
-                }
-                remote_json_with_graph_commit_precondition::<Value>(
-                    &http,
-                    if read_refusal {
-                        Method::GET
-                    } else {
-                        Method::POST
-                    },
-                    format!("{}/graphs/knowledge/mutate", server.origin),
-                    Some(json!({"query":"mutation m() {}"})),
-                    None,
-                    conditional.then_some("head-a"),
-                )
-                .await
-                .unwrap_err()
+                    .unwrap_err()
+                })
+                .await;
+                assert_eq!(
+                    server.workflow_requests().len(),
+                    if earlier_request { 2 } else { 1 }
+                );
+                server.assert_complete();
+                crate::command_outcome::Failure::classify(error, evidence)
             })
-            .await;
-            assert_eq!(
-                server.workflow_requests().len(),
-                if earlier_request { 2 } else { 1 }
-            );
-            server.assert_complete();
-            crate::command_outcome::Failure::classify(error, evidence)
+            .await
         }
         // Poll concurrently: invocation evidence must never leak to a peer.
         let (compound, single) = tokio::join!(
@@ -3338,8 +3391,10 @@ mod tests {
                     delay,
                 );
                 let client =
-                    GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
-                        .unwrap();
+                    crate::operator_routing::test_transport_scope_sync(&[&server.origin], || {
+                        GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
+                    })
+                    .unwrap();
                 // Finish synchronous client setup before join_all polls requests.
                 async move {
                     let started = std::time::Instant::now();
@@ -3467,9 +3522,17 @@ mod tests {
                         vec![IntentReply::json(200, reply.clone())],
                         delay,
                     );
-                    let client =
-                        GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
-                            .unwrap();
+                    let client = crate::operator_routing::test_transport_scope_sync(
+                        &[&server.origin],
+                        || {
+                            GraphClient::managed(
+                                &server.origin,
+                                "knowledge",
+                                "data-credential".into(),
+                            )
+                        },
+                    )
+                    .unwrap();
                     // Finish synchronous client setup before join_all polls requests.
                     async move {
                         let started = std::time::Instant::now();
@@ -3549,91 +3612,95 @@ mod tests {
     #[tokio::test]
     async fn process_setting_is_refused_before_any_request_is_sent() {
         let server = IntentApiFixture::new(vec![]);
-        let client =
-            GraphClient::managed(&server.origin, "knowledge", "data-credential".into()).unwrap();
-        let settings = parse_set_flags(&["stage_write_concurrency=4".to_string()]).unwrap();
-        const REFUSAL: &str = "setting `stage_write_concurrency` is a process setting; it is \
+        crate::operator_routing::test_transport_scope(&[&server.origin], async {
+            let client =
+                GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
+                    .unwrap();
+            let settings = parse_set_flags(&["stage_write_concurrency=4".to_string()]).unwrap();
+            const REFUSAL: &str = "setting `stage_write_concurrency` is a process setting; it is \
                                read from the server's environment, not from a request";
-        let refused = [
-            (
-                "query",
-                client
-                    .query(
-                        Some(ReadTarget::branch("main")),
-                        "query q() {}",
-                        Some("q"),
-                        None,
-                        &settings,
-                    )
-                    .await
-                    .map(|_| ()),
-            ),
-            (
-                "mutate",
-                client
-                    .mutate(
-                        Some("main"),
-                        "mutation m() {}",
-                        Some("m"),
-                        None,
-                        None,
-                        &settings,
-                        &mut std::io::sink(),
-                    )
-                    .await
-                    .map(|_| ()),
-            ),
-            (
-                "branch list",
-                client
-                    .branch_list_statement("branch list", &settings)
-                    .await
-                    .map(|_| ()),
-            ),
-            (
-                "branch merge",
-                client
-                    .branch_merge(
-                        "review",
-                        "main",
-                        false,
-                        false,
-                        false,
-                        &settings,
-                        &mut std::io::sink(),
-                    )
-                    .await
-                    .map(|_| ()),
-            ),
-            (
-                "changes poll",
-                client
-                    .poll_changes_page(
-                        Some("main"),
-                        None,
-                        None,
-                        None,
-                        None,
-                        &ChangeFilterArgs {
-                            kinds: &[],
-                            types: &[],
-                            ops: &[],
-                        },
-                        &settings,
-                    )
-                    .await
-                    .map(|_| ()),
-            ),
-        ];
-        for (owner, result) in refused {
-            let error = result.expect_err(owner);
-            assert_eq!(error.to_string(), REFUSAL, "{owner}");
-        }
-        assert!(
-            server.requests().is_empty(),
-            "the scope refusal precedes the round trip"
-        );
-        server.assert_complete();
+            let refused = [
+                (
+                    "query",
+                    client
+                        .query(
+                            Some(ReadTarget::branch("main")),
+                            "query q() {}",
+                            Some("q"),
+                            None,
+                            &settings,
+                        )
+                        .await
+                        .map(|_| ()),
+                ),
+                (
+                    "mutate",
+                    client
+                        .mutate(
+                            Some("main"),
+                            "mutation m() {}",
+                            Some("m"),
+                            None,
+                            None,
+                            &settings,
+                            &mut std::io::sink(),
+                        )
+                        .await
+                        .map(|_| ()),
+                ),
+                (
+                    "branch list",
+                    client
+                        .branch_list_statement("branch list", &settings)
+                        .await
+                        .map(|_| ()),
+                ),
+                (
+                    "branch merge",
+                    client
+                        .branch_merge(
+                            "review",
+                            "main",
+                            false,
+                            false,
+                            false,
+                            &settings,
+                            &mut std::io::sink(),
+                        )
+                        .await
+                        .map(|_| ()),
+                ),
+                (
+                    "changes poll",
+                    client
+                        .poll_changes_page(
+                            Some("main"),
+                            None,
+                            None,
+                            None,
+                            None,
+                            &ChangeFilterArgs {
+                                kinds: &[],
+                                types: &[],
+                                ops: &[],
+                            },
+                            &settings,
+                        )
+                        .await
+                        .map(|_| ()),
+                ),
+            ];
+            for (owner, result) in refused {
+                let error = result.expect_err(owner);
+                assert_eq!(error.to_string(), REFUSAL, "{owner}");
+            }
+            assert!(
+                server.requests().is_empty(),
+                "the scope refusal precedes the round trip"
+            );
+            server.assert_complete();
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3667,103 +3734,107 @@ mod tests {
             IntentReply::json(200, merged),
             IntentReply::json(200, change),
         ]);
-        let client =
-            GraphClient::managed(&server.origin, "knowledge", "data-credential".into()).unwrap();
-        let settings = parse_set_flags(&[
-            "merge_lineage=off".to_string(),
-            "ann_nprobes=1".to_string(),
-            "write_max_bytes=4093".to_string(),
-        ])
-        .unwrap();
-        client
-            .query(
-                Some(ReadTarget::branch("main")),
-                "query q() {}",
-                Some("q"),
-                None,
-                &settings,
-            )
-            .await
+        crate::operator_routing::test_transport_scope(&[&server.origin], async {
+            let client =
+                GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
+                    .unwrap();
+            let settings = parse_set_flags(&[
+                "merge_lineage=off".to_string(),
+                "ann_nprobes=1".to_string(),
+                "write_max_bytes=4093".to_string(),
+            ])
             .unwrap();
-        client
-            .mutate(
-                Some("main"),
-                "mutation m() {}",
-                Some("m"),
-                None,
-                None,
-                &settings,
-                &mut std::io::sink(),
-            )
-            .await
-            .unwrap();
-        client
-            .mutate(
-                Some("main"),
-                "mutation m() {}",
-                Some("m"),
-                None,
-                Some("head-before"),
-                &settings,
-                &mut std::io::sink(),
-            )
-            .await
-            .unwrap();
-        client
-            .branch_merge(
-                "review",
-                "main",
-                false,
-                false,
-                false,
-                &settings,
-                &mut std::io::sink(),
-            )
-            .await
-            .unwrap();
+            client
+                .query(
+                    Some(ReadTarget::branch("main")),
+                    "query q() {}",
+                    Some("q"),
+                    None,
+                    &settings,
+                )
+                .await
+                .unwrap();
+            client
+                .mutate(
+                    Some("main"),
+                    "mutation m() {}",
+                    Some("m"),
+                    None,
+                    None,
+                    &settings,
+                    &mut std::io::sink(),
+                )
+                .await
+                .unwrap();
+            client
+                .mutate(
+                    Some("main"),
+                    "mutation m() {}",
+                    Some("m"),
+                    None,
+                    Some("head-before"),
+                    &settings,
+                    &mut std::io::sink(),
+                )
+                .await
+                .unwrap();
+            client
+                .branch_merge(
+                    "review",
+                    "main",
+                    false,
+                    false,
+                    false,
+                    &settings,
+                    &mut std::io::sink(),
+                )
+                .await
+                .unwrap();
 
-        client
-            .mutate(
-                Some("main"),
-                "mutation m() {}",
-                Some("m"),
-                None,
-                None,
-                &[],
-                &mut std::io::sink(),
-            )
-            .await
-            .unwrap();
-        let requests = server.workflow_requests();
-        assert_eq!(requests.len(), 5);
-        assert_eq!(requests[4].path, "/graphs/knowledge/mutate");
-        assert_eq!(requests[4].body["query"], "mutation m() {}");
-        assert_eq!(requests[4].body["name"], "m");
-        assert!(requests[4].body.get("query_source").is_none());
-        assert!(requests[4].body.get("query_name").is_none());
-        assert!(requests[4].body.get("settings").is_none());
-        let field = json!({"merge_lineage": "off", "ann_nprobes": 1, "write_max_bytes": 4093});
-        assert_eq!(requests[0].path, "/graphs/knowledge/query");
-        assert_eq!(requests[0].body["settings"], field);
-        assert_eq!(
-            requests[1].path, "/graphs/knowledge/mutate",
-            "mutations use the canonical route"
-        );
-        assert_eq!(requests[1].body["settings"], field);
-        assert!(
-            !requests[1]
-                .headers
-                .contains_key("omnigraph-if-graph-commit")
-        );
-        assert_eq!(requests[2].path, "/graphs/knowledge/mutate/if-graph-commit");
-        assert_eq!(
-            requests[2].headers["omnigraph-if-graph-commit"],
-            "head-before"
-        );
-        assert_eq!(requests[2].body["settings"], field);
-        assert_eq!(requests[3].path, "/graphs/knowledge/branches/merge");
-        assert_eq!(requests[3].body["settings"], field);
-        server.assert_complete();
+            client
+                .mutate(
+                    Some("main"),
+                    "mutation m() {}",
+                    Some("m"),
+                    None,
+                    None,
+                    &[],
+                    &mut std::io::sink(),
+                )
+                .await
+                .unwrap();
+            let requests = server.workflow_requests();
+            assert_eq!(requests.len(), 5);
+            assert_eq!(requests[4].path, "/graphs/knowledge/mutate");
+            assert_eq!(requests[4].body["query"], "mutation m() {}");
+            assert_eq!(requests[4].body["name"], "m");
+            assert!(requests[4].body.get("query_source").is_none());
+            assert!(requests[4].body.get("query_name").is_none());
+            assert!(requests[4].body.get("settings").is_none());
+            let field = json!({"merge_lineage": "off", "ann_nprobes": 1, "write_max_bytes": 4093});
+            assert_eq!(requests[0].path, "/graphs/knowledge/query");
+            assert_eq!(requests[0].body["settings"], field);
+            assert_eq!(
+                requests[1].path, "/graphs/knowledge/mutate",
+                "mutations use the canonical route"
+            );
+            assert_eq!(requests[1].body["settings"], field);
+            assert!(
+                !requests[1]
+                    .headers
+                    .contains_key("omnigraph-if-graph-commit")
+            );
+            assert_eq!(requests[2].path, "/graphs/knowledge/mutate/if-graph-commit");
+            assert_eq!(
+                requests[2].headers["omnigraph-if-graph-commit"],
+                "head-before"
+            );
+            assert_eq!(requests[2].body["settings"], field);
+            assert_eq!(requests[3].path, "/graphs/knowledge/branches/merge");
+            assert_eq!(requests[3].body["settings"], field);
+            server.assert_complete();
+        })
+        .await;
     }
 
     #[test]
