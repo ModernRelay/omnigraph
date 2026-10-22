@@ -3,6 +3,7 @@
 
 pub mod api;
 mod blob_transport;
+mod challenge;
 mod deployment;
 mod export_transport;
 mod extract;
@@ -61,7 +62,7 @@ pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, OriginalUri, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -520,6 +521,9 @@ enum ApiErrorDetails {
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
     FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
+    /// Whether a 401 followed a presented bearer credential. The challenge
+    /// layer renders it as `WWW-Authenticate`; the body carries nothing.
+    Unauthenticated(challenge::Unauthenticated),
 }
 
 /// What a detail says about the operation that failed with it.
@@ -548,7 +552,8 @@ impl ApiErrorDetails {
             | Self::PreconditionFailure(_)
             | Self::BlobPreconditionFailure(_)
             | Self::BranchStartRefusal(_)
-            | Self::Diagnostic(_) => DetailClass::Refusal,
+            | Self::Diagnostic(_)
+            | Self::Unauthenticated(_) => DetailClass::Refusal,
             Self::RecoveryRequired(_)
             | Self::FullTextIndexRebuildRequired(_)
             | Self::FullTextIndexRequired(_) => DetailClass::Recovery,
@@ -1118,8 +1123,14 @@ impl ApiError {
         self
     }
 
-    pub fn unauthorized(message: impl Into<String>) -> Self {
+    /// HTTP 401, recording whether a bearer credential was presented so the
+    /// response's challenge says which (RFC 6750 §3.1).
+    pub(crate) fn unauthorized(
+        reason: challenge::Unauthenticated,
+        message: impl Into<String>,
+    ) -> Self {
         Self::new(ErrorCode::Unauthorized, message)
+            .with_details(ApiErrorDetails::Unauthenticated(reason))
     }
 
     pub fn forbidden(message: impl Into<String>) -> Self {
@@ -1451,7 +1462,38 @@ impl ApiError {
     }
 
     fn from_omni(err: OmniError) -> Self {
+        Self::from_omni_settled(err, Self::with_request_facts)
+    }
+
+    /// [`Self::from_omni`] with `settle` giving the error its final facts
+    /// before the warning reads its status: a served error carries its
+    /// request's, and an embedded caller states its own, so the warning and
+    /// the body agree on both paths.
+    fn from_omni_settled(err: OmniError, settle: impl FnOnce(Self) -> Self) -> Self {
         let cause = redacted_cause::RedactedCause::of(&err);
+        // Every translation leaves through this one exit, an internal
+        // replacement included, so the warning reads each one's settled facts.
+        let response = settle(Self::translated(err));
+        if response.completion_uncertain {
+            // The record of a write's unknown outcome: the failure's class,
+            // the status its response sends, and whether its uncertainty is
+            // scoped to its keys and branch, never its message, which can
+            // carry object URIs. It shares the request's span with the
+            // containment log.
+            tracing::warn!(
+                status = %response.status(),
+                ?cause,
+                scoped = response.scoped_unknown,
+                "engine failure without definite completion evidence"
+            );
+        }
+        response
+    }
+
+    /// An engine failure's code, details and completion facts, before its
+    /// operation's own. A failure naming invalid graph type metadata becomes
+    /// an internal error, which takes no completion evidence from it.
+    fn translated(err: OmniError) -> Self {
         let (err, evidence) = err.into_completion_evidence();
         let storage_outcome = err.is_manifest_publish_in_doubt()
             || matches!(&err, OmniError::Storage(_) | OmniError::Io(_));
@@ -1762,22 +1804,6 @@ impl ApiError {
             None => {}
         }
         response.scoped_unknown = response.completion_uncertain && storage_outcome;
-        // The error carries what its request has done, as one leaving an
-        // owned read's task does, so its status is the one its response sends.
-        let response = response.with_request_facts();
-        if response.completion_uncertain {
-            // The record of a write's unknown outcome: the failure's class,
-            // the status its response sends, and whether its uncertainty is
-            // scoped to its keys and branch, never its message, which can
-            // carry object URIs. It shares the request's span with the
-            // containment log.
-            tracing::warn!(
-                status = %response.status(),
-                ?cause,
-                scoped = response.scoped_unknown,
-                "engine failure without definite completion evidence"
-            );
-        }
         response
     }
 }
@@ -1849,6 +1875,12 @@ impl IntoResponse for ApiError {
         {
             headers.insert(axum::http::header::ETAG, etag);
         }
+        // The output consumes the details; keep authentication's reason for
+        // the challenge layer.
+        let unauthenticated = match error.details.as_deref() {
+            Some(ApiErrorDetails::Unauthenticated(reason)) => Some(*reason),
+            _ => None,
+        };
         let output = error.into_judged_output();
         if output
             .disposition
@@ -1863,7 +1895,11 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
         }
-        (status, headers, Json(output)).into_response()
+        let mut response = (status, headers, Json(output)).into_response();
+        if let Some(reason) = unauthenticated {
+            response.extensions_mut().insert(reason);
+        }
+        response
     }
 }
 
@@ -1877,10 +1913,15 @@ impl ApiError {
     /// The output of one step's error, such as a merge's optional source
     /// deletion, judged by that step alone: it may have taken effect only when
     /// its own completion is uncertain.
-    pub(crate) fn into_step_output(mut self) -> ErrorOutput {
+    pub(crate) fn into_step_output(self) -> ErrorOutput {
+        self.into_step().into_judged_output()
+    }
+
+    /// The facts of one step's error, judged by that step alone.
+    fn into_step(mut self) -> Self {
         self.owned_write = self.completion_uncertain;
         self.compound = false;
-        self.into_judged_output()
+        self
     }
 
     /// The output of an error whose facts are final.
@@ -1924,6 +1965,7 @@ impl ApiError {
                     output.full_text_index_required = Some(value)
                 }
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
+                ApiErrorDetails::Unauthenticated(_) => {}
             }
         }
         output
@@ -1933,7 +1975,7 @@ impl ApiError {
 /// Project an engine failure into the shared error body, including structured
 /// details, for embedded callers that compose a second effect after success.
 pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
-    ApiError::from_omni(error).into_step_output()
+    ApiError::from_omni_settled(error, ApiError::into_step).into_judged_output()
 }
 
 /// Project an engine failure into the error body a server answers for a
@@ -1948,9 +1990,11 @@ pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
 /// a fork is itself a write, so that changes the disposition only together with
 /// `after_write`.
 pub fn engine_error_output_after(error: OmniError, after_write: bool) -> api::ErrorOutput {
-    let mut error = ApiError::from_omni(error);
-    error.owned_write = after_write;
-    error.into_judged_output()
+    ApiError::from_omni_settled(error, |mut error| {
+        error.owned_write = after_write;
+        error
+    })
+    .into_judged_output()
 }
 
 /// The error body of an embedded read's engine failure: a read writes
@@ -2443,6 +2487,78 @@ mod api_error_tests {
         assert_eq!(sent, StatusCode::INTERNAL_SERVER_ERROR);
         assert_logged(&in_write, WARNING, sent);
         assert_logged(&in_write, CONTAINMENT, sent);
+
+        // An embedded caller states its own facts, and the warning reads them:
+        // one step's failure, a failure after a write, and a read.
+        let datafusion = || OmniError::DataFusion("execution failure".into());
+        type Judge = fn(OmniError) -> api::ErrorOutput;
+        let embedded: [(&str, Judge, StatusCode); 3] = [
+            (
+                "step",
+                engine_error_output,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                "after a write",
+                |error| engine_error_output_after(error, true),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            ("read", engine_read_error_output, StatusCode::BAD_REQUEST),
+        ];
+        for (label, output, sent) in embedded {
+            let capture = test_log_capture::Capture::default();
+            let logs = tracing::subscriber::set_default(capture.subscriber("warn"));
+            let body = output(datafusion());
+            drop(logs);
+            assert_eq!(body.http_status(), Some(sent.as_u16()), "{label}");
+            assert_logged(&capture, WARNING, sent);
+        }
+
+        // A conflict naming an invalid graph type becomes an internal error,
+        // which settles and logs through the same exit: a write's helpers
+        // report its outcome unknown, at the status its body sends.
+        let invalid_key = || OmniError::key_conflict("Person", "Alice");
+        let writes: [(&str, Judge); 2] = [
+            ("step", engine_error_output),
+            ("after a write", |error| {
+                engine_error_output_after(error, true)
+            }),
+        ];
+        for (label, output) in writes {
+            let capture = test_log_capture::Capture::default();
+            let logs = tracing::subscriber::set_default(capture.subscriber("warn"));
+            let body = output(invalid_key());
+            drop(logs);
+            assert_eq!(body.code, Some(api::ErrorCode::OutcomeUnknown), "{label}");
+            assert_eq!(
+                body.disposition,
+                Some(api::DispositionOutput {
+                    effects: api::DispositionEffects::Unknown,
+                    action: api::DispositionAction::Reconcile,
+                }),
+                "{label}"
+            );
+            assert_logged(&capture, WARNING, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        // A read's helper keeps its own facts even inside a request that has
+        // submitted a write.
+        let capture = test_log_capture::Capture::default();
+        let logs = tracing::subscriber::set_default(capture.subscriber("warn"));
+        let runtime = OperationRuntime::default();
+        let body = scope_request(async {
+            runtime
+                .submit((), async { Ok::<_, ApiError>(()).into() })
+                .unwrap()
+                .result()
+                .await
+                .unwrap();
+            engine_read_error_output(datafusion())
+        })
+        .await;
+        drop(logs);
+        assert_eq!(body.http_status(), Some(400));
+        assert_logged(&capture, WARNING, StatusCode::BAD_REQUEST);
     }
 
     /// Each class of refusal asks its caller for one thing. Before any write
@@ -2469,7 +2585,7 @@ mod api_error_tests {
         let cases = [
             (
                 "unauthorized",
-                ApiError::unauthorized("no token"),
+                ApiError::unauthorized(crate::challenge::Unauthenticated::NoCredential, "no token"),
                 Action::Fix,
             ),
             (
@@ -3665,6 +3781,9 @@ pub fn build_app(state: AppState) -> Router {
     if state.has_credential_source() {
         app = app.merge(mcp::router(state.clone()));
     }
+    // Every 401, from any router, handler or fallback, carries the one
+    // challenge, built once from the fixed OIDC resource binding.
+    let challenge = challenge::Challenge::new(state.oidc_resource_url().as_deref());
     // The unrouted answer, and the method fallback of the public routes. A
     // protected route already has its own, from `guarded`, which this one
     // leaves alone. Inside the layers, so both answer with the contract
@@ -3672,6 +3791,7 @@ pub fn build_app(state: AppState) -> Router {
     app.fallback(unrouted)
         .method_not_allowed_fallback(method_not_served)
         .layer(middleware::from_fn(http_contract::identify_response))
+        .layer(middleware::from_fn_with_state(challenge, challenge::answer))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

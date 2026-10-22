@@ -889,7 +889,7 @@ fn alias_unknown_name_errors_listing_defined() {
     let home = tempdir().unwrap();
     std::fs::write(
         home.path().join("config.yaml"),
-        "version: 1\ntargets:\n  dev:\n    kind: server\n    endpoint: https://x\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_DEV\ndefaults:\n  output: json\naliases:\n  who:\n    target: dev\n    graph: knowledge\n    query: find_person\n",
+        "version: 1\ntargets:\n  dev:\n    kind: server\n    endpoint: https://x\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_DEV\ndefaults:\n  output: json\naliases:\n  who:\n    target: dev\n    graph: knowledge\n    query: find_person\n",
     )
     .unwrap();
     let output = output_failure(
@@ -950,12 +950,12 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
         };
         let server = IntentApiFixture::graph(vec![response]);
         let captured_config = format!(
-            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_PROD\n  graph-owner:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/unrelated'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_GRAPH_OWNER\ndefaults:\n  output: {default_format}\naliases:\n  who:\n    target: prod\n    graph: knowledge\n    query: find_person\n    params: {{name: fixed, limit: 2, source: original-alias}}\n",
+            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_PROD\n  graph-owner:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/unrelated'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_GRAPH_OWNER\ndefaults:\n  output: {default_format}\naliases:\n  who:\n    target: prod\n    graph: knowledge\n    query: find_person\n    params: {{name: fixed, limit: 2, source: original-alias}}\n",
             server.origin, server.origin
         );
         fs::write(&config, captured_config).unwrap();
         let replacement_config = format!(
-            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_PROD\n  replacement:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/graphs/knowledge'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_REPLACEMENT\naliases:\n  who:\n    target: prod\n    graph: replacement\n    query: replacement_query\n    params: {{source: replacement-alias}}\n",
+            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_PROD\n  replacement:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/graphs/knowledge'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_REPLACEMENT\naliases:\n  who:\n    target: prod\n    graph: replacement\n    query: replacement_query\n    params: {{source: replacement-alias}}\n",
             trap.origin, server.origin
         );
         fs::write(&replacement, &replacement_config).unwrap();
@@ -1108,7 +1108,7 @@ fn alias_rejects_non_object_parameters_and_positional_arguments_without_requests
     fs::write(
         home.path().join("config.yaml"),
         format!(
-            "version: 1\ntargets:\n  srv:\n    kind: server\n    endpoint: '{}'\n    default_auth: public\n    auth:\n      public: {{provider: anonymous}}\naliases:\n  lookup:\n    target: srv\n    graph: knowledge\n    query: lookup\n    params: {{name: default}}\n",
+            "version: 1\ntargets:\n  srv:\n    kind: server\n    endpoint: '{}'\n    auth: {{provider: anonymous}}\naliases:\n  lookup:\n    target: srv\n    graph: knowledge\n    query: lookup\n    params: {{name: default}}\n",
             server.origin
         ),
     ).unwrap();
@@ -1259,7 +1259,7 @@ fn queries_list_on_a_server_target_prints_the_route_body() {
     fs::write(
         home.path().join("config.yaml"),
         format!(
-            "version: 1\ntargets:\n  srv:\n    kind: server\n    endpoint: '{}'\n    default_auth: public\n    auth:\n      public:\n        provider: anonymous\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n    default_graph: knowledge\n",
+            "version: 1\ntargets:\n  srv:\n    kind: server\n    endpoint: '{}'\n    auth:\n      provider: anonymous\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n    default_graph: knowledge\n",
             server.base_url, tls_gateway::ca_path().display()
         ),
     )

@@ -2423,7 +2423,7 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server_issue_1022() {
     let token = home.path().join("token");
     let write_config = |url: &str, source: &str| {
         fs::write(home.path().join("config.yaml"), format!(
-            "version: 1\ntargets:\n  test-srv:\n    kind: server\n    endpoint: {url}\n    default_auth: explicit\n    auth:\n      explicit:\n        provider: token\n        source: {source}\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n",
+            "version: 1\ntargets:\n  test-srv:\n    kind: server\n    endpoint: {url}\n    auth:\n      provider: token\n      source: {source}\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n",
             tls_gateway::ca_path().display())).unwrap();
     };
     write_config(&server.base_url, "{file: ./token}");
@@ -2503,8 +2503,6 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server_issue_1022() {
         command.env("OMNIGRAPH_HOME", home.path()).args([
             "--target",
             "test-srv",
-            "--auth",
-            "explicit",
             "credentials",
             verb,
         ]);
@@ -2541,7 +2539,6 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server_issue_1022() {
     );
     assert_eq!(fs::read_to_string(&token).unwrap(), "secret-tok\n");
     for args in [
-        vec!["credentials", "status", "--target", "test-srv"],
         vec!["credentials", "status", "--auth", "explicit"],
         vec!["login", "--target", "test-srv", "--token", "never-print"],
     ] {
@@ -2622,7 +2619,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     fs::write(
         operator_home.path().join("config.yaml"),
         format!(
-            "version: 1\ntargets:\n  dev:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: {}\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          file: ./token\naliases:\n  who:\n    target: dev\n    graph: local\n    query: find_person\n  create_person:\n    target: dev\n    graph: local\n    query: insert_person\n",
+            "version: 1\ntargets:\n  dev:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: {}\n    auth:\n      provider: token\n      source:\n        file: ./token\naliases:\n  who:\n    target: dev\n    graph: local\n    query: find_person\n  create_person:\n    target: dev\n    graph: local\n    query: insert_person\n",
             server.base_url
         ),
     )

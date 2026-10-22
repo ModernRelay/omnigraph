@@ -83,7 +83,7 @@ impl TlsGateway {
         let origin = format!("https://{}", listener.local_addr().unwrap());
         let anonymous = tempfile::tempdir().unwrap();
         std::fs::write(anonymous.path().join("config.yaml"), format!(
-            "version: 1\ntargets:\n  test-server:\n    kind: server\n    endpoint: {origin}\n    default_auth: public\n    auth:\n      public:\n        provider: anonymous\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n", ca_path().display()
+            "version: 1\ntargets:\n  test-server:\n    kind: server\n    endpoint: {origin}\n    auth:\n      provider: anonymous\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n", ca_path().display()
         )).unwrap();
         anonymous_homes()
             .lock()
@@ -170,8 +170,8 @@ mod tests {
         let target = &config["targets"]["test-server"];
         assert_eq!(config["version"], 1);
         assert_eq!(target["endpoint"], origin);
-        assert_eq!(target["default_auth"], "public");
-        assert_eq!(target["auth"]["public"]["provider"], "anonymous");
+        assert!(target.get("default_auth").is_none());
+        assert_eq!(target["auth"]["provider"], "anonymous");
         assert_eq!(target["transport"]["tls"]["ca"]["mode"], "replace");
         assert_eq!(
             target["transport"]["tls"]["ca"]["file"],

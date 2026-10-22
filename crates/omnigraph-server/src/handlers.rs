@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::api::{GraphAvailability, GraphAvailabilityAction};
+use crate::challenge::Unauthenticated;
 use crate::operations::OwnedResult;
 use crate::redacted_cause::RedactedCause;
 use crate::registry::{GraphEntry, RegistryCapture, StartupFailure};
@@ -247,7 +248,9 @@ pub(crate) async fn server_graphs_discovery(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<GraphDiscoveryResponse>, ApiError> {
-    let actor = actor.ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+    let actor = actor.ok_or_else(|| {
+        ApiError::unauthorized(Unauthenticated::NoCredential, "missing bearer token")
+    })?;
     if !actor.is_identity() {
         return Err(ApiError::forbidden(
             "graph discovery requires an admitted identity credential",
@@ -423,24 +426,12 @@ pub(crate) async fn require_bearer_auth(
         return Ok(next.run(request).await);
     }
 
-    if request.headers().get_all(AUTHORIZATION).iter().count() != 1 {
-        return Err(ApiError::unauthorized("one bearer credential is required"));
-    }
-
-    let Some(header) = request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Err(ApiError::unauthorized("missing bearer token"));
-    };
-
-    let Some(provided_token) = header.strip_prefix("Bearer ") else {
-        return Err(ApiError::unauthorized("missing bearer token"));
-    };
-
+    let provided_token = crate::challenge::bearer_token(request.headers())?;
     let Some(actor) = state.authenticate_bearer_token(provided_token) else {
-        return Err(ApiError::unauthorized("invalid bearer token"));
+        return Err(ApiError::unauthorized(
+            Unauthenticated::Refused,
+            "invalid bearer token",
+        ));
     };
     request.extensions_mut().insert(actor.actor().clone());
     request.extensions_mut().insert(actor);
@@ -717,7 +708,10 @@ pub(crate) fn authorize(
         return Ok(Authz::Allowed);
     };
     let Some(actor) = actor else {
-        return Err(ApiError::unauthorized("missing bearer token"));
+        return Err(ApiError::unauthorized(
+            Unauthenticated::NoCredential,
+            "missing bearer token",
+        ));
     };
     // SECURITY INVARIANT (MR-731): actor identity is supplied to the
     // policy engine here as a separate argument, sourced from the

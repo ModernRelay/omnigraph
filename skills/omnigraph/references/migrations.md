@@ -223,12 +223,14 @@ entity, property, graph-manifest, and published-dataset terms plus
 ## Operator configuration rewrite
 
 `version: 1` replaces the old target format without backward compatibility.
-Replace account targets and connections with profiles, flatten each managed
-`auth` to one provider object, and split multiple identities into separate profiles.
+Replace account targets and connections with profiles, flatten every
+`auth` to one provider object, and split managed identities into separate profiles.
 Change managed target `connection` to `profile` and `defaults.connection` to
-`defaults.profile`; remove managed `default_auth` and `--auth`. Standalone servers
-retain named auth entries and `--auth`. Use `--profile` instead of `--connection` and
-install static credentials with `credentials set --stdin`. There is no config
+`defaults.profile`; remove `default_auth` and `--auth`. Standalone identities
+use separate targets; reinstall their stored tokens with `credentials set
+--target NAME --stdin` rather than guessing an old named identity. Use `--profile`
+instead of `--connection` and `login --create-profile NAME` for explicit setup.
+Bare login uses the existing default profile. There is no config
 importer. `config recover-operations --source DIR --profile NAME`
 preserves matching legacy folder lifecycle evidence separately; retain old operator
 homes and reconcile unresolved operations under the original identity and key. See the primary

@@ -28,7 +28,7 @@ for `not_retained`.
 | Status | Meaning | Usual action |
 |---:|---|---|
 | 400 | Invalid request, query, schema, configuration, or external-Blob policy, including an update that must carry a stored external Blob reference the policy does not admit | Correct the request; retrying unchanged will fail again. For a stored reference, assign that property in the same update (a new value or null), or admit its base in the policy |
-| 401 | Missing or invalid bearer token | Supply a token configured by the server. The CLI sends a token only to the server it is keyed to; see [server credentials](../cli/index.md#use-a-server) |
+| 401 | Missing or invalid bearer token. `WWW-Authenticate` says which: `error="invalid_token"` when the server refused the token sent, and `resource_metadata` when the server accepts OAuth sign-in | Supply a token configured by the server. The CLI sends a token only to the server it is keyed to; see [server credentials](../cli/index.md#use-a-server) |
 | 403 | The resolved actor is not authorized | Change policy or use an authorized identity |
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
 | 405 | The path is served, but not with this method (`method_not_allowed`) | Use a method the `Allow` header lists |
@@ -135,8 +135,9 @@ exit follows from the disposition:
 
 Maintenance commands (`init`, `upgrade`, `optimize`, `rebuild-full-text-indexes`,
 `repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy`,
-`target`, `credential` and the managed commands keep their own exits for now:
-their exit 1 does not by itself say that nothing changed, so read their report.
+`target`, `credential`, `mcp` and the managed commands keep their own exits for now:
+their exit 1 does not by itself say that nothing changed, so read their report;
+`mcp` answers each relayed request with its own disposition.
 
 A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
 `api_contract_mismatch` exits 1 with `effects: none`, and `action: refresh` for

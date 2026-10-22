@@ -88,6 +88,133 @@ fn loaded_credential_is_revalidated_before_constructing_graph_or_registry_client
 }
 
 #[tokio::test]
+async fn loaded_data_credential_expiry_is_rechecked_after_discovery() {
+    for graph in [Some("knowledge"), None] {
+        let expiry = OffsetDateTime::now_utc().unix_timestamp() + 2;
+        let data = IntentApiFixture::graph_with_discovery_hook(
+            vec![IntentReply::json(200, json!({"graphs": []}))],
+            move || {
+                while OffsetDateTime::now_utc().unix_timestamp() < expiry {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            },
+        );
+        let mut context = context();
+        context.endpoint = Some(data.origin.clone());
+        let mut credential = identity_credential(&context, &data.origin);
+        set_identity_expiry(&mut credential, expiry);
+        crate::operator_routing::test_transport_scope(&[&data.origin], async {
+            let client = resolve_loaded(graph, &context, credential).unwrap();
+            let result = if graph.is_some() {
+                client
+                    .invoke_named::<Value>("write", true, None, None, None, None)
+                    .await
+            } else {
+                client.list_graphs().await.map(|_| Value::Null)
+            };
+            assert_eq!(
+                data.requests().len(),
+                1,
+                "expired data credentials must not be dispatched"
+            );
+            assert!(!data.requests()[0].headers.contains_key("authorization"));
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<crate::credential_sources::CredentialError>(),
+                Some(&crate::credential_sources::CredentialError::Expired)
+            );
+        })
+        .await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn valid_data_credential_remains_usable_when_control_expires_during_discovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let expiry = std::sync::Arc::new(std::sync::Mutex::new(None::<OffsetDateTime>));
+    let data = IntentApiFixture::graph_with_discovery_hook(
+        vec![IntentReply::json(200, json!({"graphs": []}))],
+        {
+            let expiry = expiry.clone();
+            move || {
+                let expiry = expiry.lock().unwrap().unwrap();
+                while OffsetDateTime::now_utc() < expiry {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        },
+    );
+    let helper = directory.path().join("helper.sh");
+    let response = directory.path().join("response.json");
+    let calls = directory.path().join("calls");
+    std::fs::write(
+        &helper,
+        "IFS= read -r request\nprintf 'called\\n' >> \"$2\"\ncat \"$1\"\n",
+    )
+    .unwrap();
+    let mut context = context();
+    context.endpoint = Some(data.origin.clone());
+    std::fs::write(
+        directory.path().join("config.yaml"),
+        json!({
+            "version": 1, "profiles": {"work": {
+                "api": context.api, "organization_id": context.organization_id,
+                "auth": {"provider": "exec", "command": ["/bin/sh", helper, response, calls]}
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+    let cli = crate::invocation::parse_from(["omnigraph", "cluster", "list", "--profile", "work"])
+        .unwrap()
+        .cli;
+    let target = crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
+        .unwrap()
+        .unwrap();
+    let authentication = crate::operator_routing::authentication(&cli, &input, Some(&target))
+        .unwrap()
+        .unwrap();
+    crate::operator_routing::test_transport_scope(&[&data.origin], async {
+        crate::operator_routing::AUTH
+            .scope(Some(authentication.clone()), async {
+                let expires = OffsetDateTime::now_utc() + time::Duration::seconds(2);
+                *expiry.lock().unwrap() = Some(expires);
+                std::fs::write(
+                    &response,
+                    json!({"version": 1,
+                        "credential": {"type": "bearer", "token": "expiring-control-test-only"},
+                        "expires_at": expires.format(&Rfc3339).unwrap()
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                authentication.token().await.unwrap();
+                let credential = identity_credential(&context, &data.origin);
+                let expected = format!("Bearer {}", credential.token);
+                let client = resolve_loaded(None, &context, credential).unwrap();
+                client.list_graphs().await.unwrap();
+                assert_eq!(data.requests().len(), 2);
+                assert_eq!(data.requests()[1].headers["authorization"], expected);
+                assert_eq!(
+                    authentication
+                        .token()
+                        .await
+                        .unwrap_err()
+                        .downcast_ref::<crate::credential_sources::CredentialError>(),
+                    Some(&crate::credential_sources::CredentialError::Expired)
+                );
+                assert_eq!(std::fs::read_to_string(&calls).unwrap(), "called\n");
+                data.assert_complete();
+            })
+            .await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn issuance_reuses_rechecked_store_and_returns_persisted_credential_without_rereading() {
     let mut context = context();
     let cp = IntentApiFixture::with_origin(|origin| {
@@ -813,7 +940,10 @@ fn identity_credential(context: &Context, endpoint: &str) -> Credential {
 }
 
 fn expire_identity(credential: &mut Credential) {
-    let expiry = OffsetDateTime::now_utc().unix_timestamp() - 1;
+    set_identity_expiry(credential, OffsetDateTime::now_utc().unix_timestamp() - 1);
+}
+
+fn set_identity_expiry(credential: &mut Credential, expiry: i64) {
     credential.expires_at = OffsetDateTime::from_unix_timestamp(expiry)
         .unwrap()
         .format(&Rfc3339)
@@ -1434,8 +1564,12 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                 .collect(),
         );
         crate::operator_routing::test_transport_scope(&[&server.origin], async {
-            let client =
-                GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+            let client = GraphClient::managed(
+                &server.origin,
+                "knowledge",
+                crate::credential_sources::test_credential(&server.origin, DATA_TOKEN),
+            )
+            .unwrap();
             let mut completed = 0;
             for (_, expected) in &cases {
                 for operation in operations {
@@ -1510,7 +1644,7 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
             .collect(),
     );
     crate::operator_routing::test_transport_scope(&[&server.origin], async {
-    let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+    let client = GraphClient::managed(&server.origin, "knowledge", crate::credential_sources::test_credential(&server.origin, DATA_TOKEN)).unwrap();
     let mut completed = 0;
     for (status, _) in cases {
         for operation in operations {
@@ -1669,8 +1803,12 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
     let file = tempfile::NamedTempFile::new().unwrap();
     let empty_server = IntentApiFixture::new(vec![]);
     crate::operator_routing::test_transport_scope(&[&empty_server.origin], async {
-        let client =
-            GraphClient::managed(&empty_server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+        let client = GraphClient::managed(
+            &empty_server.origin,
+            "knowledge",
+            crate::credential_sources::test_credential(&empty_server.origin, DATA_TOKEN),
+        )
+        .unwrap();
         file.as_file().set_len(32 * 1024 * 1024 + 1).unwrap();
         assert!(
             client
@@ -1718,8 +1856,12 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
         ] {
             let server = IntentApiFixture::graph(vec![reply]);
             crate::operator_routing::test_transport_scope(&[&server.origin], async {
-                let client =
-                    GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+                let client = GraphClient::managed(
+                    &server.origin,
+                    "knowledge",
+                    crate::credential_sources::test_credential(&server.origin, DATA_TOKEN),
+                )
+                .unwrap();
                 assert!(
                     client
                         .load(

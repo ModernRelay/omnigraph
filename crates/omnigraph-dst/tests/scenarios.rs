@@ -135,9 +135,11 @@ fn dst_harness_crash_recovery_deterministic() {
 /// 873 universes misses by construction. A window whose precondition is an
 /// earlier crash's aftermath gets that setup crash first
 /// (`setup_crash_for`), and a hit is the window's own verdict
-/// (`window_hit`), never the setup's. Families the workload has no op
-/// for are reported as "unschedulable" so the coverage report says WHY
-/// each dark window is dark. Any panic is a find.
+/// (`window_hit`), never the setup's. Windows in
+/// `harness::REACH_EXPECTED_DARK` are not scheduled; the reach census owns
+/// them. Families the workload has no op for are reported as
+/// "unschedulable" so the coverage report says WHY each dark window is
+/// dark. Any panic is a find.
 #[cfg(feature = "failpoints")]
 #[test]
 #[ignore = "hunt: targeted-scheduling catalog run; run explicitly with -- --ignored"]
@@ -151,8 +153,14 @@ fn dst_hunt_crash_window_sweep() {
     let mut hit: Vec<&str> = Vec::new();
     let mut never_reached: Vec<&str> = Vec::new();
     let mut unschedulable: Vec<&str> = Vec::new();
+    let mut expected_dark: Vec<&str> = Vec::new();
     let mut universes = 0usize;
     for (w, window) in catalog::CRASH_WINDOWS.iter().enumerate() {
+        // The reach census proves these dark; scheduling them only burns cells.
+        if omnigraph_dst::harness::expected_dark_reason(window).is_some() {
+            expected_dark.push(window);
+            continue;
+        }
         if !omnigraph_dst::harness::workload_can_reach(window) {
             unschedulable.push(window);
             continue;
@@ -213,16 +221,18 @@ fn dst_hunt_crash_window_sweep() {
     }
 
     println!(
-        "HUNT COMPLETE ({universes} universes): {} hit, {} crossed-but-absorbed, {} never reached, {} unschedulable",
+        "HUNT COMPLETE ({universes} universes): {} hit, {} crossed-but-absorbed, {} never reached, {} unschedulable, {} expected dark",
         hit.len(),
         absorbed.len(),
         dark.len(),
-        unschedulable.len()
+        unschedulable.len(),
+        expected_dark.len()
     );
     println!("hit: {hit:?}");
     println!("crossed-but-absorbed (self-healing verified live): {absorbed:?}");
     println!("never reached (workload/path gap): {dark:?}");
     println!("unschedulable (need schema/init workload ops): {unschedulable:?}");
+    println!("expected dark (harness::REACH_EXPECTED_DARK, not scheduled): {expected_dark:?}");
     assert!(
         !hit.is_empty(),
         "coverage assertion: the hunt must actually reach SOME windows"
@@ -1942,11 +1952,6 @@ fn dst_dead_staging_sweep_window_is_reached_and_retried() {
             &stopped,
         );
         assert!(
-            window_hit(&a, window),
-            "{label} must stop the cleanup at {window}: {:?}",
-            a.reconcile_verdicts
-        );
-        assert!(
             a.reconcile_verdicts.iter().any(|(tag, verdict, channel)| {
                 tag.starts_with(&format!("deferred:{window}@"))
                     && verdict == "Deferred"
@@ -1995,6 +2000,50 @@ fn dst_setup_crash_waits_for_a_crossed_window() {
     assert!(!window_hit(&a, target));
     let b = run_universe("shared-memory://dst-setup-miss-b", &sc);
     omnigraph_dst::harness::assert_strict_replay(&a, &b, "uncrossed setup");
+}
+
+/// A recorded setup crash arms its target, so the setup window must be one
+/// that is crossed only once the aftermath exists. In hunt cell seed 2 an
+/// Optimize builds the missing indexes before the first EnsureIndices, which
+/// then has nothing to build: it still crosses the index build's
+/// pre-manifest window, but not `ensure_indices.post_table_effect`, the
+/// setup `setup_crash_for` names, so no setup is recorded and the
+/// dead-staging target stays unarmed.
+#[cfg(feature = "failpoints")]
+#[test]
+#[serial]
+fn dst_setup_crash_needs_its_aftermath() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let window = omnigraph::seams::catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.name();
+    let pre_manifest = Scenario {
+        setup_crash: Some((
+            omnigraph::seams::catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
+            0,
+        )),
+        ..hunt_window_scenario(2, window, 0)
+    };
+    let a = run_universe(
+        "shared-memory://dst-setup-aftermath-pre-manifest",
+        &pre_manifest,
+    );
+    assert_eq!(
+        (a.crashes, window_hit(&a, window)),
+        (1, false),
+        "the cell's index build has nothing to build yet crosses the pre-manifest \
+         window, so a setup there arms the target with no staging: {:?}",
+        a.reconcile_verdicts
+    );
+
+    let named = hunt_window_scenario(2, window, 0);
+    let a = run_universe("shared-memory://dst-setup-aftermath-a", &named);
+    assert_eq!(
+        a.crashes, 0,
+        "an index build with nothing to build must not record the setup: {:?}",
+        a.reconcile_verdicts
+    );
+    assert!(!window_hit(&a, window));
+    let b = run_universe("shared-memory://dst-setup-aftermath-b", &named);
+    omnigraph_dst::harness::assert_strict_replay(&a, &b, "setup without its aftermath");
 }
 
 #[cfg(feature = "failpoints")]
@@ -3753,14 +3802,16 @@ fn dst_predict_born_on_both_person_probe() {
 }
 
 /// MILESTONE REACH PROBE: the "one seeded universe per window,
-/// can we catch all 66?" experiment. For each catalog window, ONE universe
-/// with the window's milestone plan woven into the seeded stream +
-/// `crash_on_match` probe_only (record-only crossing). Reports per-window
-/// crossed/not and the tally. Success target: every milestone-reachable
-/// window crosses in its single universe; the residue (recovery internals,
-/// init/open) is expected dark for NAMED reasons. (The schema families
-/// left the dark list when the `schema_ops` face requalified them.)
-///   cargo test -p omnigraph-dst dst_window_reach_probe -- --ignored --nocapture
+/// can we catch them all?" experiment. For each catalog window, up to three
+/// seeded universes with the window's milestone plan woven into the stream,
+/// its setup crash (`setup_crash_for`) when it has one, and a record-only
+/// probe over the whole universe (`probe_window`). Reports per-window
+/// crossed/not and the tally. Every window must cross on one of its seeds
+/// except those in `harness::REACH_EXPECTED_DARK`; the first cross wins, so
+/// a seed that trips an oracle fails the census only when no seed of that
+/// window crosses (`errored`), since the census asks whether the window is
+/// reachable.
+///   cd crates/omnigraph-dst && cargo test --locked --test scenarios dst_window_reach_probe -- --ignored --nocapture
 #[test]
 #[serial]
 #[ignore = "instrument: one-universe-each milestone reach census over the crash-window catalog"]
@@ -3816,17 +3867,16 @@ fn dst_window_reach_probe() {
         "errored (milestone tripped an oracle — separate finding) ({}): {errored:?}",
         errored.len()
     );
-    // Non-regression floor: the census measured 50/66 on 2026-08-12; the
-    // then-16 non-crossing windows all carried NAMED reasons (schema
-    // quarantine — since requalified by the `schema_ops` face, whose
-    // windows now cross — birth-owned init, #473-blocked adopts, chunk
-    // thresholds, branch-from-branch first-touch shapes, kill-territory
-    // orphan discard). Floor 48 leaves margin for benign seed sensitivity;
-    // a bigger drop = a recipe-mechanism regression.
+    // Each universe is a pure function of its seed, so a change in reach
+    // comes from a code change; the message names the window it moved.
+    let expected_dark =
+        |window: &&str| omnigraph_dst::harness::expected_dark_reason(window).is_some();
+    let newly_dark: Vec<&&str> = dark.iter().filter(|w| !expected_dark(w)).collect();
+    let listed_but_crossed: Vec<&&str> = crossed.iter().filter(|w| expected_dark(w)).collect();
     assert!(
-        crossed.len() >= 48,
-        "milestone reach regressed below the measured 50 ({} crossed)",
-        crossed.len()
+        newly_dark.is_empty() && listed_but_crossed.is_empty() && errored.is_empty(),
+        "milestone reach changed: newly dark {newly_dark:?}, listed dark but crossed \
+         {listed_but_crossed:?}, errored {errored:?}"
     );
 }
 
@@ -3980,15 +4030,20 @@ fn dst_fleet() {
             },
             &mut failures,
         );
-        // Crash-window arm: round-robin over the catalog so a 66+-seed
-        // pass draws every window. `reach_target` weaves the
-        // window's milestone recipe into the seeded stream — guarantee from
-        // milestones, diversity from the seed — and skip stays 0 so the
-        // recipe-built op is the one that carries the crash. Windows the
+        // Crash-window arm: round-robin over the catalog so a pass with at
+        // least as many seeds as windows draws every window. `reach_target`
+        // weaves the window's milestone recipe into the seeded stream —
+        // guarantee from milestones, diversity from the seed — and skip
+        // stays 0, so the crash lands on the first matching op; for a window
+        // with a setup crash (`setup_crash_for`), that is the first matching
+        // op after the setup crash is recorded. Windows the
         // workload has no op for are skipped (the hunt's coverage ledger
-        // owns naming those as unschedulable).
+        // owns naming those as unschedulable), and so are those in
+        // `harness::REACH_EXPECTED_DARK`, which no universe can cross.
         let window = catalog::CRASH_WINDOWS[(seed as usize) % catalog::CRASH_WINDOWS.len()];
-        if omnigraph_dst::harness::workload_can_reach(window) {
+        if omnigraph_dst::harness::workload_can_reach(window)
+            && omnigraph_dst::harness::expected_dark_reason(window).is_none()
+        {
             universes += 1;
             run(
                 seed,

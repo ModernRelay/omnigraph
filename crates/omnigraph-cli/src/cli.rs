@@ -4,6 +4,7 @@
 pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
 pub(crate) use crate::commands::local::SkillCommand;
+pub(crate) use crate::commands::mcp::McpArgs;
 pub(crate) use crate::commands::targets::{AccessArgs, CredentialCommand, TargetCommand};
 pub(crate) use crate::managed::args::{
     OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
@@ -29,14 +30,12 @@ use crate::embed::EmbedArgs;
 #[command(version = crate::commands::local::output::PACKAGE_VERSION.as_str(), disable_version_flag = true)]
 #[command(
     after_help = "Select resources with --target and account operations with --profile.
-Select standalone server authentication with --auth. --operator-config selects one operator file.
+--operator-config selects one operator file.
 --config supplies deployment sources. Use config validate and target inspect for offline checks."
 )]
 pub(crate) struct Cli {
     #[arg(long, global = true, help = "Named profile for control-plane operations; otherwise defaults.profile", conflicts_with = "target", value_parser = crate::invocation::single_selector("--profile"))]
     pub(crate) profile: Option<String>,
-    #[arg(long, global = true, help = "Authentication on the selected standalone server; otherwise its default_auth", value_parser = crate::invocation::single_selector("--auth"))]
-    pub(crate) auth: Option<String>,
     #[arg(long, global = true, help = "Use this operator configuration file instead of the default, without merging", value_parser = crate::invocation::single_selector("--operator-config"))]
     pub(crate) operator_config: Option<String>,
     /// Named resource target or inline local storage address; otherwise defaults.target.
@@ -44,8 +43,8 @@ pub(crate) struct Cli {
     pub(crate) target: Option<String>,
 
     /// Actor id for direct-engine writes and actor-bound cluster operations;
-    /// On a served write it is an assertion: the
-    /// request carries `omnigraph-if-actor`, and the server refuses it
+    /// On a served write, and on every request `mcp` relays, it is an assertion:
+    /// the request carries `omnigraph-if-actor`, and the server refuses it
     /// before anything runs when the bearer token resolves to another actor.
     /// With a policy configured but no actor set, a direct operation is
     /// denied — see docs/user/operations/policy.md.
@@ -177,15 +176,18 @@ pub(crate) enum Command {
     },
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
-    /// Sign in to a managed profile or register a new profile.
+    /// Sign in to an existing managed profile, or explicitly create one.
     Login {
-        #[arg(long, conflicts_with_all = ["register", "api", "organization"])]
+        #[arg(long, conflicts_with_all = ["create_profile", "api", "organization"])]
         replace_principal: Option<String>,
-        #[arg(long, conflicts_with_all = ["profile", "target"])]
-        register: Option<String>,
-        #[arg(long, conflicts_with_all = ["profile", "target"])]
+        /// Create a new local profile after verifying login and organization selection.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["profile", "target"], value_parser = crate::invocation::single_selector("--create-profile"))]
+        create_profile: Option<String>,
+        /// Control-plane endpoint for the new profile; defaults to https://platform.omnigraph.dev.
+        #[arg(long, requires = "create_profile", conflicts_with_all = ["profile", "target"])]
         api: Option<String>,
-        #[arg(long, conflicts_with_all = ["profile", "target"])]
+        /// Organization to verify when creating the profile; otherwise discover it during login.
+        #[arg(long, requires = "create_profile", conflicts_with_all = ["profile", "target"])]
         organization: Option<String>,
         #[arg(long)]
         json: bool,
@@ -209,6 +211,15 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: CredentialCommand,
     },
+    /// Relay an agent's MCP over stdio to an existing server target's `/mcp`.
+    ///
+    /// For agents that start their tools as child processes. The bridge sends
+    /// the target's stored credential, which the agent never sees, and is
+    /// bound to one graph: `--graph`, else the target's `default_graph`.
+    /// It only connects: a direct target refuses, and it never starts,
+    /// discovers or hosts a server. stdout carries only MCP messages and
+    /// diagnostics go to stderr.
+    Mcp(McpArgs),
     #[command(
         about = "Validate operator configuration, rename bindings, or recover interrupted edits"
     )]

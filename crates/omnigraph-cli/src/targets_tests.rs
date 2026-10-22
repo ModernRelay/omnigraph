@@ -2,31 +2,10 @@ use super::*;
 use crate::operator::{InvocationConfig, parse_operator_config};
 
 #[test]
-fn auth_selection_never_infers_a_sole_profile() {
-    use crate::operator_schema::AuthProfile;
-    let profiles = BTreeMap::from([("only".to_owned(), AuthProfile::Anonymous)]);
-    assert!(crate::operator_routing::choose(&profiles, None, None).is_err());
-    assert_eq!(
-        crate::operator_routing::choose(&profiles, Some("only"), None)
-            .unwrap()
-            .0,
-        "only"
-    );
-    assert_eq!(
-        crate::operator_routing::choose(&profiles, None, Some("only"))
-            .unwrap()
-            .0,
-        "only"
-    );
-    assert!(crate::operator_routing::choose(&profiles, Some("only"), Some("missing")).is_err());
-}
-
-#[test]
 fn explicit_rename_and_principal_replacement_commands_parse_without_legacy_selectors() {
     for args in [
         vec!["config", "rename-profile", "old", "new"],
         vec!["config", "rename-target", "old", "new"],
-        vec!["config", "rename-auth", "server", "served", "old", "new"],
         vec!["config", "recover-rename"],
         vec![
             "login",
@@ -40,6 +19,7 @@ fn explicit_rename_and_principal_replacement_commands_parse_without_legacy_selec
     }
     for args in [
         vec!["config", "rename-connection", "old", "new"],
+        vec!["config", "rename-auth", "server", "served", "old", "new"],
         vec!["config", "rename-auth", "connection", "work", "old", "new"],
         vec!["config", "rename-auth", "profile", "work", "old", "new"],
         vec!["login", "--connection", "work"],
@@ -52,17 +32,18 @@ fn explicit_rename_and_principal_replacement_commands_parse_without_legacy_selec
         vec!["login", "--auth", "me"],
         vec!["login", "--replace-principal", "principal_new"],
     ] {
-        let parsed =
-            crate::invocation::parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
-        assert!(crate::planes::guard_addressing(&parsed.cli).is_err());
+        if let Ok(parsed) = crate::invocation::parse_from(std::iter::once("omnigraph").chain(args))
+        {
+            assert!(crate::planes::guard_addressing(&parsed.cli).is_err());
+        }
     }
 }
 
 #[test]
-fn standalone_server_and_auth_renames_preserve_the_secret_store_binding() {
+fn standalone_target_rename_preserves_the_secret_store_binding() {
     let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("config.yaml"), "version: 1\ntargets:\n  old:\n    kind: server\n    endpoint: https://example.test/prefix\n    auth: {first: {provider: token, source: {store: {}}}}\n    default_auth: first\n").unwrap();
-    let resolve = |target: &str, profile: &str| {
+    std::fs::write(directory.path().join("config.yaml"), "version: 1\ntargets:\n  old:\n    kind: server\n    endpoint: https://example.test/prefix\n    auth: {provider: token, source: {store: {}}}\n").unwrap();
+    let resolve = |target: &str| {
         let input = InvocationConfig::at(Some(directory.path().to_owned()), None);
         let cli = crate::invocation::parse_from([
             "omnigraph",
@@ -70,8 +51,6 @@ fn standalone_server_and_auth_renames_preserve_the_secret_store_binding() {
             "status",
             "--target",
             target,
-            "--auth",
-            profile,
         ])
         .unwrap()
         .cli;
@@ -82,7 +61,8 @@ fn standalone_server_and_auth_renames_preserve_the_secret_store_binding() {
             .unwrap()
             .unwrap()
     };
-    let before = resolve("old", "first");
+    let before = resolve("old");
+    assert_eq!(before.name, "@target");
     let input = InvocationConfig::at(Some(directory.path().to_owned()), None);
     crate::operator_routing::rename(
         &input,
@@ -91,29 +71,16 @@ fn standalone_server_and_auth_renames_preserve_the_secret_store_binding() {
         "new",
     )
     .unwrap();
-    let input = InvocationConfig::at(Some(directory.path().to_owned()), None);
-    crate::operator_routing::rename(
-        &input,
-        crate::operator_routing::Rename::Auth {
-            owner: "new".into(),
-        },
-        "first",
-        "second",
-    )
-    .unwrap();
-    assert_eq!(resolve("new", "second").owner, before.owner);
+    assert_eq!(resolve("new").owner, before.owner);
     assert!(before.ensure_current().is_ok());
 }
 
 #[tokio::test]
 async fn anonymous_loopback_and_store_status_do_not_acquire_credentials() {
     let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("config.yaml"), "version: 1\ntargets:\n  public:\n    kind: server\n    endpoint: http://127.0.0.1:9000/prefix\n    auth: {guest: {provider: anonymous}}\n  private:\n    kind: server\n    endpoint: https://example.test/prefix\n    auth: {saved: {provider: token, source: {store: {}}}}\n").unwrap();
+    std::fs::write(directory.path().join("config.yaml"), "version: 1\ntargets:\n  public:\n    kind: server\n    endpoint: http://127.0.0.1:9000/prefix\n    auth: {provider: anonymous}\n  private:\n    kind: server\n    endpoint: https://example.test/prefix\n    auth: {provider: token, source: {store: {}}}\n").unwrap();
     let input = InvocationConfig::at(Some(directory.path().to_owned()), None);
-    for (name, profile, expected) in [
-        ("public", "guest", "anonymous"),
-        ("private", "saved", "unknown"),
-    ] {
+    for (name, expected) in [("public", "anonymous"), ("private", "unknown")] {
         let cli = crate::invocation::parse_from([
             "omnigraph",
             "credentials",
@@ -121,8 +88,6 @@ async fn anonymous_loopback_and_store_status_do_not_acquire_credentials() {
             "--json",
             "--target",
             name,
-            "--auth",
-            profile,
         ])
         .unwrap()
         .cli;
@@ -138,7 +103,7 @@ async fn anonymous_loopback_and_store_status_do_not_acquire_credentials() {
                 crate::commands::targets::run_credential(
                     &target,
                     crate::commands::targets::CredentialCommand::Status { json: true },
-                    profile,
+                    name,
                     false,
                     &mut std::io::empty(),
                     &mut output,
@@ -167,12 +132,12 @@ async fn supported_owner_and_profile_renames_preserve_custody_and_references() {
     let after = registration_auth(&input, "renamed", "https://api.example/prefix").unwrap();
     assert_eq!(before.owner, after.owner);
     assert_eq!(after.name, "auth");
-    let bindings: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(directory.path().join("config.yaml.bindings.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(bindings.get("profile:work").is_none());
-    let auth_bindings = bindings["profile:renamed"]["profiles"].as_object().unwrap();
+    let bindings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(input.auth_state_path().unwrap()).unwrap()).unwrap();
+    assert!(bindings["owners"].get("profile:work").is_none());
+    let auth_bindings = bindings["owners"]["profile:renamed"]["profiles"]
+        .as_object()
+        .unwrap();
     assert_eq!(auth_bindings.len(), 1);
     assert!(auth_bindings.contains_key("auth"));
     let old_namespace = crate::operator_routing::AUTH
@@ -258,7 +223,7 @@ fn invocation_keeps_one_success_or_failure_snapshot() {
 fn explicit_operator_file_replaces_default_and_resolves_credential_paths() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("config.yaml"), "invalid: [").unwrap();
-    std::fs::write(dir.path().join("chosen.yaml"), "version: 1\ntargets:\n  served:\n    kind: server\n    endpoint: https://example.test/prefix\n    auth: {me: {provider: token, source: {file: ./secret}}}\n").unwrap();
+    std::fs::write(dir.path().join("chosen.yaml"), "version: 1\ntargets:\n  served:\n    kind: server\n    endpoint: https://example.test/prefix\n    auth: {provider: token, source: {file: ./secret}}\n").unwrap();
     let input = InvocationConfig::at(Some(dir.path().to_owned()), None)
         .with_path(Some("chosen.yaml"), dir.path());
     let config = input.get(&mut Vec::new()).unwrap();
@@ -269,7 +234,7 @@ fn explicit_operator_file_replaces_default_and_resolves_credential_paths() {
     };
     let crate::operator_schema::AuthProfile::Token {
         source: crate::operator_schema::TokenSource::File { file },
-    } = &auth["me"]
+    } = auth
     else {
         panic!()
     };
@@ -277,24 +242,16 @@ fn explicit_operator_file_replaces_default_and_resolves_credential_paths() {
 }
 
 #[tokio::test]
-async fn owner_profiles_capture_one_credential_and_never_fall_back() {
+async fn server_targets_capture_one_credential_and_never_fall_back() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.yaml"), "version: 1\ntargets:\n  served:\n    kind: server\n    endpoint: https://example.test/prefix\n    default_graph: knowledge\n    auth:\n      first: {provider: token, source: {file: ./first}}\n      second: {provider: token, source: {file: ./second}}\n").unwrap();
+    std::fs::write(dir.path().join("config.yaml"), "version: 1\ntargets:\n  first:\n    kind: server\n    endpoint: https://example.test/prefix\n    default_graph: knowledge\n    auth: {provider: token, source: {file: ./first}}\n  second:\n    kind: server\n    endpoint: https://example.test/prefix\n    default_graph: knowledge\n    auth: {provider: token, source: {file: ./second}}\n").unwrap();
     std::fs::write(dir.path().join("first"), "first-token\n").unwrap();
     let input = InvocationConfig::at(Some(dir.path().to_owned()), None);
     let resolve = |profile| {
-        let cli = crate::invocation::parse_from([
-            "omnigraph",
-            "query",
-            "-e",
-            "q",
-            "--target",
-            "served",
-            "--auth",
-            profile,
-        ])
-        .unwrap()
-        .cli;
+        let cli =
+            crate::invocation::parse_from(["omnigraph", "query", "-e", "q", "--target", profile])
+                .unwrap()
+                .cli;
         let target = crate::scope::resolve(&cli, &input, dir.path(), false, &mut Vec::new())
             .unwrap()
             .unwrap();
@@ -307,6 +264,20 @@ async fn owner_profiles_capture_one_credential_and_never_fall_back() {
     assert_ne!(first.owner, second.owner);
     assert_eq!(first.token().await.unwrap().as_deref(), Some("first-token"));
     std::fs::write(dir.path().join("first"), "rotated-token\n").unwrap();
+    assert_eq!(first.token().await.unwrap().as_deref(), Some("first-token"));
+    // A long-lived client reads the rotated source again for its endpoint
+    // only, and the invocation's own credential is unchanged.
+    let route = first.owner.route().to_owned();
+    assert_eq!(
+        first.reacquire(&route).await.unwrap().as_deref(),
+        Some("rotated-token")
+    );
+    assert!(
+        first
+            .reacquire("https://example.test/sibling/")
+            .await
+            .is_err()
+    );
     assert_eq!(first.token().await.unwrap().as_deref(), Some("first-token"));
     assert!(second.token().await.is_err());
     let next = resolve("first");
@@ -371,7 +342,7 @@ fn request_scope_cannot_leave_the_frozen_base_prefix() {
 }
 
 #[test]
-fn selected_root_profile_keeps_nested_boundaries_without_borrowing_other_profiles() {
+fn selected_root_target_keeps_nested_boundaries_without_borrowing_other_targets() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
     std::fs::write(
@@ -381,20 +352,15 @@ targets:
   parent:
     kind: server
     endpoint: https://example.test/api
-    default_auth: public
-    auth:
-      public: {provider: anonymous}
-      private: {provider: token, source: {env: UNUSED_TOKEN}}
+    auth: {provider: token, source: {env: UNUSED_TOKEN}}
   alternate:
     kind: server
     endpoint: https://example.test/api
-    default_auth: public
-    auth: {public: {provider: anonymous}}
+    auth: {provider: anonymous}
   child:
     kind: server
     endpoint: https://example.test/api/graphs/private
-    default_auth: public
-    auth: {public: {provider: anonymous}}
+    auth: {provider: anonymous}
 "#,
     )
     .unwrap();

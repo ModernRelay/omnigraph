@@ -82,15 +82,12 @@ pub(super) fn validate(config: &mut OperatorConfig, base: &Path) -> Result<(), C
             }
             Target::Server {
                 endpoint: route,
-                auth: profiles,
-                default_auth,
+                auth,
                 transport: network,
                 default_graph,
             } => {
-                auth(profiles, default_auth, false, base, &path)?;
-                let anonymous = profiles
-                    .values()
-                    .all(|p| matches!(p, AuthProfile::Anonymous));
+                auth_provider(auth, false, base, &format!("{path}.auth"))?;
+                let anonymous = matches!(auth, AuthProfile::Anonymous);
                 *route = endpoint(route, anonymous, &format!("{path}.endpoint"))?;
                 transport(network, base, &path)?;
                 graph(default_graph, true, &path)?;
@@ -168,30 +165,6 @@ fn graph_id(value: &str, served: bool, path: &str) -> Result<(), ConfigError> {
 fn graph(value: &Option<String>, served: bool, path: &str) -> Result<(), ConfigError> {
     if let Some(value) = value {
         graph_id(value, served, &format!("{path}.default_graph"))?;
-    }
-    Ok(())
-}
-
-fn auth(
-    profiles: &mut BTreeMap<String, AuthProfile>,
-    default: &Option<String>,
-    managed: bool,
-    base: &Path,
-    path: &str,
-) -> Result<(), ConfigError> {
-    if profiles.is_empty() {
-        return Err(invalid(
-            path,
-            "auth must declare at least one named profile",
-        ));
-    }
-    if let Some(default) = default {
-        reference(default, profiles, &format!("{path}.default_auth"))?;
-    }
-    for (key, profile) in profiles {
-        let path = format!("{path}.auth.{key}");
-        name(key, &path)?;
-        auth_provider(profile, managed, base, &path)?;
     }
     Ok(())
 }

@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod data_tokens;
+pub mod oidc;
 
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::env;

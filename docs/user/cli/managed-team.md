@@ -109,7 +109,7 @@ The teammate registers their own profile, discovers the cluster and registers
 its service-attested resource identity:
 
 ```sh
-omnigraph login --register work
+omnigraph login --create-profile work
 omnigraph cluster list --profile work
 omnigraph target add production --profile work --cluster CLUSTER_ID
 omnigraph target inspect production --resolved

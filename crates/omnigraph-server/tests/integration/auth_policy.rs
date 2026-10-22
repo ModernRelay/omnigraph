@@ -7,7 +7,7 @@ use std::fs;
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use axum::http::{HeaderValue, Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
@@ -1012,6 +1012,199 @@ async fn protected_routes_require_bearer_token() {
         error.code,
         Some(omnigraph_server::api::ErrorCode::Unauthorized)
     );
+}
+
+/// A concrete request path for a documented operation: `default` for the
+/// graph, any value for another parameter (authentication precedes lookup).
+fn concrete_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| match segment {
+            "{graph_id}" => "default",
+            segment if segment.starts_with('{') => "x",
+            segment => segment,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Every protected operation the served OpenAPI document declares answers a
+/// request without a usable credential with 401 and the server's one bearer
+/// challenge, and the document records that header on the 401. `/mcp` and the
+/// engine catalogue, outside the document, answer the same. The operations
+/// come from the document, so a newly declared route is covered as declared.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_1020_every_401_carries_the_one_bearer_challenge() {
+    let doc = serde_json::to_value(omnigraph_server::served_openapi()).unwrap();
+    let mut routes = Vec::new();
+    for (path, item) in doc["paths"].as_object().unwrap() {
+        for (method, operation) in item.as_object().unwrap() {
+            if operation["security"].as_array().is_none_or(Vec::is_empty) {
+                continue;
+            }
+            assert_eq!(
+                operation["responses"]["401"]["headers"]["WWW-Authenticate"]["schema"]["type"],
+                "string",
+                "{method} {path} documents no challenge on its 401"
+            );
+            routes.push((method.to_uppercase(), concrete_path(path)));
+        }
+    }
+    // The document reaches every router that authenticates.
+    for (method, path) in [
+        ("GET", "/graphs"),
+        ("GET", "/graphs/discovery"),
+        ("POST", "/cluster/plan"),
+        ("GET", "/cluster/deployments"),
+        ("GET", "/graphs/default/snapshot"),
+        ("HEAD", "/graphs/default/blob"),
+    ] {
+        assert!(
+            routes.iter().any(|(m, p)| m == method && p == path),
+            "{method} {path} missing from the protected operations"
+        );
+    }
+    routes.push(("POST".into(), "/graphs/og_catalog/query".into()));
+    routes.push(("POST".into(), "/mcp".into()));
+
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path()).to_string_lossy().to_string();
+    let policy = temp.path().join("policy.yaml");
+    fs::write(&policy, permit_all_policy_yaml(&["default"])).unwrap();
+    let open = || async {
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.clone(),
+            vec![("default".into(), "secret".into())],
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+    };
+    let signed = data_tokens::DataTokens::new();
+    let servers = [
+        ("static", build_app(open().await), None),
+        (
+            "signed",
+            build_app(open().await.with_data_token_trust(signed.trust.clone())),
+            None,
+        ),
+        (
+            "oidc",
+            build_app(
+                open()
+                    .await
+                    .with_oidc_identity_trust(oidc::trust(temp.path())),
+            ),
+            Some(oidc::RESOURCE_METADATA),
+        ),
+    ];
+    let wrong_audience = format!(
+        "Bearer {}",
+        oidc::token("alice", "https://data.example/clusters/B/incarnations/one")
+    );
+    // (Authorization values, whether a bearer credential was presented)
+    let credentials: [(Vec<&str>, bool); 6] = [
+        (vec![], false),
+        (vec!["Basic YWxpY2U6eA=="], false),
+        (vec!["Bearer wrong"], true),
+        (vec!["bearer wrong"], true),
+        (vec![wrong_audience.as_str()], true),
+        // Several values are not a single credential: asked for one, not refused.
+        (vec!["Bearer secret", "Bearer secret"], false),
+    ];
+
+    let mut mismatched = Vec::new();
+    for (server, app, metadata) in &servers {
+        for (method, uri) in &routes {
+            for (values, presented) in &credentials {
+                let mut request = Request::builder()
+                    .method(Method::from_bytes(method.as_bytes()).unwrap())
+                    .uri(uri)
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .header("content-type", "application/json");
+                for value in values {
+                    request = request.header(AUTHORIZATION, *value);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::from("{}")).unwrap())
+                    .await
+                    .unwrap();
+                let error = if *presented {
+                    "error=\"invalid_token\""
+                } else {
+                    ""
+                };
+                let expected = match metadata {
+                    None if error.is_empty() => "Bearer".to_string(),
+                    None => format!("Bearer {error}"),
+                    Some(url) if error.is_empty() => format!("Bearer resource_metadata=\"{url}\""),
+                    Some(url) => format!("Bearer {error}, resource_metadata=\"{url}\""),
+                };
+                let challenge = response.headers().get(WWW_AUTHENTICATE);
+                if response.status() != StatusCode::UNAUTHORIZED
+                    || challenge.map(HeaderValue::as_bytes) != Some(expected.as_bytes())
+                {
+                    mismatched.push(format!(
+                        "{server} {method} {uri} {values:?}: {} {challenge:?}, expected {expected}",
+                        response.status()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(mismatched.is_empty(), "{mismatched:#?}");
+
+    // The scheme is case-insensitive and spaces separate it from the token, on
+    // every credential source: the same reading accepts what it would refuse.
+    let identity = format!("bearer {}", signed.identity_token());
+    for (server, app, _) in &servers {
+        for value in [
+            "bearer secret",
+            "BEARER secret",
+            "Bearer   secret",
+            identity.as_str(),
+        ] {
+            let request = Request::builder()
+                .uri("/graphs/default/branches")
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header(AUTHORIZATION, value)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            // The signed identity has no policy grant; it authenticates where
+            // its trust is installed and is refused elsewhere.
+            let expected = if value == identity {
+                if *server == "signed" {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            } else {
+                StatusCode::OK
+            };
+            assert_eq!(response.status(), expected, "{server} {value}");
+            assert_eq!(
+                response.headers().contains_key(WWW_AUTHENTICATE),
+                expected == StatusCode::UNAUTHORIZED,
+                "{server} {value}"
+            );
+        }
+    }
+
+    // A server without authentication answers discovery, which needs an
+    // identity it can never resolve, with 401 and a challenge too.
+    let (_open_temp, open_app) = app_for_loaded_graph().await;
+    let response = open_app
+        .oneshot(
+            Request::get("/graphs/discovery")
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -44,16 +44,13 @@ pub(crate) fn parse(text: &str, base: &Path) -> Result<crate::operator::Operator
             Target::Server {
                 endpoint,
                 auth,
-                default_auth,
                 default_graph,
                 ..
             } => {
                 entry.kind = TargetKind::Server;
                 entry.endpoint = Some(endpoint.clone());
                 entry.default_graph = default_graph.clone();
-                let anonymous = choose(auth, default_auth.as_deref(), None)
-                    .is_ok_and(|(_, p)| matches!(p, AuthProfile::Anonymous));
-                if anonymous {
+                if matches!(auth, AuthProfile::Anonymous) {
                     entry.auth = Some(TargetAuth::Anonymous);
                 } else {
                     entry.credential = Some(name.clone());
@@ -121,22 +118,6 @@ pub(crate) fn parse(text: &str, base: &Path) -> Result<crate::operator::Operator
     })
 }
 
-pub(crate) fn choose<'a>(
-    profiles: &'a BTreeMap<String, AuthProfile>,
-    default: Option<&'a str>,
-    explicit: Option<&'a str>,
-) -> Result<(&'a str, &'a AuthProfile)> {
-    let name = explicit.or(default).ok_or_else(|| {
-        eyre!("select --auth PROFILE or configure default_auth on the selected owner")
-    })?;
-    Ok((
-        name,
-        profiles
-            .get(name)
-            .ok_or_else(|| eyre!("unknown auth profile '{name}' on the selected owner"))?,
-    ))
-}
-
 #[derive(Debug)]
 pub(crate) struct Authentication {
     pub(crate) owner: OwnerBinding,
@@ -161,14 +142,15 @@ impl Authentication {
     }
 
     pub(crate) fn ensure_current(&self) -> Result<()> {
-        let _config_lock = crate::targets::ConfigEditLock::acquire(&self.ids.config_path)?;
+        let _lock = lock_state(&self.ids.path)?;
         check_rename_pending(&self.ids.config_path)?;
-        let _lock = crate::targets::ConfigEditLock::acquire(&self.ids.path)?;
-        let text =
-            crate::operator::read_operator_file(&self.ids.path, "owner/profile binding metadata")?
-                .ok_or_else(|| eyre!("profile binding disappeared"))?;
-        let records: BTreeMap<String, OwnerRecord> = serde_json::from_str(&text)?;
-        let current = records
+        check_state_rename_pending(&self.ids.path)?;
+        let (text, state) = binding_state(&self.ids.config_path, &self.ids.path)?;
+        if text.is_none() {
+            bail!("profile binding disappeared");
+        }
+        let current = state
+            .owners
             .values()
             .find(|owner| owner.id == self.ids.owner)
             .and_then(|owner| {
@@ -183,14 +165,15 @@ impl Authentication {
         Ok(())
     }
     pub(crate) fn invalidate(&self) -> Result<()> {
-        let _config_lock = crate::targets::ConfigEditLock::acquire(&self.ids.config_path)?;
+        let _lock = lock_state(&self.ids.path)?;
         check_rename_pending(&self.ids.config_path)?;
-        let _lock = crate::targets::ConfigEditLock::acquire(&self.ids.path)?;
-        let text =
-            crate::operator::read_operator_file(&self.ids.path, "owner/profile binding metadata")?
-                .ok_or_else(|| eyre!("owner/profile binding metadata disappeared"))?;
-        let mut records: BTreeMap<String, OwnerRecord> = serde_json::from_str(&text)?;
-        let profile = records
+        check_state_rename_pending(&self.ids.path)?;
+        let (text, mut state) = binding_state(&self.ids.config_path, &self.ids.path)?;
+        if text.is_none() {
+            bail!("owner/profile binding metadata disappeared");
+        }
+        let profile = state
+            .owners
             .get_mut(&self.ids.key)
             .and_then(|owner| owner.profiles.get_mut(&self.name))
             .ok_or_else(|| eyre!("selected profile binding disappeared"))?;
@@ -201,53 +184,98 @@ impl Authentication {
             .epoch
             .checked_add(1)
             .ok_or_else(|| eyre!("credential generation exhausted"))?;
-        crate::targets::replace_file(&self.ids.path, &serde_json::to_string(&records)?)
+        crate::targets::replace_file(&self.ids.path, &serde_json::to_string(&state)?)
+    }
+    /// The selected source's credential, read from it now.
+    async fn acquire(&self) -> Result<credentials::AcquiredCredential> {
+        Ok(match &self.profile {
+            AuthProfile::Token {
+                source: TokenSource::Env { env },
+            } => credentials::acquire_environment(&self.request, env)?,
+            AuthProfile::Token {
+                source: TokenSource::File { file },
+            } => credentials::acquire_file(&self.request, file)?,
+            AuthProfile::Token {
+                source: TokenSource::Store { .. },
+            } => {
+                self.acquire_stored_with(
+                    &credentials::OsSecretStore,
+                    crate::managed::credential_lock(),
+                )
+                .await?
+            }
+            AuthProfile::Exec { command, timeout } => {
+                credentials::acquire_exec(
+                    &self.request,
+                    &credentials::ExecSource::new(command.clone(), timeout)?,
+                )
+                .await?
+            }
+            _ => bail!("selected provider does not supply a static bearer"),
+        })
     }
     pub(crate) async fn token(&self) -> Result<Option<String>> {
+        self.acquire_credential()
+            .await?
+            .map(|credential| {
+                Ok(credential
+                    .bearer_for(&self.request, time::OffsetDateTime::now_utc())?
+                    .expose()
+                    .to_owned())
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn acquire_credential(
+        &self,
+    ) -> Result<Option<credentials::AcquiredCredential>> {
         if matches!(
             self.profile,
             AuthProfile::Anonymous | AuthProfile::Omnigraph
         ) {
             return Ok(None);
         }
-        let credential = self
-            .credential
-            .get_or_try_init(|| async {
-                Ok::<_, color_eyre::Report>(match &self.profile {
-                    AuthProfile::Token {
-                        source: TokenSource::Env { env },
-                    } => credentials::acquire_environment(&self.request, env)?,
-                    AuthProfile::Token {
-                        source: TokenSource::File { file },
-                    } => credentials::acquire_file(&self.request, file)?,
-                    AuthProfile::Token {
-                        source: TokenSource::Store { .. },
-                    } => {
-                        self.acquire_stored_with(
-                            &credentials::OsSecretStore,
-                            crate::managed::credential_lock(),
-                        )
-                        .await?
-                    }
-                    AuthProfile::Exec { command, timeout } => {
-                        credentials::acquire_exec(
-                            &self.request,
-                            &credentials::ExecSource::new(command.clone(), timeout)?,
-                        )
-                        .await?
-                    }
-                    _ => bail!("selected provider does not supply a static bearer"),
-                })
-            })
-            .await?;
+        let credential = self.credential.get_or_try_init(|| self.acquire()).await?;
+        credential.bearer_for(&self.request, time::OffsetDateTime::now_utc())?;
+        Ok(Some(credential.clone()))
+    }
+    /// The selected credential read from its source again, for a long-lived
+    /// client whose server refused the one it holds. The credential this
+    /// invocation acquired is unchanged. A stored credential replaced since
+    /// the invocation began is of another generation, and refuses.
+    pub(crate) async fn reacquire(&self, endpoint: &str) -> Result<Option<String>> {
+        if endpoint != self.owner.route() {
+            bail!("credential destination differs from the frozen owner");
+        }
+        if matches!(
+            self.profile,
+            AuthProfile::Anonymous | AuthProfile::Omnigraph
+        ) {
+            return Ok(None);
+        }
         Ok(Some(
-            credential
+            self.acquire()
+                .await?
                 .bearer_for(&self.request, time::OffsetDateTime::now_utc())?
                 .expose()
                 .to_owned(),
         ))
     }
     pub(crate) fn cached_token(&self, endpoint: &str) -> Result<Option<String>> {
+        self.cached_credential(endpoint)?
+            .map(|credential| {
+                Ok(credential
+                    .bearer_for(&self.request, time::OffsetDateTime::now_utc())?
+                    .expose()
+                    .to_owned())
+            })
+            .transpose()
+    }
+
+    pub(crate) fn cached_credential(
+        &self,
+        endpoint: &str,
+    ) -> Result<Option<credentials::AcquiredCredential>> {
         if endpoint != self.owner.route() {
             bail!("credential destination differs from the frozen owner");
         }
@@ -258,12 +286,8 @@ impl Authentication {
             .credential
             .get()
             .ok_or_else(|| eyre!("selected credential has not been acquired"))?;
-        Ok(Some(
-            acquired
-                .bearer_for(&self.request, time::OffsetDateTime::now_utc())?
-                .expose()
-                .to_owned(),
-        ))
+        acquired.bearer_for(&self.request, time::OffsetDateTime::now_utc())?;
+        Ok(Some(acquired.clone()))
     }
 }
 
@@ -648,9 +672,6 @@ pub(crate) fn authentication(
             | crate::targets::TargetBinding::DirectRoot { .. }
             | crate::targets::TargetBinding::DirectCatalogue
     ) {
-        if cli.auth.is_some() {
-            bail!("direct targets do not accept --auth");
-        }
         return Ok(None);
     }
     let config = input.get(&mut std::io::sink())?;
@@ -660,11 +681,6 @@ pub(crate) fn authentication(
         .ok_or_else(|| eyre!("operator configuration requires version: 1"))?;
     let (kind, name, route, org, auth_name, profile) = match &target.binding {
         crate::targets::TargetBinding::Managed(binding) => {
-            if cli.auth.is_some() {
-                bail!(
-                    "managed profiles own one authentication configuration; select --profile instead of --auth"
-                );
-            }
             let name = if binding.cluster.is_none() {
                 cli.profile
                     .as_deref()
@@ -695,31 +711,19 @@ pub(crate) fn authentication(
             )
         }
         crate::targets::TargetBinding::Server { .. } => match source.targets.get(target.label()) {
-            Some(Target::Server {
+            Some(Target::Server { endpoint, auth, .. }) => (
+                OwnerKind::Server,
+                target.label(),
                 endpoint,
+                None,
+                // Reserved outside the operator-name grammar: a flat target
+                // never adopts a legacy named-auth credential by coincidence.
+                "@target",
                 auth,
-                default_auth,
-                ..
-            }) => {
-                let (auth_name, profile) =
-                    choose(auth, default_auth.as_deref(), cli.auth.as_deref())?;
-                (
-                    OwnerKind::Server,
-                    target.label(),
-                    endpoint,
-                    None,
-                    auth_name,
-                    profile,
-                )
-            }
+            ),
             _ => bail!("served access requires a configured server target"),
         },
-        _ => {
-            if cli.auth.is_some() {
-                bail!("direct targets do not accept --auth");
-            }
-            return Ok(None);
-        }
+        _ => return Ok(None),
     };
     if matches!(profile, AuthProfile::Anonymous) {
         return Ok(None);
@@ -820,6 +824,92 @@ struct ProfileRecord {
     epoch: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindingState {
+    version: u32,
+    // Old metadata may remain beside a read-only document. Its captured bytes
+    // never become a second writer: later changes must be reconciled explicitly.
+    legacy_sha256: Option<String>,
+    owners: BTreeMap<String, OwnerRecord>,
+}
+
+fn parse_binding_state(text: &str, legacy: Option<&str>) -> Result<BindingState> {
+    let state: BindingState = serde_json::from_str(text)?;
+    if state.version != 1
+        || state.legacy_sha256.as_ref().is_some_and(|digest| {
+            digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        bail!("invalid credential binding state");
+    }
+    if let Some(legacy) = legacy {
+        let digest = format!("{:x}", Sha256::digest(legacy.as_bytes()));
+        if state.legacy_sha256.as_ref() != Some(&digest) {
+            bail!(
+                "legacy credential bindings conflict with migrated local state; preserve both files and reconcile them before continuing"
+            );
+        }
+    }
+    Ok(state)
+}
+
+fn binding_state(config: &Path, path: &Path) -> Result<(Option<String>, BindingState)> {
+    let text = crate::operator::read_operator_file(path, "credential binding state")?;
+    let legacy = crate::operator::read_operator_file(
+        &adjacent(config, ".bindings.json"),
+        "legacy credential bindings",
+    )?;
+    let state = match &text {
+        Some(text) => parse_binding_state(text, legacy.as_deref())?,
+        None => BindingState {
+            version: 1,
+            legacy_sha256: legacy
+                .as_ref()
+                .map(|text| format!("{:x}", Sha256::digest(text.as_bytes()))),
+            owners: legacy
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or_default(),
+        },
+    };
+    Ok((text, state))
+}
+
+fn lock_state(path: &Path) -> Result<crate::targets::ConfigEditLock> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| eyre!("credential state path has no parent"))?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(directory)?;
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("credential state requires a private local directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            bail!("credential state directory must be owned by the current user and private");
+        }
+    }
+    crate::targets::ConfigEditLock::acquire(path)
+}
+
+pub(crate) fn lock_auth_state(
+    input: &crate::operator::InvocationConfig,
+) -> Result<crate::targets::ConfigEditLock> {
+    lock_state(&input.auth_state_path()?)
+}
+
 #[derive(Debug)]
 struct BindingIds {
     config_path: std::path::PathBuf,
@@ -848,25 +938,15 @@ fn owner_ids(
     let config_path = input
         .config_path()
         .ok_or_else(|| eyre!("owner binding requires an operator configuration path"))?;
-    let _config_lock = crate::targets::ConfigEditLock::acquire(&config_path)?;
-    check_rename_pending(&config_path)?;
+    let path = input.auth_state_path()?;
+    let _lock = lock_auth_state(input)?;
+    input.check_rename_pending()?;
     let captured = input.get(&mut std::io::sink())?;
     let current = crate::operator::load_operator_config_at(&config_path)?;
     if current.schema != captured.schema {
         bail!("configuration changed after invocation capture; retry with a fresh binding");
     }
-    let mut path = input
-        .config_path()
-        .ok_or_else(|| eyre!("owner binding requires an operator configuration path"))?
-        .into_os_string();
-    path.push(".bindings.json");
-    let path = std::path::PathBuf::from(path);
-    let _lock = crate::targets::ConfigEditLock::acquire(&path)?;
-    let text = crate::operator::read_operator_file(&path, "owner/profile binding metadata")?;
-    let mut records: BTreeMap<String, OwnerRecord> = match &text {
-        Some(text) => serde_json::from_str(text)?,
-        None => BTreeMap::new(),
-    };
+    let (text, mut state) = binding_state(&config_path, &path)?;
     let key = format!(
         "{}:{name}",
         if kind == OwnerKind::Profile {
@@ -875,10 +955,13 @@ fn owner_ids(
             "server"
         }
     );
-    let record = records.entry(key.clone()).or_insert_with(|| OwnerRecord {
-        id: uuid::Uuid::new_v4().to_string(),
-        profiles: BTreeMap::new(),
-    });
+    let record = state
+        .owners
+        .entry(key.clone())
+        .or_insert_with(|| OwnerRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            profiles: BTreeMap::new(),
+        });
     let profile = record
         .profiles
         .entry(profile.into())
@@ -891,7 +974,7 @@ fn owner_ids(
     if uuid::Uuid::parse_str(&owner).is_err() || uuid::Uuid::parse_str(&profile.id).is_err() {
         bail!("invalid owner/profile binding metadata");
     }
-    let after = serde_json::to_string(&records)?;
+    let after = serde_json::to_string(&state)?;
     if text.as_deref() != Some(&after) {
         crate::targets::replace_file(&path, &after)?;
     }
@@ -908,7 +991,6 @@ fn owner_ids(
 pub(crate) enum Rename {
     Profile,
     Target,
-    Auth { owner: String },
 }
 
 fn adjacent(path: &Path, suffix: &str) -> std::path::PathBuf {
@@ -918,9 +1000,15 @@ fn adjacent(path: &Path, suffix: &str) -> std::path::PathBuf {
 }
 
 pub(crate) fn check_rename_pending(path: &Path) -> Result<()> {
-    if crate::operator::read_operator_file(&adjacent(path, ".rename.json"), "rename journal")?
-        .is_some()
-    {
+    check_journal_pending(&adjacent(path, ".rename.json"))
+}
+
+pub(crate) fn check_state_rename_pending(path: &Path) -> Result<()> {
+    check_journal_pending(&adjacent(path, ".rename.json"))
+}
+
+fn check_journal_pending(path: &Path) -> Result<()> {
+    if crate::operator::read_operator_file(path, "rename journal")?.is_some() {
         bail!(
             "configuration rename is incomplete; run config recover-rename with this --operator-config"
         );
@@ -967,19 +1055,13 @@ pub(crate) fn rename(
         .config_path()
         .ok_or_else(|| eyre!("no operator configuration path"))?;
     let _config_lock = crate::targets::ConfigEditLock::acquire(&path)?;
-    check_rename_pending(&path)?;
-    let bindings_path = adjacent(&path, ".bindings.json");
-    let _bindings_lock = crate::targets::ConfigEditLock::acquire(&bindings_path)?;
+    let _bindings_lock = lock_auth_state(input)?;
+    input.check_rename_pending()?;
+    let bindings_path = input.auth_state_path()?;
     let before_config = crate::operator::read_operator_file(&path, "operator configuration")?
         .ok_or_else(|| eyre!("operator configuration is missing"))?;
     let mut config = schema::parse(&before_config, path.parent().unwrap())?;
-    let before_bindings =
-        crate::operator::read_operator_file(&bindings_path, "owner/profile bindings")?;
-    let mut records: BTreeMap<String, OwnerRecord> = before_bindings
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()?
-        .unwrap_or_default();
+    let (before_bindings, mut state) = binding_state(&path, &bindings_path)?;
     let owner_move = match kind {
         Rename::Profile => {
             move_entry(&mut config.profiles, from, to)?;
@@ -1004,33 +1086,13 @@ pub(crate) fn rename(
             }
             server.then(|| (format!("server:{from}"), format!("server:{to}")))
         }
-        Rename::Auth { owner } => {
-            let (profiles, default) = match config.targets.get_mut(&owner) {
-                Some(Target::Server {
-                    auth, default_auth, ..
-                }) => (auth, default_auth),
-                _ => bail!("auth rename requires a standalone server owner"),
-            };
-            move_entry(profiles, from, to)?;
-            rename_default(default, from, to);
-            let key = format!("server:{owner}");
-            if let Some(record) = records.get_mut(&key) {
-                if record.profiles.contains_key(to) {
-                    bail!("destination profile has retained custody; choose another name");
-                }
-                if record.profiles.contains_key(from) {
-                    move_entry(&mut record.profiles, from, to)?;
-                }
-            }
-            None
-        }
     };
     if let Some((from, to)) = owner_move {
-        if records.contains_key(&to) {
+        if state.owners.contains_key(&to) {
             bail!("destination owner has retained custody; choose another name");
         }
-        if records.contains_key(&from) {
-            move_entry(&mut records, &from, &to)?;
+        if state.owners.contains_key(&from) {
+            move_entry(&mut state.owners, &from, &to)?;
         }
     }
     let after_config = yaml_serde::to_string(&config)?;
@@ -1039,19 +1101,22 @@ pub(crate) fn rename(
         before_config,
         after_config,
         before_bindings,
-        after_bindings: serde_json::to_string(&records)?,
+        after_bindings: serde_json::to_string(&state)?,
     };
-    crate::targets::replace_file(
-        &adjacent(&path, ".rename.json"),
-        &serde_json::to_string(&journal)?,
-    )?;
-    finish_rename(&path, &journal)
+    let journal_path = adjacent(&bindings_path, ".rename.json");
+    crate::targets::replace_file(&journal_path, &serde_json::to_string(&journal)?)?;
+    finish_rename(&path, &bindings_path, &journal_path, &journal, false)
 }
 
-fn finish_rename(path: &Path, journal: &RenameJournal) -> Result<()> {
+fn finish_rename(
+    path: &Path,
+    bindings_path: &Path,
+    journal_path: &Path,
+    journal: &RenameJournal,
+    legacy: bool,
+) -> Result<()> {
     let config = crate::operator::read_operator_file(path, "operator configuration")?;
-    let bindings_path = adjacent(path, ".bindings.json");
-    let bindings = crate::operator::read_operator_file(&bindings_path, "owner/profile bindings")?;
+    let bindings = crate::operator::read_operator_file(bindings_path, "owner/profile bindings")?;
     if ![
         Some(journal.before_config.as_str()),
         Some(journal.after_config.as_str()),
@@ -1068,10 +1133,23 @@ fn finish_rename(path: &Path, journal: &RenameJournal) -> Result<()> {
         );
     }
     schema::parse(&journal.after_config, path.parent().unwrap())?;
-    let _: BTreeMap<String, OwnerRecord> = serde_json::from_str(&journal.after_bindings)?;
-    crate::targets::replace_file(&bindings_path, &journal.after_bindings)?;
+    if legacy {
+        let _: BTreeMap<String, OwnerRecord> = serde_json::from_str(&journal.after_bindings)?;
+    } else {
+        let old = crate::operator::read_operator_file(
+            &adjacent(path, ".bindings.json"),
+            "legacy credential bindings",
+        )?;
+        parse_binding_state(&journal.after_bindings, old.as_deref())?;
+    }
+    crate::targets::replace_file(bindings_path, &journal.after_bindings)?;
     crate::targets::replace_file(path, &journal.after_config)?;
-    std::fs::remove_file(adjacent(path, ".rename.json"))?;
+    std::fs::remove_file(journal_path)?;
+    crate::sync_dir(
+        journal_path
+            .parent()
+            .ok_or_else(|| eyre!("rename journal has no parent"))?,
+    )?;
     Ok(())
 }
 
@@ -1080,17 +1158,230 @@ pub(crate) fn recover_rename(input: &crate::operator::InvocationConfig) -> Resul
         .config_path()
         .ok_or_else(|| eyre!("no operator configuration path"))?;
     let _config_lock = crate::targets::ConfigEditLock::acquire(&path)?;
-    let _bindings_lock =
-        crate::targets::ConfigEditLock::acquire(&adjacent(&path, ".bindings.json"))?;
-    let text =
-        crate::operator::read_operator_file(&adjacent(&path, ".rename.json"), "rename journal")?
-            .ok_or_else(|| eyre!("no pending rename"))?;
-    finish_rename(&path, &serde_json::from_str(&text)?)
+    let _bindings_lock = lock_auth_state(input)?;
+    let state_path = input.auth_state_path()?;
+    let journal_path = adjacent(&state_path, ".rename.json");
+    let text = crate::operator::read_operator_file(&journal_path, "rename journal")?;
+    let old_journal_path = adjacent(&path, ".rename.json");
+    let old = crate::operator::read_operator_file(&old_journal_path, "legacy rename journal")?;
+    match (text, old) {
+        (Some(_), Some(_)) => {
+            bail!("legacy and current rename journals conflict; preserve both before recovery")
+        }
+        (Some(text), None) => finish_rename(
+            &path,
+            &state_path,
+            &journal_path,
+            &serde_json::from_str(&text)?,
+            false,
+        ),
+        (None, Some(text)) => {
+            if crate::operator::read_operator_file(&state_path, "credential binding state")?
+                .is_some()
+            {
+                bail!(
+                    "legacy rename conflicts with migrated credential state; preserve both before recovery"
+                );
+            }
+            let journal: RenameJournal = serde_json::from_str(&text)?;
+            schema::parse(&journal.after_config, path.parent().unwrap()).map_err(|_| {
+                eyre!(
+                    "legacy rename journal contains configuration this CLI no longer accepts; run config recover-rename with the previous CLI and the same --operator-config before flattening the YAML; configuration, credential bindings, and journal were preserved"
+                )
+            })?;
+            let old_bindings = adjacent(&path, ".bindings.json");
+            let _old_lock = crate::targets::ConfigEditLock::acquire(&old_bindings)?;
+            finish_rename(&path, &old_bindings, &old_journal_path, &journal, true)
+        }
+        (None, None) => bail!("no pending rename"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_credentials_accept_readonly_operator_config_issue_1115() {
+        let executable = std::env::current_exe().unwrap();
+        for provider in [
+            serde_json::json!({"provider":"token","source":{"env":"OMNIGRAPH_READONLY_TOKEN"}}),
+            serde_json::json!({"provider":"token","source":{"file":"./token"}}),
+            serde_json::json!({"provider":"exec","command":[executable]}),
+        ] {
+            let configuration = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let path = configuration.path().join("config.yaml");
+            let document = serde_json::json!({
+                "version":1,
+                "targets":{"prod":{
+                    "kind":"server",
+                    "endpoint":"https://example.test/",
+                    "default_graph":"knowledge",
+                    "auth":provider
+                }}
+            });
+            std::fs::write(&path, document.to_string()).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+                std::fs::set_permissions(
+                    configuration.path(),
+                    std::fs::Permissions::from_mode(0o555),
+                )
+                .unwrap();
+            }
+            let input = crate::operator::InvocationConfig::at(Some(state.path().to_owned()), None)
+                .with_path(Some(path.to_str().unwrap()), configuration.path());
+            let cli =
+                crate::invocation::parse_from(["omnigraph", "query", "report", "--target", "prod"])
+                    .unwrap()
+                    .cli;
+            let result = (|| -> Result<()> {
+                let target = crate::scope::resolve(
+                    &cli,
+                    &input,
+                    configuration.path(),
+                    false,
+                    &mut std::io::sink(),
+                )?;
+                let auth = authentication(&cli, &input, target.as_ref())?.unwrap();
+                auth.ensure_current()
+            })();
+            let names = std::fs::read_dir(configuration.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    configuration.path(),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            assert!(result.is_ok(), "provider {provider}: {result:?}");
+            assert_eq!(names, vec![std::ffi::OsString::from("config.yaml")]);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                document.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_bindings_migrate_once_without_losing_custody_or_generations() {
+        let configuration = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let path = configuration.path().join("config.yaml");
+        std::fs::write(&path, "version: 1\nprofiles:\n  work:\n    api: https://api.example\n    organization_id: org_test\n    auth: {provider: omnigraph}\ntargets:\n  retained:\n    kind: server\n    endpoint: https://data.example\n    default_graph: knowledge\n    auth: {provider: token, source: {store: {}}}\n").unwrap();
+        let owner = uuid::Uuid::new_v4().to_string();
+        let profile = uuid::Uuid::new_v4().to_string();
+        let server_owner = uuid::Uuid::new_v4().to_string();
+        let old_server_profile = uuid::Uuid::new_v4().to_string();
+        let legacy = serde_json::json!({
+            "profile:work":{"id":owner,"profiles":{"auth":{"id":profile,"epoch":7}}},
+            "server:retained":{"id":server_owner,"profiles":{
+                "old-name":{"id":old_server_profile,"epoch":2}
+            }}
+        })
+        .to_string();
+        let legacy_path = adjacent(&path, ".bindings.json");
+        std::fs::write(&legacy_path, &legacy).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for file in [&path, &legacy_path] {
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o444)).unwrap();
+            }
+            std::fs::set_permissions(configuration.path(), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+        }
+        let input = || {
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None)
+                .with_path(Some(path.to_str().unwrap()), configuration.path())
+        };
+        let before = registration_auth(&input(), "work", "https://api.example");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(configuration.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            for file in [&path, &legacy_path] {
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let before = before.unwrap();
+        assert_eq!(before.ids.owner, owner);
+        assert_eq!(before.ids.profile, profile);
+        assert_eq!(before.ids.epoch, 7);
+        assert_eq!(std::fs::read_to_string(&legacy_path).unwrap(), legacy);
+        let server_input = input();
+        let cli =
+            crate::invocation::parse_from(["omnigraph", "query", "report", "--target", "retained"])
+                .unwrap()
+                .cli;
+        let target = crate::scope::resolve(
+            &cli,
+            &server_input,
+            configuration.path(),
+            false,
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        let server = authentication(&cli, &server_input, target.as_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.ids.owner, server_owner);
+        assert_eq!(server.name, "@target");
+        assert_ne!(
+            server.ids.profile, old_server_profile,
+            "flattening must not adopt a legacy named credential"
+        );
+        assert_eq!(server.ids.epoch, 0);
+        before.invalidate().unwrap();
+        assert!(before.ensure_current().is_err());
+        let after = registration_auth(&input(), "work", "https://api.example").unwrap();
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after.ids.epoch, 8);
+        rename(&input(), Rename::Profile, "work", "renamed").unwrap();
+        let renamed = registration_auth(&input(), "renamed", "https://api.example").unwrap();
+        assert_eq!(renamed.owner, before.owner);
+        assert_eq!(renamed.ids.epoch, 8);
+        let state_path = input().auth_state_path().unwrap();
+        let saved = std::fs::read_to_string(&state_path).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert!(state["owners"].get("profile:work").is_none());
+        assert_eq!(state["owners"]["profile:renamed"]["id"], owner);
+        assert_eq!(
+            state["owners"]["server:retained"]["profiles"]["@target"]["id"],
+            server.ids.profile
+        );
+        assert_eq!(
+            state["owners"]["server:retained"]["profiles"]["old-name"]["id"],
+            old_server_profile
+        );
+        assert_eq!(
+            state["owners"]["server:retained"]["profiles"]["old-name"]["epoch"],
+            2
+        );
+        assert_eq!(std::fs::read_to_string(&legacy_path).unwrap(), legacy);
+        // A later old-client write cannot roll generations back or replace the
+        // migrated authority, even when it still has well-formed UUIDs.
+        let changed = legacy.replace("\"epoch\":7", "\"epoch\":9");
+        assert_ne!(changed, legacy);
+        std::fs::write(&legacy_path, changed).unwrap();
+        assert!(
+            registration_auth(&input(), "renamed", "https://api.example")
+                .unwrap_err()
+                .to_string()
+                .contains("conflict")
+        );
+        assert_eq!(std::fs::read_to_string(&state_path).unwrap(), saved);
+    }
 
     struct InterleavedStore {
         token: std::cell::RefCell<Option<String>>,
@@ -1304,36 +1595,110 @@ mod tests {
 
     #[test]
     fn interrupted_rename_refuses_normal_use_and_recovers_both_files() {
+        for legacy in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.yaml");
+            let input =
+                crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+            let bindings_path = if legacy {
+                adjacent(&path, ".bindings.json")
+            } else {
+                input.auth_state_path().unwrap()
+            };
+            let journal_path = if legacy {
+                adjacent(&path, ".rename.json")
+            } else {
+                adjacent(&bindings_path, ".rename.json")
+            };
+            if !legacy {
+                drop(lock_auth_state(&input).unwrap());
+            }
+            let journal = RenameJournal {
+                before_config: "version: 1\n".into(),
+                after_config: "version: 1\ndefaults: {output: json}\n".into(),
+                before_bindings: None,
+                after_bindings: if legacy {
+                    "{}".into()
+                } else {
+                    serde_json::to_string(&BindingState {
+                        version: 1,
+                        legacy_sha256: None,
+                        owners: BTreeMap::new(),
+                    })
+                    .unwrap()
+                },
+            };
+            std::fs::write(&path, &journal.before_config).unwrap();
+            std::fs::write(&journal_path, serde_json::to_string(&journal).unwrap()).unwrap();
+            std::fs::write(&bindings_path, &journal.after_bindings).unwrap();
+            assert!(input.get(&mut std::io::sink()).is_err());
+            recover_rename(&input).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                journal.after_config
+            );
+            let input =
+                crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+            assert!(input.get(&mut std::io::sink()).is_ok());
+            std::fs::write(&journal_path, serde_json::to_string(&journal).unwrap()).unwrap();
+            std::fs::write(&path, "version: 1\ndefaults: {output: csv}\n").unwrap();
+            assert!(recover_rename(&input).is_err());
+            assert!(journal_path.exists());
+        }
+
+        // A real old-format server journal must be finished by the previous
+        // CLI before its named authentication map is manually flattened.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.yaml");
-        let journal = RenameJournal {
-            before_config: "version: 1\n".into(),
-            after_config: "version: 1\ndefaults: {output: json}\n".into(),
-            before_bindings: None,
-            after_bindings: "{}".into(),
+        let bindings_path = adjacent(&path, ".bindings.json");
+        let journal_path = adjacent(&path, ".rename.json");
+        let document = |name: &str| {
+            serde_json::json!({
+                "version": 1,
+                "targets": {(name): {
+                    "kind": "server", "endpoint": "https://data.example",
+                    "default_graph": "knowledge", "default_auth": "deploy",
+                    "auth": {"deploy": {"provider": "token", "source": {"store": {}}}}
+                }}
+            })
+            .to_string()
         };
+        let owner = uuid::Uuid::new_v4().to_string();
+        let profile = uuid::Uuid::new_v4().to_string();
+        let bindings = |name: &str| {
+            serde_json::json!({
+                (format!("server:{name}")): {"id": owner, "profiles": {
+                    "deploy": {"id": profile, "epoch": 3}
+                }}
+            })
+            .to_string()
+        };
+        let journal = RenameJournal {
+            before_config: document("old"),
+            after_config: document("renamed"),
+            before_bindings: Some(bindings("old")),
+            after_bindings: bindings("renamed"),
+        };
+        let journal_text = serde_json::to_string(&journal).unwrap();
         std::fs::write(&path, &journal.before_config).unwrap();
-        std::fs::write(
-            adjacent(&path, ".rename.json"),
-            serde_json::to_string(&journal).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(adjacent(&path, ".bindings.json"), &journal.after_bindings).unwrap();
-        assert!(crate::operator::load_operator_config_at(&path).is_err());
+        std::fs::write(&bindings_path, &journal.after_bindings).unwrap();
+        std::fs::write(&journal_path, &journal_text).unwrap();
         let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
-        recover_rename(&input).unwrap();
+        let error = recover_rename(&input).unwrap_err().to_string();
+        assert!(error.contains("previous CLI"), "{error}");
+        assert!(error.contains("before flattening"), "{error}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            journal.after_config
+            journal.before_config
         );
-        assert!(crate::operator::load_operator_config_at(&path).is_ok());
-        std::fs::write(
-            adjacent(&path, ".rename.json"),
-            serde_json::to_string(&journal).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(&path, "version: 1\ndefaults: {output: csv}\n").unwrap();
-        assert!(recover_rename(&input).is_err());
-        assert!(adjacent(&path, ".rename.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(&bindings_path).unwrap(),
+            journal.after_bindings
+        );
+        assert_eq!(
+            std::fs::read_to_string(&journal_path).unwrap(),
+            journal_text
+        );
+        assert!(!input.auth_state_path().unwrap().exists());
     }
 }

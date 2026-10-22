@@ -807,6 +807,33 @@ pub(crate) fn resolve_server_token_for(
     server_root: &str,
     request_url: &str,
 ) -> Result<Option<String>> {
+    match frozen_server_credential(auth, server_root, request_url)? {
+        Some(selected) => selected.cached_token(server_root),
+        None => Ok(None),
+    }
+}
+
+/// The credential of [`resolve_server_token_for`] read from its source
+/// again, for a long-lived client whose server refused it. Only the client
+/// holds the new token; the invocation's own credential is unchanged.
+pub(crate) async fn reread_server_token_for(
+    auth: &ServerAuth,
+    server_root: &str,
+    request_url: &str,
+) -> Result<Option<String>> {
+    match frozen_server_credential(auth, server_root, request_url)? {
+        Some(selected) => selected.reacquire(server_root).await,
+        None => Ok(None),
+    }
+}
+
+/// The invocation's frozen owner/profile binding for a request under the
+/// captured endpoint, or none for anonymous access.
+fn frozen_server_credential(
+    auth: &ServerAuth,
+    server_root: &str,
+    request_url: &str,
+) -> Result<Option<std::sync::Arc<crate::operator_routing::Authentication>>> {
     let ServerAuth::Token { .. } = auth else {
         return Ok(None);
     };
@@ -818,10 +845,9 @@ pub(crate) fn resolve_server_token_for(
         ));
     }
     crate::operator_routing::AUTH
-        .try_with(|auth| {
-            auth.as_ref()
-                .ok_or_else(|| refusal("credential_missing", "no frozen owner/profile binding"))?
-                .cached_token(server_root)
-        })
-        .map_err(|_| refusal("credential_missing", "no frozen owner/profile binding"))?
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .map(Some)
+        .ok_or_else(|| refusal("credential_missing", "no frozen owner/profile binding"))
 }

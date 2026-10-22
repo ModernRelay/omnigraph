@@ -55,9 +55,7 @@ pub(crate) enum Target {
     },
     Server {
         endpoint: String,
-        auth: BTreeMap<String, AuthProfile>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        default_auth: Option<String>,
+        auth: AuthProfile,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transport: Option<Transport>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

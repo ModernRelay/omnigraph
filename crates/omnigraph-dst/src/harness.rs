@@ -791,10 +791,8 @@ enum Milestone {
     /// Delete a base-fixture person on the milestone branch — puts a DELETE
     /// in the branch's merge delta (the rewrite-with-deletes merge route).
     DeleteFixtureOnBranch,
-    /// `ensure_indices` on main (the non-fork ensure_indices windows).
+    /// `ensure_indices` on main.
     EnsureIndicesMain,
-    /// `ensure_indices` on the milestone branch after a data op there.
-    EnsureIndicesBranch,
     /// `cleanup` on main (branch-snapshot resolution / fork reconciliation /
     /// table GC run against whatever state earlier milestones built).
     CleanupMain,
@@ -829,12 +827,11 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         }
         // Diverge main after the branch insert so this reaches the general
         // rewrite publisher, whose insert commit precedes the update phase.
-        // The hook also fires when that phase has no update payload.
-        "branch_merge.rewrite_after_insert_pre_update" => {
+        // The hook also fires when that phase has no update payload. A merge
+        // into an unchanged main only switches pins, so the rewrite is also
+        // the route that stages a table effect.
+        "branch_merge.rewrite_after_insert_pre_update" | "branch_merge.post_table_effect" => {
             return vec![EnsureBranch, DataOnBranch, MutateMain, MergeBranch];
-        }
-        "ensure_indices.post_table_effect" => {
-            return vec![EnsureBranch, DataOnBranch, EnsureIndicesBranch];
         }
         // cleanup with state to work on: a live branch fork.
         "cleanup.resolve_branch_snapshot" => {
@@ -844,7 +841,7 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
             return vec![MutateMain, DeleteFixtureOnMain, CleanupMain];
         }
         // A dead staging for cleanup to reclaim: `setup_crash_for`'s crash
-        // stops the index build at its pre-manifest window, stranding a
+        // stops the index build after its first table effect, stranding a
         // detached commit whose witness records main's head; the second
         // insert moves that head on, so the next cleanup judges the staging
         // dead and deletes its files before its manifest.
@@ -862,6 +859,10 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "load" if window == "load.post_branch_create_pre_stage" => vec![ForkLoad],
         "load" => vec![DataOnBranch], // LoadMerge/Append on main
         "mutation" | "graph_publish" | "publish" | "classify" => vec![MutateMain],
+        // Index maintenance builds only missing indexes, and so does an
+        // Optimize; the sampler holds Optimize back while a recipe still
+        // owes its index build, so an EnsureIndices is the first index build
+        // and has the fixture's unbuilt indexes to build.
         "ensure_indices" => vec![MutateMain, EnsureIndicesMain],
         "cleanup" => vec![MutateMain, CleanupMain],
         "optimize" => vec![MutateMain],
@@ -870,17 +871,73 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
 }
 
 /// The setup crash a window needs (`Scenario::setup_crash`), shared by the
-/// reach census, the hunt and the fleet.
+/// reach census, the hunt and the fleet. The setup window must be crossed
+/// only once its aftermath exists, since a recorded setup crash arms the
+/// target.
 /// - the window before the dead stagings' manifests: an index build crashed
-///   before its manifest commit leaves the unpublished staging that the
-///   window's recipe then makes dead and reclaims.
+///   after its first table effect leaves the unpublished staging that the
+///   window's recipe then makes dead and reclaims. Its pre-manifest window
+///   would not do: an index build with nothing to build crosses that too.
 pub fn setup_crash_for(window: &str) -> Option<(&'static str, usize)> {
     match window {
-        "cleanup.sweep_pre_dead_manifest_delete" => {
-            Some(("ensure_indices.post_phase_b_pre_manifest_commit", 0))
-        }
+        "cleanup.sweep_pre_dead_manifest_delete" => Some(("ensure_indices.post_table_effect", 0)),
         _ => None,
     }
+}
+
+/// The windows no seeded universe can cross, each with its reason. The
+/// reach census fails, naming the window, when another window stays dark or
+/// a listed one crosses; the hunt and the fleet do not schedule these.
+pub const REACH_EXPECTED_DARK: &[(&str, &str)] = &[
+    (
+        "init.after_coordinator_init",
+        "graph birth precedes the probe; dst_birth_contract_sweep owns it",
+    ),
+    (
+        "init.post_manifest_create",
+        "graph birth precedes the probe; dst_birth_contract_sweep owns it",
+    ),
+    (
+        "blob_read.post_capture",
+        "the DST schema has no Blob property",
+    ),
+    (
+        "mutation.post_no_effect_pre_gate",
+        "crossed only by a no-effect mutation that carries an expected graph head; \
+         the workload sends none",
+    ),
+    (
+        "branch_merge.between_delete_chunks",
+        "needs a merge that deletes more than one chunk of rows",
+    ),
+    (
+        "classify.fresh_read",
+        "crossed only for a table with native fork trees, a table fork from before format v11",
+    ),
+    (
+        "cleanup.resolve_branch_snapshot",
+        "crossed only for a table with native fork trees, a table fork from before format v11",
+    ),
+    (
+        "branch_merge.adopt_after_append_pre_upsert",
+        "a merge adopts a delta only from a forked source table (adopt_advances_head)",
+    ),
+    (
+        "branch_merge.adopt_after_upsert_pre_delete",
+        "a merge adopts a delta only from a forked source table (adopt_advances_head)",
+    ),
+    (
+        "branch_merge.adopt_between_insert_chunks",
+        "a merge adopts a delta only from a forked source table (adopt_advances_head)",
+    ),
+];
+
+/// Why `window` is in [`REACH_EXPECTED_DARK`], if it is.
+pub fn expected_dark_reason(window: &str) -> Option<&'static str> {
+    REACH_EXPECTED_DARK
+        .iter()
+        .find(|(dark, _)| *dark == window)
+        .map(|(_, reason)| *reason)
 }
 
 /// Emit the next pending milestone op if it is due (seeded coin, or forced
@@ -1031,15 +1088,6 @@ fn milestone_op(
             branch: "main".to_string(),
             op: Op::EnsureIndices,
         },
-        Milestone::EnsureIndicesBranch => {
-            if !world.branches.contains_key(MILESTONE_BRANCH) {
-                return None; // wait for EnsureBranch
-            }
-            WorldOp::Data {
-                branch: MILESTONE_BRANCH.to_string(),
-                op: Op::EnsureIndices,
-            }
-        }
         Milestone::CleanupMain => WorldOp::Data {
             branch: "main".to_string(),
             op: Op::Cleanup,
@@ -5558,16 +5606,34 @@ impl UniverseScenario<RustResources> for Scenario {
                 &mut next_ver,
             )
             .unwrap_or_else(|| {
-                sample_world_op(
-                    &mut rng,
-                    &world,
-                    &mut next_ver,
-                    sc.hostile,
-                    sc.wide,
-                    sc.schema_ops,
-                    &mut schema_extras,
-                    &mut fresh_load,
-                )
+                // An Optimize builds missing indexes too: while the recipe
+                // still owes its index build, a sampled one would leave that
+                // build nothing to do, so the sampler draws again.
+                let owes_index_build =
+                    reach_steps[reach_progress..].contains(&Milestone::EnsureIndicesMain);
+                loop {
+                    let wop = sample_world_op(
+                        &mut rng,
+                        &world,
+                        &mut next_ver,
+                        sc.hostile,
+                        sc.wide,
+                        sc.schema_ops,
+                        &mut schema_extras,
+                        &mut fresh_load,
+                    );
+                    if !(owes_index_build
+                        && matches!(
+                            wop,
+                            WorldOp::Data {
+                                op: Op::Optimize,
+                                ..
+                            }
+                        ))
+                    {
+                        break wop;
+                    }
+                }
             });
             if matches!(
                 wop,

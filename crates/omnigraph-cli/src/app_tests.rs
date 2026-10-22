@@ -8,6 +8,161 @@ use super::{Completion, UndeliveredFailure, finish, run_from};
 use crate::{client::GraphClient, command_outcome, invocation::MachineErrors};
 
 #[tokio::test]
+async fn login_uses_the_default_profile_without_starting_onboarding_issue_1115() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.yaml");
+    let source = "version: 1\nprofiles:\n  work:\n    api: https://control.example.com\n    organization_id: org_work\n    auth: {provider: token, source: {env: UNUSED_TOKEN}}\ndefaults: {profile: work}\n";
+    std::fs::write(&path, source).unwrap();
+    for args in [
+        vec!["omnigraph", "login", "--json"],
+        vec!["omnigraph", "login", "--profile", "work", "--json"],
+    ] {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = super::execute(
+            crate::invocation::parse_from(args).unwrap(),
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+            &mut io::empty(),
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.code(), 0);
+        let error: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            error["type"], "authentication_mode_conflict",
+            "the selected token profile must reach the login provider check: {error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+}
+
+#[tokio::test]
+async fn managed_target_add_uses_the_resolved_default_profile_issue_1115() {
+    let home = tempfile::tempdir().unwrap();
+    let source = "version: 1\nprofiles:\n  work:\n    api: https://control.example.com\n    organization_id: org_work\n    auth: {provider: omnigraph}\ndefaults: {profile: work}\n";
+    std::fs::write(home.path().join("config.yaml"), source).unwrap();
+    for explicit in [false, true] {
+        let mut args = vec![
+            "omnigraph",
+            "target",
+            "add",
+            "production",
+            "--cluster",
+            "invalid/id",
+        ];
+        if explicit {
+            args.extend(["--profile", "work"]);
+        }
+        let error = super::execute(
+            crate::invocation::parse_from(args).unwrap(),
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+            &mut io::empty(),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("identifier_invalid"),
+            "profile selection must reach the cluster-ID check before credentials or HTTP: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("config.yaml")).unwrap(),
+            source
+        );
+    }
+}
+
+#[tokio::test]
+async fn login_never_creates_or_overwrites_a_profile_implicitly() {
+    let home = tempfile::tempdir().unwrap();
+    let source = "version: 1\nprofiles:\n  work:\n    api: https://control.example.com\n    organization_id: org_work\n    auth: {provider: omnigraph}\n";
+    std::fs::write(home.path().join("config.yaml"), source).unwrap();
+    for (args, message) in [
+        (vec!["omnigraph", "login"], "--create-profile"),
+        (
+            vec!["omnigraph", "login", "--profile", "typo"],
+            "unknown profile",
+        ),
+        (
+            vec!["omnigraph", "login", "--create-profile", "work"],
+            "already exists",
+        ),
+    ] {
+        for terminal in [false, true] {
+            let mut stderr = Vec::new();
+            let result = super::execute(
+                crate::invocation::parse_from(args.clone()).unwrap(),
+                crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+                &mut io::empty(),
+                terminal,
+                &mut Vec::new(),
+                &mut stderr,
+            )
+            .await;
+            let diagnostic = match result {
+                Ok(completion) => {
+                    assert_ne!(completion.code(), 0);
+                    String::from_utf8(stderr).unwrap()
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(diagnostic.contains(message), "{args:?}: {diagnostic}");
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("config.yaml")).unwrap(),
+                source
+            );
+            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
+        }
+    }
+}
+
+#[test]
+fn profile_creation_has_one_explicit_non_overlapping_spelling() {
+    for args in [
+        vec!["login", "--create-profile", "work"],
+        vec![
+            "login",
+            "--create-profile",
+            "work",
+            "--api",
+            "https://control.example.com",
+            "--organization",
+            "org_work",
+        ],
+    ] {
+        assert!(crate::invocation::parse_from(std::iter::once("omnigraph").chain(args)).is_ok());
+    }
+    for args in [
+        vec!["login", "--register", "work"],
+        vec!["login", "--api", "https://control.example.com"],
+        vec!["login", "--organization", "org_work"],
+        vec!["login", "--create-profile", "work", "--profile", "work"],
+        vec![
+            "login",
+            "--create-profile",
+            "work",
+            "--target",
+            "production",
+        ],
+        vec![
+            "login",
+            "--create-profile",
+            "work",
+            "--replace-principal",
+            "person",
+        ],
+        vec!["target", "register", "production"],
+    ] {
+        assert!(crate::invocation::parse_from(std::iter::once("omnigraph").chain(args)).is_err());
+    }
+}
+
+#[tokio::test]
 async fn argument_refusal_help_and_success_return_without_terminating_the_caller() {
     for (args, expected) in [
         (vec!["omnigraph", "--unknown-option"], 64),
@@ -520,8 +675,12 @@ async fn baseline_keeps_installed_snapshot_locked_through_cursor_delivery() {
                 body,
             }]);
             crate::operator_routing::test_transport_scope(&[&server.origin], async {
-                let client =
-                    GraphClient::managed(&server.origin, "knowledge", "test-token".into()).unwrap();
+                let client = GraphClient::managed(
+                    &server.origin,
+                    "knowledge",
+                    crate::credential_sources::test_credential(&server.origin, "test-token"),
+                )
+                .unwrap();
                 let mut output = CursorOutput {
                     path: path.clone(),
                     competing_lock: OpenOptions::new()
@@ -638,9 +797,12 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                 };
                 let server = IntentApiFixture::graph(vec![IntentReply::json(200, receipt)]);
                 crate::operator_routing::test_transport_scope(&[&server.origin], async {
-                    let client =
-                        GraphClient::managed(&server.origin, "knowledge", "test-token".into())
-                            .unwrap();
+                    let client = GraphClient::managed(
+                        &server.origin,
+                        "knowledge",
+                        crate::credential_sources::test_credential(&server.origin, "test-token"),
+                    )
+                    .unwrap();
                     let mut stdout = FailingOutput {
                         fault,
                         bytes: Vec::new(),
@@ -762,8 +924,12 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
     // Losing the target announcement happens before the load is dispatched.
     let server = IntentApiFixture::graph(Vec::new());
     crate::operator_routing::test_transport_scope(&[&server.origin], async {
-        let client =
-            GraphClient::managed(&server.origin, "knowledge", "test-token".into()).unwrap();
+        let client = GraphClient::managed(
+            &server.origin,
+            "knowledge",
+            crate::credential_sources::test_credential(&server.origin, "test-token"),
+        )
+        .unwrap();
         let mut stdout = Vec::new();
         let mut stderr = FailingOutput {
             fault: OutputFault::AfterPrefix,
@@ -924,8 +1090,12 @@ async fn transfer_reads_use_the_supplied_sink_and_propagate_delivery_errors() {
                 body: body.to_vec(),
             }]);
             crate::operator_routing::test_transport_scope(&[&server.origin], async {
-                let client =
-                    GraphClient::managed(&server.origin, "knowledge", "test-token".into()).unwrap();
+                let client = GraphClient::managed(
+                    &server.origin,
+                    "knowledge",
+                    crate::credential_sources::test_credential(&server.origin, "test-token"),
+                )
+                .unwrap();
                 let mut stdout = FailingOutput {
                     fault,
                     bytes: Vec::new(),
@@ -1003,7 +1173,7 @@ async fn blob_input_failure_returns_before_resolution_or_dispatch() {
     let server = IntentApiFixture::graph(Vec::new());
     crate::operator_routing::test_transport_scope(&[&server.origin], async {
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join("config.yaml"), format!("version: 1\ntargets:\n  test:\n    kind: server\n    endpoint: {}\n    auth: {{public: {{provider: anonymous}}}}\n    default_auth: public\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n", server.origin, crate::tls_gateway::ca_path().display())).unwrap();
+    std::fs::write(home.path().join("config.yaml"), format!("version: 1\ntargets:\n  test:\n    kind: server\n    endpoint: {}\n    auth: {{provider: anonymous}}\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n", server.origin, crate::tls_gateway::ca_path().display())).unwrap();
     let parsed = parse_from([
         "omnigraph",
         "--target",

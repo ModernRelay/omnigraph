@@ -645,7 +645,10 @@ derives the GitHub body from that same snapshot with links pinned to the release
 tag. Earlier manual backfills keep their asset-only route. Edge builds need no
 snapshot: `scripts/edge_release.py body` puts the build's compatibility facts,
 read from its own `omnigraph version --json` and the latest stable release's,
-before the unreleased preview rendered at the build's commit.
+before the unreleased preview rendered at the build's commit. A stable release
+before 0.14 does not report its HTTP contract, so the composer reads it from
+`HTTP_API_CONTRACT` in the tag's `crates/omnigraph-api-types/src/lib.rs`; a
+release that reports it must agree with that source.
 
 | Workflow | Trigger and output |
 |---|---|
