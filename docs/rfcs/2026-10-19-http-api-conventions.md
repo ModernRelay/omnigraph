@@ -2,8 +2,8 @@
 rfc: "2026-10-19-http-api-conventions"
 title: "HTTP API conventions"
 track: maintainer
-status: draft
-implementation: in-progress
+status: accepted
+implementation: complete
 authors:
   - Ragnor Comerford
 created: 2026-10-19
@@ -99,8 +99,8 @@ long-term cost.
 
 ## User and operational behavior
 
-Clients see the conventions below when the rename batch lands in the
-unreleased 0.14 contract. Clients built against earlier development commits
+Clients see the conventions below in the finalized unreleased 0.14 contract.
+Clients built against earlier development commits
 must adopt the renamed fields and selectors; the HTTP contract header remains
 0.14. A breaking release note records those changes.
 
@@ -317,14 +317,13 @@ to every protected operation, 429 and 503 to graph and deployment routes, and
 408 and 413 to those of them that take a body. The lint adds no response to
 any operation.
 
-Response coverage is checked independently of those descriptions. In step 1,
-the existing per-operation assertions in the OpenAPI owner require the errors
+Response coverage is checked independently of those descriptions. The
+OpenAPI owner's assertions require the errors
 each handler can send, including `outcome_unknown` for an operation that can
 submit an owned write. Required statuses come from `ErrorCode::http_statuses`.
 Removing a required response, or its named code, must fail even when no
-remaining description mentions that code. When the operation table lands,
-its operation capabilities drive the shared write-outcome assertions; this
-replaces the per-operation checks rather than adding another route or status
+remaining description mentions that code. The operation table's capabilities
+drive the shared write-outcome assertions, without another route or status
 registry. HTTP method alone cannot identify a write: POST also serves reads.
 
 The lint extends the checks that already live in that file:
@@ -391,8 +390,8 @@ breaking release-note row per change:
 | `AccessOutput.actor` becomes `actor_id` | `GET …/access`, MCP `access`, `omnigraph access --json` | Read `actor_id`. The CLI's access protocol moves from 1 to 2; MCP clients follow the tool-schema migration below. |
 | `unpublished` and `unattached` become one `listing` enum: `history` (the default), `unpublished`, `unattached` | `GET …/commits` | Send `listing=unpublished` or `listing=unattached` instead of the corresponding true boolean. Non-history listings still refuse `limit` and `page_token`; retired selectors are rejected as described below. |
 
-Dropping `cluster_` updates `multi_mode_openapi_prefixes_operation_ids_with_cluster`
-to assert the table's ids. Uniqueness then rests on
+`multi_mode_openapi_uses_inventory_operation_ids` asserts the table's ids
+without `cluster_`. Uniqueness rests on
 `multi_mode_operation_ids_are_unique` and the lint. Old spellings are not kept
 as aliases. Protected HTTP routes continue to require 0.14 and refuse other
 values with 400 `api_contract_mismatch` before graph lookup. A prerelease
@@ -471,7 +470,7 @@ it does not change unknown-query-parameter handling on other routes.
   `auth_policy`, `schema_routes`, `stored_queries`, `multi_graph`,
   `boot_settings` and `mcp`, plus the CLI's `GraphHttpClient`, its access
   command and managed fixtures, and
-  `multi_mode_openapi_prefixes_operation_ids_with_cluster`.
+  `multi_mode_openapi_uses_inventory_operation_ids`.
 - The conventions this RFC writes down are already held:
   `data_routes::remote_branch_delete_flow_works` creates and deletes branches
   named `merge`, `diff` and `merge-base` and checks the 405 `Allow` header of
@@ -480,42 +479,27 @@ it does not change unknown-query-parameter handling on other routes.
 
 ## Rollout
 
-The implementation is prepared as three stacked PRs, in merge order. None
-has merged yet:
+Implemented in the following PRs, in merge order:
 
 - [#1131](https://github.com/ModernRelay/omnigraph/pull/1131): OpenAPI
   conventions, the documentation-driven lint and additive documentation.
 - [#1132](https://github.com/ModernRelay/omnigraph/pull/1132): the shared
   operation inventory, checked against actual HTTP registrations, MCP tools
   and CLI commands.
-- [#1133](https://github.com/ModernRelay/omnigraph/pull/1133): standardize the
+- [#1133](https://github.com/ModernRelay/omnigraph/pull/1133): finalized the
   unreleased HTTP contract 0.14 with SDK naming, `actor_id`, commit `listing`,
   access protocol 2 and MCP client migration.
 
-1. **The lint, its table and the additive documentation.** Today's exceptions
-   are pinned as they stand. The same change documents the six missing
-   parameter descriptions, the `limit` bounds of diffs and changes, 401 on the
-   `/cluster/*` routes, the 500 each handler can send (`outcome_unknown` on a
-   write included), the top-level `tags` array and the reserved `og_catalog`
-   id, with the required-response assertions in the same change. It needs no
-   new contract value and can land now.
-2. **The rename batch**, within the unreleased contract 0.14, once the
-   operation table lands in `omnigraph-api-types`, so that the operationIds
-   render from it. Its rows are the table in
-   [Compatibility and reversibility](#compatibility-and-reversibility).
-   Ship the retired-selector refusals, MCP schema/result parity checks and
-   explicit MCP client upgrade instructions in this batch. HTTP admission
-   does not establish MCP compatibility.
-   The graph-access stack merged code for contract 0.14
-   ([#1074](https://github.com/ModernRelay/omnigraph/pull/1074) and
-   [#1076](https://github.com/ModernRelay/omnigraph/pull/1076)):
-   `disposition`, the code registry and `Omnigraph-If-Actor`. Those merges are
-   prerelease development, not a published 0.14 release. This RFC completes
-   that same contract without advancing the HTTP contract value.
+The implementation retains HTTP contract 0.14, which is unreleased. The
+graph-access changes in [#1074](https://github.com/ModernRelay/omnigraph/pull/1074)
+and [#1076](https://github.com/ModernRelay/omnigraph/pull/1076) introduced
+`disposition`, the code registry and `Omnigraph-If-Actor` during prerelease
+development; this batch completes that same contract. HTTP admission does
+not establish compatibility with earlier development shapes or MCP clients.
 
-`implementation` moves to `in-progress` with step 1 and to `complete` when
-step 2 ships and only the permanent classes and the rows owned by the
-page-token design remain in the table.
+Only permanent exceptions and the pagination-owned conditional default remain
+in the conventions table. List pagination and the existence-hiding policy
+question below are outside this RFC's completed scope.
 
 ## Unresolved questions
 
@@ -558,6 +542,13 @@ page-token design remain in the table.
   advancing it to 0.15. Access protocol 2, the MCP client upgrade and explicit
   retired-selector refusal remain. New HTTP contract values are required for
   incompatible changes after release, not for this pre-release correction.
+- 2026-10-22: Accepted and completed through
+  [#1131](https://github.com/ModernRelay/omnigraph/pull/1131),
+  [#1132](https://github.com/ModernRelay/omnigraph/pull/1132) and
+  [#1133](https://github.com/ModernRelay/omnigraph/pull/1133). The conventions,
+  operation inventory and rename batch are implemented with HTTP contract
+  0.14 and CLI access protocol 2. Pagination and existence hiding retain
+  their separate owners.
 
 [graph-access]: 2026-10-16-graph-access-serving-and-cross-process-writes.md
 [one-set]: 2026-10-16-graph-access-serving-and-cross-process-writes.md#one-set-of-operations
