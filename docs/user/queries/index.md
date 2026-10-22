@@ -40,11 +40,8 @@ Parameter types use the schema scalar types. Every non-nullable declared
 parameter must be supplied; omission fails before query execution. A trailing
 `?` accepts `null` or an omitted value. `@description("...")` and
 `@instruction("...")` attach metadata for clients that expose stored queries
-as tools.
-
-A parameter carries the whole range of its declared type: a `U64` parameter
-takes every value from `0` to `18446744073709551615`. Send a 64-bit integer
-as a decimal string, so a value past 2^53 keeps every digit.
+as tools. An integer parameter carries the whole range of its declared type,
+so a `U64` parameter takes every value from `0` to `18446744073709551615`.
 
 ## Match patterns
 
@@ -168,9 +165,8 @@ query prolific($least: I64) {
 
 `NULL` never matches these predicates. `%` and `_` are ordinary characters,
 not wildcards. The predicates remain correct without an index; do not assume a
-free-text String index accelerates exact prefix or substring filters.
-
-Use [full-text search](../search/index.md) for tokenization, fuzzy matching, and
+free-text String index accelerates exact prefix or substring filters. Use
+[full-text search](../search/index.md) for tokenization, fuzzy matching, and
 relevance ranking.
 
 ### System fields
@@ -276,9 +272,7 @@ includes its `graph_commit_id`, pinned with the returned rows. Use that
 same-snapshot id with a later mutation's `--if-commit` option when implementing
 read-modify-write. On a newly created, unmodified branch, it is the head
 inherited from the source branch and is valid for the branch's first
-conditional mutation.
-
-See [Branches, Commits, and History](../branching/index.md).
+conditional mutation. See [Branches, Commits, and History](../branching/index.md).
 
 ## JSON result spelling
 
@@ -297,9 +291,10 @@ its own. The spellings a consumer sees:
   (`1.0e20`, `1.0e-7`); a non-finite computed value is `null`.
 - `Vector(N)` and list properties are JSON arrays.
 
-On input, a JSON number for an `F64` parses to the nearest `F64` value, the one
-a GQ literal with the same digits names, so an `F64` value read from `rows`
-loads back unchanged. A `Date` string is a calendar day, `"2024-01-01"`; a
+Send a 64-bit integer above 2^53 as a decimal string, so a client that parses
+JSON through a double keeps every digit. On input, a JSON number for an `F64`
+parses to the nearest `F64` value, the one a GQ literal with the same digits
+names, so an `F64` value read from `rows` loads back unchanged. A `Date` string is a calendar day, `"2024-01-01"`; a
 string that carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is
 refused as a load value, a param, or a `date(...)` literal, and an instant
 belongs in a `DateTime` property. A `DateTime` holds milliseconds: a string
