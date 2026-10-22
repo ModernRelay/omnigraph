@@ -425,13 +425,17 @@ impl UniqueShardJob {
     }
 }
 
+/// One uniqueness check's merge input: its list index, every partition's
+/// final keys, and the earliest repeat a partition saw among its own rows.
+type UniqueMerge = (usize, Vec<FinalKeys>, Option<(Position, Violation)>);
+
 /// The partitions' facts taken apart: everything but the unique shards
 /// already merged, the shards left to [`UniqueShardJob::run`].
 pub(crate) struct Merging {
     value: Option<Violation>,
     ids: HashSet<String>,
     card: HashMap<String, String>,
-    unique: Vec<(usize, Vec<FinalKeys>, Option<(Position, Violation)>)>,
+    unique: Vec<UniqueMerge>,
 }
 
 impl Merging {
@@ -516,7 +520,7 @@ impl Extracted {
             .iter()
             .map(|_| (0..plan.shards).map(|_| Vec::new()).collect())
             .collect();
-        let mut unique: Vec<(usize, Vec<FinalKeys>, Option<(Position, Violation)>)> = plan
+        let mut unique: Vec<UniqueMerge> = plan
             .unique
             .iter()
             .map(|(check, _)| (*check, Vec::new(), None))
