@@ -286,6 +286,9 @@ pub(crate) struct GraphHttpClient {
     /// Self-hosted requests retain the selected owner across every composed route.
     /// Managed authority is independent and never uses operator server declarations.
     request_scope: Option<crate::targets::ServerRequestScope>,
+    /// A bearer is a bound credential with a lifetime, not only a header value.
+    /// Public discovery may outlive its validity.
+    credential: Option<crate::credential_sources::AcquiredCredential>,
 }
 
 impl GraphHttpClient {
@@ -323,6 +326,18 @@ impl GraphHttpClient {
                 },
             };
             client = client.with_missing_credential(missing);
+        } else {
+            let credential = crate::operator_routing::AUTH
+                .try_with(|selected| {
+                    selected
+                        .as_ref()
+                        .ok_or_else(|| color_eyre::eyre::eyre!("no frozen credential binding"))?
+                        .cached_credential(endpoint)
+                })??
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!("selected server credential is unavailable")
+                })?;
+            client = client.with_credential(credential)?;
         }
         Ok(client)
     }
@@ -377,7 +392,24 @@ impl GraphHttpClient {
             missing_credential: None,
             expected_actor: None,
             request_scope: None,
+            credential: None,
         })
+    }
+
+    pub(crate) fn with_credential(
+        mut self,
+        credential: crate::credential_sources::AcquiredCredential,
+    ) -> Result<Self> {
+        use crate::credential_sources::{CredentialError, Purpose};
+        let binding = credential.request();
+        let endpoint = RequestTarget::of(binding.endpoint(), binding.endpoint())?;
+        if binding.purpose() != Purpose::Data
+            || !RequestTarget::from_sent(&self.transport, &self.health_url).is_under(&endpoint)
+        {
+            return Err(CredentialError::BindingMismatch.into());
+        }
+        self.credential = Some(credential);
+        Ok(self)
     }
 
     pub(crate) fn with_request_scope(mut self, scope: crate::targets::ServerRequestScope) -> Self {
@@ -414,6 +446,7 @@ impl GraphHttpClient {
             missing_credential: self.missing_credential.clone(),
             expected_actor: self.expected_actor.clone(),
             request_scope: self.request_scope.clone(),
+            credential: self.credential.clone(),
         })
     }
 
@@ -433,6 +466,19 @@ impl GraphHttpClient {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .map(str::to_owned);
+        if let Some(credential) = &self.credential {
+            let binding = credential.request();
+            let endpoint = RequestTarget::of(binding.endpoint(), binding.endpoint())?;
+            if !RequestTarget::from_sent(&self.transport, request.url()).is_under(&endpoint)
+                || Some(
+                    credential
+                        .bearer_for(binding, time::OffsetDateTime::now_utc())?
+                        .expose(),
+                ) != bearer.as_deref()
+            {
+                return Err(crate::credential_sources::CredentialError::BindingMismatch.into());
+            }
+        }
         crate::command_outcome::dispatched(request.method());
         let mut response = self.client.execute(request).await?;
         crate::command_outcome::response(response.status(), response.headers(), bearer.as_deref());

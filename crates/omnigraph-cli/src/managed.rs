@@ -591,6 +591,7 @@ struct Api {
     client: Client,
     origin: String,
     token: Option<String>,
+    credential: Option<crate::credential_sources::AcquiredCredential>,
     selection: Option<auth::Selection>,
     cluster: Option<(String, String)>,
 }
@@ -660,9 +661,19 @@ impl Api {
             client,
             origin,
             token,
+            credential: None,
             selection: None,
             cluster: None,
         })
+    }
+
+    fn with_credential(
+        origin: String,
+        credential: crate::credential_sources::AcquiredCredential,
+    ) -> Result<Self> {
+        let mut api = Self::new(origin, None)?;
+        api.credential = Some(credential);
+        Ok(api)
     }
 
     async fn authenticated(
@@ -744,12 +755,22 @@ impl Api {
             preserve_contents,
         } = limits;
         let url = self.url(path)?;
+        let mut request = self.client.request(method, url).timeout(timeout);
+        if let Some(key) = key {
+            request = request.header("Idempotency-Key", key);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        // Serialization may take time. Check the captured credential only once
+        // the request is ready, without rereading its external source.
         let token = if let Some(selection) = &self.selection {
             Some(Box::pin(selection.credential(&self.origin)).await?)
+        } else if let Some(credential) = &self.credential {
+            Some(auth::acquired_bearer(credential, &self.origin)?.to_owned())
         } else {
             self.token.clone()
         };
-        let mut request = self.client.request(method, url).timeout(timeout);
         if let Some(token) = &token {
             let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|_| {
@@ -757,12 +778,6 @@ impl Api {
                 })?;
             value.set_sensitive(true);
             request = request.header(reqwest::header::AUTHORIZATION, value);
-        }
-        if let Some(key) = key {
-            request = request.header("Idempotency-Key", key);
-        }
-        if let Some(body) = body {
-            request = request.json(body);
         }
         let transport = || {
             Failure::new(

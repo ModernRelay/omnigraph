@@ -424,66 +424,22 @@ async fn run(
     planes::guard_addressing(&cli)?;
     let operator = operator.with_path(cli.operator_config.as_deref(), &cwd);
     if let Command::Login {
-        register,
+        create_profile: Some(name),
         api,
         organization,
         ..
     } = &cli.command
     {
-        if register.is_some() || (cli.target.is_none() && cli.profile.is_none()) {
-            if matches!(
-                &cli.command,
-                Command::Login {
-                    replace_principal: Some(_),
-                    ..
-                }
-            ) {
-                color_eyre::eyre::bail!(
-                    "principal replacement requires an explicit existing --profile or --target"
-                );
-            }
-            let name = if let Some(name) = register {
-                name.clone()
-            } else {
-                if !stdin_is_terminal {
-                    color_eyre::eyre::bail!("noninteractive onboarding requires --register NAME");
-                }
-                write!(stderr, "Profile name [omnigraph]: ")?;
-                stderr.flush()?;
-                let mut bytes = Vec::new();
-                let mut byte = [0u8; 1];
-                while bytes.len() < 257 {
-                    match stdin.read(&mut byte) {
-                        Ok(0) => break,
-                        Ok(_) if byte[0] == b'\n' => break,
-                        Ok(_) => bytes.push(byte[0]),
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                let name = String::from_utf8(bytes)?.trim().to_owned();
-                if name.is_empty() {
-                    "omnigraph".to_owned()
-                } else {
-                    name
-                }
-            };
-            commands::targets::onboard(
-                &operator,
-                &name,
-                api.as_deref().unwrap_or("https://platform.omnigraph.dev"),
-                organization.as_deref(),
-                stdout,
-                stderr,
-            )
-            .await?;
-            return Ok(Completion::exit(0));
-        }
-        if api.is_some() || organization.is_some() {
-            color_eyre::eyre::bail!(
-                "--api and --organization are only available during new profile registration"
-            );
-        }
+        commands::targets::onboard(
+            &operator,
+            name,
+            api.as_deref().unwrap_or("https://platform.omnigraph.dev"),
+            organization.as_deref(),
+            stdout,
+            stderr,
+        )
+        .await?;
+        return Ok(Completion::exit(0));
     }
     let mut target = scope::resolve(&cli, &operator, &cwd, explicit_config, stderr)?;
     let authentication = crate::operator_routing::authentication(&cli, &operator, target.as_ref())?;
@@ -594,9 +550,9 @@ async fn run_bound(
             commands::targets::run_target(
                 &operator,
                 target.as_ref(),
-                (cli.profile.as_deref(), cli.auth.as_deref()),
                 command,
                 input.reader,
+                input.is_terminal,
                 stdout,
                 stderr,
             )
@@ -609,9 +565,8 @@ async fn run_bound(
             commands::targets::run_credential(
                 required_target(),
                 command,
-                cli.auth
+                cli.profile
                     .as_deref()
-                    .or(cli.profile.as_deref())
                     .unwrap_or_else(|| required_target().label()),
                 input.is_terminal,
                 input.reader,

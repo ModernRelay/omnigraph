@@ -172,9 +172,9 @@ impl std::fmt::Display for MissingCredential {
         match self {
             Self::AnonymousTarget(name) => write!(
                 f,
-                "target `{name}` uses anonymous authentication: configure and select a token or exec \
-                 auth profile; for a token profile with source: store, run \
-                 `omnigraph credentials set --target {name} --auth <profile> --stdin`"
+                "target `{name}` uses anonymous authentication: configure a token or exec \
+                 provider; for a token provider with source: store, run \
+                 `omnigraph credentials set --target {name} --stdin`"
             ),
             Self::Unbound {
                 server_root,
@@ -182,7 +182,7 @@ impl std::fmt::Display for MissingCredential {
             } => write!(
                 f,
                 "no credential is bound to {server_root}: declare a server target and explicit auth \
-                 profile under `targets:` in {}; select it with --target and --auth",
+                 provider under `targets:` in {}; select it with --target",
                 config.as_deref().map_or_else(
                     || "~/.omnigraph/config.yaml".to_string(),
                     |path| path.display().to_string()

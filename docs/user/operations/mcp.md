@@ -76,11 +76,10 @@ on stdin to the server target's `/mcp`, one `POST` each, and writes each answer
 as one line on stdout; diagnostics go to stderr. Tools, their logic and their
 refusals stay the server's.
 
-- **Credential.** Requests carry the token of the target's selected auth
-  profile (`--auth PROFILE`, else its `default_auth`), acquired as every served
-  command acquires it ([authentication providers](../cli/targets.md#authentication-providers));
-  it never appears in the agent's configuration or output. A profile with
-  `provider: anonymous` sends none. `--as ACTOR` sends `Omnigraph-If-Actor` with
+- **Credential.** Requests carry the token of the target's `auth`, acquired as
+  every served command acquires it ([authentication providers](../cli/targets.md#authentication-providers));
+  it never appears in the agent's configuration or output. A target whose
+  `auth` is `provider: anonymous` sends none. `--as ACTOR` sends `Omnigraph-If-Actor` with
   every request, so another actor's token is refused with `412 actor_mismatch`.
 - **One graph.** `--graph`, else the target's `default_graph`; without either the
   command refuses before any request. A tool call that omits `graph` gets it, a

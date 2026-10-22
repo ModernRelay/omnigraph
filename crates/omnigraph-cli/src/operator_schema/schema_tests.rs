@@ -104,7 +104,7 @@ fn checked_in_schema_fields_and_required_lists_match_serde_records() {
     );
     record::<Target>(
         "serverTarget",
-        json!({"kind":"server","endpoint":"https://example.com","auth":{},"default_auth":"me","transport":{},"default_graph":"graph"}),
+        json!({"kind":"server","endpoint":"https://example.com","auth":{"provider":"anonymous"},"transport":{},"default_graph":"graph"}),
     );
     record::<Target>(
         "directGraphTarget",
@@ -160,8 +160,13 @@ fn schema_discriminators_defaults_and_owner_variants_match_contract() {
     assert!(defs["profile"]["properties"].get("default_auth").is_none());
     assert!(schema["properties"].get("connections").is_none());
     assert_eq!(
-        defs["serverTarget"]["properties"]["auth"]["additionalProperties"],
+        defs["serverTarget"]["properties"]["auth"],
         json!({"$ref": "#/$defs/serverAuth"})
+    );
+    assert!(
+        defs["serverTarget"]["properties"]
+            .get("default_auth")
+            .is_none()
     );
     for (name, expected) in [
         (
@@ -236,7 +241,7 @@ fn schema_discriminators_defaults_and_owner_variants_match_contract() {
     );
     assert_eq!(schema["properties"]["version"]["const"], 1);
     assert_eq!(
-        defs["serverTarget"]["allOf"][0]["then"]["properties"]["auth"]["additionalProperties"],
+        defs["serverTarget"]["allOf"][0]["then"]["properties"]["auth"],
         json!({"$ref":"#/$defs/anonymousAuth"})
     );
 }

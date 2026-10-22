@@ -2649,7 +2649,7 @@ fn served_credential_follows_the_sent_url_issue_1022() {
     fs::write(
         home.path().join("config.yaml"),
         format!(
-            "version: 1\ntargets:\n  tenant-a:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/tenant-a'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_TENANT_A\n",
+            "version: 1\ntargets:\n  tenant-a:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/tenant-a'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_TENANT_A\n",
             fixture.origin
         ),
     )
@@ -2676,7 +2676,7 @@ fn served_credential_follows_the_sent_url_issue_1022() {
     fs::write(
         home.path().join("config.yaml"),
         format!(
-            "version: 1\ntargets:\n  tenant-a:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/tenant-a'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_TENANT_A\n",
+            "version: 1\ntargets:\n  tenant-a:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/tenant-a'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_TENANT_A\n",
             fixture.origin
         ),
     )
@@ -2715,7 +2715,7 @@ fn served_credential_follows_the_sent_url_issue_1022() {
         let other_socket = UnixGateway::new(&other.origin);
         fs::write(
             home.path().join("config.yaml"),
-            format!("version: 1\ntargets:\n  og:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_OG\n", declared_socket.url()),
+            format!("version: 1\ntargets:\n  og:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_OG\n", declared_socket.url()),
         )
         .unwrap();
         let og = ("OMNIGRAPH_TOKEN_OG", "og-token");
@@ -3199,9 +3199,9 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
                     Some(json!({
                         "target": "test-server",
                         "auth": "anonymous",
-                        "hint": "target `test-server` uses anonymous authentication: configure and select a token or exec \
-                                 auth profile; for a token profile with source: store, run \
-                                 `omnigraph credentials set --target test-server --auth <profile> --stdin`"
+                        "hint": "target `test-server` uses anonymous authentication: configure a token or exec \
+                                 provider; for a token provider with source: store, run \
+                                 `omnigraph credentials set --target test-server --stdin`"
                     }))
                 );
             } else {
@@ -3578,13 +3578,13 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         fs::write(
             &config,
             format!(
-                "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          file: ./credentials\n  graph-owner:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/unrelated'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_GRAPH_OWNER\ndefaults:\n  output: csv\n",
+                "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        file: ./credentials\n  graph-owner:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/unrelated'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_GRAPH_OWNER\ndefaults:\n  output: csv\n",
                 server.origin, server.origin
             ),
         )
         .unwrap();
         let replacement_config = format!(
-            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          file: ./credentials\n  replacement:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_REPLACEMENT\ndefaults:\n  output: json\n",
+            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        file: ./credentials\n  replacement:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_REPLACEMENT\ndefaults:\n  output: json\n",
             trap.origin, server.origin
         );
         fs::write(&replacement, &replacement_config).unwrap();
@@ -3688,15 +3688,15 @@ fn composed_http_routes_refuse_crossing_captured_auth_boundaries() {
     // belongs to another owner. No discovery or data request may cross it.
     for (root_auth, nested_auth, extra, suffix, args) in [
         (
-            "default_auth: fixture\n    auth: {fixture: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}}",
-            "default_auth: public\n    auth: {public: {provider: anonymous}}",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}",
+            "auth: {provider: anonymous}",
             "",
             "graphs/knowledge/branches",
             vec!["branch", "list", "--json"],
         ),
         (
-            "default_auth: fixture\n    auth: {fixture: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}}",
-            "default_auth: fixture\n    auth: {fixture: {provider: token, source: {env: OMNIGRAPH_TOKEN_CHILD}}}",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_CHILD}}",
             "",
             "graphs/knowledge/query",
             vec![
@@ -3707,29 +3707,29 @@ fn composed_http_routes_refuse_crossing_captured_auth_boundaries() {
             ],
         ),
         (
-            "default_auth: public\n    auth: {public: {provider: anonymous}}",
-            "default_auth: fixture\n    auth: {fixture: {provider: token, source: {env: OMNIGRAPH_TOKEN_CHILD}}}",
+            "auth: {provider: anonymous}",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_CHILD}}",
             "",
             "graphs/knowledge/branches",
             vec!["branch", "list", "--json"],
         ),
         (
-            "default_auth: fixture\n    auth: {fixture: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}}",
-            "default_auth: public\n    auth: {public: {provider: anonymous}}",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}",
+            "auth: {provider: anonymous}",
             "    default_graph: '../invalid'\n",
             "graphs/knowledge/branches",
             vec!["branch", "list", "--json"],
         ),
         (
-            "default_auth: fixture\n    auth: {fixture: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}}",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}",
             "",
             "",
             "graphs/knowledge/branches",
             vec!["branch", "list", "--json"],
         ),
         (
-            "default_auth: fixture\n    auth: {fixture: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}}",
-            "default_auth: public\n    auth: {public: {provider: anonymous}}",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}",
+            "auth: {provider: anonymous}",
             "",
             "healthz",
             vec!["branch", "list", "--json"],
@@ -3814,7 +3814,7 @@ fn server_scope_refuses_a_non_server_scheme_issue_979() {
         "s3://bucket/graph.omni",
         "file:///tmp/graph.omni",
     ] {
-        fs::write(home.path().join("config.yaml"), format!("version: 1\ntargets:\n  bad:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: {endpoint}\n    default_auth: public\n    auth:\n      public:\n        provider: anonymous\n")).unwrap();
+        fs::write(home.path().join("config.yaml"), format!("version: 1\ntargets:\n  bad:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: {endpoint}\n    auth:\n      provider: anonymous\n")).unwrap();
         for arguments in [
             vec!["query", "-e", "branch list"],
             vec!["graphs", "list"],
@@ -5396,7 +5396,7 @@ fn cli_fails_for_invalid_merge_requests() {
 fn target_home() -> tempfile::TempDir {
     let home = tempdir().unwrap();
     fs::write(home.path().join("config.yaml"),
-        "version: 1\ndefaults:\n  target: staging\ntargets:\n  staging:\n    kind: server\n    endpoint: https://graph.example.com\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_PROD\n    default_graph: kb\n  localdev:\n    kind: direct\n    scope: graph\n    uri: file:///data/dev.omni\n").unwrap();
+        "version: 1\ndefaults:\n  target: staging\ntargets:\n  staging:\n    kind: server\n    endpoint: https://graph.example.com\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_PROD\n    default_graph: kb\n  localdev:\n    kind: direct\n    scope: graph\n    uri: file:///data/dev.omni\n").unwrap();
     home
 }
 
@@ -5963,7 +5963,7 @@ fn catalogue_scope_reads_the_binary_registries_without_a_store() {
             }
         }
     }
-    for flag in ["--target", "--profile", "--auth", "--graph", "--as"] {
+    for flag in ["--target", "--profile", "--graph", "--as"] {
         let output = output_failure(
             cli()
                 .env("OMNIGRAPH_HOME", home.path())
@@ -6110,7 +6110,7 @@ fn remote_catalogue_reads_preserve_optional_targets() {
                 fs::write(
                     home.path().join("config.yaml"),
                     format!(
-                        "version: 1\ntargets:\n  catalogue:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    default_auth: public\n    auth:\n      public:\n        provider: anonymous\n    default_graph: og_catalog\n",
+                        "version: 1\ntargets:\n  catalogue:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: anonymous\n    default_graph: og_catalog\n",
                         server.origin
                     ),
                 )

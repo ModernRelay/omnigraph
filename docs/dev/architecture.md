@@ -136,6 +136,16 @@ unsupported command/backend combinations. Graph selection is explicit or target
 `default_graph`; discovery never selects one. Local tooling ignores defaults
 and rejects irrelevant routing flags. Diagnostics use stderr.
 
+Managed profiles and standalone server targets each own one provider object.
+`login --create-profile` is the CLI profile-creation flow; ordinary login uses
+an explicit profile or the profile default. Private mutable authentication state
+is namespaced by the selected configuration path under the captured operator home,
+so reading YAML does not require writing beside it. Stable owner IDs, credential
+generations and compatible rename journals survive the state relocation.
+Incompatible old server-auth rename journals must be recovered with the previous
+CLI before flattening YAML. Conflicting legacy metadata refuses instead of
+replacing credential ownership.
+
 [`credential_sources`](../../crates/omnigraph-cli/src/credential_sources.rs)
 owns bounded token sources and the exec protocol. Providers acquire credentials
 for frozen destinations; they cannot return routing authority. Managed acquisition
@@ -144,6 +154,10 @@ constructing the common served `GraphClient`. There is no per-command managed
 allowlist or control credential at a graph endpoint. Real direct-only capability
 boundaries remain in dispatch. Operator direct targets support local files only;
 engine/server cloud-storage constructors retain their independent contracts.
+Acquired credentials retain their typed binding and expiry through client
+construction. HTTP dispatch checks expiry after public discovery and before
+recording submission; managed control and issued data credentials have independent
+lifetimes. An expiry refusal does not authorize replaying a mutation.
 
 [`operator_transport`](../../crates/omnigraph-cli/src/operator_transport.rs)
 captures declared proxy/CA inputs once. Direct routing ignores ambient proxies;

@@ -4,7 +4,7 @@
 //! Requests go through the transport every served command uses: the
 //! target's captured credential scope and transport settings, the `--as`
 //! assertion, and a fresh discovery probe before each request. The token is
-//! the one every served command acquires from the selected auth profile, read
+//! the one every served command acquires from the target's `auth`, read
 //! from its source again once after the server refuses it, and never written
 //! anywhere.
 
@@ -109,9 +109,8 @@ pub(super) struct Routing<'a> {
 
 pub(super) struct Upstream {
     auth: ServerAuth,
-    /// The selected auth profile's name and provider, which say how to
-    /// replace a refused token.
-    profile: Option<(String, AuthProfile)>,
+    /// The target's auth provider, which says how to replace a refused token.
+    profile: Option<AuthProfile>,
     endpoint: String,
     /// The endpoint's `/mcp`.
     url: String,
@@ -128,7 +127,7 @@ struct Credential {
 
 impl Upstream {
     /// The server target's `/mcp`, with the token the invocation acquired
-    /// from the selected auth profile. Fails before any request when it has
+    /// from the target's `auth`. Fails before any request when it has
     /// none to send.
     pub(super) fn open(
         input: &InvocationConfig,
@@ -144,11 +143,7 @@ impl Upstream {
         let _ = http.request(Method::POST, url.clone())?;
         let token = crate::targets::resolve_server_token_for(input, auth, endpoint, &url)?;
         let profile = crate::operator_routing::AUTH
-            .try_with(|selected| {
-                selected
-                    .as_ref()
-                    .map(|selected| (selected.name.clone(), selected.profile.clone()))
-            })
+            .try_with(|selected| selected.as_ref().map(|selected| selected.profile.clone()))
             .ok()
             .flatten();
         Ok(Self {
@@ -165,46 +160,37 @@ impl Upstream {
         &self.url
     }
 
-    /// The selected auth profile is `provider: anonymous`.
+    /// The target's `auth` is `provider: anonymous`.
     pub(super) fn anonymous(&self) -> bool {
         matches!(self.auth, ServerAuth::Anonymous)
     }
 
     /// How to replace a token the server still refuses after it was read
-    /// again, by where the selected auth profile reads it.
+    /// again, by where the target's `auth` reads it.
     pub(super) fn replacement(&self, target: &str) -> String {
         match &self.profile {
-            Some((
-                name,
-                AuthProfile::Token {
-                    source: TokenSource::Store { .. },
-                },
-            )) => format!(
-                "replace it with `omnigraph credentials set --target {target} --auth {name} \
-                 --stdin --replace` and start `omnigraph mcp` again"
+            Some(AuthProfile::Token {
+                source: TokenSource::Store { .. },
+            }) => format!(
+                "replace it with `omnigraph credentials set --target {target} --stdin \
+                 --replace` and start `omnigraph mcp` again"
             ),
-            Some((
-                _,
-                AuthProfile::Token {
-                    source: TokenSource::Env { env },
-                },
-            )) => format!(
+            Some(AuthProfile::Token {
+                source: TokenSource::Env { env },
+            }) => format!(
                 "start `omnigraph mcp` again with `{env}` set to a token the server accepts"
             ),
-            Some((
-                _,
-                AuthProfile::Token {
-                    source: TokenSource::File { file },
-                },
-            )) => format!(
+            Some(AuthProfile::Token {
+                source: TokenSource::File { file },
+            }) => format!(
                 "write a token the server accepts to `{}`, which a later refused request reads \
                  again",
                 file.display()
             ),
-            Some((name, AuthProfile::Exec { .. })) => {
-                format!("a later refused request runs the helper of auth profile `{name}` again")
+            Some(AuthProfile::Exec { .. }) => {
+                "a later refused request runs the target's auth helper again".to_string()
             }
-            _ => "replace the token its auth profile supplies".to_string(),
+            _ => "replace the token the target's `auth` supplies".to_string(),
         }
     }
 

@@ -445,8 +445,20 @@ fn retired_managed_selectors_refuse_and_targets_do_not_add_selector_commands() {
         assert!(Cli::try_parse_from(["omnigraph", verb, "--profile", "work"]).is_ok());
     }
     for args in [
-        vec!["login", "--api", "https://control.example"],
-        vec!["login", "--organization", "org_one"],
+        vec![
+            "login",
+            "--create-profile",
+            "work",
+            "--api",
+            "https://control.example",
+        ],
+        vec![
+            "login",
+            "--create-profile",
+            "work",
+            "--organization",
+            "org_one",
+        ],
     ] {
         assert!(Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).is_ok());
     }

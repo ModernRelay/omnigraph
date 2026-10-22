@@ -42,7 +42,11 @@ pub(crate) fn resolve(
             .ok_or_else(|| {
                 targets::refusal(
                     "profile_required",
-                    "select --profile NAME or configure defaults.profile",
+                    if matches!(cli.command, Command::Login { .. }) {
+                        "select --profile NAME or configure defaults.profile; create a profile with login --create-profile NAME"
+                    } else {
+                        "select --profile NAME or configure defaults.profile"
+                    },
                 )
             })?;
         let profile = source.profiles.get(name).ok_or_else(|| {
@@ -431,7 +435,7 @@ targets:
   server:
     kind: server
     endpoint: https://example.test/
-    auth: {public: {provider: anonymous}}
+    auth: {provider: anonymous}
     default_graph: knowledge
 defaults: {target: local, profile: work}
 "#;
@@ -445,7 +449,7 @@ defaults: {target: local, profile: work}
         input: &InvocationConfig,
         cwd: &Path,
     ) -> Result<Option<ResolvedTarget>> {
-        let parsed = parse_from(std::iter::once("omnigraph").chain(args.iter().copied())).unwrap();
+        let parsed = parse_from(std::iter::once("omnigraph").chain(args.iter().copied()))?;
         resolve(
             &parsed.cli,
             input,
@@ -461,14 +465,7 @@ defaults: {target: local, profile: work}
         for args in [
             vec!["credentials", "status", "--profile", "work"],
             vec!["credentials", "export", "--target", "cluster"],
-            vec![
-                "credentials",
-                "status",
-                "--target",
-                "server",
-                "--auth",
-                "public",
-            ],
+            vec!["credentials", "status", "--target", "server"],
             vec![
                 "login",
                 "--profile",
@@ -488,7 +485,6 @@ defaults: {target: local, profile: work}
         }
         for args in [
             vec!["credentials", "status"],
-            vec!["credentials", "status", "--target", "server"],
             vec!["credentials", "status", "--target", "cluster"],
             vec!["credentials", "status", "--profile", "work", "--auth", "me"],
             vec![

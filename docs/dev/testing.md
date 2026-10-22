@@ -246,6 +246,14 @@ barrier test proves reported failures do not wait for blocked runtime work;
 `cli_schema_config` owns help/version/refusal statuses with closed streams.
 These are CLI boundary contracts; query-semantic GQT cases remain unchanged.
 
+The operator-config owners also cover read-only YAML and parent directories with
+writable private credential state, preservation/conflict checks when relocating
+legacy state, and explicit profile creation versus default-profile login.
+The existing client and managed-auth fixtures delay discovery or a later request
+past credential expiry and assert that no authenticated operation is dispatched.
+Standalone flat-auth fixtures retain distinct-target identity isolation, including
+two targets sharing an endpoint; no auth-name fallback remains.
+
 The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
@@ -300,7 +308,7 @@ storage-fault paths. CI requires the local journey to execute successfully.
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
-CLI `integration/cli_mcp.rs` owns the stdio MCP bridge against a real served cluster and a stand-in endpoint: refusals before any I/O, tool listing under the server's write setting and `--write`, graph binding, reads equal to the server's own `/mcp` answers, a Unix-socket endpoint refused before it connects, `--as`, credential re-reading from the auth profile's source after a 401 without resending, the server's `WWW-Authenticate` challenge relayed with a 401, cancellation, and unreachable servers or lost answers that start nothing and resend nothing. In-source `commands/mcp` tests own framing, binding and narrowing rules, and that the bridge names no server or MCP implementation crate.
+CLI `integration/cli_mcp.rs` owns the stdio MCP bridge against a real served cluster and a stand-in endpoint: refusals before any I/O, tool listing under the server's write setting and `--write`, graph binding, reads equal to the server's own `/mcp` answers, a Unix-socket endpoint refused before it connects, `--as`, credential re-reading from the target's `auth` source after a 401 without resending, the server's `WWW-Authenticate` challenge relayed with a 401, cancellation, and unreachable servers or lost answers that start nothing and resend nothing. In-source `commands/mcp` tests own framing, binding and narrowing rules, and that the bridge names no server or MCP implementation crate.
 
 Deployment tests extend these owners: cluster `tests.rs` pins no-reset
 ledger conversion, captured source bytes, exact-ID lookup, bounded results and

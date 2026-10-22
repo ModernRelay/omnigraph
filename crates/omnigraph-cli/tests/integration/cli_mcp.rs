@@ -1,5 +1,5 @@
 //! `omnigraph mcp`: an agent's MCP over stdio, relayed to an existing server
-//! target's `/mcp` with the token of the target's selected auth profile. The
+//! target's `/mcp` with the token of the target's `auth`. The
 //! bridge only connects: a target it cannot relay to refuses before any
 //! request, and an unreachable server fails each request without anything
 //! being started.
@@ -51,20 +51,18 @@ impl Home {
     }
 
     /// A home whose target `staging` is the TLS fixture server at
-    /// `endpoint`, serving `knowledge` by default. Its default auth profile
-    /// `fixture` reads its token from `OMNIGRAPH_TOKEN_STAGING`.
+    /// `endpoint`, serving `knowledge` by default. Its `auth` reads its
+    /// token from `OMNIGRAPH_TOKEN_STAGING`.
     fn server(endpoint: &str) -> Self {
         Self::with_source(endpoint, "{env: OMNIGRAPH_TOKEN_STAGING}")
     }
 
     /// [`Self::server`], with `fixture` reading its token from `source`, and
-    /// an anonymous auth profile `public` beside it.
+    /// a token read from `source`.
     fn with_source(endpoint: &str, source: &str) -> Self {
         Self::new(&format!(
             "targets:\n  staging:\n    kind: server\n    endpoint: '{endpoint}'\n    \
-             default_graph: knowledge\n    default_auth: fixture\n    auth:\n      \
-             fixture: {{provider: token, source: {source}}}\n      \
-             public: {{provider: anonymous}}\n{}",
+             default_graph: knowledge\n    auth: {{provider: token, source: {source}}}\n{}",
             fixture_transport()
         ))
     }
@@ -446,10 +444,7 @@ fn mcp_refuses_what_it_cannot_relay_to_before_any_request() {
     let temp = tempdir().unwrap();
     let absent = temp.path().join("absent");
     let token = |owner: &str| {
-        format!(
-            "    default_auth: fixture\n    auth:\n      fixture: {{provider: token, source: \
-             {{env: OMNIGRAPH_TOKEN_{owner}}}}}\n"
-        )
+        format!("    auth: {{provider: token, source: {{env: OMNIGRAPH_TOKEN_{owner}}}}}\n")
     };
     let home = Home::new(&format!(
         "profiles:\n  work:\n    api: '{endpoint}'\n    organization_id: org\n    \
@@ -476,7 +471,7 @@ fn mcp_refuses_what_it_cannot_relay_to_before_any_request() {
         ),
         (vec!["--target", "managed"], "target_kind_unsupported"),
         (vec!["--target", "nograph"], "graph_required"),
-        // The selected auth profile's source has no token.
+        // The target's `auth` source has no token.
         (
             vec!["--target", "keyed"],
             "selected credential environment variable is missing",
@@ -1156,34 +1151,24 @@ fn mcp_reads_a_refused_credential_again_for_later_requests_without_resending() {
     finished.assert_success();
     finished.assert_never_shows(&["first-token-71", "second-token-72"]);
 
-    // An anonymous auth profile sends no credential at all, whether the
-    // target selects it by default or `--auth` selects it.
+    // An anonymous target sends no credential at all.
     let open = Home::new(&format!(
         "targets:\n  open:\n    kind: server\n    endpoint: '{}'\n    default_graph: knowledge\n    \
-         default_auth: public\n    auth:\n      public: {{provider: anonymous}}\n{}",
+         auth: {{provider: anonymous}}\n{}",
         endpoint.url,
         fixture_transport()
     ));
-    for (id, home, args) in [
-        (9, &open, ["--target", "open"].as_slice()),
-        (
-            10,
-            &home,
-            ["--target", "staging", "--auth", "public"].as_slice(),
-        ),
-    ] {
-        let mut bridge = home.bridge(args, &[]);
-        let refused = bridge.call(tools_list(id));
-        assert_eq!(refused["error"]["data"]["status"], 401, "{refused}");
-        let message = refused["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains("requires a credential")
-                && message.contains("uses anonymous authentication"),
-            "{refused}"
-        );
-        assert_eq!(endpoint.received(id), [""]);
-        bridge.finish().assert_success();
-    }
+    let mut bridge = open.bridge(&["--target", "open"], &[]);
+    let refused = bridge.call(tools_list(9));
+    assert_eq!(refused["error"]["data"]["status"], 401, "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("requires a credential")
+            && message.contains("uses anonymous authentication"),
+        "{refused}"
+    );
+    assert_eq!(endpoint.received(9), [""]);
+    bridge.finish().assert_success();
 }
 
 /// The server's `WWW-Authenticate` challenge on a 401 is relayed verbatim

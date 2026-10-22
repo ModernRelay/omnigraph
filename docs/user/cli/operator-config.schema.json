@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "OmniGraph operator configuration (format version 1)",
   "description": "Public operator configuration grammar. Validate the original YAML with the CLI parser before use; JSON Schema validation alone does not establish a usable invocation binding.",
-  "$comment": "The CLI rejects inputs larger than 1048576 UTF-8 bytes before parsing. YAML-only requirements (one document, duplicate keys, explicit tags, merge keys, non-string keys and finite JSON-compatible numbers) must be enforced before JSON Schema validation. Offline parser validation additionally resolves every local profile/target/default_auth reference and enforces alias graph presence against the referenced target: required for managed, server and direct-root targets, forbidden for direct-graph targets, never inherited from default_graph. It validates canonical URL authority, loopback classification, percent encoding, traversal and prefix boundaries, and resolves relative token/CA paths against the absolute operator-file directory. Schema format annotations are not a substitute for those checks. Runtime checks only for the selected operation include credential/helper/CA availability, proxy environment conflicts and bypass syntax, adapter capability, remote identity/authorization/reachability, stored-query existence and read-only classification, and command output-format support. No credentials, files, environment variables, helpers or network are consulted by offline parsing.",
+  "$comment": "The CLI rejects inputs larger than 1048576 UTF-8 bytes before parsing. YAML-only requirements (one document, duplicate keys, explicit tags, merge keys, non-string keys and finite JSON-compatible numbers) must be enforced before JSON Schema validation. Offline parser validation additionally resolves every local profile/target reference and enforces alias graph presence against the referenced target: required for managed, server and direct-root targets, forbidden for direct-graph targets, never inherited from default_graph. It validates canonical URL authority, loopback classification, percent encoding, traversal and prefix boundaries, and resolves relative token/CA paths against the absolute operator-file directory. Schema format annotations are not a substitute for those checks. Runtime checks only for the selected operation include credential/helper/CA availability, proxy environment conflicts and bypass syntax, adapter capability, remote identity/authorization/reachability, stored-query existence and read-only classification, and command output-format support. No credentials, files, environment variables, helpers or network are consulted by offline parsing.",
   "type": "object",
   "properties": {
     "version": {
@@ -60,12 +60,23 @@
     "graphId": {
       "type": "string",
       "pattern": "^[A-Za-z0-9-]{1,64}$(?![\\s\\S])",
-      "not": {"enum": ["policies", "healthz", "openapi", "graphs"]}
+      "not": {
+        "enum": [
+          "policies",
+          "healthz",
+          "openapi",
+          "graphs"
+        ]
+      }
     },
     "servedGraphId": {
       "oneOf": [
-        {"$ref": "#/$defs/graphId"},
-        {"const": "og_catalog"}
+        {
+          "$ref": "#/$defs/graphId"
+        },
+        {
+          "const": "og_catalog"
+        }
       ],
       "description": "A real graph ID or the served virtual catalogue scope og_catalog."
     },
@@ -97,7 +108,7 @@
       "type": "string",
       "format": "uri",
       "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#@\\s%\\\\]+(?:/[^?#\\s\\\\]*)?$(?![\\s\\S])",
-      "description": "HTTPS, or HTTP only for an explicitly configured loopback server whose profiles are all anonymous. CLI validates the parsed host as loopback."
+      "description": "HTTPS, or HTTP only for an explicitly configured loopback server whose auth provider is anonymous. CLI validates the parsed host as loopback."
     },
     "localUri": {
       "type": "string",
@@ -324,17 +335,7 @@
           "$ref": "#/$defs/serverUrl"
         },
         "auth": {
-          "type": "object",
-          "propertyNames": {
-            "$ref": "#/$defs/name"
-          },
-          "additionalProperties": {
-            "$ref": "#/$defs/serverAuth"
-          },
-          "minProperties": 1
-        },
-        "default_auth": {
-          "$ref": "#/$defs/name"
+          "$ref": "#/$defs/serverAuth"
         },
         "transport": {
           "$ref": "#/$defs/transport"
@@ -364,14 +365,7 @@
           "then": {
             "properties": {
               "auth": {
-                "type": "object",
-                "propertyNames": {
-                  "$ref": "#/$defs/name"
-                },
-                "additionalProperties": {
-                  "$ref": "#/$defs/anonymousAuth"
-                },
-                "minProperties": 1
+                "$ref": "#/$defs/anonymousAuth"
               }
             }
           }
