@@ -649,7 +649,7 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         vec![HeaderValue::from_static("0.11")],
         vec![HeaderValue::from_static("0.12")],
         vec![HeaderValue::from_static("0.13")],
-        vec![HeaderValue::from_static("0.14")],
+        vec![HeaderValue::from_static("0.15")],
         vec![HeaderValue::from_str(&format!("{HTTP_API_CONTRACT}, {HTTP_API_CONTRACT}")).unwrap()],
         vec![
             HeaderValue::from_static(HTTP_API_CONTRACT),

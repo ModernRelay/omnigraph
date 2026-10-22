@@ -3026,7 +3026,7 @@ mod tests {
                 (200, vec![(HEADER.into(), "0.11".into())]),
                 (200, vec![(HEADER.into(), "0.12".into())]),
                 (200, vec![(HEADER.into(), "0.13".into())]),
-                (200, vec![(HEADER.into(), "0.14".into())]),
+                (200, vec![(HEADER.into(), "0.15".into())]),
                 (
                     200,
                     vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],

@@ -29,11 +29,11 @@ pub use omnigraph_compiler::settings;
 
 pub mod operations;
 
-/// The single request/response discriminator for the v0.15 HTTP contract.
+/// The single request/response discriminator for the v0.14 HTTP contract.
 /// This is independent of the package version and graph-storage stamp.
 pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
 /// Exact header value; consumers must reject missing or repeated values.
-pub const HTTP_API_CONTRACT: &str = "0.15";
+pub const HTTP_API_CONTRACT: &str = "0.14";
 /// An optional request header naming the actor the caller expects its
 /// credential to resolve to. The server refuses a mismatch with
 /// [`ErrorCode::ActorMismatch`] before graph lookup or effects; a matching

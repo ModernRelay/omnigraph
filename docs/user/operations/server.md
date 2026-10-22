@@ -59,13 +59,13 @@ its error class, never by its message; see
 
 ## HTTP contract
 
-Upgrade the CLI, server and HTTP integrations together ([0.15 migration](../../../changelog.d/http-contract-015.breaking.md)). Every protected
-request requires exactly one `Omnigraph-Http-Api: 0.15`: graph, registry and
+Refresh the CLI, server and HTTP integrations together ([unreleased 0.14 changes](../../../changelog.d/http-contract-014.breaking.md)). Every protected
+request requires exactly one `Omnigraph-Http-Api: 0.14`: graph, registry and
 cluster-deployment calls, including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
 duplicate, combined or unsupported values return `400 api_contract_mismatch`
 after authentication but before graph lookup, body decoding or execution. This HTTP identifier is
-separate from package/storage versions and grants no permission. The previous `0.14` value is
-refused; update integrations to the current routes, shapes and credentials before their header.
+separate from package/storage versions and grants no permission. Earlier prerelease builds also use `0.14`,
+so header admission cannot detect their older shapes; refresh components together and regenerate SDKs.
 
 Ordinary responses, including errors and streams, carry the same header. Check
 it before decoding or emitting the body. A missing/incompatible response header
@@ -249,7 +249,7 @@ Change a managed graph's schema through `cluster apply --target URL --config DIR
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/query \
-  -H 'Omnigraph-Http-Api: 0.15' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{
@@ -268,7 +268,7 @@ writes go to `/mutate` and may select a target `branch`.
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/queries/find_person \
-  -H 'Omnigraph-Http-Api: 0.15' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{"params":{"name":"Ada"}}'
@@ -285,7 +285,7 @@ acting on:
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/mutate/if-graph-commit \
-  -H 'Omnigraph-Http-Api: 0.15' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -H 'Omnigraph-If-Graph-Commit: <graph_commit_id>' \

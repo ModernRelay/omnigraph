@@ -169,7 +169,7 @@ on a graph, so a client can show only the actions it is allowed instead of
 learning them from a refusal:
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.15" \
+curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.14" \
   "https://graph.example/graphs/knowledge/access?branch=feature&target_branch=main"
 ```
 

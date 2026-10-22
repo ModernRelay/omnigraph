@@ -72,7 +72,7 @@ cell:
 
 ```http
 PUT /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.15
+Omnigraph-Http-Api: 0.14
 Content-Type: application/octet-stream
 If-Match: "<current ETag>"
 
@@ -204,7 +204,7 @@ Servers expose the same logical selector with GET and HEAD:
 
 ```http
 GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.15
+Omnigraph-Http-Api: 0.14
 ```
 
 Both methods follow the [HTTP contract](operations/server.md#http-contract),

@@ -126,7 +126,7 @@ graph or contacting a server. For example, a plain source build prints:
 ```text
 omnigraph 0.14.0
 internal-schema 16 (serves v14 to v16)
-http-contract 0.15
+http-contract 0.14
 ```
 
 `omnigraph version --json` also reports the machine-readable CLI protocols:
@@ -136,7 +136,7 @@ http-contract 0.15
   "version": "0.14.0",
   "channel": null,
   "commit": null,
-  "http_contract": "0.15",
+  "http_contract": "0.14",
   "protocols": { "target": 1, "credential": 1, "access": 2 },
   "internal_schema": {
     "writes": 16,

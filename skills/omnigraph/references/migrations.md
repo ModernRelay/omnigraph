@@ -4,12 +4,13 @@ The rest of this skill targets the current CLI and HTTP contract. The versioned
 procedures below use their named predecessor binaries. Read this page before replacing
 an older binary, rebuilding a graph, or translating earlier API examples.
 
-Current HTTP integrations must use exactly `Omnigraph-Http-Api: 0.15`, including
-the current routes, shapes and credentials. A `0.14` peer is refused before data
-dispatch or graph access; changing an old integration's header alone is not an
-upgrade. See [server policy](server-policy.md).
+Current HTTP integrations must use exactly `Omnigraph-Http-Api: 0.14`, including
+the current routes, shapes and credentials. A `0.13` peer is refused before data
+dispatch or graph access. Earlier prerelease 0.14 builds share the header and
+header admission cannot distinguish their older shapes; refresh clients,
+server and integrations together. See [server policy](server-policy.md).
 
-## HTTP contract 0.15 and access reports
+## Finalizing the unreleased 0.14 API
 
 Regenerate SDKs from the current OpenAPI document: graph operation IDs lose
 `cluster_`, path arguments become `branch_name`, `query_name` and
@@ -28,7 +29,7 @@ After the server upgrade, reconnect MCP clients and refresh cached tool schemas
 through `tools/list`. Clients with fixed response types must update them to
 `actor_id` before reconnecting. The HTTP header does not fence `/mcp`, so old
 MCP clients are not automatically refused; protocol negotiation is unchanged.
-See the [migration note](https://github.com/ModernRelay/omnigraph/blob/main/changelog.d/http-contract-015.breaking.md)
+See the [migration note](https://github.com/ModernRelay/omnigraph/blob/main/changelog.d/http-contract-014.breaking.md)
 and [MCP guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/mcp.md#upgrade-tool-schemas).
 
 ## Upgrade v0.10 to v0.11

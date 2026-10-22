@@ -74,12 +74,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -101,7 +101,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -122,7 +122,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -143,7 +143,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -170,7 +170,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -191,7 +191,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -218,7 +218,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -239,7 +239,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -260,7 +260,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -287,7 +287,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -308,7 +308,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -344,12 +344,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -381,7 +381,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -402,7 +402,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -423,7 +423,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -444,7 +444,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -471,7 +471,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -492,7 +492,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -519,7 +519,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -540,7 +540,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -561,7 +561,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -582,7 +582,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -603,7 +603,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -624,7 +624,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -645,7 +645,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -672,7 +672,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -693,7 +693,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -740,12 +740,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -767,7 +767,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -788,7 +788,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -809,7 +809,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -836,7 +836,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -857,7 +857,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -884,7 +884,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -905,7 +905,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -926,7 +926,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -953,7 +953,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -991,12 +991,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -1028,7 +1028,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1049,7 +1049,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1070,7 +1070,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1097,7 +1097,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1118,7 +1118,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1145,7 +1145,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1166,7 +1166,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1187,7 +1187,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1208,7 +1208,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1229,7 +1229,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1250,7 +1250,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1271,7 +1271,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1298,7 +1298,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1319,7 +1319,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1359,12 +1359,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -1386,7 +1386,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1407,7 +1407,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1428,7 +1428,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1455,7 +1455,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1476,7 +1476,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1503,7 +1503,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1524,7 +1524,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1545,7 +1545,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1577,12 +1577,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -1604,7 +1604,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1625,7 +1625,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1646,7 +1646,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1673,7 +1673,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1694,7 +1694,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1721,7 +1721,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1742,7 +1742,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1803,12 +1803,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -1830,7 +1830,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1851,7 +1851,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1872,7 +1872,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1899,7 +1899,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1926,7 +1926,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1947,7 +1947,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1968,7 +1968,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1995,7 +1995,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2016,7 +2016,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2167,12 +2167,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -2214,7 +2214,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2265,7 +2265,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2305,7 +2305,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2343,7 +2343,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2362,7 +2362,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2383,7 +2383,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2410,7 +2410,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2431,7 +2431,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2458,7 +2458,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2489,7 +2489,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2531,7 +2531,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2557,7 +2557,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2584,7 +2584,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2605,7 +2605,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2709,12 +2709,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -2755,7 +2755,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2776,7 +2776,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2797,7 +2797,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2824,7 +2824,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2845,7 +2845,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2872,7 +2872,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2893,7 +2893,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2914,7 +2914,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2941,7 +2941,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2962,7 +2962,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2983,7 +2983,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3004,7 +3004,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3025,7 +3025,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3052,7 +3052,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3073,7 +3073,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3177,12 +3177,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -3204,7 +3204,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3225,7 +3225,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3246,7 +3246,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3273,7 +3273,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3294,7 +3294,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3321,7 +3321,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3342,7 +3342,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3369,7 +3369,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3390,7 +3390,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3411,7 +3411,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3432,7 +3432,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3459,7 +3459,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3480,7 +3480,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3629,12 +3629,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -3676,7 +3676,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3708,7 +3708,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3746,7 +3746,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3765,7 +3765,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3779,7 +3779,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3799,7 +3799,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3813,7 +3813,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3833,7 +3833,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3857,7 +3857,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3876,7 +3876,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3896,7 +3896,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3910,7 +3910,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3952,12 +3952,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -3979,7 +3979,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4000,7 +4000,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4021,7 +4021,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4048,7 +4048,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4069,7 +4069,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4096,7 +4096,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4117,7 +4117,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4138,7 +4138,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4165,7 +4165,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4186,7 +4186,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4233,12 +4233,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -4270,7 +4270,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4291,7 +4291,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4312,7 +4312,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4339,7 +4339,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4360,7 +4360,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4387,7 +4387,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4408,7 +4408,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4429,7 +4429,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4450,7 +4450,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4471,7 +4471,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4492,7 +4492,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4513,7 +4513,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4540,7 +4540,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4561,7 +4561,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4685,12 +4685,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -4712,7 +4712,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4733,7 +4733,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4754,7 +4754,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4781,7 +4781,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4802,7 +4802,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4829,7 +4829,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4850,7 +4850,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4871,7 +4871,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4892,7 +4892,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4913,7 +4913,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4934,7 +4934,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4961,7 +4961,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4982,7 +4982,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5031,12 +5031,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -5068,7 +5068,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5089,7 +5089,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5110,7 +5110,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5137,7 +5137,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5158,7 +5158,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5185,7 +5185,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5206,7 +5206,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5227,7 +5227,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5248,7 +5248,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5269,7 +5269,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5290,7 +5290,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5311,7 +5311,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5338,7 +5338,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5359,7 +5359,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5426,12 +5426,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -5453,7 +5453,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5474,7 +5474,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5495,7 +5495,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5522,7 +5522,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5543,7 +5543,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5570,7 +5570,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5591,7 +5591,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5612,7 +5612,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5639,7 +5639,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5660,7 +5660,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5718,12 +5718,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -5745,7 +5745,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5766,7 +5766,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5787,7 +5787,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5814,7 +5814,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5835,7 +5835,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5862,7 +5862,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5883,7 +5883,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5904,7 +5904,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5931,7 +5931,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5952,7 +5952,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6097,12 +6097,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -6124,7 +6124,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6145,7 +6145,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6166,7 +6166,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6193,7 +6193,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6214,7 +6214,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6241,7 +6241,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6262,7 +6262,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6283,7 +6283,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6304,7 +6304,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6325,7 +6325,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6346,7 +6346,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6373,7 +6373,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6394,7 +6394,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6443,12 +6443,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -6480,7 +6480,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6501,7 +6501,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6522,7 +6522,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6549,7 +6549,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6570,7 +6570,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6597,7 +6597,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6618,7 +6618,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6639,7 +6639,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6660,7 +6660,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6681,7 +6681,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6708,7 +6708,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6729,7 +6729,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6821,12 +6821,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -6848,7 +6848,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6869,7 +6869,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6890,7 +6890,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6917,7 +6917,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6938,7 +6938,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6965,7 +6965,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6986,7 +6986,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7007,7 +7007,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7028,7 +7028,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7055,7 +7055,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7076,7 +7076,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7134,12 +7134,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -7161,7 +7161,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7182,7 +7182,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7203,7 +7203,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7230,7 +7230,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7251,7 +7251,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7278,7 +7278,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7299,7 +7299,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7320,7 +7320,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7347,7 +7347,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7368,7 +7368,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7424,12 +7424,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -7451,7 +7451,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7465,7 +7465,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7486,7 +7486,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7513,7 +7513,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7540,7 +7540,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7561,7 +7561,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7582,7 +7582,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7603,7 +7603,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7630,7 +7630,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7651,7 +7651,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7778,12 +7778,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -7805,7 +7805,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7826,7 +7826,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7847,7 +7847,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7874,7 +7874,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7901,7 +7901,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7922,7 +7922,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7943,7 +7943,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7964,7 +7964,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7985,7 +7985,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8006,7 +8006,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8033,7 +8033,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8054,7 +8054,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8112,12 +8112,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -8139,7 +8139,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8160,7 +8160,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8181,7 +8181,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8208,7 +8208,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8235,7 +8235,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8256,7 +8256,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8277,7 +8277,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8298,7 +8298,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8325,7 +8325,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8346,7 +8346,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8470,12 +8470,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -8497,7 +8497,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8518,7 +8518,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8539,7 +8539,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8566,7 +8566,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8593,7 +8593,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8614,7 +8614,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8635,7 +8635,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8656,7 +8656,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8677,7 +8677,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8698,7 +8698,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8725,7 +8725,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8746,7 +8746,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8795,12 +8795,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -8832,7 +8832,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8849,7 +8849,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8870,7 +8870,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8897,7 +8897,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8918,7 +8918,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8945,7 +8945,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8966,7 +8966,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8987,7 +8987,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9008,7 +9008,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9029,7 +9029,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9050,7 +9050,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9071,7 +9071,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9098,7 +9098,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9119,7 +9119,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9168,12 +9168,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -9205,7 +9205,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9226,7 +9226,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9247,7 +9247,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9274,7 +9274,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9295,7 +9295,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9322,7 +9322,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9343,7 +9343,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9364,7 +9364,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9385,7 +9385,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9406,7 +9406,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9427,7 +9427,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9448,7 +9448,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9475,7 +9475,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9496,7 +9496,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9572,12 +9572,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -9610,7 +9610,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9631,7 +9631,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9652,7 +9652,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9679,7 +9679,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9700,7 +9700,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9727,7 +9727,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9748,7 +9748,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9769,7 +9769,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9790,7 +9790,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9811,7 +9811,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9832,7 +9832,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9853,7 +9853,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9874,7 +9874,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9901,7 +9901,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9922,7 +9922,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -9971,12 +9971,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -10008,7 +10008,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10029,7 +10029,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10050,7 +10050,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10077,7 +10077,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10098,7 +10098,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10125,7 +10125,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10146,7 +10146,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10167,7 +10167,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10188,7 +10188,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10209,7 +10209,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10230,7 +10230,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10251,7 +10251,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10278,7 +10278,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10299,7 +10299,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10357,12 +10357,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -10394,7 +10394,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10415,7 +10415,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10436,7 +10436,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10463,7 +10463,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10484,7 +10484,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10511,7 +10511,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10532,7 +10532,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10553,7 +10553,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10574,7 +10574,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10595,7 +10595,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10616,7 +10616,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10637,7 +10637,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10664,7 +10664,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10685,7 +10685,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10734,12 +10734,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -10761,7 +10761,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10782,7 +10782,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10803,7 +10803,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10830,7 +10830,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10851,7 +10851,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10878,7 +10878,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10899,7 +10899,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10920,7 +10920,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10947,7 +10947,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -10968,7 +10968,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11026,12 +11026,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -11069,7 +11069,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11090,7 +11090,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11111,7 +11111,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11138,7 +11138,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11159,7 +11159,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11186,7 +11186,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11207,7 +11207,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11228,7 +11228,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11249,7 +11249,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11270,7 +11270,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11291,7 +11291,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11312,7 +11312,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11339,7 +11339,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11360,7 +11360,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11427,12 +11427,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -11470,7 +11470,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11491,7 +11491,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11512,7 +11512,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11539,7 +11539,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11560,7 +11560,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11587,7 +11587,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11608,7 +11608,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11629,7 +11629,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11650,7 +11650,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11671,7 +11671,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11692,7 +11692,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11713,7 +11713,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11740,7 +11740,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11761,7 +11761,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11810,12 +11810,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -11847,7 +11847,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11868,7 +11868,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11889,7 +11889,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11916,7 +11916,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11937,7 +11937,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11964,7 +11964,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -11985,7 +11985,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12006,7 +12006,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12027,7 +12027,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12048,7 +12048,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12069,7 +12069,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12090,7 +12090,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12117,7 +12117,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12138,7 +12138,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12187,12 +12187,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -12214,7 +12214,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12235,7 +12235,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12256,7 +12256,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12283,7 +12283,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12304,7 +12304,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12331,7 +12331,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12352,7 +12352,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12373,7 +12373,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12400,7 +12400,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12421,7 +12421,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12479,12 +12479,12 @@
           {
             "name": "Omnigraph-Http-Api",
             "in": "header",
-            "description": "exactly one Omnigraph-Http-Api header with value 0.15 is required",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.15"
+                "0.14"
               ]
             }
           },
@@ -12506,7 +12506,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12527,7 +12527,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12548,7 +12548,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12575,7 +12575,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12596,7 +12596,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12623,7 +12623,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12644,7 +12644,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12665,7 +12665,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12692,7 +12692,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12713,7 +12713,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12765,7 +12765,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12804,7 +12804,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12830,7 +12830,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -12851,7 +12851,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.15"
+                    "0.14"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."

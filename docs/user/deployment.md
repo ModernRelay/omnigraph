@@ -5,7 +5,7 @@ storage, or Azure Blob Storage. The server always boots from one cluster root
 and exposes its ready applied graphs under `/graphs/{graph_id}/…`; use
 `--require-all-graphs` when any blocked graph must fail startup.
 
-Servers use the v0.15 HTTP contract and open graph storage formats v14 to v16. The
+Servers use the v0.14 HTTP contract and open graph storage formats v14 to v16. The
 cluster ledger has a separate version: explicitly converting it to v2 preserves
 graph data and history. Start with [Operating a cluster](clusters/index.md) to
 create and apply a deployment bundle.

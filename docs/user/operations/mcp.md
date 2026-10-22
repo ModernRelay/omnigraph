@@ -43,9 +43,9 @@ with `tools/list`. The `access` tool now returns `actor_id` instead of `actor`;
 clients with fixed response types must update those types before reconnecting.
 Its output matches the [HTTP access report](policy.md#learn-your-access).
 
-MCP does not use the `Omnigraph-Http-Api` header, so an old MCP client is not
-automatically refused by the HTTP contract 0.15 upgrade. MCP protocol
-negotiation is unchanged, and the old field has no alias.
+These changes finalize the unreleased 0.14 access output. MCP does not use the
+`Omnigraph-Http-Api` header, so an old MCP client is not automatically refused.
+MCP protocol negotiation is unchanged, and the old field has no alias.
 
 ### Sign-in and discovery
 
