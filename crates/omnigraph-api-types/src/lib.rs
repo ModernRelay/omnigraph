@@ -27,6 +27,8 @@ use utoipa::{IntoParams, ToSchema};
 /// re-exported so a wire consumer needs no second dependency for it.
 pub use omnigraph_compiler::settings;
 
+pub mod operations;
+
 /// The single request/response discriminator for the v0.14 HTTP contract.
 /// This is independent of the package version and graph-storage stamp.
 pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";

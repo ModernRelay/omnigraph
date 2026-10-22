@@ -632,6 +632,7 @@ async fn instructions(app: &Router, token: &str) -> String {
 /// server enables it.
 #[tokio::test]
 async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
+    let mut advertised = std::collections::BTreeSet::new();
     let alice = token("alice", RESOURCE);
     for (settings, expected) in [
         (
@@ -695,6 +696,11 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
         let enabled = settings.allow_adhoc;
         let (_temp, app, _state) = fixture_app_with(settings).await;
         let tools = tool_list(&app, &alice).await;
+        advertised.extend(
+            tools
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_owned()),
+        );
         let lines: Vec<String> = tools
             .iter()
             .map(|tool| {
@@ -733,6 +739,13 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
             assert!(refused.get("error").is_some(), "{refused}");
         }
     }
+    // Compare real tools/list responses across the boot gates with the shared
+    // inventory, without adding an engine dependency to the MCP crate.
+    let inventoried = omnigraph_server::api::operations::HTTP_OPERATIONS
+        .iter()
+        .flat_map(|operation| operation.mcp.names.iter().map(|name| (*name).to_owned()))
+        .collect();
+    assert_eq!(advertised, inventoried);
 }
 
 #[tokio::test]

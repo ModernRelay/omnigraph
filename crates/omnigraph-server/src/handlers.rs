@@ -292,9 +292,8 @@ pub(crate) async fn server_openapi(
     Json(doc)
 }
 
-/// Path prefix used to namespace per-graph routes in multi mode.
-/// Kept in sync with the `Router::nest(...)` invocation in `build_app`.
-const CLUSTER_PATH_PREFIX: &str = "/graphs/{graph_id}";
+/// The graph-route mount, shared by registration and OpenAPI nesting.
+pub(crate) const CLUSTER_PATH_PREFIX: &str = "/graphs/{graph_id}";
 
 /// Operation-id prefix applied to every cloned cluster operation.
 /// Decision 7 in the implementation plan — keeps operation IDs unique
@@ -3021,19 +3020,24 @@ impl BranchAction {
         Self::ALL.into_iter().find(|action| action.name() == name)
     }
 
+    fn operation(self) -> &'static api::operations::HttpOperation {
+        crate::http_operations::operation(match self {
+            Self::Merge => "branch merge",
+            Self::Diff => "branch diff",
+            Self::MergeBase => "branch merge base",
+        })
+    }
+
     fn name(self) -> &'static str {
-        match self {
-            Self::Merge => "merge",
-            Self::Diff => "diff",
-            Self::MergeBase => "merge-base",
-        }
+        self.operation()
+            .path
+            .rsplit('/')
+            .next()
+            .expect("a branch action has a final path segment")
     }
 
     fn method(self) -> axum::http::Method {
-        match self {
-            Self::Merge => axum::http::Method::POST,
-            Self::Diff | Self::MergeBase => axum::http::Method::GET,
-        }
+        crate::http_operations::method(self.operation().method)
     }
 
     /// Whether `method` runs this action; HEAD runs a GET action.
@@ -3050,6 +3054,24 @@ impl BranchAction {
             Self::MergeBase => server_merge_base.call(request, state).await,
         }
     }
+}
+
+/// Inventory the same actions the dynamic branch route dispatches. Construct
+/// their paths from that route's mount, so an action moved elsewhere only in
+/// the shared table cannot appear to be registered there.
+#[cfg(test)]
+pub(crate) fn branch_action_http_routes()
+-> impl Iterator<Item = (api::operations::HttpMethod, String)> {
+    let (prefix, _) = crate::http_operations::operation("branch delete")
+        .path
+        .rsplit_once('/')
+        .expect("the branch route has a name capture");
+    BranchAction::ALL.into_iter().map(move |action| {
+        (
+            action.operation().method,
+            format!("{prefix}/{}", action.name()),
+        )
+    })
 }
 
 /// Every method of `/branches/{branch}` except DELETE: the action the name

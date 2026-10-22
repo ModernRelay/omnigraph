@@ -90,6 +90,27 @@ belong to the rename batch in the [HTTP conventions RFC](https://github.com/Mode
 | `page-envelope` | Paged response bodies | `next_page_token` | Items use a named array alongside the continuation. |
 | `operation-tags` | Every operation | `declared` | Every tag belongs to the top-level tags array. |
 
+## Operation inventory
+
+`omnigraph-api-types::operations` names each HTTP operation once, with its
+method, path, write capability and existing MCP and CLI bindings. An absent
+or restricted binding has a reason. CLI commands whose owners are local
+storage, the operator configuration or the managed control plane have exact
+named entries with those reasons. The inventory adds no commands or tools.
+
+The server registers native routes through this inventory. Its route owner
+also records branch actions from the actual `BranchAction` dispatch and OAuth
+metadata from the production constructor. Tests compare those registrations
+with the inventory and the generated specification. The CLI compares its
+Clap command leaves; the MCP integration owner compares real `tools/list`
+responses across its boot gates. The MCP crate remains engine-free.
+
+When adding an operation, update its inventory row, handler registration,
+OpenAPI annotation and existing test owner together. The convention test uses
+write capabilities for required unknown-outcome coverage; HTTP method alone
+cannot distinguish read POSTs from writes. Current operationIds remain pinned
+until the contract rename batch.
+
 ## Error and response coverage
 
 `ErrorCode` owns code spellings and allowed HTTP statuses. The convention test

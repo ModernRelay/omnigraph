@@ -9,6 +9,7 @@ mod export_transport;
 mod extract;
 mod handlers;
 mod http_contract;
+mod http_operations;
 mod ingress;
 mod mcp;
 pub mod operations;
@@ -3682,59 +3683,7 @@ pub fn build_app(state: AppState) -> Router {
     //   4. `resolve_graph_handle` — captures `serving::GraphRequest` based on
     //      the active mode (single: the only handle; multi: lookup by
     //      `{graph_id}` in the URI path).
-    let per_graph_routes = Router::new()
-        .route("/snapshot", get(server_snapshot))
-        .route("/access", get(server_access))
-        // Register HEAD explicitly. Axum's GET fallback would invoke the GET
-        // handler and could begin payload work before stripping the body; the
-        // dedicated handler makes the zero-payload-read contract structural.
-        .route(
-            "/blob",
-            get(server_blob_get)
-                .head(server_blob_head)
-                .put(server_blob_put)
-                .delete(server_blob_delete),
-        )
-        .route("/export", post(server_export))
-        .route("/query", post(server_query))
-        .route("/mutate", post(server_mutate))
-        .route(
-            "/mutate/if-graph-commit",
-            post(server_mutate_if_graph_commit),
-        )
-        .route("/queries", get(server_list_queries))
-        .route("/queries/{name}", post(server_invoke_query))
-        .route(
-            "/queries/{name}/if-graph-commit",
-            post(server_invoke_query_if_graph_commit),
-        )
-        .route("/schema", get(server_schema_get))
-        .route(
-            "/load",
-            post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
-        )
-        .route("/load/ndjson", post(server_load_ndjson))
-        .route(
-            "/branches",
-            get(server_branch_list).post(server_branch_create),
-        )
-        // One route owns `/branches/{name}`: the branch actions `merge`,
-        // `diff` and `merge-base` share its shape, so it dispatches them by
-        // name and method, and DELETE of any name deletes that branch.
-        .route(
-            "/branches/{branch}",
-            axum::routing::delete(server_branch_delete).fallback(server_branch_action),
-        )
-        .route("/commits", get(server_commit_list))
-        .route(
-            "/commits/{commit_id}",
-            get(server_commit_show).delete(server_commit_drop),
-        )
-        .route("/commits/{commit_id}/publish", post(server_commit_publish))
-        .route("/commits/{commit_id}/changes", get(server_commit_changes))
-        .route("/diff", get(server_diff))
-        .route("/changes", get(server_changes_feed))
-        .route("/changes/baseline", post(server_changes_baseline));
+    let per_graph_routes = http_operations::graph().into_router();
     let per_graph_protected = guarded(&state, per_graph_routes, |routes| {
         routes.route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -3750,19 +3699,11 @@ pub fn build_app(state: AppState) -> Router {
     // exposed — inventory additions use the server-owned deployment route.
     let management = guarded(
         &state,
-        Router::new()
-            .route("/graphs", get(server_graphs_list))
-            .route("/graphs/discovery", get(server_graphs_discovery)),
+        http_operations::management().into_router(),
         |routes| routes,
     );
 
-    let deployment_routes = Router::new()
-        .route("/cluster/plan", post(deployment::plan))
-        .route(
-            "/cluster/deployments",
-            get(deployment::status).post(deployment::apply),
-        )
-        .route("/cluster/deployments/{id}", get(deployment::lookup));
+    let deployment_routes = http_operations::deployments().into_router();
     let deployments = guarded(&state, deployment_routes, |routes| {
         admitted(
             &state,
@@ -3781,13 +3722,12 @@ pub fn build_app(state: AppState) -> Router {
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
     let protected: Router<AppState> = Router::new()
         .nest(CATALOGUE_ROUTE_PREFIX, catalogue)
-        .nest("/graphs/{graph_id}", per_graph_protected)
+        .nest(handlers::CLUSTER_PATH_PREFIX, per_graph_protected)
         .merge(management)
         .merge(deployments);
 
-    let mut app = Router::new()
-        .route("/healthz", get(server_health))
-        .route("/readyz", get(server_ready))
+    let mut app = http_operations::probes()
+        .into_router()
         .route("/openapi.json", get(server_openapi))
         .merge(protected);
     // MCP needs an authenticated caller; without a credential source there is

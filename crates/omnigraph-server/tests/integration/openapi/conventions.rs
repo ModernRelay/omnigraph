@@ -1,5 +1,6 @@
 //! HTTP convention checks share the generated-spec owner and its fixtures.
 
+use omnigraph_api_types::operations::{HTTP_OPERATIONS, HttpOperation};
 use omnigraph_server::api::ErrorCode;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -399,24 +400,88 @@ fn conventions_reject_new_deviations() {
     }
 }
 
-// Existing handler capabilities, until the shared operation inventory replaces
-// these assertions. A POST may read, and a stored query may write.
-const OWNED_WRITE_OPERATIONS: &[&str] = &[
-    "cluster_putBlob",
-    "cluster_clearBlob",
-    "cluster_mutate",
-    "cluster_mutate_if_graph_commit",
-    "cluster_invoke_query",
-    "cluster_invoke_query_if_graph_commit",
-    "cluster_load",
-    "cluster_loadNdjson",
-    "cluster_createBranch",
-    "cluster_deleteBranch",
-    "cluster_mergeBranches",
-    "cluster_publishCommit",
-    "cluster_dropCommit",
-    "deployment_apply",
-];
+fn inventory_errors(doc: &Value, inventory: &[HttpOperation]) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut declared = BTreeSet::new();
+    for expected in inventory {
+        let method = expected.method.as_lowercase();
+        let path = expected.path;
+        if !declared.insert((path, method)) {
+            errors.push(format!("duplicate inventory operation {method} {path}"));
+        }
+        let operation = &doc["paths"][path][method];
+        if !operation.is_object() {
+            errors.push(format!("missing documented operation {method} {path}"));
+        } else if operation["operationId"] != expected.legacy_operation_id {
+            errors.push(format!(
+                "{method} {path}: operationId must remain {} before the rename batch",
+                expected.legacy_operation_id
+            ));
+        }
+    }
+    for (path, item) in doc["paths"].as_object().unwrap() {
+        for method in item.as_object().unwrap().keys().filter(|method| {
+            matches!(
+                method.as_str(),
+                "get" | "head" | "post" | "put" | "delete" | "patch" | "options" | "trace"
+            )
+        }) {
+            if !declared.contains(&(path.as_str(), method.as_str())) {
+                errors.push(format!("operation missing from inventory: {method} {path}"));
+            }
+        }
+    }
+    errors
+}
+
+#[test]
+fn openapi_matches_the_http_operation_inventory() {
+    let errors = inventory_errors(&openapi_json(), HTTP_OPERATIONS);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+#[test]
+fn inventory_checks_detect_missing_extra_and_rebound_operations() {
+    let doc = openapi_json();
+    assert!(inventory_errors(&doc, HTTP_OPERATIONS).is_empty());
+    let expected = HTTP_OPERATIONS
+        .iter()
+        .find(|operation| operation.legacy_operation_id == "cluster_getAccess")
+        .unwrap();
+    let method = expected.method.as_lowercase();
+
+    let mut missing = doc.clone();
+    missing["paths"][expected.path]
+        .as_object_mut()
+        .unwrap()
+        .remove(method);
+    let errors = inventory_errors(&missing, HTTP_OPERATIONS);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("missing documented operation"));
+
+    let missing_row: Vec<_> = HTTP_OPERATIONS
+        .iter()
+        .copied()
+        .filter(|operation| operation.legacy_operation_id != expected.legacy_operation_id)
+        .collect();
+    let errors = inventory_errors(&doc, &missing_row);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("operation missing from inventory"));
+
+    let mut rebound = doc;
+    rebound["paths"][expected.path][method]["operationId"] = "anotherOperation".into();
+    let errors = inventory_errors(&rebound, HTTP_OPERATIONS);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("operationId must remain"));
+}
+
+fn write_operation_ids(inventory: &[HttpOperation]) -> Vec<&'static str> {
+    inventory
+        .iter()
+        .filter(|operation| operation.capability.may_write())
+        .map(|operation| operation.legacy_operation_id)
+        .collect()
+}
 
 fn required_response_errors(doc: &Value, names: &[&str], code: ErrorCode) -> Vec<String> {
     let mut errors = Vec::new();
@@ -444,20 +509,28 @@ fn required_response_errors(doc: &Value, names: &[&str], code: ErrorCode) -> Vec
     errors
 }
 
-fn required_write_response_errors(doc: &Value) -> Vec<String> {
-    required_response_errors(doc, OWNED_WRITE_OPERATIONS, ErrorCode::OutcomeUnknown)
+fn required_write_response_errors(doc: &Value, inventory: &[HttpOperation]) -> Vec<String> {
+    required_response_errors(
+        doc,
+        &write_operation_ids(inventory),
+        ErrorCode::OutcomeUnknown,
+    )
 }
 
 #[test]
 fn owned_writes_document_unknown_outcomes() {
-    let errors = required_write_response_errors(&openapi_json());
+    let errors = required_write_response_errors(&openapi_json(), HTTP_OPERATIONS);
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
 #[test]
 fn handlers_document_internal_failures() {
     let doc = openapi_json();
-    let mut errors = required_response_errors(&doc, OWNED_WRITE_OPERATIONS, ErrorCode::Internal);
+    let mut errors = required_response_errors(
+        &doc,
+        &write_operation_ids(HTTP_OPERATIONS),
+        ErrorCode::Internal,
+    );
     // These reads can fail internally too. Discovery and deployment lookup
     // have narrower refusal contracts; neither is inferred from its method.
     errors.extend(required_response_errors(
@@ -492,7 +565,7 @@ fn handlers_document_internal_failures() {
 #[test]
 fn required_write_coverage_detects_a_missing_response_or_code() {
     let doc = openapi_json();
-    assert!(required_write_response_errors(&doc).is_empty());
+    assert!(required_write_response_errors(&doc, HTTP_OPERATIONS).is_empty());
     let status = ErrorCode::OutcomeUnknown.http_statuses()[0].to_string();
     for remove_response in [true, false] {
         let mut changed = doc.clone();
@@ -508,8 +581,35 @@ fn required_write_coverage_detects_a_missing_response_or_code() {
                 .replace(ErrorCode::OutcomeUnknown.as_str(), "");
             responses.get_mut(&status).unwrap()["description"] = Value::String(description);
         }
-        let errors = required_write_response_errors(&changed);
+        let errors = required_write_response_errors(&changed, HTTP_OPERATIONS);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("cluster_mutate"));
     }
+}
+
+#[test]
+fn a_new_write_operation_requires_unknown_outcome_coverage() {
+    let mut doc = openapi_json();
+    let mut inventory = HTTP_OPERATIONS.to_vec();
+    let existing_write = *HTTP_OPERATIONS
+        .iter()
+        .find(|operation| operation.legacy_operation_id == "cluster_mutate")
+        .unwrap();
+    let new_write = HttpOperation {
+        name: "future write",
+        path: "/graphs/{graph_id}/future-write",
+        legacy_operation_id: "futureWrite",
+        ..existing_write
+    };
+    // A read response already documents internal failures but cannot describe
+    // an uncertain write. Adding a write must demand that additional contract.
+    let mut operation = doc["paths"]["/graphs/{graph_id}/query"]["post"].clone();
+    operation["operationId"] = new_write.legacy_operation_id.into();
+    doc["paths"][new_write.path] = serde_json::json!({"post": operation});
+    inventory.push(new_write);
+    assert!(inventory_errors(&doc, &inventory).is_empty());
+    let errors = required_write_response_errors(&doc, &inventory);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("futureWrite"));
+    assert!(errors[0].contains(ErrorCode::OutcomeUnknown.as_str()));
 }

@@ -8,7 +8,6 @@ use axum::extract::{RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
 use axum::{Extension, Json, Router};
 use omnigraph_mcp::{
     AdmissionError, Host, HostError, Pending, ProtocolError, ResourceOutput, ResourceRequest,
@@ -104,14 +103,30 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         .oidc_resource_url()
         .and_then(|resource| advertised_metadata_url(&resource))
         .map(|url| AdvertisedMetadataPath(Arc::from(url.path())));
-    let mut discovery = Router::new().route(RESOURCE_METADATA_PATH, get(resource_metadata));
+    metadata_routes(advertised).into_router().merge(protected)
+}
+
+/// The protocol-defined discovery routes keep their boot-time availability
+/// and layers while sharing registration with the operation inventory.
+fn metadata_routes(
+    advertised: Option<AdvertisedMetadataPath>,
+) -> crate::http_operations::HttpRoutes {
+    let mut discovery = crate::http_operations::HttpRoutes::new("")
+        .route("oauth protected resource metadata", resource_metadata);
     if let Some(advertised) = advertised {
-        discovery = discovery.route(
-            &format!("{RESOURCE_METADATA_PATH}/{{*resource_path}}"),
-            get(resource_metadata_at_resource_path).layer(Extension(advertised)),
-        );
+        discovery = discovery.resource_metadata(resource_metadata_at_resource_path, |route| {
+            route.layer(Extension(advertised))
+        });
     }
-    discovery.merge(protected)
+    discovery
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_http_operations() -> Vec<(crate::api::operations::HttpMethod, String)> {
+    metadata_routes(Some(AdvertisedMetadataPath(Arc::from(
+        "/.well-known/oauth-protected-resource/mcp",
+    ))))
+    .registered()
 }
 
 #[utoipa::path(get, path = "/.well-known/oauth-protected-resource", tag = "management",

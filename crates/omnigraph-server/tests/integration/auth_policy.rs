@@ -880,6 +880,10 @@ async fn malformed_and_unrouted_requests_answer_the_error_body() {
             request(Method::PUT, &g("/snapshot"), ""),
             StatusCode::METHOD_NOT_ALLOWED,
         ),
+        (
+            request(Method::POST, "/healthz", ""),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
     ];
     for (request, status) in cases {
         let what = format!("{} {}", request.method(), request.uri());
@@ -928,6 +932,7 @@ async fn an_unserved_method_on_a_protected_route_answers_after_every_guard() {
     let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
     let routes = [
         (Method::PUT, g("/snapshot"), "GET,HEAD"),
+        (Method::POST, g("/blob"), "GET,HEAD,PUT,DELETE"),
         (Method::PUT, g("/branches/feature"), "DELETE"),
         (Method::PUT, "/graphs".to_string(), "GET,HEAD"),
         (Method::PUT, "/cluster/plan".to_string(), "POST"),
