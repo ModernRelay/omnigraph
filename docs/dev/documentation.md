@@ -128,16 +128,24 @@ normalizing CRLF line endings to LF. Do not add release headings to fragments.
 ### The release file
 
 The release-prep pull request adds `changelog.d/<version>.md`, named for the
-`version` in `release.json`. It opens with an intro of at most 80 words saying
-what the release is. When the release has any breaking note, a
+`version` in `release.json`. It opens with an intro of at most 80 words that
+says what users get from the release and, when it breaks something, what
+they must do before they upgrade. Write the intro in
+[ASD-STE100](https://www.asd-ste100.org/) Simplified Technical English: short
+sentences (at most 25 words), active voice, simple present, one statement per
+sentence and no slogans. When the release has any breaking note, a
 `## Why these changes` section of at most 80 words says why the release asks
 users to act; it is printed at the top of the upgrade actions, and a release
-with no breaking note refuses it. A
-`## Highlights` section holds three to five `### ` highlights for a minor or
+with no breaking note refuses it.
+
+A `## Highlights` section holds three to five `### ` highlights for a minor or
 major release, and up to five for a patch release, each at most 150 words.
-Head each highlight with what users gain, then explain it in database terms
-(projection pushdown, copy-on-write branches, compare-and-swap publication)
-and list its pull requests:
+The heading names the change and what it gives users in a few words, with a
+measured number when there is one (`CSV import: 630 million rows in under
+five minutes`, not `CSV loads go through the planner`). The body is in
+database terms: it opens with the mechanism (projection pushdown,
+copy-on-write branches, compare-and-swap publication), names the benchmark
+behind any number, and lists its pull requests:
 
 ```markdown
 ### Counting no longer loads every embedding
