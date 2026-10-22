@@ -20,7 +20,7 @@ use omnigraph_planner::ValidateSpec;
 
 use futures::StreamExt;
 
-use super::csv_source::{CsvSourceExec, slice_of};
+use super::csv_source::{CsvSourceExec, FailedSlice, slice_of};
 use super::external;
 use super::memory::WorkMemory;
 use super::shape::{Breaker, work};
@@ -240,8 +240,8 @@ impl ExecutionPlan for ValidateExec {
 }
 
 /// Every input partition drained and swept at once ([`sweep_partition`]), the
-/// held batches sorted back into slice order under `schema`; the refusal is the
-/// lowest failed slice's (a sliceless failure first), whatever partition met it.
+/// held batches sorted back into slice order under `schema`; the refusal is a
+/// sliceless failure first, then the best [`FailedSlice::rank`], any partition.
 async fn drain_and_sweep(
     inputs: Vec<SendableRecordBatchStream>,
     memory: &Arc<WorkMemory>,
@@ -275,21 +275,21 @@ async fn drain_and_sweep(
             .downcast_ref::<CsvSourceExec>()
             .map(CsvSourceExec::failed_slices)
             .unwrap_or_default();
-        let slice_of_partition = |partition: usize| {
+        let rank_of_partition = |partition: usize| {
             failed
                 .iter()
-                .filter(|(_, failed_partition)| *failed_partition == partition)
-                .map(|(slice, _)| *slice)
+                .filter(|failed| failed.partition == partition)
+                .map(FailedSlice::rank)
                 .min()
         };
         let winner = failures
             .iter()
-            .position(|(partition, _)| slice_of_partition(*partition).is_none())
+            .position(|(partition, _)| rank_of_partition(*partition).is_none())
             .or_else(|| {
                 failures
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, (partition, _))| slice_of_partition(*partition))
+                    .min_by_key(|(_, (partition, _))| rank_of_partition(*partition))
                     .map(|(index, _)| index)
             })
             .unwrap_or(0);
@@ -546,9 +546,11 @@ mod tests {
     use super::super::fixtures;
     use super::*;
     use crate::loader::csv::{
-        CSV_READ_BATCH_ROWS, CsvLoadRequest, ResolvedCsv, target_arrow_schema,
+        CSV_READ_BATCH_ROWS, CsvLoadRequest, NormalizeStep, ResolvedCsv, target_arrow_schema,
     };
     use crate::table_store::CapturedSource;
+
+    const PERSON: &str = "node Person {\n  key: I64 @key\n  score: F64\n}\n";
 
     fn request() -> CsvLoadRequest {
         CsvLoadRequest {
@@ -561,13 +563,21 @@ mod tests {
         }
     }
 
-    fn catalog() -> Arc<Catalog> {
-        Arc::new(
-            build_catalog(
-                &parse_schema("node Person {\n  key: I64 @key\n  score: F64\n}\n").unwrap(),
-            )
-            .unwrap(),
-        )
+    fn catalog(schema: &str) -> Arc<Catalog> {
+        Arc::new(build_catalog(&parse_schema(schema).unwrap()).unwrap())
+    }
+
+    /// The slice `record` sits in when `source` is cut at 64 bytes.
+    fn slice_of_record(schema: &str, source: &str, record: usize) -> usize {
+        let resolved =
+            ResolvedCsv::resolve(&catalog(schema), &request(), source.as_bytes(), 64).unwrap();
+        resolved
+            .slices()
+            .iter()
+            .position(|slice| {
+                (slice.first_record..slice.first_record + slice.rows).contains(&record)
+            })
+            .unwrap()
     }
 
     fn capture(source: &str) -> Arc<CapturedSource> {
@@ -581,20 +591,18 @@ mod tests {
     }
 
     /// `source` cut into 64-byte slices, parsed by `partitions` and judged by
-    /// the breaker as an overwrite of a fresh graph of the test schema.
+    /// the breaker as an overwrite of a fresh graph of `schema`.
     async fn validate(
+        schema: &str,
         source: &str,
         partitions: usize,
     ) -> (Arc<CsvSourceExec>, DfResult<Vec<RecordBatch>>) {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::Session::from_defaults(
             Arc::new(
-                Omnigraph::init(
-                    dir.path().to_str().unwrap(),
-                    "node Person {\n  key: I64 @key\n  score: F64\n}\n",
-                )
-                .await
-                .unwrap(),
+                Omnigraph::init(dir.path().to_str().unwrap(), schema)
+                    .await
+                    .unwrap(),
             ),
             SessionSettings::default(),
         );
@@ -674,7 +682,7 @@ mod tests {
         for row in 0..1000 {
             writeln!(&mut source, "{row},1.5").unwrap();
         }
-        let (exec, drained) = validate(&source, 3).await;
+        let (exec, drained) = validate(PERSON, &source, 3).await;
         let batches = drained.unwrap();
         assert_eq!(keys(&batches), (0..1000).collect::<Vec<i64>>());
         assert!(
@@ -686,9 +694,9 @@ mod tests {
         assert!(exec.failed_slices().is_empty());
     }
 
-    /// Two bad records in two slices: the slices are claimed in order and a
-    /// claimed slice is parsed to its end, so the earlier slice always fails
-    /// and its record is the refusal, on every run.
+    /// Two bad records at the same normalization step in two slices: every
+    /// slice is normalized whatever partition claimed it, so the lower record
+    /// is the refusal, on every run.
     #[tokio::test]
     async fn the_lowest_failed_slice_names_the_refusal() {
         let mut source = String::from("key,score\n");
@@ -699,30 +707,99 @@ mod tests {
                 writeln!(&mut source, "{row:03},1.5").unwrap();
             }
         }
-        let resolved = ResolvedCsv::resolve(&catalog(), &request(), source.as_bytes(), 64).unwrap();
-        let slice_of_record = |record: usize| {
-            resolved
-                .slices()
-                .iter()
-                .position(|slice| {
-                    (slice.first_record..slice.first_record + slice.rows).contains(&record)
-                })
-                .unwrap()
-        };
-        assert_eq!((slice_of_record(12), slice_of_record(28)), (1, 3));
+        assert_eq!(
+            (
+                slice_of_record(PERSON, &source, 12),
+                slice_of_record(PERSON, &source, 28)
+            ),
+            (1, 3)
+        );
 
-        let (exec, drained) = validate(&source, 3).await;
+        let (exec, drained) = validate(PERSON, &source, 3).await;
         let error = drained.unwrap_err();
         assert!(
             error.to_string().contains("record 12 has an empty field"),
             "{error}"
         );
         let failed = exec.failed_slices();
-        assert_eq!(failed.iter().map(|(slice, _)| *slice).min(), Some(1));
+        assert_eq!(failed.iter().map(|failed| failed.slice).min(), Some(1));
         assert!(
-            failed.iter().all(|(slice, _)| [1, 3].contains(slice)),
+            failed.iter().all(|failed| [1, 3].contains(&failed.slice)),
             "{failed:?}"
         );
+    }
+
+    /// Two properties refused in two slices, the later-declared one in the
+    /// earlier slice: a partition keeps normalizing past a refusal, so the
+    /// earlier-declared property's record is named, from one partition or two.
+    #[tokio::test]
+    async fn the_first_declared_property_names_the_normalization_refusal() {
+        const SCHEMA: &str = "node Person {\n  key: I64 @key\n  a: Bool\n  b: Bool\n}\n";
+        let mut source = String::from("key,a,b\n");
+        for row in 0..40 {
+            let (a, b) = match row {
+                8 => ("true", "nope"),
+                20 => ("nope", "true"),
+                _ => ("true", "true"),
+            };
+            writeln!(&mut source, "{row:03},{a},{b}").unwrap();
+        }
+        assert!(slice_of_record(SCHEMA, &source, 9) < slice_of_record(SCHEMA, &source, 21));
+        for partitions in [1, 2] {
+            let (exec, judged) = validate(SCHEMA, &source, partitions).await;
+            let error = judged.unwrap_err().to_string();
+            assert!(
+                error.contains("record 21, property 'a': 'nope' is not `true` or `false`"),
+                "{partitions} partitions: {error}"
+            );
+            let failed = exec.failed_slices();
+            assert!(
+                failed.iter().any(|failed| failed.normalize
+                    == Some(NormalizeStep {
+                        step: 2,
+                        record: 21
+                    })),
+                "{partitions} partitions: {failed:?}"
+            );
+        }
+    }
+
+    /// Two `@range` constraints (the catalog sorts them by property: `age`
+    /// before `score`), the second violated in an earlier slice than the first:
+    /// the first-listed constraint is named, from one partition or two.
+    #[tokio::test]
+    async fn the_first_listed_constraint_names_the_value_refusal() {
+        const SCHEMA: &str = "node Person {\n  key: I64 @key\n  score: F64\n  age: I64\n  @range(score, 0.0..10.0)\n  @range(age, 0..150)\n}\n";
+        let dir = tempfile::tempdir().unwrap();
+        let graph = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+        assert_eq!(
+            graph.catalog().node_types["Person"]
+                .range_constraints
+                .iter()
+                .map(|rc| rc.property.as_str())
+                .collect::<Vec<_>>(),
+            ["age", "score"]
+        );
+        let mut source = String::from("key,score,age\n");
+        for row in 0..40 {
+            let (score, age) = match row {
+                8 => ("99", 30),
+                20 => ("1.5", 999),
+                _ => ("1.5", 30),
+            };
+            writeln!(&mut source, "{row:03},{score},{age}").unwrap();
+        }
+        assert!(slice_of_record(SCHEMA, &source, 9) < slice_of_record(SCHEMA, &source, 21));
+        for partitions in [1, 2] {
+            let (_, judged) = validate(SCHEMA, &source, partitions).await;
+            let error = judged.unwrap_err().to_string();
+            assert!(
+                error.contains("@range violation on Person.age: value 999 > max 150"),
+                "{partitions} partitions: {error}"
+            );
+        }
     }
 
     /// Two keys each repeated once, the repeats far apart in the source: the
@@ -740,7 +817,7 @@ mod tests {
             writeln!(&mut source, "{key},1.5").unwrap();
         }
         for partitions in [1, 3] {
-            let (_, judged) = validate(&source, partitions).await;
+            let (_, judged) = validate(PERSON, &source, partitions).await;
             let error = judged.unwrap_err().to_string();
             assert!(
                 error.contains("value '20' held by '20' and '20'"),

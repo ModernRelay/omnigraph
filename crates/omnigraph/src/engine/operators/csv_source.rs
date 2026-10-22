@@ -22,7 +22,9 @@ use super::external;
 use super::shape::{Source, work};
 use crate::error::OmniError;
 use crate::loader::LoadSliceExecuted;
-use crate::loader::csv::{CsvLoadRequest, ResolvedCsv};
+use crate::loader::csv::{
+    CsvLoadRequest, NormalizeFailure, NormalizeStep, ResolvedCsv, SliceRefusal,
+};
 use crate::table_store::CapturedSource;
 
 /// The `csv_source_rows` metric: the records the source held, counted once
@@ -53,10 +55,38 @@ struct Parse {
     stop: AtomicBool,
     started: OnceLock<Instant>,
     slices: Mutex<Vec<LoadSliceExecuted>>,
-    failed: Mutex<Vec<(usize, usize)>>,
+    failed: Mutex<Vec<FailedSlice>>,
+}
+
+/// A slice a partition refused and, for a normalization refusal, where it
+/// ranks; the breaker names the best-ranked one's refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FailedSlice {
+    pub(crate) slice: usize,
+    pub(crate) partition: usize,
+    pub(crate) normalize: Option<NormalizeStep>,
+}
+
+impl FailedSlice {
+    /// The order the breaker names refusals in: a parse refusal first, the
+    /// lowest slice's, then a normalization refusal by its step and record;
+    /// the order the whole-capture path meets them in.
+    pub(crate) fn rank(&self) -> (bool, usize, usize) {
+        match self.normalize {
+            None => (false, self.slice, 0),
+            Some(at) => (true, at.step, at.record),
+        }
+    }
 }
 
 impl Parse {
+    fn record_failure(&self, failed: FailedSlice) {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(failed);
+    }
+
     fn resolved(&self) -> crate::error::Result<Arc<ResolvedCsv>> {
         let mut resolved = self
             .resolved
@@ -124,9 +154,10 @@ impl CsvSourceExec {
         slices
     }
 
-    /// The `(slice, partition)` pairs whose parse was refused, so the
-    /// breaker answers the lowest slice's refusal whatever partition met it.
-    pub(crate) fn failed_slices(&self) -> Vec<(usize, usize)> {
+    /// Every refused slice with the partition that met it, one per failed
+    /// partition (its best-ranked), so the breaker answers the best-ranked
+    /// refusal whatever partition met it.
+    pub(crate) fn failed_slices(&self) -> Vec<FailedSlice> {
         self.parse
             .failed
             .lock()
@@ -200,7 +231,17 @@ impl ExecutionPlan for CsvSourceExec {
             &self.metrics,
             move |memory, sender| async move {
                 let started = *parse.started.get_or_init(Instant::now);
-                let resolved = parse.resolved().map_err(external)?;
+                if parse.stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let resolved = match parse.resolved() {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        parse.stop.store(true, Ordering::Release);
+                        return Err(external(error));
+                    }
+                };
+                let mut failed: Option<(usize, NormalizeFailure)> = None;
                 loop {
                     if parse.stop.load(Ordering::Acquire) {
                         break;
@@ -226,16 +267,25 @@ impl ExecutionPlan for CsvSourceExec {
                     );
                     let batches = match parsed {
                         Ok(batches) => batches,
-                        Err(error) => {
+                        Err(SliceRefusal::Normalize(failure)) => {
+                            if failed.as_ref().is_none_or(|(_, held)| failure.at < held.at) {
+                                failed = Some((slice, failure));
+                            }
+                            continue;
+                        }
+                        Err(SliceRefusal::Parse(error)) => {
                             parse.stop.store(true, Ordering::Release);
-                            parse
-                                .failed
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push((slice, partition));
-                            return Err(external(error));
+                            parse.record_failure(FailedSlice {
+                                slice,
+                                partition,
+                                normalize: None,
+                            });
+                            return Err(external(*error));
                         }
                     };
+                    if failed.is_some() {
+                        continue;
+                    }
                     let elapsed_compute_ns = elapsed_ns(computing);
                     for batch in &batches {
                         memory.hold(batch)?;
@@ -260,6 +310,14 @@ impl ExecutionPlan for CsvSourceExec {
                             start_ns,
                             end_ns: elapsed_ns(started),
                         });
+                }
+                if let Some((slice, failure)) = failed {
+                    parse.record_failure(FailedSlice {
+                        slice,
+                        partition,
+                        normalize: Some(failure.at),
+                    });
+                    return Err(external(*failure.error));
                 }
                 Ok(())
             },
@@ -470,14 +528,21 @@ mod tests {
             ),
             "{error}"
         );
-        assert_eq!(exec.failed_slices(), vec![(0, 0)]);
+        assert_eq!(
+            exec.failed_slices(),
+            vec![FailedSlice {
+                slice: 0,
+                partition: 0,
+                normalize: Some(NormalizeStep { step: 5, record: 1 }),
+            }]
+        );
     }
 
-    /// A refused slice stops the claim loop: the partitions in flight finish
-    /// their slice and no later slice is parsed, so the lowest refused slice
-    /// is always among the parsed ones.
+    /// A normalization refusal holds nothing after it: the partition keeps
+    /// normalizing the later slices for an earlier-ranked refusal, but
+    /// records and sends none of them.
     #[tokio::test]
-    async fn a_refused_slice_stops_the_claims() {
+    async fn a_refused_slice_records_nothing_after_it() {
         let mut source = String::from("key,score\n");
         for row in 0..200 {
             if row == 20 {
@@ -504,8 +569,9 @@ mod tests {
         assert!(
             parsed
                 .iter()
-                .all(|slice| (slice.slice as usize) < failed[0].0)
+                .all(|slice| (slice.slice as usize) < failed[0].slice)
         );
+        assert_eq!(outputs.len(), parsed.len() + 1, "{outputs:?}");
     }
 
     /// Drops the load caller while its blocking CSV producer owns captured bytes;

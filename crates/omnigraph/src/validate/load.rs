@@ -27,7 +27,7 @@ use super::{
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
 use crate::loader::read_reuse::LoadReadReuse;
-use crate::loader::{LoadMode, validate_enum_constraints, validate_value_constraints};
+use crate::loader::{LoadMode, enum_constraint_failures, value_constraint_failures};
 
 pub(crate) enum LoadPhase {
     RemovedInput,
@@ -346,7 +346,10 @@ impl SweepPlan {
 /// The facts one partition extracted from the batches it drained, every row
 /// placed by its [`Position`]; [`Extracted::prepare`] joins the partitions'.
 pub(crate) struct SweepPartial {
-    value: Option<(Position, Violation)>,
+    /// Per value constraint, by its declaration index: the earliest row that
+    /// violates it, so the merge names constraints in declaration order over
+    /// the whole source, whatever batch or slice each violation sits in.
+    value: Vec<Option<(Position, Violation)>>,
     ids: HashSet<String>,
     unique: Vec<UniquePartial>,
     card: HashMap<String, (Position, String)>,
@@ -355,7 +358,7 @@ pub(crate) struct SweepPartial {
 impl SweepPartial {
     pub(crate) fn new(plan: &SweepPlan) -> Self {
         Self {
-            value: None,
+            value: Vec::new(),
             ids: HashSet::new(),
             unique: plan
                 .unique
@@ -377,10 +380,16 @@ impl SweepPartial {
         base: Position,
     ) -> Result<()> {
         let table = plan.table.as_str();
-        if plan.needs_value && self.value.is_none() {
+        if plan.needs_value {
             let type_name = table.split_once(':').map(|(_, name)| name).unwrap_or(table);
-            if let Some(error) = value_check(table, type_name, catalog, batch) {
-                self.value = Some((base, value_violation(table, error)));
+            for (index, row, error) in value_check(table, type_name, catalog, batch) {
+                if index >= self.value.len() {
+                    self.value.resize(index + 1, None);
+                }
+                if self.value[index].is_none() {
+                    let position = base.saturating_add(row as Position);
+                    self.value[index] = Some((position, value_violation(table, error)));
+                }
             }
         }
         if plan.needs_ids {
@@ -468,7 +477,8 @@ impl Merging {
 /// What one sweep over the delta extracts for every check at once.
 #[derive(Default)]
 pub(crate) struct Extracted {
-    /// The first value violation in source order.
+    /// The first value violation: the first constraint in declaration order
+    /// with a violating row anywhere in the delta, at its earliest row.
     value: Option<Violation>,
     /// Every non-null id of the delta.
     ids: HashSet<String>,
@@ -505,14 +515,16 @@ impl Extracted {
         Ok(merging.finish(shards))
     }
 
-    /// Join the partitions' partials: the first value violation, the union
-    /// of ids, the last src per edge id, each check's own repeats and final
-    /// keys; the unique holders come back as one job per shard and check.
+    /// Join the partitions' partials: the first value violation (the earliest
+    /// row per constraint, then the first constraint in declaration order),
+    /// the union of ids, the last src per edge id, each check's own repeats
+    /// and final keys; the unique holders come back as one job per shard and
+    /// check.
     pub(crate) fn prepare(
         plan: &SweepPlan,
         partials: Vec<SweepPartial>,
     ) -> (Merging, Vec<UniqueShardJob>) {
-        let mut value: Option<(Position, Violation)> = None;
+        let mut value: Vec<Option<(Position, Violation)>> = Vec::new();
         let mut ids = HashSet::new();
         let mut card: HashMap<String, (Position, String)> = HashMap::new();
         let mut shards: Vec<Vec<Vec<FirstHolders>>> = plan
@@ -526,9 +538,14 @@ impl Extracted {
             .map(|(check, _)| (*check, Vec::new(), None))
             .collect();
         for partial in partials {
-            if let Some((position, violation)) = partial.value {
-                if value.as_ref().is_none_or(|(at, _)| position < *at) {
-                    value = Some((position, violation));
+            if partial.value.len() > value.len() {
+                value.resize(partial.value.len(), None);
+            }
+            for (index, found) in partial.value.into_iter().enumerate() {
+                if let Some((position, violation)) = found {
+                    if value[index].as_ref().is_none_or(|(at, _)| position < *at) {
+                        value[index] = Some((position, violation));
+                    }
                 }
             }
             ids.extend(partial.ids);
@@ -567,7 +584,11 @@ impl Extracted {
             .collect();
         (
             Merging {
-                value: value.map(|(_, violation)| violation),
+                value: value
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .map(|(_, violation)| violation),
                 ids,
                 card: card.into_iter().map(|(id, (_, src))| (id, src)).collect(),
                 unique,
@@ -577,22 +598,32 @@ impl Extracted {
     }
 }
 
-/// The evaluator's row-local value judgment of one batch: `@range`/`@check`
-/// then enum membership on a node, enum membership on an edge.
+/// The evaluator's row-local value judgment of one batch: every violated
+/// constraint with its declaration index and first violating row, `@range`
+/// and `@check` then enum membership on a node, enum membership on an edge.
 fn value_check(
     table: &str,
     type_name: &str,
     catalog: &Catalog,
     batch: &RecordBatch,
-) -> Option<OmniError> {
+) -> Vec<(usize, usize, OmniError)> {
     if table.starts_with("node:") {
-        let node_type = catalog.node_types.get(type_name)?;
-        validate_value_constraints(batch, node_type)
-            .err()
-            .or_else(|| validate_enum_constraints(batch, &node_type.properties, type_name).err())
+        let Some(node_type) = catalog.node_types.get(type_name) else {
+            return Vec::new();
+        };
+        let declared = node_type.range_constraints.len() + node_type.check_constraints.len();
+        let mut failures = value_constraint_failures(batch, node_type);
+        failures.extend(
+            enum_constraint_failures(batch, &node_type.properties, type_name)
+                .into_iter()
+                .map(|(index, row, error)| (declared + index, row, error)),
+        );
+        failures
     } else {
-        let edge_type = catalog.edge_types.get(type_name)?;
-        validate_enum_constraints(batch, &edge_type.properties, type_name).err()
+        match catalog.edge_types.get(type_name) {
+            Some(edge_type) => enum_constraint_failures(batch, &edge_type.properties, type_name),
+            None => Vec::new(),
+        }
     }
 }
 

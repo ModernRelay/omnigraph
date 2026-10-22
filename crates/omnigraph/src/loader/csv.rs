@@ -362,6 +362,67 @@ pub(crate) struct CsvSlice {
     pub(crate) rows: usize,
 }
 
+/// Where whole-source normalization refuses a record, in the order
+/// [`CsvTyping::normalize_batches_from`] meets failures: `step` counts the
+/// from endpoints, the to endpoints, then each property's conversion and its
+/// non-null check, then the ids; `record` is the 1-based source record. The
+/// lowest step over every slice, then the lowest record, is the refusal the
+/// whole-capture path raises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct NormalizeStep {
+    pub(crate) step: usize,
+    pub(crate) record: usize,
+}
+
+impl NormalizeStep {
+    /// The step of property `index`'s conversion, or of its non-null check.
+    fn property(index: usize, non_null: bool) -> usize {
+        2 + 2 * index + usize::from(non_null)
+    }
+}
+
+/// A record [`CsvTyping::normalize_batches_from`] refused: where it ranks
+/// and the refusal, boxed to keep the `Err` variant small.
+#[derive(Debug)]
+pub(crate) struct NormalizeFailure {
+    pub(crate) at: NormalizeStep,
+    pub(crate) error: Box<OmniError>,
+}
+
+/// Why [`ResolvedCsv::parse_slice`] refused a slice.
+#[derive(Debug)]
+pub(crate) enum SliceRefusal {
+    /// The reader, an admission or the slice itself: the load ends on it,
+    /// the lowest refused slice named, as the whole-capture path reads the
+    /// source to its end before any record is normalized.
+    Parse(Box<OmniError>),
+    /// A record failed normalization: the other slices are still normalized
+    /// and the earliest [`NormalizeStep`] over all of them is named.
+    Normalize(NormalizeFailure),
+}
+
+impl SliceRefusal {
+    #[cfg(test)]
+    pub(crate) fn into_error(self) -> OmniError {
+        match self {
+            Self::Parse(error) => *error,
+            Self::Normalize(failure) => *failure.error,
+        }
+    }
+}
+
+impl From<OmniError> for SliceRefusal {
+    fn from(error: OmniError) -> Self {
+        Self::Parse(Box::new(error))
+    }
+}
+
+impl From<NormalizeFailure> for SliceRefusal {
+    fn from(failure: NormalizeFailure) -> Self {
+        Self::Normalize(failure)
+    }
+}
+
 /// A capture resolved once for the engine's source operator: the columns,
 /// the record count and the slices its partitions parse; every refusal the
 /// counting pass can raise is raised here, before any slice is parsed.
@@ -417,7 +478,7 @@ impl ResolvedCsv {
         bytes: &[u8],
         index: usize,
         admit: &mut dyn FnMut(u64) -> Result<()>,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> std::result::Result<Vec<RecordBatch>, SliceRefusal> {
         let slice = self.slices.get(index).copied().ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "load csv into {}: slice {index} of {} requested",
@@ -453,7 +514,8 @@ impl ResolvedCsv {
             return Err(OmniError::manifest_internal(format!(
                 "load csv into {}: slice {index} counted {} records and read {rows}",
                 self.table_key, slice.rows
-            )));
+            ))
+            .into());
         }
         let properties = match &request.target {
             LoadTarget::Node(name) => &catalog.node_types[name].properties,
@@ -469,7 +531,7 @@ impl ResolvedCsv {
             is_edge: self.is_edge,
         };
         admit(typing.normalization_bytes(&read)?)?;
-        typing.normalize_batches_from(&read, slice.first_record)
+        Ok(typing.normalize_batches_from(&read, slice.first_record)?)
     }
 }
 
@@ -686,16 +748,22 @@ impl CsvTyping<'_> {
 
     fn normalize_batches(&self, read: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
         self.normalize_batches_from(read, 1)
+            .map_err(|failure| *failure.error)
     }
 
     /// [`Self::normalize_batches`] with the records numbered from
-    /// `first_record`, the number a slice's first record has in the source.
+    /// `first_record`, a slice's first record in the source; the steps run in
+    /// [`NormalizeStep`] order, so the first failure met is the lowest-ranked.
     fn normalize_batches_from(
         &self,
         read: &[RecordBatch],
         first_record: usize,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> std::result::Result<Vec<RecordBatch>, NormalizeFailure> {
         let table_key = self.table_key;
+        let failed = |step: usize, record: usize, error: OmniError| NormalizeFailure {
+            at: NormalizeStep { step, record },
+            error: Box::new(error),
+        };
         let by_role: HashMap<&ColumnRole, usize> = self
             .roles
             .iter()
@@ -703,45 +771,62 @@ impl CsvTyping<'_> {
             .map(|(index, role)| (role, index))
             .collect();
         let leading = if self.is_edge { 3 } else { 1 };
-        let mut first_record = first_record;
+        let mut next_record = first_record;
         let mut normalized: Vec<NormalizedCsvBatch> = read
             .iter()
             .map(|batch| {
                 let normalized = NormalizedCsvBatch {
-                    first_record,
+                    first_record: next_record,
                     rows: batch.num_rows(),
                     endpoints: Vec::with_capacity(leading - 1),
                     properties: Vec::with_capacity(
                         self.arrow_schema.fields().len().saturating_sub(leading),
                     ),
                 };
-                first_record += batch.num_rows();
+                next_record += batch.num_rows();
                 normalized
             })
             .collect();
         if self.is_edge {
-            for (role, label) in [(ColumnRole::Src, FROM_COLUMN), (ColumnRole::Dst, TO_COLUMN)] {
+            for (step, (role, label)) in
+                [(ColumnRole::Src, FROM_COLUMN), (ColumnRole::Dst, TO_COLUMN)]
+                    .into_iter()
+                    .enumerate()
+            {
                 let index = *by_role.get(&role).ok_or_else(|| {
-                    OmniError::manifest_internal(format!("{label} column resolved twice"))
+                    failed(
+                        step,
+                        first_record,
+                        OmniError::manifest_internal(format!("{label} column resolved twice")),
+                    )
                 })?;
                 for (read, normalized) in read.iter().zip(&mut normalized) {
                     let strings = utf8_without_empty(read.column(index));
                     if let Some(row) = first_null(&strings) {
-                        return Err(OmniError::manifest(format!(
-                            "load csv into {table_key}: record {} has an empty `{label}` endpoint",
-                            normalized.first_record + row
-                        )));
+                        let record = normalized.first_record + row;
+                        return Err(failed(
+                            step,
+                            record,
+                            OmniError::manifest(format!(
+                                "load csv into {table_key}: record {record} has an empty `{label}` endpoint"
+                            )),
+                        ));
                     }
                     normalized.endpoints.push(Arc::new(strings));
                 }
             }
         }
-        for field in self.arrow_schema.fields().iter().skip(leading) {
+        for (property, field) in self.arrow_schema.fields().iter().skip(leading).enumerate() {
+            let convert = NormalizeStep::property(property, false);
             let prop = self.properties.get(field.name()).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "property '{}' of {table_key} is missing from its catalog entry",
-                    field.name()
-                ))
+                failed(
+                    convert,
+                    first_record,
+                    OmniError::manifest_internal(format!(
+                        "property '{}' of {table_key} is missing from its catalog entry",
+                        field.name()
+                    )),
+                )
             })?;
             let role = ColumnRole::Property {
                 name: field.name().to_string(),
@@ -749,10 +834,14 @@ impl CsvTyping<'_> {
             };
             let index = by_role.get(&role).copied();
             if index.is_none() && !field.is_nullable() {
-                return Err(OmniError::manifest(format!(
-                    "load csv into {table_key}: property '{}' is not nullable and the source has no column for it",
-                    field.name()
-                )));
+                return Err(failed(
+                    convert,
+                    first_record,
+                    OmniError::manifest(format!(
+                        "load csv into {table_key}: property '{}' is not nullable and the source has no column for it",
+                        field.name()
+                    )),
+                ));
             }
             for (read, normalized) in read.iter().zip(&mut normalized) {
                 let column = match index {
@@ -762,7 +851,10 @@ impl CsvTyping<'_> {
                         prop,
                         table_key,
                         normalized.first_record,
-                    )?,
+                    )
+                    .map_err(|(row, error)| {
+                        failed(convert, normalized.first_record + row, *error)
+                    })?,
                     None => new_null_array(field.data_type(), normalized.rows),
                 };
                 normalized.properties.push(column);
@@ -774,15 +866,20 @@ impl CsvTyping<'_> {
                         .last()
                         .expect("every batch has the current property");
                     if let Some(row) = first_null(column.as_ref()) {
-                        return Err(OmniError::manifest(format!(
-                            "load csv into {table_key}: record {} has an empty field for non-nullable property '{}'",
-                            normalized.first_record + row,
-                            field.name()
-                        )));
+                        let record = normalized.first_record + row;
+                        return Err(failed(
+                            NormalizeStep::property(property, true),
+                            record,
+                            OmniError::manifest(format!(
+                                "load csv into {table_key}: record {record} has an empty field for non-nullable property '{}'",
+                                field.name()
+                            )),
+                        ));
                     }
                 }
             }
         }
+        let ids_step = NormalizeStep::property(self.arrow_schema.fields().len() - leading, false);
         normalized
             .into_iter()
             .map(|normalized| {
@@ -793,7 +890,7 @@ impl CsvTyping<'_> {
                         &normalized.properties,
                         normalized.rows,
                         normalized.first_record,
-                    )?,
+                    ),
                     LoadTarget::Edge(name) => edge_ids(
                         &self.catalog.edge_types[name],
                         self.arrow_schema,
@@ -803,15 +900,21 @@ impl CsvTyping<'_> {
                         self.catalog.system_columns,
                         normalized.rows,
                         normalized.first_record,
-                    )?,
-                };
+                    ),
+                }
+                .map_err(|(row, error)| failed(ids_step, normalized.first_record + row, *error))?;
                 let mut columns: Vec<ArrayRef> =
                     Vec::with_capacity(self.arrow_schema.fields().len());
                 columns.push(Arc::new(StringArray::from(ids)));
                 columns.extend(normalized.endpoints);
                 columns.extend(normalized.properties);
-                RecordBatch::try_new(Arc::clone(self.arrow_schema), columns)
-                    .map_err(OmniError::arrow_internal)
+                RecordBatch::try_new(Arc::clone(self.arrow_schema), columns).map_err(|error| {
+                    failed(
+                        ids_step,
+                        normalized.first_record,
+                        OmniError::arrow_internal(error),
+                    )
+                })
             })
             .collect()
     }
@@ -1035,19 +1138,22 @@ fn first_null(column: &dyn Array) -> Option<usize> {
 
 /// One read column to its declared Arrow type: numbers as read, text with
 /// empty fields as null, `Bool` from exactly `true` or `false`, `Date` and
-/// `DateTime` literal-checked cell by cell; `first_record` numbers row 0.
+/// `DateTime` literal-checked cell by cell; a refusal names its 0-based row.
 fn convert_property(
     column: &ArrayRef,
     name: &str,
     prop: &PropType,
     table_key: &str,
     first_record: usize,
-) -> Result<ArrayRef> {
+) -> std::result::Result<ArrayRef, (usize, Box<OmniError>)> {
     let cell_error = |row: usize, message: String| {
-        OmniError::manifest(format!(
-            "load csv into {table_key}: record {}, property '{name}': {message}",
-            first_record + row
-        ))
+        (
+            row,
+            Box::new(OmniError::manifest(format!(
+                "load csv into {table_key}: record {}, property '{name}': {message}",
+                first_record + row
+            ))),
+        )
     };
     Ok(match prop.scalar {
         ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64 => Arc::clone(column),
@@ -1129,9 +1235,12 @@ fn convert_property(
             Arc::new(Date64Array::from(values))
         }
         ScalarType::Vector(_) | ScalarType::Blob => {
-            return Err(OmniError::manifest_internal(format!(
-                "property '{name}' of {table_key} passed the kind check with an unsupported kind"
-            )));
+            return Err((
+                0,
+                Box::new(OmniError::manifest_internal(format!(
+                    "property '{name}' of {table_key} passed the kind check with an unsupported kind"
+                ))),
+            ));
         }
     })
 }
@@ -1144,7 +1253,7 @@ fn node_ids(
     property_columns: &[ArrayRef],
     rows: usize,
     first_record: usize,
-) -> Result<Vec<String>> {
+) -> std::result::Result<Vec<String>, (usize, Box<OmniError>)> {
     let key_columns = node_type
         .key
         .as_ref()
@@ -1169,9 +1278,10 @@ fn node_ids(
                 })
                 .collect::<Result<Vec<_>>>()
         })
-        .transpose()?;
-    (0..rows)
-        .map(|row| match &key_columns {
+        .transpose()
+        .map_err(|error| (0, Box::new(error)))?;
+    let id = |row: usize| -> Result<String> {
+        match &key_columns {
             Some(key_columns) => canonical_key_id(key_columns, row)?.ok_or_else(|| {
                 OmniError::manifest(format!(
                     "load csv into node:{}: record {} is missing a non-null @key value",
@@ -1180,7 +1290,10 @@ fn node_ids(
                 ))
             }),
             None => Ok(generate_id()),
-        })
+        }
+    };
+    (0..rows)
+        .map(|row| id(row).map_err(|error| (row, Box::new(error))))
         .collect()
 }
 
@@ -1195,7 +1308,7 @@ fn edge_ids(
     system_columns: SystemColumns,
     rows: usize,
     first_record: usize,
-) -> Result<Vec<String>> {
+) -> std::result::Result<Vec<String>, (usize, Box<OmniError>)> {
     let key_columns = edge_key_columns(
         edge_type,
         schema,
@@ -1203,9 +1316,10 @@ fn edge_ids(
         dst_column,
         property_columns,
         system_columns,
-    )?;
-    (0..rows)
-        .map(|row| match &key_columns {
+    )
+    .map_err(|error| (0, Box::new(error)))?;
+    let id = |row: usize| -> Result<String> {
+        match &key_columns {
             Some(key_columns) => canonical_key_id(key_columns, row)?.ok_or_else(|| {
                 OmniError::manifest(format!(
                     "load csv into edge:{}: record {} is missing a non-null @key value",
@@ -1214,7 +1328,10 @@ fn edge_ids(
                 ))
             }),
             None => Ok(generate_id()),
-        })
+        }
+    };
+    (0..rows)
+        .map(|row| id(row).map_err(|error| (row, Box::new(error))))
         .collect()
 }
 
@@ -1504,6 +1621,7 @@ mod tests {
                 &mut |_| Ok(()),
             )
             .unwrap_err()
+            .into_error()
             .to_string();
         assert_eq!(sliced, whole);
     }
