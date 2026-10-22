@@ -243,7 +243,10 @@ impl Authentication {
     /// client whose server refused the one it holds. The credential this
     /// invocation acquired is unchanged. A stored credential replaced since
     /// the invocation began is of another generation, and refuses.
-    pub(crate) async fn reacquire(&self, endpoint: &str) -> Result<Option<String>> {
+    pub(crate) async fn reacquire(
+        &self,
+        endpoint: &str,
+    ) -> Result<Option<credentials::AcquiredCredential>> {
         if endpoint != self.owner.route() {
             bail!("credential destination differs from the frozen owner");
         }
@@ -253,13 +256,9 @@ impl Authentication {
         ) {
             return Ok(None);
         }
-        Ok(Some(
-            self.acquire()
-                .await?
-                .bearer_for(&self.request, time::OffsetDateTime::now_utc())?
-                .expose()
-                .to_owned(),
-        ))
+        let credential = self.acquire().await?;
+        credential.bearer_for(&self.request, time::OffsetDateTime::now_utc())?;
+        Ok(Some(credential))
     }
     pub(crate) fn cached_token(&self, endpoint: &str) -> Result<Option<String>> {
         self.cached_credential(endpoint)?

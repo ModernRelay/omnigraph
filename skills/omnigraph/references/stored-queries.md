@@ -43,7 +43,7 @@ omnigraph queries list --target prod --graph dev --json # a server's GET /graphs
   default while healthy graphs serve; startup is fatal when no healthy graph
   remains or `--require-all-graphs` is set.
 - Both commands take a cluster root `--target <dir|uri>`; `--graph` narrows the
-  operation to one declared graph. `queries list` also takes a server target,
+  operation to one declared graph. `queries list` also takes a server or managed target,
   where `--graph` or the target's `default_graph` selects the graph and `--json`
   prints the route's body: its parameters carry `kind` (`string`, `int`, `list`
   with `item_kind`, `vector` with `vector_dim`, ...) rather than the root

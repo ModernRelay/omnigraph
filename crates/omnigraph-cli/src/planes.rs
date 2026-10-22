@@ -181,7 +181,10 @@ pub(crate) fn root_input(command: &Command) -> bool {
 pub(crate) fn selects_graph(command: &Command, target: &ResolvedTarget) -> bool {
     match requirement(command) {
         Requirement::Graph { .. } | Requirement::ServedGraph => true,
-        Requirement::RootOrServedGraph => matches!(target.binding, TargetBinding::Server { .. }),
+        Requirement::RootOrServedGraph => matches!(
+            target.binding,
+            TargetBinding::Server { .. } | TargetBinding::Managed(_)
+        ),
         _ => false,
     }
 }
@@ -357,18 +360,13 @@ pub(crate) fn validate_target(
     use Requirement::*;
     use TargetBinding::*;
     let need = requirement(&cli.command);
-    if need == ServedGraph && !matches!(target.binding, Server { .. }) {
+    if need == ServedGraph && !matches!(target.binding, Server { .. } | Managed(_)) {
         let label = command_label(&cli.command);
-        let why = match &target.binding {
-            Managed(_) => format!(
-                "{label} does not relay to a managed target; it connects to a server target"
-            ),
-            _ => format!(
-                "{label} connects to an existing server, and target '{}' is direct storage; \
-                 select a server target for a server that serves the graph",
-                target.label()
-            ),
-        };
+        let why = format!(
+            "{label} connects to an existing server, and target '{}' is direct storage; \
+             select a served target for a server that serves the graph",
+            target.label()
+        );
         return Err(crate::targets::refusal("target_kind_unsupported", why));
     }
     let allowed = match (&need, &target.binding) {
@@ -400,12 +398,14 @@ pub(crate) fn validate_target(
             Graph {
                 direct_only: false, ..
             }
+            | ServedGraph
+            | RootOrServedGraph
             | Registry
             | Deployment
             | ManagedCluster
             | Alias,
             Managed(binding),
-        ) => binding.cluster.is_some() && !matches!(cli.command, Command::Access(_)),
+        ) => binding.cluster.is_some(),
         (ManagedAccount, Managed(binding)) => binding.cluster.is_none(),
         (ManagedOperation | Authentication | Credential, Managed(_)) => true,
         _ => false,
