@@ -1036,8 +1036,8 @@ and regressions. Step 7 can ship independently.
 | 1 | Diagnostics contract for parse and type refusals (PR #759, merged 2026-09-30) | None |
 | 2 | Planner refusals carry diagnostics; a refusal by design is a bad request (PR #815, merged 2026-10-13) | #786 |
 | 2a | Shared query/explain validation and acceptance; exact-subset rules, adaptive-policy checks, bounded/versioned replay evidence, GQT scope assertions; the order checks of a fusion and of a search-ordered aggregate (PR #839, merged 2026-10-13) | supports steps 3-6 |
-| 3 | `T27` and `FullTextIndexRequired`, refusing only an index with no segment | #747 |
-| 4 | The ranked binding roots its component; the `rrf()` arms type error | #789 |
+| 3 | `T27` and `FullTextIndexRequired`, refusing only an index with no segment (PR #1066, merged 2026-10-18) | #747 |
+| 4 | The ranked binding roots its component; the `rrf()` arms type error (PR #1069, merged 2026-10-18) | #789 |
 | 5 | One total order: fused score column, `Sort` over fusion and search-ordered aggregates, `T37` retired, `T54` (PR #938, merged); its order checks land with step 2a | #787, #788 |
 | 6 | Read descriptors with producer ids and fusion-arm references | None |
 | 7 | Served read floor | #752 |
@@ -1156,3 +1156,16 @@ None.
   planner keeps both checks as internal errors against a lowering defect.
   An `rrf()` over one reached binding keeps its arm windows, so its nearest
   arm still ranks the corpus before the traversal keeps the reached rows.
+- 2026-10-21: step 6 implemented. The planner derives the descriptors from
+  the accepted physical plan (`read_descriptors`), and execution attaches
+  them to the query result before the plan runs, so the ordinary, inspected
+  and replay doors describe one plan with the same ids. Three readings of
+  the text above: a metric is a return column whose value is a score
+  column a retrieval of the plan writes, so a column computed from a score,
+  or a stored property of a score column's name on a schema older than the
+  reservation, is not one; no run establishes
+  embedding counts yet, so every `nearest` retrieval reports
+  `embedding_coverage` as unknown with reason `not_computed`; and the Arrow
+  IPC response, which has no JSON envelope, carries neither array. The
+  result column types the self-contained server testing RFC needs remain a
+  separate additive change.

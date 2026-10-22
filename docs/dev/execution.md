@@ -977,6 +977,17 @@ required first hop of the query. The execution report records each gate's
 verdict with the counts it read and each probe attempt per overfetch rung
 (`search` decisions), and a replay must record the same.
 
+A read describes its retrievals from the accepted plan alone
+(`omnigraph_planner::read_descriptors`): one retrieval per ranked `Scan`, per
+`RankFuse` and per fusion arm, ids in plan preorder with a fusion before its
+arms, and one metric per return column of the root `Projection` (a
+`return distinct`'s `Aggregate`) that reads a `_distance`, `_score` or `_rrf`
+column a retrieval of the plan writes; a stored property of that name on a
+schema older than the reservation is no metric. `engine::execute` derives them before
+the plan runs and attaches them to the `QueryResult`, so every door, replay
+included, reports the same ids for one plan; nothing is kept beside the plan,
+and `read_output` renders them as the envelope's `retrievals` and `metrics`.
+
 Lance 13 V2 row-stream payload hydration preserves input order and the valid
 prefixes of its ordering metadata. `WorkMemory` uses that metadata for the final
 sorted merge, so nearest keeps parallel output. Supported graph writers and
