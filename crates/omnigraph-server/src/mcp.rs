@@ -409,7 +409,9 @@ impl ServerHost {
                     Extension(handle),
                     Extension(input),
                     Some(Extension(actor)),
-                    ApiPath(QueryNamePath { name: args.name }),
+                    ApiPath(QueryNamePath {
+                        query_name: args.name,
+                    }),
                     HeaderMap::new(),
                     Bytes::from(body),
                 )
@@ -471,8 +473,7 @@ impl ServerHost {
                     Some(Extension(actor)),
                     ApiQuery(crate::api::CommitListQuery {
                         branch: args.branch,
-                        unpublished: false,
-                        unattached: false,
+                        listing: crate::api::CommitListing::History,
                         limit: args.limit,
                         page_token: args.page_token,
                     }),
@@ -610,7 +611,9 @@ impl ServerHost {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    ApiPath(handlers::BranchPath { branch: args.name }),
+                    ApiPath(handlers::BranchPath {
+                        branch_name: args.name,
+                    }),
                 )
                 .await?;
                 bounded_result(&output.0)
@@ -668,7 +671,7 @@ impl ServerHost {
     async fn discover(
         &self,
         actor: AuthenticatedActor,
-    ) -> Result<crate::api::GraphDiscoveryResponse, ApiError> {
+    ) -> Result<crate::api::GraphDiscoveryOutput, ApiError> {
         let state = State(self.state.clone());
         if actor.is_identity() {
             return Ok(
@@ -680,7 +683,7 @@ impl ServerHost {
         let listed = handlers::server_graphs_list(state, Some(Extension(actor)))
             .await?
             .0;
-        Ok(crate::api::GraphDiscoveryResponse {
+        Ok(crate::api::GraphDiscoveryOutput {
             graphs: listed
                 .graphs
                 .into_iter()

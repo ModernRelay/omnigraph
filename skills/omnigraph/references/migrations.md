@@ -4,10 +4,32 @@ The rest of this skill targets the current CLI and HTTP contract. The versioned
 procedures below use their named predecessor binaries. Read this page before replacing
 an older binary, rebuilding a graph, or translating earlier API examples.
 
-Current HTTP integrations must use exactly `Omnigraph-Http-Api: 0.14`, including
-the current routes, shapes and credentials. A `0.13` peer is refused before data
+Current HTTP integrations must use exactly `Omnigraph-Http-Api: 0.15`, including
+the current routes, shapes and credentials. A `0.14` peer is refused before data
 dispatch or graph access; changing an old integration's header alone is not an
 upgrade. See [server policy](server-policy.md).
+
+## HTTP contract 0.15 and access reports
+
+Regenerate SDKs from the current OpenAPI document: graph operation IDs lose
+`cluster_`, path arguments become `branch_name`, `query_name` and
+`deployment_id`, response types use `Output`, and string enum types omit that
+suffix. Blob selectors and change results share `EntityKind`; URLs and enum
+values are unchanged.
+
+Read `actor_id` instead of `actor` from HTTP and MCP access results.
+`omnigraph access --json` carries `protocol: 2` for this shape; update scripts
+that expect protocol 1. For HTTP commit lists, use `listing=unpublished` or
+`listing=unattached`; omit `listing` or use `listing=history` for history.
+Both retired boolean keys are refused even when false or combined with
+`listing`. Non-history listings still refuse `limit` and `page_token`.
+
+After the server upgrade, reconnect MCP clients and refresh cached tool schemas
+through `tools/list`. Clients with fixed response types must update them to
+`actor_id` before reconnecting. The HTTP header does not fence `/mcp`, so old
+MCP clients are not automatically refused; protocol negotiation is unchanged.
+See the [migration note](https://github.com/ModernRelay/omnigraph/blob/main/changelog.d/http-contract-015.breaking.md)
+and [MCP guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/mcp.md#upgrade-tool-schemas).
 
 ## Upgrade v0.10 to v0.11
 

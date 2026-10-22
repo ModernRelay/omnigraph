@@ -36,6 +36,17 @@ each request is a `POST` that carries its own bearer credential and gets a JSON
 response. There is no MCP session, and a successful `initialize` never admits a
 later unauthenticated request.
 
+### Upgrade tool schemas
+
+After upgrading the server, reconnect clients and refresh cached tool schemas
+with `tools/list`. The `access` tool now returns `actor_id` instead of `actor`;
+clients with fixed response types must update those types before reconnecting.
+Its output matches the [HTTP access report](policy.md#learn-your-access).
+
+MCP does not use the `Omnigraph-Http-Api` header, so an old MCP client is not
+automatically refused by the HTTP contract 0.15 upgrade. MCP protocol
+negotiation is unchanged, and the old field has no alias.
+
 ### Sign-in and discovery
 
 A request without a valid credential is refused with 401 before its body is
@@ -152,17 +163,17 @@ for a deployment whose policy was written with an LLM caller in mind.
 |---|---|---|---|
 | `health` | none | `GET /healthz` | none |
 | `graphs` | none | `GET /graphs/discovery` for an identity credential; otherwise `GET /graphs`, narrowed to ids and names | identity, or `graph_list` |
-| `schema` | `graph` | `GET /graphs/{graph}/schema` | `read` |
-| `queries` | `graph` | `GET /graphs/{graph}/queries`, stored mutations removed | `read` |
-| `query` | `graph`, `name`, optional `params`, `branch` | `POST /graphs/{graph}/queries/{name}` as a read | `invoke_query`, then `read` |
-| `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph}/query` | `read`; `change` for `explain load csv` |
-| `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph}/snapshot` | `read` |
-| `access` | `graph`, optional `branch`, `target_branch` | `GET /graphs/{graph}/access` | none |
-| `branches_list` | `graph` | `GET /graphs/{graph}/branches` | `read` |
-| `commits_list` | `graph`, optional `branch`, `limit`, `page_token` | `GET /graphs/{graph}/commits` | `read` |
-| `commits_get` | `graph`, `commit_id` | `GET /graphs/{graph}/commits/{commit_id}` | `read` |
-| `commits_changes` | `graph`, `commit_id`, optional `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph}/commits/{commit_id}/changes` | `read` |
-| `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph}/changes` | `read` |
+| `schema` | `graph` | `GET /graphs/{graph_id}/schema` | `read` |
+| `queries` | `graph` | `GET /graphs/{graph_id}/queries`, stored mutations removed | `read` |
+| `query` | `graph`, `name`, optional `params`, `branch` | `POST /graphs/{graph_id}/queries/{query_name}` as a read | `invoke_query`, then `read` |
+| `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph_id}/query` | `read`; `change` for `explain load csv` |
+| `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph_id}/snapshot` | `read` |
+| `access` | `graph`, optional `branch`, `target_branch` | `GET /graphs/{graph_id}/access` | none |
+| `branches_list` | `graph` | `GET /graphs/{graph_id}/branches` | `read` |
+| `commits_list` | `graph`, optional `branch`, `limit`, `page_token` | `GET /graphs/{graph_id}/commits` | `read` |
+| `commits_get` | `graph`, `commit_id` | `GET /graphs/{graph_id}/commits/{commit_id}` | `read` |
+| `commits_changes` | `graph`, `commit_id`, optional `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/commits/{commit_id}/changes` | `read` |
+| `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/changes` | `read` |
 
 `graph_list` is a server-scoped action, and a server without an applied cluster
 policy denies every server-scoped action. So with a static or other non-identity
@@ -188,11 +199,11 @@ The server's `initialize` instructions tell a model to call `graphs`, then
 
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|
-| `mutate` | `graph`, `query`, optional `name`, `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph}/mutate`, or `/mutate/if-graph-commit` with `if_graph_commit` | `change`; a branch statement takes its branch action |
-| `load` | `graph`, `mode`, `data`, optional `branch`, `from` | `POST /graphs/{graph}/load` | `change`, plus `branch_create` when `from` creates the branch |
-| `branches_create` | `graph`, `name`, optional `from` | `POST /graphs/{graph}/branches` | `branch_create` |
-| `branches_delete` | `graph`, `name` | `DELETE /graphs/{graph}/branches/{name}` | `branch_delete` |
-| `branches_merge` | `graph`, `source`, optional `target` | `POST /graphs/{graph}/branches/merge` | `branch_merge` |
+| `mutate` | `graph`, `query`, optional `name`, `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/mutate`, or `/mutate/if-graph-commit` with `if_graph_commit` | `change`; a branch statement takes its branch action |
+| `load` | `graph`, `mode`, `data`, optional `branch`, `from` | `POST /graphs/{graph_id}/load` | `change`, plus `branch_create` when `from` creates the branch |
+| `branches_create` | `graph`, `name`, optional `from` | `POST /graphs/{graph_id}/branches` | `branch_create` |
+| `branches_delete` | `graph`, `name` | `DELETE /graphs/{graph_id}/branches/{branch_name}` | `branch_delete` |
+| `branches_merge` | `graph`, `source`, optional `target` | `POST /graphs/{graph_id}/branches/merge` | `branch_merge` |
 
 Write tools follow one contract:
 

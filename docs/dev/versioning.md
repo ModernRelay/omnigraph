@@ -9,7 +9,7 @@ version axes. Never derive one axis from another.
 | Axis | Policy | Guard |
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
-| CLI ↔ server wire | One v0.14 contract; coordinated client/server upgrades. Exact request admission and CLI discovery/response validation. | Shared contract header, DTOs, HTTP refusal tests and OpenAPI drift tests. |
+| CLI ↔ server wire | One v0.15 contract; coordinated client/server upgrades. Exact request admission and CLI discovery/response validation. | Shared contract header, DTOs, HTTP refusal tests and OpenAPI drift tests. |
 | Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; a standalone graph at stamp 8, 9 or 13 is converted by the offline `omnigraph upgrade`, a graph at any other stamp is rebuilt by export and load; no open-time migration. | Main-manifest stamp guard on both bounds. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
@@ -394,7 +394,7 @@ points are refused
 
 ## Wire compatibility
 
-The HTTP boundary requires `Omnigraph-Http-Api: 0.14` exactly once on
+The HTTP boundary requires `Omnigraph-Http-Api: 0.15` exactly once on
 protected graph and registry requests. Authentication precedes contract admission;
 missing, duplicate or unsupported values return typed 400 `api_contract_mismatch`
 before graph resolution or body execution. Ordinary responses carry the same
@@ -414,6 +414,13 @@ independent of package and graph-storage versions; it establishes neither suppor
 for another server increment nor permission to replay a write. No old-client
 fallback or negotiation framework is supported. New wire changes update shared
 DTOs, the contract decision, OpenAPI and transport qualification together.
+
+Contract 0.15 renames access output to `actor_id`, replaces the two commit-list
+boolean selectors with `listing`, and standardizes generated SDK names. The
+CLI's access-report protocol is 2. MCP shares the access output change but
+retains its own protocol negotiation, so clients must refresh tool schemas;
+the HTTP header does not fence them. The [migration note](../../changelog.d/http-contract-015.breaking.md)
+owns the upgrade steps.
 
 Server URLs identify the service root, preserving any proxy prefix. Migrate
 graph-qualified URLs to that root plus `--graph`, `default_graph` or alias `graph`;

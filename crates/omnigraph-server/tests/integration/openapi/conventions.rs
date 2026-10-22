@@ -412,10 +412,10 @@ fn inventory_errors(doc: &Value, inventory: &[HttpOperation]) -> Vec<String> {
         let operation = &doc["paths"][path][method];
         if !operation.is_object() {
             errors.push(format!("missing documented operation {method} {path}"));
-        } else if operation["operationId"] != expected.legacy_operation_id {
+        } else if operation["operationId"] != expected.operation_id() {
             errors.push(format!(
-                "{method} {path}: operationId must remain {} before the rename batch",
-                expected.legacy_operation_id
+                "{method} {path}: operationId must match {}",
+                expected.operation_id()
             ));
         }
     }
@@ -446,7 +446,7 @@ fn inventory_checks_detect_missing_extra_and_rebound_operations() {
     assert!(inventory_errors(&doc, HTTP_OPERATIONS).is_empty());
     let expected = HTTP_OPERATIONS
         .iter()
-        .find(|operation| operation.legacy_operation_id == "cluster_getAccess")
+        .find(|operation| operation.name == "access")
         .unwrap();
     let method = expected.method.as_lowercase();
 
@@ -462,7 +462,7 @@ fn inventory_checks_detect_missing_extra_and_rebound_operations() {
     let missing_row: Vec<_> = HTTP_OPERATIONS
         .iter()
         .copied()
-        .filter(|operation| operation.legacy_operation_id != expected.legacy_operation_id)
+        .filter(|operation| operation.name != expected.name)
         .collect();
     let errors = inventory_errors(&doc, &missing_row);
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -472,18 +472,18 @@ fn inventory_checks_detect_missing_extra_and_rebound_operations() {
     rebound["paths"][expected.path][method]["operationId"] = "anotherOperation".into();
     let errors = inventory_errors(&rebound, HTTP_OPERATIONS);
     assert_eq!(errors.len(), 1, "{errors:?}");
-    assert!(errors[0].contains("operationId must remain"));
+    assert!(errors[0].contains("operationId must match"));
 }
 
-fn write_operation_ids(inventory: &[HttpOperation]) -> Vec<&'static str> {
+fn write_operation_ids(inventory: &[HttpOperation]) -> Vec<String> {
     inventory
         .iter()
         .filter(|operation| operation.capability.may_write())
-        .map(|operation| operation.legacy_operation_id)
+        .map(HttpOperation::operation_id)
         .collect()
 }
 
-fn required_response_errors(doc: &Value, names: &[&str], code: ErrorCode) -> Vec<String> {
+fn required_response_errors(doc: &Value, names: &[String], code: ErrorCode) -> Vec<String> {
     let mut errors = Vec::new();
     for name in names {
         let operation = doc["paths"]
@@ -491,7 +491,7 @@ fn required_response_errors(doc: &Value, names: &[&str], code: ErrorCode) -> Vec
             .unwrap()
             .values()
             .flat_map(|item| item.as_object().unwrap().values())
-            .find(|operation| operation["operationId"] == *name);
+            .find(|operation| operation["operationId"].as_str() == Some(name.as_str()));
         let Some(operation) = operation else {
             errors.push(format!("missing required operation {name}"));
             continue;
@@ -533,32 +533,34 @@ fn handlers_document_internal_failures() {
     );
     // These reads can fail internally too. Discovery and deployment lookup
     // have narrower refusal contracts; neither is inferred from its method.
-    errors.extend(required_response_errors(
-        &doc,
-        &[
-            "cluster_getAccess",
-            "cluster_getBlob",
-            "cluster_headBlob",
-            "cluster_listBranches",
-            "cluster_getBranchDiff",
-            "cluster_getMergeBase",
-            "cluster_pollChanges",
-            "cluster_captureChangeBaseline",
-            "cluster_listCommits",
-            "cluster_getCommit",
-            "cluster_getCommitChanges",
-            "cluster_getDiff",
-            "cluster_export",
-            "cluster_list_queries",
-            "cluster_query",
-            "cluster_getSchema",
-            "cluster_getSnapshot",
-            "listGraphs",
-            "deployment_status",
-            "deployment_plan",
-        ],
-        ErrorCode::Internal,
-    ));
+    let reads = [
+        "access",
+        "blob get",
+        "blob stat",
+        "branch list",
+        "branch diff",
+        "branch merge base",
+        "changes poll",
+        "changes baseline",
+        "commit list",
+        "commit show",
+        "commit changes",
+        "diff",
+        "export",
+        "queries list",
+        "query",
+        "schema show",
+        "snapshot",
+        "list graphs",
+        "deployment status",
+        "deployment plan",
+    ]
+    .map(|name| {
+        omnigraph_api_types::operations::named_operation(name)
+            .expect("the read belongs to the operation inventory")
+            .operation_id()
+    });
+    errors.extend(required_response_errors(&doc, &reads, ErrorCode::Internal));
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
@@ -583,7 +585,7 @@ fn required_write_coverage_detects_a_missing_response_or_code() {
         }
         let errors = required_write_response_errors(&changed, HTTP_OPERATIONS);
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("cluster_mutate"));
+        assert!(errors[0].starts_with("mutate "));
     }
 }
 
@@ -593,18 +595,18 @@ fn a_new_write_operation_requires_unknown_outcome_coverage() {
     let mut inventory = HTTP_OPERATIONS.to_vec();
     let existing_write = *HTTP_OPERATIONS
         .iter()
-        .find(|operation| operation.legacy_operation_id == "cluster_mutate")
+        .find(|operation| operation.name == "mutate")
         .unwrap();
     let new_write = HttpOperation {
         name: "future write",
         path: "/graphs/{graph_id}/future-write",
-        legacy_operation_id: "futureWrite",
+        operation_id_override: None,
         ..existing_write
     };
     // A read response already documents internal failures but cannot describe
     // an uncertain write. Adding a write must demand that additional contract.
     let mut operation = doc["paths"]["/graphs/{graph_id}/query"]["post"].clone();
-    operation["operationId"] = new_write.legacy_operation_id.into();
+    operation["operationId"] = new_write.operation_id().into();
     doc["paths"][new_write.path] = serde_json::json!({"post": operation});
     inventory.push(new_write);
     assert!(inventory_errors(&doc, &inventory).is_empty());

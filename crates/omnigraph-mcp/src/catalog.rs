@@ -116,7 +116,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "access",
         title: "Your access",
-        description: "Return what your credential may do on a graph: your `actor`, the actions allowed whatever the branch (`graph_wide`), and, for a `branch` you name, the actions allowed on it (`actions`). Name a `target_branch` too to learn whether you may create it from `branch` or merge `branch` into it. Check this before a write instead of learning from a refusal. Branches are judged by name and need not exist.",
+        description: "Return what your credential may do on a graph: your `actor_id`, the actions allowed whatever the branch (`graph_wide`), and, for a `branch` you name, the actions allowed on it (`actions`). Name a `target_branch` too to learn whether you may create it from `branch` or merge `branch` into it. Check this before a write instead of learning from a refusal. Branches are judged by name and need not exist.",
         input: access_schema,
         output: Some(access_output_schema),
         effect: Effect::Read,
@@ -518,14 +518,14 @@ pub(super) fn access_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "actor": {"type": ["string", "null"]},
+            "actor_id": {"type": ["string", "null"]},
             "graph_id": {"type": "string"},
             "graph_wide": actions,
             "branch": {"type": ["string", "null"]},
             "target_branch": {"type": ["string", "null"]},
             "actions": actions,
         },
-        "required": ["actor", "graph_id", "graph_wide", "branch", "target_branch", "actions"],
+        "required": ["actor_id", "graph_id", "graph_wide", "branch", "target_branch", "actions"],
     })
 }
 

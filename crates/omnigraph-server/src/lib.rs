@@ -54,9 +54,9 @@ use api::{
     BranchCreateRequest, BranchDeleteOutput, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery, ErrorCode,
     ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphBatchLoadQuery, GraphDiscoveryEntry,
-    GraphDiscoveryResponse, GraphInfo, GraphListResponse, HealthOutput, IF_ACTOR_HEADER,
-    IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
+    GraphDiscoveryOutput, GraphInfo, GraphListOutput, HealthOutput, IF_ACTOR_HEADER, IngestOutput,
+    IngestRequest, InvokeStoredQueryOutput, InvokeStoredQueryRequest, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
     graph_batch_load_receipt_output, ingest_receipt_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
@@ -171,14 +171,14 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
     ),
-    components(schemas(api::BlobEntityKind, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
+    components(schemas(api::EntityKind, api::CommitListing, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
     modifiers(&SecurityAddon),
 )]
 pub struct ApiDoc;
 
 /// The canonical served OpenAPI shape (RFC-011 cluster-only): the static
 /// `ApiDoc` with every protected path nested under `/graphs/{graph_id}/…`
-/// and `cluster_`-prefixed operation ids. `/healthz` and `/graphs` stay
+/// and inventory-derived operation ids. `/healthz` and `/graphs` stay
 /// flat. This is the single source of nesting — both the runtime
 /// `server_openapi` handler and the committed `openapi.json` derive from
 /// it, so the published spec can never describe routes the server does
@@ -1852,15 +1852,15 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
     format!("merge conflicts: {}{}", preview.join("; "), suffix)
 }
 
-fn graph_type_subject(entity_kind: api::EntityKindOutput, type_name: &str) -> String {
+fn graph_type_subject(entity_kind: api::EntityKind, type_name: &str) -> String {
     match entity_kind {
-        api::EntityKindOutput::Node => format!("node type '{type_name}'"),
-        api::EntityKindOutput::Edge => format!("edge type '{type_name}'"),
+        api::EntityKind::Node => format!("node type '{type_name}'"),
+        api::EntityKind::Edge => format!("edge type '{type_name}'"),
     }
 }
 
 fn format_key_conflict(
-    entity_kind: api::EntityKindOutput,
+    entity_kind: api::EntityKind,
     type_name: &str,
     entity_id: Option<&str>,
 ) -> String {
@@ -2119,10 +2119,10 @@ mod api_error_tests {
     #[test]
     fn merge_summary_uses_type_and_entity_vocabulary() {
         let summary = summarize_merge_conflicts(&[api::MergeConflictOutput {
-            entity_kind: api::EntityKindOutput::Node,
+            entity_kind: api::EntityKind::Node,
             type_name: "Person".to_string(),
             entity_id: Some("p1".to_string()),
-            kind: api::MergeConflictKindOutput::DivergentUpdate,
+            kind: api::MergeConflictKind::DivergentUpdate,
             message: "divergent update for id 'p1'".to_string(),
         }]);
         assert_eq!(
@@ -2149,7 +2149,7 @@ mod api_error_tests {
         let details = error
             .published_dataset_version_conflict
             .expect("structured published dataset version conflict");
-        assert_eq!(details.entity_kind, api::EntityKindOutput::Edge);
+        assert_eq!(details.entity_kind, api::EntityKind::Edge);
         assert_eq!(details.type_name, "Knows");
         assert_eq!(details.expected_published_dataset_version, 7);
         assert_eq!(details.actual_published_dataset_version, 9);
@@ -3037,7 +3037,7 @@ mod api_error_tests {
             let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
             assert!(error.error.contains(expected_message));
             let details = error.key_conflict.expect("structured key conflict");
-            assert_eq!(details.entity_kind, api::EntityKindOutput::Node);
+            assert_eq!(details.entity_kind, api::EntityKind::Node);
             assert_eq!(details.type_name, "Person");
             assert_eq!(details.entity_id, entity_id);
             assert!(error.recovery_required.is_none());

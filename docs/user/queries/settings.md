@@ -59,7 +59,7 @@ A setting reaches the engine through one of three doors:
 A `set` line in the text applies after the door's value, so the file wins.
 
 A stored query runs under the process defaults: `omnigraph query <name>`
-without `-e` or `--query` refuses `--set`, and `POST /queries/{name}` takes no
+without `-e` or `--query` refuses `--set`, and `POST /queries/{query_name}` takes no
 `settings` field.
 
 Each setting's environment variable is its process default: the server reads

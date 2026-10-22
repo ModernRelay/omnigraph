@@ -373,7 +373,8 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
     // nothing with no branch named or on `main`.
     let (status, body) = json_response(&app, get_request(&g("/access?branch=main"), &token)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["actor"].is_string(), "{body}");
+    assert!(body["actor_id"].is_string(), "{body}");
+    assert!(body.get("actor").is_none(), "{body}");
     assert_eq!(body["graph_wide"], json!([]), "{body}");
     assert_eq!(body["actions"], json!([]), "{body}");
     let (status, _) = json_response(
@@ -648,6 +649,7 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         vec![HeaderValue::from_static("0.11")],
         vec![HeaderValue::from_static("0.12")],
         vec![HeaderValue::from_static("0.13")],
+        vec![HeaderValue::from_static("0.14")],
         vec![HeaderValue::from_str(&format!("{HTTP_API_CONTRACT}, {HTTP_API_CONTRACT}")).unwrap()],
         vec![
             HeaderValue::from_static(HTTP_API_CONTRACT),
@@ -1744,7 +1746,7 @@ async fn policy_commit_publish_and_drop_denials_are_indistinguishable_from_unkno
         .to_string();
     let (status, body) = json_response(
         &app,
-        get_request(&g("/commits?unpublished=true"), "writer-token"),
+        get_request(&g("/commits?listing=unpublished"), "writer-token"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1805,7 +1807,7 @@ async fn policy_commit_publish_and_drop_denials_are_indistinguishable_from_unkno
     }
     let (status, body) = json_response(
         &app,
-        get_request(&g("/commits?unpublished=true"), "writer-token"),
+        get_request(&g("/commits?listing=unpublished"), "writer-token"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -4262,32 +4264,32 @@ async fn access_reports_the_callers_own_actions_as_routes_decide_them() {
         (
             "bruno-token",
             "",
-            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+            json!({"actor_id":"act-bruno","graph_id":"default","graph_wide":["read"],
                    "branch":null,"target_branch":null,"actions":[]}),
         ),
         (
             "bruno-token",
             "?branch=main",
-            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+            json!({"actor_id":"act-bruno","graph_id":"default","graph_wide":["read"],
                    "branch":"main","target_branch":null,"actions":["read"]}),
         ),
         (
             "bruno-token",
             "?branch=feature&target_branch=main",
-            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+            json!({"actor_id":"act-bruno","graph_id":"default","graph_wide":["read"],
                    "branch":"feature","target_branch":"main","actions":["read","change"]}),
         ),
         (
             "ragnor-token",
             "?branch=main",
-            json!({"actor":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
+            json!({"actor_id":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
                    "branch":"main","target_branch":null,
                    "actions":["read","export","branch_delete"]}),
         ),
         (
             "ragnor-token",
             "?branch=feature&target_branch=main",
-            json!({"actor":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
+            json!({"actor_id":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
                    "branch":"feature","target_branch":"main",
                    "actions":["read","export","change","branch_merge"]}),
         ),
@@ -4395,7 +4397,7 @@ rules:
     let app = build_app(AppState::open(graph).await.unwrap());
     let (status, body) = access(&app, "?branch=main&target_branch=feature", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["actor"], Value::Null);
+    assert_eq!(body["actor_id"], Value::Null);
     assert_eq!(
         body["graph_wide"],
         json!([

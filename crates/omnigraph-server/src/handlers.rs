@@ -150,7 +150,7 @@ pub(crate) async fn server_ready(
     tag = "management",
     operation_id = "listGraphs",
     responses(
-        (status = 200, description = "List of registered graphs", body = GraphListResponse),
+        (status = 200, description = "List of registered graphs", body = GraphListOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
@@ -167,7 +167,7 @@ pub(crate) async fn server_ready(
 pub(crate) async fn server_graphs_list(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
-) -> std::result::Result<Json<GraphListResponse>, ApiError> {
+) -> std::result::Result<Json<GraphListOutput>, ApiError> {
     let snapshot = state.routing().registry.snapshot_ref();
 
     // Capture management authorization and inventory from one activated
@@ -230,7 +230,7 @@ pub(crate) async fn server_graphs_list(
         })
         .collect();
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
-    Ok(Json(GraphListResponse { graphs }))
+    Ok(Json(GraphListOutput { graphs }))
 }
 
 #[utoipa::path(
@@ -239,7 +239,7 @@ pub(crate) async fn server_graphs_list(
     tag = "management",
     operation_id = "discoverGraphs",
     responses(
-        (status = 200, description = "Authenticated minimal graph inventory", body = GraphDiscoveryResponse),
+        (status = 200, description = "Authenticated minimal graph inventory", body = GraphDiscoveryOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Identity credential required", body = ErrorOutput),
     ),
@@ -248,7 +248,7 @@ pub(crate) async fn server_graphs_list(
 pub(crate) async fn server_graphs_discovery(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
-) -> std::result::Result<Json<GraphDiscoveryResponse>, ApiError> {
+) -> std::result::Result<Json<GraphDiscoveryOutput>, ApiError> {
     let actor = actor.ok_or_else(|| {
         ApiError::unauthorized(Unauthenticated::NoCredential, "missing bearer token")
     })?;
@@ -266,7 +266,7 @@ pub(crate) async fn server_graphs_discovery(
         .into_iter()
         .map(|entry| entry.key().graph_id.as_str().to_owned())
         .collect();
-    Ok(Json(GraphDiscoveryResponse {
+    Ok(Json(GraphDiscoveryOutput {
         graphs: ids
             .into_iter()
             .map(|graph_id| GraphDiscoveryEntry {
@@ -295,35 +295,9 @@ pub(crate) async fn server_openapi(
 /// The graph-route mount, shared by registration and OpenAPI nesting.
 pub(crate) const CLUSTER_PATH_PREFIX: &str = "/graphs/{graph_id}";
 
-/// Operation-id prefix applied to every cloned cluster operation.
-/// Decision 7 in the implementation plan — keeps operation IDs unique
-/// across the spec when both flat and nested variants ever appear in
-/// the same generation pass.
-const CLUSTER_OPERATION_ID_PREFIX: &str = "cluster_";
-
-/// Paths that stay flat in every server mode (public or server-level,
-/// no per-graph dependency). Update this list when adding new
-/// always-flat endpoints. `/graphs` is the management enumeration —
-/// it lives at the root in both single mode (405) and multi mode, and
-/// must never be rewritten to `/graphs/{graph_id}/graphs`.
-const ALWAYS_FLAT_PATHS: &[&str] = &[
-    "/healthz",
-    "/readyz",
-    "/graphs",
-    "/graphs/discovery",
-    "/cluster/plan",
-    "/cluster/deployments",
-    "/cluster/deployments/{id}",
-    "/.well-known/oauth-protected-resource",
-    "/.well-known/oauth-protected-resource/{resource_path}",
-];
-
-/// In multi-mode `server_openapi`, every protected path-item is
-/// reattached under the cluster prefix. Operation IDs gain the
-/// `cluster_` prefix so SDK generators don't collide if/when both
-/// surfaces are merged. Every rewritten operation also declares the
-/// required `{graph_id}` path parameter so the served OpenAPI document
-/// remains internally valid.
+/// Mount graph paths under their production prefix and derive operation IDs
+/// from the shared inventory. Every graph operation also declares the required
+/// `{graph_id}` path parameter. Flat protocol and management names stay pinned.
 ///
 /// Removing the flat protected paths matches the runtime router —
 /// in multi mode, requests to `/snapshot` etc. return 404, so the
@@ -332,13 +306,16 @@ pub(crate) fn nest_paths_under_cluster_prefix(doc: &mut utoipa::openapi::OpenApi
     let original = std::mem::take(&mut doc.paths.paths);
     let mut rewritten = std::collections::BTreeMap::new();
     for (path, mut item) in original {
-        if ALWAYS_FLAT_PATHS.contains(&path.as_str()) {
+        if api::operations::HTTP_OPERATIONS
+            .iter()
+            .any(|operation| operation.path == path)
+        {
             rewritten.insert(path, item);
             continue;
         }
-        rename_operation_ids(&mut item, CLUSTER_OPERATION_ID_PREFIX);
         add_cluster_graph_id_parameter(&mut item);
         let new_path = format!("{CLUSTER_PATH_PREFIX}{path}");
+        name_graph_operations(&mut item, &new_path);
         rewritten.insert(new_path, item);
     }
     doc.paths.paths = rewritten;
@@ -371,11 +348,22 @@ pub(crate) fn graph_id_path_parameter() -> Parameter {
     parameter
 }
 
-/// Prefix every operation_id in this PathItem with `prefix`.
-pub(crate) fn rename_operation_ids(item: &mut utoipa::openapi::PathItem, prefix: &str) {
-    for op in path_item_operations_mut(item) {
-        if let Some(id) = op.operation_id.as_deref() {
-            op.operation_id = Some(format!("{prefix}{id}"));
+/// Render names from the same method/path rows the production router uses.
+fn name_graph_operations(item: &mut utoipa::openapi::PathItem, path: &str) {
+    use api::operations::{HttpMethod, http_operation};
+    for (method, operation) in [
+        (HttpMethod::Get, item.get.as_mut()),
+        (HttpMethod::Head, item.head.as_mut()),
+        (HttpMethod::Post, item.post.as_mut()),
+        (HttpMethod::Put, item.put.as_mut()),
+        (HttpMethod::Delete, item.delete.as_mut()),
+    ] {
+        if let Some(operation) = operation {
+            operation.operation_id = Some(
+                http_operation(method, path)
+                    .expect("a documented graph operation belongs to the shared inventory")
+                    .operation_id(),
+            );
         }
     }
 }
@@ -779,7 +767,6 @@ pub(crate) fn authorize_request(
     get,
     path = "/snapshot",
     tag = "snapshots",
-    operation_id = "getSnapshot",
     params(SnapshotQuery),
     responses(
         (status = 200, description = "Graph snapshot", body = api::SnapshotOutput),
@@ -832,7 +819,6 @@ pub(crate) async fn server_snapshot(
     get,
     path = "/access",
     tag = "access",
-    operation_id = "getAccess",
     params(api::AccessQuery),
     responses(
         (status = 200, description = "The actions the caller's credential may take", body = api::AccessOutput),
@@ -894,7 +880,6 @@ pub(crate) fn access_body(
     post,
     path = "/query",
     tag = "queries",
-    operation_id = "query",
     request_body = QueryRequest,
     responses(
         (status = 200, description = "Query results", body = ReadOutput),
@@ -976,7 +961,6 @@ struct BlobBinaryBody(Vec<u8>);
     get,
     path = "/blob",
     tag = "blobs",
-    operation_id = "getBlob",
     params(
         BlobReadQuery,
         ("If-Match" = Option<String>, Header, description = "Strong entity-tag-list precondition, including `*`, evaluated before If-None-Match and Range."),
@@ -1054,7 +1038,6 @@ pub(crate) async fn server_blob_get(
     head,
     path = "/blob",
     tag = "blobs",
-    operation_id = "headBlob",
     params(
         BlobReadQuery,
         ("If-Match" = Option<String>, Header, description = "Strong entity-tag-list precondition, including `*`, evaluated before If-None-Match."),
@@ -1117,7 +1100,6 @@ pub(crate) async fn server_blob_head(
     put,
     path = "/blob",
     tag = "blobs",
-    operation_id = "putBlob",
     params(
         BlobWriteQuery,
         ("If-Match" = Option<String>, Header, description = "`*` to require a value in the cell, or a list of strong entity tags one of which must equal the cell's current ETag. Weak tags never match. The write evaluates it against the branch head it applies to."),
@@ -1242,7 +1224,6 @@ pub(crate) async fn server_blob_put(
     delete,
     path = "/blob",
     tag = "blobs",
-    operation_id = "clearBlob",
     params(
         BlobWriteQuery,
         ("If-Match" = Option<String>, Header, description = "`*` to require a value in the cell, or a list of strong entity tags one of which must equal the cell's current ETag. A null cell satisfies neither form."),
@@ -1338,8 +1319,8 @@ fn authorize_blob_write(
 fn blob_write_cell(query: BlobWriteQuery) -> omnigraph::BlobCell {
     omnigraph::BlobCell {
         entity: match query.entity {
-            api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
-            api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
+            api::EntityKind::Node => omnigraph::EntityKind::Node,
+            api::EntityKind::Edge => omnigraph::EntityKind::Edge,
         },
         type_name: query.r#type,
         id: query.id,
@@ -1410,8 +1391,8 @@ async fn read_blob_for_delivery(
             .await
             .map_err(|(mapped, cause)| redact_blob_api_error(mapped, "target", cause))?;
     let entity = match query.entity {
-        api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
-        api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
+        api::EntityKind::Node => omnigraph::EntityKind::Node,
+        api::EntityKind::Edge => omnigraph::EntityKind::Edge,
     };
     handle
         .engine
@@ -1477,7 +1458,6 @@ fn redact_blob_api_error(
     post,
     path = "/export",
     tag = "queries",
-    operation_id = "export",
     request_body = ExportRequest,
     responses(
         (status = 200, description = "Exported data as NDJSON", content_type = "application/x-ndjson"),
@@ -1637,7 +1617,7 @@ fn reject_graph_commit_expected_head(
 
 /// Shared backend for `/mutate` (canonical), `/mutate/if-graph-commit`,
 /// and the stored-mutation arm of
-/// `/queries/{name}`. Returns the bare `ChangeOutput`; each route handler
+/// `/queries/{query_name}`. Returns the bare `ChangeOutput`; each route handler
 /// wraps it.
 ///
 /// Order: parse and classify first; a branch statement then passes
@@ -1851,7 +1831,7 @@ async fn unattached_child_target(
     Ok(target)
 }
 
-/// Shared backend for `/query` and the stored-read arm of `/queries/{name}`.
+/// Shared backend for `/query` and the stored-read arm of `/queries/{query_name}`.
 ///
 /// Order: parse and classify first; `branch list` then passes
 /// [`refuse_wrong_door`] and [`refuse_statement_envelope`], and otherwise runs
@@ -2046,14 +2026,13 @@ fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<RedactedCause>
     post,
     path = "/mutate",
     tag = "mutations",
-    operation_id = "mutate",
     request_body = ChangeRequest,
     responses(
         (status = 200, description = "Mutation results", body = ChangeOutput),
         (status = 400, description = "Bad request - also returned when `branch list` or a branch control read (`branch diff`, `branch merge-base`, `branch merge … dry run`) arrives here instead of POST /query, when a request target accompanies a branch statement, when a name or parameters accompany a branch statement, and when a commit precondition accompanies a branch statement", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 404, description = "`branch delete` of a branch that does not exist, as DELETE /branches/{branch} answers", body = ErrorOutput),
+        (status = 404, description = "`branch delete` of a branch that does not exist, as DELETE /branches/{branch_name} answers", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict; also `branch create` of a branch that already exists, and a conflicting `branch merge`, whose body carries `merge_conflicts`", body = ErrorOutput),
         (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
@@ -2116,7 +2095,6 @@ pub(crate) async fn server_mutate(
     post,
     path = "/mutate/if-graph-commit",
     tag = "mutations",
-    operation_id = "mutate_if_graph_commit",
     request_body = ChangeRequest,
     params(
         ("Omnigraph-If-Graph-Commit" = String, Header, description = "Required raw graph-head commit id. The mutation runs only while the branch's effective head still equals it."),
@@ -2169,10 +2147,10 @@ pub(crate) async fn server_mutate_if_graph_commit(
     ))
 }
 
-/// Path parameter for `POST /queries/{name}`.
+/// Path parameter for `POST /queries/{query_name}`.
 #[derive(Deserialize)]
 pub(crate) struct QueryNamePath {
-    pub(crate) name: String,
+    pub(crate) query_name: String,
 }
 
 pub(crate) fn parse_optional_invoke_body(
@@ -2190,15 +2168,14 @@ pub(crate) fn parse_optional_invoke_body(
 
 #[utoipa::path(
     post,
-    path = "/queries/{name}",
+    path = "/queries/{query_name}",
     tag = "queries",
-    operation_id = "invoke_query",
     params(
-        ("name" = String, Path, description = "Stored query name (the registry key)"),
+        ("query_name" = String, Path, description = "Stored query name (the registry key)"),
     ),
     request_body = Option<InvokeStoredQueryRequest>,
     responses(
-        (status = 200, description = "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged", body = InvokeStoredQueryResponse),
+        (status = 200, description = "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged", body = InvokeStoredQueryOutput),
         (status = 400, description = "Bad request (param type error; snapshot on a stored mutation)", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
@@ -2228,21 +2205,20 @@ pub(crate) async fn server_invoke_query(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    ApiPath(QueryNamePath { name }): ApiPath<QueryNamePath>,
+    ApiPath(QueryNamePath { query_name: name }): ApiPath<QueryNamePath>,
     headers: axum::http::HeaderMap,
     body: Bytes,
-) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+) -> std::result::Result<Json<InvokeStoredQueryOutput>, ApiError> {
     reject_graph_commit_expected_head(&headers, &format!("/queries/{name}/if-graph-commit"))?;
     invoke_stored_query(state, handle, ingress, actor, name, body, None).await
 }
 
 #[utoipa::path(
     post,
-    path = "/queries/{name}/if-graph-commit",
+    path = "/queries/{query_name}/if-graph-commit",
     tag = "queries",
-    operation_id = "invoke_query_if_graph_commit",
     params(
-        ("name" = String, Path, description = "Stored mutation name (the registry key)"),
+        ("query_name" = String, Path, description = "Stored mutation name (the registry key)"),
         ("Omnigraph-If-Graph-Commit" = String, Header, description = "Required raw graph-head commit id. The stored mutation runs only while the branch's effective head still equals it."),
     ),
     request_body = Option<InvokeStoredQueryRequest>,
@@ -2271,10 +2247,10 @@ pub(crate) async fn server_invoke_query_if_graph_commit(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    ApiPath(QueryNamePath { name }): ApiPath<QueryNamePath>,
+    ApiPath(QueryNamePath { query_name: name }): ApiPath<QueryNamePath>,
     headers: axum::http::HeaderMap,
     body: Bytes,
-) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+) -> std::result::Result<Json<InvokeStoredQueryOutput>, ApiError> {
     let expected_head = require_graph_commit_expected_head(&headers)?;
     invoke_stored_query(
         state,
@@ -2296,7 +2272,7 @@ async fn invoke_stored_query(
     name: String,
     body: Bytes,
     expected_head: Option<String>,
-) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+) -> std::result::Result<Json<InvokeStoredQueryOutput>, ApiError> {
     let req = parse_optional_invoke_body(body)?;
     // A caller without `invoke_query` can't tell a denial from a missing
     // query: both 404 with this exact message, so the catalog can't be
@@ -2385,7 +2361,7 @@ async fn invoke_stored_query(
             expected_head.as_deref(),
         )
         .await?;
-        Ok(Json(InvokeStoredQueryResponse::Change(output)))
+        Ok(Json(InvokeStoredQueryOutput::Change(output)))
     } else {
         if expected_head.is_some() {
             return Err(ApiError::bad_request(
@@ -2405,7 +2381,7 @@ async fn invoke_stored_query(
         )
         .await?
         .into_read_output()?;
-        Ok(Json(InvokeStoredQueryResponse::Read(output)))
+        Ok(Json(InvokeStoredQueryOutput::Read(output)))
     }
 }
 
@@ -2413,7 +2389,6 @@ async fn invoke_stored_query(
     get,
     path = "/queries",
     tag = "queries",
-    operation_id = "list_queries",
     responses(
         (status = 200, description = "Stored-query catalog (every stored query, with typed params)", body = QueriesCatalogOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
@@ -2460,7 +2435,6 @@ pub(crate) async fn server_list_queries(
     get,
     path = "/schema",
     tag = "schema",
-    operation_id = "getSchema",
     responses(
         (status = 200, description = "Current schema source", body = SchemaOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
@@ -2602,7 +2576,6 @@ async fn run_json_load(
     post,
     path = "/load",
     tag = "mutations",
-    operation_id = "load",
     request_body = IngestRequest,
     responses(
         (status = 200, description = "Load results", body = IngestOutput),
@@ -2676,7 +2649,6 @@ async fn collect_graph_batch_body(body: Body) -> std::result::Result<Bytes, ApiE
     post,
     path = "/load/ndjson",
     tag = "mutations",
-    operation_id = "loadNdjson",
     params(GraphBatchLoadQuery),
     request_body(
         content = String,
@@ -2806,7 +2778,6 @@ pub(crate) async fn server_load_ndjson(
     get,
     path = "/branches",
     tag = "branches",
-    operation_id = "listBranches",
     responses(
         (status = 200, description = "List of branches", body = BranchListOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
@@ -2864,7 +2835,6 @@ async fn branch_list_body(
     post,
     path = "/branches",
     tag = "branches",
-    operation_id = "createBranch",
     request_body = BranchCreateRequest,
     responses(
         (status = 200, description = "Branch created", body = BranchCreateOutput),
@@ -2991,7 +2961,7 @@ async fn branch_create_body(
 /// Path-param shape for [`server_branch_delete`]. Named-field
 /// deserialization (rather than `Path<String>` or `Path<(String,)>`)
 /// keeps the extractor stable across single-mode flat routes and
-/// multi-mode nested routes: the `{branch}` capture is picked by
+/// multi-mode nested routes: the `{branch_name}` capture is picked by
 /// name and any other captures in scope (e.g. `{graph_id}` in
 /// multi-mode) are ignored without breaking deserialization.
 ///
@@ -2999,10 +2969,10 @@ async fn branch_create_body(
 /// when route nesting changes" class.
 #[derive(Deserialize)]
 pub(crate) struct BranchPath {
-    pub(crate) branch: String,
+    pub(crate) branch_name: String,
 }
 
-/// The branch actions whose names share `/branches/{branch}`: the router
+/// The branch actions whose names share `/branches/{branch_name}`: the router
 /// matches one route for the whole shape, so a branch named like an action
 /// is still a branch for DELETE, and the actions keep their URLs. Each
 /// action's name, method and handler live in this one place.
@@ -3074,11 +3044,13 @@ pub(crate) fn branch_action_http_routes()
     })
 }
 
-/// Every method of `/branches/{branch}` except DELETE: the action the name
+/// Every method of `/branches/{branch_name}` except DELETE: the action the name
 /// and method select, or 405 naming what that name serves.
 pub(crate) async fn server_branch_action(
     State(state): State<AppState>,
-    ApiPath(BranchPath { branch }): ApiPath<BranchPath>,
+    ApiPath(BranchPath {
+        branch_name: branch,
+    }): ApiPath<BranchPath>,
     request: Request,
 ) -> Response {
     match BranchAction::of(&branch) {
@@ -3087,7 +3059,7 @@ pub(crate) async fn server_branch_action(
     }
 }
 
-/// 405 for a method `/branches/{branch}` does not serve for that name, with
+/// 405 for a method `/branches/{branch_name}` does not serve for that name, with
 /// the methods it does serve: DELETE for every name, plus an action's own.
 /// The body is the error body every other refusal answers.
 fn branch_method_not_allowed(action: Option<BranchAction>) -> Response {
@@ -3110,11 +3082,10 @@ fn branch_method_not_allowed(action: Option<BranchAction>) -> Response {
 
 #[utoipa::path(
     delete,
-    path = "/branches/{branch}",
+    path = "/branches/{branch_name}",
     tag = "branches",
-    operation_id = "deleteBranch",
     params(
-        ("branch" = String, Path, description = "Branch name to delete"),
+        ("branch_name" = String, Path, description = "Branch name to delete"),
     ),
     responses(
         (status = 200, description = "Branch deleted", body = BranchDeleteOutput),
@@ -3138,7 +3109,9 @@ pub(crate) async fn server_branch_delete(
     Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
-    ApiPath(BranchPath { branch }): ApiPath<BranchPath>,
+    ApiPath(BranchPath {
+        branch_name: branch,
+    }): ApiPath<BranchPath>,
 ) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     branch_delete_body(&state, &handle, actor_ref, ingress, &branch).await?;
@@ -3149,7 +3122,7 @@ pub(crate) async fn server_branch_delete(
     }))
 }
 
-/// Body shared by `DELETE /branches/{branch}` and the `branch delete`
+/// Body shared by `DELETE /branches/{branch_name}` and the `branch delete`
 /// statement: the `branch_delete` check on `name`, admission, the engine call.
 async fn branch_delete_body(
     state: &AppState,
@@ -3191,7 +3164,6 @@ async fn branch_delete_body(
     post,
     path = "/branches/merge",
     tag = "branches",
-    operation_id = "mergeBranches",
     request_body = BranchMergeRequest,
     responses(
         (status = 200, description = "Branches merged", body = BranchMergeOutput),
@@ -3415,11 +3387,10 @@ async fn delete_merged_source_branch(
     get,
     path = "/commits",
     tag = "commits",
-    operation_id = "listCommits",
     params(CommitListQuery),
     responses(
         (status = 200, description = "List of commits", body = CommitListOutput),
-        (status = 400, description = "Two listings selected, a page parameter with `unpublished` or `unattached`, a zero `limit`, or a rejected page token", body = ErrorOutput),
+        (status = 400, description = "Invalid `listing`, a retired `unpublished` or `unattached` selector, paging a non-history listing, a zero `limit`, or a rejected page token", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Branch not found", body = ErrorOutput),
@@ -3449,25 +3420,20 @@ async fn delete_merged_source_branch(
 /// branch's history, which costs what the whole listing costs, and a commit
 /// the history does not reach is refused (400).
 ///
-/// `unpublished=true` lists instead the unpublished commits whose recorded
+/// `listing=unpublished` lists instead the unpublished commits whose recorded
 /// target is `branch` (writes `as commit` awaiting `commit publish`), newest
-/// first; each carries `published: false`. `unattached=true` lists instead
+/// first; each carries `published: false`. `listing=unattached` lists instead
 /// the live unattached snapshots whose recorded target is `branch` (writes
 /// `as unattached branch`), newest first, each with `kind: "unattached"`;
-/// the two filters together are refused (400), as is either with `limit` or
-/// `page_token`.
+/// non-history listings refuse `limit` and `page_token` (400). The retired
+/// `unpublished` and `unattached` keys are rejected regardless of value.
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     ApiQuery(query): ApiQuery<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
-    if query.unattached && query.unpublished {
-        return Err(ApiError::bad_request(
-            "`unattached=true` and `unpublished=true` select different listings; pass one",
-        ));
-    }
     let paged = query.limit.is_some() || query.page_token.is_some();
-    if paged && (query.unattached || query.unpublished) {
+    if paged && query.listing != api::CommitListing::History {
         return Err(ApiError::bad_request(
             "`limit` and `page_token` page a branch's history, not `unpublished` or `unattached`",
         ));
@@ -3534,12 +3500,10 @@ pub(crate) async fn server_commit_list(
             next_page_token: page.next_page_token,
         }));
     }
-    let commits = if query.unattached {
-        db.list_unattached_commits(Some(branch.as_str())).await
-    } else if query.unpublished {
-        db.list_unpublished_commits(Some(branch.as_str())).await
-    } else {
-        db.list_commits(Some(branch.as_str())).await
+    let commits = match query.listing {
+        api::CommitListing::History => db.list_commits(Some(branch.as_str())).await,
+        api::CommitListing::Unpublished => db.list_unpublished_commits(Some(branch.as_str())).await,
+        api::CommitListing::Unattached => db.list_unattached_commits(Some(branch.as_str())).await,
     }
     .map_err(ApiError::from_omni)?;
     Ok(Json(CommitListOutput {
@@ -3560,7 +3524,6 @@ pub(crate) struct CommitPath {
     get,
     path = "/commits/{commit_id}",
     tag = "commits",
-    operation_id = "getCommit",
     params(
         ("commit_id" = String, Path, description = "Commit identifier"),
     ),
@@ -3605,7 +3568,6 @@ pub(crate) async fn server_commit_show(
     post,
     path = "/commits/{commit_id}/publish",
     tag = "commits",
-    operation_id = "publishCommit",
     params(
         ("commit_id" = String, Path, description = "Unpublished commit identifier"),
     ),
@@ -3658,7 +3620,6 @@ pub(crate) async fn server_commit_publish(
     delete,
     path = "/commits/{commit_id}",
     tag = "commits",
-    operation_id = "dropCommit",
     params(
         ("commit_id" = String, Path, description = "Unpublished commit or unattached snapshot identifier"),
     ),
@@ -4051,7 +4012,7 @@ mod blob_error_tests {
         };
         let actor = AuthenticatedActor::cluster_static(Arc::from("act-alice"));
         let query = || api::BlobReadQuery {
-            entity: api::BlobEntityKind::Node,
+            entity: api::EntityKind::Node,
             r#type: "Document".to_string(),
             id: "missing".to_string(),
             property: "content".to_string(),
@@ -4205,9 +4166,9 @@ pub(crate) struct ParsedChangeParams {
     pub start: Option<String>,
     pub page_token: Option<String>,
     pub limit: Option<usize>,
-    pub kinds: Vec<api::EntityKindOutput>,
+    pub kinds: Vec<api::EntityKind>,
     pub types: Vec<String>,
-    pub ops: Vec<api::ChangeOpOutput>,
+    pub ops: Vec<api::ChangeOp>,
     /// The `set=<name>=<value>` parameters, each checked against the settings
     /// definition and the `process` scope rule: validated here; consulted by
     /// nothing until the change feed's planner entry reads `engine` (the
@@ -4297,17 +4258,15 @@ pub(crate) fn parse_change_query(
             }
             "kind" => params
                 .kinds
-                .push(api::EntityKindOutput::parse(&value).ok_or_else(|| {
+                .push(api::EntityKind::parse(&value).ok_or_else(|| {
                     ApiError::bad_request(format!("unknown kind '{value}' (expected node | edge)"))
                 })?),
             "type" => params.types.push(value),
-            "op" => params
-                .ops
-                .push(api::ChangeOpOutput::parse(&value).ok_or_else(|| {
-                    ApiError::bad_request(format!(
-                        "unknown op '{value}' (expected insert | update | delete)"
-                    ))
-                })?),
+            "op" => params.ops.push(api::ChangeOp::parse(&value).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "unknown op '{value}' (expected insert | update | delete)"
+                ))
+            })?),
             "set" => params.settings.push(parse_set_parameter(&value)?),
             _ => unreachable!("allow-list covers every match arm"),
         }
@@ -4319,7 +4278,6 @@ pub(crate) fn parse_change_query(
     get,
     path = "/commits/{commit_id}/changes",
     tag = "changes",
-    operation_id = "getCommitChanges",
     params(
         ("commit_id" = String, Path, description = "Commit identifier"),
         api::CommitChangesQuery,
@@ -4439,7 +4397,6 @@ fn required_diff_param(value: Option<String>, name: &str) -> std::result::Result
     get,
     path = "/diff",
     tag = "changes",
-    operation_id = "getDiff",
     params(api::DiffQuery),
     responses(
         (status = 200, description = "Net entity changes between the two resolved commits, in frozen (kind, type, id, op) order, without a cause", body = api::DiffOutput),
@@ -4588,7 +4545,6 @@ pub(crate) fn authorize_branch_reads(
     get,
     path = "/branches/diff",
     tag = "changes",
-    operation_id = "getBranchDiff",
     params(api::BranchDiffQuery),
     responses(
         (status = 200, description = "What `source` changed since its merge base with `target`: the net entity changes from the base to the source head", body = api::DiffOutput),
@@ -4665,7 +4621,6 @@ pub(crate) async fn branch_diff_page(
     get,
     path = "/branches/merge-base",
     tag = "changes",
-    operation_id = "getMergeBase",
     params(api::MergeBaseQuery),
     responses(
         (status = 200, description = "The commit a merge of `source` into `target` would classify against, with the two heads", body = api::MergeBaseOutput),
@@ -4838,7 +4793,6 @@ fn parse_change_feed_start(
     get,
     path = "/changes",
     tag = "changes",
-    operation_id = "pollChanges",
     params(api::ChangeFeedQuery),
     responses(
         (status = 200, description = "Change blocks in first-parent order. The durable cursor appears only on a terminal page, advanced only over complete commits; a mid-block page carries only next_page_token", body = api::ChangeFeedOutput),
@@ -4917,7 +4871,6 @@ pub(crate) async fn server_changes_feed(
     post,
     path = "/changes/baseline",
     tag = "changes",
-    operation_id = "captureChangeBaseline",
     request_body = api::ChangeBaselineRequest,
     responses(
         (status = 200, description = "NDJSON entity snapshot pinned at one captured commit. Every preceding record is one type-keyed entity record (the load/export NDJSON shape); the FINAL record is the ChangeBaselineRecord envelope — an interrupted stream has no terminal record and therefore no usable cursor. Install the snapshot durably before the cursor.", body = api::ChangeBaselineRecord, content_type = "application/x-ndjson"),

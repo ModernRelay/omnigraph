@@ -350,7 +350,7 @@ omnigraph queries list --target prod --graph knowledge --json # a server's catal
 registry against its applied schema. `list` reads a direct cluster root, where
 `--graph` may select one graph, or one served graph, which a server target
 selects with `--graph` or its `default_graph`; there `--json` prints the body of
-`GET /graphs/{id}/queries`.
+`GET /graphs/{graph_id}/queries`.
 Distinct from `lint`, which validates authoring source. See
 [`stored-queries.md`](stored-queries.md).
 
@@ -375,7 +375,8 @@ omnigraph access --target production --branch main --json
 
 `access` reports the server-resolved actor and allowed graph actions; it is the
 identity check, with no separate `whoami` command. Direct targets use `--as`
-or no actor. Managed targets refuse `access`. See
+or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
+update scripts that read protocol 1's `actor`. Managed targets refuse `access`. See
 [access scope and policy semantics](../../../docs/user/cli/targets.md#what-you-may-do-at-a-target).
 
 Set/remove require `token`/`store`; an existing entry needs `--replace`.

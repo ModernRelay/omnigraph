@@ -14,7 +14,7 @@ use crate::operator::OperatorConfig;
 
 pub(crate) const TARGET_PROTOCOL: u32 = 1;
 pub(crate) const CREDENTIAL_PROTOCOL: u32 = 1;
-pub(crate) const ACCESS_PROTOCOL: u32 = 1;
+pub(crate) const ACCESS_PROTOCOL: u32 = 2;
 
 #[derive(Debug)]
 pub(crate) struct TargetError {

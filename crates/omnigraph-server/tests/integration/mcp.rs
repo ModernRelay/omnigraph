@@ -725,6 +725,22 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
                 if let Some(output) = tool.get("outputSchema") {
                     assert_eq!(output["type"], "object");
                     assert_eq!(output["anyOf"].as_array().unwrap().len(), 2);
+                    if tool["name"] == "access" {
+                        let success = output["anyOf"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|schema| schema["properties"].get("graph_id").is_some())
+                            .expect("access advertises its successful result");
+                        assert!(
+                            success["required"]
+                                .as_array()
+                                .unwrap()
+                                .contains(&json!("actor_id"))
+                        );
+                        assert!(success["properties"].get("actor_id").is_some());
+                        assert!(success["properties"].get("actor").is_none());
+                    }
                     line.push_str(" output");
                 }
                 line
@@ -1085,6 +1101,11 @@ async fn mcp_read_parity_tools_equal_their_routes() {
     ] {
         let result = call(&app, "secret", tool, arguments).await;
         assert_eq!(result["result"]["isError"], false, "{tool}: {result}");
+        if tool == "access" {
+            let access = &result["result"]["structuredContent"];
+            assert_eq!(access["actor_id"], "default", "{access}");
+            assert!(access.get("actor").is_none(), "{access}");
+        }
         assert_eq!(
             result["result"]["structuredContent"],
             http_get(&app, &uri, "secret").await,

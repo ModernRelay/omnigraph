@@ -5482,10 +5482,10 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
         parse_stdout_json(&output_success(&mut command))
     };
     let feature = decide(Some("act-bruno"), "feature");
-    assert_eq!(feature["protocol"], 1, "{feature}");
+    assert_eq!(feature["protocol"], 2, "{feature}");
     assert_eq!(feature["source"], "direct", "{feature}");
     assert_eq!(feature["graph_id"], "knowledge");
-    assert_eq!(feature["actor"], "act-bruno");
+    assert_eq!(feature["actor_id"], "act-bruno");
     assert!(
         actions(&feature, "actions").contains(&"change".to_string()),
         "{feature}"
@@ -5627,7 +5627,7 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
     let rows = IntentReply::json(
         200,
         json!({
-            "actor":"act-me", "graph_id":"knowledge", "graph_wide":["read"],
+            "actor_id":"act-me", "graph_id":"knowledge", "graph_wide":["read"],
             "branch":"main", "target_branch":null, "actions":["read","change"]
         }),
     );

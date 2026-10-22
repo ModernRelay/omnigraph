@@ -230,7 +230,7 @@ as it ran ([explaining a load statement](../queries/explain-load.md)).
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/mutate \
-  -H 'Omnigraph-Http-Api: 0.14' \
+  -H 'Omnigraph-Http-Api: 0.15' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{"query":"load csv \"s3://imports/person.csv\" into node:Person mode append delimiter \"|\" header","branch":"main"}'

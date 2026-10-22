@@ -33,7 +33,7 @@ loading reject branch-statement files.
 omnigraph queries validate --target .             # all applied graphs
 omnigraph queries validate --target . --graph dev # one graph
 omnigraph queries list --target . --graph dev     # names and typed params
-omnigraph queries list --target prod --graph dev --json # a server's GET /graphs/{id}/queries body
+omnigraph queries list --target prod --graph dev --json # a server's GET /graphs/{graph_id}/queries body
 ```
 
 - `cluster validate --config .` checks desired `.gq` sources before apply.
@@ -54,15 +54,15 @@ omnigraph queries list --target prod --graph dev --json # a server's GET /graphs
 
 | Route | Gate | Purpose |
 |-------|------|---------|
-| `GET /graphs/{id}/queries` | `read` | Typed tool catalog of the served queries. Graph-wide (branch-independent; `read` authorized against `main`). |
-| `POST /graphs/{id}/queries/{name}` | `invoke_query` (+ `change` for a stored mutation) | Invoke a named query. Body carries params only — **never** `.gq` source. A stored mutation cannot target a `snapshot` (`400`); a param type error is a structured `400` naming the param. |
+| `GET /graphs/{graph_id}/queries` | `read` | Typed tool catalog of the served queries. Graph-wide (branch-independent; `read` authorized against `main`). |
+| `POST /graphs/{graph_id}/queries/{query_name}` | `invoke_query` (+ `change` for a stored mutation) | Invoke a named query. Body carries params only — **never** `.gq` source. A stored mutation cannot target a `snapshot` (`400`); a param type error is a structured `400` naming the param. |
 
 The JSON body carries `params` and optionally `branch` (default `main`; the
 write target for a stored mutation) or `snapshot` (reads only); `branch` and
 `snapshot` are mutually exclusive. There are no `?branch=`/`?snapshot=` query
 parameters. Branch/snapshot access stays enforced by the inner `read`/`change`
 gate (`invoke_query` itself is graph-scoped, not branch-scoped). The
-conditional form is `POST /graphs/{id}/queries/{name}/if-graph-commit`; see
+conditional form is `POST /graphs/{graph_id}/queries/{query_name}/if-graph-commit`; see
 [`remote-ops.md`](remote-ops.md).
 
 Stored reads share the [query result contract](queries.md#system-fields-and-result-values):
@@ -76,12 +76,12 @@ are omitted from JSON rows, and DateTime strings are UTC without a trailing
 - **Stored mutations are double-gated:** the caller needs `invoke_query` to reach the query **and** `change` for the write. An actor with `invoke_query` but not `change` gets `403` on a stored mutation.
 - **Deny == unknown:** for a caller *lacking* `invoke_query`, a denial and an unknown query name return the **same 404** (identical body) — the catalog can't be probed. A caller who *holds* `invoke_query` may still get a `403` from the inner gate for a query it can't `read`/`change`, so existence is visible to grant-holders by design.
 - **Default-deny mode** (bearer tokens, no policy bundle) permits only `read`,
-  so every `/graphs/{id}/queries/{name}` call returns `404` until an
+  so every `/graphs/{graph_id}/queries/{query_name}` call returns `404` until an
   `invoke_query` rule is configured.
 
 ## MCP exposure
 
-Every applied query is listed in `GET /graphs/{id}/queries` as a typed MCP tool.
+Every applied query is listed in `GET /graphs/{graph_id}/queries` as a typed MCP tool.
 There is no per-query `mcp:` flag in cluster mode.
 
 ## Note on per-query authorization

@@ -169,14 +169,14 @@ on a graph, so a client can show only the actions it is allowed instead of
 learning them from a refusal:
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.14" \
+curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.15" \
   "https://graph.example/graphs/knowledge/access?branch=feature&target_branch=main"
 ```
 
 With the example graph policy above, `act-alice` gets:
 
 ```json
-{"actor":"act-alice","graph_id":"knowledge","graph_wide":["read","invoke_query"],
+{"actor_id":"act-alice","graph_id":"knowledge","graph_wide":["read","invoke_query"],
  "branch":"feature","target_branch":"main","actions":["read"]}
 ```
 
@@ -204,7 +204,7 @@ judges branches by name without checking that they exist. It names actions,
 never the rules behind them, and reveals nothing about other actors. A static
 token on a graph without a policy gets `read` alone, and a signed data
 credential without one nothing, as those routes decide; a server without
-authentication allows every graph action and reports no `actor`. The MCP
+authentication allows every graph action and reports `actor_id: null`. The MCP
 `access` tool returns the same body, and `omnigraph access` prints it for a
 server target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 

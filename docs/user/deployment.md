@@ -2,10 +2,10 @@
 
 OmniGraph can keep a cluster on a local filesystem, S3-compatible object
 storage, or Azure Blob Storage. The server always boots from one cluster root
-and exposes its ready applied graphs under `/graphs/{id}/…`; use
+and exposes its ready applied graphs under `/graphs/{graph_id}/…`; use
 `--require-all-graphs` when any blocked graph must fail startup.
 
-Servers use the v0.14 HTTP contract and open graph storage formats v14 to v16. The
+Servers use the v0.15 HTTP contract and open graph storage formats v14 to v16. The
 cluster ledger has a separate version: explicitly converting it to v2 preserves
 graph data and history. Start with [Operating a cluster](clusters/index.md) to
 create and apply a deployment bundle.
@@ -68,7 +68,7 @@ stored-query changes through this transition; a proved pre-effect refusal restor
 the unchanged views. See [live deployment](clusters/index.md#deploy-without-restarting).
 Ready entries use `none`. There is no separate `quarantined` list or automatic startup retry.
 
-`GET /cluster/deployments/{id}` reports `active` only when this process has installed
+`GET /cluster/deployments/{deployment_id}` reports `active` only when this process has installed
 the exact deployment and all its graph bindings are ready. Loading, blocked graphs,
 partial convergence and shutdown keep it false; a restart must verify its bindings
 again. Successful apply alone is not activation, which never rewrites the durable

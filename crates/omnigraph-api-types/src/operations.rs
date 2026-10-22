@@ -95,9 +95,9 @@ pub struct HttpOperation {
     /// The full mounted path, including the current parameter spellings.
     pub path: &'static str,
     pub capability: Capability,
-    /// The operationId before the breaking rename batch. This transitional
-    /// pin lets the inventory land without changing a generated SDK.
-    pub legacy_operation_id: &'static str,
+    /// Pinned SDK names for non-graph operations and standard protocols.
+    /// Graph operation IDs always render from the canonical name.
+    pub operation_id_override: Option<&'static str>,
     pub mcp: Surface,
     pub cli: Surface,
 }
@@ -105,6 +105,9 @@ pub struct HttpOperation {
 impl HttpOperation {
     /// Render the canonical words without maintaining another name table.
     pub fn operation_id(&self) -> String {
+        if let Some(pinned) = self.operation_id_override {
+            return pinned.to_owned();
+        }
         let mut words = self.name.split_ascii_whitespace();
         let mut rendered = words.next().unwrap_or_default().to_string();
         for word in words {
@@ -123,7 +126,7 @@ const fn operation(
     method: HttpMethod,
     path: &'static str,
     capability: Capability,
-    legacy_operation_id: &'static str,
+    operation_id_override: Option<&'static str>,
     mcp: Surface,
     cli: Surface,
 ) -> HttpOperation {
@@ -132,7 +135,7 @@ const fn operation(
         method,
         path,
         capability,
-        legacy_operation_id,
+        operation_id_override,
         mcp,
         cli,
     }
@@ -154,7 +157,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/.well-known/oauth-protected-resource",
         Capability::Read,
-        "oauthProtectedResourceMetadata",
+        Some("oauthProtectedResourceMetadata"),
         Surface::absent(OAUTH),
         Surface::absent(OAUTH),
     ),
@@ -163,7 +166,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/.well-known/oauth-protected-resource/{resource_path}",
         Capability::Read,
-        "oauthProtectedResourceMetadataAtResourcePath",
+        Some("oauthProtectedResourceMetadataAtResourcePath"),
         Surface::absent(OAUTH),
         Surface::absent(OAUTH),
     ),
@@ -172,7 +175,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/cluster/deployments",
         Capability::Read,
-        "deployment_status",
+        Some("deployment_status"),
         Surface::absent(DEPLOYMENT),
         Surface::restricted(
             &["cluster status"],
@@ -184,16 +187,16 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/cluster/deployments",
         Capability::Write,
-        "deployment_apply",
+        Some("deployment_apply"),
         Surface::absent(DEPLOYMENT),
         Surface::bound(&["cluster apply"]),
     ),
     operation(
         "deployment lookup",
         HttpMethod::Get,
-        "/cluster/deployments/{id}",
+        "/cluster/deployments/{deployment_id}",
         Capability::Read,
-        "deployment_lookup",
+        Some("deployment_lookup"),
         Surface::absent(DEPLOYMENT),
         Surface::restricted(
             &["cluster status"],
@@ -205,7 +208,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/cluster/plan",
         Capability::Read,
-        "deployment_plan",
+        Some("deployment_plan"),
         Surface::absent(DEPLOYMENT),
         Surface::bound(&["cluster plan"]),
     ),
@@ -214,7 +217,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs",
         Capability::Read,
-        "listGraphs",
+        Some("listGraphs"),
         Surface::bound(&["graphs"]),
         Surface::restricted(&["graphs list"], "Ordinary listing, without --discovery."),
     ),
@@ -223,7 +226,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/discovery",
         Capability::Read,
-        "discoverGraphs",
+        Some("discoverGraphs"),
         Surface::absent(
             "MCP graphs uses the ordinary authorized listing, not identity-only discovery.",
         ),
@@ -237,7 +240,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/access",
         Capability::Read,
-        "cluster_getAccess",
+        None,
         Surface::bound(&["access"]),
         Surface::bound(&["access"]),
     ),
@@ -246,7 +249,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/blob",
         Capability::Read,
-        "cluster_getBlob",
+        None,
         Surface::absent(BYTE_STREAM),
         Surface::bound(&["blob get"]),
     ),
@@ -255,7 +258,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Put,
         "/graphs/{graph_id}/blob",
         Capability::Write,
-        "cluster_putBlob",
+        None,
         Surface::absent(BYTE_STREAM),
         Surface::bound(&["blob put"]),
     ),
@@ -264,7 +267,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Delete,
         "/graphs/{graph_id}/blob",
         Capability::Write,
-        "cluster_clearBlob",
+        None,
         Surface::absent(MCP_PARITY),
         Surface::bound(&["blob clear"]),
     ),
@@ -273,7 +276,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Head,
         "/graphs/{graph_id}/blob",
         Capability::Read,
-        "cluster_headBlob",
+        None,
         Surface::absent(MCP_PARITY),
         Surface::bound(&["blob stat"]),
     ),
@@ -282,7 +285,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/branches",
         Capability::Read,
-        "cluster_listBranches",
+        None,
         Surface::bound(&["branches_list"]),
         Surface::bound(&["branch list"]),
     ),
@@ -291,7 +294,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/graphs/{graph_id}/branches",
         Capability::Write,
-        "cluster_createBranch",
+        None,
         Surface::bound(&["branches_create"]),
         Surface::bound(&["branch create"]),
     ),
@@ -300,7 +303,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/branches/diff",
         Capability::Read,
-        "cluster_getBranchDiff",
+        None,
         Surface::absent(MCP_PARITY),
         Surface::bound(&["branch diff"]),
     ),
@@ -309,7 +312,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/graphs/{graph_id}/branches/merge",
         Capability::Write,
-        "cluster_mergeBranches",
+        None,
         Surface::restricted(
             &["branches_merge"],
             "The dedicated tool is write-gated; ad-hoc read can express a GQ dry run.",
@@ -321,16 +324,16 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/branches/merge-base",
         Capability::Read,
-        "cluster_getMergeBase",
+        None,
         Surface::absent(MCP_PARITY),
         Surface::bound(&["branch merge-base"]),
     ),
     operation(
         "branch delete",
         HttpMethod::Delete,
-        "/graphs/{graph_id}/branches/{branch}",
+        "/graphs/{graph_id}/branches/{branch_name}",
         Capability::Write,
-        "cluster_deleteBranch",
+        None,
         Surface::bound(&["branches_delete"]),
         Surface::bound(&["branch delete"]),
     ),
@@ -339,7 +342,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/changes",
         Capability::Read,
-        "cluster_pollChanges",
+        None,
         Surface::bound(&["changes_poll"]),
         Surface::bound(&["changes poll"]),
     ),
@@ -348,7 +351,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/graphs/{graph_id}/changes/baseline",
         Capability::Read,
-        "cluster_captureChangeBaseline",
+        None,
         Surface::absent(MCP_PARITY),
         Surface::bound(&["changes baseline"]),
     ),
@@ -357,7 +360,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/commits",
         Capability::Read,
-        "cluster_listCommits",
+        None,
         Surface::restricted(
             &["commits_list"],
             "MCP lists branch history only; unpublished and unattached listings are not exposed.",
@@ -369,7 +372,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/commits/{commit_id}",
         Capability::Read,
-        "cluster_getCommit",
+        None,
         Surface::bound(&["commits_get"]),
         Surface::bound(&["commit show"]),
     ),
@@ -378,7 +381,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Delete,
         "/graphs/{graph_id}/commits/{commit_id}",
         Capability::Write,
-        "cluster_dropCommit",
+        None,
         Surface::absent(MCP_PARITY),
         Surface::bound(&["commit drop"]),
     ),
@@ -387,7 +390,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/commits/{commit_id}/changes",
         Capability::Read,
-        "cluster_getCommitChanges",
+        None,
         Surface::bound(&["commits_changes"]),
         Surface::bound(&["commit changes"]),
     ),
@@ -396,7 +399,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/graphs/{graph_id}/commits/{commit_id}/publish",
         Capability::Write,
-        "cluster_publishCommit",
+        None,
         Surface::absent(MCP_PARITY),
         Surface::bound(&["commit publish"]),
     ),
@@ -405,7 +408,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/diff",
         Capability::Read,
-        "cluster_getDiff",
+        None,
         Surface::absent(MCP_PARITY),
         Surface::bound(&["diff"]),
     ),
@@ -414,7 +417,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/graphs/{graph_id}/export",
         Capability::Read,
-        "cluster_export",
+        None,
         Surface::absent(BYTE_STREAM),
         Surface::bound(&["export"]),
     ),
@@ -423,7 +426,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/graphs/{graph_id}/load",
         Capability::Write,
-        "cluster_load",
+        None,
         Surface::bound(&["load"]),
         Surface::absent("The CLI load command sends the separate NDJSON request contract."),
     ),
@@ -432,7 +435,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/graphs/{graph_id}/load/ndjson",
         Capability::Write,
-        "cluster_loadNdjson",
+        None,
         Surface::absent("The MCP load tool sends the separate JSON request contract."),
         Surface::bound(&["load"]),
     ),
@@ -441,7 +444,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/graphs/{graph_id}/mutate",
         Capability::Write,
-        "cluster_mutate",
+        None,
         Surface::restricted(
             &["mutate"],
             "Without if_graph_commit, call the unconditional handler.",
@@ -456,7 +459,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/graphs/{graph_id}/mutate/if-graph-commit",
         Capability::ConditionalWrite,
-        "cluster_mutate_if_graph_commit",
+        None,
         Surface::restricted(
             &["mutate"],
             "if_graph_commit selects this fail-closed conditional handler.",
@@ -471,7 +474,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/queries",
         Capability::Read,
-        "cluster_list_queries",
+        None,
         Surface::restricted(
             &["queries"],
             "MCP advertises stored reads only; stored mutations remain unsupported.",
@@ -481,9 +484,9 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
     operation(
         "query invoke",
         HttpMethod::Post,
-        "/graphs/{graph_id}/queries/{name}",
+        "/graphs/{graph_id}/queries/{query_name}",
         Capability::Write,
-        "cluster_invoke_query",
+        None,
         Surface::restricted(
             &["query"],
             "Stored reads only; the HTTP route also admits stored mutations.",
@@ -496,9 +499,9 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
     operation(
         "query invoke if graph commit",
         HttpMethod::Post,
-        "/graphs/{graph_id}/queries/{name}/if-graph-commit",
+        "/graphs/{graph_id}/queries/{query_name}/if-graph-commit",
         Capability::ConditionalWrite,
-        "cluster_invoke_query_if_graph_commit",
+        None,
         Surface::absent(
             "MCP does not invoke stored mutations or expose their graph-commit precondition.",
         ),
@@ -512,7 +515,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Post,
         "/graphs/{graph_id}/query",
         Capability::Read,
-        "cluster_query",
+        None,
         Surface::bound(&["read"]),
         Surface::restricted(
             &["query"],
@@ -524,7 +527,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/schema",
         Capability::Read,
-        "cluster_getSchema",
+        None,
         Surface::bound(&["schema"]),
         Surface::bound(&["schema show"]),
     ),
@@ -533,7 +536,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/graphs/{graph_id}/snapshot",
         Capability::Read,
-        "cluster_getSnapshot",
+        None,
         Surface::bound(&["snapshot"]),
         Surface::bound(&["snapshot"]),
     ),
@@ -542,7 +545,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/healthz",
         Capability::Read,
-        "health",
+        Some("health"),
         Surface::bound(&["health"]),
         Surface::absent(PROBE),
     ),
@@ -551,7 +554,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Head,
         "/healthz",
         Capability::Read,
-        "health_head",
+        Some("health_head"),
         Surface::absent("MCP health returns the GET health body, not the process HEAD probe."),
         Surface::absent(PROBE),
     ),
@@ -560,7 +563,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         HttpMethod::Get,
         "/readyz",
         Capability::Read,
-        "readiness",
+        Some("readiness"),
         Surface::absent(PROBE),
         Surface::absent(PROBE),
     ),
@@ -684,7 +687,6 @@ mod tests {
         let mut names = BTreeSet::new();
         let mut routes = BTreeSet::new();
         let mut ids = BTreeSet::new();
-        let mut legacy_ids = BTreeSet::new();
         for operation in HTTP_OPERATIONS {
             assert!(names.insert(operation.name), "{}", operation.name);
             assert!(
@@ -694,8 +696,14 @@ mod tests {
                 operation.path
             );
             assert!(ids.insert(operation.operation_id()), "{}", operation.name);
-            assert!(legacy_ids.insert(operation.legacy_operation_id));
             assert!(operation.path.starts_with('/'));
+            if operation.path.starts_with("/graphs/{graph_id}/") {
+                assert!(
+                    operation.operation_id_override.is_none(),
+                    "graph IDs derive from their name: {}",
+                    operation.name
+                );
+            }
             assert!(operation.name.split(' ').all(|word| {
                 !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase())
             }));

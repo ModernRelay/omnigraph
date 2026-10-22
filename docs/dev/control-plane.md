@@ -108,7 +108,7 @@ revision. Retained roots, trust and storage format stay fixed. Removing a graph
 from desired configuration deletes its exact managed root, including all branches,
 retained history and managed Blob bytes. It does not follow external Blob
 references or delete peer roots. Adoption, missing-root recreation and catalog
-repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.14.
+repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.15.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
@@ -409,7 +409,7 @@ views with new epochs. Uncertain effects use existing process containment.
 Activation identity is installed in the same immutable registry snapshot as
 serving bindings: canonical root, process incarnation, original ID/input digest,
 achieved revision and config digest. The durable achieved receipt stays unchanged;
-there is no second ledger write after activation. `GET /cluster/deployments/{id}`
+there is no second ledger write after activation. `GET /cluster/deployments/{deployment_id}`
 reports active only for that exact current identity while its affected bindings
 are ready under their installed schema contracts, deleted entries are absent,
 and process admission remains open. An unrelated blocked graph does not invalidate
@@ -425,7 +425,7 @@ revision alone. Old-ID submission validates immutable input and returns the
 original record before graph closure; it cannot reinstall an old view. Boot
 digests remain boot facts. Explicit OIDC public-admission refresh is separate below.
 
-Protected graph and registry HTTP calls require the v0.14 contract header after
+Protected graph and registry HTTP calls require the v0.15 contract header after
 authentication and before graph resolution. CLI discovery and response validation
 are specified by [wire compatibility](versioning.md#wire-compatibility); the
 managed control-plane API and standard MCP/OAuth protocols are separate surfaces.
