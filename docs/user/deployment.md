@@ -210,7 +210,8 @@ docker run --rm -p 8080:8080 \
 ```
 
 Terminate TLS at a load balancer or trusted reverse proxy. Keep bearer tokens
-and storage credentials in the platform's secret store.
+and storage credentials in the platform's secret store. For encryption at rest
+and data sent to external services, see [data protection](operations/data-protection.md).
 
 ## Unix-socket access
 
@@ -329,9 +330,8 @@ Configure tokens from environment or a mounted secret file:
 - `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE`
 - `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` in the AWS-enabled build
 
-Policy bundles come from the applied cluster. See
-[HTTP server](operations/server.md) and
-[Authorization and actors](operations/policy.md).
+Policy bundles come from the applied cluster. See [HTTP server](operations/server.md)
+and [Authorization and actors](operations/policy.md).
 
 ## Upgrade and backup
 

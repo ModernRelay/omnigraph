@@ -38,7 +38,7 @@ Omnigraph Cloud is Omnigraph as a service: managed storage, servers, releases, b
 | **Branching** | Agents propose reviewable changes instead of writing to main: a branch per agent or task, three-way merge, time travel across the whole graph. |
 | **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers and policies. `cluster plan` previews, `cluster apply` converges, Terraform-style. |
 | **Security as code** | Cedar policy enforced **server-side on every mutation**, per graph or server-wide; bearer auth, server-resolved actors, audit tracking. |
-| **Object-storage native, open format** | Scales at the lowest cost on local disk or any S3-compatible store: RustFS / MinIO, AWS S3 / R2 / GCS, Azure preview. Data lives in open, versioned [Lance](https://github.com/lance-format/lance) with native blob-as-data, and never leaves your store. |
+| **Object-storage native, open format** | Scales at the lowest cost on local disk, AWS S3 or a self-hosted S3-compatible store such as RustFS, with Azure in preview. Data lives in open, versioned [Lance](https://github.com/lance-format/lance) with native blob-as-data, and never leaves your store. |
 
 ## What you can build
 
@@ -139,9 +139,11 @@ policies:
 
 **2. Stand up your object store.** On-prem, run RustFS (or MinIO); Omnigraph
 writes [Lance](https://github.com/lance-format/lance) over the standard S3 API.
-In the cloud, use S3 / R2 / GCS through `AWS_*`. Native `az://` roots are also
-available as a qualification preview. Every Azure writer, including
-`cluster apply` and the server, must use the checked-in admission wrapper;
+In the cloud, use AWS S3 through `AWS_*`; other S3-compatible services must
+support [conditional writes](docs/user/concepts/storage.md#supported-graph-uris).
+Native `az://` roots are also available as a qualification preview. Every
+Azure writer, including `cluster apply` and the server, must use the
+checked-in admission wrapper;
 follow the [Azure deployment guide](docs/user/deployment.md#azure-blob-preview)
 instead of running the bare commands below.
 
