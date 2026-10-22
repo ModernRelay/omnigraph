@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-21
+updated: 2026-10-22
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -283,7 +283,7 @@ Declared exceptions, by reason:
 |---|---|
 | Runs where the storage is | `init`, `upgrade`, `repair`, `optimize`, `cleanup`, `index rebuild`, `schema plan` and `schema apply` on a direct target, and `cluster validate`, `observe`, `force-unlock` and `upgrade-ledger` |
 | Local tooling with no graph | `lint`, `embed`, `policy test` and `explain`, `queries validate`, `skill`, `version` |
-| Byte streams, which MCP tools do not carry | Blob payloads and export streams; `blob stat` is a tool |
+| Byte streams, which MCP tools do not carry | Blob payloads, export streams and the change-feed baseline, an NDJSON snapshot whose cursor is valid only after the snapshot is installed; `blob stat` is a tool |
 | Deployment control, which is not an agent tool | `/cluster/*` over MCP |
 | Process probes, not graph operations | `/healthz` and `/readyz` in the CLI |
 
@@ -291,8 +291,8 @@ Gaps on main that this closes:
 
 | Gap | Change |
 |---|---|
-| MCP has no commit diff, commit publish or drop, change-feed baseline, branch diff or merge-base tool, and no `blob stat` | Add the tools; write tools stay behind `--mcp-allow-writes` |
-| MCP refuses stored mutations | Admit them as write tools behind `--mcp-allow-writes`, or declare the reason in the table |
+| MCP has no commit diff, commit publish or drop, branch diff or merge-base tool, and no `blob stat` or `blob clear` | Add the tools; write tools stay behind `--mcp-allow-writes` |
+| MCP refuses stored mutations | Admit them as write tools behind `--mcp-allow-writes`: `mutate` with a stored mutation's `name` and no `query`, through the stored-query routes and their preconditions |
 | The CLI cannot list a server's stored queries | `queries list --target NAME` reads `GET …/queries` for a server target |
 | `load --json` prints a CLI-only `LoadOutput`, which adds `uri`, drops `actor_id` and omits a null `base_branch` | Print the route's body |
 
@@ -1547,3 +1547,14 @@ proposal.
   otherwise" (a refused credential carries `error="invalid_token"` with or
   without OIDC), "The challenge would move into the authentication middleware
   every route shares", and A1's recommendation, now its disposition.
+- 2026-10-22: MCP parity implemented as phase 3 of
+  [RFC 0003](0003-mcp-server-surface.md). The change-feed
+  baseline joins the byte-stream exceptions: its route answers an NDJSON entity
+  snapshot, an export stream, whose cursor is valid only once the snapshot is
+  installed, so no bounded tool result can carry it. Stored mutations are
+  admitted through `mutate`, since a caller allowed `change` can already run
+  any mutation there. Superseded sentences: the gap row "MCP has no commit
+  diff, commit publish or drop, change-feed baseline, branch diff or
+  merge-base tool, and no `blob stat`", the exception "Blob payloads and
+  export streams; `blob stat` is a tool", and the stored-mutation change "or
+  declare the reason in the table".

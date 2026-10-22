@@ -61,8 +61,9 @@ struct Cli {
     /// `OMNIGRAPH_MCP_ALLOW_ADHOC=1`.
     #[arg(long)]
     mcp_allow_adhoc: bool,
-    /// List and admit the MCP write tools (`mutate`, `load`, `branches_create`,
-    /// `branches_delete`, `branches_merge`), each under its route's policy
+    /// List and admit the MCP write tools (`mutate`, `load`, `blobs_clear`,
+    /// `branches_create`, `branches_delete`, `branches_merge`,
+    /// `commits_publish`, `commits_drop`), each under its route's policy
     /// action. Off by default. Equivalent to setting `OMNIGRAPH_MCP_ALLOW_WRITES=1`.
     #[arg(long)]
     mcp_allow_writes: bool,

@@ -145,8 +145,6 @@ const PROBE: &str = "Process probe, not a graph command.";
 const OAUTH: &str = "Protocol-defined OAuth discovery, not a graph operation.";
 const DEPLOYMENT: &str = "Deployment control is not an MCP agent tool.";
 const BYTE_STREAM: &str = "MCP tools do not carry this byte-stream contract.";
-const MCP_PARITY: &str =
-    "Deferred MCP parity in the graph-access RFC's one set of operations; no tool exists yet.";
 
 /// Every operation in the generated HTTP specification. Protocol endpoints
 /// (`/mcp`, `/openapi.json`) and the catalogue's reserved-id dispatch retain
@@ -268,7 +266,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/blob",
         Capability::Write,
         None,
-        Surface::absent(MCP_PARITY),
+        Surface::bound(&["blobs_clear"]),
         Surface::bound(&["blob clear"]),
     ),
     operation(
@@ -277,7 +275,10 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/blob",
         Capability::Read,
         None,
-        Surface::absent(MCP_PARITY),
+        Surface::restricted(
+            &["blobs_stat"],
+            "The tool answers the route's headers as blob stat JSON; conditional headers are not arguments.",
+        ),
         Surface::bound(&["blob stat"]),
     ),
     operation(
@@ -304,7 +305,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/branches/diff",
         Capability::Read,
         None,
-        Surface::absent(MCP_PARITY),
+        Surface::bound(&["branches_diff"]),
         Surface::bound(&["branch diff"]),
     ),
     operation(
@@ -325,7 +326,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/branches/merge-base",
         Capability::Read,
         None,
-        Surface::absent(MCP_PARITY),
+        Surface::bound(&["branches_merge_base"]),
         Surface::bound(&["branch merge-base"]),
     ),
     operation(
@@ -352,7 +353,9 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/changes/baseline",
         Capability::Read,
         None,
-        Surface::absent(MCP_PARITY),
+        Surface::absent(
+            "The baseline is an NDJSON snapshot export, a byte stream MCP tools do not carry; its cursor is valid only once that snapshot is installed.",
+        ),
         Surface::bound(&["changes baseline"]),
     ),
     operation(
@@ -361,10 +364,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/commits",
         Capability::Read,
         None,
-        Surface::restricted(
-            &["commits_list"],
-            "MCP lists branch history only; unpublished and unattached listings are not exposed.",
-        ),
+        Surface::bound(&["commits_list"]),
         Surface::bound(&["commit list"]),
     ),
     operation(
@@ -382,7 +382,10 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/commits/{commit_id}",
         Capability::Write,
         None,
-        Surface::absent(MCP_PARITY),
+        Surface::restricted(
+            &["commits_drop"],
+            "The route answers 204 without a body; the tool answers an empty object.",
+        ),
         Surface::bound(&["commit drop"]),
     ),
     operation(
@@ -400,7 +403,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/commits/{commit_id}/publish",
         Capability::Write,
         None,
-        Surface::absent(MCP_PARITY),
+        Surface::bound(&["commits_publish"]),
         Surface::bound(&["commit publish"]),
     ),
     operation(
@@ -409,7 +412,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/diff",
         Capability::Read,
         None,
-        Surface::absent(MCP_PARITY),
+        Surface::bound(&["diff"]),
         Surface::bound(&["diff"]),
     ),
     operation(
@@ -447,7 +450,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         None,
         Surface::restricted(
             &["mutate"],
-            "Without if_graph_commit, call the unconditional handler.",
+            "query without if_graph_commit calls the unconditional handler.",
         ),
         Surface::restricted(
             &["mutate"],
@@ -462,7 +465,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         None,
         Surface::restricted(
             &["mutate"],
-            "if_graph_commit selects this fail-closed conditional handler.",
+            "query with if_graph_commit selects this fail-closed conditional handler.",
         ),
         Surface::restricted(
             &["mutate"],
@@ -475,10 +478,7 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/queries",
         Capability::Read,
         None,
-        Surface::restricted(
-            &["queries"],
-            "MCP advertises stored reads only; stored mutations remain unsupported.",
-        ),
+        Surface::bound(&["queries"]),
         Surface::bound(&["queries list"]),
     ),
     operation(
@@ -488,8 +488,8 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         Capability::Write,
         None,
         Surface::restricted(
-            &["query"],
-            "Stored reads only; the HTTP route also admits stored mutations.",
+            &["query", "mutate"],
+            "query invokes a stored read; mutate with name, no query and no if_graph_commit invokes a stored mutation.",
         ),
         Surface::restricted(
             &["query", "mutate", "alias"],
@@ -502,8 +502,9 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/queries/{query_name}/if-graph-commit",
         Capability::ConditionalWrite,
         None,
-        Surface::absent(
-            "MCP does not invoke stored mutations or expose their graph-commit precondition.",
+        Surface::restricted(
+            &["mutate"],
+            "mutate with name, no query and if_graph_commit selects this fail-closed route.",
         ),
         Surface::restricted(
             &["mutate"],
