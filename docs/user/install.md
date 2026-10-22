@@ -137,7 +137,7 @@ http-contract 0.14
   "channel": null,
   "commit": null,
   "http_contract": "0.14",
-  "protocols": { "target": 1, "credential": 1, "access": 2 },
+  "protocols": { "target": 2, "credential": 2, "access": 2 },
   "internal_schema": {
     "writes": 16,
     "serves": [14, 16]
@@ -159,8 +159,14 @@ accepts only an exact match and returns its own value on every response,
 including `HEAD /healthz` ([HTTP contract](operations/server.md#http-contract)).
 When several CLIs are installed, for example one in `~/.local/bin` and an
 older one from Homebrew, choose by this field, not by the package version.
-`protocols.target` and `protocols.credential` identify the `protocol` used by
-target administration and credential JSON reports, respectively.
+`protocols.target` and `protocols.credential` identify compatible generations of
+operator configuration/target administration and credential commands. Both are
+2 for profiles, targets with one inline `auth` provider, and credential sources.
+Match these numbers exactly when selecting a CLI for those contracts; they are
+independent of the operator document's `version: 1`. Protocol 1 was published
+with multiple incompatible 0.14 edge grammars, so that number alone cannot
+select one of them. Use protocol 2 for the [current format](cli/targets.md).
+An incompatible change to either contract requires its discovery number to change.
 `protocols.access` identifies the `omnigraph access --json` shape: protocol 2
 uses `actor_id` in place of protocol 1's `actor`.
 `internal_schema.writes` is the storage-format stamp this binary's commits

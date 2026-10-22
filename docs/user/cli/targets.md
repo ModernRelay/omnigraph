@@ -1,6 +1,6 @@
 # Operator configuration
 
-Use profiles for service/organization access and targets for resource access.
+Use profiles for service/organization access and targets for resource access. This is [target and credential protocol 2](../install.md#verify), with YAML `version: 1`.
 The operator file is `~/.omnigraph/config.yaml`, or `config.yaml` under
 `OMNIGRAPH_HOME`. `--operator-config FILE` replaces it for one invocation;
 files are never merged or discovered by searching parent directories.
