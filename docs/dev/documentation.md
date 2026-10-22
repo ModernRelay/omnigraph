@@ -131,7 +131,8 @@ The release-prep pull request adds `changelog.d/<version>.md`, named for the
 `version` in `release.json`. It opens with an intro of at most 80 words saying
 what the release is. When the release has any breaking note, a
 `## Why these changes` section of at most 80 words says why the release asks
-users to act; it is printed at the top of the upgrade actions. A
+users to act; it is printed at the top of the upgrade actions, and a release
+with no breaking note refuses it. A
 `## Highlights` section holds three to five `### ` highlights for a minor or
 major release, and up to five for a patch release, each at most 150 words.
 Head each highlight with what users gain, then explain it in database terms

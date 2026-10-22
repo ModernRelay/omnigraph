@@ -361,6 +361,8 @@ def check_release_file(path: str, raw: bytes, version: str, has_breaking: bool, 
     check_words(path, "the intro", release.intro, INTRO_WORDS)
     if has_breaking and not release.why:
         raise NotesError(f"{path}: this release has upgrade actions; add '## {WHY_HEADING}' saying why")
+    if release.why and not has_breaking:
+        raise NotesError(f"{path}: '## {WHY_HEADING}' explains upgrade actions, and this release has none; remove it")
     if release.why:
         check_words(path, f"'## {WHY_HEADING}'", release.why, WHY_WORDS)
     least = minimum_highlights(version)
@@ -592,11 +594,10 @@ def render_v2(repo: Repository, selection: Selection, info: dict, publication_re
                                  if NOTE_NAME.fullmatch(path).group(1) == category),
                                 key=lambda note: (rank.get(note[0], len(rank)), note[0]))
                for category in CATEGORIES}
-    why = release.why if release else ""
-    if grouped["breaking"] or why:
+    if grouped["breaking"]:
         parts.append(f"## {CATEGORIES['breaking']}\n\n")
-        if why:
-            text = rewrite_markdown(repo, revision, release_path, why, publication_ref, labels, INTRO_HEADINGS)
+        if release and release.why:
+            text = rewrite_markdown(repo, revision, release_path, release.why, publication_ref, labels, INTRO_HEADINGS)
             parts.append(unwrap(text).rstrip("\n") + "\n\n")
     for category, title in CATEGORIES.items():
         if not grouped[category]:
