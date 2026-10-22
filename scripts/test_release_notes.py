@@ -192,6 +192,7 @@ class ReleaseNotesTests(unittest.TestCase):
 
     def test_release_file_accepts_the_documented_shapes(self):
         notes.check_release_file(RELEASE, release_text(), "v0.13.0", has_breaking=False)
+        notes.check_release_file(RELEASE, release_text(intro=" ".join(["word"] * 100)), "v0.13.0", has_breaking=False)
         notes.check_release_file(RELEASE, release_text(why="Why."), "v0.13.0", has_breaking=True)
         notes.check_release_file("changelog.d/v0.13.1.md", release_text(highlights=0), "v0.13.1", has_breaking=False)
         crlf = notes.check_release_file(RELEASE, release_text().replace(b"\n", b"\r\n"), "v0.13.0", has_breaking=False)
@@ -201,7 +202,7 @@ class ReleaseNotesTests(unittest.TestCase):
         many = " ".join(["word"] * 81)
         for raw, version, breaking, message in (
             (release_text(intro=""), "v0.13.0", False, "start with an intro"),
-            (release_text(intro=many), "v0.13.0", False, "the intro has 81 words"),
+            (release_text(intro=" ".join(["word"] * 101)), "v0.13.0", False, "the intro has 101 words; the limit is 100"),
             (release_text(), "v0.13.0", True, "add '## Why these changes'"),
             (release_text(why=many), "v0.13.0", True, "has 81 words"),
             (release_text(why="Why."), "v0.13.0", False, "this release has none"),
