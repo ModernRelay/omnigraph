@@ -52,13 +52,20 @@ pub fn render_read(
 
 fn render_jsonl(output: &ReadOutput) -> Result<String> {
     let mut lines = Vec::new();
-    lines.push(serde_json::to_string(&serde_json::json!({
+    let mut metadata = serde_json::json!({
         "kind": "metadata",
         "query_name": output.query_name,
         "target": output.target,
         "row_count": output.row_count,
         "page": output.page,
-    }))?);
+    });
+    if !output.retrievals.is_empty() {
+        metadata["retrievals"] = serde_json::to_value(&output.retrievals)?;
+    }
+    if !output.metrics.is_empty() {
+        metadata["metrics"] = serde_json::to_value(&output.metrics)?;
+    }
+    lines.push(serde_json::to_string(&metadata)?);
     for row in rows(output)? {
         lines.push(serde_json::to_string(&row)?);
     }
@@ -324,7 +331,10 @@ fn csv_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use omnigraph_server::api::{ReadOutput, ReadTargetOutput};
+    use omnigraph_server::api::{
+        MetricKindOutput, MetricOutput, ReadOutput, ReadTargetOutput, RecallOutput,
+        RetrievalKindOutput, RetrievalOutput,
+    };
 
     use super::*;
 
@@ -343,6 +353,8 @@ mod tests {
             .unwrap(),
             graph_commit_id: None,
             page: None,
+            retrievals: Vec::new(),
+            metrics: Vec::new(),
         }
     }
 
@@ -395,12 +407,54 @@ mod tests {
 
         let first = rendered.lines().next().unwrap();
         assert!(first.contains("\"kind\":\"metadata\""));
+        assert!(!first.contains("retrievals") && !first.contains("metrics"));
         assert!(
             rendered
                 .lines()
                 .nth(1)
                 .unwrap()
                 .contains("\"name\":\"Alice\"")
+        );
+
+        // A ranked read's descriptors ride in the metadata record, as in the
+        // `--json` envelope.
+        let mut ranked = sample_output();
+        ranked.retrievals = vec![RetrievalOutput {
+            id: "r0".to_string(),
+            kind: RetrievalKindOutput::Bm25,
+            binding: Some("p".to_string()),
+            property: Some("bio".to_string()),
+            arms: None,
+            recall: RecallOutput::Exact,
+            embedding_coverage: None,
+        }];
+        ranked.metrics = vec![MetricOutput {
+            column: "score".to_string(),
+            kind: MetricKindOutput::Score,
+            retrieval_id: "r0".to_string(),
+            source: RetrievalKindOutput::Bm25,
+            binding: Some("p".to_string()),
+            property: Some("bio".to_string()),
+            descending: true,
+            recall: RecallOutput::Exact,
+        }];
+        let rendered = render_read(
+            &ranked,
+            ReadOutputFormat::Jsonl,
+            &ReadRenderOptions {
+                max_column_width: 80,
+                cell_layout: TableCellLayout::Truncate,
+            },
+        )
+        .unwrap();
+        let metadata: Value = serde_json::from_str(rendered.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            metadata["retrievals"],
+            serde_json::to_value(&ranked.retrievals).unwrap()
+        );
+        assert_eq!(
+            metadata["metrics"],
+            serde_json::to_value(&ranked.metrics).unwrap()
         );
     }
 

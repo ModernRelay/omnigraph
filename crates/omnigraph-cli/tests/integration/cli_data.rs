@@ -2187,6 +2187,86 @@ fn read_jsonl_format_outputs_metadata_header_first() {
     assert!(lines.next().unwrap().contains("\"p.name\":\"Alice\""));
 }
 
+/// A ranked read describes its retrieval and its score column in the
+/// `--json` envelope and in the `jsonl` metadata record alike, without the
+/// query text it searched for.
+#[test]
+fn ranked_read_describes_its_retrieval_in_json_and_jsonl() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(fixture("search.pg"))
+            .arg(&graph),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(fixture("search.jsonl"))
+            .arg("--target")
+            .arg(&graph),
+    );
+    let queries = temp.path().join("scored.gq");
+    write_query_file(
+        &queries,
+        r#"
+query scored($q: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.title, $q) as relevance }
+    order { bm25($d.title, $q) }
+    limit 2
+}
+"#,
+    );
+    let read = |format: &[&str]| {
+        let mut command = cli();
+        command
+            .arg("query")
+            .arg("--target")
+            .arg(&graph)
+            .arg("--query")
+            .arg(&queries)
+            .arg("scored")
+            .arg("--params")
+            .arg(r#"{"q":"learning"}"#)
+            .args(format);
+        stdout_string(&output_success(&mut command))
+    };
+    let retrievals = serde_json::json!([{
+        "id": "r0",
+        "kind": "bm25",
+        "binding": "d",
+        "property": "title",
+        "recall": "exact"
+    }]);
+    let metrics = serde_json::json!([{
+        "column": "relevance",
+        "kind": "score",
+        "retrieval_id": "r0",
+        "source": "bm25",
+        "binding": "d",
+        "property": "title",
+        "descending": true,
+        "recall": "exact"
+    }]);
+
+    let envelope: Value = serde_json::from_str(&read(&["--json"])).unwrap();
+    assert_eq!(envelope["retrievals"], retrievals);
+    assert_eq!(envelope["metrics"], metrics);
+
+    let jsonl = read(&["--format", "jsonl"]);
+    let metadata: Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+    assert_eq!(metadata["kind"], "metadata");
+    assert_eq!(metadata["retrievals"], retrievals);
+    assert_eq!(metadata["metrics"], metrics);
+    assert!(!jsonl.lines().next().unwrap().contains("learning"));
+}
+
 #[test]
 fn change_json_outputs_affected_counts_and_persists() {
     let temp = tempdir().unwrap();

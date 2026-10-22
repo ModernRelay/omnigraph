@@ -473,10 +473,15 @@ pub(crate) async fn execute(
     // fusion row keys; only what depends on this run's admission is left.
     let (bound, evidence) = accepted.into_parts();
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
+    let descriptors = omnigraph_planner::read_descriptors(&bound.plan)
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     let ctx =
         QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
-    ctx.run_owned(execute_with_context(bound, evidence, context, &ctx))
-        .await
+    let mut run = ctx
+        .run_owned(execute_with_context(bound, evidence, context, &ctx))
+        .await?;
+    run.result = run.result.with_descriptors(descriptors);
+    Ok(run)
 }
 
 /// What a load plan run produced: the sink's count and what each node's

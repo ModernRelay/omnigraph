@@ -730,6 +730,11 @@ async fn replayed(db: &Session, source: &str, name: &str, params: &ParamMap) -> 
             .await
             .unwrap();
         assert_eq!(rows_of(&replay.result), result);
+        assert_eq!(
+            replay.result.descriptors(),
+            run.result.descriptors(),
+            "the replayed plan describes its retrievals with the run's ids"
+        );
         assert_same_trace(&rows, &report_rows(&replay.report));
         assert_eq!(search_decisions(&replay.report), search);
     }
@@ -1351,6 +1356,160 @@ async fn a_fusion_replays() {
         probed[0], probed[1],
         "each arm records under its own scan: {search:#?}"
     );
+}
+
+/// A read describes its retrievals from the plan that ran: ids in plan
+/// preorder, a fusion before its arms and the arms in query argument order,
+/// two arms over one property kept apart, and every returned score column
+/// naming its producer, including two columns that read one fused score and
+/// a `distinct` group key. An inspected run, an ordinary run and a replay
+/// describe one plan alike.
+#[tokio::test]
+async fn a_read_describes_its_retrievals_and_score_columns() {
+    use omnigraph_compiler::result::{
+        EmbeddingCoverage, Metric, ReadDescriptors, Recall, Retrieval, RetrievalKind,
+        RetrievalTarget,
+    };
+
+    const DESCRIBED: &str = r#"
+query two_texts($a: String, $b: String) {
+    match { $d: Doc }
+    return {
+        $d.slug,
+        rrf(bm25($d.text, $a), bm25($d.text, $b)) as fused,
+        rrf(bm25($d.text, $a), bm25($d.text, $b)) as again
+    }
+    order { rrf(bm25($d.text, $a), bm25($d.text, $b)) }
+    limit 3
+}
+query closest($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $q) }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+query distinct_scores($a: String) {
+    match { $d: Doc }
+    return distinct { $d.slug, bm25($d.text, $a) as relevance }
+    order { bm25($d.text, $a) }
+    limit 3
+}
+query unranked() {
+    match { $d: Doc }
+    return { $d.slug }
+    order { $d.slug }
+    limit 2
+}
+"#;
+    let ranked = |id: &str, kind, property: &str| Retrieval {
+        id: id.to_string(),
+        kind,
+        target: RetrievalTarget::Ranked {
+            binding: "d".to_string(),
+            property: property.to_string(),
+            embedding_coverage: (kind == RetrievalKind::Nearest)
+                .then_some(EmbeddingCoverage::NotComputed),
+        },
+        recall: if kind == RetrievalKind::Nearest {
+            Recall::Approximate
+        } else {
+            Recall::Exact
+        },
+    };
+    let fused = |recall| Retrieval {
+        id: "r0".to_string(),
+        kind: RetrievalKind::Rrf,
+        target: RetrievalTarget::Fused {
+            arms: vec!["r1".to_string(), "r2".to_string()],
+        },
+        recall,
+    };
+    let metric = |column: &str, retrieval: &str| Metric {
+        column: column.to_string(),
+        retrieval_id: retrieval.to_string(),
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = docs(&dir).await;
+    let vector = Literal::List(vec![Literal::Float(0.0); 4]);
+    let texts = ParamMap::from([
+        ("a".to_string(), Literal::String("needle".to_string())),
+        ("b".to_string(), Literal::String("3".to_string())),
+    ]);
+    let needle = ParamMap::from([("a".to_string(), Literal::String("needle".to_string()))]);
+    let closest = ParamMap::from([("q".to_string(), vector.clone())]);
+    let mixed = ParamMap::from([
+        ("t".to_string(), Literal::String("needle".to_string())),
+        ("q".to_string(), vector),
+    ]);
+    for (source, name, params, expected) in [
+        (
+            DESCRIBED,
+            "two_texts",
+            &texts,
+            ReadDescriptors {
+                retrievals: vec![
+                    fused(Recall::Exact),
+                    ranked("r1", RetrievalKind::Bm25, "text"),
+                    ranked("r2", RetrievalKind::Bm25, "text"),
+                ],
+                metrics: vec![metric("fused", "r0"), metric("again", "r0")],
+            },
+        ),
+        (
+            DESCRIBED,
+            "closest",
+            &closest,
+            ReadDescriptors {
+                retrievals: vec![ranked("r0", RetrievalKind::Nearest, "embedding")],
+                metrics: vec![metric("d._distance", "r0")],
+            },
+        ),
+        (
+            DOC_QUERIES,
+            "fused",
+            &mixed,
+            ReadDescriptors {
+                retrievals: vec![
+                    fused(Recall::Approximate),
+                    ranked("r1", RetrievalKind::Nearest, "embedding"),
+                    ranked("r2", RetrievalKind::Bm25, "text"),
+                ],
+                metrics: vec![],
+            },
+        ),
+        (
+            DESCRIBED,
+            "distinct_scores",
+            &needle,
+            ReadDescriptors {
+                retrievals: vec![ranked("r0", RetrievalKind::Bm25, "text")],
+                metrics: vec![metric("relevance", "r0")],
+            },
+        ),
+        (
+            DESCRIBED,
+            "unranked",
+            &ParamMap::new(),
+            ReadDescriptors::default(),
+        ),
+    ] {
+        let run = db
+            .query_inspected(ReadTarget::branch("main"), source, name, params)
+            .await
+            .unwrap();
+        assert_eq!(run.result.descriptors(), &expected, "{name}");
+        let ordinary = db
+            .query(ReadTarget::branch("main"), source, name, params)
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinary.descriptors(),
+            &expected,
+            "{name}: the ordinary door"
+        );
+        replayed(&db, source, name, params).await;
+    }
 }
 
 /// A top-k whose output alone reads `text` replays with its `HydrateColumns`

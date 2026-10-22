@@ -12,7 +12,9 @@ use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
-use omnigraph_compiler::result::QueryResult;
+use omnigraph_compiler::result::{
+    EmbeddingCoverage, QueryResult, ReadDescriptors, Recall, RetrievalKind, RetrievalTarget,
+};
 use omnigraph_compiler::settings::{
     Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
 };
@@ -604,6 +606,98 @@ pub struct ReadOutput {
     /// other answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<ReadPageOutput>,
+    /// The retrievals the read ran, from the plan that ran: one per ranked
+    /// scan, per `rrf()` fusion and per fusion arm. Absent when the read
+    /// ranked nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retrievals: Vec<RetrievalOutput>,
+    /// One entry per returned column that holds a retrieval's score. Absent
+    /// when no column does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<MetricOutput>,
+}
+
+/// The search function behind a retrieval or a score column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalKindOutput {
+    Nearest,
+    Bm25,
+    Rrf,
+}
+
+/// A retrieval's contract, not what one execution did: `nearest` is
+/// `approximate` even when a run scored every row, `bm25` is `exact`, and
+/// `rrf` is `approximate` when either arm is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallOutput {
+    Exact,
+    Approximate,
+}
+
+/// One retrieval of the plan that ran. `id` is plan-local (`r0`, `r1`, …
+/// in plan preorder, a fusion's arms in query argument order); a ranked
+/// retrieval names its `binding` and `property`, a fusion its `arms` by id.
+/// Parameter values are never included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RetrievalOutput {
+    pub id: String,
+    pub kind: RetrievalKindOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arms: Option<Vec<String>>,
+    pub recall: RecallOutput,
+    /// On a `nearest` retrieval: how many ranked rows hold an embedding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_coverage: Option<EmbeddingCoverageOutput>,
+}
+
+/// `{"state": "unknown", "reason": "not_computed"}`: a read establishes no
+/// embedding count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EmbeddingCoverageOutput {
+    Unknown { reason: CoverageUnknownReasonOutput },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageUnknownReasonOutput {
+    NotComputed,
+}
+
+/// What a score column measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricKindOutput {
+    /// A `nearest` distance: smaller ranks first.
+    Distance,
+    /// A `bm25` relevance score: larger ranks first.
+    Score,
+    /// A fused `rrf()` score: larger ranks first.
+    Rrf,
+}
+
+/// A returned column holding the score retrieval `retrieval_id` computed.
+/// `binding` and `property` repeat the retrieval's for a `nearest` or
+/// `bm25` source; a fused score names neither. `descending` is whether a
+/// larger value ranks first. A column computed from a score is not a metric.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MetricOutput {
+    pub column: String,
+    pub kind: MetricKindOutput,
+    pub retrieval_id: String,
+    pub source: RetrievalKindOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property: Option<String>,
+    pub descending: bool,
+    pub recall: RecallOutput,
 }
 
 /// The page state a `branch diff` answer carries: the exact commits it
@@ -3073,6 +3167,7 @@ pub fn read_output(
     let rows = RawValue::from_string(rows).map_err(|err| {
         CompilerError::Execution(format!("query result rendered invalid JSON: {err}"))
     })?;
+    let (retrievals, metrics) = descriptor_outputs(result.descriptors())?;
     Ok(ReadOutput {
         query_name,
         target: read_target_output(target),
@@ -3081,7 +3176,96 @@ pub fn read_output(
         rows,
         graph_commit_id,
         page: None,
+        retrievals,
+        metrics,
     })
+}
+
+fn retrieval_kind_output(kind: RetrievalKind) -> RetrievalKindOutput {
+    match kind {
+        RetrievalKind::Nearest => RetrievalKindOutput::Nearest,
+        RetrievalKind::Bm25 => RetrievalKindOutput::Bm25,
+        RetrievalKind::Rrf => RetrievalKindOutput::Rrf,
+    }
+}
+
+fn recall_output(recall: Recall) -> RecallOutput {
+    match recall {
+        Recall::Exact => RecallOutput::Exact,
+        Recall::Approximate => RecallOutput::Approximate,
+    }
+}
+
+/// The wire form of a read's descriptors: each metric carries its
+/// retrieval's kind, target and recall, read from the retrieval it names.
+fn descriptor_outputs(
+    descriptors: &ReadDescriptors,
+) -> Result<(Vec<RetrievalOutput>, Vec<MetricOutput>), CompilerError> {
+    let retrievals = descriptors
+        .retrievals
+        .iter()
+        .map(|retrieval| {
+            let (binding, property, arms, embedding_coverage) = match &retrieval.target {
+                RetrievalTarget::Ranked {
+                    binding,
+                    property,
+                    embedding_coverage,
+                } => (
+                    Some(binding.clone()),
+                    Some(property.clone()),
+                    None,
+                    embedding_coverage.map(|EmbeddingCoverage::NotComputed| {
+                        EmbeddingCoverageOutput::Unknown {
+                            reason: CoverageUnknownReasonOutput::NotComputed,
+                        }
+                    }),
+                ),
+                RetrievalTarget::Fused { arms } => (None, None, Some(arms.clone()), None),
+            };
+            RetrievalOutput {
+                id: retrieval.id.clone(),
+                kind: retrieval_kind_output(retrieval.kind),
+                binding,
+                property,
+                arms,
+                recall: recall_output(retrieval.recall),
+                embedding_coverage,
+            }
+        })
+        .collect();
+    let metrics = descriptors
+        .metrics
+        .iter()
+        .map(|metric| {
+            let retrieval = descriptors.retrieval(&metric.retrieval_id).ok_or_else(|| {
+                CompilerError::Execution(format!(
+                    "score column `{}` names retrieval `{}`, which the read does not describe",
+                    metric.column, metric.retrieval_id
+                ))
+            })?;
+            let (binding, property) = match &retrieval.target {
+                RetrievalTarget::Ranked {
+                    binding, property, ..
+                } => (Some(binding.clone()), Some(property.clone())),
+                RetrievalTarget::Fused { .. } => (None, None),
+            };
+            Ok(MetricOutput {
+                column: metric.column.clone(),
+                kind: match retrieval.kind {
+                    RetrievalKind::Nearest => MetricKindOutput::Distance,
+                    RetrievalKind::Bm25 => MetricKindOutput::Score,
+                    RetrievalKind::Rrf => MetricKindOutput::Rrf,
+                },
+                retrieval_id: retrieval.id.clone(),
+                source: retrieval_kind_output(retrieval.kind),
+                binding,
+                property,
+                descending: retrieval.kind.descending(),
+                recall: recall_output(retrieval.recall),
+            })
+        })
+        .collect::<Result<_, CompilerError>>()?;
+    Ok((retrievals, metrics))
 }
 
 /// The `branch list` answer: one `{"name": ..}` row per branch in the order
@@ -3104,6 +3288,8 @@ pub fn branch_list_read_output(branches: &[String]) -> Result<ReadOutput, serde_
         rows: serde_json::value::to_raw_value(&rows)?,
         graph_commit_id: None,
         page: None,
+        retrievals: Vec::new(),
+        metrics: Vec::new(),
     })
 }
 
@@ -3126,6 +3312,8 @@ fn branch_read_rows_output(
         rows: serde_json::value::to_raw_value(&rows)?,
         graph_commit_id: None,
         page,
+        retrievals: Vec::new(),
+        metrics: Vec::new(),
     })
 }
 
@@ -3261,6 +3449,8 @@ pub fn show_read_output(rows: &[SettingRow]) -> Result<ReadOutput, serde_json::E
         rows: serde_json::value::to_raw_value(&rendered)?,
         graph_commit_id: None,
         page: None,
+        retrievals: Vec::new(),
+        metrics: Vec::new(),
     })
 }
 
@@ -3690,6 +3880,104 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<DiagnosticOutput>(json).unwrap(),
             reviewed
+        );
+    }
+
+    /// A read's descriptors render in the RFC 0047 wire shape, each metric
+    /// repeating its retrieval's kind, target and recall; the envelope reads
+    /// back unchanged (the remote CLI prints what it decoded), an envelope
+    /// without them stays without them, and a metric naming no retrieval of
+    /// the read is refused rather than rendered half.
+    #[test]
+    fn read_descriptors_render_and_round_trip() {
+        use omnigraph_compiler::result::{
+            EmbeddingCoverage, Metric, ReadDescriptors, Recall, Retrieval, RetrievalKind,
+            RetrievalTarget,
+        };
+        let ranked = |id: &str, kind, property: &str, coverage, recall| Retrieval {
+            id: id.to_string(),
+            kind,
+            target: RetrievalTarget::Ranked {
+                binding: "d".to_string(),
+                property: property.to_string(),
+                embedding_coverage: coverage,
+            },
+            recall,
+        };
+        let descriptors = ReadDescriptors {
+            retrievals: vec![
+                Retrieval {
+                    id: "r0".to_string(),
+                    kind: RetrievalKind::Rrf,
+                    target: RetrievalTarget::Fused {
+                        arms: vec!["r1".to_string(), "r2".to_string()],
+                    },
+                    recall: Recall::Approximate,
+                },
+                ranked(
+                    "r1",
+                    RetrievalKind::Nearest,
+                    "embedding",
+                    Some(EmbeddingCoverage::NotComputed),
+                    Recall::Approximate,
+                ),
+                ranked("r2", RetrievalKind::Bm25, "title", None, Recall::Exact),
+            ],
+            metrics: vec![Metric {
+                column: "score".to_string(),
+                retrieval_id: "r0".to_string(),
+            }],
+        };
+        let result =
+            || QueryResult::new(std::sync::Arc::new(arrow_schema::Schema::empty()), vec![]);
+        let output = read_output(
+            "q".to_string(),
+            &ReadTarget::branch("main"),
+            result().with_descriptors(descriptors.clone()),
+            None,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(
+            json["retrievals"],
+            json!([
+                {"id": "r0", "kind": "rrf", "arms": ["r1", "r2"], "recall": "approximate"},
+                {
+                    "id": "r1", "kind": "nearest", "binding": "d", "property": "embedding",
+                    "recall": "approximate",
+                    "embedding_coverage": {"state": "unknown", "reason": "not_computed"}
+                },
+                {"id": "r2", "kind": "bm25", "binding": "d", "property": "title", "recall": "exact"}
+            ])
+        );
+        assert_eq!(
+            json["metrics"],
+            json!([{
+                "column": "score", "kind": "rrf", "retrieval_id": "r0", "source": "rrf",
+                "descending": true, "recall": "approximate"
+            }])
+        );
+        let decoded: ReadOutput = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), json);
+
+        let unranked = serde_json::to_value(
+            read_output("q".to_string(), &ReadTarget::branch("main"), result(), None).unwrap(),
+        )
+        .unwrap();
+        assert!(unranked.get("retrievals").is_none() && unranked.get("metrics").is_none());
+        let decoded: ReadOutput = serde_json::from_value(unranked.clone()).unwrap();
+        assert!(decoded.retrievals.is_empty() && decoded.metrics.is_empty());
+
+        let mut orphan = descriptors;
+        orphan.metrics[0].retrieval_id = "r9".to_string();
+        assert!(
+            read_output(
+                "q".to_string(),
+                &ReadTarget::branch("main"),
+                result().with_descriptors(orphan),
+                None,
+            )
+            .is_err()
         );
     }
 

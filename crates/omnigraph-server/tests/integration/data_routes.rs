@@ -6315,6 +6315,104 @@ query vector_search_string($q: String) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["row_count"], 3);
     assert_eq!(body["rows"][0]["d.slug"], "alpha-doc");
+    // The retrieval is described without the text it embedded; no column
+    // returns its distance, so there is no metric.
+    assert_eq!(
+        body["retrievals"],
+        json!([{
+            "id": "r0",
+            "kind": "nearest",
+            "binding": "d",
+            "property": "embedding",
+            "recall": "approximate",
+            "embedding_coverage": {"state": "unknown", "reason": "not_computed"}
+        }])
+    );
+    assert!(body.get("metrics").is_none(), "{body}");
+}
+
+/// A ranked read's envelope says which retrievals ran and what each score
+/// column measures: a fusion names its arms by id in query argument order,
+/// two arms over one property stay distinct, two columns reading one fused
+/// score name one producer, and, since both arrays are compared whole, no
+/// parameter value appears. An unranked read carries neither array.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_envelope_describes_retrievals_and_score_columns() {
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    title: String @index\n}\n";
+    const QUERIES: &str = r#"
+query fused($a: String, $b: String) {
+    match { $d: Doc }
+    return {
+        $d.slug,
+        rrf(bm25($d.title, $a), bm25($d.title, $b)) as fused,
+        rrf(bm25($d.title, $a), bm25($d.title, $b)) as again
+    }
+    order { rrf(bm25($d.title, $a), bm25($d.title, $b)) }
+    limit 2
+}
+query unranked() {
+    match { $d: Doc }
+    return { $d.slug }
+    order { $d.slug }
+}
+"#;
+    let data = [
+        r#"{"type":"Doc","data":{"slug":"a","title":"needle guide"}}"#,
+        r#"{"type":"Doc","data":{"slug":"b","title":"needle"}}"#,
+        r#"{"type":"Doc","data":{"slug":"c","title":"handbook"}}"#,
+    ]
+    .join("\n");
+    let temp = init_graph_with_schema_and_data(SCHEMA, &data).await;
+    let graph = graph_path(temp.path());
+    let app = build_app(
+        AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap(),
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({
+                "query": QUERIES,
+                "name": "fused",
+                "params": {"a": "needle", "b": "guide"}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["retrievals"],
+        json!([
+            {"id": "r0", "kind": "rrf", "arms": ["r1", "r2"], "recall": "exact"},
+            {"id": "r1", "kind": "bm25", "binding": "d", "property": "title", "recall": "exact"},
+            {"id": "r2", "kind": "bm25", "binding": "d", "property": "title", "recall": "exact"}
+        ])
+    );
+    let fused = |column: &str| {
+        json!({
+            "column": column,
+            "kind": "rrf",
+            "retrieval_id": "r0",
+            "source": "rrf",
+            "descending": true,
+            "recall": "exact"
+        })
+    };
+    assert_eq!(body["metrics"], json!([fused("fused"), fused("again")]));
+
+    let (status, body) = json_response(
+        &app,
+        json_post("/query", &json!({"query": QUERIES, "name": "unranked"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("retrievals").is_none() && body.get("metrics").is_none(),
+        "{body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
