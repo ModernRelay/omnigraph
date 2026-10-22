@@ -102,9 +102,10 @@ Choose one static token source:
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object |
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` | Secrets Manager mapping; requires an AWS-enabled build: the container images, the release archives from v0.14.0 and every edge build, or a source build with `cargo build -p omnigraph-server --features aws` |
 
-Send `Authorization: Bearer secret-a`. The token selects the actor for
-authorization and commit attribution; clients cannot claim another actor.
-See [Authorization and actors](policy.md).
+Send `Authorization: Bearer secret-a` (the scheme is case-insensitive). The token selects the
+actor for authorization and commit attribution; clients cannot claim another actor. See
+[Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge,
+with `error="invalid_token"` when the server refused the token sent.
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
@@ -205,10 +206,9 @@ never fetch keys or call a control service, so publisher outages eventually
 prevent new OIDC access; accepted operations can finish. Admission refresh does
 not restart writers. Graph configuration retains its normal activation.
 
-With this profile configured, the server also serves public
-protected-resource metadata and an OAuth challenge on its [`/mcp`](mcp.md)
-endpoint, so standard OAuth clients such as Claude can sign in. The [MCP guide](mcp.md) describes the
-endpoint, its tools, settings and limits.
+With this profile configured, the server also serves public protected-resource metadata and names it
+in every 401's challenge, so standard OAuth clients such as Claude can sign in. The [MCP guide](mcp.md)
+describes sign-in, which resource identifier to choose, and the endpoint's tools, settings and limits.
 
 ## Route families
 

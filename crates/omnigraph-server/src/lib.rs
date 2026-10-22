@@ -3,6 +3,7 @@
 
 pub mod api;
 mod blob_transport;
+mod challenge;
 mod deployment;
 mod export_transport;
 mod extract;
@@ -61,7 +62,7 @@ pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, OriginalUri, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -520,6 +521,9 @@ enum ApiErrorDetails {
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
     FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
+    /// Whether a 401 followed a presented bearer credential. The challenge
+    /// layer renders it as `WWW-Authenticate`; the body carries nothing.
+    Unauthenticated(challenge::Unauthenticated),
 }
 
 /// What a detail says about the operation that failed with it.
@@ -548,7 +552,8 @@ impl ApiErrorDetails {
             | Self::PreconditionFailure(_)
             | Self::BlobPreconditionFailure(_)
             | Self::BranchStartRefusal(_)
-            | Self::Diagnostic(_) => DetailClass::Refusal,
+            | Self::Diagnostic(_)
+            | Self::Unauthenticated(_) => DetailClass::Refusal,
             Self::RecoveryRequired(_)
             | Self::FullTextIndexRebuildRequired(_)
             | Self::FullTextIndexRequired(_) => DetailClass::Recovery,
@@ -1118,8 +1123,14 @@ impl ApiError {
         self
     }
 
-    pub fn unauthorized(message: impl Into<String>) -> Self {
+    /// HTTP 401, recording whether a bearer credential was presented so the
+    /// response's challenge says which (RFC 6750 §3.1).
+    pub(crate) fn unauthorized(
+        reason: challenge::Unauthenticated,
+        message: impl Into<String>,
+    ) -> Self {
         Self::new(ErrorCode::Unauthorized, message)
+            .with_details(ApiErrorDetails::Unauthenticated(reason))
     }
 
     pub fn forbidden(message: impl Into<String>) -> Self {
@@ -1849,6 +1860,12 @@ impl IntoResponse for ApiError {
         {
             headers.insert(axum::http::header::ETAG, etag);
         }
+        // The output consumes the details; keep authentication's reason for
+        // the challenge layer.
+        let unauthenticated = match error.details.as_deref() {
+            Some(ApiErrorDetails::Unauthenticated(reason)) => Some(*reason),
+            _ => None,
+        };
         let output = error.into_judged_output();
         if output
             .disposition
@@ -1863,7 +1880,11 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
         }
-        (status, headers, Json(output)).into_response()
+        let mut response = (status, headers, Json(output)).into_response();
+        if let Some(reason) = unauthenticated {
+            response.extensions_mut().insert(reason);
+        }
+        response
     }
 }
 
@@ -1924,6 +1945,7 @@ impl ApiError {
                     output.full_text_index_required = Some(value)
                 }
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
+                ApiErrorDetails::Unauthenticated(_) => {}
             }
         }
         output
@@ -2469,7 +2491,7 @@ mod api_error_tests {
         let cases = [
             (
                 "unauthorized",
-                ApiError::unauthorized("no token"),
+                ApiError::unauthorized(crate::challenge::Unauthenticated::NoCredential, "no token"),
                 Action::Fix,
             ),
             (
@@ -3665,6 +3687,9 @@ pub fn build_app(state: AppState) -> Router {
     if state.has_credential_source() {
         app = app.merge(mcp::router(state.clone()));
     }
+    // Every 401, from any router, handler or fallback, carries the one
+    // challenge, built once from the fixed OIDC resource binding.
+    let challenge = challenge::Challenge::new(state.oidc_resource_url().as_deref());
     // The unrouted answer, and the method fallback of the public routes. A
     // protected route already has its own, from `guarded`, which this one
     // leaves alone. Inside the layers, so both answer with the contract
@@ -3672,6 +3697,7 @@ pub fn build_app(state: AppState) -> Router {
     app.fallback(unrouted)
         .method_not_allowed_fallback(method_not_served)
         .layer(middleware::from_fn(http_contract::identify_response))
+        .layer(middleware::from_fn_with_state(challenge, challenge::answer))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

@@ -38,8 +38,9 @@ pub(crate) fn is_resource_metadata_path(path: &str) -> bool {
 }
 
 /// The metadata URL a client derives from the resource identifier (RFC 9728
-/// §3.1): the well-known prefix inserted before the resource's path.
-fn advertised_metadata_url(resource: &str) -> Option<url::Url> {
+/// §3.1): the well-known prefix inserted before the resource's path. Every
+/// 401's challenge names it.
+pub(crate) fn advertised_metadata_url(resource: &str) -> Option<url::Url> {
     let mut url = url::Url::parse(resource).ok()?;
     let path = format!(
         "{RESOURCE_METADATA_PATH}{}",
@@ -56,8 +57,9 @@ fn advertised_metadata_url(resource: &str) -> Option<url::Url> {
 pub(crate) struct AdvertisedMetadataPath(Arc<str>);
 
 /// Mounted when the server has a bearer credential source. Discovery metadata
-/// and the OAuth challenge exist only with an OIDC resource. Every HTTP request
-/// authenticates again; no MCP session retains an actor.
+/// exists only with an OIDC resource; the 401 challenge is the server's own
+/// (`crate::challenge`). Every HTTP request authenticates again; no MCP session
+/// retains an actor.
 pub(crate) fn router(state: AppState) -> Router<AppState> {
     let resource_url = state.oidc_resource_url();
     let oidc = resource_url.is_some();
@@ -95,10 +97,7 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         state.clone(),
         handlers::require_bearer_auth,
     ))
-    .route_layer(middleware::from_fn_with_state(
-        state.clone(),
-        resource_challenge,
-    ));
+    .route_layer(middleware::from_fn(no_store));
     // Computed once from the fixed binding. A wildcard route compared with the
     // raw request path keeps the configured path out of the router's syntax.
     let advertised = state
@@ -147,43 +146,9 @@ pub(crate) async fn resource_metadata_at_resource_path(
     }
 }
 
-async fn resource_challenge(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    // RFC 6750 §3.1: `invalid_token` answers a presented bearer credential
-    // that was refused; a request without one gets no error code.
-    let presented = request
-        .headers()
-        .get_all(header::AUTHORIZATION)
-        .iter()
-        .any(|value| {
-            value
-                .as_bytes()
-                .get(..7)
-                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"bearer "))
-        });
+/// MCP responses answer one credential's request; never cache them.
+async fn no_store(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    if response.status() == StatusCode::UNAUTHORIZED {
-        if let Some(url) = state
-            .oidc_resource_url()
-            .and_then(|resource| advertised_metadata_url(&resource))
-        {
-            let error = if presented {
-                "error=\"invalid_token\", "
-            } else {
-                ""
-            };
-            if let Ok(value) =
-                HeaderValue::from_str(&format!("Bearer {error}resource_metadata=\"{url}\""))
-            {
-                response
-                    .headers_mut()
-                    .insert(header::WWW_AUTHENTICATE, value);
-            }
-        }
-    }
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -331,9 +296,10 @@ fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
         error
     };
     match error {
-        ProtocolError::Unauthenticated => {
-            ApiError::unauthorized("A verified bearer credential is required.")
-        }
+        ProtocolError::Unauthenticated => ApiError::unauthorized(
+            crate::challenge::Unauthenticated::NoCredential,
+            "A verified bearer credential is required.",
+        ),
         ProtocolError::MissingContext => ApiError::internal("MCP admission context is missing."),
         ProtocolError::Capacity => ApiError::too_many_requests(
             "The server is handling its maximum concurrent MCP tool calls.",
