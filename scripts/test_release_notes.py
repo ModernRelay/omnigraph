@@ -204,6 +204,7 @@ class ReleaseNotesTests(unittest.TestCase):
             (release_text(intro=many), "v0.13.0", False, "the intro has 81 words"),
             (release_text(), "v0.13.0", True, "add '## Why these changes'"),
             (release_text(why=many), "v0.13.0", True, "has 81 words"),
+            (release_text(why="Why."), "v0.13.0", False, "this release has none"),
             (release_text(highlights=2), "v0.13.0", False, "2 highlights; write 3 to 5"),
             (release_text(highlights=6), "v0.13.1", False, "6 highlights; write 0 to 5"),
             (release_text(body=" ".join(["word"] * 151)), "v0.13.0", False, "highlight 'Highlight 1' has 151 words"),
