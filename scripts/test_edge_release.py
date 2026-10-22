@@ -146,6 +146,9 @@ class EdgeReleaseBodyTests(unittest.TestCase):
         self.assertNotIn("\n## Upgrade actions", text)
         self.assertLess(text.index("### Upgrade actions"), text.index("### Features"))
         empty = compose(preview="# OmniGraph v0.14.0\n\nUnreleased preview.\n\nNo user-visible changes recorded.\n")
+        format_two = compose(preview=PREVIEW.replace("# OmniGraph", "# Omnigraph"))
+        self.assertIn("as v0.14.0 will publish them", format_two)
+        self.assertNotIn("# Omnigraph v0.14.0", format_two)
         self.assertIn("No user-visible changes are recorded since the last stable release.", empty)
         with self.assertRaises(body.BodyError):
             compose(preview="## Features\n")
