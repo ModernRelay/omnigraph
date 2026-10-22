@@ -191,7 +191,8 @@ CI job uploads this output as `release-notes-preview`; no generated preview is
 checked in and no bot comment is needed.
 
 `changelog.d/release.json` names the next `version`, the previous release `base`
-for that maintenance line, and an optional `legacy` baseline SHA. These are
+for that maintenance line, an optional `legacy` baseline SHA and the cycle's
+release `format` (`2`, or `1` when the field is absent). These are
 explicit inputs, not inferred from the newest tag. Set `base` to `null` only for
 an initial release without a predecessor. The base and optional legacy source
 must be available with enough history to prove ancestry. The selected notes are paths
@@ -257,17 +258,19 @@ backfills; v0.12.0 onward require a valid snapshot. Edge releases need no
 snapshot: each shows the unreleased preview at its commit
 ([release workflows](ci.md#release-workflows)).
 After publication, update the configuration for the next release: set its base
-to the release just published, advance the version and set `legacy` to `null`.
+to the release just published, advance the version, set `legacy` to `null` and
+keep `"format": 2`.
 Advance the workspace package version too: edge builds are refused while it is
 not above the latest stable release ([release workflows](ci.md#release-workflows)).
 
-v0.12.0 is the only format-1 release: its hand-written document was converted
+v0.12.0 through v0.14.0 are format 1, and each snapshot records its format, so
+their pages keep that shape. v0.12.0's hand-written document was converted
 into two notes, `changelog.d/a-release-highlights.added.md` and
-`changelog.d/a-compatibility-and-behavior-changes.changed.md`, and its page
-keeps that shape. Later releases are format 2. Their GitHub release body is
-the snapshot without its heading, status line and provenance comment.
-Generated snapshots require exact verification, and existing published
-documents and URLs stay unchanged.
+`changelog.d/a-compatibility-and-behavior-changes.changed.md`. The v0.14.1
+cycle is the first in format 2; a format-2 GitHub release body is the snapshot
+without its heading, status line and provenance comment. The length caps and
+the release file apply only to a format-2 cycle. Generated snapshots require
+exact verification, and existing published documents and URLs stay unchanged.
 
 A release may also have a curated `docs/releases/vX.Y.Z-overview.md`, linked
 from the generated release index. Reconcile superseded fragments against the
